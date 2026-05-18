@@ -303,6 +303,18 @@ The CLI source lives in `bioengine/cli/` in this repo. Install with `pip install
 
 ## Agent Workflow Guidelines
 
+- **Sync with remote BEFORE doing anything**: BioEngine is developed across multiple machines (each tests a different deployment mode), so the *local* clone is almost always stale. Before editing code, before bumping a version, before opening a PR — sync first:
+  - **On `main`**: `git fetch origin && git log --oneline HEAD..origin/main` — if any commits are listed, `git pull --ff-only origin main` before touching anything else. If the fast-forward fails, stop and ask the user; never `git pull` with a merge.
+  - **On an existing feature branch** (the branch may have new commits pushed from another machine): `git fetch origin && git log --oneline HEAD..origin/<branch>` — if commits exist, `git pull --rebase origin <branch>` before adding your own. Never push without fetching first; force-push only with explicit user approval.
+  - **Before bumping `version` in `pyproject.toml`**: do NOT trust the local file. Another machine may already have merged a higher version. Check the latest published image tag on GHCR — the CI version-strictly-greater check uses this, not the local file:
+    ```bash
+    source .env && curl -s -H "Authorization: Bearer $GITHUB_PAT" \
+      "https://api.github.com/orgs/aicell-lab/packages/container/bioengine-worker/versions?per_page=20" \
+      | python3 -c "import json,sys; print('\n'.join(t for v in json.load(sys.stdin) for t in v.get('metadata',{}).get('container',{}).get('tags',[]) if t and t!='latest'))" \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+    ```
+    Bump from whichever is higher: `origin/main`'s `pyproject.toml` or the latest GHCR tag.
+  - **Before bumping `version` in `apps/<name>/manifest.yaml`**: check `get_app_status` on the live worker for the currently deployed version, AND check `origin/main`'s copy of the manifest. Bump from the higher of the two so the next CI publish strictly increases.
 - **Simplicity First**: Make every change as minimal as possible.
 - **No Regressions**: Only change what's necessary; read before modifying.
 - **Prove It Works**: Test and verify before marking done.
