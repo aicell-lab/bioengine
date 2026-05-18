@@ -25,6 +25,19 @@ from bioengine.utils import (
 )
 
 
+def _is_stale_handle_error(exc: BaseException) -> bool:
+    """Detect a Ray Client stale-handle error.
+
+    When a detached actor we hold a handle for (e.g. the Ray Serve controller)
+    is restarted on the cluster side, the server no longer knows about the
+    handle registered for our gRPC session. The next remote call surfaces a
+    plain ``Exception`` whose message contains "doesn't have a handle for".
+    Ray Client does not auto-recover this; we have to reconnect to register
+    fresh handles. Match on substring because the exception type is generic.
+    """
+    return "doesn't have a handle for" in str(exc)
+
+
 class RayCluster:
     """
     Manages Ray cluster lifecycle across different deployment environments.
@@ -840,6 +853,73 @@ class RayCluster:
         if not ray.is_initialized():
             self.logger.warning(f"Ray client disconnected. Reconnecting...")
             await self._connect_to_cluster()
+
+    async def reconnect(self) -> None:
+        """Tear down the Ray Client session and re-run the connection sequence.
+
+        Re-acquires every detached actor handle the worker holds:
+        ``BioEngineProxyActor`` (re-attached via ``get_if_exists=True``), and
+        — implicitly, on the next ``serve.*`` call — the Ray Serve controller.
+        Use this when a server-side actor restart has invalidated our handles
+        (see ``_is_stale_handle_error``); Ray Client does not auto-recover.
+
+        Notes:
+            ``ray.shutdown()`` only tears down our gRPC session, not the
+            cluster, so this is safe in external-cluster mode. For
+            single-machine/SLURM modes ``ray.shutdown()`` would stop the
+            cluster itself, so reconnect is only valid when the worker is a
+            Ray Client (i.e. external-cluster mode).
+        """
+        if self.mode != "external-cluster":
+            raise RuntimeError(
+                "RayCluster.reconnect() is only safe in external-cluster mode; "
+                f"current mode is '{self.mode}'."
+            )
+
+        self.logger.warning("Reconnecting Ray Client to refresh stale handles...")
+        try:
+            await asyncio.to_thread(ray.shutdown)
+        except Exception as e:
+            self.logger.debug(f"ray.shutdown() during reconnect raised: {e}")
+        # Drop the stale proxy actor handle before re-acquiring it; otherwise
+        # callers racing against the reconnect could hold and use it.
+        self.proxy_actor_handle = None
+        await self._connect_to_cluster()
+        self.logger.info("Ray Client reconnected; handles refreshed.")
+
+    async def call_with_reconnect(self, fn, *args, **kwargs):
+        """Run a blocking Ray API call with one automatic stale-handle recovery.
+
+        Executes ``fn(*args, **kwargs)`` on a thread (Ray's public ``serve.*``
+        functions are synchronous). If the call raises a stale-handle error
+        the worker reconnects and retries once. Any other exception, or a
+        second stale-handle error after reconnect, propagates to the caller.
+
+        Args:
+            fn: A blocking callable that performs a Ray operation
+                (e.g. ``ray.serve.status``, ``ray.serve.run``,
+                ``ray.serve.delete``, ``ray.serve.get_app_handle``).
+            *args, **kwargs: Forwarded to ``fn``.
+
+        Returns:
+            Whatever ``fn`` returns.
+
+        Raises:
+            The exception ``fn`` raises if it is not a stale-handle error, or
+            if the retry after reconnect also fails.
+        """
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except Exception as exc:
+            if not _is_stale_handle_error(exc):
+                raise
+            self.logger.warning(
+                f"Stale Ray Client handle detected calling "
+                f"{getattr(fn, '__name__', repr(fn))!r}: {exc!s}. "
+                f"Reconnecting Ray Client and retrying once."
+            )
+            await self.reconnect()
+            return await asyncio.to_thread(fn, *args, **kwargs)
 
     async def monitor_cluster(self) -> None:
         """Monitor cluster status and update worker nodes history."""

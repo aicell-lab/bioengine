@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bioengine"
-version = "0.9.1"
+version = "0.9.2"
 description = "BioEngine — CLI and SDK for deploying and calling AI model services on BioEngine workers"
 requires-python = ">=3.11"
 authors = [
