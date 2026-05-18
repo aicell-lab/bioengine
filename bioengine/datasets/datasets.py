@@ -54,6 +54,10 @@ class BioEngineDatasets:
         http_client (httpx.AsyncClient): HTTP client for service communication
     """
 
+    # Path of the per-host discovery file written by the data server.
+    # Class attribute so refresh() / _resolve_service_url() use the same path.
+    _CURRENT_SERVER_FILE = Path.home() / ".bioengine" / "datasets" / "bioengine_current_server"
+
     def __init__(
         self,
         data_server_url: Optional[str] = "auto",  # set to None for no data server
@@ -69,7 +73,12 @@ class BioEngineDatasets:
         authentication and logging for tracking access patterns.
 
         Args:
-            data_server_url: URL of the datasets server, or None to disable remote access
+            data_server_url: URL of the datasets server, ``"auto"`` to discover
+                via the per-host file written by the data server (default),
+                or ``None`` to disable remote access entirely. When ``"auto"``
+                and the file does not exist yet, the URL is re-resolved
+                lazily on every dataset operation, so a data server started
+                after the client is constructed will be picked up automatically.
             hypha_token: Optional default authentication token for accessing protected datasets
             chunk_cache_size_gb: Size of the in-memory LRU chunk cache for zarr data in GB.
                 All zarr stores opened by this client share one cache. Pass 0 to disable.
@@ -82,28 +91,77 @@ class BioEngineDatasets:
         self.logger.info(f"Initializing {self.__class__.__name__}")
         self.chunk_cache = ChunkCache(max_size_gb=chunk_cache_size_gb, logger=logger)
 
-        if data_server_url == "auto":
-            bioengine_dir = Path.home() / ".bioengine"
-            current_server_file = (
-                bioengine_dir / "datasets" / "bioengine_current_server"
-            )
-            try:
-                data_server_url = current_server_file.read_text().strip()
-            except FileNotFoundError:
-                data_server_url = None
-                self.logger.warning(
-                    f"No current data server found at "
-                    f"'{current_server_file}', proceeding without remote datasets"
-                )
-
+        # Remember the user's intent verbatim. "auto" stays "auto" so we can
+        # re-try the discovery file later if the data server hadn't started
+        # by the time this client was constructed.
+        self._requested_data_server_url: Optional[str] = data_server_url
         self.service_url: Optional[str] = None
         self.http_client: Optional[httpx.AsyncClient] = None
-        if data_server_url is not None:
-            self.service_url = data_server_url.rstrip("/")
-            self.http_client = httpx.AsyncClient(timeout=20)  # seconds
-            self.logger.info(f"Data server URL: {data_server_url}")
-
         self.default_token = hypha_token
+
+        # First attempt at construction. Non-fatal — a still-missing
+        # discovery file just means future operations will retry.
+        self._resolve_service_url(initial=True)
+
+    def _resolve_service_url(self, *, initial: bool = False) -> None:
+        """Lazily attach to the data server (no-op once attached).
+
+        Called at construction and at the top of every public method that
+        uses ``service_url``. The cheap path — ``service_url`` already set —
+        is a single attribute check; the slow path reads one small file.
+
+        Args:
+            initial: True when called from ``__init__``. Controls whether the
+                "discovery file not found" warning is emitted (we want one
+                warning at startup, not a fresh warning on every operation
+                for the lifetime of a client that never sees a data server).
+        """
+        if self.service_url is not None:
+            return  # already attached
+
+        requested = self._requested_data_server_url
+        if requested is None:
+            return  # caller opted out of remote datasets
+
+        if requested == "auto":
+            try:
+                requested = self._CURRENT_SERVER_FILE.read_text().strip()
+            except FileNotFoundError:
+                if initial:
+                    self.logger.warning(
+                        f"No current data server found at "
+                        f"'{self._CURRENT_SERVER_FILE}'. "
+                        f"Will retry on each dataset operation; "
+                        f"datasets will become available once the data server starts."
+                    )
+                return  # leave service_url None; next operation retries
+
+        self.service_url = requested.rstrip("/")
+        self.http_client = httpx.AsyncClient(timeout=20)  # seconds
+        self.logger.info(f"Data server URL: {self.service_url}")
+
+    async def refresh(self) -> Optional[str]:
+        """Force re-discovery of the data server URL.
+
+        Tears down the current HTTP client and re-runs the resolution that
+        ``__init__`` did. Useful when the data server has restarted on a
+        different URL, or when a caller wants to force a re-check without
+        waiting for the next dataset operation to do it lazily.
+
+        Returns:
+            The newly-resolved service URL, or ``None`` if the data server
+            is still unavailable. Callers can use the return value to decide
+            whether to proceed or wait longer.
+        """
+        if self.http_client is not None:
+            try:
+                await self.http_client.aclose()
+            except Exception as e:
+                self.logger.debug(f"Closing previous http_client raised: {e}")
+        self.service_url = None
+        self.http_client = None
+        self._resolve_service_url(initial=False)
+        return self.service_url
 
     async def set_chunk_cache_size_gb(self, gb: int) -> None:
         """
@@ -128,6 +186,7 @@ class BioEngineDatasets:
         Raises:
             RuntimeError: If the connection to the data server fails for any reason
         """
+        self._resolve_service_url()
         if self.service_url is None:
             return
 
@@ -159,6 +218,7 @@ class BioEngineDatasets:
         Raises:
             httpx.HTTPStatusError: If the request fails due to HTTP error
         """
+        self._resolve_service_url()
         if self.service_url is None:
             return {}
 
@@ -205,6 +265,7 @@ class BioEngineDatasets:
             ValueError: If the service_url is None or dataset does not exist
             httpx.HTTPStatusError: If the request fails due to HTTP error
         """
+        self._resolve_service_url()
         if self.service_url is None:
             raise ValueError(
                 f"Dataset '{dataset_id}' could not be accessed. No connection to data server."
@@ -357,6 +418,7 @@ class BioEngineDatasets:
         Returns:
             Dict with dataset_id, filename, size, and public flag.
         """
+        self._resolve_service_url()
         if self.service_url is None:
             raise ValueError("No connection to data server.")
 
@@ -399,6 +461,7 @@ class BioEngineDatasets:
         Returns:
             List of file paths relative to the save directory root.
         """
+        self._resolve_service_url()
         if self.service_url is None:
             raise ValueError("No connection to data server.")
 
@@ -442,6 +505,7 @@ class BioEngineDatasets:
         Returns:
             Raw file content as bytes.
         """
+        self._resolve_service_url()
         if self.service_url is None:
             raise ValueError("No connection to data server.")
 
