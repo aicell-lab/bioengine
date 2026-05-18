@@ -4897,16 +4897,19 @@ BSD-3-Clause (Cellpose license)
         logger.info(f"Listing models trained on dataset: {dataset_id}")
 
         try:
-            # Get workspace from collection
+            # Get workspace from collection (used only for URL construction below)
             workspace = collection.split("/")[0]
 
-            # Connect to hypha
+            # Connect to hypha. We deliberately do NOT pin the connection to
+            # the bioimage-io workspace: the collection is publicly readable,
+            # so the read works from any workspace context, and pinning
+            # workspace='bioimage-io' would fail for tokens scoped to a
+            # different (e.g. personal) workspace.
             token = os.environ["HYPHA_TOKEN"]
 
             server: Any = await connect_to_server(
                 {
                     "server_url": "https://hypha.aicell.io",
-                    "workspace": workspace,
                     "token": token,
                 }
             )

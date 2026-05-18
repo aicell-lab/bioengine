@@ -1098,6 +1098,46 @@ class EntryDeployment:
         self.s3_controller = await self.hypha_client.get_service("public/s3-storage")
         logger.info(f"Connected to Hypha Server at {self.server_url}")
 
+        # Decide once at startup whether this deployment's HYPHA_TOKEN can
+        # write back to the upstream bioimage-io/* model artifacts (used by
+        # the publish-test-report path in test()). Reads of public artifacts
+        # work for any token, so the rest of the service is unaffected.
+        self._can_publish_to_bioimage_io = self._check_bioimage_io_write_access()
+        if self._can_publish_to_bioimage_io:
+            logger.info(
+                "✅ HYPHA_TOKEN has write access to bioimage-io workspace; "
+                "test reports will be published to source artifacts."
+            )
+        else:
+            logger.warning(
+                "⚠️ HYPHA_TOKEN does not have write access to bioimage-io workspace; "
+                "publish_test_report=True will be silently downgraded to a no-op. "
+                "The test() result is still returned to the caller."
+            )
+
+    def _check_bioimage_io_write_access(self) -> bool:
+        """Return True if the deployment's HYPHA_TOKEN can write to the bioimage-io workspace.
+
+        Inspects ``self.hypha_client.config.user["scope"]["workspaces"]`` —
+        Hypha exposes per-workspace permission letters there
+        (``r`` read, ``rw`` write, ``rw+`` write+create, ``a`` admin).
+        Anything that includes ``w`` or equals ``a`` is sufficient for the
+        edit/put_file/commit flow used in publish_test_report.
+        """
+        try:
+            scope = self.hypha_client.config.user.get("scope", {}) or {}
+            workspaces = scope.get("workspaces", {}) or {}
+            perm = workspaces.get("bioimage-io", "")
+            return bool(perm) and ("w" in perm or "a" in perm)
+        except Exception as e:
+            # Conservative fallback: assume no write access. Better to skip
+            # publishing than to crash an inference deployment.
+            logger.warning(
+                f"Could not introspect HYPHA_TOKEN scope for bioimage-io write access: {e}. "
+                f"Treating as read-only."
+            )
+            return False
+
     # === Ray Serve Health Check Method - will be called periodically to check the health of the deployment ===
 
     async def _check_runtime_available(self) -> None:
@@ -1723,7 +1763,13 @@ class EntryDeployment:
                     )
 
             # Publish test report to artifact
-            if publish_test_report:
+            if publish_test_report and not self._can_publish_to_bioimage_io:
+                logger.info(
+                    f"ℹ️ Skipping publish_test_report for '{model_id}': "
+                    f"deployment's HYPHA_TOKEN has no write access to the bioimage-io workspace. "
+                    f"Returning the test report to the caller without publishing it back to the source artifact."
+                )
+            elif publish_test_report:
                 artifact_id = f"bioimage-io/{model_id}"
                 report_file_name = "test_report.json"
                 should_publish_report = True
