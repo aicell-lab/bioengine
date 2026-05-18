@@ -229,7 +229,7 @@ class AppsManager:
                 # Application ID already exists, generate a new one
                 continue
 
-            serve_status = await asyncio.to_thread(serve.status)
+            serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
             if application_id not in serve_status.applications:
                 # Application ID is unique and not already deployed
                 break
@@ -403,7 +403,7 @@ class AppsManager:
             app = self._deployed_applications[application_id]["built_app"]
 
             # Run the deployment in Ray Serve with unique route prefix
-            await asyncio.to_thread(
+            await self.ray_cluster.call_with_reconnect(
                 serve.run,
                 target=app,
                 name=application_id,
@@ -433,7 +433,7 @@ class AppsManager:
                 f"Failed to deploy application '{application_id}' with error: {e}"
             )
             try:
-                serve_status = await asyncio.to_thread(serve.status)
+                serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
                 application = serve_status.applications.get(application_id)
                 if application:
                     for deployment_name, deployment in application.deployments.items():
@@ -529,7 +529,7 @@ class AppsManager:
         await self._cancel_deployment_process(application_id=application_id)
 
         try:
-            await asyncio.to_thread(
+            await self.ray_cluster.call_with_reconnect(
                 serve.delete, application_id
             )  # Note: Doesn't throw an error if app doesn't exist
             self.logger.info(
@@ -840,7 +840,7 @@ class AppsManager:
 
     async def recover_deployed_applications(self) -> None:
         """Recover app tracking state for already running Ray Serve BioEngine apps."""
-        serve_status = await asyncio.to_thread(serve.status)
+        serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
         recovered_count = 0
 
         for application_id, application in serve_status.applications.items():
@@ -851,7 +851,9 @@ class AppsManager:
                 continue
 
             try:
-                app_handle = await asyncio.to_thread(serve.get_app_handle, application_id)
+                app_handle = await self.ray_cluster.call_with_reconnect(
+                    serve.get_app_handle, application_id
+                )
                 app_data = await asyncio.wait_for(
                     app_handle.get_app_data.remote(), timeout=10.0
                 )
@@ -1036,7 +1038,7 @@ class AppsManager:
         try:
             # Get status of actively running deployments
             await self.ray_cluster.check_connection()
-            serve_status = await asyncio.to_thread(serve.status)
+            serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
 
             for application_id in apps_to_redeploy:
                 application_info = self._deployed_applications.get(application_id)
@@ -2075,7 +2077,7 @@ class AppsManager:
 
         # Get Ray Serve status
         await self.ray_cluster.check_connection()
-        serve_status = await asyncio.to_thread(serve.status)
+        serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
 
         # Iterate over applications to check
         status_tasks = [
