@@ -1106,13 +1106,13 @@ class EntryDeployment:
         if self._can_publish_to_bioimage_io:
             logger.info(
                 "✅ HYPHA_TOKEN has write access to bioimage-io workspace; "
-                "test reports will be published to source artifacts."
+                "test reports can be published to source artifacts."
             )
         else:
             logger.warning(
                 "⚠️ HYPHA_TOKEN does not have write access to bioimage-io workspace; "
-                "publish_test_report=True will be silently downgraded to a no-op. "
-                "The test() result is still returned to the caller."
+                "calls to test(publish_test_report=True) will raise a PermissionError "
+                "(test(publish_test_report=False) still works)."
             )
 
     def _check_bioimage_io_write_access(self) -> bool:
@@ -1595,6 +1595,19 @@ class EntryDeployment:
         import aiofiles
 
         await self._check_runtime_available()
+        # Fail fast before running any compute if the caller wants to publish
+        # but this deployment's HYPHA_TOKEN has no write access to the
+        # bioimage-io workspace. Better than burning GPU time and surprising
+        # the caller with a permission error from artifact_manager.edit() at
+        # the end.
+        if publish_test_report and not self._can_publish_to_bioimage_io:
+            raise PermissionError(
+                f"Cannot publish test report for '{model_id}': "
+                f"this deployment's HYPHA_TOKEN has no write access to the "
+                f"bioimage-io workspace. Either deploy with a HYPHA_TOKEN that "
+                f"has bioimage-io write permission, or call test() with "
+                f"publish_test_report=False."
+            )
         logger.info(
             f"🧪 Testing model '{model_id}' (stage={stage}, skip_cache={skip_cache}, publish_test_report={publish_test_report})."
         )
@@ -1762,14 +1775,9 @@ class EntryDeployment:
                         f"⚠️ Failed to cache test report for '{model_id}': {e}"
                     )
 
-            # Publish test report to artifact
-            if publish_test_report and not self._can_publish_to_bioimage_io:
-                logger.info(
-                    f"ℹ️ Skipping publish_test_report for '{model_id}': "
-                    f"deployment's HYPHA_TOKEN has no write access to the bioimage-io workspace. "
-                    f"Returning the test report to the caller without publishing it back to the source artifact."
-                )
-            elif publish_test_report:
+            # Publish test report to artifact (caller already validated as
+            # having bioimage-io write access at the top of this method).
+            if publish_test_report:
                 artifact_id = f"bioimage-io/{model_id}"
                 report_file_name = "test_report.json"
                 should_publish_report = True
