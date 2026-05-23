@@ -175,6 +175,9 @@ resources
 # MacOS
 .DS_STORE
 
+# Claude
+.claude/
+
 # Data
 data*
 test_cellpose_infer.py
