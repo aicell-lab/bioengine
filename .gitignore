@@ -179,5 +179,11 @@ resources
 .claude/
 
 # Data
-data*
-test_cellpose_infer.py
+# IMPORTANT: keep the leading slash. An unanchored `data*` pattern matches
+# at every depth, so it would also exclude `bioengine/datasets/` from the
+# wheel — hatchling reads .gitignore when building, and the entire
+# datasets subpackage would be dropped from `pip install git+...` installs
+# (the docker image happens to escape this because the Dockerfile doesn't
+# COPY .gitignore). Anchor to the project root.
+/data*
+/test_cellpose_infer.py
