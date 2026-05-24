@@ -100,7 +100,59 @@ class BioEngineProxyActor:
             str, Dict[str, Dict[str, Tuple[str, float, str]]]
         ] = {}
 
+        # Lazily-populated cache for the head node's geographic location.
+        # See get_geo_location() — fetched once on first call, then reused
+        # across worker reconnects (the actor is detached and survives them).
+        self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
+
         logger.info(f"ClusterState initialized with GCS address: {self.gcs_address}")
+
+    def get_geo_location(self) -> Dict[str, Optional[Union[str, float]]]:
+        """Return the head node's geographic location (cached after first call).
+
+        Runs from within the head-node actor, so the result reflects the
+        head's egress IP — not the BioEngine worker's. In external-cluster
+        mode the two can be on different continents (e.g. a worker in
+        Stockholm orchestrating a Ray cluster in Ankara), and surfacing
+        both lets dashboards show where compute actually runs.
+
+        Returns:
+            Same shape as ``bioengine.utils.fetch_geolocation``:
+            ``{region, country_name, country_code, latitude, longitude, timezone}``.
+            Values may be None if every provider failed; in that case the
+            cache is still populated so we don't hammer the providers on
+            every status query.
+        """
+        if self._cached_geo_location is not None:
+            return self._cached_geo_location
+
+        import asyncio
+        from bioengine.utils import fetch_centroid_coordinates, fetch_geolocation
+
+        async def _fetch() -> Dict[str, Optional[Union[str, float]]]:
+            geo = await fetch_geolocation(logger=logger)
+            # Same Nominatim fallback the worker does when a provider
+            # returns a country but no lat/lon.
+            if (
+                geo.get("country_name")
+                and geo.get("latitude") is None
+                and geo.get("longitude") is None
+            ):
+                try:
+                    coords = await fetch_centroid_coordinates(
+                        country=geo["country_name"],
+                        region=geo.get("region"),
+                        logger=logger,
+                    )
+                    geo.update(coords)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to fetch head-node centroid coordinates: {e}"
+                    )
+            return geo
+
+        self._cached_geo_location = asyncio.run(_fetch())
+        return self._cached_geo_location
 
     def _get_pending_jobs(self) -> List[Dict[str, Any]]:
         """Get list of jobs waiting to start in the cluster.

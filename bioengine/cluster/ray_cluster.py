@@ -183,6 +183,11 @@ class RayCluster:
         self.cluster_status_history = OrderedDict()
         self.max_status_history_length = 100
         self.is_ready = asyncio.Event()
+        # Head-node geo location, fetched once on first connect via the
+        # BioEngineProxyActor and surfaced in status()['geo_location'].
+        # Distinct from the worker process's own geo (worker.py) — in
+        # external-cluster mode the two can be different sites.
+        self.head_geo_location: Optional[Dict] = None
 
         self.start_time = None
         self.lock_file = None
@@ -317,6 +322,11 @@ class RayCluster:
             "head_address": self.address,
             "start_time": self.start_time if self.mode != "external-cluster" else "N/A",
             "mode": self.mode,
+            # Head node's geo location (fetched once on first connect via
+            # BioEngineProxyActor). Distinct from worker's own geo
+            # (worker.py -> status['geo_location']); the two may differ in
+            # external-cluster mode.
+            "geo_location": self.head_geo_location,
         }
 
         last_status = (
@@ -787,6 +797,20 @@ class RayCluster:
             self.logger.info(
                 f"Connected to Ray cluster at '{self.address}' with Serve HTTP URL {self.serve_http_url}"
             )
+
+            # Fetch the head node's geographic location once on (re)connect.
+            # The proxy actor caches the result, so subsequent reconnects
+            # return the cached value without re-querying the providers.
+            # Non-fatal: connect succeeds even if geo lookup fails.
+            try:
+                self.head_geo_location = await asyncio.wait_for(
+                    self.proxy_actor_handle.get_geo_location.remote(),
+                    timeout=15.0,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to fetch Ray head-node geo location (non-fatal): {e}"
+                )
 
             return context
         except Exception as e:
