@@ -119,9 +119,10 @@ class BioEngineProxyActor:
         Returns:
             Same shape as ``bioengine.utils.fetch_geolocation``:
             ``{region, country_name, country_code, latitude, longitude, timezone}``.
-            Values may be None if every provider failed; in that case the
-            cache is still populated so we don't hammer the providers on
-            every status query.
+            Values may be None if every provider failed; **failures are not
+            cached** — every call retries the providers until at least one
+            returns a country, then the result is cached for the lifetime
+            of the actor.
         """
         if self._cached_geo_location is not None:
             return self._cached_geo_location
@@ -151,8 +152,14 @@ class BioEngineProxyActor:
                     )
             return geo
 
-        self._cached_geo_location = asyncio.run(_fetch())
-        return self._cached_geo_location
+        geo = asyncio.run(_fetch())
+        # Only cache on success. fetch_geolocation returns an all-None dict
+        # when every provider fails; caching that would lock the actor into
+        # reporting "unknown location" forever even after the providers
+        # come back. Leaving the cache as None lets the next call retry.
+        if geo.get("country_name"):
+            self._cached_geo_location = geo
+        return geo
 
     def _get_pending_jobs(self) -> List[Dict[str, Any]]:
         """Get list of jobs waiting to start in the cluster.

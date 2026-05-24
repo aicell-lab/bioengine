@@ -957,6 +957,24 @@ class RayCluster:
             if len(self.cluster_status_history) > self.max_status_history_length:
                 self.cluster_status_history.popitem(last=False)
 
+            # Retry the head-node geo lookup until it returns a real country.
+            # The actor caches the first successful result, so this becomes a
+            # no-op once geo is known. Mirrors the worker's own retry pattern
+            # in worker._fetch_geo_location.
+            if (
+                self.head_geo_location is None
+                or not self.head_geo_location.get("country_name")
+            ):
+                try:
+                    self.head_geo_location = await asyncio.wait_for(
+                        self.proxy_actor_handle.get_geo_location.remote(),
+                        timeout=15.0,
+                    )
+                except Exception as e:
+                    self.logger.debug(
+                        f"Head-node geo location retry failed (non-fatal): {e}"
+                    )
+
             # Check if SLURM workers need to scale
             if self.slurm_workers:
                 await self.slurm_workers.check_scaling()
