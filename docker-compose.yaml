@@ -36,6 +36,7 @@ services:
       - TZ=UTC
     command: >
       python -m bioengine.worker
+      --worker-name "My BioEngine Worker"
       --mode single-machine
       --head-num-cpus 4
       --head-num-gpus 1
