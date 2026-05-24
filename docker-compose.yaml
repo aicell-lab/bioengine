@@ -1,5 +1,4 @@
-# Skip from worktree to keep local modifications: git update-index --skip-worktree docker-compose.yaml
-# Undo with: git update-index --no-skip-worktree docker-compose.yaml
+# Template docker-compose.yaml for BioEngine with data server and single-machine worker mode.
 services:
   data-server:
     image: ghcr.io/aicell-lab/bioengine-datasets:${BIOENGINE_VERSION:-latest}
@@ -25,7 +24,7 @@ services:
       retries: 3
 
   worker:
-    image: ghcr.io/aicell-lab/bioengine:${BIOENGINE_VERSION:-latest}
+    image: ghcr.io/aicell-lab/bioengine-worker:${BIOENGINE_VERSION:-latest}
     container_name: bioengine-worker
     user: "${UID}:${GID}"
     shm_size: 8g
