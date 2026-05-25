@@ -114,12 +114,11 @@ class SlurmWorkers:
         self.ray_cluster = ray_cluster
 
         # SLURM job configuration parameters
-        # apptainer accepts three image-reference styles: docker://… URI,
+        # Apptainer accepts three image-reference styles: docker:// URI,
         # local *.sif file, or local sandbox directory. Only prepend
-        # docker:// when the path looks like none of those (i.e. a bare
-        # docker reference like ghcr.io/org/img:tag). Without this guard,
-        # passing /proj/.../bioengine-worker_0.9.8-sandbox produced
-        # docker:///proj/... and every SLURM worker died in <10s.
+        # docker:// for bare docker references — without the isdir guard
+        # a sandbox-dir path was getting docker:// pasted in front, which
+        # apptainer rejects with "invalid reference format".
         if (
             image.startswith("docker://")
             or image.endswith(".sif")
