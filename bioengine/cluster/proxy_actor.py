@@ -115,7 +115,7 @@ class BioEngineProxyActor:
             return self._cached_geo_location
 
         import asyncio
-        from bioengine.utils.geo_location import fetch_geolocation
+        from bioengine.utils import fetch_geolocation
 
         geo = asyncio.run(fetch_geolocation(logger=logger))
         if geo.get("country_name"):

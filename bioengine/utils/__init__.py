@@ -1,5 +1,5 @@
-# artifact_utils requires httpx / yaml / hypha_rpc — keep optional so
-# bioengine.utils still loads in minimal envs (e.g. Ray cluster head nodes).
+# artifact_utils imports httpx at module top. Optional here so bioengine.utils
+# still loads on environments without httpx (e.g. the Ray cluster head node).
 try:
     from .artifact_utils import (
         create_application_from_files,
