@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 import base64
 import logging
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import httpx
 import yaml
-from hypha_rpc.rpc import ObjectProxy
+
+if TYPE_CHECKING:
+    from hypha_rpc.rpc import ObjectProxy
 
 from .logger import create_logger
 
