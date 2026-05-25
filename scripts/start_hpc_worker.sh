@@ -109,6 +109,28 @@ set_arg_value() {
     fi
 }
 
+# Function: detect a boolean (presence-only) CLI flag and strip it from the
+# arguments forwarded to the worker. Writes the result ("true"/"false") into
+# the global TAKE_FLAG_RESULT and mutates BIOENGINE_WORKER_ARGS in place
+# (must therefore be invoked without command substitution so the parent
+# shell sees the change). The flag is removed so python never receives it.
+take_flag() {
+    local tag="$1"
+    TAKE_FLAG_RESULT=false
+    local cleaned=()
+    for ((i=0; i<${#BIOENGINE_WORKER_ARGS[@]}; i++)); do
+        local arg="${BIOENGINE_WORKER_ARGS[i]}"
+        if [[ "$arg" == "$tag" || "$arg" == "$tag=true" || "$arg" == "$tag=1" ]]; then
+            TAKE_FLAG_RESULT=true
+        elif [[ "$arg" == "$tag=false" || "$arg" == "$tag=0" ]]; then
+            : # explicit false; drop the arg but leave TAKE_FLAG_RESULT=false
+        else
+            cleaned+=("$arg")
+        fi
+    done
+    BIOENGINE_WORKER_ARGS=("${cleaned[@]}")
+}
+
 # Function to define bind mounts
 BIND_OPTS=()
 add_bind() {
@@ -163,8 +185,41 @@ mkdir -p $IMAGE_CACHEDIR
 SINGULARITY_CACHEDIR=$IMAGE_CACHEDIR
 APPTAINER_CACHEDIR=$IMAGE_CACHEDIR
 
-# Get the path to the image 
+# Get the path to the image
 IMAGE="$(get_arg_value "--image" $DEFAULT_IMAGE)"
+
+# Auto-sandbox flag: build (or reuse) an apptainer sandbox dir from the docker
+# reference, then use that as the image. Useful on clusters where the SIF
+# build path is broken (e.g. apptainer 1.5.x + yama.ptrace_scope=2 fails the
+# proot/mksquashfs invocation; see PR #76 context). The flag is stripped from
+# the arguments forwarded to the worker so python never sees it.
+take_flag "--sandbox"
+SANDBOX_MODE="$TAKE_FLAG_RESULT"
+
+if [[ "$SANDBOX_MODE" == "true" ]]; then
+    if [[ "$IMAGE" == *.sif || -d "$IMAGE" ]]; then
+        echo "Error: --sandbox cannot be combined with a local .sif or sandbox-dir --image; pass a docker reference instead."
+        exit 1
+    fi
+    # Strip an optional docker:// prefix to derive a safe directory name.
+    SANDBOX_SRC="${IMAGE#docker://}"
+    SANDBOX_NAME="$(echo "$SANDBOX_SRC" | tr '/:' '__')-sandbox"
+    SANDBOX_DIR="$IMAGE_CACHEDIR/$SANDBOX_NAME"
+    if [[ ! -d "$SANDBOX_DIR" ]]; then
+        echo "Building apptainer sandbox from docker://${SANDBOX_SRC} → $SANDBOX_DIR (one-time, this can take several minutes) ..."
+        APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-$HOME/.apptainer-tmp}"
+        mkdir -p "$APPTAINER_TMPDIR"
+        if ! APPTAINER_TMPDIR="$APPTAINER_TMPDIR" \
+             $CONTAINER_CMD build --sandbox "$SANDBOX_DIR" "docker://${SANDBOX_SRC}"; then
+            echo "Error: sandbox build failed; aborting."
+            rm -rf "$SANDBOX_DIR"
+            exit 1
+        fi
+    else
+        echo "Reusing cached apptainer sandbox at $SANDBOX_DIR"
+    fi
+    IMAGE="$SANDBOX_DIR"
+fi
 
 # Get the image name and version
 if [[ "$IMAGE" == *.sif ]]; then
@@ -174,6 +229,13 @@ if [[ "$IMAGE" == *.sif ]]; then
         echo "Error: Image file $IMAGE not found."
         exit 1
     fi
+elif [[ -d "$IMAGE" ]]; then
+    # Apptainer sandbox directory image. Required on hosts where
+    # `apptainer pull` / `apptainer build sif` is broken (e.g. kernel
+    # yama.ptrace_scope=2 blocks the proot/mksquashfs path). Built
+    # automatically when --sandbox is passed, or supplied directly via
+    # --image /path/to/sandbox-dir.
+    IMAGE=$(realpath $IMAGE)
 elif [[ "$IMAGE" != docker://* ]]; then
     # Add docker:// prefix if not present
     IMAGE="docker://${IMAGE}"
