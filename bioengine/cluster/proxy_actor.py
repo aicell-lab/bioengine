@@ -115,29 +115,9 @@ class BioEngineProxyActor:
             return self._cached_geo_location
 
         import asyncio
-        from bioengine.utils import fetch_centroid_coordinates, fetch_geolocation
+        from bioengine.utils import fetch_geolocation
 
-        async def _fetch() -> Dict[str, Optional[Union[str, float]]]:
-            geo = await fetch_geolocation(logger=logger)
-            if (
-                geo.get("country_name")
-                and geo.get("latitude") is None
-                and geo.get("longitude") is None
-            ):
-                try:
-                    coords = await fetch_centroid_coordinates(
-                        country=geo["country_name"],
-                        region=geo.get("region"),
-                        logger=logger,
-                    )
-                    geo.update(coords)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to fetch head-node centroid coordinates: {e}"
-                    )
-            return geo
-
-        geo = asyncio.run(_fetch())
+        geo = asyncio.run(fetch_geolocation(logger=logger))
         if geo.get("country_name"):
             self._cached_geo_location = geo
         return geo

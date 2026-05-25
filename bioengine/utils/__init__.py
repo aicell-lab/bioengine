@@ -1,10 +1,15 @@
-from .artifact_utils import (
-    create_application_from_files,
-    create_file_list_from_directory,
-    ensure_applications_collection,
-    get_static_site_url,
-    validate_manifest,
-)
+# artifact_utils imports httpx at module top. Optional here so bioengine.utils
+# still loads on environments without httpx (e.g. the Ray cluster head node).
+try:
+    from .artifact_utils import (
+        create_application_from_files,
+        create_file_list_from_directory,
+        ensure_applications_collection,
+        get_static_site_url,
+        validate_manifest,
+    )
+except ImportError:
+    pass
 from .geo_location import fetch_centroid_coordinates, fetch_geolocation
 from .logger import (
     create_logger,
