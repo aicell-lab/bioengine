@@ -115,11 +115,7 @@ class BioEngineProxyActor:
             return self._cached_geo_location
 
         import asyncio
-        # Submodule path avoids bioengine.utils.__init__ -> hypha_rpc (not on Ray head).
-        from bioengine.utils.geo_location import (
-            fetch_centroid_coordinates,
-            fetch_geolocation,
-        )
+        from bioengine.utils import fetch_centroid_coordinates, fetch_geolocation
 
         async def _fetch() -> Dict[str, Optional[Union[str, float]]]:
             geo = await fetch_geolocation(logger=logger)
