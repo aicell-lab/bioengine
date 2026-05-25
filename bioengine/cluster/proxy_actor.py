@@ -114,51 +114,13 @@ class BioEngineProxyActor:
         if self._cached_geo_location is not None:
             return self._cached_geo_location
 
-        # Stdlib only: minimal Ray-head images (e.g. rayproject/ray:2.55.1-py311-cpu)
-        # do not ship httpx, so we can't reuse bioengine.utils.geo_location here.
-        def _ipwhois() -> Dict[str, Optional[Union[str, float]]]:
-            with urllib.request.urlopen("https://ipwho.is/", timeout=10) as r:
-                d = json.loads(r.read())
-            if not d.get("success"):
-                raise ValueError(d.get("message"))
-            return {
-                "region": d.get("region"),
-                "country_name": d.get("country"),
-                "country_code": d.get("country_code"),
-                "latitude": d.get("latitude"),
-                "longitude": d.get("longitude"),
-                "timezone": (d.get("timezone") or {}).get("id"),
-            }
+        import asyncio
+        from bioengine.utils.geo_location import fetch_geolocation
 
-        def _ipapi_com() -> Dict[str, Optional[Union[str, float]]]:
-            with urllib.request.urlopen("http://ip-api.com/json/", timeout=10) as r:
-                d = json.loads(r.read())
-            if d.get("status") != "success":
-                raise ValueError(d.get("message"))
-            return {
-                "region": d.get("regionName"),
-                "country_name": d.get("country"),
-                "country_code": d.get("countryCode"),
-                "latitude": d.get("lat"),
-                "longitude": d.get("lon"),
-                "timezone": d.get("timezone"),
-            }
-
-        empty = {k: None for k in (
-            "region", "country_name", "country_code", "latitude", "longitude", "timezone"
-        )}
-        for name, fn in (("ipwho.is", _ipwhois), ("ip-api.com", _ipapi_com)):
-            try:
-                geo = fn()
-                logger.info(
-                    f"Head-node geo via {name}: {geo['region']}, {geo['country_name']}"
-                )
-                self._cached_geo_location = geo
-                return geo
-            except Exception as e:
-                logger.warning(f"Head-node geo provider '{name}' failed: {e}")
-        logger.error("All head-node geo providers failed.")
-        return empty
+        geo = asyncio.run(fetch_geolocation(logger=logger))
+        if geo.get("country_name"):
+            self._cached_geo_location = geo
+        return geo
 
     def _get_pending_jobs(self) -> List[Dict[str, Any]]:
         """Get list of jobs waiting to start in the cluster.

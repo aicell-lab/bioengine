@@ -1,19 +1,24 @@
 import asyncio
+import json
 import logging
-from typing import Dict, Optional
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, Optional
 
-import httpx
 
-
-async def _get(
+async def _get_json(
     url: str,
     params: Optional[Dict[str, str]] = None,
-) -> httpx.Response:
-    """Perform a single async GET request with a 10-second timeout."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        return response
+) -> Any:
+    """Single async GET-and-parse-JSON with a 10-second timeout (stdlib only)."""
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+
+    def _blocking() -> Any:
+        with urllib.request.urlopen(url, timeout=10.0) as response:
+            return json.loads(response.read())
+
+    return await asyncio.to_thread(_blocking)
 
 
 async def fetch_centroid_coordinates(
@@ -44,11 +49,10 @@ async def fetch_centroid_coordinates(
     latitude = None
     longitude = None
     try:
-        response = await _get(
+        data = await _get_json(
             url="https://nominatim.openstreetmap.org/search",
-            params={"q": query, "format": "json", "limit": 1},
+            params={"q": query, "format": "json", "limit": "1"},
         )
-        data = response.json()
         if data:
             latitude = float(data[0]["lat"])
             longitude = float(data[0]["lon"])
@@ -65,8 +69,7 @@ async def fetch_centroid_coordinates(
 
 async def _fetch_from_ipwhois(logger: logging.Logger) -> Optional[Dict]:
     """Fetch geolocation from ipwho.is — no rate limit, returns lat/lon directly."""
-    response = await _get(url="https://ipwho.is/")
-    data = response.json()
+    data = await _get_json(url="https://ipwho.is/")
     if not data.get("success"):
         raise ValueError(f"ipwho.is returned error: {data.get('message')}")
     return {
@@ -81,8 +84,7 @@ async def _fetch_from_ipwhois(logger: logging.Logger) -> Optional[Dict]:
 
 async def _fetch_from_ipapi_com(logger: logging.Logger) -> Optional[Dict]:
     """Fetch geolocation from ip-api.com — 45 req/min free, returns lat/lon directly."""
-    response = await _get(url="http://ip-api.com/json/")
-    data = response.json()
+    data = await _get_json(url="http://ip-api.com/json/")
     if data.get("status") != "success":
         raise ValueError(f"ip-api.com returned error: {data.get('message')}")
     return {
@@ -97,8 +99,7 @@ async def _fetch_from_ipapi_com(logger: logging.Logger) -> Optional[Dict]:
 
 async def _fetch_from_ipapi_co(logger: logging.Logger) -> Optional[Dict]:
     """Fetch geolocation from ipapi.co — 1,000 req/day free, returns lat/lon directly."""
-    response = await _get(url="https://ipapi.co/json/")
-    data = response.json()
+    data = await _get_json(url="https://ipapi.co/json/")
     if data.get("error"):
         raise ValueError(f"ipapi.co returned error: {data.get('reason')}")
     return {
