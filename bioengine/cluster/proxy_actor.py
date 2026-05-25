@@ -142,10 +142,19 @@ class BioEngineProxyActor:
         return [asdict(job) for job in pending_jobs]
 
     def _get_pending_actors(self) -> List[Dict[str, Any]]:
-        """Get list of actors waiting to be created in the cluster.
+        """Get list of actors whose creation is genuinely blocked on resources.
+
+        Returns actors in ``PENDING_CREATION`` *that actually demand CPU, GPU,
+        or memory*. The router/proxy actors that bioengine wraps every Ray
+        Serve app with (``ProxyDeployment``, ``BioEngineProxyActor``, the
+        Serve ``ProxyActor``) declare ``num_cpus=0`` and can schedule onto
+        the head — they appear in ``PENDING_CREATION`` for a few ticks at
+        deploy time and would otherwise inflate the count seen by the
+        SLURM scale-up loop (one user app then reports two "pending" actors).
 
         Returns:
-            List of dictionaries containing actor information for pending actors.
+            List of dictionaries containing actor information for pending
+            actors that need additional cluster capacity.
         """
         pending_actors = self.state_api_client.list(
             resource=StateResource.ACTORS,
@@ -158,7 +167,20 @@ class BioEngineProxyActor:
             ),
             raise_on_missing_output=True,
         )
-        return [asdict(actor) for actor in pending_actors]
+        filtered: List[Dict[str, Any]] = []
+        for actor in pending_actors:
+            entry = asdict(actor)
+            req = entry.get("required_resources") or {}
+            # A 0-CPU, 0-GPU, 0-memory actor never needs a new worker node;
+            # it will schedule onto whatever node has any spare bytes — in
+            # practice the head. Exclude it from the pending-resources view.
+            cpu = float(req.get("CPU", 0) or 0)
+            gpu = float(req.get("GPU", 0) or 0)
+            mem = float(req.get("memory", 0) or 0)
+            if cpu <= 0 and gpu <= 0 and mem <= 0:
+                continue
+            filtered.append(entry)
+        return filtered
 
     def _get_pending_tasks(self) -> List[Dict[str, Any]]:
         """Get list of tasks waiting for node assignment in the cluster.

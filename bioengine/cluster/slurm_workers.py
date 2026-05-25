@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import ray
 
@@ -916,6 +916,129 @@ class SlurmWorkers:
             Exception: If job query fails due to SLURM connection issues
         """
         return len(await self._get_jobs()) - len(self.worker_deletion_tasks)
+
+    @staticmethod
+    def _parse_slurm_duration(value: str) -> Optional[int]:
+        """Parse a SLURM duration string into seconds.
+
+        SLURM emits durations as ``[D-]HH:MM:SS`` or ``MM:SS`` (the leading
+        ``D-`` is days). ``UNLIMITED`` / ``INVALID`` / ``NOT_SET`` collapse to
+        ``None`` so callers can skip "remaining time" calculations gracefully.
+        """
+        if not value or value in {"UNLIMITED", "INVALID", "NOT_SET", "N/A"}:
+            return None
+        days = 0
+        rest = value
+        if "-" in value:
+            d, _, rest = value.partition("-")
+            try:
+                days = int(d)
+            except ValueError:
+                return None
+        parts = rest.split(":")
+        try:
+            parts_int = [int(p) for p in parts]
+        except ValueError:
+            return None
+        if len(parts_int) == 3:
+            h, m, s = parts_int
+        elif len(parts_int) == 2:
+            h, m, s = 0, parts_int[0], parts_int[1]
+        else:
+            return None
+        return days * 86400 + h * 3600 + m * 60 + s
+
+    @staticmethod
+    def _parse_slurm_timestamp(value: str) -> Optional[float]:
+        """Parse a SLURM ISO-ish timestamp (``YYYY-MM-DDTHH:MM:SS``) → epoch seconds."""
+        if not value or value in {"N/A", "Unknown", "None"}:
+            return None
+        try:
+            return time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%S"))
+        except (ValueError, OverflowError):
+            return None
+
+    async def get_job_status(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Snapshot of BioEngine worker SLURM jobs split into queued vs running.
+
+        Each entry carries the timing information needed by the dashboard to
+        render "waited for / remaining in" badges:
+
+        - **queued** (pending in the SLURM queue, state ``PD``/``CF``):
+          ``job_id``, ``state``, ``submit_time`` (epoch s, may be ``None``),
+          ``pending_seconds`` (int, may be ``None``), ``reason`` (str).
+        - **running** (state ``R``): ``job_id``, ``state``, ``node``,
+          ``start_time`` (epoch s, may be ``None``), ``time_limit_seconds``
+          (int, may be ``None``), ``elapsed_seconds`` (int),
+          ``remaining_seconds`` (int, may be ``None`` if no time limit).
+
+        All durations are accurate to the second, but the UI should round to
+        the minute when displaying — per-second updates would be churny.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "squeue",
+                "-u", os.environ["USER"],
+                "-n", self.job_name,
+                "-h",
+                "-o", "%i|%T|%V|%S|%l|%M|%R|%N",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                err = (stderr.decode() if stderr else "").strip()
+                self.logger.warning(f"squeue failed (exit {proc.returncode}): {err}")
+                return {"queued": [], "running": []}
+        except FileNotFoundError:
+            # squeue not available (e.g. running unit tests without SLURM)
+            return {"queued": [], "running": []}
+
+        now = time.time()
+        queued: List[Dict[str, Any]] = []
+        running: List[Dict[str, Any]] = []
+        for line in stdout.decode().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+            job_id, state, submit_s, start_s, time_limit_s, elapsed_s, reason, node = parts
+            submit_t = self._parse_slurm_timestamp(submit_s)
+            start_t = self._parse_slurm_timestamp(start_s)
+            time_limit = self._parse_slurm_duration(time_limit_s)
+            elapsed = self._parse_slurm_duration(elapsed_s) or 0
+
+            if state == "RUNNING":
+                remaining: Optional[int]
+                if time_limit is not None:
+                    remaining = max(0, time_limit - elapsed)
+                else:
+                    remaining = None
+                running.append({
+                    "job_id": job_id,
+                    "state": state,
+                    "node": node or None,
+                    "start_time": start_t,
+                    "time_limit_seconds": time_limit,
+                    "elapsed_seconds": elapsed,
+                    "remaining_seconds": remaining,
+                })
+            else:  # PENDING, CONFIGURING, COMPLETING, etc — treat as queued
+                pending_secs: Optional[int]
+                if submit_t is not None:
+                    pending_secs = max(0, int(now - submit_t))
+                else:
+                    pending_secs = None
+                queued.append({
+                    "job_id": job_id,
+                    "state": state,
+                    "submit_time": submit_t,
+                    "pending_seconds": pending_secs,
+                    "reason": reason,
+                })
+        return {"queued": queued, "running": running}
 
     async def check_scaling(self) -> None:
         """

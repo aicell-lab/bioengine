@@ -8,7 +8,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import ray
 from ray import serve
@@ -190,6 +190,7 @@ class RayCluster:
         self.lock_file = None
         self._owns_lock = False
         self.slurm_workers = None
+        self._last_slurm_jobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
         # Base configuration for connecting to Ray cluster
         self.ray_cluster_config = {
@@ -329,6 +330,13 @@ class RayCluster:
         )
         status["cluster"] = last_status["cluster"] if last_status else {}
         status["nodes"] = last_status["nodes"] if last_status else {}
+
+        # SLURM job snapshot (only populated in slurm mode). Always present as
+        # an empty {queued: [], running: []} so UI code can render unconditionally.
+        status["slurm_jobs"] = getattr(self, "_last_slurm_jobs", None) or {
+            "queued": [],
+            "running": [],
+        }
 
         return status
 
@@ -963,6 +971,13 @@ class RayCluster:
 
             # Check if SLURM workers need to scale
             if self.slurm_workers:
+                # Snapshot the squeue state so the public status response can
+                # surface queued/running job timing without ever doing IO on
+                # the read path.
+                try:
+                    self._last_slurm_jobs = await self.slurm_workers.get_job_status()
+                except Exception as e:
+                    self.logger.warning(f"Failed to snapshot SLURM job status: {e}")
                 await self.slurm_workers.check_scaling()
         except Exception as e:
             self.logger.error(f"Error monitoring cluster: {e}")
