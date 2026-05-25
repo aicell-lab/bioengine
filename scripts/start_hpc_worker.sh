@@ -174,6 +174,13 @@ if [[ "$IMAGE" == *.sif ]]; then
         echo "Error: Image file $IMAGE not found."
         exit 1
     fi
+elif [[ -d "$IMAGE" ]]; then
+    # Apptainer sandbox directory image. Required on hosts where
+    # `apptainer pull` / `apptainer build sif` is broken (e.g. kernel
+    # yama.ptrace_scope=2 blocks the proot/mksquashfs path). Built
+    # elsewhere with `apptainer build --sandbox <dir> docker://...`
+    # and pointed at here via --image.
+    IMAGE=$(realpath $IMAGE)
 elif [[ "$IMAGE" != docker://* ]]; then
     # Add docker:// prefix if not present
     IMAGE="docker://${IMAGE}"
