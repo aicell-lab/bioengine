@@ -115,10 +115,7 @@ class BioEngineProxyActor:
             return self._cached_geo_location
 
         import asyncio
-        # Import directly from the submodule, not from `bioengine.utils`.
-        # The package __init__ pulls in artifact_utils -> hypha_rpc, which
-        # isn't installed on a plain Ray cluster head node (only the worker
-        # container has it). Direct submodule import sidesteps that.
+        # Submodule path avoids bioengine.utils.__init__ -> hypha_rpc (not on Ray head).
         from bioengine.utils.geo_location import (
             fetch_centroid_coordinates,
             fetch_geolocation,
