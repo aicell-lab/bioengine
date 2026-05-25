@@ -318,6 +318,12 @@ The CLI source lives in `bioengine/cli/` in this repo. Install with `pip install
 - **Simplicity First**: Make every change as minimal as possible.
 - **No Regressions**: Only change what's necessary; read before modifying.
 - **Prove It Works**: Test and verify before marking done.
+- **Comments — write almost none**: code should explain *what* via good names; comments only earn their place when they explain *why* something non-obvious is true. Concretely:
+  - **Do not narrate** what the next line does (`# fetch the user`, `# loop over items`, `# now connect`). The line says it.
+  - **Do not describe the PR / current task** in a comment (`# added for the geo location PR`, `# this fixes the timeout we hit yesterday`). That belongs in the commit message; in the file it just rots.
+  - **Do not write multi-paragraph comments** unless the reader genuinely cannot reconstruct the reasoning. One short sentence is almost always enough; two if there's a real footgun. Prefer a one-line docstring over a wall of `#`.
+  - **Do write a comment** when it captures a hidden constraint a future reader would otherwise re-discover the hard way: a workaround for a known bug, a non-obvious invariant, an external system's quirk, a reason for a counter-intuitive default. Make the comment as short as possible while still naming the *why*.
+  - When in doubt: delete the comment, run the diff again, and ask whether the code is materially harder to understand. If not, the comment was not pulling its weight.
 - Planning lives in model context — do NOT create planning files in the repo.
 - Lessons go in `.github/copilot-instructions.md` (durable repo-level knowledge).
 - **Test on the live worker**: When working on a BioEngine app, test and debug by deploying to the live `bioimage-io/bioengine-worker` service on https://hypha.aicell.io and calling the service directly. Do not write standalone test scripts for app behaviour — use the live service. Deploy with a stable `application_id` matching the artifact alias so the service is consistently addressable:
