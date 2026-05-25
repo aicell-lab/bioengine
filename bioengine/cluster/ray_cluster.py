@@ -183,10 +183,7 @@ class RayCluster:
         self.cluster_status_history = OrderedDict()
         self.max_status_history_length = 100
         self.is_ready = asyncio.Event()
-        # Head-node geo location, fetched once on first connect via the
-        # BioEngineProxyActor and surfaced in status()['geo_location'].
-        # Distinct from the worker process's own geo (worker.py) — in
-        # external-cluster mode the two can be different sites.
+        # Distinct from the worker process's own geo in external-cluster mode.
         self.head_geo_location: Optional[Dict] = None
 
         self.start_time = None
@@ -322,10 +319,6 @@ class RayCluster:
             "head_address": self.address,
             "start_time": self.start_time if self.mode != "external-cluster" else "N/A",
             "mode": self.mode,
-            # Head node's geo location (fetched once on first connect via
-            # BioEngineProxyActor). Distinct from worker's own geo
-            # (worker.py -> status['geo_location']); the two may differ in
-            # external-cluster mode.
             "geo_location": self.head_geo_location,
         }
 
@@ -798,10 +791,6 @@ class RayCluster:
                 f"Connected to Ray cluster at '{self.address}' with Serve HTTP URL {self.serve_http_url}"
             )
 
-            # Fetch the head node's geographic location once on (re)connect.
-            # The proxy actor caches the result, so subsequent reconnects
-            # return the cached value without re-querying the providers.
-            # Non-fatal: connect succeeds even if geo lookup fails.
             try:
                 self.head_geo_location = await asyncio.wait_for(
                     self.proxy_actor_handle.get_geo_location.remote(),
@@ -809,7 +798,7 @@ class RayCluster:
                 )
             except Exception as e:
                 self.logger.warning(
-                    f"Failed to fetch Ray head-node geo location (non-fatal): {e}"
+                    f"Failed to fetch Ray head-node geo location: {e}"
                 )
 
             return context
@@ -957,10 +946,7 @@ class RayCluster:
             if len(self.cluster_status_history) > self.max_status_history_length:
                 self.cluster_status_history.popitem(last=False)
 
-            # Retry the head-node geo lookup until it returns a real country.
-            # The actor caches the first successful result, so this becomes a
-            # no-op once geo is known. Mirrors the worker's own retry pattern
-            # in worker._fetch_geo_location.
+            # Retry until the lookup returns a real country; the actor caches success.
             if (
                 self.head_geo_location is None
                 or not self.head_geo_location.get("country_name")
@@ -972,7 +958,7 @@ class RayCluster:
                     )
                 except Exception as e:
                     self.logger.debug(
-                        f"Head-node geo location retry failed (non-fatal): {e}"
+                        f"Head-node geo location retry failed: {e}"
                     )
 
             # Check if SLURM workers need to scale

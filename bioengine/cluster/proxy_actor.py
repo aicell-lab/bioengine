@@ -100,29 +100,16 @@ class BioEngineProxyActor:
             str, Dict[str, Dict[str, Tuple[str, float, str]]]
         ] = {}
 
-        # Lazily-populated cache for the head node's geographic location.
-        # See get_geo_location() — fetched once on first call, then reused
-        # across worker reconnects (the actor is detached and survives them).
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
         logger.info(f"ClusterState initialized with GCS address: {self.gcs_address}")
 
     def get_geo_location(self) -> Dict[str, Optional[Union[str, float]]]:
-        """Return the head node's geographic location (cached after first call).
+        """Return the head node's geographic location, fetched from the actor's egress IP.
 
-        Runs from within the head-node actor, so the result reflects the
-        head's egress IP — not the BioEngine worker's. In external-cluster
-        mode the two can be on different continents (e.g. a worker in
-        Stockholm orchestrating a Ray cluster in Ankara), and surfacing
-        both lets dashboards show where compute actually runs.
-
-        Returns:
-            Same shape as ``bioengine.utils.fetch_geolocation``:
-            ``{region, country_name, country_code, latitude, longitude, timezone}``.
-            Values may be None if every provider failed; **failures are not
-            cached** — every call retries the providers until at least one
-            returns a country, then the result is cached for the lifetime
-            of the actor.
+        The first successful result is cached for the lifetime of the actor;
+        results where every provider returned all-None are not cached, so the
+        next call retries.
         """
         if self._cached_geo_location is not None:
             return self._cached_geo_location
@@ -132,8 +119,6 @@ class BioEngineProxyActor:
 
         async def _fetch() -> Dict[str, Optional[Union[str, float]]]:
             geo = await fetch_geolocation(logger=logger)
-            # Same Nominatim fallback the worker does when a provider
-            # returns a country but no lat/lon.
             if (
                 geo.get("country_name")
                 and geo.get("latitude") is None
@@ -153,10 +138,6 @@ class BioEngineProxyActor:
             return geo
 
         geo = asyncio.run(_fetch())
-        # Only cache on success. fetch_geolocation returns an all-None dict
-        # when every provider fails; caching that would lock the actor into
-        # reporting "unknown location" forever even after the providers
-        # come back. Leaving the cache as None lets the next call retry.
         if geo.get("country_name"):
             self._cached_geo_location = geo
         return geo
