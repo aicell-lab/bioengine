@@ -1156,6 +1156,32 @@ class BioEngineWorker:
             "is_ready": self.is_ready.is_set(),
         }
 
+        # Apps summary — dashboards need to know which apps are deployed.
+        # Mirrors AppsManager.get_app_status with no logs/replicas to keep
+        # the payload light on poll loops.
+        try:
+            apps_status = await self.apps_manager.get_app_status(
+                application_ids=None,
+                logs_tail=0,
+                n_previous_replica=0,
+                context=context,
+            )
+            status["apps"] = apps_status if isinstance(apps_status, dict) else {}
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch apps status for get_status: {e}")
+            status["apps"] = {}
+
+        # SLURM jobs — refresh from squeue at read time so the dashboard
+        # never observes a stale snapshot from the monitor tick (jobs that
+        # die quickly otherwise fall entirely between two ticks).
+        if self.ray_cluster.slurm_workers is not None:
+            try:
+                status["ray_cluster"]["slurm_jobs"] = (
+                    await self.ray_cluster.slurm_workers.get_job_status()
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to refresh slurm_jobs for get_status: {e}")
+
         return status
 
     @schema_method
