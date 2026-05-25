@@ -1156,6 +1156,17 @@ class BioEngineWorker:
             "is_ready": self.is_ready.is_set(),
         }
 
+        # SLURM jobs — refresh from squeue at read time so the dashboard
+        # never observes a stale snapshot from the monitor tick (jobs that
+        # die quickly otherwise fall entirely between two ticks).
+        if self.ray_cluster.slurm_workers is not None:
+            try:
+                status["ray_cluster"]["slurm_jobs"] = (
+                    await self.ray_cluster.slurm_workers.get_job_status()
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to refresh slurm_jobs for get_status: {e}")
+
         return status
 
     @schema_method

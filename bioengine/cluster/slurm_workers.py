@@ -114,11 +114,19 @@ class SlurmWorkers:
         self.ray_cluster = ray_cluster
 
         # SLURM job configuration parameters
-        self.image = (
-            f"docker://{image}"
-            if not image.startswith("docker://") and not image.endswith(".sif")
-            else image
-        )
+        # Apptainer accepts three image-reference styles: docker:// URI,
+        # local *.sif file, or local sandbox directory. Only prepend
+        # docker:// for bare docker references — without the isdir guard
+        # a sandbox-dir path was getting docker:// pasted in front, which
+        # apptainer rejects with "invalid reference format".
+        if (
+            image.startswith("docker://")
+            or image.endswith(".sif")
+            or os.path.isdir(image)
+        ):
+            self.image = image
+        else:
+            self.image = f"docker://{image}"
         self.job_name = "ray_worker"
         self.worker_workspace_dir = str(worker_workspace_dir)
         self.default_num_gpus = default_num_gpus
@@ -1025,7 +1033,12 @@ class SlurmWorkers:
                     "elapsed_seconds": elapsed,
                     "remaining_seconds": remaining,
                 })
-            else:  # PENDING, CONFIGURING, COMPLETING, etc — treat as queued
+            elif state in ("PENDING", "CONFIGURING"):
+                # Only states that have not yet started the user payload.
+                # Terminal states (COMPLETING, COMPLETED, CANCELLED, FAILED,
+                # TIMEOUT, NODE_FAIL, ...) are intentionally dropped: the
+                # job's resources are being released and the dashboard
+                # shouldn't render it as "waiting" any more.
                 pending_secs: Optional[int]
                 if submit_t is not None:
                     pending_secs = max(0, int(now - submit_t))
@@ -1038,6 +1051,7 @@ class SlurmWorkers:
                     "pending_seconds": pending_secs,
                     "reason": reason,
                 })
+            # else: terminal state — skip
         return {"queued": queued, "running": running}
 
     async def check_scaling(self) -> None:
