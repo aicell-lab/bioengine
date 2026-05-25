@@ -183,6 +183,8 @@ class RayCluster:
         self.cluster_status_history = OrderedDict()
         self.max_status_history_length = 100
         self.is_ready = asyncio.Event()
+        # Distinct from the worker process's own geo in external-cluster mode.
+        self.head_geo_location: Optional[Dict] = None
 
         self.start_time = None
         self.lock_file = None
@@ -317,6 +319,7 @@ class RayCluster:
             "head_address": self.address,
             "start_time": self.start_time if self.mode != "external-cluster" else "N/A",
             "mode": self.mode,
+            "geo_location": self.head_geo_location,
         }
 
         last_status = (
@@ -788,6 +791,16 @@ class RayCluster:
                 f"Connected to Ray cluster at '{self.address}' with Serve HTTP URL {self.serve_http_url}"
             )
 
+            try:
+                self.head_geo_location = await asyncio.wait_for(
+                    self.proxy_actor_handle.get_geo_location.remote(),
+                    timeout=15.0,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to fetch Ray head-node geo location: {e}"
+                )
+
             return context
         except Exception as e:
             self.logger.error(f"Failed to connect to existing Ray cluster: {e}")
@@ -932,6 +945,21 @@ class RayCluster:
             # Limit the history size
             if len(self.cluster_status_history) > self.max_status_history_length:
                 self.cluster_status_history.popitem(last=False)
+
+            # Retry until the lookup returns a real country; the actor caches success.
+            if (
+                self.head_geo_location is None
+                or not self.head_geo_location.get("country_name")
+            ):
+                try:
+                    self.head_geo_location = await asyncio.wait_for(
+                        self.proxy_actor_handle.get_geo_location.remote(),
+                        timeout=15.0,
+                    )
+                except Exception as e:
+                    self.logger.debug(
+                        f"Head-node geo location retry failed: {e}"
+                    )
 
             # Check if SLURM workers need to scale
             if self.slurm_workers:

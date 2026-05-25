@@ -100,7 +100,47 @@ class BioEngineProxyActor:
             str, Dict[str, Dict[str, Tuple[str, float, str]]]
         ] = {}
 
+        self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
+
         logger.info(f"ClusterState initialized with GCS address: {self.gcs_address}")
+
+    def get_geo_location(self) -> Dict[str, Optional[Union[str, float]]]:
+        """Return the head node's geographic location, fetched from the actor's egress IP.
+
+        The first successful result is cached for the lifetime of the actor;
+        results where every provider returned all-None are not cached, so the
+        next call retries.
+        """
+        if self._cached_geo_location is not None:
+            return self._cached_geo_location
+
+        import asyncio
+        from bioengine.utils import fetch_centroid_coordinates, fetch_geolocation
+
+        async def _fetch() -> Dict[str, Optional[Union[str, float]]]:
+            geo = await fetch_geolocation(logger=logger)
+            if (
+                geo.get("country_name")
+                and geo.get("latitude") is None
+                and geo.get("longitude") is None
+            ):
+                try:
+                    coords = await fetch_centroid_coordinates(
+                        country=geo["country_name"],
+                        region=geo.get("region"),
+                        logger=logger,
+                    )
+                    geo.update(coords)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to fetch head-node centroid coordinates: {e}"
+                    )
+            return geo
+
+        geo = asyncio.run(_fetch())
+        if geo.get("country_name"):
+            self._cached_geo_location = geo
+        return geo
 
     def _get_pending_jobs(self) -> List[Dict[str, Any]]:
         """Get list of jobs waiting to start in the cluster.
