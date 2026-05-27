@@ -834,7 +834,6 @@ class AppsManager:
             server=self.server,
             artifact_manager=self.artifact_manager,
             worker_service_id=worker_service_id,
-            serve_http_url=self.ray_cluster.serve_http_url,
         )
 
         # Ensure applications collection exists

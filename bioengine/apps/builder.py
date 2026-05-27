@@ -95,7 +95,6 @@ class AppBuilder:
         apps_workdir: Where to store downloaded artifacts and working directories
         server: Hypha RPC server connection for authentication and artifact access
         artifact_manager: Service for downloading deployment code and manifests
-        serve_http_url: Base URL where Ray Serve exposes HTTP endpoints
 
     Parameter Conventions (API):
         - application_kwargs: Dictionary of keyword arguments for each deployment class
@@ -151,7 +150,6 @@ class AppBuilder:
         self.server: Optional[RemoteService] = None
         self.artifact_manager: Optional[ObjectProxy] = None
         self.worker_service_id: Optional[str] = None
-        self.serve_http_url: Optional[str] = None
         self.proxy_actor_name: Optional[str] = proxy_actor_name
         self.data_server_url: Optional[str] = None
 
@@ -160,7 +158,6 @@ class AppBuilder:
         server: RemoteService,
         artifact_manager: ObjectProxy,
         worker_service_id: str,
-        serve_http_url: str,
     ) -> None:
         """
         Connect the AppBuilder to external services required for operation.
@@ -172,13 +169,11 @@ class AppBuilder:
         Service Connections:
         • server: Your authenticated connection to the Hypha workspace
         • artifact_manager: Service that stores and retrieves deployment code
-        • serve_http_url: Where Ray Serve will expose your deployed applications
 
         Args:
             server: Live connection to Hypha server (from connect_to_server())
             artifact_manager: Proxy to artifact management service (from server.get_service())
             worker_service_id: BioEngine worker service ID
-            serve_http_url: Base URL where applications will be accessible via HTTP
 
         Example:
             ```python
@@ -189,14 +184,12 @@ class AppBuilder:
                 server=server,
                 artifact_manager=artifact_manager,
                 worker_service_id="my-workspace/bioengine-worker",
-                serve_http_url="http://localhost:8000"
             )
             ```
         """
         self.server = server
         self.artifact_manager = artifact_manager
         self.worker_service_id = worker_service_id
-        self.serve_http_url = serve_http_url
 
     def update_data_server_url(self, data_server_url: str) -> None:
         """
@@ -1610,7 +1603,6 @@ class AppBuilder:
                 worker_client_id=self.server.config.client_id,
                 proxy_service_token=proxy_service_token,
                 authorized_users=effective_authorized_users,
-                serve_http_url=self.serve_http_url,
                 proxy_actor_name=self.proxy_actor_name,
                 debug=debug,
                 ice_servers=ice_servers,
@@ -1665,7 +1657,7 @@ if __name__ == "__main__":
             proxy_actor_name="TEST_PROXY_ACTOR",
         )
         app_builder.complete_initialization(
-            server, artifact_manager, worker_service_id="test-worker", serve_http_url="https://test-url"
+            server, artifact_manager, worker_service_id="test-worker"
         )
 
         app = await app_builder.build(

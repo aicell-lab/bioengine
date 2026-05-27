@@ -5,7 +5,6 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
-import httpx
 import ray
 from httpx import AsyncClient, HTTPStatusError, RequestError
 from hypha_rpc import connect_to_server, register_rtc_service
@@ -15,7 +14,6 @@ from pydantic import Field
 from ray.exceptions import RayTaskError
 from ray.serve import deployment, get_replica_context
 from ray.serve.handle import DeploymentHandle
-from starlette.requests import Request
 
 from bioengine.utils import get_pip_requirements
 
@@ -32,18 +30,14 @@ logger = logging.getLogger("ray.serve")
             ),
         },
     },
-    max_ongoing_requests=10,  # Default limit concurrent requests to avoid overload
-    autoscaling_config={
-        "min_replicas": 1,  # Always keep at least 1 replica running
-        "max_replicas": 10,  # Scale up to 10 replicas maximum
-        "target_ongoing_requests": 5,  # Target 5 ongoing requests per replica
-        "upscale_delay_s": 30.0,  # Wait 30s before scaling up
-        "downscale_delay_s": 300.0,  # Wait 5 minutes before scaling down
-        "upscale_smoothing_factor": 1.0,  # Aggressive upscaling
-        "downscale_smoothing_factor": 0.5,  # Conservative downscaling
-    },
-    health_check_period_s=10,  # Check health every 10 seconds
-    health_check_timeout_s=5,  # Timeout after 5 seconds
+    # Fixed at one replica. ProxyDeployment is a 0-CPU Hypha bridge — actual
+    # compute scaling lives in the inner deployments. Concurrency is bounded
+    # by the in-actor semaphore sized by the per-app max_ongoing_requests
+    # parameter; WebSocket and WebRTC calls both go through it.
+    num_replicas=1,
+    max_ongoing_requests=10,
+    health_check_period_s=10,
+    health_check_timeout_s=5,
 )
 class ProxyDeployment:
     """
@@ -95,7 +89,6 @@ class ProxyDeployment:
         proxy_service_token: str,
         worker_client_id: str,
         authorized_users: Dict[str, List[str]],
-        serve_http_url: str,
         proxy_actor_name: str,
         debug: bool,
         ice_servers: Optional[List[Dict[str, Any]]] = None,
@@ -140,7 +133,6 @@ class ProxyDeployment:
                             access. Method-specific entries take precedence over "*".
                             Example: {"*": ["admin@lab.edu"], "run": ["*"]}
 
-            serve_http_url: URL for Ray Serve HTTP endpoint used for autoscaling coordination.
             proxy_actor_name: Actor name of the BioEngineProxyActor for replica registration.
             debug: Set to true to enable debug logging.
             ice_servers: Optional list of ICE server configurations to use for WebRTC
@@ -251,15 +243,8 @@ class ProxyDeployment:
         # WebRTC peer connection tracking
         self._active_peer_connections: Dict[str, Dict[str, Any]] = {}
 
-        # Store request events
-        self.serve_http_url = serve_http_url
-        self._request_events: Dict[str, Dict[str, Any]] = {}
-
         # Lock for service registration
         self._registration_lock = asyncio.Lock()
-
-        # Start background cleanup task
-        self._cleanup_task = None
 
     async def get_app_data(self) -> Dict[str, Any]:
         """Return non-secret application metadata used for worker recovery."""
@@ -278,66 +263,6 @@ class ProxyDeployment:
         logger.info(
             f"✅ Updated authorized_users for '{self.application_id}': {authorized_users}"
         )
-
-    async def __call__(self, request: Request) -> Dict[str, Any]:
-        """
-        Handle HTTP requests for Ray Serve autoscaling coordination.
-
-        This endpoint receives HTTP requests from Ray Serve's HTTP proxy and waits for
-        corresponding WebRTC requests to complete. This ensures Ray Serve can properly
-        track request load for autoscaling decisions.
-
-        Only accepts POST requests with an X-Request-ID header that matches requests
-        initiated by the _mimic_request() method.
-
-        Args:
-            request: HTTP request object from Ray Serve's HTTP proxy
-
-        Returns:
-            Dictionary with completion status and request ID
-        """
-        logger.debug(
-            f"🌐 Received '{request.method}' request to ProxyDeployment"
-        )
-
-        # Only accept POST requests for mimic coordination
-        if request.method != "POST":
-            logger.error(
-                f"❌ Method '{request.method}' not supported - only POST allowed"
-            )
-            return {
-                "status": "error",
-                "message": f"Method '{request.method}' not supported - only POST allowed",
-            }
-
-        request_id = request.headers.get("X-Request-ID")
-        if not request_id:
-            logger.error(f"❌ Missing X-Request-ID header in request")
-            return {
-                "status": "error",
-                "message": "Missing X-Request-ID header",
-            }
-
-        logger.debug(f"⏳ Waiting for request: {request_id}")
-        # Wait for the corresponding request event
-        event_data = self._request_events.get(request_id)
-        if event_data:
-            try:
-                await asyncio.wait_for(
-                    event_data["event"].wait(), timeout=3600
-                )  # free after 1 hour
-                logger.debug(f"✅ Request completed: {request_id}")
-                return {"status": "completed", "request_id": request_id}
-            except asyncio.TimeoutError:
-                logger.error(f"⏱️ Request timed out after 1 hour: {request_id}")
-                return {"status": "timeout", "request_id": request_id}
-            finally:
-                # Always remove the event to prevent memory leaks
-                self._request_events.pop(request_id, None)
-        else:
-            logger.error(f"❌ Request not found: {request_id}")
-            # Request may have already completed
-            return {"status": "not_found", "request_id": request_id}
 
     # ===== Hypha Service Registration =====
     # Handles registration of WebSocket and WebRTC services with Hypha.
@@ -402,78 +327,6 @@ class ProxyDeployment:
             f"'{method_name}' on application '{self.application_id}'"
         )
 
-    async def _mimic_request(self, request_id: str) -> None:
-        """
-        Send HTTP request to Ray Serve to trigger autoscaling.
-
-        When users access the application through WebRTC connections, Ray Serve
-        doesn't automatically detect the load for autoscaling. This method sends
-        an HTTP request to the Ray Serve endpoint to mimic the load, ensuring
-        proper autoscaling behavior.
-
-        The request uses the same ID as the actual RPC call for coordination
-        with the __call__ method.
-
-        Args:
-            request_id: Unique identifier for correlating with the RPC call
-        """
-        logger.debug(f"📡 Sending autoscaling trigger for request: {request_id}")
-
-        try:
-            timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
-
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                await client.post(
-                    f"{self.serve_http_url}/{self.application_id}/",
-                    headers={"X-Request-ID": request_id},
-                    json={"mimic_request": True},
-                )
-
-            logger.debug(
-                f"✅ Autoscaling trigger sent successfully for request: {request_id}"
-            )
-
-        except Exception as e:
-            # Log but don't fail the user request
-            logger.error(
-                f"❌ Failed to send autoscaling trigger for '{self.application_id}' request {request_id}: {e}"
-            )
-            # Clean up orphaned event since HTTP request failed
-            self._request_events.pop(request_id, None)
-
-    async def _cleanup_orphaned_events(self) -> None:
-        """
-        Periodically clean up orphaned events that were never completed.
-
-        This background task runs every 5 minutes and removes events older than 2 hours
-        to prevent unbounded memory growth from failed or abandoned requests.
-        """
-        while True:
-            try:
-                await asyncio.sleep(300)  # Run every 5 minutes
-
-                current_time = time.time()
-                max_age = 7200  # 2 hours
-
-                orphaned_ids = []
-                for request_id, event_data in self._request_events.items():
-                    age = current_time - event_data["created_at"]
-                    if age > max_age:
-                        orphaned_ids.append(request_id)
-
-                if orphaned_ids:
-                    logger.info(
-                        f"🧹 Cleaning up {len(orphaned_ids)} orphaned events older than 2 hours"
-                    )
-                    for request_id in orphaned_ids:
-                        self._request_events.pop(request_id, None)
-
-            except asyncio.CancelledError:
-                logger.info(f"🛑 Cleanup task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"❌ Error in cleanup task: {e}")
-
     def _create_deployment_function(
         self, method_schema: Dict[str, Any]
     ) -> Callable[..., Any]:
@@ -504,21 +357,19 @@ class ProxyDeployment:
         method_name = method_schema["name"]
 
         async def deployment_function(*args, context: Dict[str, Any], **kwargs) -> Any:
+            # Semaphore bounds concurrency for both WebSocket and WebRTC entry paths —
+            # they share this single wrapper, so a long-running call from either
+            # transport consumes one slot until it returns.
             async with self.service_semaphore:
-                request_id = str(uuid.uuid4())
-                event_created = False
                 try:
-                    # Check user permissions
                     await self._check_permissions(context, method_name=method_name)
 
-                    # Log the method call
                     user_info = context.get("user", {}) if context else {}
                     user_id = user_info.get("id", "unknown")
                     logger.info(
                         f"🎯 User '{user_id}' calling method '{method_name}' on app '{self.application_id}'"
                     )
 
-                    # Get the method from the entry deployment handle
                     method = getattr(self.entry_deployment_handle, method_name, None)
                     if method is None:
                         logger.error(
@@ -528,28 +379,6 @@ class ProxyDeployment:
                             f"Method '{method_name}' not found on entry deployment"
                         )
 
-                    # Create event with timestamp for tracking BEFORE starting mimic request
-                    self._request_events[request_id] = {
-                        "event": asyncio.Event(),
-                        "created_at": time.time(),
-                    }
-                    event_created = True
-
-                    # Create the mimic request task but don't await it to avoid blocking
-                    mimic_task = asyncio.create_task(self._mimic_request(request_id))
-
-                    # Add error handling for the mimic task (optional - runs in background)
-                    def handle_mimic_error(task):
-                        if task.exception():
-                            logger.error(
-                                f"❌ Mimic request task failed for '{self.application_id}' request ID {request_id}: {task.exception()}"
-                            )
-                            # Clean up orphaned event if mimic request failed
-                            self._request_events.pop(request_id, None)
-
-                    mimic_task.add_done_callback(handle_mimic_error)
-
-                    # Forward the request to the actual deployment
                     try:
                         result = await method.remote(*args, **kwargs)
                         logger.info(
@@ -561,32 +390,15 @@ class ProxyDeployment:
                             f"❌ Ray task error in method '{method_name}': {e}"
                         )
                         raise
-                    except Exception as e:
-                        logger.error(
-                            f"❌ Unexpected error in method '{method_name}': {e}"
-                        )
-                        raise
 
                 except PermissionError as e:
                     logger.warning(
                         f"⚠️ Permission denied for method '{method_name}': {e}"
                     )
-                    # Clean up event if created before permission error
-                    if event_created:
-                        self._request_events.pop(request_id, None)
                     raise
                 except Exception as e:
                     logger.error(f"❌ Error in proxy function '{method_name}': {e}")
-                    # Clean up event if created before error
-                    if event_created:
-                        self._request_events.pop(request_id, None)
                     raise
-                finally:
-                    # Signal that the request is complete, but don't remove the event yet
-                    # The event will be removed when the HTTP request completes in __call__
-                    event_data = self._request_events.get(request_id)
-                    if event_data:
-                        event_data["event"].set()
 
         return schema_function(
             func=deployment_function,
@@ -1045,12 +857,6 @@ class ProxyDeployment:
                 if not self.server or not self.websocket_service_id:
                     await self._register_services()
 
-                    # Start cleanup task on first successful registration
-                    if self._cleanup_task is None or self._cleanup_task.done():
-                        self._cleanup_task = asyncio.create_task(
-                            self._cleanup_orphaned_events()
-                        )
-
         # Check if Hypha server can be reached
         try:
             logger.debug("Pinging Hypha server to check connection...")
@@ -1062,8 +868,6 @@ class ProxyDeployment:
             )
             # Reset server connection to trigger re-connection on next call
             self.server = None
-            # Clear orphaned events since the connection is lost
-            self._request_events.clear()
             raise RuntimeError("Hypha server connection failed")
 
         # Check if the WebSocket service can be reached
@@ -1080,8 +884,6 @@ class ProxyDeployment:
             )
             # Reset service ID to trigger re-registration on next call
             self.websocket_service_id = None
-            # Clear orphaned events since the service is lost
-            self._request_events.clear()
             raise RuntimeError("WebSocket service connection failed")
 
         # All checks passed - deployment is healthy
@@ -1136,12 +938,12 @@ if __name__ == "__main__":
             app_data={},
             entry_deployment_handle=entry_deployment_handle,
             method_schemas=[method_schema],
+            max_ongoing_requests=10,
             server_url=server_url,
             workspace=workspace,
             proxy_service_token=token,
             worker_client_id=worker_client_id,
             authorized_users=["*"],
-            serve_http_url="not_used_in_mock",
             proxy_actor_name="mock_actor",
             debug=True,
         )
