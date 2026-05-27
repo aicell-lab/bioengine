@@ -447,15 +447,16 @@ async def test_startup_application(
             assert isinstance(
                 service_ids, dict
             ), f"service_ids should be a dictionary for '{application_id}'"
-            assert (
-                "websocket_service_id" in service_ids
-            ), f"service_ids should contain websocket_service_id for '{application_id}'"
-            assert (
-                "webrtc_service_ids" in service_ids
-            ), f"service_ids should contain webrtc_service_ids for '{application_id}'"
+            for key in ("websocket_service_id", "websocket_service_ids", "webrtc_service_ids"):
+                assert (
+                    key in service_ids
+                ), f"service_ids should contain {key} for '{application_id}'"
             assert (
                 service_ids["websocket_service_id"]
             ), f"Running application '{application_id}' should have a websocket_service_id"
+            assert (
+                len(service_ids["websocket_service_ids"]) > 0
+            ), f"Running application '{application_id}' should have at least one per-replica websocket_service_id"
             assert (
                 len(service_ids["webrtc_service_ids"]) > 0
             ), f"Running application '{application_id}' should have at least one webrtc_service_id"

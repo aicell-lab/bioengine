@@ -663,12 +663,20 @@ class AppsManager:
             )
         )
         if not replica_ids:
-            return {"websocket_service_id": None, "webrtc_service_ids": []}
+            return {
+                "websocket_service_id": None,
+                "websocket_service_ids": [],
+                "webrtc_service_ids": [],
+            }
 
         workspace = self.server.config.workspace
         worker_client_id = self.server.config.client_id
         return {
             "websocket_service_id": f"{workspace}/{worker_client_id}-*:{application_id}",
+            "websocket_service_ids": [
+                f"{workspace}/{worker_client_id}-{replica_id}:{application_id}"
+                for replica_id in replica_ids
+            ],
             "webrtc_service_ids": [
                 f"{workspace}/{worker_client_id}-{replica_id}:{application_id}-rtc"
                 for replica_id in replica_ids
