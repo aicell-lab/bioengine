@@ -664,7 +664,8 @@ class AppsManager:
         if not replica_ids:
             return {"websocket_service_id": None, "webrtc_service_id": None}
 
-        replica_id = replica_ids[0]
+        # get_deployment_replicas returns Dict[replica_id -> actor_id], not a list.
+        replica_id = next(iter(replica_ids))
         workspace = self.server.config.workspace
         worker_client_id = self.server.config.client_id
         return {
