@@ -9,12 +9,11 @@ authors:
 - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
 maintainers: [nilsmechtel]
 license: MIT
-format_version: 0.5.0
+format_version: 0.6.0
 git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [test, bioengine]
 type: ray-serve
 version: 1.0.0
-deployments:
-  - demo_deployment:DemoDeployment
+entry: demo_app.deployment:DemoApp
 frontend_entry: "frontend/index.html"

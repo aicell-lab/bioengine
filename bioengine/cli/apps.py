@@ -86,6 +86,29 @@ def require_worker(worker_service_id, token, server_url):
     return server_url, worker_service_id, token
 
 
+# ── Local manifest validation ─────────────────────────────────────────────────
+
+
+def _validate_manifest_or_exit(manifest_path: Path) -> None:
+    """Read ``manifest_path`` and run ``validate_manifest``, exit on failure."""
+    import yaml
+
+    from bioengine.utils.artifact_utils import validate_manifest
+
+    try:
+        manifest = yaml.safe_load(manifest_path.read_text())
+    except Exception as exc:
+        error_exit(f"Failed to parse {manifest_path}: {exc}")
+
+    if not isinstance(manifest, dict):
+        error_exit(f"{manifest_path} did not parse to a mapping.")
+
+    try:
+        validate_manifest(manifest)
+    except ValueError as exc:
+        error_exit(f"Invalid manifest at {manifest_path}:\n\n{exc}")
+
+
 # ── Group ─────────────────────────────────────────────────────────────────────
 
 @click.group("apps")
@@ -112,6 +135,35 @@ def apps_group():
     """
 
 
+# ── validate ──────────────────────────────────────────────────────────────────
+
+
+@apps_group.command("validate")
+@click.argument("app_dir", metavar="APP_DIR")
+def validate(app_dir):
+    """
+    Validate a local BioEngine app directory's manifest.yaml.
+
+    Runs the v0.6.0 manifest validator locally — checks for required fields,
+    rejects legacy ``deployments:`` lists with a migration hint, and verifies
+    that ``entry:`` matches ``package.module:ClassName``.
+
+    \b
+    Examples:
+      bioengine apps validate ./my-app/
+    """
+    app_path = Path(app_dir).resolve()
+    if not app_path.is_dir():
+        error_exit(f"'{app_dir}' is not a directory.")
+
+    manifest_path = app_path / "manifest.yaml"
+    if not manifest_path.exists():
+        error_exit(f"No manifest.yaml found in '{app_dir}'.")
+
+    _validate_manifest_or_exit(manifest_path)
+    click.echo(f"OK: {manifest_path} is a valid v0.6.0 BioEngine app manifest.")
+
+
 # ── upload ─────────────────────────────────────────────────────────────────────
 
 @apps_group.command("upload")
@@ -132,10 +184,13 @@ def upload(app_dir, public, worker_service_id, token, server_url):
     is printed on success — use it with `bioengine apps run`.
 
     \b
-    Expected directory structure:
+    Expected directory structure (v0.6.0 manifest format):
       my-app/
-        manifest.yaml       (required: id, name, type: ray-serve, deployments)
-        my_deployment.py    (required: Ray Serve class)
+        manifest.yaml       (required: id, name, type: ray-serve,
+                                       format_version: 0.6.0, entry)
+        my_app/             (Python package — the only thing shipped to replicas)
+          __init__.py
+          deployment.py     (@bioengine.app class)
         README.md           (optional)
 
     \b
@@ -156,6 +211,8 @@ def upload(app_dir, public, worker_service_id, token, server_url):
             "Every BioEngine app must have a manifest.yaml. "
             "See `bioengine apps --help` for the required structure.",
         )
+
+    _validate_manifest_or_exit(manifest_path)
 
     async def _run():
         # Build file list (name, content, type)
@@ -616,6 +673,8 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
             f"No manifest.yaml found in '{app_dir}'.",
             "Every BioEngine app must have a manifest.yaml.",
         )
+
+    _validate_manifest_or_exit(manifest_path)
 
     # Default hypha_token to the auth token unless explicitly set to empty string
     if hypha_token is None:

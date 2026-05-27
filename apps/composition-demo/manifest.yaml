@@ -1,17 +1,13 @@
 name: BioEngine Composition Demo
 id: bioengine-composition-demo
 id_emoji: "🔬"
-description: "Multi-deployment composition demo with entry + 3 runtime deployments"
+description: "Multi-deployment composition demo (entry + 3 runtimes, type-hint composition, shared utils)"
 type: ray-serve
-format_version: 0.5.0
+format_version: 0.6.0
 version: 1.0.0
 authors:
   - {name: "Test User", affiliation: "BioEngine Test"}
 license: MIT
 tags: [bioengine, test, composition]
-deployments:
-  - entry_deployment:EntryDeployment
-  - runtime_a:RuntimeA
-  - runtime_b:RuntimeB
-  - runtime_c:RuntimeC
-frontend_entry: "frontend/index.html"
+entry: composition_demo.entry:EntryApp
+frontend_entry: frontend/index.html

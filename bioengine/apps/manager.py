@@ -851,6 +851,20 @@ class AppsManager:
                 if not isinstance(app_data, dict):
                     raise ValueError("get_app_data() did not return a dictionary")
 
+                # v0.6.0 hard break: refuse to recover apps deployed under
+                # the legacy v0.5 builder. Missing `format_version` is the
+                # most reliable marker (the new builder always sets it).
+                recovered_format = app_data.get("format_version")
+                if recovered_format != "0.6.0":
+                    self.logger.warning(
+                        f"Refusing to recover application '{application_id}': "
+                        f"app_data carries format_version={recovered_format!r}, "
+                        f"expected '0.6.0'. The worker was restarted across a "
+                        f"BioEngine major version break — redeploy this app "
+                        f"explicitly to bring it under the new builder."
+                    )
+                    continue
+
                 required_keys = {
                     "display_name",
                     "description",

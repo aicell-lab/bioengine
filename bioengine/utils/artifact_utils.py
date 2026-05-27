@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -217,49 +218,92 @@ async def load_manifest_from_files(
     return manifest
 
 
-def validate_manifest(manifest: Dict[str, Any]) -> None:
-    """
-    Validate that a manifest contains all required fields and has correct format.
+#: Manifest schema version this code supports. Bumped together with the
+#: bootstrap spec format in :mod:`bioengine._app.bootstrap`.
+SUPPORTED_FORMAT_VERSION = "0.6.0"
 
-    Validates manifest structure for Ray Serve application deployments.
-    This function can be called from both artifact creation (via load_manifest_from_files)
-    and deployment time (via AppBuilder._load_manifest).
+
+_MIGRATION_MSG = (
+    "BioEngine v0.11 made a hard break in the app format. Your manifest "
+    "uses the legacy v0.5 layout ({reason}).\n\n"
+    "Migration guide: docs/migration/v0.11.md\n\n"
+    "Briefly:\n"
+    "  1. Move the .py files into a Python package directory (with __init__.py).\n"
+    "  2. Replace @serve.deployment(...) with @bioengine.app(num_cpus=..., pip=[...]).\n"
+    "  3. In manifest.yaml: remove `deployments:`, add `format_version: 0.6.0` "
+    "and `entry: my_package.module:MyClass`."
+)
+
+
+_ENTRY_RE = re.compile(r"^[a-z_][\w]*(\.[a-z_][\w]*)*:[A-Z]\w*$")
+
+
+def validate_manifest(manifest: Dict[str, Any]) -> None:
+    """Validate a v0.6.0 BioEngine app manifest.
+
+    The new format:
+
+    .. code-block:: yaml
+
+        name: My App
+        id: my-app
+        id_emoji: '🔬'
+        description: ...
+        type: ray-serve
+        format_version: 0.6.0
+        version: 1.0.0
+        entry: my_app.deployment:MyApp
 
     Args:
-        manifest: The manifest dictionary to validate
+        manifest: The parsed manifest dict.
 
     Raises:
-        ValueError: If manifest is missing required fields or has invalid format
-
-    Example:
-        manifest = yaml.safe_load(manifest_content)
-        validate_manifest(manifest)  # Raises ValueError if invalid
+        ValueError: Missing required fields, wrong format_version, the
+            legacy ``deployments:`` field is present, or ``entry:`` does
+            not match ``package.module:ClassName``.
     """
-    # Validate required fields
+    fmt = manifest.get("format_version")
+    if fmt is None:
+        raise ValueError(_MIGRATION_MSG.format(reason="missing `format_version`"))
+    if str(fmt) != SUPPORTED_FORMAT_VERSION:
+        if str(fmt).startswith(("0.4.", "0.5.")):
+            raise ValueError(
+                _MIGRATION_MSG.format(
+                    reason=f"format_version {fmt!r} is no longer supported"
+                )
+            )
+        raise ValueError(
+            f"Unsupported format_version: {fmt!r}. "
+            f"Expected {SUPPORTED_FORMAT_VERSION!r}."
+        )
+
+    if "deployments" in manifest:
+        raise ValueError(
+            _MIGRATION_MSG.format(reason="found legacy `deployments` field")
+        )
+
     required_fields = [
         "name",
         "id",
         "id_emoji",
         "description",
         "type",
-        "deployments",
+        "entry",
     ]
     for field in required_fields:
         if field not in manifest:
             raise ValueError(f"Manifest is missing required field: '{field}'")
 
-    # Validate type
     if manifest["type"] != "ray-serve":
         raise ValueError(
             f"Invalid manifest type: '{manifest['type']}'. Expected 'ray-serve'."
         )
 
-    # Validate deployments format
-    deployments = manifest["deployments"]
-    if not isinstance(deployments, list) or len(deployments) == 0:
+    entry = manifest["entry"]
+    if not isinstance(entry, str) or not _ENTRY_RE.match(entry):
         raise ValueError(
-            "Invalid deployments format in manifest. "
-            "Expected a non-empty list of deployment descriptions in the format 'python_file:class_name'."
+            f"Invalid 'entry' value: {entry!r}. "
+            f"Expected 'package.module:ClassName' (e.g. 'demo_app.deployment:DemoApp')."
         )
 
 

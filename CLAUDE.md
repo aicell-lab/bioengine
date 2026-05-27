@@ -109,33 +109,38 @@ BioEngine is the **execution and adaptation layer between curated bioimage AI an
 
 ---
 
-## Application Manifest
+## Application Manifest (v0.11 / format_version 0.6.0)
 
-Every BioEngine application is described by a `manifest.yaml` file. This file is stored in the Hypha artifact manager alongside Python deployment code.
+Every BioEngine application is a folder containing a `manifest.yaml` and a Python *package* shipped via Ray's `runtime_env.py_modules`. The artifact root keeps a hyphen (matches the Hypha alias); the inner Python package uses underscores so Python can import it.
+
+```
+my-app/                       ← artifact root
+├── manifest.yaml
+├── README.md                 ← stays in artifact (not shipped to replicas)
+├── frontend/index.html       ← stays in artifact (Hypha hosts statically)
+└── my_app/                   ← Python package, the ONLY thing shipped to replicas
+    ├── __init__.py
+    └── deployment.py
+```
 
 ### Required Fields
 
 ```yaml
-name: My Application        # Human-readable name
-id: my-application          # Unique lowercase ID (hyphens only)
-id_emoji: "🔬"              # Visual emoji identifier
-description: "..."          # Short description
-type: ray-serve             # Must be "ray-serve"
-deployments:                # List of Python class entry points
-  - module_file:ClassName
-authorized_users:
-  - "*"                     # Or specific user IDs
+name: My Application
+id: my-application                       # Unique lowercase ID (hyphens only)
+id_emoji: "🔬"
+description: "..."
+type: ray-serve                          # Kept
+format_version: 0.6.0                    # v0.11 gate
+entry: my_app.deployment:MyApp           # Replaces `deployments:` — Python import path
 ```
 
 ### Optional Fields
 
 ```yaml
-# Static frontend hosting — set frontend_entry to enable automatically
-frontend_entry: "frontend/index.html"  # Entry HTML file (relative to artifact root)
-
-# Metadata
-format_version: "0.5.0"
-version: "1.0.0"
+frontend_entry: "frontend/index.html"    # Static frontend hosting
+version: 1.0.0
+authorized_users: ['*']                  # Or {method_name: [users], "*": [users]}
 authors:
   - {name: "...", affiliation: "...", github_user: "..."}
 license: MIT
@@ -148,6 +153,18 @@ When `frontend_entry` is set, BioEngine configures a `view_config` on the Hypha 
 ```
 https://hypha.aicell.io/{workspace}/view/{artifact-id}/
 ```
+
+### Authoring model
+
+User code uses the decorators in the `bioengine` package — `@bioengine.app`, `@bioengine.method`, `@bioengine.async_init`, `@bioengine.smoke_test`, `@bioengine.health_check`, `@bioengine.multiplexed` — and accesses datasets/logger via the module-level `bioengine.datasets` / `bioengine.logger` accessors. Multi-deployment composition is declared by `__init__` type hints; `.remote()` is hidden by `BioEngineRuntimeHandle`. See `docs/migration/v0.11.md` for the full mapping from the legacy decorators and an end-to-end migration walkthrough; see `apps/demo-app/` and `apps/composition-demo/` for reference apps.
+
+### Local validation
+
+```bash
+bioengine apps validate ./my-app
+```
+
+The CLI runs the same validator that the worker uses, so legacy manifests fail fast with a migration hint without a round-trip.
 
 ---
 
