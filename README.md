@@ -80,28 +80,16 @@ UID=$(id -u) GID=$(id -g) docker compose up
 
 #### Building against a specific Ray version
 
-The published `ghcr.io/aicell-lab/bioengine-worker:0.9.0` image ships **Ray 2.55.1**. When connecting to a managed Ray cluster (KubeRay, Anyscale, etc.) Ray Client enforces an **exact** version match between driver and cluster — so you may need an image built against the version your cluster runs. Two ways:
-
-**Overlay on the published image (fast — pulls the image, rebuilds only the Ray install + env layers, ~1-2 min):**
-
-```bash
-docker build \
-    --build-arg BIOENGINE_IMAGE=ghcr.io/aicell-lab/bioengine-worker:0.9.0 \
-    --build-arg RAY_VERSION=2.54.1 \
-    -f docker/worker-ray-overlay.Dockerfile \
-    -t bioengine-worker:0.9.0-ray2.54.1 .
-```
-
-**Full build from source (~5-10 min):**
+The published `ghcr.io/aicell-lab/bioengine-worker` image ships **Ray 2.55.1**. When connecting to a managed Ray cluster (KubeRay, Anyscale, etc.) Ray Client enforces an **exact** version match between driver and cluster — so you may need an image built against the version your cluster runs:
 
 ```bash
 docker build \
     --build-arg RAY_VERSION=2.54.1 \
     -f docker/worker.Dockerfile \
-    -t bioengine-worker:0.9.0-ray2.54.1 .
+    -t bioengine-worker:ray2.54.1 .
 ```
 
-Both paths produce equivalent images. The active Ray version is exposed inside the image as `$BIOENGINE_RAY_VERSION` for diagnostics. The supported Ray range is `>=2.33.0, <3.0.0` (set in `pyproject.toml`).
+The active Ray version is exposed inside the image as `$BIOENGINE_RAY_VERSION` for diagnostics. The supported Ray range is `>=2.33.0, <3.0.0` (set in `pyproject.toml`).
 
 See [Deployment Guide](docs/deployment-guide.md) for full instructions for all modes.
 
