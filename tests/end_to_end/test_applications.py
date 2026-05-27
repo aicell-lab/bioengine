@@ -443,21 +443,23 @@ async def test_startup_application(
                 ), f"replica_states should be a dictionary for deployment '{deployment_name}'"
 
             # Should have service IDs for running applications
+            service_ids = app_info["service_ids"]
+            assert isinstance(
+                service_ids, dict
+            ), f"service_ids should be a dictionary for '{application_id}'"
+            for key in ("websocket_service_id", "websocket_service_ids", "webrtc_service_ids"):
+                assert (
+                    key in service_ids
+                ), f"service_ids should contain {key} for '{application_id}'"
             assert (
-                len(app_info["service_ids"]) > 0
-            ), f"Running application '{application_id}' should have service IDs"
-
-            # Validate service ID structure
-            for service_info in app_info["service_ids"]:
-                assert isinstance(
-                    service_info, dict
-                ), f"Service info should be a dictionary for '{application_id}'"
-                assert (
-                    "websocket_service_id" in service_info
-                ), f"Service info should contain websocket_service_id for '{application_id}'"
-                assert (
-                    "webrtc_service_id" in service_info
-                ), f"Service info should contain webrtc_service_id for '{application_id}'"
+                service_ids["websocket_service_id"]
+            ), f"Running application '{application_id}' should have a websocket_service_id"
+            assert (
+                len(service_ids["websocket_service_ids"]) > 0
+            ), f"Running application '{application_id}' should have at least one per-replica websocket_service_id"
+            assert (
+                len(service_ids["webrtc_service_ids"]) > 0
+            ), f"Running application '{application_id}' should have at least one webrtc_service_id"
 
         # Validate resource allocation structure
         if app_info["application_resources"]:
@@ -567,16 +569,10 @@ async def test_startup_application(
                 ), f"Deployment '{deployment_name}' of startup application '{artifact_id}' is not healthy (status: {deployment_info['status']})"
 
             # Check that service IDs are properly configured
+            service_ids = app_info["service_ids"]
             assert (
-                len(app_info["service_ids"]) > 0
-            ), f"Startup application with artifact_id '{artifact_id}' has no service IDs configured"
-
-            for service_info in app_info["service_ids"]:
-                # WebSocket service must be present
-                has_valid_service = service_info.get("websocket_service_id") is not None
-                assert (
-                    has_valid_service
-                ), f"Startup application with artifact_id '{artifact_id}' has no valid service endpoints"
+                service_ids.get("websocket_service_id") is not None
+            ), f"Startup application with artifact_id '{artifact_id}' has no websocket_service_id configured"
 
             # Check that the application has available methods
             assert (
@@ -973,13 +969,15 @@ async def test_call_demo_app_functions(
             application_ids=[app_id]
         )
         app_status = app_status_result[app_id]
-        first_replica = app_status["service_ids"][0]
+        service_ids = app_status["service_ids"]
 
-        websocket_service_id = first_replica["websocket_service_id"]
-        webrtc_service_id = first_replica["webrtc_service_id"]
+        websocket_service_id = service_ids["websocket_service_id"]
+        webrtc_service_id = service_ids["webrtc_service_ids"][0]
 
-        # Get the websocket service using hypha_client
-        websocket_service = await hypha_client.get_service(websocket_service_id)
+        # Wildcard websocket ID needs a selection mode; least-busy replica per call
+        websocket_service = await hypha_client.get_service(
+            websocket_service_id, {"mode": "select:min:get_load"}
+        )
         assert (
             websocket_service
         ), f"Could not connect to WebSocket service {websocket_service_id}"
@@ -1120,13 +1118,15 @@ async def test_call_composition_app_functions(
             application_ids=[app_id]
         )
         app_status = app_status_result[app_id]
-        first_replica = app_status["service_ids"][0]
+        service_ids = app_status["service_ids"]
 
-        websocket_service_id = first_replica["websocket_service_id"]
-        webrtc_service_id = first_replica["webrtc_service_id"]
+        websocket_service_id = service_ids["websocket_service_id"]
+        webrtc_service_id = service_ids["webrtc_service_ids"][0]
 
-        # Get the websocket service using hypha_client
-        websocket_service = await hypha_client.get_service(websocket_service_id)
+        # Wildcard websocket ID needs a selection mode; least-busy replica per call
+        websocket_service = await hypha_client.get_service(
+            websocket_service_id, {"mode": "select:min:get_load"}
+        )
         assert (
             websocket_service
         ), f"Could not connect to WebSocket service {websocket_service_id}"
