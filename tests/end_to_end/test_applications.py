@@ -447,19 +447,10 @@ async def test_startup_application(
             assert isinstance(
                 service_ids, dict
             ), f"service_ids should be a dictionary for '{application_id}'"
-            for key in ("websocket_service_id", "websocket_service_ids", "webrtc_service_ids"):
+            for key in ("websocket_service_id", "webrtc_service_id"):
                 assert (
-                    key in service_ids
-                ), f"service_ids should contain {key} for '{application_id}'"
-            assert (
-                service_ids["websocket_service_id"]
-            ), f"Running application '{application_id}' should have a websocket_service_id"
-            assert (
-                len(service_ids["websocket_service_ids"]) > 0
-            ), f"Running application '{application_id}' should have at least one per-replica websocket_service_id"
-            assert (
-                len(service_ids["webrtc_service_ids"]) > 0
-            ), f"Running application '{application_id}' should have at least one webrtc_service_id"
+                    service_ids.get(key)
+                ), f"Running application '{application_id}' should have a {key}"
 
         # Validate resource allocation structure
         if app_info["application_resources"]:
@@ -972,12 +963,9 @@ async def test_call_demo_app_functions(
         service_ids = app_status["service_ids"]
 
         websocket_service_id = service_ids["websocket_service_id"]
-        webrtc_service_id = service_ids["webrtc_service_ids"][0]
+        webrtc_service_id = service_ids["webrtc_service_id"]
 
-        # Wildcard websocket ID needs a selection mode; least-busy replica per call
-        websocket_service = await hypha_client.get_service(
-            websocket_service_id, {"mode": "select:min:get_load"}
-        )
+        websocket_service = await hypha_client.get_service(websocket_service_id)
         assert (
             websocket_service
         ), f"Could not connect to WebSocket service {websocket_service_id}"
@@ -1121,12 +1109,9 @@ async def test_call_composition_app_functions(
         service_ids = app_status["service_ids"]
 
         websocket_service_id = service_ids["websocket_service_id"]
-        webrtc_service_id = service_ids["webrtc_service_ids"][0]
+        webrtc_service_id = service_ids["webrtc_service_id"]
 
-        # Wildcard websocket ID needs a selection mode; least-busy replica per call
-        websocket_service = await hypha_client.get_service(
-            websocket_service_id, {"mode": "select:min:get_load"}
-        )
+        websocket_service = await hypha_client.get_service(websocket_service_id)
         assert (
             websocket_service
         ), f"Could not connect to WebSocket service {websocket_service_id}"

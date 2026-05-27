@@ -652,10 +652,9 @@ class AppsManager:
 
     async def _get_application_service_ids(
         self, application_id: str
-    ) -> Dict[str, Any]:
-        # WebSocket: one wildcard ID dispatched per-call with `mode='select:min:get_load'`
-        # (each ProxyDeployment replica exposes get_load). WebRTC: explicit per-replica
-        # list — the peer-connection handshake needs the concrete replica's client_id.
+    ) -> Dict[str, Optional[str]]:
+        # ProxyDeployment is fixed at one replica per application — one concrete
+        # service ID for each transport, no wildcards, no per-replica lists.
         replica_ids = (
             await self.ray_cluster.proxy_actor_handle.get_deployment_replicas.remote(
                 application_id=application_id,
@@ -663,24 +662,14 @@ class AppsManager:
             )
         )
         if not replica_ids:
-            return {
-                "websocket_service_id": None,
-                "websocket_service_ids": [],
-                "webrtc_service_ids": [],
-            }
+            return {"websocket_service_id": None, "webrtc_service_id": None}
 
+        replica_id = replica_ids[0]
         workspace = self.server.config.workspace
         worker_client_id = self.server.config.client_id
         return {
-            "websocket_service_id": f"{workspace}/{worker_client_id}-*:{application_id}",
-            "websocket_service_ids": [
-                f"{workspace}/{worker_client_id}-{replica_id}:{application_id}"
-                for replica_id in replica_ids
-            ],
-            "webrtc_service_ids": [
-                f"{workspace}/{worker_client_id}-{replica_id}:{application_id}-rtc"
-                for replica_id in replica_ids
-            ],
+            "websocket_service_id": f"{workspace}/{worker_client_id}-{replica_id}:{application_id}",
+            "webrtc_service_id": f"{workspace}/{worker_client_id}-{replica_id}:{application_id}-rtc",
         }
 
     async def _get_app_status(
@@ -735,21 +724,15 @@ class AppsManager:
         service_ids = await self._get_application_service_ids(application_id)
 
         # Build static site URL with runtime config params so the frontend
-        # knows which Hypha server and service to connect to. WebSocket ID is
-        # a wildcard (call with mode='select:min:get_load'); WebRTC starts on
-        # the first replica's concrete ID — the frontend can swap replicas at
-        # runtime via get_rtc_service_id() once connected.
+        # knows which Hypha server and service to connect to.
         base_static_url = application_info.get("static_site_url")
         static_site_url = None
         if base_static_url and service_ids["websocket_service_id"]:
-            ws_id = service_ids["websocket_service_id"]
-            rtc_ids = service_ids["webrtc_service_ids"]
-            rtc_id = rtc_ids[0] if rtc_ids else ""
             server_url = self.server.config.public_base_url
             params = (
                 f"server={server_url}"
-                f"&ws_service_id={ws_id}"
-                f"&webrtc_service_id={rtc_id}"
+                f"&ws_service_id={service_ids['websocket_service_id']}"
+                f"&webrtc_service_id={service_ids['webrtc_service_id']}"
             )
             static_site_url = f"{base_static_url}?{params}"
 
@@ -834,7 +817,6 @@ class AppsManager:
             server=self.server,
             artifact_manager=self.artifact_manager,
             worker_service_id=worker_service_id,
-            serve_http_url=self.ray_cluster.serve_http_url,
         )
 
         # Ensure applications collection exists

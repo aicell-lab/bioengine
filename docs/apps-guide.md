@@ -1044,19 +1044,17 @@ app_status = await bioengine_worker_service.get_app_status(
 )
 
 # Extract service IDs
-websocket_service_id = app_status["service_ids"]["websocket_service_id"]   # wildcard, one per app
-webrtc_service_ids = app_status["service_ids"]["webrtc_service_ids"]       # one per replica
+websocket_service_id = app_status["service_ids"]["websocket_service_id"]
+webrtc_service_id = app_status["service_ids"]["webrtc_service_id"]
 ```
 
 #### WebSocket Connection
 
-Websocket connections send and receive their data through the connected Hypha server. The `websocket_service_id` is a wildcard that matches every ProxyDeployment replica of the application; pass `mode="select:min:get_load"` so Hypha picks the least-busy replica per call.
+Websocket connections send and receive their data through the connected Hypha server.
 
 ```python
-# Connect via WebSocket — Hypha selects the least-busy replica per call
-websocket_service = await hypha_client.get_service(
-    websocket_service_id, {"mode": "select:min:get_load"}
-)
+# Connect via WebSocket for real-time communication
+websocket_service = await hypha_client.get_service(websocket_service_id)
 
 # Call application methods
 result = await websocket_service.process_data(
@@ -1073,8 +1071,8 @@ WebRTC connections enable peer-to-peer communication for low-latency application
 # Requires aiortc to be installed
 from hypha_rpc import get_rtc_service
 
-# Connect via WebRTC for peer-to-peer communication — pick a specific replica
-peer_connection = await get_rtc_service(hypha_client, webrtc_service_ids[0])
+# Connect via WebRTC for peer-to-peer communication
+peer_connection = await get_rtc_service(hypha_client, webrtc_service_id)
 
 webrtc_service = await peer_connection.get_service(app_id)
 
