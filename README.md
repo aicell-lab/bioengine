@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/assets/bioengine-icon.svg" alt="BioEngine Logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/aicell-lab/bioengine/main/docs/assets/bioengine-icon.svg" alt="BioEngine Logo" width="200"/>
 
   # BioEngine
 
