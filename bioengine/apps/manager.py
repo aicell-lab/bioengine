@@ -398,15 +398,13 @@ class AppsManager:
             artifact_id = self._deployed_applications[application_id]["artifact_id"]
             version = self._deployed_applications[application_id]["version"]
 
-            # In v0.11, ``AppBuilder.build`` invokes ``serve.run`` inside
-            # the Ray task that constructs the deployment graph (see
-            # ``bioengine._app.bootstrap.build_and_run_application``).
-            # Ray Serve's ``Deployment.__getattr__`` falls into unbounded
-            # recursion if an unpickled deployment is re-accessed, so the
-            # graph must stay in-process. By the time we reach this point
-            # the deployment is already submitted; the manager only needs
-            # to wait for Ray Serve's status to flip to RUNNING.
-            app = self._deployed_applications[application_id]["built_app"]
+            # In v0.11, ``AppBuilder.build`` introspects + assembles
+            # metadata only; the actual ``serve.run`` is deferred to
+            # ``AppBuilder.submit``, run as a Ray task in the app's
+            # runtime_env. The split exists so ``_check_resources`` runs
+            # *before* the cluster resources are claimed.
+            built_app = self._deployed_applications[application_id]["built_app"]
+            await self.app_builder.submit(built_app, application_id)
 
             # Track the application in the internal state
             self.logger.info(

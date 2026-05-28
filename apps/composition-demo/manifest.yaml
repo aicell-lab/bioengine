@@ -9,5 +9,5 @@ authors:
   - {name: "Test User", affiliation: "BioEngine Test"}
 license: MIT
 tags: [bioengine, test, composition]
-entry: composition_demo.entry:EntryApp
+entry: entry:EntryApp
 frontend_entry: frontend/index.html

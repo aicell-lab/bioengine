@@ -2,7 +2,7 @@
 
 import bioengine
 
-from ..utils import base_status
+from utils import base_status
 
 logger = bioengine.logger
 

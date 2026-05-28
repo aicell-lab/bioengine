@@ -6,10 +6,10 @@ import time
 import bioengine
 from pydantic import Field
 
-from .runtimes.a import RuntimeA
-from .runtimes.b import RuntimeB
-from .runtimes.c import RuntimeC
-from .utils import assert_pong
+from runtimes.a import RuntimeA
+from runtimes.b import RuntimeB
+from runtimes.c import RuntimeC
+from utils import assert_pong
 
 logger = bioengine.logger
 

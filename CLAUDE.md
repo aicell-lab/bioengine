@@ -111,16 +111,29 @@ BioEngine is the **execution and adaptation layer between curated bioimage AI an
 
 ## Application Manifest (v0.11 / format_version 0.6.0)
 
-Every BioEngine application is a folder containing a `manifest.yaml` and a Python *package* shipped via Ray's `runtime_env.py_modules`. The artifact root keeps a hyphen (matches the Hypha alias); the inner Python package uses underscores so Python can import it.
+Every BioEngine application is a folder containing `manifest.yaml` and the app's Python files at the root. The whole folder is uploaded to the Hypha artifact; the worker ships the same root to Ray Serve replicas as `runtime_env.py_modules`, excluding non-Python content (`manifest.yaml`, `README*`, `*.md`, `*.ipynb`, `frontend/`, images).
 
 ```
-my-app/                       ← artifact root
+my-app/                       ← artifact root + Python module directory
 ├── manifest.yaml
-├── README.md                 ← stays in artifact (not shipped to replicas)
-├── frontend/index.html       ← stays in artifact (Hypha hosts statically)
-└── my_app/                   ← Python package, the ONLY thing shipped to replicas
+├── README.md                 ← stays in artifact (excluded from py_modules)
+├── frontend/index.html       ← Hypha hosts statically (excluded from py_modules)
+└── deployment.py             ← @bioengine.app class
+```
+
+For multi-file apps:
+
+```
+composition-demo/
+├── manifest.yaml
+├── frontend/index.html
+├── entry.py                  ← @bioengine.app entry — type-hints reference RuntimeA/B/C
+├── utils.py
+└── runtimes/
     ├── __init__.py
-    └── deployment.py
+    ├── a.py
+    ├── b.py
+    └── c.py
 ```
 
 ### Required Fields
@@ -132,7 +145,7 @@ id_emoji: "🔬"
 description: "..."
 type: ray-serve                          # Kept
 format_version: 0.6.0                    # v0.11 gate
-entry: my_app.deployment:MyApp           # Replaces `deployments:` — Python import path
+entry: deployment:MyApp                  # module:Class — module is the .py filename
 ```
 
 ### Optional Fields

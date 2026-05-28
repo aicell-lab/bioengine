@@ -15,5 +15,5 @@ links: []
 tags: [test, bioengine]
 type: ray-serve
 version: 1.0.0
-entry: demo_app.deployment:DemoApp
+entry: deployment:DemoApp
 frontend_entry: "frontend/index.html"

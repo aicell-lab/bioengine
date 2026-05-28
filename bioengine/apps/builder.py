@@ -143,13 +143,15 @@ class AppBuilder:
         artifact_id: str,
         version: Optional[str],
         application_id: str,
-        package_root: str,
     ) -> Path:
-        """Download ONLY the package directory named by ``entry`` to a clean dir.
+        """Download the whole artifact root into a clean per-app directory.
 
-        The runtime_env's ``py_modules`` ships whatever directory we point it
-        at; we exclude ``manifest.yaml``, ``README.md``, ``frontend/``, etc.
-        so they don't bloat the upload.
+        In the v0.6.0 layout the artifact root *is* the Python module dir:
+        ``manifest.yaml`` and any ``.py`` files live side by side at the
+        top level. The whole directory is later shipped as ``py_modules``;
+        non-Python content (``manifest.yaml``, ``README.md``,
+        ``frontend/``, notebooks) is excluded by
+        :meth:`_upload_pkg_to_gcs`.
         """
         target_dir = self.apps_workdir / application_id / "source"
         if target_dir.exists():
@@ -157,26 +159,28 @@ class AppBuilder:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         local_root = self._local_artifact_root(artifact_id)
-        local_pkg = local_root / package_root if local_root else None
-
-        if local_pkg and local_pkg.is_dir():
+        if local_root and local_root.is_dir():
             self.logger.info(
                 f"Materialising '{artifact_id}' from local path "
-                f"{local_pkg} → {target_dir}"
+                f"{local_root} → {target_dir}"
             )
-            dest_pkg = target_dir / package_root
-            shutil.copytree(local_pkg, dest_pkg)
+            shutil.copytree(
+                local_root,
+                target_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", ".git"),
+            )
             return target_dir
 
         self.logger.info(
-            f"Downloading package directory '{package_root}/' from artifact "
-            f"'{artifact_id}' (version={version}) → {target_dir}"
+            f"Downloading artifact root '{artifact_id}' (version={version}) "
+            f"→ {target_dir}"
         )
         files = await self.artifact_manager.list_files(
-            artifact_id=artifact_id, version=version, dir_path=package_root
+            artifact_id=artifact_id, version=version
         )
         await self._download_files_recursive(
-            artifact_id, version, target_dir, package_root, files
+            artifact_id, version, target_dir, "", files
         )
         return target_dir
 
@@ -345,6 +349,28 @@ class AppBuilder:
             "env_vars": introspect_env,
         }
 
+    #: Files inside the artifact root that are *not* Python source and
+    #: should not ship to Ray Serve replicas. ``manifest.yaml`` is already
+    #: stored as the artifact's native manifest field; ``frontend/`` is
+    #: served by Hypha statically; the others are author-facing docs.
+    _PY_MODULES_EXCLUDES = [
+        "manifest.yaml",
+        "manifest.yml",
+        "README*",
+        "*.md",
+        "*.ipynb",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.gif",
+        "*.svg",
+        "*.pdf",
+        "frontend/**",
+        "__pycache__/**",
+        ".git/**",
+        ".github/**",
+    ]
+
     def _upload_pkg_to_gcs(self, pkg_root_dir: Path) -> str:
         """Package ``pkg_root_dir`` and upload to Ray's internal GCS storage.
 
@@ -359,15 +385,18 @@ class AppBuilder:
         )
 
         # ``include_parent_dir=False`` so the zip's top level holds the
-        # package directory itself (e.g. ``demo_app/``). Ray's py_modules
-        # extraction then puts that path on ``sys.path`` and a plain
-        # ``import demo_app`` succeeds inside the task.
-        pkg_uri = get_uri_for_directory(str(pkg_root_dir))
+        # artifact-root contents directly. Ray's py_modules extraction
+        # then puts that path on ``sys.path`` so a plain
+        # ``import deployment`` succeeds inside the task.
+        pkg_uri = get_uri_for_directory(
+            str(pkg_root_dir), excludes=self._PY_MODULES_EXCLUDES
+        )
         upload_package_if_needed(
             pkg_uri,
             base_directory=str(pkg_root_dir.parent),
             directory=str(pkg_root_dir),
             include_parent_dir=False,
+            excludes=self._PY_MODULES_EXCLUDES,
             logger=self.logger,
         )
         return pkg_uri
@@ -588,7 +617,6 @@ class AppBuilder:
         manifest, resolved_version = await self._load_manifest(artifact_id, version)
         version = resolved_version
         entry_id = manifest["entry"]
-        package_root = entry_id.split(":", 1)[0].split(".", 1)[0]
         self.logger.info(
             f"Resolved application '{application_id}' artifact '{artifact_id}' "
             f"to version '{version}', entry '{entry_id}'."
@@ -598,13 +626,13 @@ class AppBuilder:
         application_kwargs = dict(application_kwargs or {})
         application_env_vars = dict(application_env_vars or {})
 
-        # 1. Materialise just the package directory.
+        # 1. Materialise the artifact root.
         pkg_root_dir = await self._materialize_artifact(
-            artifact_id, version, application_id, package_root
+            artifact_id, version, application_id
         )
 
-        # 2. AST-scan the user's package for @bioengine.app(pip=...) deps.
-        user_pip = self._extract_user_pip_deps(pkg_root_dir / package_root)
+        # 2. AST-scan the user's modules for @bioengine.app(pip=...) deps.
+        user_pip = self._extract_user_pip_deps(pkg_root_dir)
         self.logger.debug(
             f"Extracted user pip deps for introspection: {user_pip}"
         )
@@ -738,32 +766,6 @@ class AppBuilder:
             "ice_servers": ice_servers,
         }
 
-        # NOTE: We do NOT return a serve.Application object here. Ray
-        # Serve's ``Deployment.__getattr__`` falls into unbounded recursion
-        # when an unpickled deployment is re-accessed, so any
-        # ``serve.Application`` constructed inside a Ray task is unsafe to
-        # ship back to the worker. Instead, ``build_and_run_application``
-        # calls ``serve.run`` inside the task and returns a status dict;
-        # we return a metadata-only ``BuiltApp`` to the manager so the
-        # rest of the deploy flow stays unchanged.
-        try:
-            await asyncio.to_thread(
-                ray.get,
-                ray.remote(num_cpus=0, runtime_env=runtime_env)(
-                    build_and_run_application
-                ).remote(
-                    spec,
-                    translated_kwargs,
-                    proxy_args,
-                    application_id,
-                    f"/{application_id}",
-                    pkg_uri,
-                ),
-            )
-        except ray.exceptions.RayTaskError as exc:
-            cause = exc.cause if isinstance(exc.cause, Exception) else exc
-            raise BioEngineUserError(str(cause)) from exc
-
         metadata = {
             "name": manifest["name"],
             "description": manifest["description"],
@@ -776,24 +778,82 @@ class AppBuilder:
             "frontend_entry": manifest.get("frontend_entry"),
         }
         self.logger.info(
-            f"Successfully built and submitted '{application_id}' "
+            f"Introspected '{application_id}' "
             f"(methods: {available_methods})"
         )
-        return BuiltApp(metadata=metadata)
+        return BuiltApp(
+            metadata=metadata,
+            spec=spec,
+            translated_kwargs=translated_kwargs,
+            proxy_args=proxy_args,
+            runtime_env=runtime_env,
+            pkg_uri=pkg_uri,
+        )
+
+    async def submit(self, built_app: "BuiltApp", application_id: str) -> None:
+        """Fire the ``build_and_run_application`` Ray task.
+
+        ``build()`` returns metadata only (after introspection); the
+        manager runs ``_check_resources`` against that metadata and then
+        calls this to actually claim the cluster resources. Splitting
+        the steps means the resource check happens *before* ``serve.run``,
+        not after.
+        """
+        try:
+            await asyncio.to_thread(
+                ray.get,
+                ray.remote(num_cpus=0, runtime_env=built_app.runtime_env)(
+                    build_and_run_application
+                ).remote(
+                    built_app.spec,
+                    built_app.translated_kwargs,
+                    built_app.proxy_args,
+                    application_id,
+                    f"/{application_id}",
+                    built_app.pkg_uri,
+                ),
+            )
+        except ray.exceptions.RayTaskError as exc:
+            cause = exc.cause if isinstance(exc.cause, Exception) else exc
+            raise BioEngineUserError(str(cause)) from exc
+        self.logger.info(f"Submitted '{application_id}' to Ray Serve")
 
 
 class BuiltApp:
-    """Stand-in for ``serve.Application`` — carries metadata, no DAG.
+    """Carries the introspected spec + metadata until the manager submits.
 
     ``AppBuilder.build()`` previously returned a ``serve.Application`` that
     the manager passed to ``serve.run``. In v0.11, ``serve.run`` is invoked
-    inside the build Ray task (see :func:`bioengine._app.bootstrap.
-    build_and_run_application`), so the worker no longer needs the
-    Application object — just its metadata. This class preserves the
-    ``.metadata`` attribute access pattern the manager already uses.
+    inside a Ray task (see :func:`bioengine._app.bootstrap.
+    build_and_run_application`) because Ray Serve's
+    ``Deployment.__getattr__`` falls into unbounded recursion when an
+    unpickled deployment is re-accessed; the graph can't ride back to the
+    worker. The Built object stashes everything the submit task needs so
+    the manager can do ``build → check_resources → submit`` and keep the
+    resource check on the right side of the actual claim.
     """
 
-    __slots__ = ("metadata",)
+    __slots__ = (
+        "metadata",
+        "spec",
+        "translated_kwargs",
+        "proxy_args",
+        "runtime_env",
+        "pkg_uri",
+    )
 
-    def __init__(self, metadata: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        metadata: Dict[str, Any],
+        spec: Dict[str, Any],
+        translated_kwargs: Dict[str, Dict[str, Any]],
+        proxy_args: Dict[str, Any],
+        runtime_env: Dict[str, Any],
+        pkg_uri: str,
+    ) -> None:
         self.metadata = metadata
+        self.spec = spec
+        self.translated_kwargs = translated_kwargs
+        self.proxy_args = proxy_args
+        self.runtime_env = runtime_env
+        self.pkg_uri = pkg_uri
