@@ -1,12 +1,14 @@
+import functools
+import logging
 import os
 import re
+import threading
 import time
 import json
 import urllib.error
 import urllib.request
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Tuple, Union
-import logging
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import ray
 from ray.util.state import StateApiClient, get_log
@@ -26,6 +28,22 @@ from ray.util.state.exception import RayStateApiException
 
 logger = logging.getLogger("ray")
 date_format = "%Y-%m-%d %H:%M:%S %Z"
+
+
+def _touch_on_call(method: Callable) -> Callable:
+    """Decorator that updates ``self._last_called_at`` on every method invocation.
+
+    Used to drive the actor's idle self-eviction timer: any public method
+    that gets called from outside the actor counts as activity and resets
+    the clock. Internal helpers (whose names start with ``_``) are not
+    wrapped — they are reached only via calls that already touched the
+    timer at the public-method boundary.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._last_called_at = time.time()
+        return method(self, *args, **kwargs)
+    return wrapper
 
 
 @ray.remote(
@@ -53,8 +71,18 @@ class BioEngineProxyActor:
     automatically restarts if it fails.
     """
 
+    # Idle self-eviction: if no public method has been called for this long
+    # the actor terminates itself. Workers heartbeat via get_cluster_state()
+    # in their monitor loop, so under normal use the timer is always reset
+    # well within this window. Reaches the threshold only when every worker
+    # that was using this version has stopped using it for an extended
+    # period (e.g. all workers upgraded to a different version).
+    IDLE_EVICTION_SECONDS: float = 24 * 60 * 60  # 24 hours
+    IDLE_CHECK_INTERVAL_SECONDS: float = 10 * 60  # 10 minutes
+
     def __init__(
         self,
+        bioengine_version: str,
         exclude_head_node: bool = False,
         check_pending_resources: bool = False,
         dashboard_url: Optional[str] = None,
@@ -66,6 +94,14 @@ class BioEngineProxyActor:
         cluster state and configures monitoring behavior.
 
         Args:
+            bioengine_version: BioEngine version of the worker that constructed
+                this actor. The worker reads its own ``bioengine.__version__``
+                locally (where the package is properly pip-installed) and
+                passes it in. The actor cannot rely on ``importlib.metadata``
+                because BioEngine reaches the cluster via Ray's ``py_modules``
+                upload, which adds the source to ``sys.path`` without
+                installing dist-info — so a self-introspected version would
+                always be ``None``.
             exclude_head_node: Skip head node in resource calculations (useful for worker-only metrics)
             check_pending_resources: Include pending jobs/actors/tasks in cluster state reports
             dashboard_url: Ray dashboard base URL (e.g. "http://127.0.0.1:8265"). When BioEngine
@@ -76,6 +112,7 @@ class BioEngineProxyActor:
         # Get the GCS address via public API
         self.gcs_address = ray.get_runtime_context().gcs_address
         self.dashboard_url = dashboard_url
+        self.bioengine_version: str = bioengine_version
 
         # Create GCS client options
         gcs_options = GcsClientOptions.create(
@@ -102,8 +139,51 @@ class BioEngineProxyActor:
 
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
-        logger.info(f"ClusterState initialized with GCS address: {self.gcs_address}")
+        # Idle self-eviction state. Counts construction as "activity" so
+        # the actor is not killed before any worker has a chance to call it.
+        self._last_called_at: float = time.time()
+        self._idle_stop_event = threading.Event()
+        self._idle_thread = threading.Thread(
+            target=self._idle_check_loop,
+            name="bioengine-proxy-idle-check",
+            daemon=True,
+        )
+        self._idle_thread.start()
 
+        logger.info(f"ClusterState initialized with GCS address: {self.gcs_address}")
+        logger.info(f"BioEngine version: {self.bioengine_version}")
+
+    @_touch_on_call
+    def get_bioengine_version(self) -> str:
+        """Return the BioEngine version recorded when this actor was constructed."""
+        return self.bioengine_version
+
+    def _idle_check_loop(self) -> None:
+        """Background thread loop that self-evicts the actor after long idleness.
+
+        Runs in a daemon thread (so it dies with the actor process). Wakes
+        every ``IDLE_CHECK_INTERVAL_SECONDS`` and, if no public method has
+        been called for ``IDLE_EVICTION_SECONDS``, calls
+        ``ray.actor.exit_actor()`` which terminates the actor gracefully
+        and frees the named slot so a future worker can construct a fresh
+        one. ``max_restarts`` does not apply to ``exit_actor`` exits.
+        """
+        while not self._idle_stop_event.wait(self.IDLE_CHECK_INTERVAL_SECONDS):
+            try:
+                idle_seconds = time.time() - self._last_called_at
+                if idle_seconds >= self.IDLE_EVICTION_SECONDS:
+                    logger.warning(
+                        f"BioEngineProxyActor (version {self.bioengine_version}) "
+                        f"idle for {idle_seconds / 3600:.1f} h "
+                        f"(threshold {self.IDLE_EVICTION_SECONDS / 3600:.1f} h); "
+                        f"self-evicting."
+                    )
+                    ray.actor.exit_actor()
+                    return
+            except Exception as e:
+                logger.error(f"Idle-check loop error (continuing): {e}", exc_info=True)
+
+    @_touch_on_call
     def get_geo_location(self) -> Dict[str, Optional[Union[str, float]]]:
         """Return the head node's geographic location, fetched from the actor's egress IP.
 
@@ -328,6 +408,7 @@ class BioEngineProxyActor:
 
         return per_node_gpu_memory, True
 
+    @_touch_on_call
     def get_cluster_state(self) -> Dict[str, Any]:
         """
         Get comprehensive cluster resource information including per-node breakdown.
@@ -486,6 +567,7 @@ class BioEngineProxyActor:
 
         return cluster_state
 
+    @_touch_on_call
     def get_deployment_replicas(
         self, application_id: str, deployment_name: str
     ) -> Dict[str, str]:
@@ -521,6 +603,7 @@ class BioEngineProxyActor:
         }
         return replica_info
 
+    @_touch_on_call
     def register_serve_replica(
         self,
         application_id: str,
@@ -596,6 +679,7 @@ class BioEngineProxyActor:
             f"deployment '{deployment_name}' with actor ID '{actor_id}' (replica timezone: {timezone})."
         )
 
+    @_touch_on_call
     def clear_application_replicas(self, application_id: str) -> None:
         """
         Clear all registered replicas for a specific application.
@@ -611,6 +695,7 @@ class BioEngineProxyActor:
             f"Cleared all registered replicas for application '{application_id}'."
         )
 
+    @_touch_on_call
     def get_actor_logs(
         self,
         actor_id: str,
@@ -682,6 +767,7 @@ class BioEngineProxyActor:
 
         return logs
 
+    @_touch_on_call
     def get_deployment_logs(
         self,
         application_id: str,
