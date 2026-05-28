@@ -398,6 +398,12 @@ class BioEngineProxyActor:
                 "used_cpu": 0,
                 "total_gpu": 0,
                 "used_gpu": 0,
+                "total_memory": 0,
+                "used_memory": 0,
+                "total_gpu_memory": 0,
+                "used_gpu_memory": 0,
+                "total_object_store_memory": 0,
+                "used_object_store_memory": 0,
             },
             "nodes": {},
         }
@@ -455,10 +461,13 @@ class BioEngineProxyActor:
                 "slurm_job_id": self._get_slurm_job_id(total_resources),
             }
 
-            # Accumulate cluster resources
+            # Accumulate cluster resources. Per-node GPU memory can be the
+            # string "NA" when the Ray dashboard is unavailable — skip
+            # non-numeric values so the rest of the rollup still works.
             for resource_name in cluster_state["cluster"].keys():
                 node_value = cluster_state["nodes"][node_id][resource_name]
-                cluster_state["cluster"][resource_name] += node_value
+                if isinstance(node_value, (int, float)):
+                    cluster_state["cluster"][resource_name] += node_value
 
         if self.check_pending_resources:
             # TODO: Don't count task/actor/job in runtime creation
