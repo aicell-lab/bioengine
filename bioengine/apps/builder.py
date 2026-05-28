@@ -44,7 +44,7 @@ from ray import serve
 
 from bioengine._app.bootstrap import (
     SPEC_FORMAT_VERSION,
-    build_application,
+    build_and_run_application,
     introspect_app,
     validate_kwargs_against_spec,
 )
@@ -320,7 +320,13 @@ class AppBuilder:
         user_pip: List[str],
         env_vars: Dict[str, str],
     ) -> Dict[str, Any]:
-        """Compose the runtime_env for the introspection + build Ray tasks."""
+        """Compose the runtime_env for the introspection + build Ray tasks.
+
+        Ray rejects local paths in ``runtime_env.py_modules`` at task or
+        actor level (only ``ray.init`` accepts them). To work around that
+        we pre-package the user's directory and upload it to Ray's GCS
+        storage, then reference the resulting ``gcs://...zip`` URI.
+        """
         base_pip = update_requirements(
             list(user_pip),
             select=["httpx", "hypha-rpc", "pydantic"],
@@ -331,11 +337,40 @@ class AppBuilder:
         }
         introspect_env.pop("BIOENGINE_DATA_SERVER_URL", None)
 
+        pkg_uri = self._upload_pkg_to_gcs(pkg_root_dir)
+
         return {
-            "py_modules": [str(pkg_root_dir)],
+            "py_modules": [pkg_uri],
             "pip": base_pip,
             "env_vars": introspect_env,
         }
+
+    def _upload_pkg_to_gcs(self, pkg_root_dir: Path) -> str:
+        """Package ``pkg_root_dir`` and upload to Ray's internal GCS storage.
+
+        Returns a ``gcs://_ray_pkg_<hash>.zip`` URI that Ray accepts in
+        task-level ``py_modules``. Idempotent: if the same content was
+        uploaded before the function returns the cached URI without
+        re-uploading.
+        """
+        from ray._private.runtime_env.packaging import (
+            get_uri_for_directory,
+            upload_package_if_needed,
+        )
+
+        # ``include_parent_dir=False`` so the zip's top level holds the
+        # package directory itself (e.g. ``demo_app/``). Ray's py_modules
+        # extraction then puts that path on ``sys.path`` and a plain
+        # ``import demo_app`` succeeds inside the task.
+        pkg_uri = get_uri_for_directory(str(pkg_root_dir))
+        upload_package_if_needed(
+            pkg_uri,
+            base_directory=str(pkg_root_dir.parent),
+            directory=str(pkg_root_dir),
+            include_parent_dir=False,
+            logger=self.logger,
+        )
+        return pkg_uri
 
     # ───────────────── pydantic-core preflight (kept) ────────────────────
 
@@ -595,6 +630,11 @@ class AppBuilder:
         runtime_env = self._build_introspect_runtime_env(
             pkg_root_dir, user_pip, env_vars
         )
+        # The bootstrap tasks both receive the package URI directly so
+        # they can inject it into each deployment's ``runtime_env`` at
+        # bind time. Pulling it back out of ``runtime_env`` keeps a
+        # single source of truth.
+        pkg_uri = runtime_env["py_modules"][0]
 
         # 4. pydantic-core preflight (keep — same failure mode applies).
         self._check_pydantic_core_compatibility(runtime_env["pip"])
@@ -698,18 +738,33 @@ class AppBuilder:
             "ice_servers": ice_servers,
         }
 
+        # NOTE: We do NOT return a serve.Application object here. Ray
+        # Serve's ``Deployment.__getattr__`` falls into unbounded recursion
+        # when an unpickled deployment is re-accessed, so any
+        # ``serve.Application`` constructed inside a Ray task is unsafe to
+        # ship back to the worker. Instead, ``build_and_run_application``
+        # calls ``serve.run`` inside the task and returns a status dict;
+        # we return a metadata-only ``BuiltApp`` to the manager so the
+        # rest of the deploy flow stays unchanged.
         try:
-            app = await asyncio.to_thread(
+            await asyncio.to_thread(
                 ray.get,
                 ray.remote(num_cpus=0, runtime_env=runtime_env)(
-                    build_application
-                ).remote(spec, translated_kwargs, proxy_args),
+                    build_and_run_application
+                ).remote(
+                    spec,
+                    translated_kwargs,
+                    proxy_args,
+                    application_id,
+                    f"/{application_id}",
+                    pkg_uri,
+                ),
             )
         except ray.exceptions.RayTaskError as exc:
             cause = exc.cause if isinstance(exc.cause, Exception) else exc
             raise BioEngineUserError(str(cause)) from exc
 
-        app.metadata = {
+        metadata = {
             "name": manifest["name"],
             "description": manifest["description"],
             "version": version,
@@ -721,7 +776,24 @@ class AppBuilder:
             "frontend_entry": manifest.get("frontend_entry"),
         }
         self.logger.info(
-            f"Successfully built '{application_id}' "
+            f"Successfully built and submitted '{application_id}' "
             f"(methods: {available_methods})"
         )
-        return app
+        return BuiltApp(metadata=metadata)
+
+
+class BuiltApp:
+    """Stand-in for ``serve.Application`` — carries metadata, no DAG.
+
+    ``AppBuilder.build()`` previously returned a ``serve.Application`` that
+    the manager passed to ``serve.run``. In v0.11, ``serve.run`` is invoked
+    inside the build Ray task (see :func:`bioengine._app.bootstrap.
+    build_and_run_application`), so the worker no longer needs the
+    Application object — just its metadata. This class preserves the
+    ``.metadata`` attribute access pattern the manager already uses.
+    """
+
+    __slots__ = ("metadata",)
+
+    def __init__(self, metadata: Dict[str, Any]) -> None:
+        self.metadata = metadata

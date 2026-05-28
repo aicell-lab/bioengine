@@ -302,29 +302,49 @@ def _safe_default(default: Any) -> Any:
 # ───────────────────────── application builder ───────────────────────────
 
 
-def build_application(
+def build_and_run_application(
     spec: Dict[str, Any],
     application_kwargs: Dict[str, Dict[str, Any]],
     proxy_args: Dict[str, Any],
-) -> Any:
-    """Re-import the user package and assemble the Ray Serve application.
+    application_id: str,
+    route_prefix: str,
+    pkg_uri: str,
+) -> Dict[str, Any]:
+    """Assemble the Ray Serve bind graph AND call ``serve.run`` in-process.
 
-    Walks ``spec["classes"]`` and builds the bind graph by recursive
-    descent: each composition-handle param is replaced by the bound
-    child deployment. The entry handle is wrapped in
-    ``bioengine.apps.proxy_deployment.ProxyDeployment.bind(...)`` with
-    ``proxy_args`` providing the worker-side context (server URL, tokens,
-    authorisation rules, etc.).
+    Returns a status dict — never a ``serve.Application``. Ray Serve's
+    ``Deployment.__getattr__`` falls into unbounded recursion when an
+    unpickled deployment is re-accessed, so the graph must stay inside
+    the process that built it.
+
+    ``pkg_uri`` is the Ray-internal ``gcs://`` URI of the user's app
+    package. Every deployment's ``runtime_env`` is augmented with this
+    URI so the replica venv can ``import`` the user's modules — without
+    this, cloudpickle on the replica fails with ``ModuleNotFoundError``
+    for deployments whose own ``pip=`` forced a fresh venv that didn't
+    inherit ``py_modules`` from the calling task.
     """
+    from ray import serve
+
     from bioengine.apps.proxy_deployment import ProxyDeployment
 
     handles: Dict[str, Any] = {}
+
+    def _with_pkg(cls: Any) -> Any:
+        opts = dict(cls.ray_actor_options or {})
+        runtime_env = dict(opts.get("runtime_env") or {})
+        py_modules = list(runtime_env.get("py_modules") or [])
+        if pkg_uri not in py_modules:
+            py_modules.append(pkg_uri)
+        runtime_env["py_modules"] = py_modules
+        opts["runtime_env"] = runtime_env
+        return cls.options(ray_actor_options=opts)
 
     def bind(cid: str) -> Any:
         if cid in handles:
             return handles[cid]
         meta = spec["classes"][cid]
-        cls = _load_app_class(cid)
+        cls = _with_pkg(_load_app_class(cid))
         bind_kwargs: Dict[str, Any] = dict(application_kwargs.get(cid, {}))
         for param in meta["init_params"]:
             if param["kind"] == "deployment_handle":
@@ -333,12 +353,19 @@ def build_application(
         return handles[cid]
 
     entry_handle = bind(spec["entry_id"])
-
-    return ProxyDeployment.bind(
+    app = ProxyDeployment.bind(
         entry_deployment_handle=entry_handle,
         method_schemas=spec["classes"][spec["entry_id"]]["method_schemas"],
         **proxy_args,
     )
+
+    serve.run(
+        app,
+        name=application_id,
+        route_prefix=route_prefix,
+        blocking=False,
+    )
+    return {"status": "submitted", "application_id": application_id}
 
 
 # ───────────────────────── kwargs validation ─────────────────────────────

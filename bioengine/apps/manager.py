@@ -398,18 +398,15 @@ class AppsManager:
             artifact_id = self._deployed_applications[application_id]["artifact_id"]
             version = self._deployed_applications[application_id]["version"]
 
-            # Use the pre-built app from _deployed_applications
-            # This was built and validated in deploy_app() before this task was created
+            # In v0.11, ``AppBuilder.build`` invokes ``serve.run`` inside
+            # the Ray task that constructs the deployment graph (see
+            # ``bioengine._app.bootstrap.build_and_run_application``).
+            # Ray Serve's ``Deployment.__getattr__`` falls into unbounded
+            # recursion if an unpickled deployment is re-accessed, so the
+            # graph must stay in-process. By the time we reach this point
+            # the deployment is already submitted; the manager only needs
+            # to wait for Ray Serve's status to flip to RUNNING.
             app = self._deployed_applications[application_id]["built_app"]
-
-            # Run the deployment in Ray Serve with unique route prefix
-            await self.ray_cluster.call_with_reconnect(
-                serve.run,
-                target=app,
-                name=application_id,
-                route_prefix=f"/{application_id}",
-                blocking=False,
-            )
 
             # Track the application in the internal state
             self.logger.info(
