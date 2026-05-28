@@ -179,7 +179,11 @@ class RayCluster:
         self.address = None
         self.serve_http_url = None
         self.proxy_actor_handle = None
-        self.proxy_actor_name = "BIOENGINE_PROXY_ACTOR"
+        # Version-suffix the actor name so workers on different BioEngine
+        # versions get their own detached actor — they don't fight over the
+        # same one. Strip characters that aren't safe in a Ray actor name.
+        _safe_version = re.sub(r"[^a-zA-Z0-9_]", "_", bioengine.__version__ or "unknown")
+        self.proxy_actor_name = f"BIOENGINE_PROXY_ACTOR_{_safe_version}"
         self.cluster_status_history = OrderedDict()
         self.max_status_history_length = 100
         self.is_ready = asyncio.Event()
@@ -726,59 +730,6 @@ class RayCluster:
         )
         self.logger.info(f"Ray Serve HTTP URL: {self.serve_http_url}")
 
-    async def _evict_stale_proxy_actor(self) -> None:
-        """Kill an existing proxy actor whose BioEngine version differs from ours.
-
-        The proxy actor is a ``lifetime="detached"`` actor that survives across
-        worker pod restarts. After a BioEngine upgrade, the new worker pod
-        re-attaches to the old actor (which still runs the previous version's
-        code), so bug fixes never reach callers until the actor is replaced.
-
-        This method:
-          1. Attempts to attach to the existing actor by name.
-          2. Reads its ``bioengine_version`` (the version it was constructed with).
-          3. If the version differs from the local ``bioengine.__version__``,
-             kills the actor so the subsequent ``get_if_exists=True`` creation
-             produces a fresh one with the current code.
-
-        Old actors that predate the ``get_bioengine_version`` method are
-        treated as stale and replaced. Missing actor: no-op.
-        """
-        from bioengine import __version__ as local_version
-
-        try:
-            existing = ray.get_actor(name=self.proxy_actor_name, namespace="bioengine")
-        except ValueError:
-            return  # no existing actor; nothing to evict
-
-        try:
-            existing_version = await asyncio.wait_for(
-                existing.get_bioengine_version.remote(), timeout=10.0
-            )
-            if existing_version == local_version:
-                return  # version matches; keep using it
-            reason = (
-                f"BioEngine version mismatch: actor reports "
-                f"{existing_version}, local is {local_version}"
-            )
-        except Exception as e:
-            reason = (
-                f"could not read bioengine_version from existing actor "
-                f"(likely pre-versioning release): {type(e).__name__}: {e}"
-            )
-
-        self.logger.warning(
-            f"Killing stale '{self.proxy_actor_name}' detached actor — {reason}."
-        )
-        try:
-            ray.kill(existing, no_restart=True)
-        except Exception as e:
-            self.logger.warning(
-                f"ray.kill failed for stale '{self.proxy_actor_name}' "
-                f"(continuing — get_if_exists will replace it): "
-                f"{type(e).__name__}: {e}"
-            )
-
     async def _connect_to_cluster(self) -> ray.client_builder.ClientContext:
         """Connect to the Ray cluster using the configured head node address.
 
@@ -832,15 +783,10 @@ class RayCluster:
                 dashboard_port = self.ray_cluster_config["ports"]["dashboard"]
                 dashboard_url = f"http://127.0.0.1:{dashboard_port}"
 
-            # If a stale proxy actor from a previous BioEngine version is
-            # still attached to this Ray cluster, kill it so the new code
-            # path runs. Without this, an upgrade rolls the worker pod but
-            # the detached actor (created by the previous pod) keeps
-            # serving requests with the older method implementations.
-            await self._evict_stale_proxy_actor()
-
-            # Reuse a stable detached proxy actor across worker restarts
-            # If it does not exist yet, create it
+            # Each BioEngine version gets its own detached proxy actor (the
+            # name is version-suffixed in ``__init__``). Workers on the same
+            # version share an actor; workers on different versions never
+            # collide. Older actors self-evict after a long idle period.
             proxy_actor = BioEngineProxyActor.options(
                 name=self.proxy_actor_name,
                 namespace="bioengine",
@@ -848,6 +794,7 @@ class RayCluster:
                 get_if_exists=True,
             )
             self.proxy_actor_handle = proxy_actor.remote(
+                bioengine_version=bioengine.__version__,
                 exclude_head_node=exclude_head_node,
                 check_pending_resources=check_pending_resources,
                 dashboard_url=dashboard_url,
