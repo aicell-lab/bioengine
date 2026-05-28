@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bioengine"
-version = "0.10.3"
+version = "0.10.4"
 description = "BioEngine — CLI and SDK for deploying and calling AI model services on BioEngine workers"
 requires-python = ">=3.11"
 authors = [
-    {name = "Nils Mechtel", github = "nilsmechtel", affiliation = "KTH"}
+    {name = "Nils Mechtel", email = "nils.mech@gmail.com"}
 ]
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -82,9 +82,18 @@ include = [
 [tool.hatch.build.targets.wheel.sources]
 "bioengine" = "bioengine"
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/bioengine",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
 [project.urls]
+"Homepage" = "https://github.com/aicell-lab/bioengine"
 "Repository" = "https://github.com/aicell-lab/bioengine"
-"Documentation" = "https://github.com/aicell-lab/bioengine/README.md"
+"Documentation" = "https://github.com/aicell-lab/bioengine#readme"
 "Bug Tracker" = "https://github.com/aicell-lab/bioengine/issues"
 
 [tool.pytest.ini_options]
