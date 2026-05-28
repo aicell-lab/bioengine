@@ -366,10 +366,9 @@ class BioEngineDatasets:
             except ImportError as e:
                 raise ImportError("Unable to load HttpZarrStore") from e
 
+            zarr_path = _file_path.as_posix().lstrip("/")
             file_output = HttpZarrStore(
-                service_url=self.service_url,
-                dataset_id=dataset_id,
-                zarr_path=_file_path.as_posix(),
+                base_url=f"{self.service_url}/data/{dataset_id}/{zarr_path}",
                 token=token,
                 chunk_cache=self.chunk_cache,
                 logger=self.logger,
@@ -394,6 +393,63 @@ class BioEngineDatasets:
         )
 
         return file_output
+
+    def open_remote_zarr(
+        self,
+        uri: str,
+        token: Optional[str] = None,
+    ) -> "HttpZarrStore":
+        """
+        Stream an OME-Zarr (or any Zarr) from an arbitrary HTTPS URI.
+
+        Bypasses the local data server entirely — callers pass a URI obtained
+        elsewhere (e.g. from the BioImage Archive search API) and get back a
+        Zarr store that streams chunks on demand via HTTP byte-range requests.
+        The store reuses this client's shared chunk cache.
+
+        Args:
+            uri: HTTPS URL of the Zarr root (the directory containing
+                ``.zarray`` for a Zarr v2 array, ``.zattrs`` for a Zarr v2
+                group, or ``zarr.json`` for a Zarr v3 store).
+            token: Optional auth token, appended as ``?token=`` to chunk
+                URLs. Public Zarr roots (e.g. BioImage Archive) don't need it.
+
+        Returns:
+            HttpZarrStore that can be opened with ``zarr.open(store, ...)``.
+
+        Example:
+            ```python
+            # Search the BioImage Archive for an OME-Zarr image
+            import httpx
+            r = httpx.get(
+                "https://beta.bioimagearchive.org/search/v1/search/fts/image",
+                params={"q": "cellpose", "pageSize": 1},
+            ).json()
+            hit = r["hits"]["hits"][0]["_source"]
+            uri = next(
+                rep["file_uri"][0]
+                for rep in hit["representation"]
+                if rep["image_format"] == ".ome.zarr"
+            )
+
+            # Stream the OME-Zarr
+            import zarr
+            store = datasets.open_remote_zarr(uri)
+            root = zarr.open(store, mode="r")
+            ```
+        """
+        try:
+            from bioengine.datasets.http_zarr_store import HttpZarrStore
+        except ImportError as e:
+            raise ImportError("Unable to load HttpZarrStore") from e
+
+        self.logger.debug(f"Opening remote Zarr at {uri}")
+        return HttpZarrStore(
+            base_url=uri,
+            token=token,
+            chunk_cache=self.chunk_cache,
+            logger=self.logger,
+        )
 
     async def save_file(
         self,
