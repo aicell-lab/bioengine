@@ -13,9 +13,6 @@ on:
         options:
           - testpypi
           - pypi
-  push:
-    branches:
-      - feat/pypi-publish
 
 jobs:
   build:
@@ -57,7 +54,7 @@ jobs:
   publish-testpypi:
     name: Publish to TestPyPI
     needs: build
-    if: github.event_name == 'release' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')
     runs-on: ubuntu-latest
     environment:
       name: testpypi
