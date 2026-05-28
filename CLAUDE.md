@@ -326,7 +326,7 @@ The CLI source lives in `bioengine/cli/` in this repo. Install with `pip install
   - **Do not bake in machine-specific or user-identifying paths/identifiers** (`/proj/aicell/users/x_nilme/...`, `/home/<user>/...`, a SLURM allocation id, a private cluster name). The repo ships to other clusters; those strings leak local layout and rot the moment paths change. Use a generic placeholder (`<workspace>/...`, `the cluster's shared filesystem`) or drop the path entirely if the surrounding code already explains the shape.
   - When in doubt: delete the comment, run the diff again, and ask whether the code is materially harder to understand. If not, the comment was not pulling its weight.
 - Planning lives in model context — do NOT create planning files in the repo.
-- Lessons go in `.github/copilot-instructions.md` (durable repo-level knowledge).
+- **This file is also exposed as `.github/copilot-instructions.md`** (a symlink to `../CLAUDE.md`) so GitHub Copilot agents see the same rules as Claude Code agents. Edit `CLAUDE.md`; the symlink follows.
 - **Test on the live worker**: When working on a BioEngine app, test and debug by deploying to the live `bioimage-io/bioengine-worker` service on https://hypha.aicell.io and calling the service directly. Do not write standalone test scripts for app behaviour — use the live service. Deploy with a stable `application_id` matching the artifact alias so the service is consistently addressable:
   ```python
   app_id = await worker.deploy_app(
@@ -362,6 +362,10 @@ The CLI source lives in `bioengine/cli/` in this repo. Install with `pip install
 - **PRs are only required for changes that trigger `docker-publish.yml`** (i.e. changes under `bioengine/**`, `requirements*.txt`, `pyproject.toml`, `docker/**`, `.dockerignore`). Changes to `apps/**` only — push directly to `main`, no PR needed.
 - **NEVER push directly to `main` for worker/package code.** Always use a feature branch and open a PR for any change that touches the paths above. If the user asks you to push directly to main for those paths, refuse and create a PR instead.
 - **Always open the PR immediately after pushing the branch** using the GitHub PAT from `.env` so the user can see and review it without having to navigate to GitHub manually. Never merge a PR — that is always left to the user.
+- **PR descriptions are standalone documentation, not conversation summaries.** A PR body on any `aicell-lab/*` or `bioimage-io/*` repo is read months later by maintainers, contributors, and automated review tools, who did not follow the discussion that produced it. Assume the reader knows only how BioEngine is built.
+  - **Include**: problem / motivation, solution, new features or behavioural changes, migration notes (if breaking), test plan, file-level summary.
+  - **Do not include**: "design choice — alternative considered ...", pending follow-ups, after-merge / deployment steps, "pairs with PR #N ..." beyond a single `Depends on #N` line when there's a real ordering constraint, "per the recent discussion ...", "as we agreed", "after I tested X" — any direct reference to the conversation flow that produced the PR.
+  - Previously-merged PRs that violate this style stay as-is — apply going forward only.
 - **Clean up test deployments**: After testing is complete, stop and delete any temporary apps deployed to the live worker:
   ```python
   await worker.stop_app(application_id=app_id)   # stops the Ray Serve deployment
