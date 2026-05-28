@@ -179,7 +179,11 @@ class RayCluster:
         self.address = None
         self.serve_http_url = None
         self.proxy_actor_handle = None
-        self.proxy_actor_name = "BIOENGINE_PROXY_ACTOR"
+        # Version-suffix the actor name so workers on different BioEngine
+        # versions get their own detached actor — they don't fight over the
+        # same one. Strip characters that aren't safe in a Ray actor name.
+        _safe_version = re.sub(r"[^a-zA-Z0-9_]", "_", bioengine.__version__ or "unknown")
+        self.proxy_actor_name = f"BIOENGINE_PROXY_ACTOR_{_safe_version}"
         self.cluster_status_history = OrderedDict()
         self.max_status_history_length = 100
         self.is_ready = asyncio.Event()
@@ -779,8 +783,10 @@ class RayCluster:
                 dashboard_port = self.ray_cluster_config["ports"]["dashboard"]
                 dashboard_url = f"http://127.0.0.1:{dashboard_port}"
 
-            # Reuse a stable detached proxy actor across worker restarts
-            # If it does not exist yet, create it
+            # Each BioEngine version gets its own detached proxy actor (the
+            # name is version-suffixed in ``__init__``). Workers on the same
+            # version share an actor; workers on different versions never
+            # collide. Older actors self-evict after a long idle period.
             proxy_actor = BioEngineProxyActor.options(
                 name=self.proxy_actor_name,
                 namespace="bioengine",
@@ -788,6 +794,7 @@ class RayCluster:
                 get_if_exists=True,
             )
             self.proxy_actor_handle = proxy_actor.remote(
+                bioengine_version=bioengine.__version__,
                 exclude_head_node=exclude_head_node,
                 check_pending_resources=check_pending_resources,
                 dashboard_url=dashboard_url,
