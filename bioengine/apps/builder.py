@@ -23,14 +23,10 @@ import ast
 import asyncio
 import base64
 import hashlib
-import importlib.metadata
 import json
 import logging
 import os
-import re
 import shutil
-import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -401,72 +397,6 @@ class AppBuilder:
         )
         return pkg_uri
 
-    # ───────────────── pydantic-core preflight (kept) ────────────────────
-
-    def _check_pydantic_core_compatibility(
-        self, pip_requirements: List[str]
-    ) -> None:
-        """Fast-fail when the runtime_env's resolved ``pydantic-core`` would
-        diverge from the worker's. Cross-process pickle of pydantic models
-        fails opaquely otherwise (``'FieldInfo' object has no attribute
-        'exclude_if'`` and similar)."""
-        worker_pc_version = importlib.metadata.version("pydantic_core")
-        if not pip_requirements:
-            return
-
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".in", delete=False
-        ) as f:
-            f.write("\n".join(pip_requirements) + "\n")
-            req_path = Path(f.name)
-
-        try:
-            result = subprocess.run(
-                [
-                    "uv",
-                    "pip",
-                    "compile",
-                    "--no-header",
-                    "--quiet",
-                    "--no-cache",
-                    str(req_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=True,
-            )
-        finally:
-            req_path.unlink(missing_ok=True)
-
-        match = re.search(
-            r"^pydantic-core==([0-9A-Za-z.+-]+)",
-            result.stdout,
-            re.MULTILINE,
-        )
-        if not match:
-            raise RuntimeError(
-                "uv pip compile resolved the runtime_env pip list without "
-                "any pydantic-core entry. BioEngine injects pydantic into "
-                "every introspection runtime_env; this shouldn't happen. "
-                f"Resolved output:\n{result.stdout[:1000]}"
-            )
-
-        resolved_pc_version = match.group(1)
-        if resolved_pc_version == worker_pc_version:
-            return
-
-        raise RuntimeError(
-            "pydantic-core version mismatch between the BioEngine worker "
-            f"({worker_pc_version}) and the application's runtime_env "
-            f"({resolved_pc_version}). Cross-version pickle fails with "
-            "errors like \"'FieldInfo' object has no attribute "
-            "'exclude_if'\". Resolution: pin pydantic in this app's "
-            f"requirements so it resolves to pydantic-core=={worker_pc_version}, "
-            "or rebuild the BioEngine worker image with "
-            f"pydantic-core=={resolved_pc_version}."
-        )
-
     # ───────────────────────── kwargs translation ────────────────────────
 
     @staticmethod
@@ -664,10 +594,7 @@ class AppBuilder:
         # single source of truth.
         pkg_uri = runtime_env["py_modules"][0]
 
-        # 4. pydantic-core preflight (keep — same failure mode applies).
-        self._check_pydantic_core_compatibility(runtime_env["pip"])
-
-        # 5. Introspect the user package via a Ray task in the app's env.
+        # 4. Introspect the user package via a Ray task in the app's env.
         try:
             spec = await asyncio.to_thread(
                 ray.get,
@@ -687,11 +614,11 @@ class AppBuilder:
                 f"{SPEC_FORMAT_VERSION!r}."
             )
 
-        # 6. Translate user-friendly kwargs keys and validate against spec.
+        # 5. Translate user-friendly kwargs keys and validate against spec.
         translated_kwargs = self._translate_kwargs_keys(spec, application_kwargs)
         validate_kwargs_against_spec(spec, translated_kwargs)
 
-        # 7. Resource totals and disable_gpu override.
+        # 6. Resource totals and disable_gpu override.
         if disable_gpu:
             for meta in spec["classes"].values():
                 opts = meta.get("ray_actor_options", {})
@@ -699,7 +626,7 @@ class AppBuilder:
                     opts["num_gpus"] = 0
         required_resources = self._sum_resources(spec)
 
-        # 8. Generate the proxy service token (kept).
+        # 7. Generate the proxy service token.
         proxy_service_token = await self.server.generate_token(
             {
                 "workspace": self.server.config.workspace,
@@ -708,12 +635,12 @@ class AppBuilder:
             }
         )
 
-        # 9. Authorisation resolution (kept logic, refactored helper).
+        # 8. Authorisation resolution.
         effective_authorized_users = self._resolve_authorized_users(
             manifest, authorized_users, deploying_user, admin_users
         )
 
-        # 10. Build the proxy_args and run the bind graph in the runtime_env.
+        # 9. Build the proxy_args; submit happens later in AppBuilder.submit().
         method_schemas = spec["classes"][spec["entry_id"]]["method_schemas"]
         available_methods = [m["name"] for m in method_schemas]
         spec_hash = hashlib.sha256(
