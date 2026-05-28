@@ -77,6 +77,12 @@ class BioEngineProxyActor:
         self.gcs_address = ray.get_runtime_context().gcs_address
         self.dashboard_url = dashboard_url
 
+        # Record the BioEngine version that constructed this actor so a
+        # worker on a different version can detect the mismatch (via
+        # ``get_bioengine_version``) and kill+recreate.
+        from bioengine import __version__ as _bioengine_version
+        self.bioengine_version: Optional[str] = _bioengine_version
+
         # Create GCS client options
         gcs_options = GcsClientOptions.create(
             self.gcs_address,
@@ -103,6 +109,17 @@ class BioEngineProxyActor:
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
         logger.info(f"ClusterState initialized with GCS address: {self.gcs_address}")
+        logger.info(f"BioEngine version: {self.bioengine_version}")
+
+    def get_bioengine_version(self) -> Optional[str]:
+        """Return the BioEngine version recorded when this actor was constructed.
+
+        Used by workers attaching to an existing detached actor: if the
+        returned version does not match the worker's local
+        ``bioengine.__version__``, the worker kills this actor and creates
+        a fresh one so the code matches.
+        """
+        return self.bioengine_version
 
     def get_geo_location(self) -> Dict[str, Optional[Union[str, float]]]:
         """Return the head node's geographic location, fetched from the actor's egress IP.
