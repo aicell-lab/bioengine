@@ -9,6 +9,7 @@ on:
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   check-version:
@@ -48,7 +49,7 @@ jobs:
         echo "Changed files:" && echo "$CHANGED_FILES" | sed 's/^/ - /'
 
         # Match original path filters
-        if echo "$CHANGED_FILES" | grep -E '^(bioengine/|requirements[^/]*\.txt$|pyproject\.toml$|Dockerfile$|\.dockerignore$)' >/dev/null; then
+        if echo "$CHANGED_FILES" | grep -E '^(bioengine/|docker/|requirements[^/]*\.txt$|pyproject\.toml$|\.dockerignore$)' >/dev/null; then
           echo "RELEVANT_CHANGE=true" >> $GITHUB_ENV
           echo "relevant=true" >> $GITHUB_OUTPUT
           echo "Relevant changes detected; version check will run."
