@@ -364,6 +364,7 @@ The CLI source lives in `bioengine/cli/` in this repo. Install with `pip install
     2. `gh pr create --draft …` so it's visible for review but cannot be auto-merged.
     3. **Just before marking the PR ready for merge:** re-check the latest published image tag on GHCR *and* `origin/main`'s `pyproject.toml`, bump from the higher of the two, push the version-bump commit, then `gh pr ready <number>`.
   - The version-bump commit should be its own atomic commit (`chore(release): bump version to X.Y.Z`) so it can be redone if a different PR sneaks in during review.
+  - `version-check.yml` listens for `ready_for_review`, so marking a draft PR ready fires the required status check without any manual re-trigger.
 - **PRs are only required for changes that trigger `docker-publish.yml`** (i.e. changes under `bioengine/**`, `requirements*.txt`, `pyproject.toml`, `docker/**`, `.dockerignore`). Changes to `apps/**` only — push directly to `main`, no PR needed.
 - **NEVER push directly to `main` for worker/package code.** Always use a feature branch and open a PR for any change that touches the paths above. If the user asks you to push directly to main for those paths, refuse and create a PR instead.
 - **Always open the PR immediately after pushing the branch** using the GitHub PAT from `.env` so the user can see and review it without having to navigate to GitHub manually. Never merge a PR — that is always left to the user.
