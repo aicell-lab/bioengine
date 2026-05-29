@@ -8,13 +8,18 @@ Demonstrates the modern authoring model:
 * API methods via ``@bioengine.method`` instead of ``@schema_method``.
 * Multiplexed model loading via ``@bioengine.multiplexed``.
 * Module-level access to datasets and the logger.
+
+Import rule: this module contains ``@bioengine.app`` and is loaded by
+the worker's introspection Ray task, which runs with only
+``bioengine[worker]`` and the standard library installed. ``pandas``
+ships to the replica via the decorator's ``pip=`` arg and is imported
+lazily inside the smoke test below.
 """
 
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Union
 
-import pandas  # noqa: F401  # top-of-file imports now work
 from pydantic import Field
 
 import bioengine
@@ -47,6 +52,8 @@ class DemoApp:
     async def smoke(self) -> None:
         """Optional startup smoke test — fails the replica if it raises."""
         import os
+
+        import pandas  # noqa: F401  # confirms pip=["pandas"] reached this replica
 
         os.environ["EXAMPLE_ENV_VAR"]
         await self._get_model("test_model")

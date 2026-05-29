@@ -171,6 +171,10 @@ https://hypha.aicell.io/{workspace}/view/{artifact-id}/
 
 User code uses the decorators in the `bioengine` package — `@bioengine.app`, `@bioengine.method`, `@bioengine.async_init`, `@bioengine.smoke_test`, `@bioengine.health_check`, `@bioengine.multiplexed` — and accesses datasets/logger via the module-level `bioengine.datasets` / `bioengine.logger` accessors. Multi-deployment composition is declared by `__init__` type hints; `.remote()` is hidden by `BioEngineRuntimeHandle`. See `docs/migration/v0.11.md` for the full mapping from the legacy decorators and an end-to-end migration walkthrough; see `apps/demo-app/` and `apps/composition-demo/` for reference apps.
 
+### The decorator-module import rule
+
+Modules that contain `@bioengine.app` — and anything they transitively import at top level — must be importable with just `bioengine[worker]` and the standard library installed. The worker's introspection Ray task imports them in a clean baseline runtime_env. Heavy deps still go in `@bioengine.app(pip=…)` (Ray Serve installs them in each replica's venv); just put their imports inside method bodies, or in sibling helper modules that decorator files only lazy-import. See `apps/composition-demo/numpy_ops.py` + `runtimes/b.py` for the helper-module pattern.
+
 ### Local validation
 
 ```bash

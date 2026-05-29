@@ -1,6 +1,10 @@
-"""RuntimeB — stats with numpy at the top of the file (no more inside-method imports)."""
+"""RuntimeB — stats backed by numpy.
 
-import numpy as np
+This file hosts ``@bioengine.app`` so the introspection Ray task imports
+it. Heavy deps stay out of the top level — ``numpy`` lives in the
+sibling ``numpy_ops`` module which is imported lazily inside method
+bodies.
+"""
 
 import bioengine
 
@@ -19,7 +23,9 @@ logger = bioengine.logger
 class RuntimeB:
     @bioengine.async_init
     async def warm_up(self) -> None:
-        logger.info(f"RuntimeB ready (numpy {np.__version__})")
+        from numpy_ops import numpy_version
+
+        logger.info(f"RuntimeB ready (numpy {numpy_version()})")
 
     @bioengine.method
     async def ping(self) -> str:
@@ -29,18 +35,13 @@ class RuntimeB:
     @bioengine.method
     async def get_status(self) -> dict:
         """Self-describe."""
-        return base_status("runtime_b", numpy_version=np.__version__)
+        from numpy_ops import numpy_version
+
+        return base_status("runtime_b", numpy_version=numpy_version())
 
     @bioengine.method
     async def analyze(self, values: list) -> dict:
         """Run statistical analysis on a list of numbers."""
-        arr = np.array(values, dtype=float)
-        return {
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
-            "min": float(np.min(arr)),
-            "max": float(np.max(arr)),
-            "sum": float(np.sum(arr)),
-            "count": len(arr),
-            "sorted": sorted(values),
-        }
+        from numpy_ops import stats
+
+        return stats(values)

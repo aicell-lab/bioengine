@@ -19,7 +19,6 @@ Everything else — class loading, lifecycle wiring, schema collection,
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import base64
 import hashlib
@@ -224,52 +223,6 @@ class AppBuilder:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_bytes(response.content)
 
-    # ──────────────────────── AST: extract pip ───────────────────────────
-
-    def _extract_user_pip_deps(self, pkg_dir: Path) -> List[str]:
-        """Scan ``*.py`` for ``@bioengine.app(..., pip=[...])`` literals.
-
-        The worker doesn't import user code; instead we statically extract
-        every ``pip=`` argument given to ``bioengine.app`` so the
-        introspection task's runtime_env has the deps it needs to ``import``
-        the user package. Decorator args that aren't literal lists of strings
-        are silently skipped — those users should fall back to listing deps
-        in their decorator only (the replica still gets them via Ray Serve's
-        per-deployment runtime_env).
-        """
-        pips: List[str] = []
-        for py_file in pkg_dir.rglob("*.py"):
-            try:
-                source = py_file.read_text()
-                tree = ast.parse(source)
-            except Exception:
-                continue
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                if not self._is_bioengine_app_call(node.func):
-                    continue
-                for kw in node.keywords:
-                    if kw.arg != "pip":
-                        continue
-                    try:
-                        value = ast.literal_eval(kw.value)
-                    except Exception:
-                        continue
-                    if isinstance(value, list):
-                        pips.extend(p for p in value if isinstance(p, str))
-        seen: set[str] = set()
-        return [p for p in pips if not (p in seen or seen.add(p))]
-
-    @staticmethod
-    def _is_bioengine_app_call(func: ast.expr) -> bool:
-        if isinstance(func, ast.Attribute) and func.attr == "app":
-            base = func.value
-            return isinstance(base, ast.Name) and base.id == "bioengine"
-        if isinstance(func, ast.Name) and func.id == "app":
-            return True
-        return False
-
     # ─────────────────────── runtime_env compose ─────────────────────────
 
     def _build_env_vars(
@@ -317,10 +270,18 @@ class AppBuilder:
     def _build_introspect_runtime_env(
         self,
         pkg_root_dir: Path,
-        user_pip: List[str],
         env_vars: Dict[str, str],
     ) -> Dict[str, Any]:
         """Compose the runtime_env for the introspection + build Ray tasks.
+
+        The pip list is the BioEngine baseline only — every module
+        containing ``@bioengine.app`` (and anything they transitively
+        import at top level) is required to be importable with just
+        ``bioengine[worker]`` and the standard library. Heavy
+        application dependencies belong in the decorator's ``pip=`` arg
+        (where Ray Serve installs them once per replica) and are
+        imported lazily inside method bodies or from sibling modules
+        that aren't imported during introspection.
 
         Ray rejects local paths in ``runtime_env.py_modules`` at task or
         actor level (only ``ray.init`` accepts them). To work around that
@@ -328,7 +289,7 @@ class AppBuilder:
         storage, then reference the resulting ``gcs://...zip`` URI.
         """
         base_pip = update_requirements(
-            list(user_pip),
+            [],
             select=["httpx", "hypha-rpc", "pydantic"],
             extras=["worker"],
         )
@@ -561,13 +522,7 @@ class AppBuilder:
             artifact_id, version, application_id
         )
 
-        # 2. AST-scan the user's modules for @bioengine.app(pip=...) deps.
-        user_pip = self._extract_user_pip_deps(pkg_root_dir)
-        self.logger.debug(
-            f"Extracted user pip deps for introspection: {user_pip}"
-        )
-
-        # 3. Compose env_vars and the introspection runtime_env.
+        # 2. Compose env_vars and the introspection runtime_env.
         # The CLI-supplied env_vars are flattened across deployments today;
         # in the v0.6 model the framework only sees a single env_vars dict
         # (per-deployment runtime_env extension is via the @app decorator's
@@ -586,7 +541,7 @@ class AppBuilder:
             application_id, artifact_id, non_secret_env_vars, secret_env_vars, hypha_token
         )
         runtime_env = self._build_introspect_runtime_env(
-            pkg_root_dir, user_pip, env_vars
+            pkg_root_dir, env_vars
         )
         # The bootstrap tasks both receive the package URI directly so
         # they can inject it into each deployment's ``runtime_env`` at
@@ -594,7 +549,7 @@ class AppBuilder:
         # single source of truth.
         pkg_uri = runtime_env["py_modules"][0]
 
-        # 4. Introspect the user package via a Ray task in the app's env.
+        # 3. Introspect the user package via a Ray task in the app's env.
         try:
             spec = await asyncio.to_thread(
                 ray.get,
@@ -614,11 +569,11 @@ class AppBuilder:
                 f"{SPEC_FORMAT_VERSION!r}."
             )
 
-        # 5. Translate user-friendly kwargs keys and validate against spec.
+        # 4. Translate user-friendly kwargs keys and validate against spec.
         translated_kwargs = self._translate_kwargs_keys(spec, application_kwargs)
         validate_kwargs_against_spec(spec, translated_kwargs)
 
-        # 6. Resource totals and disable_gpu override.
+        # 5. Resource totals and disable_gpu override.
         if disable_gpu:
             for meta in spec["classes"].values():
                 opts = meta.get("ray_actor_options", {})
@@ -626,7 +581,7 @@ class AppBuilder:
                     opts["num_gpus"] = 0
         required_resources = self._sum_resources(spec)
 
-        # 7. Generate the proxy service token.
+        # 6. Generate the proxy service token.
         proxy_service_token = await self.server.generate_token(
             {
                 "workspace": self.server.config.workspace,
@@ -635,12 +590,12 @@ class AppBuilder:
             }
         )
 
-        # 8. Authorisation resolution.
+        # 7. Authorisation resolution.
         effective_authorized_users = self._resolve_authorized_users(
             manifest, authorized_users, deploying_user, admin_users
         )
 
-        # 9. Build the proxy_args; submit happens later in AppBuilder.submit().
+        # 8. Build the proxy_args; submit happens later in AppBuilder.submit().
         method_schemas = spec["classes"][spec["entry_id"]]["method_schemas"]
         available_methods = [m["name"] for m in method_schemas]
         spec_hash = hashlib.sha256(
