@@ -38,9 +38,16 @@
   .dropzone { border: 2px dashed #334155; border-radius: 0.5rem; padding: 1.5rem;
               text-align: center; color: #94a3b8; cursor: pointer; transition: 0.15s; }
   .dropzone:hover, .dropzone.drag { border-color: #38bdf8; background: #0c1a2e; color: #38bdf8; }
-  .preview { margin-top: 0.75rem; text-align: center; }
+  .preview { margin-top: 0.75rem; text-align: center; position: relative; }
   .preview img { max-width: 100%; max-height: 280px; border-radius: 0.5rem; border: 1px solid #334155; }
   .preview .meta { font-size: 0.75rem; color: #64748b; margin-top: 0.25rem; }
+  .preview .clear-btn { position: absolute; top: 0.4rem; right: 0.4rem; background: rgba(15,23,42,.85);
+                        color: #fca5a5; border: 1px solid #334155; border-radius: 0.5rem;
+                        padding: 0.25rem 0.6rem; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
+  .preview .clear-btn:hover { background: #450a0a; color: #fca5a5; border-color: #ef4444; }
+  .login-link { display: inline-block; margin-left: 0.5rem; color: #38bdf8;
+                text-decoration: underline; font-size: 0.8rem; word-break: break-all; }
+  .login-link:hover { color: #7dd3fc; }
   .result-block { background: #0f172a; border-radius: 0.5rem; padding: 0.75rem;
                   font-size: 0.85rem; color: #e2e8f0; white-space: pre-wrap; word-break: break-word;
                   min-height: 2rem; max-height: 32rem; overflow-y: auto; }
@@ -70,6 +77,7 @@
   <div class="row">
     <button class="btn" id="loginBtn">Sign in</button>
     <span><span class="status-dot" id="loginDot"></span><span id="loginStatus">Not signed in</span></span>
+    <a id="loginLink" class="login-link" target="_blank" rel="noopener" hidden>Open login page ↗</a>
   </div>
   <div class="small" style="margin-top: 0.5rem;">
     Scratch artifacts will be created in <code id="userWs">(your workspace)</code> and deleted
@@ -85,6 +93,7 @@
   </div>
   <input type="file" id="fileInput" accept="image/*,.tif,.tiff" style="display:none" />
   <div id="preview" class="preview" hidden>
+    <button id="clearBtn" class="clear-btn" type="button">Clear</button>
     <img id="previewImg" alt="image preview" />
     <div class="meta" id="previewMeta"></div>
   </div>
@@ -162,10 +171,27 @@ function refreshInspectEnabled() {
 
 $("loginBtn").addEventListener("click", async () => {
   $("loginBtn").disabled = true;
-  setLogin("busy", "Opening Hypha login…");
-  log("Login: opening Hypha auth flow");
+  setLogin("busy", "Requesting Hypha login URL…");
+  $("loginLink").hidden = true;
+  log("Login: requesting Hypha auth URL");
   try {
-    const token = await login({ server_url: SERVER_URL });
+    // login_callback: render the URL as a click-through anchor instead of
+    // relying on window.open(), which most browsers block once the original
+    // click context has expired (the login URL only comes back asynchronously).
+    const token = await login({
+      server_url: SERVER_URL,
+      login_callback: (ctx) => {
+        const a = $("loginLink");
+        a.href = ctx.login_url;
+        a.textContent = "Open login page ↗";
+        a.hidden = false;
+        setLogin("busy", "Click the link to sign in…");
+        log("Login URL ready — click 'Open login page' (also: " + ctx.login_url + ")");
+        // Best-effort popup: still try, but the link is the reliable path.
+        try { window.open(ctx.login_url, "_blank", "noopener,noreferrer"); } catch (_) {}
+      },
+    });
+    $("loginLink").hidden = true;
     server = await connectToServer({ server_url: SERVER_URL, token });
     userWorkspace = server.config.workspace;
     $("userWs").textContent = userWorkspace;
@@ -201,12 +227,23 @@ $("fileInput").addEventListener("change", e => {
   if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]);
 });
 
+function clearPickedFile() {
+  pickedFile = null;
+  $("preview").hidden = true;
+  $("previewImg").src = "";
+  $("previewMeta").textContent = "";
+  $("fileInput").value = "";
+  refreshInspectEnabled();
+}
+$("clearBtn").addEventListener("click", () => {
+  clearPickedFile();
+  log("Cleared picked image.");
+});
+
 function handleFile(file) {
   if (file.size > MAX_IMAGE_BYTES) {
     log(`File too large: ${(file.size / 1024 / 1024).toFixed(1)} MB > ${MAX_IMAGE_BYTES / 1024 / 1024} MB`, "err");
-    pickedFile = null;
-    $("preview").hidden = true;
-    refreshInspectEnabled();
+    clearPickedFile();
     return;
   }
   pickedFile = file;
