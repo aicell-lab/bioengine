@@ -1167,12 +1167,11 @@ class EntryDeployment:
 
     def _get_bioimageio_versions(self) -> Dict[str, str]:
         """
-        Return installed versions of bioimageio packages used by this deployment.
+        Return identities the test cache invalidates on.
 
-        Returns:
-            Dictionary containing package versions for:
-            - bioimageio.core
-            - bioimageio.spec
+        Includes installed versions of the bioimageio packages and the
+        model-runner artifact's own version — so the existing env-mismatch
+        check in ``test()`` re-runs when the runner itself is upgraded.
         """
         from importlib.metadata import PackageNotFoundError, version
 
@@ -1185,38 +1184,57 @@ class EntryDeployment:
             except PackageNotFoundError:
                 versions[package_name] = "not-installed"
 
+        versions["bioimage-io/model-runner"] = os.environ.get(
+            "HYPHA_ARTIFACT_VERSION", "unknown"
+        )
+
         logger.debug(f"📦 Bioimage.io package versions: {versions}")
         return versions
 
-    def _ensure_bioengine_in_test_env(self, test_report: dict) -> dict:
-        """Ensure test_report['env'] contains the current BioEngine version row."""
+    def _stamp_runtime_versions_in_test_env(self, test_report: dict) -> dict:
+        """Upsert runtime-identity rows in ``test_report['env']``.
+
+        The test cache invalidation in ``test()`` reuses this env list to
+        detect when a stored report was produced under different runtime
+        versions; downstream consumers (e.g. bioimage.io CI) also read it
+        from the published report to drive their own cache keys.
+        """
+        rows = [
+            ("bioengine", __version__),
+            (
+                "bioimage-io/model-runner",
+                os.environ.get("HYPHA_ARTIFACT_VERSION", "unknown"),
+            ),
+        ]
+
         env = test_report.get("env")
         if not isinstance(env, list):
             env = []
         else:
             env = list(env)
 
-        bioengine_row_index: Optional[int] = None
-        for i, row in enumerate(env):
-            if (
-                isinstance(row, (list, tuple))
-                and len(row) >= 1
-                and str(row[0]) == "bioengine"
-            ):
-                bioengine_row_index = i
-                break
+        for name, version_value in rows:
+            row_index: Optional[int] = None
+            for i, row in enumerate(env):
+                if (
+                    isinstance(row, (list, tuple))
+                    and len(row) >= 1
+                    and str(row[0]) == name
+                ):
+                    row_index = i
+                    break
 
-        bioengine_row = ["bioengine", __version__, "", ""]
-        if bioengine_row_index is None:
-            env.append(bioengine_row)
-        else:
-            existing_row = env[bioengine_row_index]
-            if isinstance(existing_row, tuple):
-                existing_row = list(existing_row)
-            while len(existing_row) < 4:
-                existing_row.append("")
-            existing_row[1] = __version__
-            env[bioengine_row_index] = existing_row
+            new_row = [name, version_value, "", ""]
+            if row_index is None:
+                env.append(new_row)
+            else:
+                existing_row = env[row_index]
+                if isinstance(existing_row, tuple):
+                    existing_row = list(existing_row)
+                while len(existing_row) < 4:
+                    existing_row.append("")
+                existing_row[1] = version_value
+                env[row_index] = existing_row
 
         test_report["env"] = env
         return test_report
@@ -1341,6 +1359,20 @@ class EntryDeployment:
 
     # === Exposed BioEngine App Methods - all methods decorated with @schema_method will be exposed as API endpoints ===
     # Note: Parameter type hints and docstrings will be used to generate the API documentation.
+
+    @schema_method
+    async def get_version(self) -> Dict[str, str]:
+        """Return the artifact identity this replica was deployed from.
+
+        Callers (e.g. bioimage.io CI cache invalidation) use this to detect
+        when a stored test report was produced under a different runner
+        version and should be re-tested.
+        """
+        return {
+            "artifact_id": os.environ.get("HYPHA_ARTIFACT_ID", "unknown"),
+            "version": os.environ.get("HYPHA_ARTIFACT_VERSION", "unknown"),
+            "bioengine_version": __version__,
+        }
 
     @schema_method
     async def search_models(
@@ -1753,8 +1785,7 @@ class EntryDeployment:
                         f"⚠️ Generated fallback test report for '{model_id}' due to test error."
                     )
 
-                # Add BioEngine version to the test report environment
-                test_report = self._ensure_bioengine_in_test_env(test_report)
+                test_report = self._stamp_runtime_versions_in_test_env(test_report)
 
                 # Add tested_at timestamp to the test report so the report is self-contained.
                 test_report["tested_at"] = tested_at
