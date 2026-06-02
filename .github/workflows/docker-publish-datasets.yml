@@ -1,0 +1,105 @@
+name: Build and Publish Datasets Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bioengine/datasets/**'
+      - 'requirements-datasets.txt'
+      - 'docker/datasets.Dockerfile'
+      - '.dockerignore'
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+
+    - name: Extract current version from pyproject.toml
+      run: |
+        VERSION=$(grep -E '^version\s*=' pyproject.toml | sed -E 's/version\s*=\s*"(.*)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "❌ Could not extract version from pyproject.toml"
+          exit 1
+        fi
+        echo "📦 Extracted version: $VERSION"
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Get latest version from container registry
+      run: |
+        if ! command -v skopeo &> /dev/null; then
+            echo "skopeo could not be found, installing..."
+            sudo apt-get update && sudo apt-get install -y skopeo
+        fi
+
+        IMAGE="docker://ghcr.io/aicell-lab/bioengine-datasets"
+        echo "🔍 Fetching tags for $IMAGE..."
+
+        if ! skopeo list-tags "$IMAGE" > /dev/null 2>&1; then
+          echo "❌ Could not list tags for $IMAGE."
+          exit 1
+        fi
+
+        TAGS=$(skopeo list-tags "$IMAGE" | jq -r '.Tags[]')
+
+        LATEST_VERSION=$(echo "$TAGS" \
+          | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+          | sort -V \
+          | tail -n1)
+
+        if [ -z "$LATEST_VERSION" ]; then
+          echo "ℹ️  No prior version tags found for $IMAGE — first publish."
+          LATEST_VERSION="0.0.0"
+        fi
+
+        echo "📦 Latest published version: $LATEST_VERSION"
+        echo "PREVIOUS_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
+
+    - name: Check that version is updated and newer
+      run: |
+        echo "📦 Previous version: $PREVIOUS_VERSION"
+        echo "📦 Current version:  $VERSION"
+        if [ "$VERSION" = "$PREVIOUS_VERSION" ]; then
+          echo "❌ Version has not been updated. Please bump the version in pyproject.toml."
+          exit 1
+        fi
+        if [ "$(printf '%s\n' "$PREVIOUS_VERSION" "$VERSION" | sort -V | head -n1)" = "$VERSION" ]; then
+          echo "❌ New version ($VERSION) is not greater than previous version ($PREVIOUS_VERSION)."
+          exit 1
+        fi
+        echo "✅ Version updated correctly."
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push datasets image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: docker/datasets.Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ghcr.io/aicell-lab/bioengine-datasets:latest
+          ghcr.io/aicell-lab/bioengine-datasets:${{ env.VERSION }}
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+        cache-from: type=gha,scope=datasets
+        cache-to: type=gha,mode=max,scope=datasets

@@ -1,4 +1,4 @@
-name: Build and Publish Docker Images
+name: Build and Publish Worker Image
 
 on:
   push:
@@ -6,9 +6,10 @@ on:
       - main
     paths:
       - 'bioengine/**'
-      - 'requirements*.txt'
-      - 'pyproject.toml'
-      - 'docker/**'
+      - '!bioengine/datasets/**'
+      - 'requirements-worker.txt'
+      - 'docker/worker.Dockerfile'
+      - 'docker/worker-ray-overlay.Dockerfile'
       - '.dockerignore'
   workflow_dispatch:
 
@@ -107,18 +108,3 @@ jobs:
           org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
         cache-from: type=gha,scope=worker
         cache-to: type=gha,mode=max,scope=worker
-
-    - name: Build and push datasets image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: docker/datasets.Dockerfile
-        platforms: linux/amd64,linux/arm64
-        push: true
-        tags: |
-          ghcr.io/aicell-lab/bioengine-datasets:latest
-          ghcr.io/aicell-lab/bioengine-datasets:${{ env.VERSION }}
-        labels: |
-          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-        cache-from: type=gha,scope=datasets
-        cache-to: type=gha,mode=max,scope=datasets
