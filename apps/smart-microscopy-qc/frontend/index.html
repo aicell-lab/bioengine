@@ -88,7 +88,7 @@
 <div class="card">
   <h2>2 — Image</h2>
   <div id="dropzone" class="dropzone">
-    Drag a microscopy image here, or click to pick a file.<br>
+    Drag a microscopy image here, click to pick a file, or paste a screenshot from the clipboard (⌘V / Ctrl+V).<br>
     <span class="small">Max 25 MB on the wire. PNG / JPG / TIFF accepted.</span>
   </div>
   <input type="file" id="fileInput" accept="image/*,.tif,.tiff" style="display:none" />
@@ -128,10 +128,17 @@
 import { login, connectToServer }
   from "https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.54/dist/hypha-rpc-websocket.mjs";
 
-// URL params: ?server=<hypha-server>&ws_service_id=<full-qc-service-id>
+// URL params:
+//   ?server=<hypha-server>              — Hypha base URL (default: aicell.io)
+//   ?ws_service_id=<full-qc-service-id> — pinned QC service id (else short fallback)
+//   ?token=<hypha-token>                — TESTING-ONLY: skip the interactive login
+//                                          flow and connect directly. Tokens in URLs
+//                                          are visible in browser history; do not
+//                                          paste production tokens here.
 const params     = new URLSearchParams(window.location.search);
 const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
 const SERVICE_ID = params.get("ws_service_id") || "";
+const URL_TOKEN  = params.get("token") || "";
 const QC_FALLBACK = "bioimage-io/smart-microscopy-qc";   // short form (proxy WebRTC offer endpoint)
 
 const MAX_INSTRUCTION_CHARS = 4000;   // must match _MAX_INSTRUCTION_CHARS in main.py
@@ -169,6 +176,23 @@ function refreshInspectEnabled() {
 
 // --- Login --------------------------------------------------------------
 
+async function connectWithToken(token, sourceLabel) {
+  $("loginBtn").disabled = true;
+  $("loginLink").hidden = true;
+  setLogin("busy", "Connecting…");
+  server = await connectToServer({ server_url: SERVER_URL, token });
+  userWorkspace = server.config.workspace;
+  $("userWs").textContent = userWorkspace;
+  setLogin("ok", `Signed in (${userWorkspace}) via ${sourceLabel}`);
+  log(`Connected as workspace=${userWorkspace} (${sourceLabel})`, "ok");
+  artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
+  const sid = SERVICE_ID || QC_FALLBACK;
+  log(`Resolving QC service: ${sid}`);
+  qcSvc = await server.getService(sid, { _rkwargs: true });
+  log("QC service handle ready.", "ok");
+  refreshInspectEnabled();
+}
+
 $("loginBtn").addEventListener("click", async () => {
   $("loginBtn").disabled = true;
   setLogin("busy", "Requesting Hypha login URL…");
@@ -191,24 +215,24 @@ $("loginBtn").addEventListener("click", async () => {
         try { window.open(ctx.login_url, "_blank", "noopener,noreferrer"); } catch (_) {}
       },
     });
-    $("loginLink").hidden = true;
-    server = await connectToServer({ server_url: SERVER_URL, token });
-    userWorkspace = server.config.workspace;
-    $("userWs").textContent = userWorkspace;
-    setLogin("ok", `Signed in (${userWorkspace})`);
-    log(`Login OK as workspace=${userWorkspace}`, "ok");
-    artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
-    const sid = SERVICE_ID || QC_FALLBACK;
-    log(`Resolving QC service: ${sid}`);
-    qcSvc = await server.getService(sid, { _rkwargs: true });
-    log("QC service handle ready.", "ok");
-    refreshInspectEnabled();
+    await connectWithToken(token, "Hypha login");
   } catch (err) {
     setLogin("error", "Login failed");
     log("Login error: " + err.message, "err");
     $("loginBtn").disabled = false;
   }
 });
+
+// Testing path: if ?token=... is in the URL, auto-connect on load.
+if (URL_TOKEN) {
+  log("?token= present in URL — auto-connecting (testing path)");
+  connectWithToken(URL_TOKEN, "URL token")
+    .catch((err) => {
+      setLogin("error", "URL-token connect failed");
+      log("URL-token connect error: " + err.message, "err");
+      $("loginBtn").disabled = false;
+    });
+}
 
 // --- Image picker -------------------------------------------------------
 
@@ -225,6 +249,30 @@ dropzone.addEventListener("drop", e => {
 });
 $("fileInput").addEventListener("change", e => {
   if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+// Paste handler: accept screenshots from the clipboard. Listens on document
+// (not the dropzone) so the user can paste while focused anywhere on the page,
+// but ignores paste events targeting input fields so the instruction textarea
+// still receives normal text paste.
+document.addEventListener("paste", (e) => {
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "TEXTAREA" || tag === "INPUT") return;
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind === "file" && item.type && item.type.startsWith("image/")) {
+      const blob = item.getAsFile();
+      if (!blob) continue;
+      const ext = (blob.type.split("/")[1] || "png").toLowerCase();
+      const name = `pasted-${Date.now()}.${ext}`;
+      const file = new File([blob], name, { type: blob.type });
+      log(`Pasted image from clipboard: ${name} (${blob.size} B)`);
+      handleFile(file);
+      e.preventDefault();
+      return;
+    }
+  }
 });
 
 function clearPickedFile() {
