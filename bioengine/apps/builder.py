@@ -298,6 +298,7 @@ class AppBuilder:
         non_secret_env_vars: Dict[str, str],
         secret_env_vars: Dict[str, str],
         artifact_id: str,
+        version: str,
     ) -> serve.Deployment:
         """
         Configure the Ray runtime environment for BioEngine deployments.
@@ -329,6 +330,7 @@ class AppBuilder:
             non_secret_env_vars: Environment variables to set directly
             secret_env_vars: Environment variables with sensitive values
             artifact_id: Artifact identifier like "my-workspace/my-app" added as env var 'HYPHA_ARTIFACT_ID'
+            version: Resolved artifact version added as env var 'HYPHA_ARTIFACT_VERSION'
 
         Returns:
             Enhanced deployment with BioEngine runtime environment configured
@@ -387,6 +389,7 @@ class AppBuilder:
         env_vars["HYPHA_SERVER_URL"] = self.server.config.public_base_url
         env_vars["HYPHA_WORKSPACE"] = self.server.config.workspace
         env_vars["HYPHA_ARTIFACT_ID"] = artifact_id
+        env_vars["HYPHA_ARTIFACT_VERSION"] = version
 
         env_vars["BIOENGINE_WORKER_SERVICE_ID"] = self.worker_service_id
 
@@ -1215,6 +1218,7 @@ class AppBuilder:
                 non_secret_env_vars=non_secret_env_vars,
                 secret_env_vars=secret_env_vars,
                 artifact_id=artifact_id,
+                version=version,
             )
 
             # Update the deployment class methods
