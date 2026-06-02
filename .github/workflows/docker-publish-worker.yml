@@ -6,8 +6,8 @@ on:
       - main
     paths:
       - 'bioengine/**'
+      - '!bioengine/datasets/**'
       - 'requirements-worker.txt'
-      - 'pyproject.toml'
       - 'docker/worker.Dockerfile'
       - 'docker/worker-ray-overlay.Dockerfile'
       - '.dockerignore'
