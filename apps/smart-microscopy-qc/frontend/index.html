@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Smart Microscopy QC</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0;
+         min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+         padding: 2rem 1rem; }
+  header { text-align: center; margin-bottom: 1.5rem; }
+  header h1 { font-size: 1.75rem; color: #38bdf8; font-weight: 700; }
+  header p  { color: #94a3b8; margin-top: 0.25rem; font-size: 0.9rem; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem;
+          padding: 1.25rem; width: 100%; max-width: 720px; margin-bottom: 1rem; }
+  .card h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em;
+             color: #64748b; margin-bottom: 0.75rem; }
+  .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .btn { background: #0284c7; color: #fff; border: none; border-radius: 0.5rem;
+         padding: 0.5rem 1rem; cursor: pointer; font-size: 0.875rem; font-weight: 600; }
+  .btn:hover { background: #0369a1; }
+  .btn:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+  .btn.secondary { background: #475569; }
+  .btn.secondary:hover { background: #64748b; }
+  .status-dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%;
+                margin-right: 0.4rem; background: #64748b; vertical-align: middle; }
+  .status-dot.ok    { background: #22c55e; }
+  .status-dot.busy  { background: #f59e0b; }
+  .status-dot.error { background: #ef4444; }
+  .small { font-size: 0.8rem; color: #94a3b8; }
+  textarea { width: 100%; background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+             border-radius: 0.5rem; padding: 0.5rem; font-family: inherit; font-size: 0.875rem;
+             min-height: 6rem; resize: vertical; outline: none; }
+  textarea:focus { border-color: #38bdf8; }
+  .counter { font-variant-numeric: tabular-nums; }
+  .counter.over { color: #ef4444; font-weight: 700; }
+  .dropzone { border: 2px dashed #334155; border-radius: 0.5rem; padding: 1.5rem;
+              text-align: center; color: #94a3b8; cursor: pointer; transition: 0.15s; }
+  .dropzone:hover, .dropzone.drag { border-color: #38bdf8; background: #0c1a2e; color: #38bdf8; }
+  .preview { margin-top: 0.75rem; text-align: center; }
+  .preview img { max-width: 100%; max-height: 280px; border-radius: 0.5rem; border: 1px solid #334155; }
+  .preview .meta { font-size: 0.75rem; color: #64748b; margin-top: 0.25rem; }
+  .result-block { background: #0f172a; border-radius: 0.5rem; padding: 0.75rem;
+                  font-size: 0.85rem; color: #e2e8f0; white-space: pre-wrap; word-break: break-word;
+                  min-height: 2rem; max-height: 32rem; overflow-y: auto; }
+  .log { background: #0f172a; border-radius: 0.5rem; padding: 0.5rem 0.75rem;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem;
+         color: #94a3b8; min-height: 1.5rem; max-height: 10rem; overflow-y: auto;
+         border: 1px solid #334155; }
+  .log .ts { color: #64748b; }
+  .log .err { color: #fca5a5; }
+  .log .ok { color: #86efac; }
+  .meta-pill { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 0.5rem;
+               background: #0f172a; color: #94a3b8; font-size: 0.7rem; margin-right: 0.4rem;
+               margin-top: 0.4rem; }
+  .meta-pill strong { color: #e2e8f0; }
+  hr.subdivider { border: 0; border-top: 1px solid #334155; margin: 0.75rem 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔬 Smart Microscopy QC</h1>
+  <p>Drag-and-drop a microscopy image, write a QC question, get a VLM verdict.</p>
+</header>
+
+<div class="card">
+  <h2>1 — Sign in to Hypha</h2>
+  <div class="row">
+    <button class="btn" id="loginBtn">Sign in</button>
+    <span><span class="status-dot" id="loginDot"></span><span id="loginStatus">Not signed in</span></span>
+  </div>
+  <div class="small" style="margin-top: 0.5rem;">
+    Scratch artifacts will be created in <code id="userWs">(your workspace)</code> and deleted
+    after the call. The QC service runs in the <code>bioimage-io</code> workspace.
+  </div>
+</div>
+
+<div class="card">
+  <h2>2 — Image</h2>
+  <div id="dropzone" class="dropzone">
+    Drag a microscopy image here, or click to pick a file.<br>
+    <span class="small">Max 25 MB on the wire. PNG / JPG / TIFF accepted.</span>
+  </div>
+  <input type="file" id="fileInput" accept="image/*,.tif,.tiff" style="display:none" />
+  <div id="preview" class="preview" hidden>
+    <img id="previewImg" alt="image preview" />
+    <div class="meta" id="previewMeta"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>3 — QC Instruction</h2>
+  <textarea id="instruction" placeholder="e.g. Evaluate focus, illumination uniformity, and approximate cell count. Flag any contamination."></textarea>
+  <div class="small" style="margin-top: 0.35rem; display:flex; justify-content:space-between;">
+    <span>Free-text question about what the VLM should look for.</span>
+    <span><span id="charCount" class="counter">0</span> / <span id="charCap">4000</span></span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>4 — Inspect</h2>
+  <div class="row">
+    <button class="btn" id="inspectBtn" disabled>Run inspect()</button>
+    <span><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span></span>
+  </div>
+  <hr class="subdivider">
+  <div id="metaRow" class="small"></div>
+  <div class="result-block" id="resultBlock">—</div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <div id="log" class="log">Ready.</div>
+</div>
+
+<script type="module">
+import { login, connectToServer }
+  from "https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.54/dist/hypha-rpc-websocket.mjs";
+
+// URL params: ?server=<hypha-server>&ws_service_id=<full-qc-service-id>
+const params     = new URLSearchParams(window.location.search);
+const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
+const SERVICE_ID = params.get("ws_service_id") || "";
+const QC_FALLBACK = "bioimage-io/smart-microscopy-qc";   // short form (proxy WebRTC offer endpoint)
+
+const MAX_INSTRUCTION_CHARS = 4000;   // must match _MAX_INSTRUCTION_CHARS in main.py
+const MAX_IMAGE_BYTES       = 25 * 1024 * 1024;
+
+document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
+
+let server = null, qcSvc = null, artMgr = null, userWorkspace = null;
+let pickedFile = null;
+
+const $ = id => document.getElementById(id);
+
+function log(msg, kind = "") {
+  const ts = new Date().toLocaleTimeString();
+  const cls = kind ? `class="${kind}"` : "";
+  $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${msg}</span>`;
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function setLogin(state, msg) {
+  $("loginDot").className = "status-dot " + (state || "");
+  $("loginStatus").textContent = msg;
+}
+function setRun(state, msg) {
+  $("runDot").className = "status-dot " + (state || "");
+  $("runStatus").textContent = msg;
+}
+
+function refreshInspectEnabled() {
+  const ready = !!qcSvc && !!pickedFile
+    && $("instruction").value.trim().length > 0
+    && $("instruction").value.length <= MAX_INSTRUCTION_CHARS;
+  $("inspectBtn").disabled = !ready;
+}
+
+// --- Login --------------------------------------------------------------
+
+$("loginBtn").addEventListener("click", async () => {
+  $("loginBtn").disabled = true;
+  setLogin("busy", "Opening Hypha login…");
+  log("Login: opening Hypha auth flow");
+  try {
+    const token = await login({ server_url: SERVER_URL });
+    server = await connectToServer({ server_url: SERVER_URL, token });
+    userWorkspace = server.config.workspace;
+    $("userWs").textContent = userWorkspace;
+    setLogin("ok", `Signed in (${userWorkspace})`);
+    log(`Login OK as workspace=${userWorkspace}`, "ok");
+    artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
+    const sid = SERVICE_ID || QC_FALLBACK;
+    log(`Resolving QC service: ${sid}`);
+    qcSvc = await server.getService(sid, { _rkwargs: true });
+    log("QC service handle ready.", "ok");
+    refreshInspectEnabled();
+  } catch (err) {
+    setLogin("error", "Login failed");
+    log("Login error: " + err.message, "err");
+    $("loginBtn").disabled = false;
+  }
+});
+
+// --- Image picker -------------------------------------------------------
+
+const dropzone = $("dropzone");
+dropzone.addEventListener("click", () => $("fileInput").click());
+["dragenter", "dragover"].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault(); dropzone.classList.add("drag");
+}));
+["dragleave", "drop"].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault(); dropzone.classList.remove("drag");
+}));
+dropzone.addEventListener("drop", e => {
+  if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+$("fileInput").addEventListener("change", e => {
+  if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+function handleFile(file) {
+  if (file.size > MAX_IMAGE_BYTES) {
+    log(`File too large: ${(file.size / 1024 / 1024).toFixed(1)} MB > ${MAX_IMAGE_BYTES / 1024 / 1024} MB`, "err");
+    pickedFile = null;
+    $("preview").hidden = true;
+    refreshInspectEnabled();
+    return;
+  }
+  pickedFile = file;
+  $("previewMeta").textContent =
+    `${file.name} — ${(file.size / 1024).toFixed(1)} KB — ${file.type || "image"}`;
+  // TIFFs typically can't be rendered in <img>; show a placeholder.
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  if (["tif", "tiff"].includes(ext)) {
+    $("previewImg").src = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyODAiIGhlaWdodD0iMTYwIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjMGYxNzJhIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZpbGw9IiM2NDc0OGIiIGZvbnQtZmFtaWx5PSJzeXN0ZW0tdWkiIGZvbnQtc2l6ZT0iMTQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5USUZGIChubyBpbi1icm93c2VyIHByZXZpZXcpPC90ZXh0Pjwvc3ZnPg==";
+  } else {
+    const reader = new FileReader();
+    reader.onload = e => { $("previewImg").src = e.target.result; };
+    reader.readAsDataURL(file);
+  }
+  $("preview").hidden = false;
+  log(`Picked file: ${file.name} (${file.size} B)`);
+  refreshInspectEnabled();
+}
+
+// --- Instruction --------------------------------------------------------
+
+const instr = $("instruction");
+instr.addEventListener("input", () => {
+  const len = instr.value.length;
+  $("charCount").textContent = len;
+  $("charCount").className = "counter" + (len > MAX_INSTRUCTION_CHARS ? " over" : "");
+  if (len > MAX_INSTRUCTION_CHARS) {
+    // Hard cap: clip and warn (we ensure the server cap can't trip from this UI).
+    instr.value = instr.value.slice(0, MAX_INSTRUCTION_CHARS);
+    $("charCount").textContent = MAX_INSTRUCTION_CHARS;
+    log(`Instruction clipped to ${MAX_INSTRUCTION_CHARS} chars (UI mirror of server cap)`, "err");
+  }
+  refreshInspectEnabled();
+});
+
+// --- Inspect ------------------------------------------------------------
+
+function randomSuffix() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+async function uploadScratch(file) {
+  const alias = `smart-microscopy-qc-scratch-${randomSuffix()}`;
+  const artifactId = `${userWorkspace}/${alias}`;
+  const ext = (file.name.split(".").pop() || "bin").toLowerCase();
+  const remotePath = `image.${ext}`;
+  log(`Creating scratch artifact ${artifactId}`);
+  await artMgr.create({
+    alias,
+    type: "generic",
+    manifest: {
+      name: "Smart Microscopy QC scratch image",
+      description: "Single image uploaded from the smart-microscopy-qc browser UI. Auto-deleted after the call.",
+      type: "generic",
+    },
+    stage: true,
+    _rkwargs: true,
+  });
+  log(`  → put_file ${remotePath}`);
+  const putUrl = await artMgr.put_file({ artifact_id: artifactId, file_path: remotePath, _rkwargs: true });
+  const buf = await file.arrayBuffer();
+  const resp = await fetch(putUrl, { method: "PUT", body: buf });
+  if (!resp.ok) throw new Error(`PUT failed: ${resp.status} ${resp.statusText}`);
+  await artMgr.commit({ artifact_id: artifactId, _rkwargs: true });
+  log(`  ✓ scratch artifact committed`, "ok");
+  return { artifactId, remotePath };
+}
+
+async function deleteScratch(artifactId) {
+  if (!artifactId) return;
+  try {
+    await artMgr.delete({ artifact_id: artifactId, delete_files: true, recursive: true, _rkwargs: true });
+    log(`Cleaned up scratch artifact ${artifactId}`, "ok");
+  } catch (err) {
+    log(`Cleanup FAILED for ${artifactId}: ${err.message}`, "err");
+  }
+}
+
+$("inspectBtn").addEventListener("click", async () => {
+  if (!pickedFile || !qcSvc) return;
+  $("inspectBtn").disabled = true;
+  setRun("busy", "Uploading image…");
+  $("resultBlock").textContent = "";
+  $("metaRow").innerHTML = "";
+
+  const instruction = instr.value.trim();
+  let scratch = null;
+  const t0 = performance.now();
+
+  try {
+    scratch = await uploadScratch(pickedFile);
+    const imageRef = `${scratch.artifactId}:${scratch.remotePath}`;
+    setRun("busy", "Calling inspect()…");
+    log(`Calling inspect(image_ref=${imageRef})`);
+    const res = await qcSvc.inspect({
+      image_ref: imageRef,
+      instruction,
+      max_new_tokens: 512,
+      _rkwargs: true,
+    });
+    const wallMs = (performance.now() - t0).toFixed(0);
+    setRun("ok", `Done in ${(wallMs / 1000).toFixed(2)} s (server reports ${res.processing_time_s} s)`);
+
+    const pills = [];
+    pills.push(`<span class="meta-pill"><strong>model</strong> ${res.model}</span>`);
+    if (res.image_size) pills.push(`<span class="meta-pill"><strong>image</strong> ${res.image_size[0]}×${res.image_size[1]}</span>`);
+    if (typeof res.tokens_per_second === "number") pills.push(`<span class="meta-pill"><strong>tok/s</strong> ${res.tokens_per_second}</span>`);
+    if (typeof res.tokens_generated === "number") pills.push(`<span class="meta-pill"><strong>tokens</strong> ${res.tokens_generated}</span>`);
+    if (typeof res.generation_time_s === "number") pills.push(`<span class="meta-pill"><strong>gen</strong> ${res.generation_time_s} s</span>`);
+    if (res.downscaled_from) pills.push(`<span class="meta-pill"><strong>downscaled</strong> ${res.downscaled_from.join("×")} → ${res.image_size.join("×")}</span>`);
+    $("metaRow").innerHTML = pills.join(" ");
+    $("resultBlock").textContent = res.description || JSON.stringify(res, null, 2);
+    log(`inspect() returned ${res.tokens_generated || "?"} tokens`, "ok");
+  } catch (err) {
+    setRun("error", "Failed");
+    $("resultBlock").textContent = "Error: " + (err.message || String(err));
+    log("inspect() error: " + (err.message || String(err)), "err");
+  } finally {
+    await deleteScratch(scratch?.artifactId);
+    $("inspectBtn").disabled = false;
+    refreshInspectEnabled();
+  }
+});
+</script>
+</body>
+</html>
