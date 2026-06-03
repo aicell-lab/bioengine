@@ -34,9 +34,6 @@
   #userMenu .info { padding: 0.45rem 0.9rem; border-bottom: 1px solid #334155;
                     font-size: 0.78rem; color: #94a3b8; word-break: break-all; }
   #userMenu .info strong { color: #e2e8f0; font-weight: 600; }
-  .login-link { display: inline-block; color: #38bdf8; text-decoration: underline;
-                font-size: 0.78rem; word-break: break-all; }
-  .login-link:hover { color: #7dd3fc; }
 
   header { text-align: center; margin-bottom: 1.5rem; }
   header h1 { font-size: 1.75rem; color: #38bdf8; font-weight: 700; }
@@ -97,8 +94,6 @@
      Token is cached in localStorage for 3 h so the page auto-connects on
      reload while it is still valid. -->
 <div id="topbar">
-  <a id="loginLink" class="login-link" target="_blank" rel="noopener" hidden>Open login page ↗</a>
-
   <!-- Logged-out -->
   <button id="loginBtn" class="topbar-btn" type="button" aria-label="Sign in to Hypha">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -263,7 +258,6 @@ function setLoggedInUI() {
   $("userWrap").hidden = false;
   $("userEmail").textContent = userEmail || "(unknown user)";
   $("userWs").textContent = userWorkspace || "—";
-  $("loginLink").hidden = true;
 }
 
 $("userBtn").addEventListener("click", () => {
@@ -296,22 +290,11 @@ async function connectWithToken(token, sourceLabel) {
 
 $("loginBtn").addEventListener("click", async () => {
   setLoggingInUI();
-  $("loginLink").hidden = true;
-  log("Login: requesting Hypha auth URL");
+  log("Login: opening Hypha auth flow");
   try {
-    // login_callback: surface the URL as a visible click-through anchor in
-    // case window.open() is popup-blocked (the URL only arrives after the
-    // original click's user-gesture has expired).
     const token = await login({
       server_url: SERVER_URL,
-      login_callback: (ctx) => {
-        const a = $("loginLink");
-        a.href = ctx.login_url;
-        a.textContent = "Open login page ↗";
-        a.hidden = false;
-        log("Login URL ready — click 'Open login page' if the popup didn't open: " + ctx.login_url);
-        try { window.open(ctx.login_url, "_blank", "noopener,noreferrer"); } catch (_) {}
-      },
+      login_callback: (ctx) => { window.open(ctx.login_url); },
     });
     saveToken(token);
     await connectWithToken(token, "Hypha login");
