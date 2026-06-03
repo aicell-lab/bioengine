@@ -389,6 +389,70 @@ def _normalize_label_files(
     return new_paths
 
 
+def _rasterize_geojson_to_tiff(geojson_path: Path, image_path: Path) -> Path:
+    """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 label TIFF.
+
+    Each Feature.geometry of type 'Polygon' / 'MultiPolygon' becomes one
+    instance; instance IDs are assigned in document order starting at 1
+    (0 = background). Coordinates are interpreted as image-pixel (x, y) —
+    the polygon-encoding convention used by the bioimage.io colab UI. The
+    output array shape matches ``image_path``'s dimensions so downstream
+    cellpose loaders see standard label TIFFs.
+
+    Returns the path to the new TIFF (placed next to the input geojson with
+    suffix ``_rasterized.tif``); the original geojson is left in place.
+    """
+    import tifffile
+    from PIL import Image as PILImage, ImageDraw
+
+    with PILImage.open(image_path) as pil_img:
+        width, height = pil_img.size
+
+    payload = json.loads(geojson_path.read_text())
+    features = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(features, list):
+        features = []
+
+    label_img = PILImage.new("I;16", (width, height), 0)
+    draw = ImageDraw.Draw(label_img)
+    instance_id = 0
+
+    def _flatten_ring(ring: Any) -> list[tuple[float, float]]:
+        return [(float(p[0]), float(p[1])) for p in ring if len(p) >= 2]
+
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        geom = feature.get("geometry") or {}
+        gtype = geom.get("type")
+        coords = geom.get("coordinates") or []
+        polygons: list[list[Any]] = []
+        if gtype == "Polygon":
+            polygons = [coords]
+        elif gtype == "MultiPolygon":
+            polygons = list(coords)
+        for poly in polygons:
+            if not poly:
+                continue
+            outer = _flatten_ring(poly[0])
+            if len(outer) < 3:
+                continue
+            instance_id += 1
+            draw.polygon(outer, fill=instance_id)
+
+    out_path = geojson_path.with_name(geojson_path.stem + "_rasterized.tif")
+    tifffile.imwrite(str(out_path), np.array(label_img, dtype=np.uint16))
+    logger.info(
+        "Rasterised GeoJSON %s → %s (%d polygon instances, %dx%d)",
+        geojson_path.name,
+        out_path.name,
+        instance_id,
+        width,
+        height,
+    )
+    return out_path
+
+
 def _load_label_array(label_path: Path) -> npt.NDArray[Any]:
     """Load a label mask from any supported format using PIL (palette-PNG safe)."""
     import tifffile
@@ -2444,7 +2508,20 @@ async def list_matching_artifact_paths(
     artifact: AsyncHyphaArtifact,
     path_pattern: str,
 ) -> list[str]:
-    """List artifact files that match a folder path or glob path pattern."""
+    """List artifact files that match a folder path or glob path pattern.
+
+    A comma-separated string of patterns is also accepted (e.g.
+    ``"masks_label/*/*.png,masks_label/*/*.geojson"``) — each segment is
+    resolved independently and the unioned result is returned.
+    """
+    if "," in path_pattern:
+        merged: list[str] = []
+        for sub in path_pattern.split(","):
+            sub = sub.strip()
+            if sub:
+                merged.extend(await list_matching_artifact_paths(artifact, sub))
+        return sorted(set(merged))
+
     normalized_pattern = _normalize_artifact_relpath(path_pattern)
 
     if normalized_pattern.endswith("/"):
@@ -2531,8 +2608,12 @@ def match_image_annotation_pairs(
     annotation_files: list[str],
     image_pattern: str,
     annotation_pattern: str,
-) -> list[tuple[str, str]]:
-    """Match image and annotation files based on patterns.
+) -> list[tuple[str, list[str]]]:
+    """Match image files to ALL annotation files sharing the same stem.
+
+    Returns ``[(image, [ann1, ann2, ...]), ...]`` so multi-annotator layouts
+    like ``masks_{label}/user-{uid}/{stem}.png`` pair every annotator's mask
+    with its image. Single-annotator layouts produce 1-element lists.
 
     Args:
         image_files: List of image filenames
@@ -2541,35 +2622,33 @@ def match_image_annotation_pairs(
         annotation_pattern: Pattern for annotations (e.g., "*_mask.ome.tif")
 
     Returns:
-        List of (image_filename, annotation_filename) pairs
+        List of (image_filename, [annotation_filename, ...]) pairs.
 
-    Example:
-        >>> images = ["t0000.ome.tif", "t0001.ome.tif"]
-        >>> annots = ["t0000_mask.ome.tif", "t0001_mask.ome.tif"]
-        >>> match_image_annotation_pairs(images, annots, "*.ome.tif", "*_mask.ome.tif")
-        [("t0000.ome.tif", "t0000_mask.ome.tif"), ("t0001.ome.tif", "t0001_mask.ome.tif")]
+    Example (multi-annotator):
+        >>> images = ["images/img1.png"]
+        >>> annots = ["masks/u1/img1.png", "masks/u2/img1.png"]
+        >>> match_image_annotation_pairs(images, annots, "images/*.png", "masks/*/*.png")
+        [("images/img1.png", ["masks/u1/img1.png", "masks/u2/img1.png"])]
     """
     normalized_image_pattern = _normalize_artifact_relpath(image_pattern)
     normalized_annotation_pattern = _normalize_artifact_relpath(annotation_pattern)
 
-    # Build a dict mapping wildcard matches to annotation files
-    annot_map: dict[tuple[str, ...], str] = {}
+    annot_map: dict[tuple[str, ...], list[str]] = {}
     for annot_file in annotation_files:
         match = extract_pattern_match(annot_file, normalized_annotation_pattern)
         if match:
-            annot_map[match] = annot_file
+            annot_map.setdefault(match, []).append(annot_file)
 
-    # Match images to annotations
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, list[str]]] = []
     for image_file in image_files:
         match = extract_pattern_match(image_file, normalized_image_pattern)
         if match and match in annot_map:
-            pairs.append((image_file, annot_map[match]))
+            pairs.append((image_file, list(annot_map[match])))
 
     if pairs:
         logger.info(
-            f"Matched {len(pairs)} pairs from {len(image_files)} images "
-            f"and {len(annotation_files)} annotations"
+            f"Matched {sum(len(a) for _, a in pairs)} (image, annotation) examples "
+            f"across {len(pairs)} images from {len(annotation_files)} annotations"
         )
         return pairs
 
@@ -2583,6 +2662,8 @@ def match_image_annotation_pairs(
             ".png",
             ".jpg",
             ".jpeg",
+            ".geojson",
+            ".json",
         ):
             if lowered.endswith(suffix):
                 return name[: -len(suffix)]
@@ -2601,22 +2682,21 @@ def match_image_annotation_pairs(
                 break
         return key
 
-    # Fallback matcher for mixed conventions like image '*.tif' vs annotation '*_mask.ome.tif'.
-    fallback_ann_map: dict[str, str] = {}
+    fallback_ann_map: dict[str, list[str]] = {}
     for annot_file in annotation_files:
         key = _annotation_key(annot_file)
-        if key and key not in fallback_ann_map:
-            fallback_ann_map[key] = annot_file
+        if key:
+            fallback_ann_map.setdefault(key, []).append(annot_file)
 
     for image_file in image_files:
         key = _image_key(image_file)
-        annot_file = fallback_ann_map.get(key)
-        if annot_file:
-            pairs.append((image_file, annot_file))
+        annot_files = fallback_ann_map.get(key)
+        if annot_files:
+            pairs.append((image_file, list(annot_files)))
 
     logger.info(
-        f"Matched {len(pairs)} pairs from {len(image_files)} images "
-        f"and {len(annotation_files)} annotations"
+        f"Matched {sum(len(a) for _, a in pairs)} (image, annotation) examples "
+        f"across {len(pairs)} images from {len(annotation_files)} annotations"
     )
 
     return pairs
@@ -2907,10 +2987,12 @@ async def download_pairs_from_artifact(
         )
         raise RuntimeError(msg)
 
-    return [
-        TrainingPair(image=img, annotation=ann)
-        for img, ann in zip(local_imgs, local_anns)
-    ]
+    pairs: list[TrainingPair] = []
+    for img, ann in zip(local_imgs, local_anns):
+        if ann.suffix.lower() in (".geojson", ".json"):
+            ann = _rasterize_geojson_to_tiff(ann, img)
+        pairs.append(TrainingPair(image=img, annotation=ann))
+    return pairs
 
 
 def create_dataset_split(
@@ -3085,9 +3167,11 @@ async def make_training_pairs(
         train_annotations,
     )
 
-    # Build full paths for training files
-    train_image_paths = [Path(img) for img, _ in train_matched]
-    train_annotation_paths = [Path(ann) for _, ann in train_matched]
+    # Flatten 1:N (image -> list of masks) into parallel lists, repeating the
+    # image path once per annotator's mask. Each (image, mask_i) becomes its
+    # own training example.
+    train_image_paths = [Path(img) for img, anns in train_matched for _ in anns]
+    train_annotation_paths = [Path(ann) for _, anns in train_matched for ann in anns]
 
     # Apply n_samples if specified
     if config["n_samples"] is not None and config["n_samples"] < len(train_image_paths):
@@ -3125,9 +3209,8 @@ async def make_training_pairs(
             config["test_annotations"],
         )
 
-        # Build full paths for test files
-        test_image_paths = [Path(img) for img, _ in test_matched]
-        test_annotation_paths = [Path(ann) for _, ann in test_matched]
+        test_image_paths = [Path(img) for img, anns in test_matched for _ in anns]
+        test_annotation_paths = [Path(ann) for _, anns in test_matched for ann in anns]
 
         # Download test pairs
         test_pairs = await download_pairs_from_artifact(
