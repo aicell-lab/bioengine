@@ -6,6 +6,10 @@
 <title>Smart Microscopy QC</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  /* The user-agent rule `[hidden] { display: none }` loses to any class
+     that sets `display: inline-flex` (e.g. .topbar-btn). Force-override so
+     setting `.hidden = true` on those buttons actually hides them. */
+  [hidden] { display: none !important; }
   body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0;
          min-height: 100vh; display: flex; flex-direction: column; align-items: center;
          padding: 2rem 1rem; }
