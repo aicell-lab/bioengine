@@ -94,8 +94,9 @@
      Token is cached in localStorage for 3 h so the page auto-connects on
      reload while it is still valid. -->
 <div id="topbar">
-  <!-- Logged-out -->
-  <button id="loginBtn" class="topbar-btn" type="button" aria-label="Sign in to Hypha">
+  <!-- Logged-out (hidden by default; JS reveals one of the two on boot
+       based on whether a cached / URL token is available, so neither flashes). -->
+  <button id="loginBtn" class="topbar-btn" type="button" aria-label="Sign in to Hypha" hidden>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
@@ -317,10 +318,13 @@ $("logoutBtn").addEventListener("click", async () => {
 });
 
 // On load: prefer URL token (testing), else cached token, else stay logged out.
+// If a token is available, hide the Login button up-front so it never flashes
+// while the WebSocket connect is still in flight.
 (async () => {
-  setLoggedOutUI();
   const cached = URL_TOKEN || loadSavedToken();
-  if (!cached) return;
+  if (!cached) { setLoggedOutUI(); return; }
+  $("loginBtn").hidden = true;
+  $("userWrap").hidden = true;
   const sourceLabel = URL_TOKEN ? "URL token" : "cached token";
   log(`${sourceLabel} found — auto-connecting`);
   try {
