@@ -9,6 +9,35 @@
   body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0;
          min-height: 100vh; display: flex; flex-direction: column; align-items: center;
          padding: 2rem 1rem; }
+
+  /* Top-right login / profile widget (mirrors bioimage.io LoginButton). */
+  #topbar { position: fixed; top: 1rem; right: 1rem; z-index: 50;
+            display: flex; align-items: center; gap: 0.5rem; }
+  .topbar-btn { display: inline-flex; align-items: center; gap: 0.4rem;
+                background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+                border-radius: 0.5rem; padding: 0.45rem 0.9rem;
+                font: inherit; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
+  .topbar-btn:hover { background: #334155; }
+  .topbar-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .topbar-btn svg { width: 1.1rem; height: 1.1rem; flex-shrink: 0; }
+  .topbar-iconbtn { background: #1e293b; border: 1px solid #334155; border-radius: 999px;
+                    width: 2.25rem; height: 2.25rem; display: inline-flex;
+                    align-items: center; justify-content: center; cursor: pointer; padding: 0; }
+  .topbar-iconbtn:hover { background: #334155; }
+  .topbar-iconbtn svg { width: 1.4rem; height: 1.4rem; color: #cbd5e1; }
+  #userMenu { position: absolute; top: 2.6rem; right: 0; min-width: 16rem;
+              background: #1e293b; border: 1px solid #334155; border-radius: 0.5rem;
+              padding: 0.4rem 0; box-shadow: 0 12px 30px rgba(0,0,0,.45); }
+  #userMenu .item { display: block; padding: 0.5rem 0.9rem; color: #e2e8f0; font-size: 0.85rem;
+                    background: none; border: 0; width: 100%; text-align: left; cursor: pointer; }
+  #userMenu .item:hover { background: #0f172a; }
+  #userMenu .info { padding: 0.45rem 0.9rem; border-bottom: 1px solid #334155;
+                    font-size: 0.78rem; color: #94a3b8; word-break: break-all; }
+  #userMenu .info strong { color: #e2e8f0; font-weight: 600; }
+  .login-link { display: inline-block; color: #38bdf8; text-decoration: underline;
+                font-size: 0.78rem; word-break: break-all; }
+  .login-link:hover { color: #7dd3fc; }
+
   header { text-align: center; margin-bottom: 1.5rem; }
   header h1 { font-size: 1.75rem; color: #38bdf8; font-weight: 700; }
   header p  { color: #94a3b8; margin-top: 0.25rem; font-size: 0.9rem; }
@@ -21,8 +50,6 @@
          padding: 0.5rem 1rem; cursor: pointer; font-size: 0.875rem; font-weight: 600; }
   .btn:hover { background: #0369a1; }
   .btn:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
-  .btn.secondary { background: #475569; }
-  .btn.secondary:hover { background: #64748b; }
   .status-dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%;
                 margin-right: 0.4rem; background: #64748b; vertical-align: middle; }
   .status-dot.ok    { background: #22c55e; }
@@ -45,9 +72,6 @@
                         color: #fca5a5; border: 1px solid #334155; border-radius: 0.5rem;
                         padding: 0.25rem 0.6rem; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
   .preview .clear-btn:hover { background: #450a0a; color: #fca5a5; border-color: #ef4444; }
-  .login-link { display: inline-block; margin-left: 0.5rem; color: #38bdf8;
-                text-decoration: underline; font-size: 0.8rem; word-break: break-all; }
-  .login-link:hover { color: #7dd3fc; }
   .result-block { background: #0f172a; border-radius: 0.5rem; padding: 0.75rem;
                   font-size: 0.85rem; color: #e2e8f0; white-space: pre-wrap; word-break: break-word;
                   min-height: 2rem; max-height: 32rem; overflow-y: auto; }
@@ -67,26 +91,52 @@
 </head>
 <body>
 
+<!-- Top-right login / profile widget. Mirrors bioimage.io's LoginButton:
+     · logged-out → "Login" button with login-box icon.
+     · logged-in  → circular avatar with dropdown (email/workspace, Logout).
+     Token is cached in localStorage for 3 h so the page auto-connects on
+     reload while it is still valid. -->
+<div id="topbar">
+  <a id="loginLink" class="login-link" target="_blank" rel="noopener" hidden>Open login page ↗</a>
+
+  <!-- Logged-out -->
+  <button id="loginBtn" class="topbar-btn" type="button" aria-label="Sign in to Hypha">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+      <polyline points="10 17 15 12 10 7"/>
+      <line x1="15" y1="12" x2="3" y2="12"/>
+    </svg>
+    <span>Login</span>
+  </button>
+
+  <!-- Logged-in -->
+  <div id="userWrap" style="position: relative;" hidden>
+    <button id="userBtn" class="topbar-iconbtn" type="button" aria-label="Account menu">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/>
+        <circle cx="12" cy="10" r="3.4"/>
+        <path d="M5.5 19a7 7 0 0 1 13 0"/>
+      </svg>
+    </button>
+    <div id="userMenu" hidden>
+      <div class="info">
+        <div><strong id="userEmail">…</strong></div>
+        <div>workspace <strong id="userWs">…</strong></div>
+      </div>
+      <button class="item" id="logoutBtn" type="button">Sign out</button>
+    </div>
+  </div>
+</div>
+
 <header>
   <h1>🔬 Smart Microscopy QC</h1>
   <p>Drag-and-drop a microscopy image, write a QC question, get a VLM verdict.</p>
 </header>
 
 <div class="card">
-  <h2>1 — Sign in to Hypha</h2>
-  <div class="row">
-    <button class="btn" id="loginBtn">Sign in</button>
-    <span><span class="status-dot" id="loginDot"></span><span id="loginStatus">Not signed in</span></span>
-    <a id="loginLink" class="login-link" target="_blank" rel="noopener" hidden>Open login page ↗</a>
-  </div>
-  <div class="small" style="margin-top: 0.5rem;">
-    Scratch artifacts will be created in <code id="userWs">(your workspace)</code> and deleted
-    after the call. The QC service runs in the <code>bioimage-io</code> workspace.
-  </div>
-</div>
-
-<div class="card">
-  <h2>2 — Image</h2>
+  <h2>1 — Image</h2>
   <div id="dropzone" class="dropzone">
     Drag a microscopy image here, click to pick a file, or paste a screenshot from the clipboard (⌘V / Ctrl+V).<br>
     <span class="small">Max 25 MB on the wire. PNG / JPG / TIFF accepted.</span>
@@ -100,7 +150,7 @@
 </div>
 
 <div class="card">
-  <h2>3 — QC Instruction</h2>
+  <h2>2 — QC Instruction</h2>
   <textarea id="instruction" placeholder="e.g. Evaluate focus, illumination uniformity, and approximate cell count. Flag any contamination."></textarea>
   <div class="small" style="margin-top: 0.35rem; display:flex; justify-content:space-between;">
     <span>Free-text question about what the VLM should look for.</span>
@@ -109,7 +159,7 @@
 </div>
 
 <div class="card">
-  <h2>4 — Inspect</h2>
+  <h2>3 — Inspect</h2>
   <div class="row">
     <button class="btn" id="inspectBtn" disabled>Run inspect()</button>
     <span><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span></span>
@@ -139,14 +189,17 @@ const params     = new URLSearchParams(window.location.search);
 const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
 const SERVICE_ID = params.get("ws_service_id") || "";
 const URL_TOKEN  = params.get("token") || "";
-const QC_FALLBACK = "bioimage-io/smart-microscopy-qc";   // short form (proxy WebRTC offer endpoint)
+const QC_FALLBACK = "bioimage-io/smart-microscopy-qc";
 
 const MAX_INSTRUCTION_CHARS = 4000;   // must match _MAX_INSTRUCTION_CHARS in main.py
 const MAX_IMAGE_BYTES       = 25 * 1024 * 1024;
+const TOKEN_KEY    = "smart-microscopy-qc:token";
+const TOKEN_EXPIRY = "smart-microscopy-qc:tokenExpiry";
+const TOKEN_TTL_MS = 3 * 60 * 60 * 1000;   // 3 h; matches bioimage.io's LoginButton
 
 document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
 
-let server = null, qcSvc = null, artMgr = null, userWorkspace = null;
+let server = null, qcSvc = null, artMgr = null, userWorkspace = null, userEmail = null;
 let pickedFile = null;
 
 const $ = id => document.getElementById(id);
@@ -156,11 +209,6 @@ function log(msg, kind = "") {
   const cls = kind ? `class="${kind}"` : "";
   $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${msg}</span>`;
   $("log").scrollTop = $("log").scrollHeight;
-}
-
-function setLogin(state, msg) {
-  $("loginDot").className = "status-dot " + (state || "");
-  $("loginStatus").textContent = msg;
 }
 function setRun(state, msg) {
   $("runDot").className = "status-dot " + (state || "");
@@ -174,17 +222,70 @@ function refreshInspectEnabled() {
   $("inspectBtn").disabled = !ready;
 }
 
-// --- Login --------------------------------------------------------------
+// --- Token cache --------------------------------------------------------
+
+function loadSavedToken() {
+  try {
+    const t = localStorage.getItem(TOKEN_KEY);
+    const exp = localStorage.getItem(TOKEN_EXPIRY);
+    if (t && exp && new Date(exp) > new Date()) return t;
+  } catch (_) {}
+  return null;
+}
+function saveToken(t) {
+  try {
+    localStorage.setItem(TOKEN_KEY, t);
+    localStorage.setItem(TOKEN_EXPIRY, new Date(Date.now() + TOKEN_TTL_MS).toISOString());
+  } catch (_) {}
+}
+function clearSavedToken() {
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_EXPIRY);
+  } catch (_) {}
+}
+
+// --- Topbar widget state ------------------------------------------------
+
+function setLoggedOutUI() {
+  $("loginBtn").hidden = false;
+  $("loginBtn").disabled = false;
+  $("userWrap").hidden = true;
+  $("userMenu").hidden = true;
+  $("userEmail").textContent = "—";
+  $("userWs").textContent = "—";
+}
+function setLoggingInUI() {
+  $("loginBtn").disabled = true;
+}
+function setLoggedInUI() {
+  $("loginBtn").hidden = true;
+  $("userWrap").hidden = false;
+  $("userEmail").textContent = userEmail || "(unknown user)";
+  $("userWs").textContent = userWorkspace || "—";
+  $("loginLink").hidden = true;
+}
+
+$("userBtn").addEventListener("click", () => {
+  $("userMenu").hidden = !$("userMenu").hidden;
+});
+document.addEventListener("mousedown", (e) => {
+  if (!$("userMenu").hidden) {
+    if (!$("userMenu").contains(e.target) && !$("userBtn").contains(e.target)) {
+      $("userMenu").hidden = true;
+    }
+  }
+});
+
+// --- Login / logout -----------------------------------------------------
 
 async function connectWithToken(token, sourceLabel) {
-  $("loginBtn").disabled = true;
-  $("loginLink").hidden = true;
-  setLogin("busy", "Connecting…");
+  setLoggingInUI();
   server = await connectToServer({ server_url: SERVER_URL, token });
   userWorkspace = server.config.workspace;
-  $("userWs").textContent = userWorkspace;
-  setLogin("ok", `Signed in (${userWorkspace}) via ${sourceLabel}`);
-  log(`Connected as workspace=${userWorkspace} (${sourceLabel})`, "ok");
+  userEmail = (server.config.user && server.config.user.email) || userWorkspace;
+  setLoggedInUI();
+  log(`Connected as ${userEmail} (workspace=${userWorkspace}) via ${sourceLabel}`, "ok");
   artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
   const sid = SERVICE_ID || QC_FALLBACK;
   log(`Resolving QC service: ${sid}`);
@@ -194,14 +295,13 @@ async function connectWithToken(token, sourceLabel) {
 }
 
 $("loginBtn").addEventListener("click", async () => {
-  $("loginBtn").disabled = true;
-  setLogin("busy", "Requesting Hypha login URL…");
+  setLoggingInUI();
   $("loginLink").hidden = true;
   log("Login: requesting Hypha auth URL");
   try {
-    // login_callback: render the URL as a click-through anchor instead of
-    // relying on window.open(), which most browsers block once the original
-    // click context has expired (the login URL only comes back asynchronously).
+    // login_callback: surface the URL as a visible click-through anchor in
+    // case window.open() is popup-blocked (the URL only arrives after the
+    // original click's user-gesture has expired).
     const token = await login({
       server_url: SERVER_URL,
       login_callback: (ctx) => {
@@ -209,30 +309,45 @@ $("loginBtn").addEventListener("click", async () => {
         a.href = ctx.login_url;
         a.textContent = "Open login page ↗";
         a.hidden = false;
-        setLogin("busy", "Click the link to sign in…");
-        log("Login URL ready — click 'Open login page' (also: " + ctx.login_url + ")");
-        // Best-effort popup: still try, but the link is the reliable path.
+        log("Login URL ready — click 'Open login page' if the popup didn't open: " + ctx.login_url);
         try { window.open(ctx.login_url, "_blank", "noopener,noreferrer"); } catch (_) {}
       },
     });
+    saveToken(token);
     await connectWithToken(token, "Hypha login");
   } catch (err) {
-    setLogin("error", "Login failed");
     log("Login error: " + err.message, "err");
-    $("loginBtn").disabled = false;
+    setLoggedOutUI();
   }
 });
 
-// Testing path: if ?token=... is in the URL, auto-connect on load.
-if (URL_TOKEN) {
-  log("?token= present in URL — auto-connecting (testing path)");
-  connectWithToken(URL_TOKEN, "URL token")
-    .catch((err) => {
-      setLogin("error", "URL-token connect failed");
-      log("URL-token connect error: " + err.message, "err");
-      $("loginBtn").disabled = false;
-    });
-}
+$("logoutBtn").addEventListener("click", async () => {
+  log("Signing out");
+  clearSavedToken();
+  qcSvc = null; artMgr = null; userWorkspace = null; userEmail = null;
+  try {
+    if (server && typeof server.disconnect === "function") await server.disconnect();
+  } catch (err) { log("disconnect warning: " + err.message, "err"); }
+  server = null;
+  setLoggedOutUI();
+  refreshInspectEnabled();
+});
+
+// On load: prefer URL token (testing), else cached token, else stay logged out.
+(async () => {
+  setLoggedOutUI();
+  const cached = URL_TOKEN || loadSavedToken();
+  if (!cached) return;
+  const sourceLabel = URL_TOKEN ? "URL token" : "cached token";
+  log(`${sourceLabel} found — auto-connecting`);
+  try {
+    await connectWithToken(cached, sourceLabel);
+  } catch (err) {
+    log("Auto-connect failed: " + err.message, "err");
+    if (!URL_TOKEN) clearSavedToken();
+    setLoggedOutUI();
+  }
+})();
 
 // --- Image picker -------------------------------------------------------
 
@@ -297,7 +412,6 @@ function handleFile(file) {
   pickedFile = file;
   $("previewMeta").textContent =
     `${file.name} — ${(file.size / 1024).toFixed(1)} KB — ${file.type || "image"}`;
-  // TIFFs typically can't be rendered in <img>; show a placeholder.
   const ext = (file.name.split(".").pop() || "").toLowerCase();
   if (["tif", "tiff"].includes(ext)) {
     $("previewImg").src = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyODAiIGhlaWdodD0iMTYwIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjMGYxNzJhIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZpbGw9IiM2NDc0OGIiIGZvbnQtZmFtaWx5PSJzeXN0ZW0tdWkiIGZvbnQtc2l6ZT0iMTQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5USUZGIChubyBpbi1icm93c2VyIHByZXZpZXcpPC90ZXh0Pjwvc3ZnPg==";
@@ -319,7 +433,6 @@ instr.addEventListener("input", () => {
   $("charCount").textContent = len;
   $("charCount").className = "counter" + (len > MAX_INSTRUCTION_CHARS ? " over" : "");
   if (len > MAX_INSTRUCTION_CHARS) {
-    // Hard cap: clip and warn (we ensure the server cap can't trip from this UI).
     instr.value = instr.value.slice(0, MAX_INSTRUCTION_CHARS);
     $("charCount").textContent = MAX_INSTRUCTION_CHARS;
     log(`Instruction clipped to ${MAX_INSTRUCTION_CHARS} chars (UI mirror of server cap)`, "err");
