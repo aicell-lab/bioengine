@@ -889,6 +889,13 @@ class AppsManager:
                     timeout=10.0,
                 )
 
+                static_site_url = None
+                if app_data.get("frontend_entry"):
+                    static_site_url = get_static_site_url(
+                        artifact_id=app_data["artifact_id"],
+                        server_url=self.server.config.public_base_url,
+                    )
+
                 self._deployed_applications[application_id] = {
                     "display_name": app_data["display_name"],
                     "description": app_data["description"],
@@ -902,6 +909,7 @@ class AppsManager:
                     "application_resources": app_data["application_resources"],
                     "authorized_users": updated_authorized_users,
                     "available_methods": app_data["available_methods"],
+                    "static_site_url": static_site_url,
                     "started_at": app_data["started_at"],
                     "last_updated_at": app_data["last_updated_at"],
                     "last_updated_by": app_data["last_updated_by"],

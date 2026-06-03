@@ -1592,6 +1592,7 @@ class AppBuilder:
                 ),
                 "auto_redeploy": auto_redeploy,
                 "debug": debug,
+                "frontend_entry": manifest.get("frontend_entry"),
             }
 
             app = proxy_deployment.bind(
