@@ -107,6 +107,15 @@ Define a metric once with `create_metric(...)`, then call `inspect(image_ref, me
 
 `downscaled_from` and `downscale_note` may be present in either mode when the server resized the inspected image.
 
+### Few-shot quality notes
+
+The 3B model handles **specific, visually-grounded criteria** ("at least 5 distinct cells", "any saturated pixels", "vertical motion blur") considerably better than **coarse class differences** ("good vs. bad image"). Two patterns observed on the live deployment:
+
+- A criterion phrased as a measurable property (cell count, focus sharpness on a defined region, presence of a specific artefact) generally returns a verdict aligned with the actual content.
+- A criterion phrased as broad quality vs. anti-quality, with references that span very different visual styles (e.g. real microscopy frames as good, flat grey as bad), can occasionally produce verdicts that echo the good-class reason regardless of the new image. The 3B model isn't large enough to discriminate sharply by visual gestalt alone.
+
+If a metric isn't discriminating well: tighten the `description` (it goes into the prompt verbatim) to spell out *what to look for*; consider asking a more specific question via the `instruction` override at inspect time.
+
 ### Metric management
 
 | Method | Description |
