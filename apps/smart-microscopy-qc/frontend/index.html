@@ -150,10 +150,22 @@
 </div>
 
 <div class="card">
-  <h2>2 — QC Instruction</h2>
-  <textarea id="instruction" placeholder="e.g. Evaluate focus, illumination uniformity, and approximate cell count. Flag any contamination."></textarea>
+  <h2>2 — QC Metric</h2>
+  <div class="row" style="margin-bottom: 0.5rem;">
+    <label for="metricSelect" class="small" style="min-width: 5rem;">Pre-defined:</label>
+    <select id="metricSelect" style="flex: 1; background: #0f172a; color: #e2e8f0;
+            border: 1px solid #334155; border-radius: 0.5rem; padding: 0.4rem 0.5rem;
+            font-family: inherit; font-size: 0.875rem; outline: none;">
+      <option value="">— none (free-text only) —</option>
+    </select>
+    <button id="refreshMetricsBtn" class="btn" type="button" title="Reload metric list"
+            style="padding: 0.4rem 0.7rem; font-size: 0.75rem;">↻</button>
+  </div>
+  <div id="metricMeta" class="small" hidden style="margin-bottom: 0.5rem; padding: 0.5rem 0.75rem;
+       background: #0f172a; border: 1px solid #334155; border-radius: 0.5rem;"></div>
+  <textarea id="instruction" placeholder="Free-text criterion (required if no metric is selected; optional override otherwise)."></textarea>
   <div class="small" style="margin-top: 0.35rem; display:flex; justify-content:space-between;">
-    <span>Free-text question about what the VLM should look for.</span>
+    <span id="instructionHint">Free-text question about what the VLM should look for.</span>
     <span><span id="charCount" class="counter">0</span> / <span id="charCap">4000</span></span>
   </div>
 </div>
@@ -216,10 +228,14 @@ function setRun(state, msg) {
 }
 
 function refreshInspectEnabled() {
-  const ready = !!qcSvc && !!pickedFile
-    && $("instruction").value.trim().length > 0
-    && $("instruction").value.length <= MAX_INSTRUCTION_CHARS;
-  $("inspectBtn").disabled = !ready;
+  if (!qcSvc || !pickedFile) { $("inspectBtn").disabled = true; return; }
+  const instr = $("instruction").value;
+  const hasInstruction = instr.trim().length > 0;
+  const overLimit = instr.length > MAX_INSTRUCTION_CHARS;
+  const hasMetric = !!$("metricSelect").value;
+  // Need either a selected metric OR a non-empty instruction (or both).
+  const inputValid = (hasMetric || hasInstruction) && !overLimit;
+  $("inspectBtn").disabled = !inputValid;
 }
 
 // --- Token cache --------------------------------------------------------
@@ -290,8 +306,73 @@ async function connectWithToken(token, sourceLabel) {
   log(`Resolving QC service: ${sid}`);
   qcSvc = await server.getService(sid, { _rkwargs: true });
   log("QC service handle ready.", "ok");
+  await refreshMetricsDropdown();
   refreshInspectEnabled();
 }
+
+// Load metric list from the service and rebuild the <select>.
+async function refreshMetricsDropdown() {
+  if (!qcSvc) return;
+  const sel = $("metricSelect");
+  const prior = sel.value;
+  try {
+    const metrics = await qcSvc.list_metrics({ _rkwargs: true });
+    // Reset to just the "none" option, then add each metric.
+    while (sel.options.length > 1) sel.remove(1);
+    for (const m of metrics) {
+      const opt = document.createElement("option");
+      opt.value = m.name;
+      opt.textContent = m.name;
+      opt.dataset.description = m.description || "";
+      opt.dataset.nGood = String(m.n_good ?? "?");
+      opt.dataset.nBad  = String(m.n_bad  ?? "?");
+      sel.appendChild(opt);
+    }
+    // Restore prior selection if still present.
+    if (prior && [...sel.options].some(o => o.value === prior)) sel.value = prior;
+    log(`Loaded ${metrics.length} metric${metrics.length === 1 ? "" : "s"}.`);
+  } catch (err) {
+    log("list_metrics failed: " + err.message, "err");
+  }
+  updateMetricMeta();
+}
+
+// Show/hide the metric-detail row and adjust the instruction hint based on
+// whether a metric is currently selected.
+function updateMetricMeta() {
+  const sel = $("metricSelect");
+  const meta = $("metricMeta");
+  const opt = sel.options[sel.selectedIndex];
+  if (!sel.value || !opt) {
+    meta.hidden = true;
+    $("instruction").placeholder =
+      "Free-text criterion (required when no metric is selected).";
+    $("instructionHint").textContent =
+      "Free-text question about what the VLM should look for. Required.";
+  } else {
+    const desc = opt.dataset.description || "";
+    const ng = opt.dataset.nGood, nb = opt.dataset.nBad;
+    meta.hidden = false;
+    meta.innerHTML =
+      `<strong style="color:#e2e8f0">${sel.value}</strong>` +
+      ` &middot; <span>${ng} good, ${nb} bad reference${ng === "1" && nb === "1" ? "" : "s"}</span>` +
+      (desc ? `<br><span style="color:#94a3b8">${escapeHTML(desc)}</span>` : "");
+    $("instruction").placeholder =
+      "Optional — override the metric's criterion for this call only.";
+    $("instructionHint").textContent =
+      "Optional override of the metric description for this call only.";
+  }
+  refreshInspectEnabled();
+}
+
+function escapeHTML(s) {
+  return s.replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+$("metricSelect").addEventListener("change", updateMetricMeta);
+$("refreshMetricsBtn").addEventListener("click", () => { refreshMetricsDropdown(); });
 
 $("loginBtn").addEventListener("click", async () => {
   setLoggingInUI();
@@ -481,25 +562,34 @@ $("inspectBtn").addEventListener("click", async () => {
   $("resultBlock").textContent = "";
   $("metaRow").innerHTML = "";
 
-  const instruction = instr.value.trim();
+  const metricName = $("metricSelect").value || null;
+  const rawInstr = instr.value.trim();
+  const callArgs = {
+    image_ref: null,                                // set below after scratch upload
+    max_new_tokens: 512,
+    _rkwargs: true,
+  };
+  if (metricName) callArgs.metric_name = metricName;
+  if (rawInstr)   callArgs.instruction = rawInstr;
+
   let scratch = null;
   const t0 = performance.now();
-
   try {
     scratch = await uploadScratch(pickedFile);
-    const imageRef = `${scratch.artifactId}:${scratch.remotePath}`;
+    callArgs.image_ref = `${scratch.artifactId}:${scratch.remotePath}`;
     setRun("busy", "Calling inspect()…");
-    log(`Calling inspect(image_ref=${imageRef})`);
-    const res = await qcSvc.inspect({
-      image_ref: imageRef,
-      instruction,
-      max_new_tokens: 512,
-      _rkwargs: true,
-    });
+    log(`Calling inspect(image_ref=${callArgs.image_ref}` +
+        (metricName ? `, metric_name='${metricName}'` : "") +
+        (rawInstr ? `, instruction='${rawInstr.slice(0, 40)}…'` : "") + ")");
+
+    const res = await qcSvc.inspect(callArgs);
     const wallMs = (performance.now() - t0).toFixed(0);
     setRun("ok", `Done in ${(wallMs / 1000).toFixed(2)} s (server reports ${res.processing_time_s} s)`);
 
     const pills = [];
+    pills.push(`<span class="meta-pill"><strong>mode</strong> ${res.mode || "describe"}</span>`);
+    if (res.metric_name) pills.push(`<span class="meta-pill"><strong>metric</strong> ${res.metric_name}</span>`);
+    if (res.verdict)     pills.push(`<span class="meta-pill"><strong>verdict</strong> ${res.verdict}</span>`);
     pills.push(`<span class="meta-pill"><strong>model</strong> ${res.model}</span>`);
     if (res.image_size) pills.push(`<span class="meta-pill"><strong>image</strong> ${res.image_size[0]}×${res.image_size[1]}</span>`);
     if (typeof res.tokens_per_second === "number") pills.push(`<span class="meta-pill"><strong>tok/s</strong> ${res.tokens_per_second}</span>`);
@@ -507,7 +597,18 @@ $("inspectBtn").addEventListener("click", async () => {
     if (typeof res.generation_time_s === "number") pills.push(`<span class="meta-pill"><strong>gen</strong> ${res.generation_time_s} s</span>`);
     if (res.downscaled_from) pills.push(`<span class="meta-pill"><strong>downscaled</strong> ${res.downscaled_from.join("×")} → ${res.image_size.join("×")}</span>`);
     $("metaRow").innerHTML = pills.join(" ");
-    $("resultBlock").textContent = res.description || JSON.stringify(res, null, 2);
+
+    // For few-shot mode, foreground the verdict + reason; for describe, show description.
+    if (res.mode === "few-shot") {
+      const verdictLine = res.verdict
+        ? `VERDICT: ${res.verdict.toUpperCase()}`
+        : "VERDICT: (model output didn't follow the schema)";
+      $("resultBlock").textContent =
+        verdictLine + (res.reason ? `\n\n${res.reason}` : "") +
+        (res.description && res.description !== res.reason ? `\n\n— raw model output —\n${res.description}` : "");
+    } else {
+      $("resultBlock").textContent = res.description || JSON.stringify(res, null, 2);
+    }
     log(`inspect() returned ${res.tokens_generated || "?"} tokens`, "ok");
   } catch (err) {
     setRun("error", "Failed");

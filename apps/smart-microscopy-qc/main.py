@@ -191,6 +191,42 @@ class SmartMicroscopyQC:
 
     # ---------------------------------------------------------------- helpers
 
+    async def _ensure_artifact_manager(self) -> Any:
+        """Return a working artifact-manager handle, reconnecting on staleness.
+
+        Long-lived Hypha WebSocket sessions can drop with 'Connection is
+        closed' after idle periods. Detect by sending a cheap probe call;
+        on failure, tear down and rebuild self._server / self._artifact_manager
+        once and return the fresh handle.
+        """
+        if self._artifact_manager is not None:
+            try:
+                # Cheap probe: list_collections is a no-arg read.
+                await self._artifact_manager.list(parent_id="public/applications")
+                return self._artifact_manager
+            except Exception as e:
+                msg = str(e)
+                if "Connection is closed" not in msg and "WebSocket" not in msg:
+                    raise
+                logger.warning("Hypha WS appears stale (%s); reconnecting", msg[:120])
+
+        from hypha_rpc import connect_to_server
+        token = os.environ.get("HYPHA_TOKEN")
+        if not token:
+            raise RuntimeError("HYPHA_TOKEN environment variable is not set.")
+        try:
+            if self._server and hasattr(self._server, "disconnect"):
+                await self._server.disconnect()
+        except Exception:
+            pass
+        self._server = await connect_to_server({
+            "server_url": _DEFAULT_SERVER_URL,
+            "token": token,
+        })
+        self._artifact_manager = await self._server.get_service("public/artifact-manager")
+        logger.info("Re-connected Hypha artifact-manager.")
+        return self._artifact_manager
+
     async def _resolve_to_url(self, image_ref: str) -> str:
         """Map either an HTTPS URL or '<workspace>/<alias>:<path>' to a fetchable URL."""
         if image_ref.startswith(("http://", "https://")):
@@ -201,10 +237,8 @@ class SmartMicroscopyQC:
                 f"(got: {image_ref!r})"
             )
         artifact_id, file_path = image_ref.split(":", 1)
-        url = await self._artifact_manager.get_file(
-            artifact_id=artifact_id,
-            file_path=file_path,
-        )
+        am = await self._ensure_artifact_manager()
+        url = await am.get_file(artifact_id=artifact_id, file_path=file_path)
         if not url:
             raise RuntimeError(
                 f"artifact-manager.get_file returned no URL for {image_ref!r}."
@@ -340,17 +374,28 @@ class SmartMicroscopyQC:
             source_urls.append(url)
         return rel_paths, source_urls
 
+    # Master system prompt: anchors the model as a microscopy QC controller in
+    # both modes. Short by design to leave context budget for examples and
+    # the inspected image (~50 tokens).
+    _SYSTEM_PROMPT = (
+        "You are a microscopy quality-control controller. Your job is to "
+        "decide whether the provided microscopy image passes or fails a "
+        "given quality-control criterion. Base every judgement on visible "
+        "evidence in the image. Be precise, do not invent details, and keep "
+        "responses short."
+    )
+
     async def _run_vlm(
         self, image: "Image.Image", instruction: str, max_new_tokens: int
     ) -> tuple[str, int]:
         """Free-text describe path: single image + free-text instruction."""
-        messages = [{
-            "role": "user",
-            "content": [
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT}]},
+            {"role": "user", "content": [
                 {"type": "image", "image": image},
                 {"type": "text", "text": instruction},
-            ],
-        }]
+            ]},
+        ]
         return await self._generate_with_images(messages, [image], max_new_tokens)
 
     async def _run_vlm_few_shot(
@@ -366,27 +411,30 @@ class SmartMicroscopyQC:
         criterion = (instruction_override or metric["description"]).strip()
         user_content: List[Dict[str, Any]] = [
             {"type": "text", "text":
-                f"You are a microscopy QC assistant. Your task is to decide whether a new "
-                f"image meets the following quality-control criterion.\n\n"
-                f"Metric: {metric['name']}\n"
+                f"Quality-control metric: {metric['name']}\n"
                 f"Criterion: {criterion}\n\n"
-                f"Reference images that DO meet the criterion (GOOD):"},
+                f"Reference images that PASS this criterion (GOOD):"},
         ]
         for img in good_images:
             user_content.append({"type": "image", "image": img})
         user_content.append({"type": "text", "text":
-            "Reference images that DO NOT meet the criterion (BAD):"})
+            "Reference images that FAIL this criterion (BAD):"})
         for img in bad_images:
             user_content.append({"type": "image", "image": img})
         user_content.append({"type": "text", "text":
-            "Now evaluate this new image against the same criterion:"})
+            "Now evaluate this new image against the same criterion. Compare "
+            "against the references and decide whether it passes (good) or "
+            "fails (bad):"})
         user_content.append({"type": "image", "image": new_image})
         user_content.append({"type": "text", "text":
             "Reply on the first line with exactly `VERDICT: good` or `VERDICT: bad`, "
             "then on a second line `REASON: ` followed by ONE short sentence "
-            "explaining your decision in terms of the criterion."})
+            "grounded in the new image's visible content (not in the references)."})
 
-        messages = [{"role": "user", "content": user_content}]
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT}]},
+            {"role": "user", "content": user_content},
+        ]
         ordered_images = list(good_images) + list(bad_images) + [new_image]
         return await self._generate_with_images(messages, ordered_images, max_new_tokens)
 
