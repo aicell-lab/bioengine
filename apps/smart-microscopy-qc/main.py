@@ -65,7 +65,19 @@ _MIN_EXAMPLES_PER_CLASS = 1
 _MAX_METRIC_NAME_CHARS = 50
 _MAX_METRIC_DESC_CHARS = 800
 _METRIC_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,49}$")
-_METRICS_DIR = Path(os.environ.get("HOME", "/tmp")) / "metrics"
+
+
+def _resolve_metrics_dir() -> Path:
+    """Pick a writable directory for the metric library at actor startup.
+
+    The Ray runtime_env venv often boots with HOME=/nonexistent (no home
+    for the service account); BioEngine injects the real per-deployment HOME
+    after the process is up. Compute lazily so we never bake the
+    module-import-time value into module state.
+    """
+    home = os.environ.get("HOME", "")
+    candidate = Path(home) / "metrics" if home and home != "/nonexistent" else Path("/tmp") / "smart-microscopy-qc" / "metrics"
+    return candidate
 
 
 @serve.deployment(
@@ -114,17 +126,19 @@ class SmartMicroscopyQC:
         self._processor = None
         self._server = None
         self._artifact_manager = None
+        self._metrics_dir: Optional[Path] = None
 
     async def async_init(self) -> None:
         """Load the VLM and connect to Hypha for artifact resolution."""
         import os as _os
         for d in ("/tmp/triton-cache", "/tmp/hf-home", "/tmp/xdg-cache"):
             _os.makedirs(d, exist_ok=True)
-        _METRICS_DIR.mkdir(parents=True, exist_ok=True)
+        self._metrics_dir = _resolve_metrics_dir()
+        self._metrics_dir.mkdir(parents=True, exist_ok=True)
         existing = self._list_metric_records()
         logger.info(
             "Metric library at %s (%d metric%s)",
-            _METRICS_DIR, len(existing), "" if len(existing) == 1 else "s",
+            self._metrics_dir, len(existing), "" if len(existing) == 1 else "s",
         )
 
         from hypha_rpc import connect_to_server
@@ -262,7 +276,9 @@ class SmartMicroscopyQC:
     # ------------------------------------------------ metric library helpers
 
     def _metric_dir(self, name: str) -> Path:
-        return _METRICS_DIR / name
+        if self._metrics_dir is None:
+            raise RuntimeError("metric library not initialized yet.")
+        return self._metrics_dir / name
 
     def _metric_json_path(self, name: str) -> Path:
         return self._metric_dir(name) / "metric.json"
@@ -280,10 +296,10 @@ class SmartMicroscopyQC:
             return json.load(f)
 
     def _list_metric_records(self) -> List[dict]:
-        if not _METRICS_DIR.exists():
+        if self._metrics_dir is None or not self._metrics_dir.exists():
             return []
         out = []
-        for child in sorted(_METRICS_DIR.iterdir()):
+        for child in sorted(self._metrics_dir.iterdir()):
             if not child.is_dir():
                 continue
             mj = child / "metric.json"
