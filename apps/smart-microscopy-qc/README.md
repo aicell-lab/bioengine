@@ -45,20 +45,31 @@ Real-time visual quality-control inspector for live microscopy. A microscope (or
 
 If the server downscales, the response carries `downscaled_from: [W, H]` and a `downscale_note` so callers can see whether the QC verdict was rendered on the original or a resized version.
 
+## Two modes
+
+The app has two operating modes that share the same `inspect()` entry point:
+
+1. **Describe mode** (`instruction` only) — single image + free-text question, get a natural-language description.
+2. **Few-shot verdict mode** (`metric_name` set) — a previously-defined "metric" supplies good/bad reference images and a criterion. The model is prompted with the references first, then the new image, and asked to classify it as `good` or `bad` with a short reason.
+
+Define a metric once with `create_metric(...)`, then call `inspect(image_ref, metric_name=...)` as many times as you like — references stay on the replica's disk.
+
 ## API
 
-### `inspect(image_ref, instruction, max_new_tokens=512) -> dict`
+### `inspect(image_ref, instruction=None, metric_name=None, max_new_tokens=512) -> dict`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `image_ref` | `str` | Either an `https://...` URL (public or presigned) **or** a Hypha artifact reference `<workspace>/<alias>:<file_path>` (e.g. `ws-user-github\|49943582/qc-samples:images/frame_001.tif`). |
-| `instruction` | `str` | Free-text QC question. Max 4000 chars. |
+| `instruction` | `str?` | Free-text QC question. Required when `metric_name` is not given. Optional when it is — then it overrides the metric's stored description. Max 4000 chars. |
+| `metric_name` | `str?` | Name of a metric created via `create_metric(...)`. Switches into few-shot verdict mode. |
 | `max_new_tokens` | `int` | Response token budget. Default 512, range 1–1024. |
 
-**Returns:**
+**Returns (describe mode):**
 
 ```json
 {
+  "mode": "describe",
   "description": "- Focus: in focus, clear outlines …",
   "image_size": [1024, 1024],
   "source_url": "https://hypha.aicell.io/s3/…",
@@ -66,13 +77,53 @@ If the server downscales, the response carries `downscaled_from: [W, H]` and a `
   "tokens_generated": 66,
   "generation_time_s": 2.55,
   "tokens_per_second": 25.9,
-  "processing_time_s": 3.0,
-  "downscaled_from": [4096, 4096],
-  "downscale_note": "Image downscaled from 4096x4096 to 980x980 before VLM. The QC verdict applies to the resized image."
+  "processing_time_s": 3.0
 }
 ```
 
-`downscaled_from` and `downscale_note` are only present when the server resized the image.
+**Returns (few-shot verdict mode):**
+
+```json
+{
+  "mode": "few-shot",
+  "metric_name": "focus-quality",
+  "metric_description": "Sharp cell outlines, no motion blur, distinct staining patterns.",
+  "verdict": "good",
+  "reason": "Cell outlines are crisp and the staining is well-resolved.",
+  "description": "VERDICT: good\nREASON: Cell outlines are crisp …",
+  "n_good_examples": 3,
+  "n_bad_examples": 3,
+  "image_size": [1024, 1024],
+  "source_url": "https://hypha.aicell.io/s3/…",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "tokens_generated": 24,
+  "generation_time_s": 0.92,
+  "tokens_per_second": 26.1,
+  "processing_time_s": 1.3
+}
+```
+
+`verdict` is `"good"` / `"bad"` / `null` (when the model output doesn't follow the schema closely enough; the raw text is always in `description`).
+
+`downscaled_from` and `downscale_note` may be present in either mode when the server resized the inspected image.
+
+### Metric management
+
+| Method | Description |
+|---|---|
+| `create_metric(name, description, good_image_refs, bad_image_refs)` | Define or replace a metric. References can be HTTPS URLs (public or presigned) or Hypha artifact refs. Images are downloaded, downscaled (capped at ~512×512), and persisted to `$HOME/metrics/<name>/`. |
+| `list_metrics()` | List all metrics on this replica. |
+| `get_metric(name)` | Return one metric's full record. |
+| `delete_metric(name)` | Remove a metric and its cached reference images. |
+
+Limits enforced by `create_metric`:
+
+- `1 ≤ N_good ≤ 5`, `1 ≤ N_bad ≤ 5`. More examples eat the model's context budget without improving few-shot quality.
+- `name` must match `^[a-z0-9][a-z0-9-]{0,49}$`.
+- `description` ≤ 800 characters.
+- Each reference image is fetched once and stored at ≤ 512×512 to keep the prompt's image-token cost bounded.
+
+Persistence note: metrics live on the replica's local filesystem (`$HOME/metrics/`). The directory survives an inspect() call but is wiped when the Ray Serve actor restarts (e.g. on a pod roll). Treat metrics as session-local for now; promote to a Hypha-artifact-backed store when persistence across pod restarts becomes a requirement.
 
 ### `ping() -> dict`
 
