@@ -386,6 +386,12 @@ class AppBuilder:
         env_vars["TEMP"] = tmp_dir
         env_vars["TMP"] = tmp_dir
 
+        # Prevents getpass.getuser() falling through to pwd lookup, which raises
+        # KeyError when the actor's uid has no /etc/passwd entry (torch._dynamo
+        # hits this at import time in containers run with --user $(id -u)).
+        env_vars.setdefault("USER", "bioengine")
+        env_vars.setdefault("LOGNAME", "bioengine")
+
         env_vars["HYPHA_SERVER_URL"] = self.server.config.public_base_url
         env_vars["HYPHA_WORKSPACE"] = self.server.config.workspace
         env_vars["HYPHA_ARTIFACT_ID"] = artifact_id
