@@ -132,7 +132,9 @@ Limits enforced by `create_metric`:
 - `description` ≤ 800 characters.
 - Each reference image is fetched once and stored at ≤ 512×512 to keep the prompt's image-token cost bounded.
 
-Persistence note: metrics live on the replica's local filesystem (`$HOME/metrics/`). The directory survives an inspect() call but is wiped when the Ray Serve actor restarts (e.g. on a pod roll). Treat metrics as session-local for now; promote to a Hypha-artifact-backed store when persistence across pod restarts becomes a requirement.
+Persistence: metrics live under `$HOME/metrics/` on the replica's filesystem. On the KTH BioEngine worker (and any worker whose `apps_workdir` resolves to PVC-backed storage), that directory is mounted from a persistent volume — the per-app working directory is the same path across actor restarts, pod rolls, and full stop+deploy cycles. Empirically verified by creating a metric, performing `stop_app → deploy_app` (fresh deploy, `recovered_app=False`), and seeing the metric still present on the new actor.
+
+A metric is therefore **persistent within a worker** but **not portable across workers** (each worker pod has its own PVC). To share a metric library across deployments or rebuild it after a worker is wiped, the user can re-call `create_metric()` against the source image refs.
 
 ### `ping() -> dict`
 
