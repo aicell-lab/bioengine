@@ -6,13 +6,19 @@ Cellpose model, and exposes training control and inference functions.
 
 from __future__ import annotations
 
+import os
+
+# torch._dynamo (>=2.5) calls getpass.getuser() at import; fails when USER is
+# unset and host uid has no /etc/passwd entry (slim images run with --user $(id -u)).
+os.environ.setdefault("USER", "bioengine")
+os.environ.setdefault("LOGNAME", "bioengine")
+
 import asyncio
 import base64
 import fnmatch
 import io
 import json
 import logging
-import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
