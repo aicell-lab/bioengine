@@ -1505,7 +1505,7 @@ class AppsManager:
         ),
         hypha_token: str = Field(
             None,
-            description="Hypha connection token for authentication. The token will be set as environment variable 'HYPHA_TOKEN' in the application deployments. An already existing environment variable named 'HYPHA_TOKEN' will not be overwritten. The token is used to authenticate to BioEngine datasets and enables Hypha API calls as logged in user. If not specified, uses None (no token) for a new application, or preserves the previous token if updating an existing application (only when application_id is specified).",
+            description="Hypha connection token to set as environment variable 'HYPHA_TOKEN' inside the application's Ray actor. Required for apps whose code reads HYPHA_TOKEN at startup (e.g. apps that authenticate to BioEngine datasets, read private artifacts, or call back to Hypha as the logged-in user). Pass the deploying user's token unless you are certain the app does not need it. If omitted: when redeploying an existing instance (matching application_id), the previously stored token is preserved; on a fresh instance the actor receives no token and any app reading HYPHA_TOKEN at __init__ will fail. The '--env HYPHA_TOKEN=...' flag is silently ignored by the app builder; always use this parameter.",
         ),
         disable_gpu: bool = Field(
             None,
