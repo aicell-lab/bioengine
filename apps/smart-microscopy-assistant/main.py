@@ -377,10 +377,16 @@ class SmartMicroscopyAssistant:
             source_urls.append(url)
         return rel_paths, source_urls
 
-    # Master system prompt: anchors the model as a microscopy QC controller in
-    # both modes. Short by design to leave context budget for examples and
-    # the inspected image (~70 tokens).
-    _SYSTEM_PROMPT = (
+    # Separate system prompts per mode. The verdict-anchored prompt primes
+    # the 3B model to default to UNSURE on any criterion-shaped question, so
+    # describe mode uses an open-ended analyst prompt instead.
+    _SYSTEM_PROMPT_DESCRIBE = (
+        "You are a microscopy image analyst. Answer the user's question "
+        "about the provided microscopy image, grounded strictly in what is "
+        "visible. Be specific, do not invent details, and keep responses "
+        "short."
+    )
+    _SYSTEM_PROMPT_VERDICT = (
         "You are a microscopy quality-control assistant. Your job is to "
         "decide whether a microscopy image meets a stated visual-test "
         "criterion. Base every judgement on visible evidence in the image. "
@@ -395,7 +401,7 @@ class SmartMicroscopyAssistant:
     ) -> tuple[str, int]:
         """Free-text describe path: single image + free-text instruction."""
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT}]},
+            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT_DESCRIBE}]},
             {"role": "user", "content": [
                 {"type": "image", "image": image},
                 {"type": "text", "text": instruction},
@@ -441,7 +447,7 @@ class SmartMicroscopyAssistant:
             "the references)."})
 
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT}]},
+            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT_VERDICT}]},
             {"role": "user", "content": user_content},
         ]
         ordered_images = list(positive_images) + list(negative_images) + [new_image]
