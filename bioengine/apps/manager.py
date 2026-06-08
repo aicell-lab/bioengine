@@ -570,10 +570,21 @@ class AppsManager:
                 "status": deployment_info.status.value,
                 "message": deployment_info.message,
                 "replica_states": deployment_info.replica_states,
+                "nodes": [],
                 "logs": None,
             }
 
-            # Collect logs for all tracked actor IDs
+            try:
+                nodes = await self.ray_cluster.proxy_actor_handle.get_deployment_nodes.remote(
+                    application_id=application_id,
+                    deployment_name=deployment_name,
+                )
+                deployments_info[deployment_name]["nodes"] = nodes
+            except Exception as e:
+                self.logger.error(
+                    f"Error retrieving node placement for application '{application_id}', deployment '{deployment_name}': {e}"
+                )
+
             try:
                 deployment_logs = await self.ray_cluster.proxy_actor_handle.get_deployment_logs.remote(
                     application_id=application_id,
@@ -724,6 +735,14 @@ class AppsManager:
 
         service_ids = await self._get_application_service_ids(application_id)
 
+        seen_nodes = set()
+        app_nodes: List[str] = []
+        for dep in deployments.values():
+            for node_id in dep.get("nodes") or []:
+                if node_id and node_id not in seen_nodes:
+                    seen_nodes.add(node_id)
+                    app_nodes.append(node_id)
+
         # Build static site URL with runtime config params so the frontend
         # knows which Hypha server and service to connect to.
         base_static_url = application_info.get("static_site_url")
@@ -745,6 +764,7 @@ class AppsManager:
             "recovered_app": application_info["recovered_app"],
             "status": status,
             "message": message,
+            "nodes": app_nodes,
             "deployments": deployments,
             "application_kwargs": application_info["application_kwargs"],
             "application_env_vars": self._filter_secret_env_vars(
