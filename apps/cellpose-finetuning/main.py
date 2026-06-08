@@ -2478,16 +2478,13 @@ async def list_artifact_files_recursive(
             continue
         visited.add(current)
 
-        entries = await artifact.ls(current)
+        # detail=True is required — without it ls() returns a list[str] of bare
+        # names and the recursive walk has no type info, so subfolders never get
+        # enqueued and the result silently contains zero files.
+        entries = await artifact.ls(current, detail=True)
         for entry in entries:
-            raw_path = ""
-            entry_type = ""
-            if isinstance(entry, dict):
-                entry_dict = entry
-                raw_path = str(entry_dict.get("path") or entry_dict.get("name") or "")
-                entry_type = str(entry_dict.get("type") or "").lower()
-            else:
-                raw_path = str(entry)
+            raw_path = str(entry.get("path") or entry.get("name") or "")
+            entry_type = str(entry.get("type") or "").lower()
 
             normalized = _normalize_artifact_relpath(raw_path)
             if current and normalized and not normalized.startswith(current):
