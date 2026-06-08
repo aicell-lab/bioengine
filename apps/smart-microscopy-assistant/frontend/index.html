@@ -428,6 +428,42 @@
     opacity: 0.4; pointer-events: none; filter: grayscale(0.3);
     user-select: none;
   }
+
+  /* --- Lightbox (click-to-enlarge) ------------------------------------ */
+  .lightbox {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(2, 6, 16, 0.92);
+    backdrop-filter: blur(6px);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 4rem 1.5rem 2rem;
+    cursor: zoom-out;
+  }
+  .lightbox img {
+    max-width: 92vw; max-height: 80vh; object-fit: contain;
+    border-radius: 0.6rem;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+    cursor: default;
+    background: var(--bg-0);
+  }
+  .lightbox-caption {
+    margin-top: 0.95rem; color: var(--fg-dim); font-size: 0.85rem;
+    text-align: center; max-width: 92vw;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    cursor: default;
+  }
+  .lightbox-close {
+    position: absolute; top: 1.25rem; right: 1.25rem;
+    width: 2.5rem; height: 2.5rem; border-radius: 999px;
+    background: rgba(11, 18, 32, 0.85); color: var(--fg);
+    border: 1px solid var(--border-strong);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 1.5rem; line-height: 1; cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .lightbox-close:hover { background: var(--bg-3); color: #fff; }
+  .lightbox-close svg { width: 1.2rem; height: 1.2rem; }
+  .zoomable { cursor: zoom-in; }
 </style>
 </head>
 <body class="signed-out">
@@ -627,6 +663,19 @@
     <div id="log" class="log-body">Ready.</div>
   </details>
 
+</div>
+
+<!-- Lightbox (click-to-enlarge) -->
+<div id="lightbox" class="lightbox" role="dialog" aria-label="Image preview" hidden>
+  <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Close preview">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="18" y1="6" x2="6" y2="18"/>
+      <line x1="6" y1="6" x2="18" y2="18"/>
+    </svg>
+  </button>
+  <img id="lightboxImg" alt="" />
+  <div id="lightboxCaption" class="lightbox-caption"></div>
 </div>
 
 <script type="module">
@@ -899,6 +948,29 @@ function previewSrcFor(file) {
   return null;
 }
 
+// Lightbox: click any image to enlarge; close with X / backdrop / Escape.
+function openLightbox(src, caption) {
+  if (!src) return;
+  $("lightboxImg").src = src;
+  $("lightboxCaption").textContent = caption || "";
+  $("lightbox").hidden = false;
+  document.body.style.overflow = "hidden";
+}
+function closeLightbox() {
+  $("lightbox").hidden = true;
+  $("lightboxImg").src = "";
+  $("lightboxCaption").textContent = "";
+  document.body.style.overflow = "";
+}
+$("lightboxClose").addEventListener("click", closeLightbox);
+$("lightbox").addEventListener("click", (e) => {
+  // Only close when the backdrop itself is clicked, not the image/caption.
+  if (e.target.id === "lightbox") closeLightbox();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("lightbox").hidden) closeLightbox();
+});
+
 function renderGallery(side) {
   const arr = side === "positive" ? positiveFiles
             : side === "negative" ? negativeFiles
@@ -907,7 +979,8 @@ function renderGallery(side) {
   wrap.innerHTML = "";
   arr.forEach((file, idx) => {
     const tile = document.createElement("div");
-    tile.className = "tile";
+    tile.className = "tile zoomable";
+    tile.title = "Click to enlarge";
     const img = document.createElement("img");
     const placeholder = previewSrcFor(file);
     if (placeholder) img.src = placeholder;
@@ -931,6 +1004,10 @@ function renderGallery(side) {
     const lab = document.createElement("div");
     lab.className = "name"; lab.textContent = file.name;
     tile.appendChild(lab);
+    tile.addEventListener("click", (e) => {
+      if (e.target.closest(".x")) return;
+      openLightbox(img.src, file.name);
+    });
     wrap.appendChild(tile);
   });
   $(side + "Count").textContent = arr.length;
@@ -1056,17 +1133,18 @@ function makeResultCard(file, idx) {
   head.className = "result-head";
 
   const thumb = document.createElement("div");
-  thumb.className = "result-thumb";
+  thumb.className = "result-thumb zoomable";
+  thumb.title = "Click to enlarge";
   const placeholder = previewSrcFor(file);
-  if (placeholder) {
-    const img = document.createElement("img"); img.src = placeholder; thumb.appendChild(img);
-  } else {
-    const img = document.createElement("img");
+  const img = document.createElement("img");
+  if (placeholder) img.src = placeholder;
+  else {
     const reader = new FileReader();
     reader.onload = e => { img.src = e.target.result; };
     reader.readAsDataURL(file);
-    thumb.appendChild(img);
   }
+  thumb.appendChild(img);
+  thumb.addEventListener("click", () => openLightbox(img.src, file.name));
   head.appendChild(thumb);
 
   const body = document.createElement("div");
