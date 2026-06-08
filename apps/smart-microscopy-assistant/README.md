@@ -1,6 +1,6 @@
-# Smart Microscopy QC
+# Smart Microscopy Assistant
 
-Real-time visual quality-control inspector for live microscopy. A microscope (or any client) submits an acquired frame together with a free-text instruction describing the QC metrics to check, and a vision-language model returns a textual description of what it sees relative to that instruction.
+VLM-backed microscopy analyst. Define re-usable visual tests with a few positive and negative reference images, then run them against new images to get a **PASSED / FAILED / UNSURE** verdict. Or describe an image with a free-text instruction.
 
 ## Method
 
@@ -41,28 +41,28 @@ Real-time visual quality-control inspector for live microscopy. A microscope (or
 | Image pixel count | ≤ 1280 × 28 × 28 (≈ 1.0 MP) AND longest side ≤ 2048 | Server-side downscale in `_download_image` (PIL `Image.resize` with LANCZOS) |
 | Image hard reject | 200 MP (≈ 14000 × 14000) | Raises `ValueError` before downscale |
 | Instruction length | 4000 characters | Server-side `ValueError` (also mirrored in the browser UI which clips the textarea) |
-| Generation timeout | 120 s per `_run_vlm` call | `asyncio.wait_for` |
+| Generation timeout | 180 s per `_generate_with_images` call | `asyncio.wait_for` |
 
-If the server downscales, the response carries `downscaled_from: [W, H]` and a `downscale_note` so callers can see whether the QC verdict was rendered on the original or a resized version.
+If the server downscales, the response carries `downscaled_from: [W, H]` and a `downscale_note` so callers can see whether the verdict was rendered on the original or a resized version.
 
 ## Two modes
 
 The app has two operating modes that share the same `inspect()` entry point:
 
 1. **Describe mode** (`instruction` only) — single image + free-text question, get a natural-language description.
-2. **Few-shot verdict mode** (`metric_name` set) — a previously-defined "metric" supplies good/bad reference images and a criterion. The model is prompted with the references first, then the new image, and asked to classify it as `good` or `bad` with a short reason.
+2. **Few-shot verdict mode** (`visual_test_name` set) — a previously-defined "visual test" supplies positive/negative reference images and a criterion. The model is prompted with the references first, then the new image, and asked to return one of `passed`, `failed`, or `unsure` with a short reason.
 
-Define a metric once with `create_metric(...)`, then call `inspect(image_ref, metric_name=...)` as many times as you like — references stay on the replica's disk.
+Define a visual test once with `create_visual_test(...)`, then call `inspect(image_ref, visual_test_name=...)` as many times as you like — references stay on the replica's disk.
 
 ## API
 
-### `inspect(image_ref, instruction=None, metric_name=None, max_new_tokens=512) -> dict`
+### `inspect(image_ref, instruction=None, visual_test_name=None, max_new_tokens=512) -> dict`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `image_ref` | `str` | Either an `https://...` URL (public or presigned) **or** a Hypha artifact reference `<workspace>/<alias>:<file_path>` (e.g. `ws-user-github\|49943582/qc-samples:images/frame_001.tif`). |
-| `instruction` | `str?` | Free-text QC question. Required when `metric_name` is not given. Optional when it is — then it overrides the metric's stored description. Max 4000 chars. |
-| `metric_name` | `str?` | Name of a metric created via `create_metric(...)`. Switches into few-shot verdict mode. |
+| `instruction` | `str?` | Free-text instruction. Required when `visual_test_name` is not given. Optional when it is — then it overrides the visual test's stored description. Max 4000 chars. |
+| `visual_test_name` | `str?` | Name of a visual test created via `create_visual_test(...)`. Switches into few-shot verdict mode. |
 | `max_new_tokens` | `int` | Response token budget. Default 512, range 1–1024. |
 
 **Returns (describe mode):**
@@ -86,13 +86,13 @@ Define a metric once with `create_metric(...)`, then call `inspect(image_ref, me
 ```json
 {
   "mode": "few-shot",
-  "metric_name": "focus-quality",
-  "metric_description": "Sharp cell outlines, no motion blur, distinct staining patterns.",
-  "verdict": "good",
+  "visual_test_name": "focus-quality",
+  "visual_test_description": "Sharp cell outlines, no motion blur, distinct staining patterns.",
+  "verdict": "passed",
   "reason": "Cell outlines are crisp and the staining is well-resolved.",
-  "description": "VERDICT: good\nREASON: Cell outlines are crisp …",
-  "n_good_examples": 3,
-  "n_bad_examples": 3,
+  "description": "VERDICT: passed\nREASON: Cell outlines are crisp …",
+  "n_positive_examples": 3,
+  "n_negative_examples": 3,
   "image_size": [1024, 1024],
   "source_url": "https://hypha.aicell.io/s3/…",
   "model": "Qwen/Qwen2.5-VL-3B-Instruct",
@@ -103,7 +103,7 @@ Define a metric once with `create_metric(...)`, then call `inspect(image_ref, me
 }
 ```
 
-`verdict` is `"good"` / `"bad"` / `null` (when the model output doesn't follow the schema closely enough; the raw text is always in `description`).
+`verdict` is one of `"passed"`, `"failed"`, or `"unsure"`. The model returns `unsure` when the visible evidence is genuinely ambiguous or insufficient; the parser also defaults to `unsure` when the output doesn't follow the `VERDICT: …` schema (the raw text is always in `description`).
 
 `downscaled_from` and `downscale_note` may be present in either mode when the server resized the inspected image.
 
@@ -112,29 +112,29 @@ Define a metric once with `create_metric(...)`, then call `inspect(image_ref, me
 The 3B model handles **specific, visually-grounded criteria** ("at least 5 distinct cells", "any saturated pixels", "vertical motion blur") considerably better than **coarse class differences** ("good vs. bad image"). Two patterns observed on the live deployment:
 
 - A criterion phrased as a measurable property (cell count, focus sharpness on a defined region, presence of a specific artefact) generally returns a verdict aligned with the actual content.
-- A criterion phrased as broad quality vs. anti-quality, with references that span very different visual styles (e.g. real microscopy frames as good, flat grey as bad), can occasionally produce verdicts that echo the good-class reason regardless of the new image. The 3B model isn't large enough to discriminate sharply by visual gestalt alone.
+- A criterion phrased as broad quality vs. anti-quality, with references that span very different visual styles, can occasionally produce verdicts that echo the positive-class reason regardless of the new image. The 3B model isn't large enough to discriminate sharply by visual gestalt alone.
 
-If a metric isn't discriminating well: tighten the `description` (it goes into the prompt verbatim) to spell out *what to look for*; consider asking a more specific question via the `instruction` override at inspect time.
+If a visual test isn't discriminating well: tighten the `description` (it goes into the prompt verbatim) to spell out *what to look for*; consider asking a more specific question via the `instruction` override at inspect time.
 
-### Metric management
+### Visual-test management
 
 | Method | Description |
 |---|---|
-| `create_metric(name, description, good_image_refs, bad_image_refs)` | Define or replace a metric. References can be HTTPS URLs (public or presigned) or Hypha artifact refs. Images are downloaded, downscaled (capped at ~512×512), and persisted to `$HOME/metrics/<name>/`. |
-| `list_metrics()` | List all metrics on this replica. |
-| `get_metric(name)` | Return one metric's full record. |
-| `delete_metric(name)` | Remove a metric and its cached reference images. |
+| `create_visual_test(name, description, positive_image_refs, negative_image_refs)` | Define or replace a visual test. References can be HTTPS URLs (public or presigned) or Hypha artifact refs. Images are downloaded, downscaled (capped at ~512×512), and persisted to `$HOME/visual_tests/<name>/`. |
+| `list_visual_tests()` | List all visual tests on this replica. |
+| `get_visual_test(name)` | Return one visual test's full record. |
+| `delete_visual_test(name)` | Remove a visual test and its cached reference images. |
 
-Limits enforced by `create_metric`:
+Limits enforced by `create_visual_test`:
 
-- `1 ≤ N_good ≤ 5`, `1 ≤ N_bad ≤ 5`. More examples eat the model's context budget without improving few-shot quality.
+- `1 ≤ N_positive ≤ 5`, `1 ≤ N_negative ≤ 5`. More examples eat the model's context budget without improving few-shot quality.
 - `name` must match `^[a-z0-9][a-z0-9-]{0,49}$`.
 - `description` ≤ 800 characters.
 - Each reference image is fetched once and stored at ≤ 512×512 to keep the prompt's image-token cost bounded.
 
-Persistence: metrics live under `$HOME/metrics/` on the replica's filesystem. On the KTH BioEngine worker (and any worker whose `apps_workdir` resolves to PVC-backed storage), that directory is mounted from a persistent volume — the per-app working directory is the same path across actor restarts, pod rolls, and full stop+deploy cycles. Empirically verified by creating a metric, performing `stop_app → deploy_app` (fresh deploy, `recovered_app=False`), and seeing the metric still present on the new actor.
+Persistence: visual tests live under `$HOME/visual_tests/` on the replica's filesystem. On the KTH BioEngine worker (and any worker whose `apps_workdir` resolves to PVC-backed storage), that directory is mounted from a persistent volume — the per-app working directory is the same path across actor restarts, pod rolls, and full stop+deploy cycles. Empirically verified by creating a visual test, performing `stop_app → deploy_app` (fresh deploy, `recovered_app=False`), and seeing the test still present on the new actor.
 
-A metric is therefore **persistent within a worker** but **not portable across workers** (each worker pod has its own PVC). To share a metric library across deployments or rebuild it after a worker is wiped, the user can re-call `create_metric()` against the source image refs.
+A visual test is therefore **persistent within a worker** but **not portable across workers** (each worker pod has its own PVC). To share a library across deployments, re-call `create_visual_test()` against the source image refs.
 
 ### `ping() -> dict`
 
@@ -156,13 +156,18 @@ Describes the served model and the input/output contract:
   "max_pixels": 1003520,
   "max_long_side": 2048,
   "hard_reject_pixels": 209715200,
+  "min_examples_per_class": 1,
+  "max_examples_per_class": 5,
+  "max_visual_test_name_chars": 50,
+  "max_visual_test_desc_chars": 800,
+  "verdicts": ["passed", "failed", "unsure"],
   "license": "Qwen2.5-VL Apache 2.0 weights"
 }
 ```
 
 ## Operating characteristics (measured on KTH A40-16C vGPU)
 
-10 back-to-back `inspect()` calls, same 512×512 HPA RGB image, identical 200-char QC instruction, `max_new_tokens=192`, 66 generated tokens each:
+10 back-to-back `inspect()` calls, same 512×512 HPA RGB image, identical 200-char instruction, `max_new_tokens=192`, 66 generated tokens each:
 
 | Metric | min | median | mean | max | std | spread |
 |---|---:|---:|---:|---:|---:|---:|
@@ -181,17 +186,14 @@ VRAM is not exposed directly via the Hypha service. The model load reports ~6 GB
 https://hypha.aicell.io/{workspace}/view/{artifact-id}/
 ```
 
-The page:
+The page has two modes:
 
-1. Prompts the user to sign in to Hypha (the user's own token, never the worker's).
-2. Accepts a drag-dropped or file-picked image.
-3. Takes a QC instruction (UI mirrors the 4000-char server cap with a live counter).
-4. Uploads the image to a `smart-microscopy-qc-scratch-<random>` artifact in the user's workspace.
-5. Calls `inspect(...)`.
-6. Displays the response with token/throughput metadata.
-7. **Always** deletes the scratch artifact in a `finally` block, success or failure.
+- **Analyze** — drag in one or more images, pick a saved visual test (or type a free-text instruction), and hit *Run analysis*. Each image is uploaded and inspected sequentially; the result row shows a colored verdict chip (Passed / Failed / Unsure / Described / Error), the reason, and an expandable details panel with tok/s, timing, and the raw model output.
+- **Define visual test** — name, criterion, plus positive + negative example galleries (1–5 each). On save, examples are uploaded to a scratch artifact, presigned with the caller's session, and handed to `create_visual_test()`; the worker downloads them once, downscales, and caches under `$HOME/visual_tests/<name>/`.
 
-The page expects the QC service ID via `?ws_service_id=<full-id>&server=<hypha-url>` URL params; without them it falls back to the short artifact form `bioimage-io/smart-microscopy-qc`.
+An info button in the top bar opens a popover with the served model details (pulled from `get_model_info`). The activity log is hidden behind an expandable "Activity log" panel at the bottom.
+
+The page expects the service ID via `?ws_service_id=<full-id>&server=<hypha-url>` URL params; without them it falls back to the short artifact form `bioimage-io/smart-microscopy-assistant`.
 
 ## Usage example (Python)
 
@@ -203,16 +205,22 @@ server = await connect_to_server({
     "token": HYPHA_TOKEN,
 })
 worker  = await server.get_service("bioimage-io/bioengine-worker-kth-...:bioengine-worker")
-status  = await worker.get_app_status(["smart-microscopy-qc"])
-ws_sid  = status["smart-microscopy-qc"]["service_ids"]["websocket_service_id"]
+status  = await worker.get_app_status(["smart-microscopy-assistant"])
+ws_sid  = status["smart-microscopy-assistant"]["service_ids"]["websocket_service_id"]
 qc      = await server.get_service(ws_sid)
 
+# Define a visual test once
+await qc.create_visual_test(
+    name="has-cells",
+    description="PASS: visible cellular structures with nuclei. FAIL: flat, empty, or uniform regions.",
+    positive_image_refs=["https://example.org/cells_1.tif", "https://example.org/cells_2.tif"],
+    negative_image_refs=["https://example.org/flat_1.png",  "https://example.org/flat_2.png"],
+)
+
+# Run it against any number of new images
 result = await qc.inspect(
     image_ref="https://example.org/scan.tif",
-    instruction=(
-        "Assess focus quality, illumination uniformity, and the approximate "
-        "number of cells. Flag any dark spots or contamination."
-    ),
+    visual_test_name="has-cells",
 )
-print(result["description"])
+print(result["verdict"], "—", result["reason"])
 ```

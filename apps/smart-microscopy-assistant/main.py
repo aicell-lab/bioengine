@@ -1,16 +1,18 @@
-"""Smart Microscopy QC — VLM-backed real-time quality-control inspector.
+"""Smart Microscopy Assistant — VLM-backed analyst for microscopy images.
 
 Accepts a microscopy image (Hypha artifact reference OR HTTPS URL) and either
-a free-text QC instruction (describe-what-you-see mode) or the name of a
-previously-defined QC metric (few-shot good/bad-verdict mode), and returns
-the VLM's textual judgement.
+a free-text instruction (describe-what-you-see) or the name of a previously-
+defined "visual test" (few-shot verdict mode), and returns the VLM's textual
+judgement.
 
-Few-shot mode persists a small library of "metrics" on the replica's
-local workspace under $HOME/metrics. Each metric records a name, a
-free-text criterion, and a set of small reference images (up to 5 good
-+ 5 bad) downloaded once at create_metric() time. inspect() then builds
-a multi-image prompt prepending those reference images and asks the VLM
-to classify the new image as GOOD or BAD against the criterion.
+A visual test is a re-usable definition of "what to look for" in an image.
+The replica persists a small library of visual tests on its local workspace
+at $HOME/visual_tests. Each test records a name, a free-text criterion, and
+a set of small reference images (up to 5 positive + 5 negative) downloaded
+once at create_visual_test() time. inspect() then builds a multi-image
+prompt prepending those references and asks the VLM to return one of three
+verdicts: PASSED, FAILED, or UNSURE (when it cannot make a confident
+judgement from the visible content).
 
 Backed by Qwen2.5-VL-3B-Instruct via HuggingFace transformers on a single
 NVIDIA A40-16C vGPU slice (Ampere, sm_86; 16 GB framebuffer time-shared
@@ -53,7 +55,7 @@ _HARD_REJECT_PIXELS = 200 * 1024 * 1024
 _DOWNLOAD_TIMEOUT_S = 30
 _GENERATE_TIMEOUT_S = 180
 
-# Few-shot metric library.
+# Visual-test library.
 # Reference images are aggressively downscaled before storage so the prompt
 # stays within Qwen's working-set even when N is at the upper bound.
 # 512x512 -> ~64 vision tokens after Qwen's 28-pixel patch + 2x2 merge,
@@ -62,13 +64,14 @@ _EXAMPLE_MAX_PIXELS = 512 * 512
 _EXAMPLE_MAX_LONG_SIDE = 768
 _MAX_EXAMPLES_PER_CLASS = 5
 _MIN_EXAMPLES_PER_CLASS = 1
-_MAX_METRIC_NAME_CHARS = 50
-_MAX_METRIC_DESC_CHARS = 800
-_METRIC_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,49}$")
+_MAX_TEST_NAME_CHARS = 50
+_MAX_TEST_DESC_CHARS = 800
+_TEST_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,49}$")
+_VERDICT_VALUES = ("passed", "failed", "unsure")
 
 
-def _resolve_metrics_dir() -> Path:
-    """Pick a writable directory for the metric library at actor startup.
+def _resolve_tests_dir() -> Path:
+    """Pick a writable directory for the visual-test library at actor startup.
 
     The Ray runtime_env venv often boots with HOME=/nonexistent (no home
     for the service account); BioEngine injects the real per-deployment HOME
@@ -76,8 +79,9 @@ def _resolve_metrics_dir() -> Path:
     module-import-time value into module state.
     """
     home = os.environ.get("HOME", "")
-    candidate = Path(home) / "metrics" if home and home != "/nonexistent" else Path("/tmp") / "smart-microscopy-qc" / "metrics"
-    return candidate
+    if home and home != "/nonexistent":
+        return Path(home) / "visual_tests"
+    return Path("/tmp") / "smart-microscopy-assistant" / "visual_tests"
 
 
 @serve.deployment(
@@ -119,26 +123,26 @@ def _resolve_metrics_dir() -> Path:
     health_check_timeout_s=600.0,
     graceful_shutdown_timeout_s=120.0,
 )
-class SmartMicroscopyQC:
+class SmartMicroscopyAssistant:
     def __init__(self) -> None:
         self.start_time = time.time()
         self._engine = None
         self._processor = None
         self._server = None
         self._artifact_manager = None
-        self._metrics_dir: Optional[Path] = None
+        self._tests_dir: Optional[Path] = None
 
     async def async_init(self) -> None:
         """Load the VLM and connect to Hypha for artifact resolution."""
         import os as _os
         for d in ("/tmp/triton-cache", "/tmp/hf-home", "/tmp/xdg-cache"):
             _os.makedirs(d, exist_ok=True)
-        self._metrics_dir = _resolve_metrics_dir()
-        self._metrics_dir.mkdir(parents=True, exist_ok=True)
-        existing = self._list_metric_records()
+        self._tests_dir = _resolve_tests_dir()
+        self._tests_dir.mkdir(parents=True, exist_ok=True)
+        existing = self._list_test_records()
         logger.info(
-            "Metric library at %s (%d metric%s)",
-            self._metrics_dir, len(existing), "" if len(existing) == 1 else "s",
+            "Visual-test library at %s (%d test%s)",
+            self._tests_dir, len(existing), "" if len(existing) == 1 else "s",
         )
 
         from hypha_rpc import connect_to_server
@@ -169,7 +173,7 @@ class SmartMicroscopyQC:
             low_cpu_mem_usage=True,
         )
         self._engine.eval()
-        logger.info("Qwen2.5-VL-7B-AWQ ready on %s.", next(self._engine.parameters()).device)
+        logger.info("Qwen2.5-VL-3B ready on %s.", next(self._engine.parameters()).device)
 
     async def test_deployment(self) -> None:
         """No-op smoke test.
@@ -201,7 +205,6 @@ class SmartMicroscopyQC:
         """
         if self._artifact_manager is not None:
             try:
-                # Cheap probe: list_collections is a no-arg read.
                 await self._artifact_manager.list(parent_id="public/applications")
                 return self._artifact_manager
             except Exception as e:
@@ -307,58 +310,58 @@ class SmartMicroscopyQC:
             )
         return img, original_size
 
-    # ------------------------------------------------ metric library helpers
+    # --------------------------------------------- visual-test library helpers
 
-    def _metric_dir(self, name: str) -> Path:
-        if self._metrics_dir is None:
-            raise RuntimeError("metric library not initialized yet.")
-        return self._metrics_dir / name
+    def _test_dir(self, name: str) -> Path:
+        if self._tests_dir is None:
+            raise RuntimeError("visual-test library not initialized yet.")
+        return self._tests_dir / name
 
-    def _metric_json_path(self, name: str) -> Path:
-        return self._metric_dir(name) / "metric.json"
+    def _test_json_path(self, name: str) -> Path:
+        return self._test_dir(name) / "visual_test.json"
 
-    def _load_metric(self, name: str) -> dict:
-        if not _METRIC_NAME_RE.match(name):
+    def _load_test(self, name: str) -> dict:
+        if not _TEST_NAME_RE.match(name):
             raise ValueError(
-                f"metric name must match {_METRIC_NAME_RE.pattern} "
+                f"visual-test name must match {_TEST_NAME_RE.pattern} "
                 f"(got: {name!r})"
             )
-        path = self._metric_json_path(name)
+        path = self._test_json_path(name)
         if not path.exists():
-            raise ValueError(f"metric {name!r} not found.")
+            raise ValueError(f"visual test {name!r} not found.")
         with open(path, "r") as f:
             return json.load(f)
 
-    def _list_metric_records(self) -> List[dict]:
-        if self._metrics_dir is None or not self._metrics_dir.exists():
+    def _list_test_records(self) -> List[dict]:
+        if self._tests_dir is None or not self._tests_dir.exists():
             return []
         out = []
-        for child in sorted(self._metrics_dir.iterdir()):
+        for child in sorted(self._tests_dir.iterdir()):
             if not child.is_dir():
                 continue
-            mj = child / "metric.json"
+            mj = child / "visual_test.json"
             if not mj.exists():
                 continue
             try:
                 with open(mj, "r") as f:
                     out.append(json.load(f))
             except Exception as e:
-                logger.warning("Skipping corrupt metric %s: %s", child.name, e)
+                logger.warning("Skipping corrupt visual test %s: %s", child.name, e)
         return out
 
     async def _save_example_images(
         self,
-        metric_dir: Path,
-        side: str,                 # "good" or "bad"
+        test_dir: Path,
+        side: str,                 # "positive" or "negative"
         image_refs: List[str],
     ) -> tuple[list[str], list[str]]:
         """Download each ref, downscale tight, write PNG to disk.
 
-        Returns (list of relative paths under metric_dir, list of source urls).
+        Returns (list of relative paths under test_dir, list of source urls).
         """
         from PIL import Image  # noqa: F401  (touched here only to surface ImportError early)
 
-        side_dir = metric_dir / side
+        side_dir = test_dir / side
         side_dir.mkdir(parents=True, exist_ok=True)
         rel_paths, source_urls = [], []
         for i, ref in enumerate(image_refs):
@@ -376,13 +379,15 @@ class SmartMicroscopyQC:
 
     # Master system prompt: anchors the model as a microscopy QC controller in
     # both modes. Short by design to leave context budget for examples and
-    # the inspected image (~50 tokens).
+    # the inspected image (~70 tokens).
     _SYSTEM_PROMPT = (
-        "You are a microscopy quality-control controller. Your job is to "
-        "decide whether the provided microscopy image passes or fails a "
-        "given quality-control criterion. Base every judgement on visible "
-        "evidence in the image. Be precise, do not invent details, and keep "
-        "responses short."
+        "You are a microscopy quality-control assistant. Your job is to "
+        "decide whether a microscopy image meets a stated visual-test "
+        "criterion. Base every judgement on visible evidence in the image. "
+        "Possible verdicts are PASSED (the criterion is clearly met), "
+        "FAILED (the criterion is clearly violated), or UNSURE (the "
+        "evidence is ambiguous or insufficient). Be precise, do not invent "
+        "details, and keep responses short."
     )
 
     async def _run_vlm(
@@ -401,41 +406,45 @@ class SmartMicroscopyQC:
     async def _run_vlm_few_shot(
         self,
         new_image: "Image.Image",
-        metric: dict,
-        good_images: List["Image.Image"],
-        bad_images: List["Image.Image"],
+        visual_test: dict,
+        positive_images: List["Image.Image"],
+        negative_images: List["Image.Image"],
         instruction_override: Optional[str],
         max_new_tokens: int,
     ) -> tuple[str, int]:
-        """Few-shot verdict path: prepend good/bad examples, ask for GOOD/BAD."""
-        criterion = (instruction_override or metric["description"]).strip()
+        """Few-shot verdict path: prepend positive/negative examples, ask for
+        PASSED / FAILED / UNSURE."""
+        criterion = (instruction_override or visual_test["description"]).strip()
         user_content: List[Dict[str, Any]] = [
             {"type": "text", "text":
-                f"Quality-control metric: {metric['name']}\n"
+                f"Visual test: {visual_test['name']}\n"
                 f"Criterion: {criterion}\n\n"
-                f"Reference images that PASS this criterion (GOOD):"},
+                f"Reference images that PASS this criterion:"},
         ]
-        for img in good_images:
+        for img in positive_images:
             user_content.append({"type": "image", "image": img})
         user_content.append({"type": "text", "text":
-            "Reference images that FAIL this criterion (BAD):"})
-        for img in bad_images:
+            "Reference images that FAIL this criterion:"})
+        for img in negative_images:
             user_content.append({"type": "image", "image": img})
         user_content.append({"type": "text", "text":
             "Now evaluate this new image against the same criterion. Compare "
-            "against the references and decide whether it passes (good) or "
-            "fails (bad):"})
+            "against the references and decide whether it PASSED, FAILED, or "
+            "is UNSURE:"})
         user_content.append({"type": "image", "image": new_image})
         user_content.append({"type": "text", "text":
-            "Reply on the first line with exactly `VERDICT: good` or `VERDICT: bad`, "
-            "then on a second line `REASON: ` followed by ONE short sentence "
-            "grounded in the new image's visible content (not in the references)."})
+            "Reply on the first line with exactly `VERDICT: passed`, "
+            "`VERDICT: failed`, or `VERDICT: unsure`. Use `unsure` only when "
+            "the visible evidence is genuinely ambiguous or insufficient. "
+            "Then on a second line write `REASON: ` followed by ONE short "
+            "sentence grounded in the new image's visible content (not in "
+            "the references)."})
 
         messages = [
             {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT}]},
             {"role": "user", "content": user_content},
         ]
-        ordered_images = list(good_images) + list(bad_images) + [new_image]
+        ordered_images = list(positive_images) + list(negative_images) + [new_image]
         return await self._generate_with_images(messages, ordered_images, max_new_tokens)
 
     async def _generate_with_images(
@@ -483,13 +492,13 @@ class SmartMicroscopyQC:
         )
 
     @staticmethod
-    def _parse_verdict(text: str) -> tuple[Optional[str], str]:
-        """Parse 'VERDICT: good/bad' and 'REASON: ...' out of the model output.
-        Returns (verdict, reason). verdict is None when the output didn't follow
-        the schema closely enough."""
-        verdict: Optional[str] = None
+    def _parse_verdict(text: str) -> tuple[str, str]:
+        """Parse 'VERDICT: passed|failed|unsure' and 'REASON: ...' out of the
+        model output. Returns (verdict, reason). When the output does not
+        follow the schema the verdict defaults to 'unsure'."""
+        verdict = "unsure"
         reason = text.strip()
-        m = re.search(r"VERDICT\s*:\s*(good|bad)\b", text, flags=re.IGNORECASE)
+        m = re.search(r"VERDICT\s*:\s*(passed|failed|unsure)\b", text, flags=re.IGNORECASE)
         if m:
             verdict = m.group(1).lower()
         m2 = re.search(r"REASON\s*:\s*(.+?)(?:\n|$)", text, flags=re.IGNORECASE | re.DOTALL)
@@ -524,71 +533,79 @@ class SmartMicroscopyQC:
             "hard_reject_pixels": _HARD_REJECT_PIXELS,
             "min_examples_per_class": _MIN_EXAMPLES_PER_CLASS,
             "max_examples_per_class": _MAX_EXAMPLES_PER_CLASS,
-            "max_metric_desc_chars": _MAX_METRIC_DESC_CHARS,
+            "max_visual_test_name_chars": _MAX_TEST_NAME_CHARS,
+            "max_visual_test_desc_chars": _MAX_TEST_DESC_CHARS,
+            "verdicts": list(_VERDICT_VALUES),
             "license": "Qwen2.5-VL Apache 2.0 weights",
         }
 
-    # ----------------------------------------------------- metric management
+    # ----------------------------------------------- visual-test management
 
     @schema_method
-    async def create_metric(
+    async def create_visual_test(
         self,
         name: str = Field(
             ...,
             description=(
-                "Metric identifier. Lowercase letters, digits, and hyphens; "
-                "max 50 chars; must start with a letter or digit. Example: "
-                "'focus-quality'. Re-using an existing name overwrites it."
+                "Visual-test identifier. Lowercase letters, digits, and "
+                "hyphens; max 50 chars; must start with a letter or digit. "
+                "Example: 'focus-quality'. Re-using an existing name "
+                "overwrites it."
             ),
         ),
         description: str = Field(
             ...,
             description=(
-                "Free-text criterion describing what makes an image GOOD or "
-                "BAD for this metric. Max 800 chars. Example: 'Sharp cell "
+                "Free-text criterion describing what makes an image PASS or "
+                "FAIL this visual test. Max 800 chars. Example: 'Sharp cell "
                 "outlines, no motion blur, distinct staining patterns'."
             ),
         ),
-        good_image_refs: list = Field(
+        positive_image_refs: list = Field(
             ...,
             description=(
-                "List of 1–5 image references that exemplify the criterion. "
-                "Each entry can be an HTTPS URL (public or presigned) or a "
-                "Hypha artifact reference '<workspace>/<alias>:<file_path>'. "
-                "Private artifacts must be presigned ahead of time or "
-                "fetched server-side via artifact-manager."
+                "List of 1–5 image references that exemplify the criterion "
+                "(i.e. images that should PASS). Each entry can be an HTTPS "
+                "URL (public or presigned) or a Hypha artifact reference "
+                "'<workspace>/<alias>:<file_path>'. Private artifacts must "
+                "be presigned ahead of time or fetched server-side via "
+                "artifact-manager."
             ),
         ),
-        bad_image_refs: list = Field(
+        negative_image_refs: list = Field(
             ...,
             description=(
-                "List of 1–5 image references that VIOLATE the criterion. "
-                "Same accepted formats as good_image_refs."
+                "List of 1–5 image references that VIOLATE the criterion "
+                "(i.e. images that should FAIL). Same accepted formats as "
+                "positive_image_refs."
             ),
         ),
     ) -> dict:
-        """Define or replace a QC metric in the on-replica metric library.
+        """Define or replace a visual test in the on-replica test library.
 
         Downloads each reference image, downscales it to a small fixed budget
         (so the few-shot prompt stays within the model's working context),
-        and persists the metric record on the replica's local disk under
-        $HOME/metrics/<name>/. Subsequent inspect() calls can then reference
-        the metric by name.
+        and persists the visual-test record on the replica's local disk under
+        $HOME/visual_tests/<name>/. Subsequent inspect() calls can then
+        reference the test by name via the `visual_test_name` parameter.
 
-        Returns the saved metric record (without raw image bytes).
+        Returns the saved visual-test record (without raw image bytes).
         """
-        if not _METRIC_NAME_RE.match(name):
+        if not _TEST_NAME_RE.match(name):
             raise ValueError(
-                f"metric name must match {_METRIC_NAME_RE.pattern} (got: {name!r})"
+                f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
             )
         if not isinstance(description, str) or not description.strip():
             raise ValueError("description must be a non-empty string.")
-        if len(description) > _MAX_METRIC_DESC_CHARS:
+        if len(description) > _MAX_TEST_DESC_CHARS:
             raise ValueError(
-                f"description exceeds {_MAX_METRIC_DESC_CHARS}-char limit "
+                f"description exceeds {_MAX_TEST_DESC_CHARS}-char limit "
                 f"(got {len(description)})."
             )
-        for side_name, refs in (("good", good_image_refs), ("bad", bad_image_refs)):
+        for side_name, refs in (
+            ("positive", positive_image_refs),
+            ("negative", negative_image_refs),
+        ):
             if not isinstance(refs, list):
                 raise ValueError(f"{side_name}_image_refs must be a list.")
             if len(refs) < _MIN_EXAMPLES_PER_CLASS:
@@ -607,70 +624,69 @@ class SmartMicroscopyQC:
                 )
 
         import shutil
-        metric_dir = self._metric_dir(name)
-        # Wipe any previous version so partial writes never get mixed in.
-        if metric_dir.exists():
-            shutil.rmtree(metric_dir)
-        metric_dir.mkdir(parents=True, exist_ok=True)
+        test_dir = self._test_dir(name)
+        if test_dir.exists():
+            shutil.rmtree(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
         try:
-            good_paths, good_urls = await self._save_example_images(
-                metric_dir, "good", good_image_refs,
+            pos_paths, pos_urls = await self._save_example_images(
+                test_dir, "positive", positive_image_refs,
             )
-            bad_paths, bad_urls = await self._save_example_images(
-                metric_dir, "bad", bad_image_refs,
+            neg_paths, neg_urls = await self._save_example_images(
+                test_dir, "negative", negative_image_refs,
             )
         except Exception:
-            shutil.rmtree(metric_dir, ignore_errors=True)
+            shutil.rmtree(test_dir, ignore_errors=True)
             raise
 
         record = {
             "name": name,
             "description": description.strip(),
-            "good_images": good_paths,
-            "bad_images": bad_paths,
-            "good_source_urls": good_urls,
-            "bad_source_urls": bad_urls,
-            "n_good": len(good_paths),
-            "n_bad": len(bad_paths),
+            "positive_images": pos_paths,
+            "negative_images": neg_paths,
+            "positive_source_urls": pos_urls,
+            "negative_source_urls": neg_urls,
+            "n_positive": len(pos_paths),
+            "n_negative": len(neg_paths),
             "created_at": time.time(),
         }
-        with open(self._metric_json_path(name), "w") as f:
+        with open(self._test_json_path(name), "w") as f:
             json.dump(record, f, indent=2)
         logger.info(
-            "Saved metric %r: %d good, %d bad examples at %s",
-            name, record["n_good"], record["n_bad"], metric_dir,
+            "Saved visual test %r: %d positive, %d negative examples at %s",
+            name, record["n_positive"], record["n_negative"], test_dir,
         )
         return record
 
     @schema_method
-    async def list_metrics(self) -> list:
-        """List the QC metrics defined on this replica."""
-        return self._list_metric_records()
+    async def list_visual_tests(self) -> list:
+        """List the visual tests defined on this replica."""
+        return self._list_test_records()
 
     @schema_method
-    async def get_metric(
+    async def get_visual_test(
         self,
-        name: str = Field(..., description="Metric identifier."),
+        name: str = Field(..., description="Visual-test identifier."),
     ) -> dict:
-        """Return one metric record by name."""
-        return self._load_metric(name)
+        """Return one visual-test record by name."""
+        return self._load_test(name)
 
     @schema_method
-    async def delete_metric(
+    async def delete_visual_test(
         self,
-        name: str = Field(..., description="Metric identifier."),
+        name: str = Field(..., description="Visual-test identifier."),
     ) -> dict:
-        """Delete a metric and its reference images from the replica's disk."""
+        """Delete a visual test and its reference images from the replica's disk."""
         import shutil
-        if not _METRIC_NAME_RE.match(name):
+        if not _TEST_NAME_RE.match(name):
             raise ValueError(
-                f"metric name must match {_METRIC_NAME_RE.pattern} (got: {name!r})"
+                f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
             )
-        metric_dir = self._metric_dir(name)
-        if not metric_dir.exists():
-            raise ValueError(f"metric {name!r} not found.")
-        shutil.rmtree(metric_dir)
-        logger.info("Deleted metric %r at %s", name, metric_dir)
+        test_dir = self._test_dir(name)
+        if not test_dir.exists():
+            raise ValueError(f"visual test {name!r} not found.")
+        shutil.rmtree(test_dir)
+        logger.info("Deleted visual test %r at %s", name, test_dir)
         return {"name": name, "deleted": True}
 
     @schema_method
@@ -688,20 +704,21 @@ class SmartMicroscopyQC:
         instruction: Optional[str] = Field(
             None,
             description=(
-                "Free-text QC instruction telling the VLM what to look for. "
-                "Either `instruction` OR `metric_name` is required. If both are "
-                "given the metric's pre-defined good/bad examples are used "
-                "and `instruction` overrides the metric's stored description. "
-                "Max 4000 characters."
+                "Free-text instruction telling the VLM what to look for. "
+                "Either `instruction` OR `visual_test_name` is required. If "
+                "both are given the visual test's pre-defined positive/"
+                "negative examples are used and `instruction` overrides the "
+                "stored description. Max 4000 characters."
             ),
         ),
-        metric_name: Optional[str] = Field(
+        visual_test_name: Optional[str] = Field(
             None,
             description=(
-                "Name of a previously-defined metric (see create_metric / "
-                "list_metrics). Switches inspect() into few-shot verdict mode: "
-                "the model is shown the metric's good/bad reference images "
-                "before the new image and asked to classify it as GOOD or BAD."
+                "Name of a previously-defined visual test (see "
+                "create_visual_test / list_visual_tests). Switches inspect() "
+                "into few-shot verdict mode: the model is shown the test's "
+                "positive/negative reference images before the new image and "
+                "asked to return PASSED, FAILED, or UNSURE."
             ),
         ),
         max_new_tokens: int = Field(
@@ -714,23 +731,24 @@ class SmartMicroscopyQC:
 
         Two modes:
 
-        - Free-text describe (instruction set, metric_name unset):
-          existing behaviour. Returns a natural-language description of
-          what the model sees relative to `instruction`.
+        - Free-text describe (instruction set, visual_test_name unset):
+          returns a natural-language description of what the model sees
+          relative to `instruction`.
 
-        - Few-shot verdict (metric_name set):
-          looks up the named metric's reference images, prepends them
-          (good then bad) to the prompt, asks the model to classify the
-          new image as GOOD or BAD against the metric's criterion. The
-          response includes parsed `verdict` and `reason` fields plus the
-          raw text in `description`. If `instruction` is also supplied,
-          it overrides the metric's stored description for this call only.
+        - Few-shot verdict (visual_test_name set):
+          looks up the named visual test's reference images, prepends them
+          (positive then negative) to the prompt, asks the model to classify
+          the new image as PASSED, FAILED, or UNSURE against the test's
+          criterion. The response includes parsed `verdict` and `reason`
+          fields plus the raw text in `description`. If `instruction` is
+          also supplied, it overrides the test's stored description for
+          this call only.
         """
         t0 = time.time()
 
-        if not metric_name and not (isinstance(instruction, str) and instruction.strip()):
+        if not visual_test_name and not (isinstance(instruction, str) and instruction.strip()):
             raise ValueError(
-                "Either `metric_name` or `instruction` must be provided."
+                "Either `visual_test_name` or `instruction` must be provided."
             )
         if isinstance(instruction, str):
             if len(instruction) > _MAX_INSTRUCTION_CHARS:
@@ -742,19 +760,19 @@ class SmartMicroscopyQC:
         url = await self._resolve_to_url(image_ref)
         image, original_size = await self._download_image(url)
 
-        if metric_name:
+        if visual_test_name:
             from PIL import Image
-            metric = self._load_metric(metric_name)
-            metric_dir = self._metric_dir(metric_name)
-            good_imgs = [Image.open(metric_dir / p).convert("RGB") for p in metric["good_images"]]
-            bad_imgs  = [Image.open(metric_dir / p).convert("RGB") for p in metric["bad_images"]]
+            visual_test = self._load_test(visual_test_name)
+            test_dir = self._test_dir(visual_test_name)
+            pos_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test["positive_images"]]
+            neg_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test["negative_images"]]
 
             t_gen0 = time.time()
             raw, n_tokens = await self._run_vlm_few_shot(
                 new_image=image,
-                metric=metric,
-                good_images=good_imgs,
-                bad_images=bad_imgs,
+                visual_test=visual_test,
+                positive_images=pos_imgs,
+                negative_images=neg_imgs,
                 instruction_override=instruction,
                 max_new_tokens=max_new_tokens,
             )
@@ -762,13 +780,13 @@ class SmartMicroscopyQC:
             verdict, reason = self._parse_verdict(raw)
             result = {
                 "mode": "few-shot",
-                "metric_name": metric_name,
-                "metric_description": instruction.strip() if instruction else metric["description"],
-                "verdict": verdict,                # "good" / "bad" / None if unparseable
+                "visual_test_name": visual_test_name,
+                "visual_test_description": instruction.strip() if instruction else visual_test["description"],
+                "verdict": verdict,                # "passed" / "failed" / "unsure"
                 "reason": reason,
                 "description": raw,                # raw model output
-                "n_good_examples": metric["n_good"],
-                "n_bad_examples": metric["n_bad"],
+                "n_positive_examples": visual_test["n_positive"],
+                "n_negative_examples": visual_test["n_negative"],
                 "image_size": list(image.size),
                 "source_url": url,
                 "model": _MODEL_ID,

@@ -1,0 +1,1294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Smart Microscopy Assistant</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  /* User-agent `[hidden] { display: none }` loses specificity to any class
+     that sets display: inline-flex / flex / grid. Force-override. */
+  [hidden] { display: none !important; }
+  :root {
+    --bg-0: #0b1220;
+    --bg-1: #111a2d;
+    --bg-2: #18223a;
+    --bg-3: #1f2c4a;
+    --border: #2a3a5e;
+    --border-strong: #3a4d75;
+    --fg: #e6edf7;
+    --fg-dim: #9aa9c2;
+    --fg-muted: #6b7a99;
+    --accent: #38bdf8;
+    --accent-strong: #0ea5e9;
+    --accent-deep: #0284c7;
+    --pass: #22c55e;
+    --fail: #ef4444;
+    --unsure: #f59e0b;
+    --pass-bg: rgba(34, 197, 94, 0.13);
+    --fail-bg: rgba(239, 68, 68, 0.13);
+    --unsure-bg: rgba(245, 158, 11, 0.13);
+  }
+  body {
+    font-family: -apple-system, "Inter", system-ui, "Segoe UI", sans-serif;
+    background:
+      radial-gradient(1200px 600px at 80% -200px, rgba(14, 165, 233, 0.10), transparent 70%),
+      radial-gradient(900px 500px at -10% 110%, rgba(34, 197, 94, 0.08), transparent 70%),
+      var(--bg-0);
+    color: var(--fg);
+    min-height: 100vh;
+    padding: 5rem 1rem 4rem;
+    line-height: 1.45;
+  }
+  .container { max-width: 920px; margin: 0 auto; }
+
+  /* --- Top bar ----------------------------------------------------------- */
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.75rem 1.25rem;
+    background: rgba(11, 18, 32, 0.85);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  #topbar .brand {
+    display: flex; align-items: center; gap: 0.55rem;
+    font-weight: 700; font-size: 0.95rem; color: var(--fg);
+  }
+  #topbar .brand .logo {
+    width: 1.7rem; height: 1.7rem; border-radius: 0.45rem;
+    background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.95rem;
+  }
+  #topbar .actions { display: flex; align-items: center; gap: 0.6rem; }
+  .topbar-btn {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    background: var(--bg-2); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 0.5rem;
+    padding: 0.4rem 0.85rem;
+    font: inherit; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .topbar-btn:hover { background: var(--bg-3); border-color: var(--border-strong); }
+  .topbar-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .topbar-btn svg { width: 1.05rem; height: 1.05rem; flex-shrink: 0; }
+  .topbar-iconbtn {
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: 999px; width: 2.15rem; height: 2.15rem;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; padding: 0; color: var(--fg-dim);
+    transition: background 0.12s, color 0.12s;
+  }
+  .topbar-iconbtn:hover { background: var(--bg-3); color: var(--fg); }
+  .topbar-iconbtn svg { width: 1.25rem; height: 1.25rem; }
+  #userWrap, #infoWrap { position: relative; }
+  .popover {
+    position: absolute; top: 2.5rem; right: 0; min-width: 17rem;
+    background: var(--bg-2); border: 1px solid var(--border-strong);
+    border-radius: 0.6rem; padding: 0.35rem 0;
+    box-shadow: 0 16px 40px rgba(0,0,0,.55);
+  }
+  .popover .item {
+    display: block; padding: 0.55rem 0.9rem; color: var(--fg);
+    font-size: 0.85rem; background: none; border: 0; width: 100%;
+    text-align: left; cursor: pointer;
+  }
+  .popover .item:hover { background: var(--bg-3); }
+  .popover .info-row {
+    padding: 0.45rem 0.9rem; border-bottom: 1px solid var(--border);
+    font-size: 0.78rem; color: var(--fg-dim); word-break: break-all;
+  }
+  .popover .info-row:last-child { border-bottom: 0; }
+  .popover .info-row strong { color: var(--fg); font-weight: 600; }
+  #infoPopover { min-width: 21rem; padding: 0.6rem 0; }
+  #infoPopover .row {
+    display: flex; justify-content: space-between; gap: 0.75rem;
+    padding: 0.4rem 0.95rem; font-size: 0.8rem;
+  }
+  #infoPopover .row .k { color: var(--fg-dim); }
+  #infoPopover .row .v { color: var(--fg); font-weight: 500; text-align: right; }
+  #infoPopover .heading {
+    padding: 0.35rem 0.95rem 0.55rem; font-size: 0.72rem;
+    color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.07em;
+    border-bottom: 1px solid var(--border); margin-bottom: 0.35rem;
+  }
+
+  /* --- Header ----------------------------------------------------------- */
+  header.page { text-align: center; margin-bottom: 1.5rem; }
+  header.page h1 {
+    font-size: 1.9rem; font-weight: 700; color: var(--fg);
+    letter-spacing: -0.01em;
+  }
+  header.page h1 .accent {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 80%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  header.page p { color: var(--fg-dim); margin-top: 0.35rem; font-size: 0.9rem; }
+
+  /* --- Mode toggle (segmented) ----------------------------------------- */
+  .mode-toggle-wrap { display: flex; justify-content: center; margin-bottom: 1.5rem; }
+  .mode-toggle {
+    display: inline-flex; background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: 0.7rem; padding: 0.3rem; gap: 0.25rem;
+  }
+  .mode-toggle .seg {
+    background: transparent; color: var(--fg-dim); border: 0;
+    padding: 0.55rem 1.4rem; cursor: pointer; font: inherit;
+    font-size: 0.88rem; font-weight: 600; border-radius: 0.5rem;
+    display: inline-flex; align-items: center; gap: 0.45rem;
+    transition: color 0.12s, background 0.12s;
+  }
+  .mode-toggle .seg:hover { color: var(--fg); }
+  .mode-toggle .seg.active {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+    color: #fff; box-shadow: 0 6px 16px rgba(14,165,233,0.25);
+  }
+
+  /* --- Cards ---------------------------------------------------------- */
+  .card {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 0.9rem; padding: 1.25rem 1.4rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 4px 14px rgba(0,0,0,0.18);
+  }
+  .card h2 {
+    font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.09em;
+    color: var(--fg-muted); margin-bottom: 0.85rem; font-weight: 700;
+    display: flex; align-items: center; gap: 0.45rem;
+  }
+  .card h2 .h-icon { font-size: 1rem; }
+  .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+
+  /* --- Buttons -------------------------------------------------------- */
+  .btn {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+    color: #fff; border: none; border-radius: 0.55rem;
+    padding: 0.6rem 1.2rem; cursor: pointer;
+    font-size: 0.9rem; font-weight: 600;
+    transition: filter 0.12s, transform 0.05s;
+    display: inline-flex; align-items: center; gap: 0.45rem;
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .btn:active { transform: translateY(1px); }
+  .btn:disabled {
+    background: var(--bg-3); color: var(--fg-muted); cursor: not-allowed;
+    filter: none; transform: none;
+  }
+  .btn-primary-lg { padding: 0.7rem 1.6rem; font-size: 0.95rem; }
+  .btn-sm { padding: 0.35rem 0.7rem; font-size: 0.78rem; }
+  .btn-ghost {
+    background: transparent; color: var(--fg-dim);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover { background: var(--bg-2); color: var(--fg); }
+  .status {
+    display: inline-flex; align-items: center; gap: 0.45rem;
+    font-size: 0.85rem; color: var(--fg-dim);
+  }
+  .status-dot {
+    display: inline-block; width: 0.55rem; height: 0.55rem;
+    border-radius: 50%; background: var(--fg-muted);
+  }
+  .status-dot.ok    { background: var(--pass); box-shadow: 0 0 0 3px rgba(34,197,94,0.18); }
+  .status-dot.busy  { background: var(--unsure); box-shadow: 0 0 0 3px rgba(245,158,11,0.18); animation: pulse 1.2s ease-in-out infinite; }
+  .status-dot.error { background: var(--fail); box-shadow: 0 0 0 3px rgba(239,68,68,0.18); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+  /* --- Form widgets --------------------------------------------------- */
+  .small { font-size: 0.8rem; color: var(--fg-dim); }
+  .field-label { font-size: 0.78rem; color: var(--fg-dim); margin-bottom: 0.35rem; display: block; }
+  input[type=text], textarea, select {
+    width: 100%; background: var(--bg-0); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 0.5rem;
+    padding: 0.55rem 0.65rem; font-family: inherit;
+    font-size: 0.88rem; outline: none;
+    transition: border-color 0.12s, box-shadow 0.12s;
+  }
+  textarea { min-height: 5rem; resize: vertical; }
+  input[type=text]:focus, textarea:focus, select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
+  }
+  .radio-row { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem;
+               font-size: 0.85rem; flex-wrap: wrap; }
+  .radio-row label { display: inline-flex; align-items: center; gap: 0.35rem; cursor: pointer; color: var(--fg); }
+  .counter { font-variant-numeric: tabular-nums; }
+  .counter.over { color: var(--fail); font-weight: 700; }
+  .field-help {
+    margin-top: 0.4rem; display: flex; justify-content: space-between;
+    font-size: 0.75rem; color: var(--fg-muted);
+  }
+
+  /* --- Dropzone ------------------------------------------------------- */
+  .dropzone {
+    border: 1.5px dashed var(--border-strong); border-radius: 0.65rem;
+    padding: 1.2rem; text-align: center;
+    color: var(--fg-dim); cursor: pointer;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+    font-size: 0.85rem;
+  }
+  .dropzone:hover, .dropzone.drag {
+    border-color: var(--accent); background: rgba(14,165,233,0.06); color: var(--accent);
+  }
+  .dropzone .dz-strong { color: var(--fg); font-weight: 600; }
+
+  /* --- Image gallery (analyze + define) ------------------------------- */
+  .gallery {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 0.6rem; margin-top: 0.85rem;
+  }
+  .gallery .tile {
+    position: relative; border: 1px solid var(--border); border-radius: 0.55rem;
+    overflow: hidden; aspect-ratio: 1 / 1; background: var(--bg-0);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .gallery .tile img { width: 100%; height: 100%; object-fit: cover; }
+  .gallery .tile .x {
+    position: absolute; top: 0.25rem; right: 0.25rem;
+    background: rgba(11,18,32,0.92); color: #fca5a5;
+    border: 1px solid var(--border-strong); border-radius: 999px;
+    width: 1.45rem; height: 1.45rem;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.85rem; cursor: pointer; padding: 0; line-height: 1;
+  }
+  .gallery .tile .x:hover { background: #450a0a; color: #fca5a5; border-color: var(--fail); }
+  .gallery .tile .name {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    background: rgba(11,18,32,0.88); color: var(--fg-dim);
+    font-size: 0.65rem; padding: 0.2rem 0.35rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* --- Result list (analyze) ------------------------------------------ */
+  .results { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.65rem; }
+  .result-card {
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.7rem;
+    overflow: hidden;
+  }
+  .result-head {
+    display: grid; grid-template-columns: 80px 1fr auto; gap: 0.85rem;
+    padding: 0.7rem 0.85rem; align-items: center;
+  }
+  .result-thumb {
+    width: 80px; height: 80px; border-radius: 0.5rem; overflow: hidden;
+    background: var(--bg-0); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .result-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .result-thumb .placeholder {
+    color: var(--fg-muted); font-size: 0.7rem; padding: 0.3rem; text-align: center;
+  }
+  .result-body { min-width: 0; }
+  .result-name { font-size: 0.82rem; color: var(--fg-dim); margin-bottom: 0.3rem;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .result-reason { font-size: 0.88rem; color: var(--fg); line-height: 1.4; }
+  .result-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 0.35rem; }
+  .verdict-chip {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    padding: 0.25rem 0.65rem; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.04em; border: 1px solid;
+    white-space: nowrap;
+  }
+  .verdict-chip .dot {
+    width: 0.45rem; height: 0.45rem; border-radius: 50%;
+  }
+  .verdict-chip.passed { color: var(--pass); background: var(--pass-bg); border-color: rgba(34,197,94,0.4); }
+  .verdict-chip.passed .dot { background: var(--pass); }
+  .verdict-chip.failed { color: var(--fail); background: var(--fail-bg); border-color: rgba(239,68,68,0.4); }
+  .verdict-chip.failed .dot { background: var(--fail); }
+  .verdict-chip.unsure { color: var(--unsure); background: var(--unsure-bg); border-color: rgba(245,158,11,0.4); }
+  .verdict-chip.unsure .dot { background: var(--unsure); }
+  .verdict-chip.pending { color: var(--fg-dim); background: var(--bg-3); border-color: var(--border); }
+  .verdict-chip.pending .dot { background: var(--fg-muted); }
+  .verdict-chip.describe { color: var(--accent); background: rgba(56,189,248,0.10); border-color: rgba(56,189,248,0.35); }
+  .verdict-chip.describe .dot { background: var(--accent); }
+  .verdict-chip.error { color: var(--fail); background: var(--fail-bg); border-color: rgba(239,68,68,0.4); }
+  .verdict-chip.error .dot { background: var(--fail); }
+
+  .details-toggle {
+    background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
+    border-radius: 0.4rem; padding: 0.15rem 0.55rem; font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .details-toggle:hover { background: var(--bg-3); color: var(--fg); }
+  .result-details {
+    border-top: 1px solid var(--border);
+    padding: 0.75rem 0.85rem; background: var(--bg-1);
+    font-size: 0.78rem; color: var(--fg-dim);
+  }
+  .pill-row { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.5rem; }
+  .meta-pill {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    padding: 0.2rem 0.55rem; border-radius: 0.45rem;
+    background: var(--bg-0); border: 1px solid var(--border);
+    color: var(--fg-dim); font-size: 0.7rem;
+  }
+  .meta-pill strong { color: var(--fg); font-weight: 600; font-size: 0.72rem; }
+  .raw {
+    background: var(--bg-0); border-radius: 0.4rem; padding: 0.55rem 0.7rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.74rem;
+    color: var(--fg-dim); white-space: pre-wrap; word-break: break-word;
+    max-height: 12rem; overflow-y: auto;
+    border: 1px solid var(--border);
+  }
+
+  /* --- Test-meta + run-summary ---------------------------------------- */
+  .test-meta {
+    font-size: 0.82rem; color: var(--fg-dim); margin-top: 0.65rem;
+    padding: 0.65rem 0.8rem; background: var(--bg-0);
+    border: 1px solid var(--border); border-radius: 0.55rem;
+  }
+  .test-meta strong { color: var(--fg); }
+  .run-summary {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 0.5rem; margin-top: 0.6rem;
+  }
+
+  /* --- Create-mode result block --------------------------------------- */
+  .create-result {
+    background: var(--bg-0); border-radius: 0.55rem; padding: 0.8rem 0.95rem;
+    font-size: 0.85rem; color: var(--fg); white-space: pre-wrap; word-break: break-word;
+    min-height: 2rem; border: 1px solid var(--border);
+  }
+
+  /* --- Log (collapsed by default) ------------------------------------- */
+  .log-details {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 0.6rem; margin-top: 1rem;
+  }
+  .log-details summary {
+    list-style: none; cursor: pointer; padding: 0.65rem 1rem;
+    font-size: 0.82rem; color: var(--fg-dim); font-weight: 600;
+    display: flex; align-items: center; gap: 0.45rem;
+  }
+  .log-details summary::-webkit-details-marker { display: none; }
+  .log-details summary::before {
+    content: "▸"; color: var(--fg-muted); transition: transform 0.15s;
+    font-size: 0.7rem;
+  }
+  .log-details[open] summary::before { transform: rotate(90deg); }
+  .log-body {
+    background: var(--bg-0);
+    padding: 0.55rem 1rem; border-top: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem;
+    color: var(--fg-dim); max-height: 18rem; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+    border-radius: 0 0 0.6rem 0.6rem;
+  }
+  .log-body .ts { color: var(--fg-muted); }
+  .log-body .err { color: #fca5a5; }
+  .log-body .ok { color: #86efac; }
+
+  /* --- Help text ------------------------------------------------------ */
+  .empty-hint {
+    font-size: 0.85rem; color: var(--fg-dim); text-align: center;
+    padding: 0.75rem 0;
+  }
+</style>
+</head>
+<body>
+
+<!-- Top bar -->
+<div id="topbar">
+  <div class="brand">
+    <span class="logo">🔬</span>
+    <span>Smart Microscopy Assistant</span>
+  </div>
+  <div class="actions">
+    <div id="infoWrap">
+      <button id="infoBtn" class="topbar-iconbtn" type="button" aria-label="App info">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+      </button>
+      <div id="infoPopover" class="popover" hidden>
+        <div class="heading">Model &amp; runtime</div>
+        <div id="infoBody"><div class="row"><span class="k">loading…</span></div></div>
+      </div>
+    </div>
+    <button id="loginBtn" class="topbar-btn" type="button" aria-label="Sign in to Hypha" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+        <polyline points="10 17 15 12 10 7"/>
+        <line x1="15" y1="12" x2="3" y2="12"/>
+      </svg>
+      <span>Sign in</span>
+    </button>
+    <div id="userWrap" hidden>
+      <button id="userBtn" class="topbar-iconbtn" type="button" aria-label="Account menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3.4"/>
+          <path d="M5.5 19a7 7 0 0 1 13 0"/>
+        </svg>
+      </button>
+      <div id="userMenu" class="popover" hidden>
+        <div class="info-row">
+          <div><strong id="userEmail">…</strong></div>
+          <div>workspace <strong id="userWs">…</strong></div>
+        </div>
+        <button class="item" id="logoutBtn" type="button">Sign out</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+  <header class="page">
+    <h1><span class="accent">Smart Microscopy</span> Assistant</h1>
+    <p>VLM-backed microscopy analyst — run reusable visual tests across image batches, or describe a single frame.</p>
+  </header>
+
+  <div class="mode-toggle-wrap">
+    <div class="mode-toggle" role="tablist">
+      <button id="modeAnalyzeBtn" class="seg active" data-mode="analyze" role="tab" aria-selected="true">
+        🔍 Analyze
+      </button>
+      <button id="modeDefineBtn" class="seg" data-mode="define" role="tab" aria-selected="false">
+        ＋ Define visual test
+      </button>
+    </div>
+  </div>
+
+  <!-- =========================================================== -->
+  <!-- ANALYZE VIEW                                                 -->
+  <!-- =========================================================== -->
+  <div id="analyzeView">
+
+    <div class="card">
+      <h2><span class="h-icon">🎯</span> What to check for</h2>
+      <div class="radio-row">
+        <label><input type="radio" name="analyzeSource" id="srcTest" value="test" checked> Use a saved visual test</label>
+        <label><input type="radio" name="analyzeSource" id="srcFreetext" value="freetext"> Describe with free-text</label>
+      </div>
+
+      <div id="testChooser" class="row" style="margin-bottom: 0.5rem;">
+        <select id="testSelect" style="flex: 1; min-width: 0;">
+          <option value="">(no visual tests defined yet — switch to Define)</option>
+        </select>
+        <button id="refreshTestsBtn" class="topbar-btn btn-sm" type="button" title="Reload list">↻</button>
+      </div>
+      <div id="testMeta" class="test-meta" hidden></div>
+
+      <div id="freetextChooser" hidden>
+        <textarea id="instruction" placeholder="What should the model look for? Max 4000 chars."></textarea>
+        <div class="field-help">
+          <span>The instruction is passed to the VLM verbatim.</span>
+          <span><span id="charCount" class="counter">0</span> / <span id="charCap">4000</span></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="h-icon">🖼️</span> Images to analyze <span class="small" style="margin-left:auto;font-weight:400;">(<span id="analyzeCount">0</span>)</span></h2>
+      <div id="analyzeDrop" class="dropzone">
+        <span class="dz-strong">Drag images here</span>, click to pick, or paste (⌘V / Ctrl+V).<br>
+        <span class="small">Each image ≤ 25 MB. PNG, JPG, TIFF accepted. Tested one-by-one when you run.</span>
+      </div>
+      <input type="file" id="analyzeInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
+      <div id="analyzeGallery" class="gallery"></div>
+    </div>
+
+    <div class="card">
+      <div class="run-summary">
+        <div class="row" style="gap: 0.75rem;">
+          <button class="btn btn-primary-lg" id="runBtn" disabled>
+            <span>Run analysis</span>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                 stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="9 18 15 12 9 6"/>
+            </svg>
+          </button>
+          <button class="btn btn-ghost btn-sm" id="clearResultsBtn" type="button" hidden>Clear results</button>
+        </div>
+        <span class="status"><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span></span>
+      </div>
+      <div id="results" class="results" hidden></div>
+    </div>
+
+  </div>
+
+  <!-- =========================================================== -->
+  <!-- DEFINE VIEW                                                  -->
+  <!-- =========================================================== -->
+  <div id="defineView" hidden>
+
+    <div class="card">
+      <h2><span class="h-icon">📝</span> Visual test definition</h2>
+      <label class="field-label">Test name <span class="small">(lowercase, hyphens, max 50 chars)</span></label>
+      <input id="defineName" type="text" placeholder="e.g. focus-quality"
+             pattern="^[a-z0-9][a-z0-9-]{0,49}$" maxlength="50"
+             style="margin-bottom: 0.75rem;" />
+      <label class="field-label">Criterion <span class="small">(what makes an image pass vs. fail)</span></label>
+      <textarea id="defineDesc" maxlength="800"
+                placeholder="e.g. PASS: sharp cell outlines, uniform illumination. FAIL: motion blur, saturated regions."></textarea>
+      <div class="field-help">
+        <span>The criterion is fed to the VLM verbatim. Be specific.</span>
+        <span><span id="defineDescCount" class="counter">0</span> / 800</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="h-icon">✅</span> Positive examples (should pass) <span class="small" style="margin-left:auto;font-weight:400;">(<span id="positiveCount">0</span> / <span class="exMax">5</span>)</span></h2>
+      <div id="positiveDrop" class="dropzone">
+        <span class="dz-strong">Drop images that PASS the criterion</span>, or click to pick.
+      </div>
+      <input type="file" id="positiveInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
+      <div id="positiveGallery" class="gallery"></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="h-icon">❌</span> Negative examples (should fail) <span class="small" style="margin-left:auto;font-weight:400;">(<span id="negativeCount">0</span> / <span class="exMax">5</span>)</span></h2>
+      <div id="negativeDrop" class="dropzone">
+        <span class="dz-strong">Drop images that FAIL the criterion</span>, or click to pick.
+      </div>
+      <input type="file" id="negativeInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
+      <div id="negativeGallery" class="gallery"></div>
+    </div>
+
+    <div class="card">
+      <div class="run-summary">
+        <button class="btn btn-primary-lg" id="defineBtn" disabled>Save visual test</button>
+        <span class="status"><span class="status-dot" id="defineDot"></span><span id="defineStatus">Idle</span></span>
+      </div>
+      <div id="defineResultBlock" class="create-result" style="margin-top: 0.85rem;" hidden></div>
+    </div>
+
+  </div>
+
+  <!-- Logs (collapsed by default) -->
+  <details class="log-details">
+    <summary>Activity log</summary>
+    <div id="log" class="log-body">Ready.</div>
+  </details>
+
+</div>
+
+<script type="module">
+import { login, connectToServer }
+  from "https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.54/dist/hypha-rpc-websocket.mjs";
+
+// ---- URL params ----------------------------------------------------------
+const params     = new URLSearchParams(window.location.search);
+const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
+const SERVICE_ID = params.get("ws_service_id") || "";
+const URL_TOKEN  = params.get("token") || "";
+const APP_FALLBACK = "bioimage-io/smart-microscopy-assistant";
+
+const MAX_INSTRUCTION_CHARS = 4000;
+const MAX_DESC_CHARS = 800;
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_EXAMPLES_PER_CLASS = 5;
+const TEST_NAME_RE = /^[a-z0-9][a-z0-9-]{0,49}$/;
+const TOKEN_KEY    = "smart-microscopy-assistant:token";
+const TOKEN_EXPIRY = "smart-microscopy-assistant:tokenExpiry";
+const TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
+
+document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
+for (const el of document.querySelectorAll(".exMax")) el.textContent = MAX_EXAMPLES_PER_CLASS;
+
+// ---- Module state --------------------------------------------------------
+let server = null, qcSvc = null, artMgr = null, userWorkspace = null, userEmail = null;
+let analyzeFiles = [];        // analyze-mode multi-image
+let positiveFiles = [];       // define-mode positive gallery
+let negativeFiles = [];       // define-mode negative gallery
+let currentMode = "analyze";
+let resultsFor = [];          // synchronized with rendered .result-card per analyze run
+
+const $ = id => document.getElementById(id);
+
+function log(msg, kind = "") {
+  const ts = new Date().toLocaleTimeString();
+  const cls = kind ? `class="${kind}"` : "";
+  $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${msg}</span>`;
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function setRun(state, msg)    { $("runDot").className   = "status-dot " + (state || ""); $("runStatus").textContent   = msg; }
+function setDefine(state, msg) { $("defineDot").className = "status-dot " + (state || ""); $("defineStatus").textContent = msg; }
+function escapeHTML(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+function randomSuffix() { return Math.random().toString(36).slice(2, 10); }
+function fileExt(f) { return (f.name.split(".").pop() || "bin").toLowerCase(); }
+
+// ---- Token cache + login -------------------------------------------------
+function loadSavedToken() {
+  try {
+    const t = localStorage.getItem(TOKEN_KEY);
+    const e = localStorage.getItem(TOKEN_EXPIRY);
+    if (t && e && new Date(e) > new Date()) return t;
+  } catch (_) {}
+  return null;
+}
+function saveToken(t) {
+  try {
+    localStorage.setItem(TOKEN_KEY, t);
+    localStorage.setItem(TOKEN_EXPIRY, new Date(Date.now() + TOKEN_TTL_MS).toISOString());
+  } catch (_) {}
+}
+function clearSavedToken() {
+  try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_EXPIRY); } catch (_) {}
+}
+function setLoggedOutUI() {
+  $("loginBtn").hidden = false;
+  $("loginBtn").disabled = false;
+  $("userWrap").hidden = true;
+  $("userMenu").hidden = true;
+}
+function setLoggingInUI() { $("loginBtn").disabled = true; }
+function setLoggedInUI() {
+  $("loginBtn").hidden = true;
+  $("userWrap").hidden = false;
+  $("userEmail").textContent = userEmail || "(unknown)";
+  $("userWs").textContent    = userWorkspace || "—";
+}
+
+$("userBtn").addEventListener("click", () => {
+  $("userMenu").hidden = !$("userMenu").hidden;
+  $("infoPopover").hidden = true;
+});
+$("infoBtn").addEventListener("click", () => {
+  $("infoPopover").hidden = !$("infoPopover").hidden;
+  $("userMenu").hidden = true;
+});
+document.addEventListener("mousedown", (e) => {
+  for (const id of ["userMenu", "infoPopover"]) {
+    const m = $(id);
+    const trig = id === "userMenu" ? $("userBtn") : $("infoBtn");
+    if (!m.hidden && !m.contains(e.target) && !trig.contains(e.target)) m.hidden = true;
+  }
+});
+
+async function connectWithToken(token) {
+  setLoggingInUI();
+  server = await connectToServer({ server_url: SERVER_URL, token });
+  userWorkspace = server.config.workspace;
+  userEmail = (server.config.user && server.config.user.email) || userWorkspace;
+  setLoggedInUI();
+  log(`Connected as ${userEmail} (workspace=${userWorkspace})`, "ok");
+  artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
+  const sid = SERVICE_ID || APP_FALLBACK;
+  qcSvc = await server.getService(sid, { _rkwargs: true });
+  log("Service handle ready.", "ok");
+  await Promise.all([refreshTestsDropdown(), refreshModelInfo()]);
+  refreshAnalyzeEnabled();
+  refreshDefineEnabled();
+}
+
+$("loginBtn").addEventListener("click", async () => {
+  setLoggingInUI();
+  log("Opening Hypha auth flow…");
+  try {
+    const token = await login({
+      server_url: SERVER_URL,
+      login_callback: (ctx) => { window.open(ctx.login_url); },
+    });
+    saveToken(token);
+    await connectWithToken(token);
+  } catch (err) {
+    log("Login error: " + err.message, "err");
+    setLoggedOutUI();
+  }
+});
+
+$("logoutBtn").addEventListener("click", async () => {
+  clearSavedToken();
+  qcSvc = null; artMgr = null; userWorkspace = null; userEmail = null;
+  try { if (server?.disconnect) await server.disconnect(); } catch (_) {}
+  server = null;
+  setLoggedOutUI();
+});
+
+(async () => {
+  const cached = URL_TOKEN || loadSavedToken();
+  if (!cached) { setLoggedOutUI(); return; }
+  $("loginBtn").hidden = true;
+  $("userWrap").hidden = true;
+  try { await connectWithToken(cached); }
+  catch (err) {
+    if (!URL_TOKEN) clearSavedToken();
+    setLoggedOutUI();
+    log("Auto-connect failed: " + err.message, "err");
+  }
+})();
+
+// ---- Mode toggle ---------------------------------------------------------
+function setMode(mode) {
+  currentMode = mode;
+  for (const btn of document.querySelectorAll(".mode-toggle .seg")) {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+    btn.setAttribute("aria-selected", btn.dataset.mode === mode ? "true" : "false");
+  }
+  $("analyzeView").hidden = (mode !== "analyze");
+  $("defineView").hidden  = (mode !== "define");
+}
+$("modeAnalyzeBtn").addEventListener("click", () => setMode("analyze"));
+$("modeDefineBtn").addEventListener("click",  () => setMode("define"));
+
+// ---- Info popover (get_model_info) --------------------------------------
+async function refreshModelInfo() {
+  if (!qcSvc) return;
+  try {
+    const info = await qcSvc.get_model_info({ _rkwargs: true });
+    const body = $("infoBody");
+    body.innerHTML = "";
+    const add = (k, v) => {
+      const row = document.createElement("div"); row.className = "row";
+      row.innerHTML = `<span class="k">${escapeHTML(k)}</span><span class="v">${escapeHTML(String(v))}</span>`;
+      body.appendChild(row);
+    };
+    add("Model",      info.model || "—");
+    add("Engine",     info.engine || "—");
+    add("Precision",  info.dtype || "—");
+    add("Device",     info.device || "—");
+    add("Max input",  `${(info.max_pixels/1e6).toFixed(2)} MP · ${info.max_long_side}px`);
+    add("Image size", `≤ ${(info.max_image_bytes/1024/1024).toFixed(0)} MB`);
+    add("Examples",   `${info.min_examples_per_class}–${info.max_examples_per_class} per class`);
+    add("Verdicts",   (info.verdicts || []).join(" · "));
+    add("License",    info.license || "—");
+  } catch (err) {
+    log("get_model_info failed: " + err.message, "err");
+  }
+}
+
+// ---- Visual-test dropdown -----------------------------------------------
+function applySourceRadio() {
+  const useTest = $("srcTest").checked;
+  $("testChooser").hidden = !useTest;
+  $("testMeta").hidden    = !useTest || !$("testSelect").value;
+  $("freetextChooser").hidden = useTest;
+  refreshAnalyzeEnabled();
+}
+$("srcTest").addEventListener("change", applySourceRadio);
+$("srcFreetext").addEventListener("change", applySourceRadio);
+
+async function refreshTestsDropdown() {
+  if (!qcSvc) return;
+  const sel = $("testSelect");
+  const prior = sel.value;
+  try {
+    const tests = await qcSvc.list_visual_tests({ _rkwargs: true });
+    sel.innerHTML = "";
+    if (tests.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = ""; opt.textContent = "(no visual tests defined yet — switch to Define)";
+      sel.appendChild(opt);
+    } else {
+      for (const t of tests) {
+        const opt = document.createElement("option");
+        opt.value = t.name; opt.textContent = t.name;
+        opt.dataset.description = t.description || "";
+        opt.dataset.nPos = String(t.n_positive ?? "?");
+        opt.dataset.nNeg = String(t.n_negative ?? "?");
+        sel.appendChild(opt);
+      }
+      if (prior && [...sel.options].some(o => o.value === prior)) sel.value = prior;
+    }
+    log(`Loaded ${tests.length} visual test${tests.length === 1 ? "" : "s"}.`);
+  } catch (err) {
+    log("list_visual_tests failed: " + err.message, "err");
+  }
+  updateTestMeta();
+}
+
+function updateTestMeta() {
+  const sel = $("testSelect");
+  const opt = sel.options[sel.selectedIndex];
+  const meta = $("testMeta");
+  if (!sel.value || !opt) { meta.hidden = true; }
+  else {
+    const desc = opt.dataset.description || "";
+    const np = opt.dataset.nPos, nn = opt.dataset.nNeg;
+    meta.hidden = false;
+    meta.innerHTML =
+      `<strong>${escapeHTML(sel.value)}</strong>` +
+      ` · ${np} positive, ${nn} negative reference${np === "1" && nn === "1" ? "" : "s"}` +
+      (desc ? `<br><span style="color:var(--fg);">${escapeHTML(desc)}</span>` : "");
+  }
+  applySourceRadio();
+}
+$("testSelect").addEventListener("change", updateTestMeta);
+$("refreshTestsBtn").addEventListener("click", () => { refreshTestsDropdown(); });
+
+// ---- Generic multi-file gallery -----------------------------------------
+function previewSrcFor(file) {
+  const ext = fileExt(file);
+  if (["tif", "tiff"].includes(ext)) {
+    // TIFF can't preview in <img>; show a neutral placeholder.
+    return "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjAgMTIwIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjMGIxMjIwIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZpbGw9IiM2YjdhOTkiIGZvbnQtZmFtaWx5PSJzeXN0ZW0tdWkiIGZvbnQtc2l6ZT0iMTQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5USUZGPC90ZXh0Pjwvc3ZnPg==";
+  }
+  return null;
+}
+
+function renderGallery(side) {
+  const arr = side === "positive" ? positiveFiles
+            : side === "negative" ? negativeFiles
+            : analyzeFiles;
+  const wrap = $(side + "Gallery");
+  wrap.innerHTML = "";
+  arr.forEach((file, idx) => {
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    const img = document.createElement("img");
+    const placeholder = previewSrcFor(file);
+    if (placeholder) img.src = placeholder;
+    else {
+      const reader = new FileReader();
+      reader.onload = e => { img.src = e.target.result; };
+      reader.readAsDataURL(file);
+    }
+    tile.appendChild(img);
+    const x = document.createElement("button");
+    x.className = "x"; x.type = "button"; x.textContent = "×";
+    x.title = "Remove";
+    x.addEventListener("click", (e) => {
+      e.stopPropagation();
+      arr.splice(idx, 1);
+      renderGallery(side);
+      if (side === "analyze") refreshAnalyzeEnabled();
+      else refreshDefineEnabled();
+    });
+    tile.appendChild(x);
+    const lab = document.createElement("div");
+    lab.className = "name"; lab.textContent = file.name;
+    tile.appendChild(lab);
+    wrap.appendChild(tile);
+  });
+  $(side + "Count").textContent = arr.length;
+}
+
+function addFiles(side, files) {
+  const arr = side === "positive" ? positiveFiles
+            : side === "negative" ? negativeFiles
+            : analyzeFiles;
+  const cap = side === "analyze" ? Infinity : MAX_EXAMPLES_PER_CLASS;
+  let added = 0, skipped = 0;
+  for (const f of files) {
+    if (arr.length >= cap) { skipped++; continue; }
+    if (f.size > MAX_IMAGE_BYTES) {
+      log(`${side}: skipping ${f.name}: ${(f.size/1024/1024).toFixed(1)} MB > 25 MB`, "err");
+      continue;
+    }
+    arr.push(f); added++;
+  }
+  if (skipped > 0) log(`${side}: skipped ${skipped} (cap ${cap})`, "err");
+  if (added > 0) renderGallery(side);
+  if (side === "analyze") refreshAnalyzeEnabled();
+  else refreshDefineEnabled();
+}
+
+function wireDrop(side) {
+  const dz = $(side + "Drop");
+  const input = $(side + "Input");
+  dz.addEventListener("click", () => input.click());
+  ["dragenter","dragover"].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault(); dz.classList.add("drag");
+  }));
+  ["dragleave","drop"].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault(); dz.classList.remove("drag");
+  }));
+  dz.addEventListener("drop", e => {
+    if (e.dataTransfer.files && e.dataTransfer.files.length)
+      addFiles(side, [...e.dataTransfer.files]);
+  });
+  input.addEventListener("change", e => {
+    if (e.target.files && e.target.files.length) addFiles(side, [...e.target.files]);
+    input.value = "";
+  });
+}
+wireDrop("analyze"); wireDrop("positive"); wireDrop("negative");
+
+// Paste-to-add in analyze mode
+document.addEventListener("paste", (e) => {
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "TEXTAREA" || tag === "INPUT") return;
+  if (currentMode !== "analyze") return;
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const pasted = [];
+  for (const item of items) {
+    if (item.kind === "file" && item.type && item.type.startsWith("image/")) {
+      const blob = item.getAsFile(); if (!blob) continue;
+      const ext = (blob.type.split("/")[1] || "png").toLowerCase();
+      pasted.push(new File([blob], `pasted-${Date.now()}-${pasted.length}.${ext}`, { type: blob.type }));
+    }
+  }
+  if (pasted.length) {
+    log(`Pasted ${pasted.length} image${pasted.length === 1 ? "" : "s"}`);
+    addFiles("analyze", pasted);
+    e.preventDefault();
+  }
+});
+
+// ---- Analyze enable check ------------------------------------------------
+$("instruction").addEventListener("input", () => {
+  const len = $("instruction").value.length;
+  $("charCount").textContent = len;
+  $("charCount").className = "counter" + (len > MAX_INSTRUCTION_CHARS ? " over" : "");
+  if (len > MAX_INSTRUCTION_CHARS) {
+    $("instruction").value = $("instruction").value.slice(0, MAX_INSTRUCTION_CHARS);
+    $("charCount").textContent = MAX_INSTRUCTION_CHARS;
+  }
+  refreshAnalyzeEnabled();
+});
+
+function refreshAnalyzeEnabled() {
+  if (!qcSvc || analyzeFiles.length === 0) { $("runBtn").disabled = true; return; }
+  if ($("srcTest").checked) {
+    $("runBtn").disabled = !$("testSelect").value;
+  } else {
+    const v = $("instruction").value;
+    $("runBtn").disabled = !(v.trim().length > 0 && v.length <= MAX_INSTRUCTION_CHARS);
+  }
+}
+
+// ---- Scratch artifact upload helpers ------------------------------------
+async function uploadAndPresign(file, artifactId, remotePath) {
+  const putUrl = await artMgr.put_file({ artifact_id: artifactId, file_path: remotePath, _rkwargs: true });
+  const resp = await fetch(putUrl, { method: "PUT", body: await file.arrayBuffer() });
+  if (!resp.ok) throw new Error(`PUT ${remotePath} failed: ${resp.status}`);
+  // Presigning happens after commit() — caller is responsible for committing.
+  return remotePath;
+}
+async function presignAll(artifactId, remotePaths) {
+  const urls = [];
+  for (const path of remotePaths) {
+    const u = await artMgr.get_file({ artifact_id: artifactId, file_path: path, _rkwargs: true });
+    urls.push(u);
+  }
+  return urls;
+}
+async function deleteScratch(artifactId) {
+  if (!artifactId) return;
+  try {
+    await artMgr.delete({ artifact_id: artifactId, delete_files: true, recursive: true, _rkwargs: true });
+  } catch (err) {
+    log(`Cleanup FAILED for ${artifactId}: ${err.message}`, "err");
+  }
+}
+
+// ---- Result rendering ----------------------------------------------------
+function makeResultCard(file, idx) {
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.dataset.idx = String(idx);
+
+  const head = document.createElement("div");
+  head.className = "result-head";
+
+  const thumb = document.createElement("div");
+  thumb.className = "result-thumb";
+  const placeholder = previewSrcFor(file);
+  if (placeholder) {
+    const img = document.createElement("img"); img.src = placeholder; thumb.appendChild(img);
+  } else {
+    const img = document.createElement("img");
+    const reader = new FileReader();
+    reader.onload = e => { img.src = e.target.result; };
+    reader.readAsDataURL(file);
+    thumb.appendChild(img);
+  }
+  head.appendChild(thumb);
+
+  const body = document.createElement("div");
+  body.className = "result-body";
+  body.innerHTML = `
+    <div class="result-name">${escapeHTML(file.name)}</div>
+    <div class="result-reason">Waiting…</div>
+  `;
+  head.appendChild(body);
+
+  const actions = document.createElement("div");
+  actions.className = "result-actions";
+  actions.innerHTML = `
+    <span class="verdict-chip pending"><span class="dot"></span>Pending</span>
+    <button class="details-toggle" type="button" hidden>Details</button>
+  `;
+  head.appendChild(actions);
+
+  card.appendChild(head);
+
+  const details = document.createElement("div");
+  details.className = "result-details";
+  details.hidden = true;
+  card.appendChild(details);
+
+  const toggle = actions.querySelector(".details-toggle");
+  toggle.addEventListener("click", () => {
+    details.hidden = !details.hidden;
+    toggle.textContent = details.hidden ? "Details" : "Hide";
+  });
+  return card;
+}
+
+function updateResultCard(card, state, payload) {
+  const chip = card.querySelector(".verdict-chip");
+  const reasonEl = card.querySelector(".result-reason");
+  const detailsBtn = card.querySelector(".details-toggle");
+  const details = card.querySelector(".result-details");
+
+  if (state === "busy") {
+    chip.className = "verdict-chip pending";
+    chip.innerHTML = `<span class="dot"></span>Analyzing…`;
+    reasonEl.textContent = "Running…";
+    return;
+  }
+  if (state === "error") {
+    chip.className = "verdict-chip error";
+    chip.innerHTML = `<span class="dot"></span>Error`;
+    reasonEl.textContent = payload?.error || "Unknown error";
+    detailsBtn.hidden = true;
+    return;
+  }
+  if (state === "ok") {
+    const r = payload.res;
+    const mode = r.mode || "describe";
+    if (mode === "few-shot") {
+      const v = (r.verdict || "unsure").toLowerCase();
+      const label = v === "passed" ? "Passed" : v === "failed" ? "Failed" : "Unsure";
+      chip.className = `verdict-chip ${v}`;
+      chip.innerHTML = `<span class="dot"></span>${label}`;
+      reasonEl.textContent = r.reason || r.description || "(no reason returned)";
+    } else {
+      chip.className = "verdict-chip describe";
+      chip.innerHTML = `<span class="dot"></span>Described`;
+      reasonEl.textContent = r.description || "(no description)";
+    }
+    detailsBtn.hidden = false;
+
+    const pills = [];
+    pills.push(`<span class="meta-pill"><strong>mode</strong> ${escapeHTML(mode)}</span>`);
+    if (r.visual_test_name) pills.push(`<span class="meta-pill"><strong>test</strong> ${escapeHTML(r.visual_test_name)}</span>`);
+    if (r.image_size) pills.push(`<span class="meta-pill"><strong>image</strong> ${r.image_size[0]}×${r.image_size[1]}</span>`);
+    if (r.downscaled_from) pills.push(`<span class="meta-pill"><strong>downscaled from</strong> ${r.downscaled_from.join("×")}</span>`);
+    if (typeof r.tokens_generated === "number") pills.push(`<span class="meta-pill"><strong>tokens</strong> ${r.tokens_generated}</span>`);
+    if (typeof r.tokens_per_second === "number") pills.push(`<span class="meta-pill"><strong>tok/s</strong> ${r.tokens_per_second}</span>`);
+    if (typeof r.generation_time_s === "number") pills.push(`<span class="meta-pill"><strong>gen</strong> ${r.generation_time_s}s</span>`);
+    if (typeof r.processing_time_s === "number") pills.push(`<span class="meta-pill"><strong>e2e</strong> ${r.processing_time_s}s</span>`);
+    if (typeof payload.wallMs === "number") pills.push(`<span class="meta-pill"><strong>wall</strong> ${(payload.wallMs/1000).toFixed(2)}s</span>`);
+    pills.push(`<span class="meta-pill"><strong>model</strong> ${escapeHTML(r.model || "—")}</span>`);
+
+    const rawSection = (r.description && r.description !== r.reason)
+      ? `<div class="raw">${escapeHTML(r.description)}</div>`
+      : "";
+    details.innerHTML = `<div class="pill-row">${pills.join("")}</div>${rawSection}`;
+  }
+}
+
+$("clearResultsBtn").addEventListener("click", () => {
+  $("results").innerHTML = "";
+  $("results").hidden = true;
+  $("clearResultsBtn").hidden = true;
+  resultsFor = [];
+  setRun("", "Idle");
+});
+
+// ---- Analyze: run --------------------------------------------------------
+$("runBtn").addEventListener("click", async () => {
+  if (!qcSvc || analyzeFiles.length === 0) return;
+  $("runBtn").disabled = true;
+  $("clearResultsBtn").hidden = false;
+
+  const useTest = $("srcTest").checked;
+  const visualTest = useTest ? $("testSelect").value : null;
+  const instruction = !useTest ? $("instruction").value.trim() : null;
+
+  // Snapshot the file list at click time — user might add more after.
+  const batch = analyzeFiles.slice();
+  resultsFor = batch.slice();
+
+  // Render placeholder cards
+  $("results").innerHTML = "";
+  $("results").hidden = false;
+  const cards = batch.map((f, i) => {
+    const c = makeResultCard(f, i);
+    $("results").appendChild(c);
+    return c;
+  });
+
+  // Upload all files to a single scratch artifact for the run, presign them
+  // up-front so the inspect() calls work via plain HTTPS.
+  const scratchAlias = `smart-microscopy-assistant-scratch-${randomSuffix()}`;
+  const scratchId = `${userWorkspace}/${scratchAlias}`;
+  let uploadedUrls = null;
+  try {
+    setRun("busy", `Uploading ${batch.length} image${batch.length === 1 ? "" : "s"}…`);
+    await artMgr.create({
+      alias: scratchAlias, type: "generic",
+      manifest: { name: "scratch", description: "scratch", type: "generic" },
+      config: { permissions: { "*": "r" } },
+      stage: true, _rkwargs: true,
+    });
+    const paths = [];
+    for (let i = 0; i < batch.length; i++) {
+      const f = batch[i];
+      const p = `image_${i}.${fileExt(f)}`;
+      await uploadAndPresign(f, scratchId, p);
+      paths.push(p);
+    }
+    await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
+    uploadedUrls = await presignAll(scratchId, paths);
+    log(`Uploaded ${batch.length} image${batch.length === 1 ? "" : "s"} to scratch artifact.`);
+  } catch (err) {
+    setRun("error", "Upload failed");
+    log("upload error: " + (err.message || String(err)), "err");
+    for (const c of cards) updateResultCard(c, "error", { error: "Upload failed: " + err.message });
+    await deleteScratch(scratchId);
+    $("runBtn").disabled = false; refreshAnalyzeEnabled();
+    return;
+  }
+
+  // Sequentially analyze each image.
+  let passed = 0, failed = 0, unsure = 0, errs = 0;
+  for (let i = 0; i < batch.length; i++) {
+    const file = batch[i];
+    const card = cards[i];
+    updateResultCard(card, "busy");
+    setRun("busy", `Analyzing ${i+1} / ${batch.length}: ${file.name}`);
+    const t0 = performance.now();
+    try {
+      const callArgs = {
+        image_ref: uploadedUrls[i],
+        max_new_tokens: 512,
+        _rkwargs: true,
+      };
+      if (visualTest) callArgs.visual_test_name = visualTest;
+      else            callArgs.instruction = instruction;
+      const res = await qcSvc.inspect(callArgs);
+      const wallMs = performance.now() - t0;
+      updateResultCard(card, "ok", { res, wallMs });
+      if (res.mode === "few-shot") {
+        const v = (res.verdict || "unsure").toLowerCase();
+        if (v === "passed") passed++;
+        else if (v === "failed") failed++;
+        else unsure++;
+      }
+      log(`inspect(${file.name}): ${res.mode === "few-shot" ? (res.verdict || "unsure") : "described"}, ${res.tokens_generated || "?"}t in ${res.generation_time_s}s`, "ok");
+    } catch (err) {
+      errs++;
+      updateResultCard(card, "error", { error: err.message || String(err) });
+      log(`inspect(${file.name}) error: ${err.message || String(err)}`, "err");
+    }
+  }
+
+  // Cleanup
+  await deleteScratch(scratchId);
+
+  let summary;
+  if (visualTest) {
+    const parts = [];
+    if (passed) parts.push(`${passed} passed`);
+    if (failed) parts.push(`${failed} failed`);
+    if (unsure) parts.push(`${unsure} unsure`);
+    if (errs)   parts.push(`${errs} error${errs === 1 ? "" : "s"}`);
+    summary = parts.join(" · ") || "—";
+  } else {
+    summary = `Described ${batch.length - errs} / ${batch.length}`;
+  }
+  setRun(errs ? "error" : "ok", `Done. ${summary}`);
+  $("runBtn").disabled = false;
+  refreshAnalyzeEnabled();
+});
+
+// ---- Define mode: form + submit ------------------------------------------
+$("defineName").addEventListener("input", refreshDefineEnabled);
+$("defineDesc").addEventListener("input", () => {
+  const len = $("defineDesc").value.length;
+  $("defineDescCount").textContent = len;
+  $("defineDescCount").className = "counter" + (len > MAX_DESC_CHARS ? " over" : "");
+  refreshDefineEnabled();
+});
+
+function refreshDefineEnabled() {
+  if (!qcSvc) { $("defineBtn").disabled = true; return; }
+  const name = $("defineName").value.trim();
+  const desc = $("defineDesc").value.trim();
+  const ok = TEST_NAME_RE.test(name)
+          && desc.length > 0 && desc.length <= MAX_DESC_CHARS
+          && positiveFiles.length >= 1 && positiveFiles.length <= MAX_EXAMPLES_PER_CLASS
+          && negativeFiles.length  >= 1 && negativeFiles.length  <= MAX_EXAMPLES_PER_CLASS;
+  $("defineBtn").disabled = !ok;
+}
+
+$("defineBtn").addEventListener("click", async () => {
+  if (!qcSvc) return;
+  $("defineBtn").disabled = true;
+  setDefine("busy", "Uploading examples…");
+  $("defineResultBlock").hidden = true;
+  $("defineResultBlock").textContent = "";
+
+  const name = $("defineName").value.trim();
+  const desc = $("defineDesc").value.trim();
+  const scratchAlias = `smart-microscopy-assistant-define-${randomSuffix()}`;
+  const scratchId = `${userWorkspace}/${scratchAlias}`;
+  try {
+    await artMgr.create({
+      alias: scratchAlias, type: "generic",
+      manifest: { name: "scratch (visual test)", description: "scratch", type: "generic" },
+      config: { permissions: { "*": "r" } },
+      stage: true, _rkwargs: true,
+    });
+    const posPaths = [];
+    for (let i = 0; i < positiveFiles.length; i++) {
+      const f = positiveFiles[i];
+      const p = `positive/${i}.${fileExt(f)}`;
+      await uploadAndPresign(f, scratchId, p);
+      posPaths.push(p);
+    }
+    const negPaths = [];
+    for (let i = 0; i < negativeFiles.length; i++) {
+      const f = negativeFiles[i];
+      const p = `negative/${i}.${fileExt(f)}`;
+      await uploadAndPresign(f, scratchId, p);
+      negPaths.push(p);
+    }
+    await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
+
+    log("Presigning each upload with the caller's session …");
+    const posUrls = await presignAll(scratchId, posPaths);
+    const negUrls = await presignAll(scratchId, negPaths);
+
+    setDefine("busy", "Saving visual test on the worker…");
+    const rec = await qcSvc.create_visual_test({
+      name, description: desc,
+      positive_image_refs: posUrls,
+      negative_image_refs: negUrls,
+      _rkwargs: true,
+    });
+    setDefine("ok", "Saved");
+    $("defineResultBlock").hidden = false;
+    $("defineResultBlock").textContent =
+      `Visual test '${rec.name}' saved.\n` +
+      `${rec.n_positive} positive + ${rec.n_negative} negative reference images cached on the worker.\n` +
+      `Switch to Analyze — the dropdown now lists this test.`;
+    log(`create_visual_test '${name}' OK (n_positive=${rec.n_positive}, n_negative=${rec.n_negative})`, "ok");
+
+    $("defineName").value = ""; $("defineDesc").value = "";
+    $("defineDescCount").textContent = "0";
+    positiveFiles = []; negativeFiles = [];
+    renderGallery("positive"); renderGallery("negative");
+
+    await refreshTestsDropdown();
+  } catch (err) {
+    setDefine("error", "Failed");
+    $("defineResultBlock").hidden = false;
+    $("defineResultBlock").textContent = "Error: " + (err.message || String(err));
+    log("create_visual_test error: " + (err.message || String(err)), "err");
+  } finally {
+    await deleteScratch(scratchId);
+    refreshDefineEnabled();
+  }
+});
+</script>
+</body>
+</html>
