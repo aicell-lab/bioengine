@@ -2685,11 +2685,22 @@ def match_image_annotation_pairs(
                 break
         return key
 
+    # Dedupe duplicate-format masks per image — e.g. a single annotator exporting
+    # both foo.png (raster) and foo.geojson (vector polygons rasterised at train
+    # time produces the same supervision) would otherwise pair the image twice.
+    # Multi-annotator masks at different subfolders keep their distinct full-stem
+    # identity and still pair 1:N.
     fallback_ann_map: dict[str, list[str]] = {}
+    seen_full_stems: set[str] = set()
     for annot_file in annotation_files:
         key = _annotation_key(annot_file)
-        if key:
-            fallback_ann_map.setdefault(key, []).append(annot_file)
+        if not key:
+            continue
+        full_stem = Path(annot_file).with_suffix("").as_posix().lower()
+        if full_stem in seen_full_stems:
+            continue
+        seen_full_stems.add(full_stem)
+        fallback_ann_map.setdefault(key, []).append(annot_file)
 
     for image_file in image_files:
         key = _image_key(image_file)
