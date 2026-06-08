@@ -11,7 +11,6 @@ from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 from ray import serve
-from ray.serve.schema import ApplicationDetails, ServeStatus
 
 from bioengine import __version__
 from bioengine.apps.builder import AppBuilder
@@ -557,53 +556,14 @@ class AppsManager:
         self._deployed_applications.pop(application_id, None)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
-    async def _get_serve_instance_details(self) -> Dict[str, Any]:
-        """Fetch the Serve controller's full instance details (one RPC for all apps).
-
-        Returns the dict form of `ServeInstanceDetails` — same data as
-        `serve.status()` but with per-replica `ReplicaDetails` populated
-        (`node_id`, `node_ip`, `node_instance_id`, `state`, `pid`,
-        `start_time_s`, etc.). Returns an empty dict on failure so callers
-        can fall back to the simplified `serve.status()` view.
-        """
-        import ray
-
-        def _fetch() -> Dict[str, Any]:
-            client = serve.context._get_global_client()
-            details = ray.get(client._controller.get_serve_instance_details.remote())
-            if hasattr(details, "model_dump"):
-                return details.model_dump()
-            if isinstance(details, dict):
-                return details
-            return {}
-
-        try:
-            return await self.ray_cluster.call_with_reconnect(_fetch)
-        except Exception as e:
-            self.logger.error(f"Error fetching Serve instance details: {e}")
-            return {}
-
-    def _replicas_for_deployment(
-        self,
-        instance_details: Dict[str, Any],
-        application_id: str,
-        deployment_name: str,
+    def _project_replicas(
+        self, replicas: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """Pick the fields the dashboard needs from each ReplicaDetails entry.
 
         Keeps the payload small — `actor_id`, `worker_id`, `log_file_path`
         are intentionally dropped since the dashboard does not need them.
         """
-        try:
-            replicas = (
-                instance_details.get("applications", {})
-                .get(application_id, {})
-                .get("deployments", {})
-                .get(deployment_name, {})
-                .get("replicas", [])
-            )
-        except AttributeError:
-            return []
         out = []
         for r in replicas or []:
             out.append(
@@ -622,20 +582,26 @@ class AppsManager:
     async def _get_deployment_status(
         self,
         application_id: str,
-        application_status: ApplicationDetails,
-        instance_details: Dict[str, Any],
+        application_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
     ) -> Dict[str, Dict[str, Any]]:
         deployments_info = {}
-        for deployment_name, deployment_info in application_status.deployments.items():
+        for deployment_name, deployment_info in (
+            application_details.get("deployments") or {}
+        ).items():
+            replicas = self._project_replicas(deployment_info.get("replicas") or [])
+            replica_states: Dict[str, int] = {}
+            for r in replicas:
+                state = r.get("state")
+                if state:
+                    replica_states[state] = replica_states.get(state, 0) + 1
+
             deployments_info[deployment_name] = {
-                "status": deployment_info.status.value,
-                "message": deployment_info.message,
-                "replica_states": deployment_info.replica_states,
-                "replicas": self._replicas_for_deployment(
-                    instance_details, application_id, deployment_name
-                ),
+                "status": deployment_info.get("status"),
+                "message": deployment_info.get("message", ""),
+                "replica_states": replica_states,
+                "replicas": replicas,
                 "logs": None,
             }
 
@@ -741,7 +707,6 @@ class AppsManager:
     async def _get_app_status(
         self,
         application_id: str,
-        serve_status: ServeStatus,
         instance_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
@@ -763,16 +728,17 @@ class AppsManager:
 
         # Get application info from tracked applications
         application_info = self._deployed_applications[application_id]
-        application_status = serve_status.applications.get(application_id)
+        application_details = (instance_details.get("applications") or {}).get(
+            application_id
+        )
 
-        if application_status:
-            status = application_status.status.value
-            message = application_status.message
+        if application_details:
+            status = application_details.get("status")
+            message = application_details.get("message", "")
 
             deployments = await self._get_deployment_status(
                 application_id=application_id,
-                application_status=application_status,
-                instance_details=instance_details,
+                application_details=application_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
             )
@@ -2142,14 +2108,14 @@ class AppsManager:
 
         # Get Ray Serve status
         await self.ray_cluster.check_connection()
-        serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
-        instance_details = await self._get_serve_instance_details()
+        instance_details = (
+            await self.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote()
+        )
 
         # Iterate over applications to check
         status_tasks = [
             self._get_app_status(
                 application_id=application_id,
-                serve_status=serve_status,
                 instance_details=instance_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,

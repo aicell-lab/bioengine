@@ -604,6 +604,35 @@ class BioEngineProxyActor:
         return replica_info
 
     @_touch_on_call
+    def get_serve_instance_details(self) -> Dict[str, Any]:
+        """Fetch the Serve controller's full instance details.
+
+        Returns the dict form of `ServeInstanceDetails`, including per-replica
+        `ReplicaDetails` (`node_id`, `node_ip`, `node_instance_id`, `state`,
+        `pid`, `start_time_s`, ...) for every deployment — the single source
+        of truth for application + deployment status and replica placement.
+        Returns an empty dict on failure so callers can render a degraded but
+        still-valid status payload.
+        """
+        try:
+            from ray import serve
+
+            client = serve.context._get_global_client()
+            details = ray.get(
+                client._controller.get_serve_instance_details.remote()
+            )
+            if hasattr(details, "model_dump"):
+                return details.model_dump()
+            if isinstance(details, dict):
+                return details
+            return {}
+        except Exception as e:
+            logger.error(
+                f"Failed to fetch Serve instance details: {e}", exc_info=True
+            )
+            return {}
+
+    @_touch_on_call
     def register_serve_replica(
         self,
         application_id: str,
