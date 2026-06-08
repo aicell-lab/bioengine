@@ -616,6 +616,11 @@ function refreshInspectEnabled() {
 
 // ---- Inspect: run --------------------------------------------------------
 async function uploadScratchSingle(file) {
+  // The worker's HYPHA_TOKEN belongs to the worker-deployer's identity, not
+  // the calling user's. To let the app read the upload we *presign* the file
+  // here (the user's own session has full permission) and hand the server an
+  // HTTPS URL. The app's _resolve_to_url passes HTTPS URLs through unchanged.
+  // public-read on the artifact is belt-and-suspenders for the brief window.
   const alias = `smart-microscopy-qc-scratch-${randomSuffix()}`;
   const artifactId = `${userWorkspace}/${alias}`;
   const ext = (file.name.split(".").pop() || "bin").toLowerCase();
@@ -623,13 +628,17 @@ async function uploadScratchSingle(file) {
   await artMgr.create({
     alias, type: "generic",
     manifest: { name: "scratch", description: "scratch", type: "generic" },
+    config: { permissions: { "*": "r" } },
     stage: true, _rkwargs: true,
   });
   const putUrl = await artMgr.put_file({ artifact_id: artifactId, file_path: remotePath, _rkwargs: true });
   const resp = await fetch(putUrl, { method: "PUT", body: await file.arrayBuffer() });
   if (!resp.ok) throw new Error(`PUT failed: ${resp.status}`);
   await artMgr.commit({ artifact_id: artifactId, _rkwargs: true });
-  return { artifactId, remotePath };
+  const presignedUrl = await artMgr.get_file({
+    artifact_id: artifactId, file_path: remotePath, _rkwargs: true,
+  });
+  return { artifactId, remotePath, url: presignedUrl };
 }
 
 async function deleteScratch(artifactId) {
@@ -656,7 +665,9 @@ $("inspectBtn").addEventListener("click", async () => {
   const t0 = performance.now();
   try {
     scratch = await uploadScratchSingle(pickedFile);
-    callArgs.image_ref = `${scratch.artifactId}:${scratch.remotePath}`;
+    // Pass the presigned URL, not the artifact ref — the app's identity may
+    // differ from the caller's and lack read permission on this artifact.
+    callArgs.image_ref = scratch.url;
     setRun("busy", "Calling inspect()…");
     log(`Calling inspect(${callArgs.metric_name ? `metric=${callArgs.metric_name}` : "free-text"})`);
     const res = await qcSvc.inspect(callArgs);
@@ -789,8 +800,10 @@ function refreshCreateEnabled() {
 }
 
 async function uploadScratchMulti(files, sidePrefix, artifactId) {
-  // artifactId already created+staged by caller. Returns list of refs.
-  const refs = [];
+  // Upload each file, then presign and return its public download URL. The
+  // QC service runs under a different identity from the caller and would
+  // hit PermissionError if we sent the bare artifact ref.
+  const remotePaths = [];
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     const ext = (f.name.split(".").pop() || "bin").toLowerCase();
@@ -798,9 +811,18 @@ async function uploadScratchMulti(files, sidePrefix, artifactId) {
     const putUrl = await artMgr.put_file({ artifact_id: artifactId, file_path: path, _rkwargs: true });
     const resp = await fetch(putUrl, { method: "PUT", body: await f.arrayBuffer() });
     if (!resp.ok) throw new Error(`PUT ${path} failed: ${resp.status}`);
-    refs.push(`${artifactId}:${path}`);
+    remotePaths.push(path);
   }
-  return refs;
+  return remotePaths;
+}
+
+async function presignAll(artifactId, remotePaths) {
+  const urls = [];
+  for (const path of remotePaths) {
+    const u = await artMgr.get_file({ artifact_id: artifactId, file_path: path, _rkwargs: true });
+    urls.push(u);
+  }
+  return urls;
 }
 
 $("createBtn").addEventListener("click", async () => {
@@ -815,21 +837,31 @@ $("createBtn").addEventListener("click", async () => {
   try {
     const alias = `smart-microscopy-qc-create-${randomSuffix()}`;
     scratchId = `${userWorkspace}/${alias}`;
+    // public-read so the app can fall back to a normal GET on the presigned
+    // URL even if its identity differs from the caller's.
     await artMgr.create({
       alias, type: "generic",
       manifest: { name: "scratch (create_metric)", description: "scratch", type: "generic" },
+      config: { permissions: { "*": "r" } },
       stage: true, _rkwargs: true,
     });
     log(`Uploading ${goodFiles.length} good + ${badFiles.length} bad examples to scratch artifact`);
-    const goodRefs = await uploadScratchMulti(goodFiles, "good", scratchId);
-    const badRefs  = await uploadScratchMulti(badFiles,  "bad",  scratchId);
+    const goodPaths = await uploadScratchMulti(goodFiles, "good", scratchId);
+    const badPaths  = await uploadScratchMulti(badFiles,  "bad",  scratchId);
     await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
 
+    log("Presigning each upload with the caller's session …");
+    const goodUrls = await presignAll(scratchId, goodPaths);
+    const badUrls  = await presignAll(scratchId, badPaths);
+
     setCreate("busy", "Saving metric on the worker…");
+    // Pass presigned HTTPS URLs (not artifact refs): the QC service may run
+    // under a different identity than the caller and would lack permission
+    // to read the caller's artifact directly.
     const rec = await qcSvc.create_metric({
       name, description: desc,
-      good_image_refs: goodRefs,
-      bad_image_refs: badRefs,
+      good_image_refs: goodUrls,
+      bad_image_refs: badUrls,
       _rkwargs: true,
     });
     setCreate("ok", `Saved`);
