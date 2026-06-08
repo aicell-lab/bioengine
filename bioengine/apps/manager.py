@@ -557,10 +557,73 @@ class AppsManager:
         self._deployed_applications.pop(application_id, None)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
+    async def _get_serve_instance_details(self) -> Dict[str, Any]:
+        """Fetch the Serve controller's full instance details (one RPC for all apps).
+
+        Returns the dict form of `ServeInstanceDetails` — same data as
+        `serve.status()` but with per-replica `ReplicaDetails` populated
+        (`node_id`, `node_ip`, `node_instance_id`, `state`, `pid`,
+        `start_time_s`, etc.). Returns an empty dict on failure so callers
+        can fall back to the simplified `serve.status()` view.
+        """
+        import ray
+
+        def _fetch() -> Dict[str, Any]:
+            client = serve.context._get_global_client()
+            details = ray.get(client._controller.get_serve_instance_details.remote())
+            if hasattr(details, "model_dump"):
+                return details.model_dump()
+            if isinstance(details, dict):
+                return details
+            return {}
+
+        try:
+            return await self.ray_cluster.call_with_reconnect(_fetch)
+        except Exception as e:
+            self.logger.error(f"Error fetching Serve instance details: {e}")
+            return {}
+
+    def _replicas_for_deployment(
+        self,
+        instance_details: Dict[str, Any],
+        application_id: str,
+        deployment_name: str,
+    ) -> List[Dict[str, Any]]:
+        """Pick the fields the dashboard needs from each ReplicaDetails entry.
+
+        Keeps the payload small — `actor_id`, `worker_id`, `log_file_path`
+        are intentionally dropped since the dashboard does not need them.
+        """
+        try:
+            replicas = (
+                instance_details.get("applications", {})
+                .get(application_id, {})
+                .get("deployments", {})
+                .get(deployment_name, {})
+                .get("replicas", [])
+            )
+        except AttributeError:
+            return []
+        out = []
+        for r in replicas or []:
+            out.append(
+                {
+                    "replica_id": r.get("replica_id"),
+                    "node_id": r.get("node_id"),
+                    "node_ip": r.get("node_ip"),
+                    "node_instance_id": r.get("node_instance_id"),
+                    "state": r.get("state"),
+                    "pid": r.get("pid"),
+                    "start_time_s": r.get("start_time_s"),
+                }
+            )
+        return out
+
     async def _get_deployment_status(
         self,
         application_id: str,
         application_status: ApplicationDetails,
+        instance_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
     ) -> Dict[str, Dict[str, Any]]:
@@ -570,20 +633,11 @@ class AppsManager:
                 "status": deployment_info.status.value,
                 "message": deployment_info.message,
                 "replica_states": deployment_info.replica_states,
-                "nodes": [],
+                "replicas": self._replicas_for_deployment(
+                    instance_details, application_id, deployment_name
+                ),
                 "logs": None,
             }
-
-            try:
-                nodes = await self.ray_cluster.proxy_actor_handle.get_deployment_nodes.remote(
-                    application_id=application_id,
-                    deployment_name=deployment_name,
-                )
-                deployments_info[deployment_name]["nodes"] = nodes
-            except Exception as e:
-                self.logger.error(
-                    f"Error retrieving node placement for application '{application_id}', deployment '{deployment_name}': {e}"
-                )
 
             try:
                 deployment_logs = await self.ray_cluster.proxy_actor_handle.get_deployment_logs.remote(
@@ -688,6 +742,7 @@ class AppsManager:
         self,
         application_id: str,
         serve_status: ServeStatus,
+        instance_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
     ) -> Dict[str, Any]:
@@ -717,6 +772,7 @@ class AppsManager:
             deployments = await self._get_deployment_status(
                 application_id=application_id,
                 application_status=application_status,
+                instance_details=instance_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
             )
@@ -734,14 +790,6 @@ class AppsManager:
             deployments = {}
 
         service_ids = await self._get_application_service_ids(application_id)
-
-        seen_nodes = set()
-        app_nodes: List[str] = []
-        for dep in deployments.values():
-            for node_id in dep.get("nodes") or []:
-                if node_id and node_id not in seen_nodes:
-                    seen_nodes.add(node_id)
-                    app_nodes.append(node_id)
 
         # Build static site URL with runtime config params so the frontend
         # knows which Hypha server and service to connect to.
@@ -764,7 +812,6 @@ class AppsManager:
             "recovered_app": application_info["recovered_app"],
             "status": status,
             "message": message,
-            "nodes": app_nodes,
             "deployments": deployments,
             "application_kwargs": application_info["application_kwargs"],
             "application_env_vars": self._filter_secret_env_vars(
@@ -2096,12 +2143,14 @@ class AppsManager:
         # Get Ray Serve status
         await self.ray_cluster.check_connection()
         serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
+        instance_details = await self._get_serve_instance_details()
 
         # Iterate over applications to check
         status_tasks = [
             self._get_app_status(
                 application_id=application_id,
                 serve_status=serve_status,
+                instance_details=instance_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
             )

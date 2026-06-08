@@ -604,45 +604,6 @@ class BioEngineProxyActor:
         return replica_info
 
     @_touch_on_call
-    def get_deployment_nodes(
-        self, application_id: str, deployment_name: str
-    ) -> List[str]:
-        """
-        Get the distinct Ray node IDs hosting ALIVE replicas of a deployment.
-
-        Returns the same node_id strings used as keys in `get_cluster_state().nodes`,
-        suitable for joining application status against the cluster's node table.
-
-        Args:
-            application_id: Name of the Ray Serve application.
-            deployment_name: Name of the specific deployment within the app.
-
-        Returns:
-            List of distinct node_id strings for replicas currently in ALIVE state.
-            Empty list if no ALIVE replicas were found or `node_id` is unavailable.
-        """
-        class_name = f"ServeReplica:{application_id}:{deployment_name}"
-        deployment_actors = self.state_api_client.list(
-            resource=StateResource.ACTORS,
-            options=ListApiOptions(
-                limit=DEFAULT_LIMIT,
-                timeout=DEFAULT_RPC_TIMEOUT,
-                filters=[("class_name", "=", class_name), ("state", "=", "ALIVE")],
-                detail=False,
-                explain=False,
-            ),
-            raise_on_missing_output=True,
-        )
-        seen = set()
-        nodes = []
-        for actor in deployment_actors:
-            node_id = getattr(actor, "node_id", None)
-            if node_id and node_id not in seen:
-                seen.add(node_id)
-                nodes.append(node_id)
-        return nodes
-
-    @_touch_on_call
     def register_serve_replica(
         self,
         application_id: str,
