@@ -3706,6 +3706,7 @@ def _predict_and_encode(
                 "numpy==1.26.4",
                 "tifffile",
                 "Pillow",
+                "matplotlib",
                 "hypha-artifact==0.1.2",
             ],
         },
@@ -4700,17 +4701,25 @@ class CellposeFinetune:
             np.save(export_dir / test_output_filename, test_output)
             logger.info(f"Saved test samples: {test_input.shape}, {test_output.shape}")
 
-            # 4. Generate cover image
+            # 4. Generate cover image (best-effort — failure must not block export)
+            cover_filename: str | None = "cover.png"
             logger.info("Generating cover image...")
-            cover_filename = "cover.png"
-            await generate_cover_image(
-                test_input,
-                test_output,
-                export_dir / cover_filename,
-                model_name=model_name,
-                session_id=session_id,
-                training_info=status,
-            )
+            try:
+                await generate_cover_image(
+                    test_input,
+                    test_output,
+                    export_dir / cover_filename,
+                    model_name=model_name,
+                    session_id=session_id,
+                    training_info=status,
+                )
+            except Exception as cover_err:
+                logger.warning(
+                    f"Cover image generation failed ({type(cover_err).__name__}: {cover_err}); "
+                    "continuing export without it.",
+                    exc_info=True,
+                )
+                cover_filename = None
 
             # 5. Generate documentation
             train_losses = status.get("train_losses")
@@ -4899,23 +4908,26 @@ BSD-3-Clause (Cellpose license)
             )
             download_url = f"{artifact_url}/create-zip-file"
 
+            result_files = [
+                weights_filename,
+                model_py_filename,
+                test_input_filename,
+                test_output_filename,
+                DOC_FILENAME,
+                RDF_FILENAME,
+                TRAINING_PARAMS_FILENAME,
+                "training_history.json",
+            ]
+            if cover_filename:
+                result_files.insert(4, cover_filename)
+
             result: dict[str, str] = {
                 "artifact_id": artifact_id,
                 "model_name": model_name,
                 "status": "exported",
                 "artifact_url": artifact_url,
                 "download_url": download_url,
-                "files": [
-                    weights_filename,
-                    model_py_filename,
-                    test_input_filename,
-                    test_output_filename,
-                    cover_filename,
-                    DOC_FILENAME,
-                    RDF_FILENAME,
-                    TRAINING_PARAMS_FILENAME,
-                    "training_history.json",
-                ],
+                "files": result_files,
             }
 
             # Update status with export info and mark model as not modified
