@@ -387,9 +387,50 @@
     font-size: 0.85rem; color: var(--fg-dim); text-align: center;
     padding: 0.75rem 0;
   }
+
+  /* --- Auth gate (shown when signed out) ------------------------------ */
+  .auth-gate {
+    background:
+      radial-gradient(800px 300px at 50% -50px, rgba(14, 165, 233, 0.18), transparent 70%),
+      var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 1rem;
+    padding: 2rem 1.75rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+    box-shadow: 0 12px 36px rgba(0,0,0,0.35);
+  }
+  .auth-gate .lock-icon {
+    width: 3rem; height: 3rem; margin: 0 auto 0.85rem;
+    border-radius: 999px;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 1.4rem;
+    box-shadow: 0 8px 24px rgba(14, 165, 233, 0.35);
+  }
+  .auth-gate h2 {
+    font-size: 1.25rem; font-weight: 700; color: var(--fg);
+    text-transform: none; letter-spacing: 0; margin-bottom: 0.4rem;
+    display: block;
+  }
+  .auth-gate p {
+    color: var(--fg-dim); font-size: 0.9rem;
+    max-width: 32rem; margin: 0 auto 1.1rem;
+  }
+  .auth-gate .btn { margin: 0 auto; }
+
+  /* When the body is in the signed-out state, dim and disable the
+     signed-in-only content so the user can see the app's structure but
+     can't interact with parts that would silently fail without a session. */
+  body.signed-out .signed-out-only { display: block; }
+  body:not(.signed-out) .signed-out-only { display: none !important; }
+  body.signed-out .signed-in-only {
+    opacity: 0.4; pointer-events: none; filter: grayscale(0.3);
+    user-select: none;
+  }
 </style>
 </head>
-<body>
+<body class="signed-out">
 
 <!-- Top bar -->
 <div id="topbar">
@@ -447,7 +488,23 @@
     <p>VLM-backed microscopy analyst — run reusable visual tests across image batches, or describe a single frame.</p>
   </header>
 
-  <div class="mode-toggle-wrap">
+  <!-- Auth gate: visible only when not signed in -->
+  <div class="auth-gate signed-out-only">
+    <div class="lock-icon">🔒</div>
+    <h2>Sign in to start</h2>
+    <p>This assistant runs on Hypha. Sign in with your Hypha account to define visual tests, analyze images, and access the model.</p>
+    <button id="gateLoginBtn" class="btn btn-primary-lg" type="button">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+           stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+        <polyline points="10 17 15 12 10 7"/>
+        <line x1="15" y1="12" x2="3" y2="12"/>
+      </svg>
+      <span>Sign in to Hypha</span>
+    </button>
+  </div>
+
+  <div class="mode-toggle-wrap signed-in-only">
     <div class="mode-toggle" role="tablist">
       <button id="modeAnalyzeBtn" class="seg active" data-mode="analyze" role="tab" aria-selected="true">
         🔍 Analyze
@@ -461,7 +518,7 @@
   <!-- =========================================================== -->
   <!-- ANALYZE VIEW                                                 -->
   <!-- =========================================================== -->
-  <div id="analyzeView">
+  <div id="analyzeView" class="signed-in-only">
 
     <div class="card">
       <h2><span class="h-icon">🎯</span> What to check for</h2>
@@ -519,7 +576,7 @@
   <!-- =========================================================== -->
   <!-- DEFINE VIEW                                                  -->
   <!-- =========================================================== -->
-  <div id="defineView" hidden>
+  <div id="defineView" class="signed-in-only" hidden>
 
     <div class="card">
       <h2><span class="h-icon">📝</span> Visual test definition</h2>
@@ -640,13 +697,19 @@ function clearSavedToken() {
   try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_EXPIRY); } catch (_) {}
 }
 function setLoggedOutUI() {
+  document.body.classList.add("signed-out");
   $("loginBtn").hidden = false;
   $("loginBtn").disabled = false;
+  $("gateLoginBtn").disabled = false;
   $("userWrap").hidden = true;
   $("userMenu").hidden = true;
 }
-function setLoggingInUI() { $("loginBtn").disabled = true; }
+function setLoggingInUI() {
+  $("loginBtn").disabled = true;
+  $("gateLoginBtn").disabled = true;
+}
 function setLoggedInUI() {
+  document.body.classList.remove("signed-out");
   $("loginBtn").hidden = true;
   $("userWrap").hidden = false;
   $("userEmail").textContent = userEmail || "(unknown)";
@@ -685,7 +748,7 @@ async function connectWithToken(token) {
   refreshDefineEnabled();
 }
 
-$("loginBtn").addEventListener("click", async () => {
+async function startLogin() {
   setLoggingInUI();
   log("Opening Hypha auth flow…");
   try {
@@ -699,7 +762,9 @@ $("loginBtn").addEventListener("click", async () => {
     log("Login error: " + err.message, "err");
     setLoggedOutUI();
   }
-});
+}
+$("loginBtn").addEventListener("click", startLogin);
+$("gateLoginBtn").addEventListener("click", startLogin);
 
 $("logoutBtn").addEventListener("click", async () => {
   clearSavedToken();
@@ -712,6 +777,10 @@ $("logoutBtn").addEventListener("click", async () => {
 (async () => {
   const cached = URL_TOKEN || loadSavedToken();
   if (!cached) { setLoggedOutUI(); return; }
+  // We have a cached token — pre-emptively remove the signed-out body class
+  // so the gate doesn't flash before connectWithToken() resolves. Restored
+  // by setLoggedOutUI() if the connect fails.
+  document.body.classList.remove("signed-out");
   $("loginBtn").hidden = true;
   $("userWrap").hidden = true;
   try { await connectWithToken(cached); }
