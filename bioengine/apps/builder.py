@@ -338,23 +338,27 @@ class AppBuilder:
         task-level ``py_modules``. Idempotent: if the same content was
         uploaded before the function returns the cached URI without
         re-uploading.
+
+        ``include_gitignore=False`` means Ray applies only our explicit
+        ``excludes``; ``include_parent_dir=False`` keeps the artifact root
+        at the top of the zip so a plain ``import deployment`` succeeds
+        inside the task.
         """
         from ray._private.runtime_env.packaging import (
             get_uri_for_directory,
             upload_package_if_needed,
         )
 
-        # ``include_parent_dir=False`` so the zip's top level holds the
-        # artifact-root contents directly. Ray's py_modules extraction
-        # then puts that path on ``sys.path`` so a plain
-        # ``import deployment`` succeeds inside the task.
         pkg_uri = get_uri_for_directory(
-            str(pkg_root_dir), excludes=self._PY_MODULES_EXCLUDES
+            str(pkg_root_dir),
+            include_gitignore=False,
+            excludes=self._PY_MODULES_EXCLUDES,
         )
         upload_package_if_needed(
             pkg_uri,
             base_directory=str(pkg_root_dir.parent),
-            directory=str(pkg_root_dir),
+            module_path=str(pkg_root_dir),
+            include_gitignore=False,
             include_parent_dir=False,
             excludes=self._PY_MODULES_EXCLUDES,
             logger=self.logger,
