@@ -109,33 +109,51 @@ BioEngine is the **execution and adaptation layer between curated bioimage AI an
 
 ---
 
-## Application Manifest
+## Application Manifest (v0.11 / format_version 0.6.0)
 
-Every BioEngine application is described by a `manifest.yaml` file. This file is stored in the Hypha artifact manager alongside Python deployment code.
+Every BioEngine application is a folder containing `manifest.yaml` and the app's Python files at the root. The whole folder is uploaded to the Hypha artifact; the worker ships the same root to Ray Serve replicas as `runtime_env.py_modules`, excluding non-Python content (`manifest.yaml`, `README*`, `*.md`, `*.ipynb`, `frontend/`, images).
+
+```
+my-app/                       ← artifact root + Python module directory
+├── manifest.yaml
+├── README.md                 ← stays in artifact (excluded from py_modules)
+├── frontend/index.html       ← Hypha hosts statically (excluded from py_modules)
+└── deployment.py             ← @bioengine.app class
+```
+
+For multi-file apps:
+
+```
+composition-demo/
+├── manifest.yaml
+├── frontend/index.html
+├── entry.py                  ← @bioengine.app entry — type-hints reference RuntimeA/B/C
+├── utils.py
+└── runtimes/
+    ├── __init__.py
+    ├── a.py
+    ├── b.py
+    └── c.py
+```
 
 ### Required Fields
 
 ```yaml
-name: My Application        # Human-readable name
-id: my-application          # Unique lowercase ID (hyphens only)
-id_emoji: "🔬"              # Visual emoji identifier
-description: "..."          # Short description
-type: ray-serve             # Must be "ray-serve"
-deployments:                # List of Python class entry points
-  - module_file:ClassName
-authorized_users:
-  - "*"                     # Or specific user IDs
+name: My Application
+id: my-application                       # Unique lowercase ID (hyphens only)
+id_emoji: "🔬"
+description: "..."
+type: ray-serve                          # Kept
+format_version: 0.6.0                    # v0.11 gate
+entry: deployment:MyApp                  # module:Class — module is the .py filename
 ```
 
 ### Optional Fields
 
 ```yaml
-# Static frontend hosting — set frontend_entry to enable automatically
-frontend_entry: "frontend/index.html"  # Entry HTML file (relative to artifact root)
-
-# Metadata
-format_version: "0.5.0"
-version: "1.0.0"
+frontend_entry: "frontend/index.html"    # Static frontend hosting
+version: 1.0.0
+authorized_users: ['*']                  # Or {method_name: [users], "*": [users]}
 authors:
   - {name: "...", affiliation: "...", github_user: "..."}
 license: MIT
@@ -148,6 +166,22 @@ When `frontend_entry` is set, BioEngine configures a `view_config` on the Hypha 
 ```
 https://hypha.aicell.io/{workspace}/view/{artifact-id}/
 ```
+
+### Authoring model
+
+User code uses the decorators in the `bioengine` package — `@bioengine.app`, `@bioengine.method`, `@bioengine.async_init`, `@bioengine.smoke_test`, `@bioengine.health_check`, `@bioengine.multiplexed` — and accesses datasets/logger via the module-level `bioengine.datasets` / `bioengine.logger` accessors. Multi-deployment composition is declared by `__init__` type hints; `.remote()` is hidden by `BioEngineRuntimeHandle`. See `docs/migration/v0.11.md` for the full mapping from the legacy decorators and an end-to-end migration walkthrough; see `apps/demo-app/` and `apps/composition-demo/` for reference apps.
+
+### The decorator-module import rule
+
+Modules that contain `@bioengine.app` — and anything they transitively import at top level — must be importable with just `bioengine[worker]` and the standard library installed. The worker's introspection Ray task imports them in a clean baseline runtime_env. Heavy deps still go in `@bioengine.app(pip=…)` (Ray Serve installs them in each replica's venv); just put their imports inside method bodies, or in sibling helper modules that decorator files only lazy-import. See `apps/composition-demo/numpy_ops.py` + `runtimes/b.py` for the helper-module pattern.
+
+### Local validation
+
+```bash
+bioengine apps validate ./my-app
+```
+
+The CLI runs the same validator that the worker uses, so legacy manifests fail fast with a migration hint without a round-trip.
 
 ---
 

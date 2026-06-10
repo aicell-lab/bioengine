@@ -397,18 +397,13 @@ class AppsManager:
             artifact_id = self._deployed_applications[application_id]["artifact_id"]
             version = self._deployed_applications[application_id]["version"]
 
-            # Use the pre-built app from _deployed_applications
-            # This was built and validated in deploy_app() before this task was created
-            app = self._deployed_applications[application_id]["built_app"]
-
-            # Run the deployment in Ray Serve with unique route prefix
-            await self.ray_cluster.call_with_reconnect(
-                serve.run,
-                target=app,
-                name=application_id,
-                route_prefix=f"/{application_id}",
-                blocking=False,
-            )
+            # In v0.11, ``AppBuilder.build`` introspects + assembles
+            # metadata only; the actual ``serve.run`` is deferred to
+            # ``AppBuilder.submit``, run as a Ray task in the app's
+            # runtime_env. The split exists so ``_check_resources`` runs
+            # *before* the cluster resources are claimed.
+            built_app = self._deployed_applications[application_id]["built_app"]
+            await self.app_builder.submit(built_app, application_id)
 
             # Track the application in the internal state
             self.logger.info(
@@ -883,6 +878,20 @@ class AppsManager:
 
                 if not isinstance(app_data, dict):
                     raise ValueError("get_app_data() did not return a dictionary")
+
+                # v0.6.0 hard break: refuse to recover apps deployed under
+                # the legacy v0.5 builder. Missing `format_version` is the
+                # most reliable marker (the new builder always sets it).
+                recovered_format = app_data.get("format_version")
+                if recovered_format != "0.6.0":
+                    self.logger.warning(
+                        f"Refusing to recover application '{application_id}': "
+                        f"app_data carries format_version={recovered_format!r}, "
+                        f"expected '0.6.0'. The worker was restarted across a "
+                        f"BioEngine major version break — redeploy this app "
+                        f"explicitly to bring it under the new builder."
+                    )
+                    continue
 
                 required_keys = {
                     "display_name",
