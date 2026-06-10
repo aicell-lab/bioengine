@@ -1300,6 +1300,7 @@ class AppBuilder:
         hypha_token: Optional[str],
         disable_gpu: bool,
         max_ongoing_requests: int,
+        proxy_memory_in_gb: float,
         debug: bool,
         started_at: Optional[float] = None,
         last_updated_at: Optional[float] = None,
@@ -1441,8 +1442,19 @@ class AppBuilder:
                     "runtime_env"
                 ]["env_vars"]
 
-            # Calculate the total number of required resources
-            proxy_deployment = ProxyDeployment
+            # Override the proxy's ray_actor_options.memory at deployment time —
+            # the default 0 reservation on the decorator lets Ray place the proxy
+            # anywhere, including resource-tight nodes (e.g. the head). A real
+            # reservation biases scheduling toward nodes with headroom for the
+            # WebSocket/WebRTC payloads the proxy terminates. Ray treats `memory`
+            # as a scheduling hint, not a runtime cap.
+            proxy_ray_actor_options = dict(ProxyDeployment.ray_actor_options)
+            proxy_ray_actor_options["memory"] = int(
+                proxy_memory_in_gb * (1024**3)
+            )
+            proxy_deployment = ProxyDeployment.options(
+                ray_actor_options=proxy_ray_actor_options
+            )
             required_resources = self._calculate_required_resources(
                 deployments + [proxy_deployment]
             )
@@ -1576,6 +1588,7 @@ class AppBuilder:
                 "application_env_vars": sanitized_env_vars,
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,
+                "proxy_memory_in_gb": proxy_memory_in_gb,
                 "application_resources": required_resources,
                 "authorized_users": effective_authorized_users,
                 "available_methods": [
