@@ -625,28 +625,111 @@
     .criterion-grid { grid-template-columns: 1fr; }
   }
   .criterion-block {
-    background: var(--bg-0); border: 1px solid var(--border);
-    border-radius: 0.6rem; padding: 0.65rem 0.75rem;
+    /* Only the header carries the pass/fail color cue; the textarea stays
+       on the standard input background so the form feels uniform. */
+    display: flex; flex-direction: column; gap: 0.35rem;
   }
-  .criterion-block.pass { border-color: rgba(34,197,94,0.30); background: rgba(34,197,94,0.04); }
-  .criterion-block.fail { border-color: rgba(239,68,68,0.30); background: rgba(239,68,68,0.04); }
   .criterion-block .criterion-label {
     font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
     letter-spacing: 0.08em;
     display: flex; align-items: center; gap: 0.4rem;
-    margin-bottom: 0.4rem;
   }
   .criterion-block.pass .criterion-label { color: var(--pass); }
   .criterion-block.fail .criterion-label { color: var(--fail); }
   .criterion-block textarea {
-    background: transparent; border: 0; padding: 0;
     min-height: 4.5rem; font-size: 0.85rem;
   }
-  .criterion-block textarea:focus { box-shadow: none; }
   .criterion-block .criterion-help {
-    margin-top: 0.3rem; font-size: 0.7rem; color: var(--fg-muted);
+    margin-top: 0.05rem; font-size: 0.7rem; color: var(--fg-muted);
     display: flex; justify-content: space-between;
   }
+
+  /* Define-mode tiles: hide the cloud-upload icon entirely. The icon's
+     point is to signal "not yet uploaded to the worker", which only
+     applies to the Analyze pipeline. */
+  #positiveGrid .image-tile .cloud-icon,
+  #negativeGrid .image-tile .cloud-icon { display: none; }
+
+  /* --- Sub-section headers inside a single card --------------------- */
+  .subsection { margin-top: 1.1rem; }
+  .subsection:first-child { margin-top: 0; }
+  .subsection-label {
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.09em;
+    color: var(--fg-muted); margin-bottom: 0.5rem; font-weight: 700;
+    display: flex; align-items: center; gap: 0.45rem;
+  }
+  .subsection-label .step {
+    width: 1.25rem; height: 1.25rem; border-radius: 999px;
+    background: var(--bg-3); color: var(--fg-dim);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.7rem; font-weight: 700;
+  }
+
+  /* --- Confirm dialog ---------------------------------------------- */
+  .dialog-backdrop {
+    position: fixed; inset: 0; z-index: 110;
+    background: rgba(2, 6, 16, 0.78);
+    backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 2rem 1.25rem;
+    opacity: 1;
+    transition: opacity 160ms var(--ease-out);
+  }
+  @starting-style {
+    .dialog-backdrop { opacity: 0; }
+  }
+  .dialog {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 0.85rem;
+    box-shadow: 0 22px 50px rgba(0, 0, 0, 0.55);
+    width: 100%; max-width: 26rem;
+    padding: 1.4rem 1.4rem 1.2rem;
+    transform: translateY(0) scale(1);
+    transition: opacity 180ms var(--ease-out),
+                transform 180ms var(--ease-out);
+  }
+  @starting-style {
+    .dialog { opacity: 0; transform: translateY(-6px) scale(0.97); }
+  }
+  .dialog .dialog-title {
+    font-size: 1.02rem; font-weight: 700; color: var(--fg);
+    margin-bottom: 0.5rem;
+    display: flex; align-items: center; gap: 0.55rem;
+  }
+  .dialog .dialog-icon {
+    width: 1.85rem; height: 1.85rem; border-radius: 999px;
+    background: rgba(239,68,68,0.13); color: var(--fail);
+    display: inline-flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .dialog .dialog-icon svg { width: 1.05rem; height: 1.05rem; }
+  .dialog .dialog-message {
+    color: var(--fg-dim); font-size: 0.88rem; line-height: 1.5;
+    margin-bottom: 1.1rem;
+  }
+  .dialog .dialog-message strong { color: var(--fg); font-weight: 600; }
+  .dialog .dialog-actions {
+    display: flex; justify-content: flex-end; gap: 0.55rem;
+  }
+  .dialog .dialog-btn {
+    font: inherit; font-size: 0.86rem; font-weight: 600;
+    padding: 0.5rem 1rem; border-radius: 0.5rem;
+    cursor: pointer; border: 1px solid transparent;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                border-color 0.12s var(--ease-out),
+                transform 0.1s var(--ease-out);
+  }
+  .dialog .dialog-btn:active { transform: scale(0.97); }
+  .dialog .dialog-btn.cancel {
+    background: transparent; color: var(--fg-dim); border-color: var(--border-strong);
+  }
+  .dialog .dialog-btn.cancel:hover { background: var(--bg-3); color: var(--fg); }
+  .dialog .dialog-btn.danger {
+    background: var(--fail); color: #450a0a; border-color: var(--fail);
+  }
+  .dialog .dialog-btn.danger:hover { filter: brightness(1.08); }
 
   /* --- Define mode submit result block --------------------------------- */
   .create-result {
@@ -876,7 +959,7 @@
   <div id="analyzeView" class="signed-in-only">
 
     <div class="card">
-      <h2><span class="h-icon">🎯</span> What to check for</h2>
+      <h2>What to check for</h2>
       <div class="radio-row">
         <label><input type="radio" name="analyzeSource" id="srcTest" value="test" checked> Use a saved visual test</label>
         <label><input type="radio" name="analyzeSource" id="srcFreetext" value="freetext"> Describe with free-text</label>
@@ -900,7 +983,7 @@
     </div>
 
     <div class="card">
-      <h2><span class="h-icon">🖼️</span> Images <span class="small" style="margin-left:auto;font-weight:400;">(<span id="analyzeCount">0</span>)</span></h2>
+      <h2>Images <span class="small" style="margin-left:auto;font-weight:400;">(<span id="analyzeCount">0</span>)</span></h2>
       <div id="analyzeBox" class="image-canvas" tabindex="0" data-side="analyze">
         <div class="canvas-hint" id="analyzeHint">
           <div class="hint-primary">Click to select this area</div>
@@ -933,90 +1016,99 @@
     <!-- Existing tests browser -->
     <div class="card">
       <h2>
-        <span class="h-icon">📚</span> Existing tests
+        Existing tests
         <span class="small" style="margin-left:auto;font-weight:400;">your tests + public tests · click delete to remove your own</span>
       </h2>
       <div id="testList" class="test-list"></div>
     </div>
 
-    <!-- New test creation -->
+    <!-- New test creation (single combined panel) -->
     <div class="card">
-      <h2><span class="h-icon">＋</span> Create a new visual test</h2>
-      <label class="field-label">Test name <span class="small">(lowercase, hyphens, max 50 chars)</span></label>
-      <input id="defineName" type="text" placeholder="e.g. focus-quality"
-             pattern="^[a-z0-9][a-z0-9-]{0,49}$" maxlength="50"
-             style="margin-bottom: 0.75rem;" />
+      <h2>Create a new visual test</h2>
 
-      <label class="field-label">Conditions <span class="small">(both required; reference images below are optional)</span></label>
-      <div class="criterion-grid">
-        <div class="criterion-block pass">
-          <div class="criterion-label">✓ When does it PASS?</div>
-          <textarea id="passCriterion" maxlength="800"
-                    placeholder="e.g. Sharp cell outlines, uniform illumination across the field, no obvious artefacts."></textarea>
-          <div class="criterion-help">
-            <span>Used in the prompt verbatim.</span>
-            <span><span id="passCount" class="counter">0</span> / 800</span>
-          </div>
+      <!-- 1. Visibility -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">1</span>Visibility</div>
+        <div class="visibility-toggle" role="radiogroup" aria-label="Visibility">
+          <button type="button" id="visPrivateBtn" class="active" data-vis="private" role="radio" aria-checked="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="11" width="18" height="11" rx="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <span>Private (only you)</span>
+          </button>
+          <button type="button" id="visPublicBtn" data-vis="public" role="radio" aria-checked="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="2" y1="12" x2="22" y2="12"/>
+              <path d="M12 2a15 15 0 0 1 0 20a15 15 0 0 1 0 -20z"/>
+            </svg>
+            <span>Public (anyone)</span>
+          </button>
         </div>
-        <div class="criterion-block fail">
-          <div class="criterion-label">✗ When does it FAIL?</div>
-          <textarea id="failCriterion" maxlength="800"
-                    placeholder="e.g. Motion blur, saturated regions, dark spots, or out-of-focus areas."></textarea>
-          <div class="criterion-help">
-            <span>Used in the prompt verbatim.</span>
-            <span><span id="failCount" class="counter">0</span> / 800</span>
+      </div>
+
+      <!-- 2. Name -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">2</span>Test name <span class="small" style="margin-left:0.35rem;color:var(--fg-muted);font-weight:400;letter-spacing:0;text-transform:none;">lowercase, hyphens, max 50 chars</span></div>
+        <input id="defineName" type="text" placeholder="e.g. focus-quality"
+               pattern="^[a-z0-9][a-z0-9-]{0,49}$" maxlength="50" />
+      </div>
+
+      <!-- 3. Conditions -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">3</span>Conditions <span class="small" style="margin-left:0.35rem;color:var(--fg-muted);font-weight:400;letter-spacing:0;text-transform:none;">both required</span></div>
+        <div class="criterion-grid">
+          <div class="criterion-block pass">
+            <div class="criterion-label">When does it PASS?</div>
+            <textarea id="passCriterion" maxlength="800"
+                      placeholder="e.g. Sharp cell outlines, uniform illumination across the field, no obvious artefacts."></textarea>
+            <div class="criterion-help">
+              <span>Used in the prompt verbatim.</span>
+              <span><span id="passCount" class="counter">0</span> / 800</span>
+            </div>
+          </div>
+          <div class="criterion-block fail">
+            <div class="criterion-label">When does it FAIL?</div>
+            <textarea id="failCriterion" maxlength="800"
+                      placeholder="e.g. Motion blur, saturated regions, dark spots, or out-of-focus areas."></textarea>
+            <div class="criterion-help">
+              <span>Used in the prompt verbatim.</span>
+              <span><span id="failCount" class="counter">0</span> / 800</span>
+            </div>
           </div>
         </div>
       </div>
 
-      <label class="field-label" style="margin-top: 0.85rem;">Visibility</label>
-      <div class="visibility-toggle" role="radiogroup" aria-label="Visibility">
-        <button type="button" id="visPrivateBtn" class="active" data-vis="private" role="radio" aria-checked="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="3" y="11" width="18" height="11" rx="2"/>
-            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-          </svg>
-          <span>Private (only you)</span>
-        </button>
-        <button type="button" id="visPublicBtn" data-vis="public" role="radio" aria-checked="false">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="10"/>
-            <line x1="2" y1="12" x2="22" y2="12"/>
-            <path d="M12 2a15 15 0 0 1 0 20a15 15 0 0 1 0 -20z"/>
-          </svg>
-          <span>Public (anyone)</span>
-        </button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2><span class="h-icon">📌</span> Reference examples <span class="small" style="margin-left:auto;font-weight:400;">optional · 0–<span class="exMax">5</span> each · skip if you want a text-only test</span></h2>
-      <div class="dual-canvas">
-        <div id="positiveBox" class="image-canvas" tabindex="0" data-side="positive">
-          <div class="canvas-label pass">✓ Should pass <span class="small" style="margin-left:auto;font-weight:400;color:var(--fg-muted);">(<span id="positiveCount">0</span>/<span class="exMax">5</span>)</span></div>
-          <div class="canvas-hint">
-            <div class="hint-primary">Click to select</div>
-            <div>then paste, or double-click</div>
+      <!-- 4. Images -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">4</span>Reference examples <span class="small" style="margin-left:0.35rem;color:var(--fg-muted);font-weight:400;letter-spacing:0;text-transform:none;">optional · 0–<span class="exMax">5</span> each</span></div>
+        <div class="dual-canvas">
+          <div id="positiveBox" class="image-canvas" tabindex="0" data-side="positive">
+            <div class="canvas-label pass">Should pass <span class="small" style="margin-left:auto;font-weight:400;color:var(--fg-muted);">(<span id="positiveCount">0</span>/<span class="exMax">5</span>)</span></div>
+            <div class="canvas-hint">
+              <div class="hint-primary">Click to select</div>
+              <div>then paste, or double-click</div>
+            </div>
+            <div id="positiveGrid" class="image-grid"></div>
           </div>
-          <div id="positiveGrid" class="image-grid"></div>
-        </div>
-        <div id="negativeBox" class="image-canvas" tabindex="0" data-side="negative">
-          <div class="canvas-label fail">✗ Should fail <span class="small" style="margin-left:auto;font-weight:400;color:var(--fg-muted);">(<span id="negativeCount">0</span>/<span class="exMax">5</span>)</span></div>
-          <div class="canvas-hint">
-            <div class="hint-primary">Click to select</div>
-            <div>then paste, or double-click</div>
+          <div id="negativeBox" class="image-canvas" tabindex="0" data-side="negative">
+            <div class="canvas-label fail">Should fail <span class="small" style="margin-left:auto;font-weight:400;color:var(--fg-muted);">(<span id="negativeCount">0</span>/<span class="exMax">5</span>)</span></div>
+            <div class="canvas-hint">
+              <div class="hint-primary">Click to select</div>
+              <div>then paste, or double-click</div>
+            </div>
+            <div id="negativeGrid" class="image-grid"></div>
           </div>
-          <div id="negativeGrid" class="image-grid"></div>
         </div>
+        <input type="file" id="positiveInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
+        <input type="file" id="negativeInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
       </div>
-      <input type="file" id="positiveInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
-      <input type="file" id="negativeInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
-    </div>
 
-    <div class="card">
-      <div class="run-summary">
+      <!-- Save -->
+      <div class="run-summary" style="margin-top: 1.25rem;">
         <button class="btn btn-primary-lg" id="defineBtn" disabled>Save visual test</button>
         <span class="status"><span class="status-dot" id="defineDot"></span><span id="defineStatus">Idle</span></span>
       </div>
@@ -1031,6 +1123,29 @@
     <div id="log" class="log-body">Ready.</div>
   </details>
 
+</div>
+
+<!-- Confirm dialog -->
+<div id="confirmDialog" class="dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" hidden>
+  <div class="dialog">
+    <div class="dialog-title">
+      <span class="dialog-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6l-1.5 14a2 2 0 0 1 -2 2h-7a2 2 0 0 1 -2 -2L5 6"/>
+          <path d="M10 11v6"/><path d="M14 11v6"/>
+          <path d="M9 6V4a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v2"/>
+        </svg>
+      </span>
+      <span id="confirmTitle">Delete?</span>
+    </div>
+    <div class="dialog-message" id="confirmMessage">Are you sure?</div>
+    <div class="dialog-actions">
+      <button class="dialog-btn cancel" type="button" id="confirmCancel">Cancel</button>
+      <button class="dialog-btn danger" type="button" id="confirmOk">Delete</button>
+    </div>
+  </div>
 </div>
 
 <!-- Lightbox -->
@@ -1055,7 +1170,6 @@ const params     = new URLSearchParams(window.location.search);
 const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
 const SERVICE_ID = params.get("ws_service_id") || "";
 const URL_TOKEN  = params.get("token") || "";
-const APP_FALLBACK = "bioimage-io/smart-microscopy-assistant";
 
 const MAX_INSTRUCTION_CHARS = 4000;
 const MAX_DESC_CHARS = 800;
@@ -1165,8 +1279,14 @@ async function connectWithToken(token) {
   setLoggedInUI();
   log(`Connected as ${userEmail} (workspace=${userWorkspace})`, "ok");
   artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
-  const sid = SERVICE_ID || APP_FALLBACK;
-  qcSvc = await server.getService(sid, { _rkwargs: true });
+  if (!SERVICE_ID) {
+    log("No ws_service_id in the URL — open the app from the BioEngine dashboard or append `?ws_service_id=<id>`.", "err");
+    throw new Error(
+      "ws_service_id is required. Open this app from the BioEngine dashboard, " +
+      "or append ?ws_service_id=<service-id> to the URL."
+    );
+  }
+  qcSvc = await server.getService(SERVICE_ID, { _rkwargs: true });
   log("Service handle ready.", "ok");
   await Promise.all([refreshTests(), refreshModelInfo()]);
   refreshAnalyzeEnabled();
@@ -1407,7 +1527,12 @@ function refreshTestList() {
       del.title = "Only the creator can delete this test.";
     } else {
       del.addEventListener("click", async () => {
-        if (!window.confirm(`Delete visual test "${t.name}"? This cannot be undone.`)) return;
+        const ok = await showConfirm({
+          title: "Delete visual test?",
+          message: `Delete visual test <strong>${escapeHTML(t.name)}</strong>? This cannot be undone.`,
+          confirmLabel: "Delete",
+        });
+        if (!ok) return;
         del.disabled = true;
         try {
           await qcSvc.delete_visual_test({
@@ -1440,6 +1565,38 @@ function getActiveSide() {
   const box = $(activeBoxId);
   return box ? box.dataset.side : null;
 }
+
+// ===== Confirm dialog ====================================================
+// Promise-based replacement for window.confirm — rendered with the rest of
+// the app's styling so it looks intentional (vs. the browser's native chrome).
+let _confirmResolve = null;
+function showConfirm({ title = "Confirm", message = "Are you sure?",
+                       confirmLabel = "Delete", cancelLabel = "Cancel" } = {}) {
+  $("confirmTitle").textContent = title;
+  // message accepts HTML so the caller can bold the test name etc.
+  $("confirmMessage").innerHTML = message;
+  $("confirmOk").textContent = confirmLabel;
+  $("confirmCancel").textContent = cancelLabel;
+  $("confirmDialog").hidden = false;
+  // Focus the danger button for keyboard-only confirms.
+  setTimeout(() => $("confirmOk").focus(), 0);
+  return new Promise(res => { _confirmResolve = res; });
+}
+function closeConfirm(value) {
+  if (_confirmResolve) {
+    _confirmResolve(value);
+    _confirmResolve = null;
+  }
+  $("confirmDialog").hidden = true;
+}
+$("confirmOk").addEventListener("click", () => closeConfirm(true));
+$("confirmCancel").addEventListener("click", () => closeConfirm(false));
+$("confirmDialog").addEventListener("click", (e) => {
+  if (e.target === $("confirmDialog")) closeConfirm(false);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("confirmDialog").hidden) closeConfirm(false);
+});
 
 // ===== Lightbox ===========================================================
 function openLightbox(src, caption) {
