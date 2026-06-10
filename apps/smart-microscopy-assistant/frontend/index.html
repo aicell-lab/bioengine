@@ -394,13 +394,28 @@
     opacity: 0;
     transition: opacity 220ms var(--ease-out),
                 transform 220ms var(--ease-out);
-    max-width: calc(100% - 4rem);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    /* Tile padding minus a sliver so the badge never bleeds past the rounded
+       corners. The X is hover-only and the badge fades out on hover, so we
+       no longer need to reserve a giant 4-rem gutter for it. */
+    max-width: calc(100% - 0.6rem);
   }
   .tile-badge.shown {
     opacity: 1; transform: translateX(-50%) scale(1);
   }
-  .tile-badge .dot { width: 0.4rem; height: 0.4rem; border-radius: 50%; }
+  .tile-badge .dot {
+    width: 0.4rem; height: 0.4rem; border-radius: 50%;
+    flex: 0 0 auto;
+  }
+  /* The label sits in its own span so text-overflow: ellipsis actually
+     applies (it cannot truncate a raw text node directly inside a flex
+     container). min-width: 0 lets the span shrink below its intrinsic
+     content width when the tile is too narrow. */
+  .tile-badge .badge-text {
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .tile-badge.passed   { color: var(--pass);   background: rgba(34,197,94,0.85);  border-color: rgba(34,197,94,0.6); color: #052e16; }
   .tile-badge.passed .dot   { background: #052e16; }
   .tile-badge.failed   { color: #450a0a; background: rgba(239,68,68,0.85); border-color: rgba(239,68,68,0.6); }
@@ -1726,7 +1741,10 @@ function applyBadge(node, tile) {
   const dot = document.createElement("span");
   dot.className = "dot";
   badge.appendChild(dot);
-  badge.appendChild(document.createTextNode(text));
+  const label = document.createElement("span");
+  label.className = "badge-text";
+  label.textContent = text;
+  badge.appendChild(label);
   // Force reflow then add .shown so the @starting-style-like transition fires.
   void badge.offsetWidth;
   badge.classList.add("shown");
