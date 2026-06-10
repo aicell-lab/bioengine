@@ -339,54 +339,29 @@ class AppBuilder:
         uploaded before the function returns the cached URI without
         re-uploading.
 
-        Ray reshapes the signatures of the two helpers between versions
-        — e.g. Ray 2.55 added a required ``include_gitignore`` parameter
-        to ``get_uri_for_directory`` and made ``include_parent_dir``
-        keyword-only on ``upload_package_if_needed``. We probe the
-        installed function signatures and only pass kwargs Ray actually
-        accepts so the same builder works against Ray 2.33 (the floor
-        in ``pyproject.toml``) and Ray 2.55+ (the shipping worker image).
-        ``include_gitignore=False`` matches the pre-2.55 behaviour
-        (apply only explicit ``excludes``).
+        ``include_gitignore=False`` means Ray applies only our explicit
+        ``excludes``; ``include_parent_dir=False`` keeps the artifact root
+        at the top of the zip so a plain ``import deployment`` succeeds
+        inside the task.
         """
-        import inspect
-
         from ray._private.runtime_env.packaging import (
             get_uri_for_directory,
             upload_package_if_needed,
         )
 
-        # ``include_parent_dir=False`` so the zip's top level holds the
-        # artifact-root contents directly. Ray's py_modules extraction
-        # then puts that path on ``sys.path`` so a plain
-        # ``import deployment`` succeeds inside the task.
-        def _filter_kwargs(func, candidates):
-            sig = inspect.signature(func)
-            return {k: v for k, v in candidates.items() if k in sig.parameters}
-
         pkg_uri = get_uri_for_directory(
             str(pkg_root_dir),
-            **_filter_kwargs(
-                get_uri_for_directory,
-                {
-                    "excludes": self._PY_MODULES_EXCLUDES,
-                    "include_gitignore": False,
-                },
-            ),
+            include_gitignore=False,
+            excludes=self._PY_MODULES_EXCLUDES,
         )
         upload_package_if_needed(
             pkg_uri,
             base_directory=str(pkg_root_dir.parent),
-            directory=str(pkg_root_dir),
-            **_filter_kwargs(
-                upload_package_if_needed,
-                {
-                    "include_parent_dir": False,
-                    "excludes": self._PY_MODULES_EXCLUDES,
-                    "include_gitignore": False,
-                    "logger": self.logger,
-                },
-            ),
+            module_path=str(pkg_root_dir),
+            include_gitignore=False,
+            include_parent_dir=False,
+            excludes=self._PY_MODULES_EXCLUDES,
+            logger=self.logger,
         )
         return pkg_uri
 
