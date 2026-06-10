@@ -309,6 +309,7 @@ def build_and_run_application(
     application_id: str,
     route_prefix: str,
     pkg_uri: str,
+    proxy_memory_in_gb: float,
 ) -> Dict[str, Any]:
     """Assemble the Ray Serve bind graph AND call ``serve.run`` in-process.
 
@@ -323,6 +324,11 @@ def build_and_run_application(
     this, cloudpickle on the replica fails with ``ModuleNotFoundError``
     for deployments whose own ``pip=`` forced a fresh venv that didn't
     inherit ``py_modules`` from the calling task.
+
+    ``proxy_memory_in_gb`` overrides ``ProxyDeployment.ray_actor_options
+    .memory`` so the scheduler is biased toward a node with at least
+    that much free memory for the WebSocket/WebRTC bridge. Ray treats
+    ``memory`` as a placement hint, not a runtime cap.
     """
     from ray import serve
 
@@ -353,7 +359,17 @@ def build_and_run_application(
         return handles[cid]
 
     entry_handle = bind(spec["entry_id"])
-    app = ProxyDeployment.bind(
+
+    # Override the proxy's ray_actor_options.memory at deployment time.
+    # The default 0 reservation lets Ray place the proxy on any node,
+    # including resource-tight ones (e.g. the head). A real reservation
+    # biases scheduling toward nodes with headroom for the
+    # WebSocket/WebRTC payloads the proxy terminates.
+    proxy_actor_options = dict(ProxyDeployment.ray_actor_options or {})
+    proxy_actor_options["memory"] = int(proxy_memory_in_gb * (1024**3))
+    proxy_cls = ProxyDeployment.options(ray_actor_options=proxy_actor_options)
+
+    app = proxy_cls.bind(
         entry_deployment_handle=entry_handle,
         method_schemas=spec["classes"][spec["entry_id"]]["method_schemas"],
         **proxy_args,
