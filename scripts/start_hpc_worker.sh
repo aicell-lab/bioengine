@@ -131,6 +131,34 @@ take_flag() {
     BIOENGINE_WORKER_ARGS=("${cleaned[@]}")
 }
 
+# Same pattern as take_flag but for value-bearing launcher-only flags
+# ("--tag value" or "--tag=value"). Writes the value into TAKE_VALUE_RESULT
+# (defaulting to $2) and strips the flag + its value from BIOENGINE_WORKER_ARGS
+# so the Python worker never receives them.
+take_value() {
+    local tag="$1"
+    local default="$2"
+    TAKE_VALUE_RESULT="$default"
+    local cleaned=()
+    local i=0
+    local n=${#BIOENGINE_WORKER_ARGS[@]}
+    while [ $i -lt $n ]; do
+        local arg="${BIOENGINE_WORKER_ARGS[i]}"
+        if [[ "$arg" == "$tag" ]] && [ $((i+1)) -lt $n ]; then
+            TAKE_VALUE_RESULT="${BIOENGINE_WORKER_ARGS[i+1]}"
+            i=$((i+2))
+            continue
+        elif [[ "$arg" == "$tag="* ]]; then
+            TAKE_VALUE_RESULT="${arg#*=}"
+            i=$((i+1))
+            continue
+        fi
+        cleaned+=("$arg")
+        i=$((i+1))
+    done
+    BIOENGINE_WORKER_ARGS=("${cleaned[@]}")
+}
+
 # Function to define bind mounts
 BIND_OPTS=()
 add_bind() {
@@ -176,9 +204,16 @@ set_arg_value "--mode" "$MODE"
 WORKSPACE_DIR=$(get_arg_value "--workspace-dir" "${HOME}/.bioengine")
 WORKSPACE_DIR=$(realpath $WORKSPACE_DIR)
 
-IMAGE_CACHEDIR=$(get_arg_value "--apptainer-cachedir")
+# Launcher-only: --apptainer-cachedir / --singularity-cachedir control
+# where the image is cached/built. They must be stripped before the args
+# are forwarded to python -m bioengine.worker, which does not know them.
+take_value "--apptainer-cachedir" ""
+IMAGE_CACHEDIR="$TAKE_VALUE_RESULT"
 if [[ -z "$IMAGE_CACHEDIR" ]]; then
-    IMAGE_CACHEDIR=$(get_arg_value "--singularity-cachedir" "$WORKSPACE_DIR/images")
+    take_value "--singularity-cachedir" "$WORKSPACE_DIR/images"
+    IMAGE_CACHEDIR="$TAKE_VALUE_RESULT"
+else
+    take_value "--singularity-cachedir" ""   # strip even if unused
 fi
 IMAGE_CACHEDIR=$(realpath $IMAGE_CACHEDIR)
 mkdir -p $IMAGE_CACHEDIR

@@ -1,0 +1,2369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Smart Microscopy Assistant</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+  :root {
+    --bg-0: #0b1220;
+    --bg-1: #111a2d;
+    --bg-2: #18223a;
+    --bg-3: #1f2c4a;
+    --border: #2a3a5e;
+    --border-strong: #3a4d75;
+    --fg: #e6edf7;
+    --fg-dim: #9aa9c2;
+    --fg-muted: #6b7a99;
+    --accent: #38bdf8;
+    --accent-strong: #0ea5e9;
+    --accent-deep: #0284c7;
+    --pass: #22c55e;
+    --fail: #ef4444;
+    --unsure: #f59e0b;
+    --pass-bg: rgba(34, 197, 94, 0.13);
+    --fail-bg: rgba(239, 68, 68, 0.13);
+    --unsure-bg: rgba(245, 158, 11, 0.13);
+
+    /* Emil's strong easing curves */
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  }
+  body {
+    font-family: -apple-system, "Inter", system-ui, "Segoe UI", sans-serif;
+    background:
+      radial-gradient(1200px 600px at 80% -200px, rgba(14, 165, 233, 0.10), transparent 70%),
+      radial-gradient(900px 500px at -10% 110%, rgba(34, 197, 94, 0.06), transparent 70%),
+      var(--bg-0);
+    color: var(--fg);
+    min-height: 100vh;
+    padding: 5rem 1rem 4rem;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  /* --- Top bar ----------------------------------------------------------- */
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.75rem 1.25rem;
+    background: rgba(11, 18, 32, 0.85);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  #topbar .brand {
+    display: flex; align-items: center; gap: 0.55rem;
+    font-weight: 700; font-size: 0.95rem; color: var(--fg);
+  }
+  #topbar .brand .logo {
+    width: 1.7rem; height: 1.7rem; border-radius: 0.45rem;
+    background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.95rem;
+  }
+  #topbar .actions { display: flex; align-items: center; gap: 0.6rem; }
+  .topbar-btn {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    background: var(--bg-2); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 0.5rem;
+    padding: 0.4rem 0.85rem;
+    font: inherit; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+    transition: background 0.12s var(--ease-out),
+                border-color 0.12s var(--ease-out),
+                transform 0.12s var(--ease-out);
+  }
+  .topbar-btn:hover { background: var(--bg-3); border-color: var(--border-strong); }
+  .topbar-btn:active { transform: scale(0.97); }
+  .topbar-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .topbar-btn svg { width: 1.05rem; height: 1.05rem; flex-shrink: 0; }
+  .topbar-iconbtn {
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: 999px; width: 2.15rem; height: 2.15rem;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; padding: 0; color: var(--fg-dim);
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                transform 0.12s var(--ease-out);
+  }
+  .topbar-iconbtn:hover { background: var(--bg-3); color: var(--fg); }
+  .topbar-iconbtn:active { transform: scale(0.95); }
+  .topbar-iconbtn svg { width: 1.25rem; height: 1.25rem; }
+  #userWrap, #infoWrap { position: relative; }
+  .popover {
+    position: absolute; top: 2.5rem; right: 0; min-width: 17rem;
+    background: var(--bg-2); border: 1px solid var(--border-strong);
+    border-radius: 0.6rem; padding: 0.35rem 0;
+    box-shadow: 0 16px 40px rgba(0,0,0,.55);
+    opacity: 1; transform: translateY(0) scale(1);
+    transform-origin: top right;
+    transition: opacity 160ms var(--ease-out),
+                transform 160ms var(--ease-out);
+  }
+  @starting-style {
+    .popover { opacity: 0; transform: translateY(-4px) scale(0.97); }
+  }
+  .popover .item {
+    display: block; padding: 0.55rem 0.9rem; color: var(--fg);
+    font-size: 0.85rem; background: none; border: 0; width: 100%;
+    text-align: left; cursor: pointer;
+    transition: background 0.12s var(--ease-out);
+  }
+  .popover .item:hover { background: var(--bg-3); }
+  .popover .info-row {
+    padding: 0.45rem 0.9rem; border-bottom: 1px solid var(--border);
+    font-size: 0.78rem; color: var(--fg-dim); word-break: break-all;
+  }
+  .popover .info-row:last-child { border-bottom: 0; }
+  .popover .info-row strong { color: var(--fg); font-weight: 600; }
+  #infoPopover { min-width: 21rem; padding: 0.6rem 0; }
+  #infoPopover .row {
+    display: flex; justify-content: space-between; gap: 0.75rem;
+    padding: 0.4rem 0.95rem; font-size: 0.8rem;
+  }
+  #infoPopover .row .k { color: var(--fg-dim); }
+  #infoPopover .row .v { color: var(--fg); font-weight: 500; text-align: right; }
+  #infoPopover .heading {
+    padding: 0.35rem 0.95rem 0.55rem; font-size: 0.72rem;
+    color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.07em;
+    border-bottom: 1px solid var(--border); margin-bottom: 0.35rem;
+  }
+
+  /* --- Header ----------------------------------------------------------- */
+  header.page { text-align: center; margin-bottom: 1.5rem; }
+  header.page h1 {
+    font-size: 1.9rem; font-weight: 700; color: var(--fg);
+    letter-spacing: -0.01em;
+  }
+  header.page h1 .accent {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 80%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  header.page p { color: var(--fg-dim); margin-top: 0.35rem; font-size: 0.9rem; }
+
+  /* --- Mode toggle (segmented) ----------------------------------------- */
+  .mode-toggle-wrap { display: flex; justify-content: center; margin-bottom: 1.5rem; }
+  .mode-toggle {
+    display: inline-flex; background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: 0.7rem; padding: 0.3rem; gap: 0.25rem;
+  }
+  .mode-toggle .seg {
+    background: transparent; color: var(--fg-dim); border: 0;
+    padding: 0.55rem 1.4rem; cursor: pointer; font: inherit;
+    font-size: 0.88rem; font-weight: 600; border-radius: 0.5rem;
+    display: inline-flex; align-items: center; gap: 0.45rem;
+    transition: color 0.14s var(--ease-out),
+                background 0.14s var(--ease-out);
+  }
+  .mode-toggle .seg:hover { color: var(--fg); }
+  .mode-toggle .seg:active { transform: scale(0.97); }
+  .mode-toggle .seg.active {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+    color: #fff; box-shadow: 0 6px 16px rgba(14,165,233,0.25);
+  }
+
+  /* --- Cards ---------------------------------------------------------- */
+  .card {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 0.9rem; padding: 1.25rem 1.4rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 4px 14px rgba(0,0,0,0.18);
+  }
+  .card h2 {
+    font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.09em;
+    color: var(--fg-muted); margin-bottom: 0.85rem; font-weight: 700;
+    display: flex; align-items: center; gap: 0.45rem;
+  }
+  .card h2 .h-icon { font-size: 1rem; }
+  .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+
+  /* --- Buttons -------------------------------------------------------- */
+  .btn {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+    color: #fff; border: none; border-radius: 0.55rem;
+    padding: 0.6rem 1.2rem; cursor: pointer;
+    font-size: 0.9rem; font-weight: 600;
+    transition: filter 0.14s var(--ease-out),
+                transform 0.14s var(--ease-out);
+    display: inline-flex; align-items: center; gap: 0.45rem;
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled {
+    background: var(--bg-3); color: var(--fg-muted); cursor: not-allowed;
+    filter: none; transform: none;
+  }
+  .btn-primary-lg { padding: 0.7rem 1.6rem; font-size: 0.95rem; }
+  .btn-sm { padding: 0.35rem 0.7rem; font-size: 0.78rem; }
+  .btn-ghost {
+    background: transparent; color: var(--fg-dim);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover { background: var(--bg-2); color: var(--fg); }
+  .status {
+    display: inline-flex; align-items: center; gap: 0.45rem;
+    font-size: 0.85rem; color: var(--fg-dim);
+  }
+  .status-dot {
+    display: inline-block; width: 0.55rem; height: 0.55rem;
+    border-radius: 50%; background: var(--fg-muted);
+    transition: background 0.16s var(--ease-out),
+                box-shadow 0.16s var(--ease-out);
+  }
+  .status-dot.ok    { background: var(--pass); box-shadow: 0 0 0 3px rgba(34,197,94,0.18); }
+  .status-dot.busy  { background: var(--unsure); box-shadow: 0 0 0 3px rgba(245,158,11,0.18); animation: pulse 1.2s ease-in-out infinite; }
+  .status-dot.error { background: var(--fail); box-shadow: 0 0 0 3px rgba(239,68,68,0.18); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+  /* --- Form widgets --------------------------------------------------- */
+  .small { font-size: 0.8rem; color: var(--fg-dim); }
+  .field-label { font-size: 0.78rem; color: var(--fg-dim); margin-bottom: 0.35rem; display: block; }
+  input[type=text], textarea, select {
+    width: 100%; background: var(--bg-0); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 0.5rem;
+    padding: 0.55rem 0.65rem; font-family: inherit;
+    font-size: 0.88rem; outline: none;
+    transition: border-color 0.14s var(--ease-out),
+                box-shadow 0.14s var(--ease-out);
+  }
+  textarea { min-height: 5rem; resize: vertical; }
+  input[type=text]:focus, textarea:focus, select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
+  }
+  .radio-row { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem;
+               font-size: 0.85rem; flex-wrap: wrap; }
+  .radio-row label { display: inline-flex; align-items: center; gap: 0.35rem; cursor: pointer; color: var(--fg); }
+  .counter { font-variant-numeric: tabular-nums; }
+  .counter.over { color: var(--fail); font-weight: 700; }
+  .field-help {
+    margin-top: 0.4rem; display: flex; justify-content: space-between;
+    font-size: 0.75rem; color: var(--fg-muted);
+  }
+
+  /* --- Image canvas (click-to-select + paste/double-click) ----------- */
+  .image-canvas {
+    position: relative;
+    background: var(--bg-0);
+    border: 1.5px dashed var(--border-strong);
+    border-radius: 0.7rem;
+    padding: 1rem;
+    min-height: 9rem;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.18s var(--ease-out),
+                box-shadow 0.18s var(--ease-out),
+                background 0.18s var(--ease-out);
+  }
+  .image-canvas:hover {
+    border-color: var(--border-strong);
+    background: rgba(15, 23, 41, 0.6);
+  }
+  .image-canvas.selected {
+    border-color: var(--accent);
+    border-style: solid;
+    background: rgba(14, 165, 233, 0.05);
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18),
+                0 12px 28px rgba(14, 165, 233, 0.10);
+  }
+  .image-canvas.drag {
+    border-color: var(--accent);
+    background: rgba(14, 165, 233, 0.10);
+  }
+  .image-canvas.locked {
+    opacity: 0.85; pointer-events: none; cursor: not-allowed;
+  }
+  .canvas-label {
+    font-size: 0.78rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--fg-dim);
+    display: flex; align-items: center; gap: 0.45rem;
+    margin-bottom: 0.65rem;
+  }
+  .canvas-label.pass { color: var(--pass); }
+  .canvas-label.fail { color: var(--fail); }
+  .canvas-hint {
+    color: var(--fg-muted); font-size: 0.82rem; text-align: center;
+    padding: 1.25rem 0.5rem;
+  }
+  .canvas-hint .hint-primary { color: var(--fg); font-weight: 600; }
+  .canvas-hint .kbd {
+    display: inline-block; padding: 0.05rem 0.4rem;
+    background: var(--bg-2); border: 1px solid var(--border-strong);
+    border-radius: 0.3rem; font-family: ui-monospace, monospace;
+    font-size: 0.72rem; color: var(--fg); margin: 0 0.15rem;
+  }
+  .image-canvas.selected .canvas-hint .hint-primary { color: var(--accent); }
+  .dual-canvas { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }
+  @media (max-width: 640px) {
+    .dual-canvas { grid-template-columns: 1fr; }
+  }
+
+  /* --- Image grid + tiles ----------------------------------------------- */
+  .image-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+    gap: 0.55rem;
+    position: relative;
+  }
+  .image-grid:empty { display: none; }
+  .image-tile {
+    position: relative;
+    aspect-ratio: 1 / 1;
+    border: 1px solid var(--border);
+    border-radius: 0.55rem;
+    overflow: hidden;
+    background: var(--bg-1);
+    transition: border-color 0.16s var(--ease-out),
+                transform 0.16s var(--ease-out);
+  }
+  .image-tile.zoomable { cursor: zoom-in; }
+  .image-tile img {
+    width: 100%; height: 100%; object-fit: cover;
+    display: block;
+  }
+  .image-tile .tile-x {
+    position: absolute; top: 0.3rem; right: 0.3rem;
+    width: 1.55rem; height: 1.55rem; border-radius: 999px;
+    background: rgba(11, 18, 32, 0.92); color: #fca5a5;
+    border: 1px solid var(--border-strong);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.95rem; line-height: 1; cursor: pointer; padding: 0;
+    z-index: 3;
+    opacity: 0; pointer-events: none;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                transform 0.12s var(--ease-out),
+                opacity 140ms var(--ease-out);
+  }
+  /* Touch devices have no hover — keep X visible there so users can still
+     remove tiles by tapping. */
+  @media (hover: hover) and (pointer: fine) {
+    .image-tile:hover .tile-x { opacity: 1; pointer-events: auto; }
+    .image-tile:focus-within .tile-x { opacity: 1; pointer-events: auto; }
+    /* Hide the badge while the user is hovering — X + badge fighting for
+       the top of the tile is visually noisy and the user is already
+       looking at the image at hover-time. */
+    .image-tile:hover .tile-badge.shown { opacity: 0; }
+  }
+  @media not all and (hover: hover) {
+    .image-tile .tile-x { opacity: 1; pointer-events: auto; }
+  }
+  .image-tile .tile-x:hover { background: #450a0a; color: #fca5a5; border-color: var(--fail); }
+  .image-tile .tile-x:active { transform: scale(0.93); }
+
+  /* Cloud-upload indicator (local-only, pre-upload) */
+  .image-tile .cloud-icon {
+    position: absolute; top: 0.3rem; right: 2rem;
+    width: 1.55rem; height: 1.55rem; border-radius: 999px;
+    background: rgba(11, 18, 32, 0.92);
+    border: 1px solid var(--border-strong);
+    color: var(--fg-dim);
+    display: inline-flex; align-items: center; justify-content: center;
+    z-index: 3;
+    transition: opacity 0.18s var(--ease-out),
+                transform 0.18s var(--ease-out);
+  }
+  .image-tile .cloud-icon svg { width: 0.9rem; height: 0.9rem; }
+  .image-tile[data-state="local"] .cloud-icon { opacity: 1; transform: scale(1); }
+  .image-tile[data-state="uploading"] .cloud-icon {
+    opacity: 1; color: var(--accent);
+  }
+  .image-tile[data-state="uploading"] .cloud-icon svg { animation: cloudPulse 1.4s ease-in-out infinite; }
+  @keyframes cloudPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .image-tile[data-state="uploaded"] .cloud-icon,
+  .image-tile[data-state="analyzing"] .cloud-icon,
+  .image-tile[data-state="done"] .cloud-icon,
+  .image-tile[data-state="error"] .cloud-icon {
+    opacity: 0; transform: scale(0.85);
+    pointer-events: none;
+  }
+
+  /* Verdict badge (top center, over the image) */
+  .tile-badge {
+    position: absolute; top: 0.4rem; left: 50%;
+    transform: translateX(-50%) scale(0.95);
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    padding: 0.22rem 0.6rem; border-radius: 999px;
+    font-size: 0.7rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.045em; border: 1px solid;
+    backdrop-filter: blur(6px);
+    z-index: 2;
+    opacity: 0;
+    transition: opacity 220ms var(--ease-out),
+                transform 220ms var(--ease-out);
+    max-width: calc(100% - 4rem);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tile-badge.shown {
+    opacity: 1; transform: translateX(-50%) scale(1);
+  }
+  .tile-badge .dot { width: 0.4rem; height: 0.4rem; border-radius: 50%; }
+  .tile-badge.passed   { color: var(--pass);   background: rgba(34,197,94,0.85);  border-color: rgba(34,197,94,0.6); color: #052e16; }
+  .tile-badge.passed .dot   { background: #052e16; }
+  .tile-badge.failed   { color: #450a0a; background: rgba(239,68,68,0.85); border-color: rgba(239,68,68,0.6); }
+  .tile-badge.failed .dot   { background: #450a0a; }
+  .tile-badge.unsure   { color: #422006; background: rgba(245,158,11,0.85); border-color: rgba(245,158,11,0.6); }
+  .tile-badge.unsure .dot   { background: #422006; }
+  .tile-badge.analyzed { color: var(--fg); background: rgba(56,189,248,0.85); border-color: rgba(56,189,248,0.6); color: #082f49; }
+  .tile-badge.analyzed .dot { background: #082f49; }
+  .tile-badge.error    { color: #450a0a; background: rgba(239,68,68,0.85); border-color: rgba(239,68,68,0.6); }
+  .tile-badge.error .dot    { background: #450a0a; }
+
+  /* Tile state overlay for analyzing */
+  .tile-overlay {
+    position: absolute; inset: 0;
+    background: rgba(11, 18, 32, 0.55);
+    backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 200ms var(--ease-out);
+    pointer-events: none;
+  }
+  .image-tile[data-state="analyzing"] .tile-overlay { opacity: 1; }
+  .tile-overlay-spinner {
+    width: 1.7rem; height: 1.7rem; border-radius: 50%;
+    border: 2.5px solid rgba(56, 189, 248, 0.25);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Details toggle and expanded panel */
+  .tile-details-toggle {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    background: rgba(11, 18, 32, 0.85);
+    color: var(--fg); border: 0; border-top: 1px solid var(--border-strong);
+    padding: 0.35rem 0.6rem; font: inherit; font-size: 0.72rem;
+    font-weight: 600; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 0.3rem;
+    z-index: 3;
+    transition: background 0.12s var(--ease-out);
+    opacity: 0;
+    transition: opacity 200ms var(--ease-out),
+                background 0.12s var(--ease-out);
+  }
+  .image-tile[data-state="done"] .tile-details-toggle,
+  .image-tile[data-state="error"] .tile-details-toggle { opacity: 1; }
+  .tile-details-toggle:hover { background: rgba(15, 23, 41, 0.95); }
+  .tile-details-toggle .chev {
+    display: inline-block; transition: transform 180ms var(--ease-out);
+  }
+  .image-tile.expanded .tile-details-toggle .chev { transform: rotate(180deg); }
+  .image-tile.expanded { border-color: var(--accent); }
+
+  /* Floating details panel positioned via JS to overlay the next row */
+  .grid-details-panel {
+    position: absolute; left: 0; right: 0;
+    background: var(--bg-2);
+    border: 1px solid var(--border-strong);
+    border-radius: 0.6rem;
+    padding: 0.85rem 1rem;
+    box-shadow: 0 18px 36px rgba(0, 0, 0, 0.45);
+    z-index: 10;
+    opacity: 0; transform: translateY(-4px);
+    transition: opacity 200ms var(--ease-out),
+                transform 200ms var(--ease-out);
+    pointer-events: none;
+    color: var(--fg-dim); font-size: 0.82rem;
+  }
+  .grid-details-panel.shown {
+    opacity: 1; transform: translateY(0); pointer-events: auto;
+  }
+  .grid-details-panel .panel-head {
+    display: flex; align-items: center; gap: 0.55rem;
+    margin-bottom: 0.55rem;
+    font-size: 0.84rem; color: var(--fg);
+  }
+  .grid-details-panel .panel-name {
+    font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    flex: 1; min-width: 0;
+  }
+  .grid-details-panel .panel-close {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--fg-dim); border-radius: 0.4rem;
+    width: 1.6rem; height: 1.6rem; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: background 0.12s var(--ease-out), color 0.12s var(--ease-out);
+  }
+  .grid-details-panel .panel-close:hover { background: var(--bg-3); color: var(--fg); }
+  .grid-details-panel .panel-close svg { width: 0.9rem; height: 0.9rem; }
+  .grid-details-panel .panel-reason {
+    color: var(--fg); margin-bottom: 0.6rem;
+    line-height: 1.45;
+    max-height: 8rem; overflow-y: auto;
+  }
+  .grid-details-panel .pill-row {
+    display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.45rem;
+  }
+  .grid-details-panel .meta-pill {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    padding: 0.18rem 0.5rem; border-radius: 0.4rem;
+    background: var(--bg-0); border: 1px solid var(--border);
+    color: var(--fg-dim); font-size: 0.68rem;
+  }
+  .grid-details-panel .meta-pill strong {
+    color: var(--fg); font-weight: 600; font-size: 0.7rem;
+  }
+  .grid-details-panel .raw {
+    background: var(--bg-0); border-radius: 0.4rem; padding: 0.55rem 0.7rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem;
+    color: var(--fg-dim); white-space: pre-wrap; word-break: break-word;
+    max-height: 12rem; overflow-y: auto;
+    border: 1px solid var(--border);
+    margin-top: 0.45rem;
+  }
+
+  /* --- Visual-test metadata bar (Analyze) ----------------------------- */
+  .test-meta {
+    font-size: 0.82rem; color: var(--fg-dim); margin-top: 0.65rem;
+    padding: 0.65rem 0.8rem; background: var(--bg-0);
+    border: 1px solid var(--border); border-radius: 0.55rem;
+  }
+  .test-meta strong { color: var(--fg); }
+
+  /* --- Visual-tests list (in the Tests tab) --------------------------- */
+  .test-list {
+    display: flex; flex-direction: column; gap: 0.5rem;
+  }
+  .test-list-empty {
+    color: var(--fg-muted); font-size: 0.85rem; text-align: center;
+    padding: 1rem 0;
+  }
+  .test-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.85rem;
+    align-items: center;
+    padding: 0.65rem 0.85rem;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 0.6rem;
+    transition: border-color 0.12s var(--ease-out),
+                background 0.12s var(--ease-out);
+  }
+  .test-row:hover { border-color: var(--border-strong); }
+  .test-row-main { min-width: 0; }
+  .test-row-name {
+    font-size: 0.92rem; font-weight: 600; color: var(--fg);
+    display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
+    margin-bottom: 0.25rem;
+  }
+  .test-row-criterion {
+    font-size: 0.78rem; color: var(--fg-dim);
+    line-height: 1.4;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .test-row-criterion .label-pass { color: var(--pass); font-weight: 600; }
+  .test-row-criterion .label-fail { color: var(--fail); font-weight: 600; }
+  .test-row-meta {
+    font-size: 0.72rem; color: var(--fg-muted); margin-top: 0.25rem;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.25rem;
+    padding: 0.1rem 0.45rem; border-radius: 999px;
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.04em; border: 1px solid;
+  }
+  .chip.chip-public  { color: var(--accent); background: rgba(56,189,248,0.10); border-color: rgba(56,189,248,0.35); }
+  .chip.chip-private { color: var(--fg-dim); background: var(--bg-2); border-color: var(--border-strong); }
+  .chip.chip-yours   { color: #fbbf24; background: rgba(251,191,36,0.10); border-color: rgba(251,191,36,0.35); }
+  .test-row-delete {
+    background: transparent; color: var(--fg-dim);
+    border: 1px solid var(--border); border-radius: 0.45rem;
+    padding: 0.3rem 0.65rem; font: inherit; font-size: 0.78rem;
+    font-weight: 600; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                border-color 0.12s var(--ease-out),
+                transform 0.12s var(--ease-out);
+  }
+  .test-row-delete:hover {
+    background: rgba(239,68,68,0.10); color: var(--fail);
+    border-color: rgba(239,68,68,0.4);
+  }
+  .test-row-delete:active { transform: scale(0.96); }
+  .test-row-delete:disabled {
+    opacity: 0.4; cursor: not-allowed; transform: none;
+  }
+  .test-row-delete svg { width: 0.85rem; height: 0.85rem; }
+
+  /* --- Public/private toggle in the new-test form --------------------- */
+  .visibility-toggle {
+    display: inline-flex; gap: 0.35rem;
+    background: var(--bg-0); border: 1px solid var(--border);
+    border-radius: 0.55rem; padding: 0.25rem;
+  }
+  .visibility-toggle button {
+    background: transparent; color: var(--fg-dim); border: 0;
+    padding: 0.4rem 0.85rem; cursor: pointer; font: inherit;
+    font-size: 0.82rem; font-weight: 600; border-radius: 0.4rem;
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out);
+  }
+  .visibility-toggle button:hover { color: var(--fg); }
+  .visibility-toggle button:active { transform: scale(0.97); }
+  .visibility-toggle button.active {
+    background: var(--bg-3); color: var(--fg);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .visibility-toggle button svg { width: 0.95rem; height: 0.95rem; }
+
+  /* --- Pass / Fail criterion textareas -------------------------------- */
+  .criterion-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;
+  }
+  @media (max-width: 640px) {
+    .criterion-grid { grid-template-columns: 1fr; }
+  }
+  .criterion-block {
+    /* Only the header carries the pass/fail color cue; the textarea stays
+       on the standard input background so the form feels uniform. */
+    display: flex; flex-direction: column; gap: 0.35rem;
+  }
+  .criterion-block .criterion-label {
+    font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em;
+    display: flex; align-items: center; gap: 0.4rem;
+  }
+  .criterion-block.pass .criterion-label { color: var(--pass); }
+  .criterion-block.fail .criterion-label { color: var(--fail); }
+  .criterion-block textarea {
+    min-height: 4.5rem; font-size: 0.85rem;
+  }
+  .criterion-block .criterion-help {
+    margin-top: 0.05rem; font-size: 0.7rem; color: var(--fg-muted);
+    display: flex; justify-content: space-between;
+  }
+
+  /* Define-mode tiles: hide the cloud-upload icon entirely. The icon's
+     point is to signal "not yet uploaded to the worker", which only
+     applies to the Analyze pipeline. */
+  #positiveGrid .image-tile .cloud-icon,
+  #negativeGrid .image-tile .cloud-icon { display: none; }
+
+  /* --- Sub-section headers inside a single card --------------------- */
+  .subsection { margin-top: 1.1rem; }
+  .subsection:first-child { margin-top: 0; }
+  .subsection-label {
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.09em;
+    color: var(--fg-muted); margin-bottom: 0.5rem; font-weight: 700;
+    display: flex; align-items: center; gap: 0.45rem;
+  }
+  .subsection-label .step {
+    width: 1.25rem; height: 1.25rem; border-radius: 999px;
+    background: var(--bg-3); color: var(--fg-dim);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.7rem; font-weight: 700;
+  }
+
+  /* --- Confirm dialog ---------------------------------------------- */
+  .dialog-backdrop {
+    position: fixed; inset: 0; z-index: 110;
+    background: rgba(2, 6, 16, 0.78);
+    backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 2rem 1.25rem;
+    opacity: 1;
+    transition: opacity 160ms var(--ease-out);
+  }
+  @starting-style {
+    .dialog-backdrop { opacity: 0; }
+  }
+  .dialog {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 0.85rem;
+    box-shadow: 0 22px 50px rgba(0, 0, 0, 0.55);
+    width: 100%; max-width: 26rem;
+    padding: 1.4rem 1.4rem 1.2rem;
+    transform: translateY(0) scale(1);
+    transition: opacity 180ms var(--ease-out),
+                transform 180ms var(--ease-out);
+  }
+  @starting-style {
+    .dialog { opacity: 0; transform: translateY(-6px) scale(0.97); }
+  }
+  .dialog .dialog-title {
+    font-size: 1.02rem; font-weight: 700; color: var(--fg);
+    margin-bottom: 0.5rem;
+    display: flex; align-items: center; gap: 0.55rem;
+  }
+  .dialog .dialog-icon {
+    width: 1.85rem; height: 1.85rem; border-radius: 999px;
+    background: rgba(239,68,68,0.13); color: var(--fail);
+    display: inline-flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .dialog .dialog-icon svg { width: 1.05rem; height: 1.05rem; }
+  .dialog .dialog-message {
+    color: var(--fg-dim); font-size: 0.88rem; line-height: 1.5;
+    margin-bottom: 1.1rem;
+  }
+  .dialog .dialog-message strong { color: var(--fg); font-weight: 600; }
+  .dialog .dialog-actions {
+    display: flex; justify-content: flex-end; gap: 0.55rem;
+  }
+  .dialog .dialog-btn {
+    font: inherit; font-size: 0.86rem; font-weight: 600;
+    padding: 0.5rem 1rem; border-radius: 0.5rem;
+    cursor: pointer; border: 1px solid transparent;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                border-color 0.12s var(--ease-out),
+                transform 0.1s var(--ease-out);
+  }
+  .dialog .dialog-btn:active { transform: scale(0.97); }
+  .dialog .dialog-btn.cancel {
+    background: transparent; color: var(--fg-dim); border-color: var(--border-strong);
+  }
+  .dialog .dialog-btn.cancel:hover { background: var(--bg-3); color: var(--fg); }
+  .dialog .dialog-btn.danger {
+    background: var(--fail); color: #450a0a; border-color: var(--fail);
+  }
+  .dialog .dialog-btn.danger:hover { filter: brightness(1.08); }
+
+  /* --- Define mode submit result block --------------------------------- */
+  .create-result {
+    background: var(--bg-0); border-radius: 0.55rem; padding: 0.8rem 0.95rem;
+    font-size: 0.85rem; color: var(--fg); white-space: pre-wrap; word-break: break-word;
+    min-height: 2rem; border: 1px solid var(--border);
+  }
+
+  /* --- Run summary row ------------------------------------------------ */
+  .run-summary {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 0.5rem; margin-top: 0.85rem;
+  }
+
+  /* --- Log (collapsed by default) ------------------------------------- */
+  .log-details {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 0.6rem; margin-top: 1rem;
+  }
+  .log-details summary {
+    list-style: none; cursor: pointer; padding: 0.65rem 1rem;
+    font-size: 0.82rem; color: var(--fg-dim); font-weight: 600;
+    display: flex; align-items: center; gap: 0.45rem;
+    transition: color 0.12s var(--ease-out);
+  }
+  .log-details summary:hover { color: var(--fg); }
+  .log-details summary::-webkit-details-marker { display: none; }
+  .log-details summary::before {
+    content: "▸"; color: var(--fg-muted);
+    transition: transform 0.18s var(--ease-out);
+    font-size: 0.7rem;
+  }
+  .log-details[open] summary::before { transform: rotate(90deg); }
+  .log-body {
+    background: var(--bg-0);
+    padding: 0.55rem 1rem; border-top: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem;
+    color: var(--fg-dim); max-height: 18rem; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+    border-radius: 0 0 0.6rem 0.6rem;
+  }
+  .log-body .ts { color: var(--fg-muted); }
+  .log-body .err { color: #fca5a5; }
+  .log-body .ok { color: #86efac; }
+
+  /* --- Auth gate ------------------------------------------------------- */
+  .auth-gate {
+    background:
+      radial-gradient(800px 300px at 50% -50px, rgba(14, 165, 233, 0.18), transparent 70%),
+      var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 1rem;
+    padding: 2rem 1.75rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+    box-shadow: 0 12px 36px rgba(0,0,0,0.35);
+  }
+  .auth-gate .lock-icon {
+    width: 3rem; height: 3rem; margin: 0 auto 0.85rem;
+    border-radius: 999px;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 1.4rem;
+    box-shadow: 0 8px 24px rgba(14, 165, 233, 0.35);
+  }
+  .auth-gate h2 {
+    font-size: 1.25rem; font-weight: 700; color: var(--fg);
+    text-transform: none; letter-spacing: 0; margin-bottom: 0.4rem;
+    display: block;
+  }
+  .auth-gate p {
+    color: var(--fg-dim); font-size: 0.9rem;
+    max-width: 32rem; margin: 0 auto 1.1rem;
+  }
+  .auth-gate .btn { margin: 0 auto; }
+
+  body.signed-out .signed-out-only { display: block; }
+  body:not(.signed-out) .signed-out-only { display: none !important; }
+  body.signed-out .signed-in-only {
+    opacity: 0.4; pointer-events: none; filter: grayscale(0.3);
+    user-select: none;
+  }
+
+  /* --- Lightbox (click-to-enlarge) ------------------------------------ */
+  .lightbox {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(2, 6, 16, 0.92);
+    backdrop-filter: blur(6px);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 4rem 1.5rem 2rem;
+    cursor: zoom-out;
+    opacity: 1;
+    transition: opacity 200ms var(--ease-out);
+  }
+  @starting-style {
+    .lightbox { opacity: 0; }
+  }
+  .lightbox img {
+    max-width: 92vw; max-height: 80vh; object-fit: contain;
+    border-radius: 0.6rem;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+    cursor: default;
+    background: var(--bg-0);
+    transform: scale(1);
+    transition: transform 220ms var(--ease-out);
+  }
+  @starting-style {
+    .lightbox img { transform: scale(0.95); }
+  }
+  .lightbox-caption {
+    margin-top: 0.95rem; color: var(--fg-dim); font-size: 0.85rem;
+    text-align: center; max-width: 92vw;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    cursor: default;
+  }
+  .lightbox-close {
+    position: absolute; top: 1.25rem; right: 1.25rem;
+    width: 2.5rem; height: 2.5rem; border-radius: 999px;
+    background: rgba(11, 18, 32, 0.85); color: var(--fg);
+    border: 1px solid var(--border-strong);
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                transform 0.12s var(--ease-out);
+  }
+  .lightbox-close:hover { background: var(--bg-3); color: #fff; }
+  .lightbox-close:active { transform: scale(0.93); }
+  .lightbox-close svg { width: 1.2rem; height: 1.2rem; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+</style>
+</head>
+<body class="signed-out">
+
+<!-- Top bar -->
+<div id="topbar">
+  <div class="brand">
+    <span class="logo">🔬</span>
+    <span>Smart Microscopy Assistant</span>
+  </div>
+  <div class="actions">
+    <div id="infoWrap">
+      <button id="infoBtn" class="topbar-iconbtn" type="button" aria-label="App info">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+      </button>
+      <div id="infoPopover" class="popover" hidden>
+        <div class="heading">Model &amp; runtime</div>
+        <div id="infoBody"><div class="row"><span class="k">loading…</span></div></div>
+      </div>
+    </div>
+    <button id="loginBtn" class="topbar-btn" type="button" aria-label="Sign in to Hypha" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+        <polyline points="10 17 15 12 10 7"/>
+        <line x1="15" y1="12" x2="3" y2="12"/>
+      </svg>
+      <span>Sign in</span>
+    </button>
+    <div id="userWrap" hidden>
+      <button id="userBtn" class="topbar-iconbtn" type="button" aria-label="Account menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3.4"/>
+          <path d="M5.5 19a7 7 0 0 1 13 0"/>
+        </svg>
+      </button>
+      <div id="userMenu" class="popover" hidden>
+        <div class="info-row">
+          <div><strong id="userEmail">…</strong></div>
+          <div>workspace <strong id="userWs">…</strong></div>
+        </div>
+        <button class="item" id="logoutBtn" type="button">Sign out</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+  <header class="page">
+    <h1><span class="accent">Smart Microscopy</span> Assistant</h1>
+    <p>VLM-backed microscopy analyst — reusable visual tests, batched image analysis, plain English.</p>
+  </header>
+
+  <!-- Auth gate -->
+  <div class="auth-gate signed-out-only">
+    <div class="lock-icon">🔒</div>
+    <h2>Sign in to start</h2>
+    <p>This assistant runs on Hypha. Sign in with your Hypha account to define visual tests, analyze images, and access the model.</p>
+    <button id="gateLoginBtn" class="btn btn-primary-lg" type="button">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+           stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+        <polyline points="10 17 15 12 10 7"/>
+        <line x1="15" y1="12" x2="3" y2="12"/>
+      </svg>
+      <span>Sign in to Hypha</span>
+    </button>
+  </div>
+
+  <div class="mode-toggle-wrap signed-in-only">
+    <div class="mode-toggle" role="tablist">
+      <button id="modeAnalyzeBtn" class="seg active" data-mode="analyze" role="tab" aria-selected="true">
+        🔍 Analyze
+      </button>
+      <button id="modeDefineBtn" class="seg" data-mode="define" role="tab" aria-selected="false">
+        📚 Visual tests
+      </button>
+    </div>
+  </div>
+
+  <!-- ====== ANALYZE VIEW ====================================== -->
+  <div id="analyzeView" class="signed-in-only">
+
+    <div class="card">
+      <h2>What to check for</h2>
+      <div class="radio-row">
+        <label><input type="radio" name="analyzeSource" id="srcTest" value="test" checked> Use a saved visual test</label>
+        <label><input type="radio" name="analyzeSource" id="srcFreetext" value="freetext"> Describe with free-text</label>
+      </div>
+
+      <div id="testChooser" class="row" style="margin-bottom: 0.5rem;">
+        <select id="testSelect" style="flex: 1; min-width: 0;">
+          <option value="">(no visual tests defined yet — switch to Define)</option>
+        </select>
+        <button id="refreshTestsBtn" class="topbar-btn btn-sm" type="button" title="Reload list">↻</button>
+      </div>
+      <div id="testMeta" class="test-meta" hidden></div>
+
+      <div id="freetextChooser" hidden>
+        <textarea id="instruction" placeholder="What should the model look for? Max 4000 chars. Tip: ask for a single-word category if you want categorical badges."></textarea>
+        <div class="field-help">
+          <span>If your prompt asks for a category, the badge will show it; otherwise it shows "Analyzed".</span>
+          <span><span id="charCount" class="counter">0</span> / <span id="charCap">4000</span></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Images <span class="small" style="margin-left:auto;font-weight:400;">(<span id="analyzeCount">0</span>)</span></h2>
+      <div id="analyzeBox" class="image-canvas" tabindex="0" data-side="analyze">
+        <div class="canvas-hint" id="analyzeHint">
+          <div class="hint-primary">Click to select this area</div>
+          <div>then paste with <span class="kbd">⌘V</span> / <span class="kbd">Ctrl</span>+<span class="kbd">V</span>, or double-click to upload from disk</div>
+        </div>
+        <div id="analyzeGrid" class="image-grid"></div>
+      </div>
+      <input type="file" id="analyzeInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
+
+      <div class="run-summary">
+        <div class="row" style="gap: 0.5rem;">
+          <button class="btn btn-primary-lg" id="runBtn" disabled>
+            <span id="runBtnLabel">Analyze images</span>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                 stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="9 18 15 12 9 6"/>
+            </svg>
+          </button>
+          <button class="btn btn-ghost btn-sm" id="clearAllBtn" type="button" hidden>Clear all</button>
+        </div>
+        <span class="status"><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span></span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ====== VISUAL TESTS VIEW ====================================== -->
+  <div id="defineView" class="signed-in-only" hidden>
+
+    <!-- Existing tests browser -->
+    <div class="card">
+      <h2>
+        Existing tests
+        <span class="small" style="margin-left:auto;font-weight:400;">your tests + public tests · click delete to remove your own</span>
+      </h2>
+      <div id="testList" class="test-list"></div>
+    </div>
+
+    <!-- New test creation (single combined panel) -->
+    <div class="card">
+      <h2>Create a new visual test</h2>
+
+      <!-- 1. Visibility -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">1</span>Visibility</div>
+        <div class="visibility-toggle" role="radiogroup" aria-label="Visibility">
+          <button type="button" id="visPrivateBtn" class="active" data-vis="private" role="radio" aria-checked="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="11" width="18" height="11" rx="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <span>Private (only you)</span>
+          </button>
+          <button type="button" id="visPublicBtn" data-vis="public" role="radio" aria-checked="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="2" y1="12" x2="22" y2="12"/>
+              <path d="M12 2a15 15 0 0 1 0 20a15 15 0 0 1 0 -20z"/>
+            </svg>
+            <span>Public (anyone)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 2. Name -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">2</span>Test name <span class="small" style="margin-left:0.35rem;color:var(--fg-muted);font-weight:400;letter-spacing:0;text-transform:none;">lowercase, hyphens, max 50 chars</span></div>
+        <input id="defineName" type="text" placeholder="e.g. focus-quality"
+               pattern="^[a-z0-9][a-z0-9-]{0,49}$" maxlength="50" />
+      </div>
+
+      <!-- 3. Conditions -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">3</span>Conditions <span class="small" style="margin-left:0.35rem;color:var(--fg-muted);font-weight:400;letter-spacing:0;text-transform:none;">both required</span></div>
+        <div class="criterion-grid">
+          <div class="criterion-block pass">
+            <div class="criterion-label">When does it PASS?</div>
+            <textarea id="passCriterion" maxlength="800"
+                      placeholder="e.g. Sharp cell outlines, uniform illumination across the field, no obvious artefacts."></textarea>
+            <div class="criterion-help">
+              <span>Used in the prompt verbatim.</span>
+              <span><span id="passCount" class="counter">0</span> / 800</span>
+            </div>
+          </div>
+          <div class="criterion-block fail">
+            <div class="criterion-label">When does it FAIL?</div>
+            <textarea id="failCriterion" maxlength="800"
+                      placeholder="e.g. Motion blur, saturated regions, dark spots, or out-of-focus areas."></textarea>
+            <div class="criterion-help">
+              <span>Used in the prompt verbatim.</span>
+              <span><span id="failCount" class="counter">0</span> / 800</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4. Images -->
+      <div class="subsection">
+        <div class="subsection-label"><span class="step">4</span>Reference examples <span class="small" style="margin-left:0.35rem;color:var(--fg-muted);font-weight:400;letter-spacing:0;text-transform:none;">optional · 0–<span class="exMax">5</span> each</span></div>
+        <div class="dual-canvas">
+          <div id="positiveBox" class="image-canvas" tabindex="0" data-side="positive">
+            <div class="canvas-label pass">Should pass <span class="small" style="margin-left:auto;font-weight:400;color:var(--fg-muted);">(<span id="positiveCount">0</span>/<span class="exMax">5</span>)</span></div>
+            <div class="canvas-hint">
+              <div class="hint-primary">Click to select</div>
+              <div>then paste, or double-click</div>
+            </div>
+            <div id="positiveGrid" class="image-grid"></div>
+          </div>
+          <div id="negativeBox" class="image-canvas" tabindex="0" data-side="negative">
+            <div class="canvas-label fail">Should fail <span class="small" style="margin-left:auto;font-weight:400;color:var(--fg-muted);">(<span id="negativeCount">0</span>/<span class="exMax">5</span>)</span></div>
+            <div class="canvas-hint">
+              <div class="hint-primary">Click to select</div>
+              <div>then paste, or double-click</div>
+            </div>
+            <div id="negativeGrid" class="image-grid"></div>
+          </div>
+        </div>
+        <input type="file" id="positiveInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
+        <input type="file" id="negativeInput" multiple accept="image/*,.tif,.tiff" style="display:none" />
+      </div>
+
+      <!-- Save -->
+      <div class="run-summary" style="margin-top: 1.25rem;">
+        <button class="btn btn-primary-lg" id="defineBtn" disabled>Save visual test</button>
+        <span class="status"><span class="status-dot" id="defineDot"></span><span id="defineStatus">Idle</span></span>
+      </div>
+      <div id="defineResultBlock" class="create-result" style="margin-top: 0.85rem;" hidden></div>
+    </div>
+
+  </div>
+
+  <!-- Logs -->
+  <details class="log-details">
+    <summary>Activity log</summary>
+    <div id="log" class="log-body">Ready.</div>
+  </details>
+
+</div>
+
+<!-- Confirm dialog -->
+<div id="confirmDialog" class="dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" hidden>
+  <div class="dialog">
+    <div class="dialog-title">
+      <span class="dialog-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6l-1.5 14a2 2 0 0 1 -2 2h-7a2 2 0 0 1 -2 -2L5 6"/>
+          <path d="M10 11v6"/><path d="M14 11v6"/>
+          <path d="M9 6V4a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v2"/>
+        </svg>
+      </span>
+      <span id="confirmTitle">Delete?</span>
+    </div>
+    <div class="dialog-message" id="confirmMessage">Are you sure?</div>
+    <div class="dialog-actions">
+      <button class="dialog-btn cancel" type="button" id="confirmCancel">Cancel</button>
+      <button class="dialog-btn danger" type="button" id="confirmOk">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- Lightbox -->
+<div id="lightbox" class="lightbox" role="dialog" aria-label="Image preview" hidden>
+  <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Close preview">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="18" y1="6" x2="6" y2="18"/>
+      <line x1="6" y1="6" x2="18" y2="18"/>
+    </svg>
+  </button>
+  <img id="lightboxImg" alt="" />
+  <div id="lightboxCaption" class="lightbox-caption"></div>
+</div>
+
+<script type="module">
+import { login, connectToServer }
+  from "https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.54/dist/hypha-rpc-websocket.mjs";
+
+// ---- URL params ----------------------------------------------------------
+const params     = new URLSearchParams(window.location.search);
+const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
+const SERVICE_ID = params.get("ws_service_id") || "";
+const URL_TOKEN  = params.get("token") || "";
+
+const MAX_INSTRUCTION_CHARS = 4000;
+const MAX_DESC_CHARS = 800;
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_EXAMPLES_PER_CLASS = 5;
+const TEST_NAME_RE = /^[a-z0-9][a-z0-9-]{0,49}$/;
+const TOKEN_KEY    = "smart-microscopy-assistant:token";
+const TOKEN_EXPIRY = "smart-microscopy-assistant:tokenExpiry";
+const TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
+
+document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
+for (const el of document.querySelectorAll(".exMax")) el.textContent = MAX_EXAMPLES_PER_CLASS;
+
+// ---- Module state --------------------------------------------------------
+let server = null, qcSvc = null, artMgr = null, userWorkspace = null, userEmail = null;
+let activeBoxId = null;          // currently selected canvas box id
+let currentMode = "analyze";
+let pipelineRunning = false;     // analyze-mode: blocks add + Run button
+let analyzeScratchId = null;     // batched scratch artifact id (committed once per run)
+let openDetailsTileId = null;    // id of tile whose details panel is currently open
+
+// Per-mode tile arrays. Each tile is an object:
+//   { id, file, src, state, remoteUrl, result, error }
+let analyzeTiles = [];
+let positiveTiles = [];
+let negativeTiles = [];
+
+const $ = id => document.getElementById(id);
+const log = (msg, kind = "") => {
+  const ts = new Date().toLocaleTimeString();
+  const cls = kind ? `class="${kind}"` : "";
+  $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${msg}</span>`;
+  $("log").scrollTop = $("log").scrollHeight;
+};
+const setRun = (state, msg) => { $("runDot").className = "status-dot " + (state || ""); $("runStatus").textContent = msg; };
+const setDefine = (state, msg) => { $("defineDot").className = "status-dot " + (state || ""); $("defineStatus").textContent = msg; };
+const escapeHTML = s => String(s).replace(/[&<>"']/g, c => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+));
+const randomSuffix = () => Math.random().toString(36).slice(2, 10);
+const fileExt = f => (f.name.split(".").pop() || "bin").toLowerCase();
+const tilesFor = side =>
+  side === "positive" ? positiveTiles :
+  side === "negative" ? negativeTiles : analyzeTiles;
+const gridFor = side => $(side + "Grid");
+const countFor = side => $(side + "Count");
+
+// ---- Token cache + login -------------------------------------------------
+function loadSavedToken() {
+  try {
+    const t = localStorage.getItem(TOKEN_KEY);
+    const e = localStorage.getItem(TOKEN_EXPIRY);
+    if (t && e && new Date(e) > new Date()) return t;
+  } catch (_) {}
+  return null;
+}
+function saveToken(t) {
+  try {
+    localStorage.setItem(TOKEN_KEY, t);
+    localStorage.setItem(TOKEN_EXPIRY, new Date(Date.now() + TOKEN_TTL_MS).toISOString());
+  } catch (_) {}
+}
+function clearSavedToken() {
+  try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(TOKEN_EXPIRY); } catch (_) {}
+}
+function setLoggedOutUI() {
+  document.body.classList.add("signed-out");
+  $("loginBtn").hidden = false;
+  $("loginBtn").disabled = false;
+  $("gateLoginBtn").disabled = false;
+  $("userWrap").hidden = true;
+  $("userMenu").hidden = true;
+}
+function setLoggingInUI() {
+  $("loginBtn").disabled = true;
+  $("gateLoginBtn").disabled = true;
+}
+function setLoggedInUI() {
+  document.body.classList.remove("signed-out");
+  $("loginBtn").hidden = true;
+  $("userWrap").hidden = false;
+  $("userEmail").textContent = userEmail || "(unknown)";
+  $("userWs").textContent    = userWorkspace || "—";
+}
+
+$("userBtn").addEventListener("click", () => {
+  $("userMenu").hidden = !$("userMenu").hidden;
+  $("infoPopover").hidden = true;
+});
+$("infoBtn").addEventListener("click", () => {
+  $("infoPopover").hidden = !$("infoPopover").hidden;
+  $("userMenu").hidden = true;
+});
+document.addEventListener("mousedown", (e) => {
+  for (const id of ["userMenu", "infoPopover"]) {
+    const m = $(id);
+    const trig = id === "userMenu" ? $("userBtn") : $("infoBtn");
+    if (!m.hidden && !m.contains(e.target) && !trig.contains(e.target)) m.hidden = true;
+  }
+});
+
+async function connectWithToken(token) {
+  setLoggingInUI();
+  server = await connectToServer({ server_url: SERVER_URL, token });
+  userWorkspace = server.config.workspace;
+  userEmail = (server.config.user && server.config.user.email) || userWorkspace;
+  setLoggedInUI();
+  log(`Connected as ${userEmail} (workspace=${userWorkspace})`, "ok");
+  artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
+  if (!SERVICE_ID) {
+    log("No ws_service_id in the URL — open the app from the BioEngine dashboard or append `?ws_service_id=<id>`.", "err");
+    throw new Error(
+      "ws_service_id is required. Open this app from the BioEngine dashboard, " +
+      "or append ?ws_service_id=<service-id> to the URL."
+    );
+  }
+  qcSvc = await server.getService(SERVICE_ID, { _rkwargs: true });
+  log("Service handle ready.", "ok");
+  await Promise.all([refreshTests(), refreshModelInfo()]);
+  refreshAnalyzeEnabled();
+  refreshDefineEnabled();
+}
+
+async function startLogin() {
+  setLoggingInUI();
+  log("Opening Hypha auth flow…");
+  try {
+    const token = await login({
+      server_url: SERVER_URL,
+      login_callback: (ctx) => { window.open(ctx.login_url); },
+    });
+    saveToken(token);
+    await connectWithToken(token);
+  } catch (err) {
+    log("Login error: " + err.message, "err");
+    setLoggedOutUI();
+  }
+}
+$("loginBtn").addEventListener("click", startLogin);
+$("gateLoginBtn").addEventListener("click", startLogin);
+
+$("logoutBtn").addEventListener("click", async () => {
+  clearSavedToken();
+  qcSvc = null; artMgr = null; userWorkspace = null; userEmail = null;
+  try { if (server?.disconnect) await server.disconnect(); } catch (_) {}
+  server = null;
+  setLoggedOutUI();
+});
+
+(async () => {
+  const cached = URL_TOKEN || loadSavedToken();
+  if (!cached) { setLoggedOutUI(); return; }
+  document.body.classList.remove("signed-out");
+  $("loginBtn").hidden = true;
+  $("userWrap").hidden = true;
+  try { await connectWithToken(cached); }
+  catch (err) {
+    if (!URL_TOKEN) clearSavedToken();
+    setLoggedOutUI();
+    log("Auto-connect failed: " + err.message, "err");
+  }
+})();
+
+// ---- Mode toggle ---------------------------------------------------------
+function setMode(mode) {
+  currentMode = mode;
+  for (const btn of document.querySelectorAll(".mode-toggle .seg")) {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+    btn.setAttribute("aria-selected", btn.dataset.mode === mode ? "true" : "false");
+  }
+  $("analyzeView").hidden = (mode !== "analyze");
+  $("defineView").hidden  = (mode !== "define");
+  // Switching mode collapses any open details panel and clears selection.
+  collapseOpenDetails();
+  setActiveBox(null);
+}
+$("modeAnalyzeBtn").addEventListener("click", () => setMode("analyze"));
+$("modeDefineBtn").addEventListener("click",  () => setMode("define"));
+
+// ---- Info popover --------------------------------------------------------
+async function refreshModelInfo() {
+  if (!qcSvc) return;
+  try {
+    const info = await qcSvc.get_model_info({ _rkwargs: true });
+    const body = $("infoBody");
+    body.innerHTML = "";
+    const add = (k, v) => {
+      const row = document.createElement("div"); row.className = "row";
+      row.innerHTML = `<span class="k">${escapeHTML(k)}</span><span class="v">${escapeHTML(String(v))}</span>`;
+      body.appendChild(row);
+    };
+    add("Model",      info.model || "—");
+    add("Engine",     info.engine || "—");
+    add("Precision",  info.dtype || "—");
+    add("Device",     info.device || "—");
+    add("Max input",  `${(info.max_pixels/1e6).toFixed(2)} MP · ${info.max_long_side}px`);
+    add("Image size", `≤ ${(info.max_image_bytes/1024/1024).toFixed(0)} MB`);
+    add("Examples",   `${info.min_examples_per_class}–${info.max_examples_per_class} per class`);
+    add("Verdicts",   (info.verdicts || []).join(" · "));
+    add("License",    info.license || "—");
+  } catch (err) {
+    log("get_model_info failed: " + err.message, "err");
+  }
+}
+
+// ---- Visual-test dropdown -----------------------------------------------
+function applySourceRadio() {
+  const useTest = $("srcTest").checked;
+  $("testChooser").hidden = !useTest;
+  $("testMeta").hidden    = !useTest || !$("testSelect").value;
+  $("freetextChooser").hidden = useTest;
+  refreshAnalyzeEnabled();
+}
+$("srcTest").addEventListener("change", applySourceRadio);
+$("srcFreetext").addEventListener("change", applySourceRadio);
+
+// Shared cache so the Tests-tab list and the Analyze dropdown stay in sync.
+let cachedTests = [];
+
+async function refreshTests() {
+  if (!qcSvc) return;
+  try {
+    cachedTests = await qcSvc.list_visual_tests({
+      caller_user_id: userWorkspace, _rkwargs: true,
+    });
+    log(`Loaded ${cachedTests.length} visual test${cachedTests.length === 1 ? "" : "s"}.`);
+  } catch (err) {
+    cachedTests = [];
+    log("list_visual_tests failed: " + err.message, "err");
+  }
+  refreshTestsDropdown();
+  refreshTestList();
+}
+
+function refreshTestsDropdown() {
+  const sel = $("testSelect");
+  const prior = sel.value;
+  sel.innerHTML = "";
+  if (cachedTests.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = ""; opt.textContent = "(no visual tests visible to you yet — switch to Visual tests)";
+    sel.appendChild(opt);
+  } else {
+    for (const t of cachedTests) {
+      const opt = document.createElement("option");
+      opt.value = t.name;
+      const tag = t.owned_by_you ? "" : (t.is_public ? " (public)" : "");
+      opt.textContent = t.name + tag;
+      opt.dataset.pass = t.pass_criterion || t.description || "";
+      opt.dataset.fail = t.fail_criterion || "";
+      opt.dataset.nPos = String(t.n_positive ?? "?");
+      opt.dataset.nNeg = String(t.n_negative ?? "?");
+      opt.dataset.public = t.is_public ? "1" : "0";
+      opt.dataset.mine = t.owned_by_you ? "1" : "0";
+      sel.appendChild(opt);
+    }
+    if (prior && [...sel.options].some(o => o.value === prior)) sel.value = prior;
+  }
+  updateTestMeta();
+}
+
+function updateTestMeta() {
+  const sel = $("testSelect");
+  const opt = sel.options[sel.selectedIndex];
+  const meta = $("testMeta");
+  if (!sel.value || !opt) { meta.hidden = true; }
+  else {
+    const passC = opt.dataset.pass || "";
+    const failC = opt.dataset.fail || "";
+    const np = opt.dataset.nPos, nn = opt.dataset.nNeg;
+    const isPublic = opt.dataset.public === "1";
+    const isMine = opt.dataset.mine === "1";
+    const chips = [];
+    if (isPublic) chips.push(`<span class="chip chip-public">Public</span>`);
+    else          chips.push(`<span class="chip chip-private">Private</span>`);
+    if (isMine)   chips.push(`<span class="chip chip-yours">Yours</span>`);
+    const refs = `${np} pos, ${nn} neg reference${np === "1" && nn === "1" ? "" : "s"}`;
+    meta.hidden = false;
+    meta.innerHTML =
+      `<strong>${escapeHTML(sel.value)}</strong> ${chips.join(" ")} · ${refs}` +
+      (passC ? `<br><span class="label-pass" style="color:var(--pass);font-weight:600;">PASS:</span> <span style="color:var(--fg);">${escapeHTML(passC)}</span>` : "") +
+      (failC ? `<br><span class="label-fail" style="color:var(--fail);font-weight:600;">FAIL:</span> <span style="color:var(--fg);">${escapeHTML(failC)}</span>` : "");
+  }
+  applySourceRadio();
+}
+$("testSelect").addEventListener("change", updateTestMeta);
+$("refreshTestsBtn").addEventListener("click", () => { refreshTests(); });
+
+// ---- Existing-tests list rendering (Visual Tests tab) -------------------
+function refreshTestList() {
+  const wrap = $("testList");
+  wrap.innerHTML = "";
+  if (!cachedTests || cachedTests.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "test-list-empty";
+    empty.textContent = "No visual tests yet. Define your first one below.";
+    wrap.appendChild(empty);
+    return;
+  }
+  // Sort: your own first, then public, then by name.
+  const sorted = cachedTests.slice().sort((a, b) => {
+    if (a.owned_by_you !== b.owned_by_you) return a.owned_by_you ? -1 : 1;
+    if (!!a.is_public !== !!b.is_public) return a.is_public ? -1 : 1;
+    return (a.name || "").localeCompare(b.name || "");
+  });
+  for (const t of sorted) {
+    const row = document.createElement("div");
+    row.className = "test-row";
+
+    const main = document.createElement("div");
+    main.className = "test-row-main";
+
+    const name = document.createElement("div");
+    name.className = "test-row-name";
+    const nameText = document.createElement("span");
+    nameText.textContent = t.name;
+    name.appendChild(nameText);
+    if (t.is_public) {
+      const c = document.createElement("span"); c.className = "chip chip-public";
+      c.textContent = "Public"; name.appendChild(c);
+    } else {
+      const c = document.createElement("span"); c.className = "chip chip-private";
+      c.textContent = "Private"; name.appendChild(c);
+    }
+    if (t.owned_by_you) {
+      const c = document.createElement("span"); c.className = "chip chip-yours";
+      c.textContent = "Yours"; name.appendChild(c);
+    }
+    main.appendChild(name);
+
+    const passC = t.pass_criterion || t.description || "";
+    const failC = t.fail_criterion || "";
+    const crit = document.createElement("div");
+    crit.className = "test-row-criterion";
+    crit.innerHTML =
+      (passC ? `<span class="label-pass">PASS:</span> ${escapeHTML(passC)} ` : "") +
+      (failC ? `<br><span class="label-fail">FAIL:</span> ${escapeHTML(failC)}` : "");
+    main.appendChild(crit);
+
+    const meta = document.createElement("div");
+    meta.className = "test-row-meta";
+    const refStr = `${t.n_positive ?? 0} positive, ${t.n_negative ?? 0} negative reference${(t.n_positive === 1 && t.n_negative === 1) ? "" : "s"}`;
+    meta.textContent = refStr;
+    main.appendChild(meta);
+
+    row.appendChild(main);
+
+    const del = document.createElement("button");
+    del.className = "test-row-delete";
+    del.type = "button";
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1.5 14a2 2 0 0 1 -2 2h-7a2 2 0 0 1 -2 -2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v2"/></svg><span>Delete</span>';
+    if (!t.owned_by_you) {
+      del.disabled = true;
+      del.title = "Only the creator can delete this test.";
+    } else {
+      del.addEventListener("click", async () => {
+        const ok = await showConfirm({
+          title: "Delete visual test?",
+          message: `Delete visual test <strong>${escapeHTML(t.name)}</strong>? This cannot be undone.`,
+          confirmLabel: "Delete",
+        });
+        if (!ok) return;
+        del.disabled = true;
+        try {
+          await qcSvc.delete_visual_test({
+            name: t.name, caller_user_id: userWorkspace, _rkwargs: true,
+          });
+          log(`Deleted visual test '${t.name}'.`, "ok");
+          await refreshTests();
+        } catch (err) {
+          log(`delete_visual_test(${t.name}) error: ${err.message || err}`, "err");
+          alert("Delete failed: " + (err.message || err));
+          del.disabled = false;
+        }
+      });
+    }
+    row.appendChild(del);
+
+    wrap.appendChild(row);
+  }
+}
+
+// ===== Active-box selection model =========================================
+function setActiveBox(id) {
+  for (const box of document.querySelectorAll(".image-canvas")) {
+    box.classList.toggle("selected", box.id === id);
+  }
+  activeBoxId = id;
+}
+function getActiveSide() {
+  if (!activeBoxId) return null;
+  const box = $(activeBoxId);
+  return box ? box.dataset.side : null;
+}
+
+// ===== Confirm dialog ====================================================
+// Promise-based replacement for window.confirm — rendered with the rest of
+// the app's styling so it looks intentional (vs. the browser's native chrome).
+let _confirmResolve = null;
+function showConfirm({ title = "Confirm", message = "Are you sure?",
+                       confirmLabel = "Delete", cancelLabel = "Cancel" } = {}) {
+  $("confirmTitle").textContent = title;
+  // message accepts HTML so the caller can bold the test name etc.
+  $("confirmMessage").innerHTML = message;
+  $("confirmOk").textContent = confirmLabel;
+  $("confirmCancel").textContent = cancelLabel;
+  $("confirmDialog").hidden = false;
+  // Focus the danger button for keyboard-only confirms.
+  setTimeout(() => $("confirmOk").focus(), 0);
+  return new Promise(res => { _confirmResolve = res; });
+}
+function closeConfirm(value) {
+  if (_confirmResolve) {
+    _confirmResolve(value);
+    _confirmResolve = null;
+  }
+  $("confirmDialog").hidden = true;
+}
+$("confirmOk").addEventListener("click", () => closeConfirm(true));
+$("confirmCancel").addEventListener("click", () => closeConfirm(false));
+$("confirmDialog").addEventListener("click", (e) => {
+  if (e.target === $("confirmDialog")) closeConfirm(false);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("confirmDialog").hidden) closeConfirm(false);
+});
+
+// ===== Lightbox ===========================================================
+function openLightbox(src, caption) {
+  if (!src) return;
+  $("lightboxImg").src = src;
+  $("lightboxCaption").textContent = caption || "";
+  $("lightbox").hidden = false;
+  document.body.style.overflow = "hidden";
+}
+function closeLightbox() {
+  $("lightbox").hidden = true;
+  $("lightboxImg").src = "";
+  $("lightboxCaption").textContent = "";
+  document.body.style.overflow = "";
+}
+$("lightboxClose").addEventListener("click", closeLightbox);
+$("lightbox").addEventListener("click", (e) => {
+  if (e.target.id === "lightbox") closeLightbox();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("lightbox").hidden) closeLightbox();
+});
+
+// ===== Tile rendering =====================================================
+function previewSrcFor(file) {
+  const ext = fileExt(file);
+  if (["tif", "tiff"].includes(ext)) {
+    return "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjAgMTIwIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjMGIxMjIwIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZpbGw9IiM2YjdhOTkiIGZvbnQtZmFtaWx5PSJzeXN0ZW0tdWkiIGZvbnQtc2l6ZT0iMTQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj5USUZGPC90ZXh0Pjwvc3ZnPg==";
+  }
+  return null;
+}
+
+function makeTileNode(tile) {
+  const node = document.createElement("div");
+  node.className = "image-tile zoomable";
+  node.dataset.id = tile.id;
+  node.dataset.state = tile.state;
+  node.title = "Click to enlarge";
+
+  const img = document.createElement("img");
+  if (tile.src) {
+    img.src = tile.src;
+  } else {
+    const placeholder = previewSrcFor(tile.file);
+    if (placeholder) img.src = placeholder;
+    else {
+      const reader = new FileReader();
+      reader.onload = e => { img.src = e.target.result; tile.src = e.target.result; };
+      reader.readAsDataURL(tile.file);
+    }
+  }
+  node.appendChild(img);
+
+  // Analyzing overlay
+  const overlay = document.createElement("div");
+  overlay.className = "tile-overlay";
+  overlay.innerHTML = '<div class="tile-overlay-spinner"></div>';
+  node.appendChild(overlay);
+
+  // Cloud-pending icon
+  const cloud = document.createElement("div");
+  cloud.className = "cloud-icon";
+  cloud.title = "Local image — not yet uploaded";
+  cloud.innerHTML =
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+       <path d="M17.5 19a4.5 4.5 0 1 0 -.5 -8.97A6 6 0 0 0 5 11.5"/>
+       <path d="M12 20v-8"/><path d="M9 15l3 -3l3 3"/>
+     </svg>`;
+  node.appendChild(cloud);
+
+  // Verdict / category / analyzed badge
+  const badge = document.createElement("div");
+  badge.className = "tile-badge";
+  node.appendChild(badge);
+
+  // Remove (X)
+  const x = document.createElement("button");
+  x.className = "tile-x"; x.type = "button"; x.textContent = "×";
+  x.title = "Remove";
+  x.addEventListener("click", (e) => {
+    e.stopPropagation();
+    removeTile(node.dataset.id);
+  });
+  node.appendChild(x);
+
+  // Details toggle (only visible when state is done/error)
+  const toggle = document.createElement("button");
+  toggle.className = "tile-details-toggle";
+  toggle.type = "button";
+  toggle.innerHTML = `<span>Details</span><span class="chev">▾</span>`;
+  toggle.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleDetails(node.dataset.id);
+  });
+  node.appendChild(toggle);
+
+  // Click to enlarge (delegate by ignoring X / toggle clicks)
+  node.addEventListener("click", (e) => {
+    if (e.target.closest(".tile-x")) return;
+    if (e.target.closest(".tile-details-toggle")) return;
+    if (img.src) openLightbox(img.src, tile.file.name);
+  });
+
+  return node;
+}
+
+function applyBadge(node, tile) {
+  const badge = node.querySelector(".tile-badge");
+  badge.classList.remove("shown", "passed", "failed", "unsure", "analyzed", "error");
+  if (tile.state !== "done" && tile.state !== "error") return;
+
+  let cls = "analyzed", text = "Analyzed";
+  if (tile.state === "error") { cls = "error"; text = "Error"; }
+  else if (tile.mode === "few-shot") {
+    const v = (tile.result?.verdict || "unsure").toLowerCase();
+    cls = v;
+    text = v.charAt(0).toUpperCase() + v.slice(1);
+  } else {
+    // Free-text describe: try to extract a category from the response
+    const cat = extractCategory(tile.result?.description || "");
+    if (cat) { cls = "analyzed"; text = cat; }
+    else      { cls = "analyzed"; text = "Analyzed"; }
+  }
+  badge.classList.add(cls);
+  badge.textContent = "";
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  badge.appendChild(dot);
+  badge.appendChild(document.createTextNode(text));
+  // Force reflow then add .shown so the @starting-style-like transition fires.
+  void badge.offsetWidth;
+  badge.classList.add("shown");
+}
+
+function extractCategory(text) {
+  if (!text) return null;
+  const head = text.slice(0, 200);
+  const m = head.match(/(?:CATEGORY|CLASSIFICATION|VERDICT|ANSWER|RESULT|LABEL)\s*[:=]\s*([A-Za-z][\w\-/ ]{0,28})/i);
+  if (m) return m[1].trim().slice(0, 28);
+  return null;
+}
+
+function renderGrid(side) {
+  const tiles = tilesFor(side);
+  const grid = gridFor(side);
+  collapseOpenDetailsIfNot(side);
+  // Diff-based render: re-render to keep node structure simple while batches are small.
+  grid.innerHTML = "";
+  for (const tile of tiles) {
+    const node = makeTileNode(tile);
+    grid.appendChild(node);
+    applyBadge(node, tile);
+  }
+  countFor(side).textContent = tiles.length;
+  // Hint visibility (only in image-canvas with id ${side}Box)
+  const box = $(side + "Box");
+  if (box) {
+    const hint = box.querySelector(".canvas-hint");
+    if (hint) hint.style.display = tiles.length ? "none" : "";
+  }
+  if (side === "analyze") {
+    refreshAnalyzeEnabled();
+    $("clearAllBtn").hidden = (tiles.length === 0);
+  } else {
+    refreshDefineEnabled();
+  }
+}
+
+function tileById(id) {
+  for (const arr of [analyzeTiles, positiveTiles, negativeTiles]) {
+    const t = arr.find(x => x.id === id);
+    if (t) return { arr, tile: t };
+  }
+  return null;
+}
+
+function sideOfTile(id) {
+  if (analyzeTiles.some(t => t.id === id)) return "analyze";
+  if (positiveTiles.some(t => t.id === id)) return "positive";
+  if (negativeTiles.some(t => t.id === id)) return "negative";
+  return null;
+}
+
+function removeTile(id) {
+  if (pipelineRunning && analyzeTiles.some(t => t.id === id)) {
+    log("Cannot remove tile while the pipeline is running.", "err");
+    return;
+  }
+  const side = sideOfTile(id);
+  if (!side) return;
+  if (openDetailsTileId === id) collapseOpenDetails();
+  const arr = tilesFor(side);
+  const i = arr.findIndex(t => t.id === id);
+  if (i >= 0) arr.splice(i, 1);
+  renderGrid(side);
+}
+
+function clearAllAnalyze() {
+  if (pipelineRunning) {
+    log("Cannot clear while the pipeline is running.", "err");
+    return;
+  }
+  collapseOpenDetails();
+  analyzeTiles = [];
+  renderGrid("analyze");
+  setRun("", "Idle");
+}
+$("clearAllBtn").addEventListener("click", clearAllAnalyze);
+
+// ===== File ingestion =====================================================
+function nextId() { return "t-" + Math.random().toString(36).slice(2, 10); }
+
+function addFiles(side, files) {
+  if (side === "analyze" && pipelineRunning) {
+    log("Pipeline is running — wait for it to finish before adding new images.", "err");
+    return;
+  }
+  const tiles = tilesFor(side);
+  const cap = side === "analyze" ? Infinity : MAX_EXAMPLES_PER_CLASS;
+  let added = 0, skipped = 0;
+  for (const f of files) {
+    if (tiles.length >= cap) { skipped++; continue; }
+    if (f.size > MAX_IMAGE_BYTES) {
+      log(`${side}: skipping ${f.name}: ${(f.size/1024/1024).toFixed(1)} MB > 25 MB`, "err");
+      continue;
+    }
+    tiles.push({
+      id: nextId(), file: f, src: null,
+      state: "local", remoteUrl: null, result: null, error: null, mode: null,
+    });
+    added++;
+  }
+  if (skipped > 0) log(`${side}: skipped ${skipped} (cap ${cap})`, "err");
+  if (added > 0) {
+    log(`Added ${added} image${added === 1 ? "" : "s"} to ${side}.`);
+    renderGrid(side);
+  }
+}
+
+// ===== Canvas selection + paste/double-click + drag-drop ==================
+function wireCanvas(box) {
+  const side = box.dataset.side;
+  const input = $(side + "Input") || $("analyzeInput");
+
+  box.addEventListener("click", (e) => {
+    if (e.target.closest(".image-tile")) return;
+    if (e.target.closest(".grid-details-panel")) return;
+    setActiveBox(box.id);
+  });
+  box.addEventListener("dblclick", (e) => {
+    if (e.target.closest(".image-tile")) return;
+    setActiveBox(box.id);
+    input.click();
+  });
+  // Drag-and-drop still works (handy for demos)
+  ["dragenter","dragover"].forEach(ev => box.addEventListener(ev, e => {
+    e.preventDefault(); box.classList.add("drag");
+  }));
+  ["dragleave","drop"].forEach(ev => box.addEventListener(ev, e => {
+    e.preventDefault(); box.classList.remove("drag");
+  }));
+  box.addEventListener("drop", e => {
+    if (e.dataTransfer.files && e.dataTransfer.files.length) {
+      setActiveBox(box.id);
+      addFiles(side, [...e.dataTransfer.files]);
+    }
+  });
+}
+wireCanvas($("analyzeBox"));
+wireCanvas($("positiveBox"));
+wireCanvas($("negativeBox"));
+
+// File input change → addFiles
+function wireInput(side) {
+  const input = $(side + "Input");
+  if (!input) return;
+  input.addEventListener("change", e => {
+    if (e.target.files && e.target.files.length) addFiles(side, [...e.target.files]);
+    // Clear the FileList via an empty DataTransfer so the next file pick
+    // (even of the same path) re-fires the change event. `input.value = ""`
+    // also clears it but interacts badly with Playwright's set_input_files
+    // on subsequent runs.
+    try {
+      const dt = new DataTransfer();
+      input.files = dt.files;
+    } catch (_) {
+      input.value = "";
+    }
+  });
+}
+wireInput("analyze"); wireInput("positive"); wireInput("negative");
+
+// Click outside any canvas → deselect (but don't deselect on tile/popover/topbar clicks)
+document.addEventListener("mousedown", (e) => {
+  if (!activeBoxId) return;
+  if (e.target.closest(".image-canvas")) return;
+  if (e.target.closest(".grid-details-panel")) return;
+  if (e.target.closest("#topbar")) return;
+  if (e.target.closest(".popover")) return;
+  if (e.target.closest(".mode-toggle")) return;
+  setActiveBox(null);
+});
+
+// Paste: routes to active box's side
+document.addEventListener("paste", (e) => {
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "TEXTAREA" || tag === "INPUT") return;
+  if (!activeBoxId) {
+    // Not selected: ignore (don't surprise the user).
+    return;
+  }
+  const side = getActiveSide();
+  if (!side) return;
+  if (side === "analyze" && pipelineRunning) return;
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const pasted = [];
+  for (const item of items) {
+    if (item.kind === "file" && item.type && item.type.startsWith("image/")) {
+      const blob = item.getAsFile(); if (!blob) continue;
+      const ext = (blob.type.split("/")[1] || "png").toLowerCase();
+      pasted.push(new File([blob], `pasted-${Date.now()}-${pasted.length}.${ext}`, { type: blob.type }));
+    }
+  }
+  if (pasted.length) {
+    log(`Pasted ${pasted.length} image${pasted.length === 1 ? "" : "s"} into ${side}.`);
+    addFiles(side, pasted);
+    e.preventDefault();
+  }
+});
+
+// ===== Analyze enable check ===============================================
+$("instruction").addEventListener("input", () => {
+  const len = $("instruction").value.length;
+  $("charCount").textContent = len;
+  $("charCount").className = "counter" + (len > MAX_INSTRUCTION_CHARS ? " over" : "");
+  if (len > MAX_INSTRUCTION_CHARS) {
+    $("instruction").value = $("instruction").value.slice(0, MAX_INSTRUCTION_CHARS);
+    $("charCount").textContent = MAX_INSTRUCTION_CHARS;
+  }
+  refreshAnalyzeEnabled();
+});
+
+function pendingTiles() { return analyzeTiles.filter(t => t.state === "local"); }
+
+function refreshAnalyzeEnabled() {
+  if (!qcSvc || pendingTiles().length === 0 || pipelineRunning) {
+    $("runBtn").disabled = true;
+    if (pipelineRunning) $("runBtnLabel").textContent = "Analyzing…";
+    else                 $("runBtnLabel").textContent = analyzeTiles.some(t => t.state === "done") ? "Analyze new images" : "Analyze images";
+    return;
+  }
+  if ($("srcTest").checked) $("runBtn").disabled = !$("testSelect").value;
+  else {
+    const v = $("instruction").value;
+    $("runBtn").disabled = !(v.trim().length > 0 && v.length <= MAX_INSTRUCTION_CHARS);
+  }
+  $("runBtnLabel").textContent = analyzeTiles.some(t => t.state === "done") ? "Analyze new images" : "Analyze images";
+}
+
+// ===== Scratch artifact helpers ===========================================
+async function uploadFileToScratch(file, artifactId, remotePath) {
+  const putUrl = await artMgr.put_file({ artifact_id: artifactId, file_path: remotePath, _rkwargs: true });
+  const resp = await fetch(putUrl, { method: "PUT", body: await file.arrayBuffer() });
+  if (!resp.ok) throw new Error(`PUT ${remotePath} failed: ${resp.status}`);
+}
+async function presignFromScratch(artifactId, remotePath) {
+  return await artMgr.get_file({ artifact_id: artifactId, file_path: remotePath, _rkwargs: true });
+}
+async function deleteScratch(artifactId) {
+  if (!artifactId) return;
+  try {
+    await artMgr.delete({ artifact_id: artifactId, delete_files: true, recursive: true, _rkwargs: true });
+  } catch (err) {
+    log(`Cleanup FAILED for ${artifactId}: ${err.message}`, "err");
+  }
+}
+
+// ===== Analyze pipeline ===================================================
+// Two serial channels running concurrently:
+//   uploadWorker: image LOCAL -> UPLOADING -> UPLOADED
+//   vlmWorker:    image UPLOADED -> ANALYZING -> DONE|ERROR
+// We process a batch (snapshot of LOCAL tiles at click time) and create one
+// scratch artifact for all of them so the worker can reuse a single
+// staged-then-committed artifact.
+
+async function runPipeline() {
+  if (!qcSvc) return;
+  const pending = pendingTiles();
+  if (pending.length === 0) return;
+  pipelineRunning = true;
+  refreshAnalyzeEnabled();
+  $("clearAllBtn").disabled = true;
+  collapseOpenDetails();
+
+  const useTest = $("srcTest").checked;
+  const visualTest = useTest ? $("testSelect").value : null;
+  const instruction = !useTest ? $("instruction").value.trim() : null;
+
+  // Pipeline:
+  //   uploadWorker: tile -> create per-image scratch artifact -> put_file ->
+  //                 commit -> presign -> push tile to VLM queue
+  //   vlmWorker:    pops UPLOADED tiles, runs inspect, marks done/error
+  // Per-image scratch artifacts because a Hypha artifact transitions out of
+  // the staged state on commit, so a single shared artifact can't accept new
+  // files between commits without re-staging.
+  const vlmQueue = [];
+  const scratchIds = [];
+  let vlmDone = 0, vlmErrs = 0, passed = 0, failed = 0, unsure = 0;
+  let vlmActive = false;
+
+  async function runVlmForTile(tile) {
+    tile.state = "analyzing";
+    renderGrid("analyze");
+    setRun("busy", `Analyzing ${tile.file.name}`);
+    try {
+      const callArgs = {
+        image_ref: tile.remoteUrl,
+        max_new_tokens: 512,
+        caller_user_id: userWorkspace,
+        _rkwargs: true,
+      };
+      if (visualTest) callArgs.visual_test_name = visualTest;
+      else            callArgs.instruction = instruction;
+      const res = await qcSvc.inspect(callArgs);
+      tile.result = res;
+      tile.mode = res.mode || "describe";
+      tile.state = "done";
+      if (tile.mode === "few-shot") {
+        const v = (res.verdict || "unsure").toLowerCase();
+        if (v === "passed") passed++;
+        else if (v === "failed") failed++;
+        else unsure++;
+      }
+      vlmDone++;
+      log(`inspect(${tile.file.name}): ${tile.mode === "few-shot" ? (res.verdict || "unsure") : "described"} in ${res.generation_time_s}s`, "ok");
+    } catch (err) {
+      tile.state = "error";
+      tile.error = err.message || String(err);
+      vlmErrs++;
+      log(`inspect(${tile.file.name}) error: ${tile.error}`, "err");
+    }
+    renderGrid("analyze");
+  }
+
+  async function drainVlm() {
+    if (vlmActive) return;
+    vlmActive = true;
+    while (vlmQueue.length) {
+      const tile = vlmQueue.shift();
+      await runVlmForTile(tile);
+    }
+    vlmActive = false;
+  }
+
+  for (let i = 0; i < pending.length; i++) {
+    const tile = pending[i];
+    tile.state = "uploading";
+    renderGrid("analyze");
+    setRun("busy", `Uploading ${tile.file.name} (${i+1}/${pending.length})`);
+    const alias = `smart-microscopy-assistant-img-${randomSuffix()}`;
+    const scratchId = `${userWorkspace}/${alias}`;
+    const remotePath = `image.${fileExt(tile.file)}`;
+    try {
+      await artMgr.create({
+        alias, type: "generic",
+        manifest: { name: "scratch", description: "scratch", type: "generic" },
+        config: { permissions: { "*": "r" } },
+        stage: true, _rkwargs: true,
+      });
+      await uploadFileToScratch(tile.file, scratchId, remotePath);
+      await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
+      tile.remoteUrl = await presignFromScratch(scratchId, remotePath);
+      tile.state = "uploaded";
+      scratchIds.push(scratchId);
+      renderGrid("analyze");
+      vlmQueue.push(tile);
+      drainVlm(); // fire-and-forget; runs concurrently with the next upload
+    } catch (err) {
+      tile.state = "error";
+      tile.error = "upload failed: " + (err.message || String(err));
+      vlmErrs++;
+      log(`upload(${tile.file.name}) error: ${tile.error}`, "err");
+      renderGrid("analyze");
+    }
+  }
+  // Wait for the VLM queue to drain.
+  while (vlmActive || vlmQueue.length) {
+    await new Promise(r => setTimeout(r, 80));
+  }
+
+  // Cleanup all per-image scratch artifacts.
+  await Promise.allSettled(scratchIds.map(deleteScratch));
+  pipelineRunning = false;
+  $("clearAllBtn").disabled = false;
+  refreshAnalyzeEnabled();
+
+  let summary;
+  if (visualTest) {
+    const parts = [];
+    if (passed) parts.push(`${passed} passed`);
+    if (failed) parts.push(`${failed} failed`);
+    if (unsure) parts.push(`${unsure} unsure`);
+    if (vlmErrs) parts.push(`${vlmErrs} error${vlmErrs === 1 ? "" : "s"}`);
+    summary = parts.join(" · ") || "—";
+  } else {
+    summary = `Analyzed ${vlmDone}${vlmErrs ? ` · ${vlmErrs} error${vlmErrs === 1 ? "" : "s"}` : ""}`;
+  }
+  setRun(vlmErrs ? "error" : "ok", `Done. ${summary}`);
+}
+
+$("runBtn").addEventListener("click", runPipeline);
+
+// ===== Floating details panel =============================================
+// Single shared panel; positioned just below the row containing the active
+// tile, overlapping the row below. Reusing one panel keeps DOM simple and
+// guarantees only one is open at a time.
+
+let detailsPanelEl = null;
+function ensureDetailsPanel(grid) {
+  // The panel lives inside the grid container so its left/right: 0 align with
+  // the grid's content box.
+  if (detailsPanelEl && detailsPanelEl.parentElement === grid) return detailsPanelEl;
+  if (detailsPanelEl && detailsPanelEl.parentElement) detailsPanelEl.parentElement.removeChild(detailsPanelEl);
+  detailsPanelEl = document.createElement("div");
+  detailsPanelEl.className = "grid-details-panel";
+  detailsPanelEl.hidden = true;
+  detailsPanelEl.addEventListener("click", e => e.stopPropagation());
+  grid.appendChild(detailsPanelEl);
+  return detailsPanelEl;
+}
+
+function collapseOpenDetails() {
+  if (!openDetailsTileId) return;
+  if (detailsPanelEl) {
+    detailsPanelEl.classList.remove("shown");
+    detailsPanelEl.hidden = true;
+  }
+  for (const node of document.querySelectorAll(".image-tile.expanded")) {
+    node.classList.remove("expanded");
+  }
+  openDetailsTileId = null;
+}
+function collapseOpenDetailsIfNot(side) {
+  // If the open details belongs to a different grid, close it.
+  if (!openDetailsTileId) return;
+  const s = sideOfTile(openDetailsTileId);
+  if (s !== side) collapseOpenDetails();
+}
+
+function toggleDetails(tileId) {
+  if (openDetailsTileId === tileId) { collapseOpenDetails(); return; }
+  collapseOpenDetails();
+  const ref = tileById(tileId);
+  if (!ref) return;
+  const side = sideOfTile(tileId);
+  const grid = gridFor(side);
+  const panel = ensureDetailsPanel(grid);
+
+  const tileNode = grid.querySelector(`.image-tile[data-id="${tileId}"]`);
+  if (!tileNode) return;
+  tileNode.classList.add("expanded");
+
+  // Render panel content
+  renderDetails(panel, ref.tile);
+  panel.hidden = false;
+
+  // Position the panel just below the tile's row. Find the row's bottom by
+  // looking at all tiles whose offsetTop equals the active tile's offsetTop.
+  const myTop = tileNode.offsetTop;
+  let rowBottom = tileNode.offsetTop + tileNode.offsetHeight;
+  for (const node of grid.querySelectorAll(".image-tile")) {
+    if (node.offsetTop === myTop) {
+      rowBottom = Math.max(rowBottom, node.offsetTop + node.offsetHeight);
+    }
+  }
+  panel.style.top = (rowBottom + 6) + "px";
+
+  // Trigger transition
+  requestAnimationFrame(() => panel.classList.add("shown"));
+  openDetailsTileId = tileId;
+}
+
+function renderDetails(panel, tile) {
+  panel.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "panel-head";
+  const name = document.createElement("div");
+  name.className = "panel-name";
+  name.textContent = tile.file.name;
+  head.appendChild(name);
+  const close = document.createElement("button");
+  close.className = "panel-close"; close.type = "button"; close.title = "Close";
+  close.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  close.addEventListener("click", e => { e.stopPropagation(); collapseOpenDetails(); });
+  head.appendChild(close);
+  panel.appendChild(head);
+
+  if (tile.state === "error") {
+    const r = document.createElement("div");
+    r.className = "panel-reason";
+    r.textContent = "Error: " + (tile.error || "Unknown");
+    panel.appendChild(r);
+    return;
+  }
+  const r = tile.result || {};
+  const reason = document.createElement("div");
+  reason.className = "panel-reason";
+  if (tile.mode === "few-shot") reason.textContent = r.reason || r.description || "(no reason returned)";
+  else                          reason.textContent = r.description || "(no description)";
+  panel.appendChild(reason);
+
+  const pills = document.createElement("div");
+  pills.className = "pill-row";
+  const pillsArr = [];
+  pillsArr.push(`<span class="meta-pill"><strong>mode</strong> ${escapeHTML(tile.mode || "describe")}</span>`);
+  if (r.visual_test_name) pillsArr.push(`<span class="meta-pill"><strong>test</strong> ${escapeHTML(r.visual_test_name)}</span>`);
+  if (r.image_size) pillsArr.push(`<span class="meta-pill"><strong>image</strong> ${r.image_size[0]}×${r.image_size[1]}</span>`);
+  if (r.downscaled_from) pillsArr.push(`<span class="meta-pill"><strong>downscaled from</strong> ${r.downscaled_from.join("×")}</span>`);
+  if (typeof r.tokens_generated === "number") pillsArr.push(`<span class="meta-pill"><strong>tokens</strong> ${r.tokens_generated}</span>`);
+  if (typeof r.tokens_per_second === "number") pillsArr.push(`<span class="meta-pill"><strong>tok/s</strong> ${r.tokens_per_second}</span>`);
+  if (typeof r.generation_time_s === "number") pillsArr.push(`<span class="meta-pill"><strong>gen</strong> ${r.generation_time_s}s</span>`);
+  if (typeof r.processing_time_s === "number") pillsArr.push(`<span class="meta-pill"><strong>e2e</strong> ${r.processing_time_s}s</span>`);
+  if (r.model) pillsArr.push(`<span class="meta-pill"><strong>model</strong> ${escapeHTML(r.model)}</span>`);
+  pills.innerHTML = pillsArr.join("");
+  panel.appendChild(pills);
+
+  if (r.description && r.description !== r.reason) {
+    const raw = document.createElement("div");
+    raw.className = "raw";
+    raw.textContent = r.description;
+    panel.appendChild(raw);
+  }
+}
+
+// ===== Define mode form ===================================================
+let defineIsPublic = false;
+
+function setVisibility(isPublic) {
+  defineIsPublic = !!isPublic;
+  $("visPrivateBtn").classList.toggle("active", !defineIsPublic);
+  $("visPublicBtn").classList.toggle("active",  defineIsPublic);
+  $("visPrivateBtn").setAttribute("aria-checked", String(!defineIsPublic));
+  $("visPublicBtn").setAttribute("aria-checked",  String(defineIsPublic));
+}
+$("visPrivateBtn").addEventListener("click", () => setVisibility(false));
+$("visPublicBtn").addEventListener("click",  () => setVisibility(true));
+
+$("defineName").addEventListener("input", refreshDefineEnabled);
+$("passCriterion").addEventListener("input", () => {
+  const len = $("passCriterion").value.length;
+  $("passCount").textContent = len;
+  $("passCount").className = "counter" + (len > MAX_DESC_CHARS ? " over" : "");
+  refreshDefineEnabled();
+});
+$("failCriterion").addEventListener("input", () => {
+  const len = $("failCriterion").value.length;
+  $("failCount").textContent = len;
+  $("failCount").className = "counter" + (len > MAX_DESC_CHARS ? " over" : "");
+  refreshDefineEnabled();
+});
+
+// Test hook: lets headless smoke tests inject files programmatically. The
+// browser's set_input_files and synthetic-drop paths both fight Chromium's
+// quirks; this is the simplest reliable injection point for Playwright and
+// has no effect on real users (they go through paste / dblclick / drop).
+window.__smaTest = {
+  addFiles(side, fileObjs) { addFiles(side, fileObjs); },
+};
+
+function refreshDefineEnabled() {
+  if (!qcSvc) { $("defineBtn").disabled = true; return; }
+  const name = $("defineName").value.trim();
+  const passC = $("passCriterion").value.trim();
+  const failC = $("failCriterion").value.trim();
+  // Refs are optional (0 each side); text-only tests are valid.
+  const ok = TEST_NAME_RE.test(name)
+          && passC.length > 0 && passC.length <= MAX_DESC_CHARS
+          && failC.length > 0 && failC.length <= MAX_DESC_CHARS
+          && positiveTiles.length <= MAX_EXAMPLES_PER_CLASS
+          && negativeTiles.length <= MAX_EXAMPLES_PER_CLASS;
+  $("defineBtn").disabled = !ok;
+}
+
+$("defineBtn").addEventListener("click", async () => {
+  if (!qcSvc) return;
+  $("defineBtn").disabled = true;
+  $("defineResultBlock").hidden = true;
+  $("defineResultBlock").textContent = "";
+
+  const name = $("defineName").value.trim();
+  const passC = $("passCriterion").value.trim();
+  const failC = $("failCriterion").value.trim();
+  const hasImages = positiveTiles.length > 0 || negativeTiles.length > 0;
+  setDefine("busy", hasImages ? "Uploading examples…" : "Saving…");
+
+  // Skip the scratch artifact entirely for text-only tests.
+  let scratchId = null;
+  try {
+    let posUrls = [], negUrls = [];
+    if (hasImages) {
+      const scratchAlias = `smart-microscopy-assistant-define-${randomSuffix()}`;
+      scratchId = `${userWorkspace}/${scratchAlias}`;
+      await artMgr.create({
+        alias: scratchAlias, type: "generic",
+        manifest: { name: "scratch (visual test)", description: "scratch", type: "generic" },
+        config: { permissions: { "*": "r" } },
+        stage: true, _rkwargs: true,
+      });
+      const posPaths = [];
+      for (let i = 0; i < positiveTiles.length; i++) {
+        const f = positiveTiles[i].file;
+        const p = `positive/${i}.${fileExt(f)}`;
+        await uploadFileToScratch(f, scratchId, p);
+        posPaths.push(p);
+      }
+      const negPaths = [];
+      for (let i = 0; i < negativeTiles.length; i++) {
+        const f = negativeTiles[i].file;
+        const p = `negative/${i}.${fileExt(f)}`;
+        await uploadFileToScratch(f, scratchId, p);
+        negPaths.push(p);
+      }
+      await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
+      log("Presigning each upload …");
+      for (const p of posPaths) posUrls.push(await presignFromScratch(scratchId, p));
+      for (const p of negPaths) negUrls.push(await presignFromScratch(scratchId, p));
+    }
+
+    setDefine("busy", "Saving visual test on the worker…");
+    const rec = await qcSvc.create_visual_test({
+      name,
+      pass_criterion: passC,
+      fail_criterion: failC,
+      positive_image_refs: posUrls,
+      negative_image_refs: negUrls,
+      is_public: defineIsPublic,
+      caller_user_id: userWorkspace,
+      _rkwargs: true,
+    });
+    setDefine("ok", "Saved");
+    $("defineResultBlock").hidden = false;
+    $("defineResultBlock").textContent =
+      `Visual test '${rec.name}' saved (${rec.is_public ? "public" : "private"}).\n` +
+      `${rec.n_positive} positive + ${rec.n_negative} negative reference images cached on the worker.\n` +
+      `Switch to Analyze — the dropdown now lists this test.`;
+    log(`create_visual_test '${name}' OK (n_pos=${rec.n_positive}, n_neg=${rec.n_negative}, public=${rec.is_public})`, "ok");
+
+    $("defineName").value = "";
+    $("passCriterion").value = ""; $("failCriterion").value = "";
+    $("passCount").textContent = "0"; $("failCount").textContent = "0";
+    positiveTiles = []; negativeTiles = [];
+    renderGrid("positive"); renderGrid("negative");
+    setVisibility(false);
+
+    await refreshTests();
+  } catch (err) {
+    setDefine("error", "Failed");
+    $("defineResultBlock").hidden = false;
+    $("defineResultBlock").textContent = "Error: " + (err.message || String(err));
+    log("create_visual_test error: " + (err.message || String(err)), "err");
+  } finally {
+    if (scratchId) await deleteScratch(scratchId);
+    refreshDefineEnabled();
+  }
+});
+</script>
+</body>
+</html>

@@ -777,25 +777,34 @@ class BioEngineWorker:
         # Signal that the worker has completed cleanup
         self._shutdown_event.set()
 
-    async def _create_monitoring_task(self, max_consecutive_errors: int = 5) -> None:
+    async def _create_monitoring_task(
+        self,
+        backoff_initial_seconds: float = 2.0,
+        backoff_max_seconds: float = 60.0,
+    ) -> None:
         """Continuously monitor cluster status and update worker nodes history.
 
         This loop runs while the cluster is active, periodically collecting
-        cluster status information and updating the history. It handles
-        connection errors by attempting to reconnect to the Ray cluster.
-
-        The monitoring task:
-        1. Collects cluster status every <status_interval_seconds>
-        2. Updates cluster_status_history with timestamped entries
-        3. Maintains history size within max_status_history_length
-        4. Handles Ray connection errors with automatic reconnection
-        5. Gracefully handles task cancellation during shutdown
+        cluster status information and updating the history. Errors raised by
+        any monitoring step (Hypha reconnect, Ray client, Serve status, apps
+        manager, …) are treated as transient: the loop logs, sleeps with
+        exponential backoff capped at ``backoff_max_seconds``, then retries.
+        It never self-terminates the worker — only an explicit ``stop()`` /
+        OS signal does. Hypha's own websocket reconnect logic recovers
+        transparently once the server returns, so a multi-hour outage no
+        longer brings every BioEngine worker down with it.
 
         Args:
-            max_consecutive_errors: Maximum number of consecutive errors before stopping
+            backoff_initial_seconds: Base for the exponential backoff after
+                the first error (doubles each subsequent consecutive error
+                until ``backoff_max_seconds``).
+            backoff_max_seconds: Cap on the per-error sleep so a stuck
+                worker still polls roughly once a minute.
 
         Raises:
-            Exception: If an unrecoverable error occurs during monitoring.
+            Exception: Only on unexpected errors outside the monitoring
+                step (e.g. ``is_ready`` initialisation). Errors inside a
+                monitoring tick are handled and retried.
         """
         try:
             # Signal that the worker is ready
@@ -857,21 +866,33 @@ class BioEngineWorker:
                     # Run BioEngine Datasets monitoring
                     # await self.dataset_manager.monitor_datasets()
 
-                    # Reset error counter on success
+                    # Log recovery after a streak of failures
+                    if consecutive_errors > 0:
+                        self.logger.info(
+                            f"Monitoring loop recovered after "
+                            f"{consecutive_errors} consecutive error(s)"
+                        )
                     consecutive_errors = 0
 
+                except asyncio.CancelledError:
+                    # Propagate so the outer handler performs clean shutdown.
+                    raise
                 except Exception as e:
-                    self.logger.error(f"Error in monitoring task: {e}")
                     consecutive_errors += 1
-                    # Don't raise the exception to avoid crashing the monitoring task
-                    # Instead, continue monitoring until the maximum of consecutive errors is reached
-
-                    if consecutive_errors >= max_consecutive_errors:
-                        self.logger.error(
-                            f"Stopping monitoring loop after {consecutive_errors} consecutive errors"
-                        )
-                        # Reset the is_ready event to indicate worker is no longer ready
-                        self.is_ready.clear()
+                    # Exponential backoff capped at backoff_max_seconds.
+                    backoff = min(
+                        backoff_max_seconds,
+                        backoff_initial_seconds * (2 ** (consecutive_errors - 1)),
+                    )
+                    # Escalate severity once the streak indicates a sustained
+                    # outage so dashboards / alerts still notice, without
+                    # ever killing the worker.
+                    log = self.logger.warning if consecutive_errors <= 5 else self.logger.error
+                    log(
+                        f"Error in monitoring task (#{consecutive_errors} consecutive, "
+                        f"sleeping {backoff:.0f}s before retry): {e}"
+                    )
+                    await asyncio.sleep(backoff)
 
         except asyncio.CancelledError:
             self.logger.info("Monitoring task cancelled.")

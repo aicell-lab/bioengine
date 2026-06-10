@@ -1,14 +1,13 @@
-name: Build and Publish Docker Images
+name: Build and Publish Datasets Image
 
 on:
   push:
     branches:
       - main
     paths:
-      - 'bioengine/**'
-      - 'requirements*.txt'
-      - 'pyproject.toml'
-      - 'docker/**'
+      - 'bioengine/datasets/**'
+      - 'requirements-datasets.txt'
+      - 'docker/datasets.Dockerfile'
       - '.dockerignore'
   workflow_dispatch:
 
@@ -50,7 +49,7 @@ jobs:
             sudo apt-get update && sudo apt-get install -y skopeo
         fi
 
-        IMAGE="docker://ghcr.io/aicell-lab/bioengine-worker"
+        IMAGE="docker://ghcr.io/aicell-lab/bioengine-datasets"
         echo "🔍 Fetching tags for $IMAGE..."
 
         if ! skopeo list-tags "$IMAGE" > /dev/null 2>&1; then
@@ -60,17 +59,14 @@ jobs:
 
         TAGS=$(skopeo list-tags "$IMAGE" | jq -r '.Tags[]')
 
-        # Canonical X.Y.Z tags only — this is what this workflow publishes.
-        # Excludes manually-pushed rc tags (0.9.1-rcN) and external-cluster
-        # overlays (0.9.1-rcN-rayX.Y.Z), neither of which CI ever produces.
         LATEST_VERSION=$(echo "$TAGS" \
           | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
           | sort -V \
           | tail -n1)
 
         if [ -z "$LATEST_VERSION" ]; then
-          echo "❌ No version tags found for $IMAGE."
-          exit 1
+          echo "ℹ️  No prior version tags found for $IMAGE — first publish."
+          LATEST_VERSION="0.0.0"
         fi
 
         echo "📦 Latest published version: $LATEST_VERSION"
@@ -92,21 +88,6 @@ jobs:
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-
-    - name: Build and push worker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: docker/worker.Dockerfile
-        platforms: linux/amd64,linux/arm64
-        push: true
-        tags: |
-          ghcr.io/aicell-lab/bioengine-worker:latest
-          ghcr.io/aicell-lab/bioengine-worker:${{ env.VERSION }}
-        labels: |
-          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-        cache-from: type=gha,scope=worker
-        cache-to: type=gha,mode=max,scope=worker
 
     - name: Build and push datasets image
       uses: docker/build-push-action@v5

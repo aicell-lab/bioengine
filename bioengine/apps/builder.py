@@ -229,6 +229,7 @@ class AppBuilder:
         self,
         application_id: str,
         artifact_id: str,
+        version: Optional[str],
         non_secret_env_vars: Dict[str, str],
         secret_env_vars: Dict[str, str],
         hypha_token: Optional[str],
@@ -253,6 +254,8 @@ class AppBuilder:
             env_vars["HYPHA_SERVER_URL"] = self.server.config.public_base_url
             env_vars["HYPHA_WORKSPACE"] = self.server.config.workspace
         env_vars["HYPHA_ARTIFACT_ID"] = artifact_id
+        if version is not None:
+            env_vars["HYPHA_ARTIFACT_VERSION"] = version
 
         if self.worker_service_id:
             env_vars["BIOENGINE_WORKER_SERVICE_ID"] = self.worker_service_id
@@ -404,18 +407,21 @@ class AppBuilder:
     # ──────────────────────────── resources ──────────────────────────────
 
     @staticmethod
-    def _sum_resources(spec: Dict[str, Any]) -> Dict[str, int]:
+    def _sum_resources(
+        spec: Dict[str, Any], proxy_memory_in_gb: float
+    ) -> Dict[str, int]:
         totals: Dict[str, Union[int, float]] = {"num_cpus": 0, "num_gpus": 0, "memory": 0}
         for meta in spec["classes"].values():
             opts = meta.get("ray_actor_options", {})
             totals["num_cpus"] += opts.get("num_cpus", 0)
             totals["num_gpus"] += opts.get("num_gpus", 0)
             totals["memory"] += opts.get("memory", 0)
-        # ProxyDeployment overhead
+        # ProxyDeployment overhead — CPU/GPU come from the decorator;
+        # memory reservation is the deploy-time ``proxy_memory_in_gb``.
         proxy_opts = getattr(ProxyDeployment, "ray_actor_options", {}) or {}
         totals["num_cpus"] += proxy_opts.get("num_cpus", 0)
         totals["num_gpus"] += proxy_opts.get("num_gpus", 0)
-        totals["memory"] += proxy_opts.get("memory", 0)
+        totals["memory"] += int(proxy_memory_in_gb * (1024**3))
         return {k: int(v) if isinstance(v, (int, float)) else v for k, v in totals.items()}
 
     # ────────────────────────── auth resolution ──────────────────────────
@@ -487,6 +493,7 @@ class AppBuilder:
         hypha_token: Optional[str],
         disable_gpu: bool,
         max_ongoing_requests: int,
+        proxy_memory_in_gb: float,
         debug: bool,
         started_at: Optional[float] = None,
         last_updated_at: Optional[float] = None,
@@ -538,7 +545,8 @@ class AppBuilder:
             k: v for k, v in flat_env_vars.items() if not k.startswith("_")
         }
         env_vars = self._build_env_vars(
-            application_id, artifact_id, non_secret_env_vars, secret_env_vars, hypha_token
+            application_id, artifact_id, version,
+            non_secret_env_vars, secret_env_vars, hypha_token,
         )
         runtime_env = self._build_introspect_runtime_env(
             pkg_root_dir, env_vars
@@ -579,7 +587,7 @@ class AppBuilder:
                 opts = meta.get("ray_actor_options", {})
                 if opts.get("num_gpus"):
                     opts["num_gpus"] = 0
-        required_resources = self._sum_resources(spec)
+        required_resources = self._sum_resources(spec, proxy_memory_in_gb)
 
         # 6. Generate the proxy service token.
         proxy_service_token = await self.server.generate_token(
@@ -616,6 +624,7 @@ class AppBuilder:
             ),
             "disable_gpu": disable_gpu,
             "max_ongoing_requests": max_ongoing_requests,
+            "proxy_memory_in_gb": proxy_memory_in_gb,
             "application_resources": required_resources,
             "authorized_users": effective_authorized_users,
             "available_methods": available_methods,
@@ -670,6 +679,7 @@ class AppBuilder:
             proxy_args=proxy_args,
             runtime_env=runtime_env,
             pkg_uri=pkg_uri,
+            proxy_memory_in_gb=proxy_memory_in_gb,
         )
 
     async def submit(self, built_app: "BuiltApp", application_id: str) -> None:
@@ -693,6 +703,7 @@ class AppBuilder:
                     application_id,
                     f"/{application_id}",
                     built_app.pkg_uri,
+                    built_app.proxy_memory_in_gb,
                 ),
             )
         except ray.exceptions.RayTaskError as exc:
@@ -722,6 +733,7 @@ class BuiltApp:
         "proxy_args",
         "runtime_env",
         "pkg_uri",
+        "proxy_memory_in_gb",
     )
 
     def __init__(
@@ -732,6 +744,7 @@ class BuiltApp:
         proxy_args: Dict[str, Any],
         runtime_env: Dict[str, Any],
         pkg_uri: str,
+        proxy_memory_in_gb: float,
     ) -> None:
         self.metadata = metadata
         self.spec = spec
@@ -739,3 +752,4 @@ class BuiltApp:
         self.proxy_args = proxy_args
         self.runtime_env = runtime_env
         self.pkg_uri = pkg_uri
+        self.proxy_memory_in_gb = proxy_memory_in_gb

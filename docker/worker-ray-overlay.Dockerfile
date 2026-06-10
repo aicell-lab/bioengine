@@ -5,17 +5,17 @@
 #
 # Build:
 #   docker build \
-#       --build-arg BIOENGINE_IMAGE=ghcr.io/aicell-lab/bioengine-worker:0.9.0 \
-#       --build-arg RAY_VERSION=2.54.1 \
+#       --build-arg BIOENGINE_IMAGE=ghcr.io/aicell-lab/bioengine-worker:<bioengine-version> \
+#       --build-arg RAY_VERSION=<ray-version> \
 #       -f docker/worker-ray-overlay.Dockerfile \
-#       -t bioengine-worker:0.9.0-ray2.54.1 .
+#       -t bioengine-worker:<bioengine-version>-ray<ray-version> .
 #
-# BIOENGINE_IMAGE: the published image to use as the base. Update this
-#   when you want a newer BioEngine release as the floor.
+# BIOENGINE_IMAGE: the published image to use as the base. Pin to a specific
+#   tag for reproducible builds; `latest` is fine for ad-hoc work.
 # RAY_VERSION:     the exact Ray release to swap in. Must satisfy the
 #   range BioEngine supports (>=2.33.0, <3.0.0) — see pyproject.toml.
 
-ARG BIOENGINE_IMAGE=ghcr.io/aicell-lab/bioengine-worker:0.9.0
+ARG BIOENGINE_IMAGE=ghcr.io/aicell-lab/bioengine-worker:latest
 FROM ${BIOENGINE_IMAGE}
 
 ARG RAY_VERSION=2.55.1

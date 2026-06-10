@@ -11,7 +11,6 @@ from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 from ray import serve
-from ray.serve.schema import ApplicationDetails, ServeStatus
 
 from bioengine import __version__
 from bioengine.apps.builder import AppBuilder
@@ -552,23 +551,55 @@ class AppsManager:
         self._deployed_applications.pop(application_id, None)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
+    def _project_replicas(
+        self, replicas: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Pick the fields the dashboard needs from each ReplicaDetails entry.
+
+        Keeps the payload small — `actor_id`, `worker_id`, `log_file_path`
+        are intentionally dropped since the dashboard does not need them.
+        """
+        out = []
+        for r in replicas or []:
+            out.append(
+                {
+                    "replica_id": r.get("replica_id"),
+                    "node_id": r.get("node_id"),
+                    "node_ip": r.get("node_ip"),
+                    "node_instance_id": r.get("node_instance_id"),
+                    "state": r.get("state"),
+                    "pid": r.get("pid"),
+                    "start_time_s": r.get("start_time_s"),
+                }
+            )
+        return out
+
     async def _get_deployment_status(
         self,
         application_id: str,
-        application_status: ApplicationDetails,
+        application_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
     ) -> Dict[str, Dict[str, Any]]:
         deployments_info = {}
-        for deployment_name, deployment_info in application_status.deployments.items():
+        for deployment_name, deployment_info in (
+            application_details.get("deployments") or {}
+        ).items():
+            replicas = self._project_replicas(deployment_info.get("replicas") or [])
+            replica_states: Dict[str, int] = {}
+            for r in replicas:
+                state = r.get("state")
+                if state:
+                    replica_states[state] = replica_states.get(state, 0) + 1
+
             deployments_info[deployment_name] = {
-                "status": deployment_info.status.value,
-                "message": deployment_info.message,
-                "replica_states": deployment_info.replica_states,
+                "status": deployment_info.get("status"),
+                "message": deployment_info.get("message", ""),
+                "replica_states": replica_states,
+                "replicas": replicas,
                 "logs": None,
             }
 
-            # Collect logs for all tracked actor IDs
             try:
                 deployment_logs = await self.ray_cluster.proxy_actor_handle.get_deployment_logs.remote(
                     application_id=application_id,
@@ -671,7 +702,7 @@ class AppsManager:
     async def _get_app_status(
         self,
         application_id: str,
-        serve_status: ServeStatus,
+        instance_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
     ) -> Dict[str, Any]:
@@ -692,15 +723,17 @@ class AppsManager:
 
         # Get application info from tracked applications
         application_info = self._deployed_applications[application_id]
-        application_status = serve_status.applications.get(application_id)
+        application_details = (instance_details.get("applications") or {}).get(
+            application_id
+        )
 
-        if application_status:
-            status = application_status.status.value
-            message = application_status.message
+        if application_details:
+            status = application_details.get("status")
+            message = application_details.get("message", "")
 
             deployments = await self._get_deployment_status(
                 application_id=application_id,
-                application_status=application_status,
+                application_details=application_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
             )
@@ -898,6 +931,13 @@ class AppsManager:
                     timeout=10.0,
                 )
 
+                static_site_url = None
+                if app_data.get("frontend_entry"):
+                    static_site_url = get_static_site_url(
+                        artifact_id=app_data["artifact_id"],
+                        server_url=self.server.config.public_base_url,
+                    )
+
                 self._deployed_applications[application_id] = {
                     "display_name": app_data["display_name"],
                     "description": app_data["description"],
@@ -908,9 +948,11 @@ class AppsManager:
                     "hypha_token": None,
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
+                    "proxy_memory_in_gb": app_data.get("proxy_memory_in_gb", 0.5),
                     "application_resources": app_data["application_resources"],
                     "authorized_users": updated_authorized_users,
                     "available_methods": app_data["available_methods"],
+                    "static_site_url": static_site_url,
                     "started_at": app_data["started_at"],
                     "last_updated_at": app_data["last_updated_at"],
                     "last_updated_by": app_data["last_updated_by"],
@@ -1506,7 +1548,7 @@ class AppsManager:
         ),
         hypha_token: str = Field(
             None,
-            description="Hypha connection token for authentication. The token will be set as environment variable 'HYPHA_TOKEN' in the application deployments. An already existing environment variable named 'HYPHA_TOKEN' will not be overwritten. The token is used to authenticate to BioEngine datasets and enables Hypha API calls as logged in user. If not specified, uses None (no token) for a new application, or preserves the previous token if updating an existing application (only when application_id is specified).",
+            description="Hypha connection token to set as environment variable 'HYPHA_TOKEN' inside the application's Ray actor. Required for apps whose code reads HYPHA_TOKEN at startup (e.g. apps that authenticate to BioEngine datasets, read private artifacts, or call back to Hypha as the logged-in user). Pass the deploying user's token unless you are certain the app does not need it. If omitted: when redeploying an existing instance (matching application_id), the previously stored token is preserved; on a fresh instance the actor receives no token and any app reading HYPHA_TOKEN at __init__ will fail. The '--env HYPHA_TOKEN=...' flag is silently ignored by the app builder; always use this parameter.",
         ),
         disable_gpu: bool = Field(
             None,
@@ -1515,6 +1557,10 @@ class AppsManager:
         max_ongoing_requests: int = Field(
             None,
             description="Maximum number of concurrent requests this application instance can handle simultaneously. Higher values allow more parallelism but use more memory. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
+        ),
+        proxy_memory_in_gb: float = Field(
+            None,
+            description="Memory reservation (in GiB) for the application's ProxyDeployment — the actor that terminates the WebSocket/WebRTC connection and forwards client payloads to the compute deployments. Ray uses this as a scheduling hint (places the proxy on a node with at least this much free memory), not a hard runtime cap. Together with `max_ongoing_requests`, it bounds the worst-case memory pressure on whatever node receives the proxy, biasing placement away from resource-tight nodes (e.g. the head). If not specified, uses 0.5 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified). Typical values: 0.5-4 GiB; raise for apps expecting large image/array uploads.",
         ),
         auto_redeploy: bool = Field(
             None,
@@ -1634,6 +1680,8 @@ class AppsManager:
                     disable_gpu = existing_app["disable_gpu"]
                 if max_ongoing_requests is None:
                     max_ongoing_requests = existing_app["max_ongoing_requests"]
+                if proxy_memory_in_gb is None:
+                    proxy_memory_in_gb = existing_app.get("proxy_memory_in_gb", 0.5)
                 if auto_redeploy is None:
                     auto_redeploy = existing_app["auto_redeploy"]
                 if debug is None:
@@ -1656,6 +1704,8 @@ class AppsManager:
                     disable_gpu = False
                 if max_ongoing_requests is None:
                     max_ongoing_requests = 10
+                if proxy_memory_in_gb is None:
+                    proxy_memory_in_gb = 0.5
                 if auto_redeploy is None:
                     auto_redeploy = False
                 if debug is None:
@@ -1750,6 +1800,7 @@ class AppsManager:
                 hypha_token=hypha_token,
                 disable_gpu=disable_gpu,
                 max_ongoing_requests=max_ongoing_requests,
+                proxy_memory_in_gb=proxy_memory_in_gb,
                 debug=debug,
                 started_at=started_at,
                 last_updated_at=last_updated_at,
@@ -1787,6 +1838,7 @@ class AppsManager:
                 "hypha_token": hypha_token,
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,
+                "proxy_memory_in_gb": proxy_memory_in_gb,
                 "application_resources": app.metadata["resources"],
                 "authorized_users": app.metadata["authorized_users"],
                 "available_methods": app.metadata["available_methods"],
@@ -2076,13 +2128,15 @@ class AppsManager:
 
         # Get Ray Serve status
         await self.ray_cluster.check_connection()
-        serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
+        instance_details = (
+            await self.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote()
+        )
 
         # Iterate over applications to check
         status_tasks = [
             self._get_app_status(
                 application_id=application_id,
-                serve_status=serve_status,
+                instance_details=instance_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
             )

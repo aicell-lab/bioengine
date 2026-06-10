@@ -1,5 +1,5 @@
-# Use an official slim Python 3.11 image
-FROM python:3.11.9-slim
+# Rolling tag — each build picks up current Debian-slim security patches.
+FROM python:3.11-slim
 
 # Set environment variables for installation
 ENV PYTHONUNBUFFERED=1 \
@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     build-essential \
     curl \
