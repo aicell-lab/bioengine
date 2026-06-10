@@ -9,7 +9,6 @@ on:
       - '!bioengine/datasets/**'
       - 'requirements-worker.txt'
       - 'docker/worker.Dockerfile'
-      - 'docker/worker-ray-overlay.Dockerfile'
       - '.dockerignore'
   workflow_dispatch:
 

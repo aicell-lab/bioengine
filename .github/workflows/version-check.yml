@@ -48,8 +48,10 @@ jobs:
         CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
         echo "Changed files:" && echo "$CHANGED_FILES" | sed 's/^/ - /'
 
-        # Match original path filters
-        if echo "$CHANGED_FILES" | grep -E '^(bioengine/|docker/|requirements[^/]*\.txt$|pyproject\.toml$|\.dockerignore$)' >/dev/null; then
+        # Match the file patterns that drive the published image builds.
+        # docker/worker-ray-overlay.Dockerfile is a user-facing recipe, not part
+        # of the canonical worker image build — changes to it do not need a bump.
+        if echo "$CHANGED_FILES" | grep -E '^(bioengine/|docker/worker\.Dockerfile$|docker/datasets\.Dockerfile$|requirements[^/]*\.txt$|pyproject\.toml$|\.dockerignore$)' >/dev/null; then
           echo "RELEVANT_CHANGE=true" >> $GITHUB_ENV
           echo "relevant=true" >> $GITHUB_OUTPUT
           echo "Relevant changes detected; version check will run."
