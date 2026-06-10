@@ -332,9 +332,24 @@
     display: inline-flex; align-items: center; justify-content: center;
     font-size: 0.95rem; line-height: 1; cursor: pointer; padding: 0;
     z-index: 3;
+    opacity: 0; pointer-events: none;
     transition: background 0.12s var(--ease-out),
                 color 0.12s var(--ease-out),
-                transform 0.12s var(--ease-out);
+                transform 0.12s var(--ease-out),
+                opacity 140ms var(--ease-out);
+  }
+  /* Touch devices have no hover — keep X visible there so users can still
+     remove tiles by tapping. */
+  @media (hover: hover) and (pointer: fine) {
+    .image-tile:hover .tile-x { opacity: 1; pointer-events: auto; }
+    .image-tile:focus-within .tile-x { opacity: 1; pointer-events: auto; }
+    /* Hide the badge while the user is hovering — X + badge fighting for
+       the top of the tile is visually noisy and the user is already
+       looking at the image at hover-time. */
+    .image-tile:hover .tile-badge.shown { opacity: 0; }
+  }
+  @media not all and (hover: hover) {
+    .image-tile .tile-x { opacity: 1; pointer-events: auto; }
   }
   .image-tile .tile-x:hover { background: #450a0a; color: #fca5a5; border-color: var(--fail); }
   .image-tile .tile-x:active { transform: scale(0.93); }
@@ -511,6 +526,127 @@
     border: 1px solid var(--border); border-radius: 0.55rem;
   }
   .test-meta strong { color: var(--fg); }
+
+  /* --- Visual-tests list (in the Tests tab) --------------------------- */
+  .test-list {
+    display: flex; flex-direction: column; gap: 0.5rem;
+  }
+  .test-list-empty {
+    color: var(--fg-muted); font-size: 0.85rem; text-align: center;
+    padding: 1rem 0;
+  }
+  .test-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.85rem;
+    align-items: center;
+    padding: 0.65rem 0.85rem;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 0.6rem;
+    transition: border-color 0.12s var(--ease-out),
+                background 0.12s var(--ease-out);
+  }
+  .test-row:hover { border-color: var(--border-strong); }
+  .test-row-main { min-width: 0; }
+  .test-row-name {
+    font-size: 0.92rem; font-weight: 600; color: var(--fg);
+    display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
+    margin-bottom: 0.25rem;
+  }
+  .test-row-criterion {
+    font-size: 0.78rem; color: var(--fg-dim);
+    line-height: 1.4;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .test-row-criterion .label-pass { color: var(--pass); font-weight: 600; }
+  .test-row-criterion .label-fail { color: var(--fail); font-weight: 600; }
+  .test-row-meta {
+    font-size: 0.72rem; color: var(--fg-muted); margin-top: 0.25rem;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.25rem;
+    padding: 0.1rem 0.45rem; border-radius: 999px;
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.04em; border: 1px solid;
+  }
+  .chip.chip-public  { color: var(--accent); background: rgba(56,189,248,0.10); border-color: rgba(56,189,248,0.35); }
+  .chip.chip-private { color: var(--fg-dim); background: var(--bg-2); border-color: var(--border-strong); }
+  .chip.chip-yours   { color: #fbbf24; background: rgba(251,191,36,0.10); border-color: rgba(251,191,36,0.35); }
+  .test-row-delete {
+    background: transparent; color: var(--fg-dim);
+    border: 1px solid var(--border); border-radius: 0.45rem;
+    padding: 0.3rem 0.65rem; font: inherit; font-size: 0.78rem;
+    font-weight: 600; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                border-color 0.12s var(--ease-out),
+                transform 0.12s var(--ease-out);
+  }
+  .test-row-delete:hover {
+    background: rgba(239,68,68,0.10); color: var(--fail);
+    border-color: rgba(239,68,68,0.4);
+  }
+  .test-row-delete:active { transform: scale(0.96); }
+  .test-row-delete:disabled {
+    opacity: 0.4; cursor: not-allowed; transform: none;
+  }
+  .test-row-delete svg { width: 0.85rem; height: 0.85rem; }
+
+  /* --- Public/private toggle in the new-test form --------------------- */
+  .visibility-toggle {
+    display: inline-flex; gap: 0.35rem;
+    background: var(--bg-0); border: 1px solid var(--border);
+    border-radius: 0.55rem; padding: 0.25rem;
+  }
+  .visibility-toggle button {
+    background: transparent; color: var(--fg-dim); border: 0;
+    padding: 0.4rem 0.85rem; cursor: pointer; font: inherit;
+    font-size: 0.82rem; font-weight: 600; border-radius: 0.4rem;
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out);
+  }
+  .visibility-toggle button:hover { color: var(--fg); }
+  .visibility-toggle button:active { transform: scale(0.97); }
+  .visibility-toggle button.active {
+    background: var(--bg-3); color: var(--fg);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .visibility-toggle button svg { width: 0.95rem; height: 0.95rem; }
+
+  /* --- Pass / Fail criterion textareas -------------------------------- */
+  .criterion-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;
+  }
+  @media (max-width: 640px) {
+    .criterion-grid { grid-template-columns: 1fr; }
+  }
+  .criterion-block {
+    background: var(--bg-0); border: 1px solid var(--border);
+    border-radius: 0.6rem; padding: 0.65rem 0.75rem;
+  }
+  .criterion-block.pass { border-color: rgba(34,197,94,0.30); background: rgba(34,197,94,0.04); }
+  .criterion-block.fail { border-color: rgba(239,68,68,0.30); background: rgba(239,68,68,0.04); }
+  .criterion-block .criterion-label {
+    font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em;
+    display: flex; align-items: center; gap: 0.4rem;
+    margin-bottom: 0.4rem;
+  }
+  .criterion-block.pass .criterion-label { color: var(--pass); }
+  .criterion-block.fail .criterion-label { color: var(--fail); }
+  .criterion-block textarea {
+    background: transparent; border: 0; padding: 0;
+    min-height: 4.5rem; font-size: 0.85rem;
+  }
+  .criterion-block textarea:focus { box-shadow: none; }
+  .criterion-block .criterion-help {
+    margin-top: 0.3rem; font-size: 0.7rem; color: var(--fg-muted);
+    display: flex; justify-content: space-between;
+  }
 
   /* --- Define mode submit result block --------------------------------- */
   .create-result {
@@ -731,7 +867,7 @@
         🔍 Analyze
       </button>
       <button id="modeDefineBtn" class="seg" data-mode="define" role="tab" aria-selected="false">
-        ＋ Define visual test
+        📚 Visual tests
       </button>
     </div>
   </div>
@@ -791,26 +927,72 @@
 
   </div>
 
-  <!-- ====== DEFINE VIEW ====================================== -->
+  <!-- ====== VISUAL TESTS VIEW ====================================== -->
   <div id="defineView" class="signed-in-only" hidden>
 
+    <!-- Existing tests browser -->
     <div class="card">
-      <h2><span class="h-icon">📝</span> Visual test definition</h2>
+      <h2>
+        <span class="h-icon">📚</span> Existing tests
+        <span class="small" style="margin-left:auto;font-weight:400;">your tests + public tests · click delete to remove your own</span>
+      </h2>
+      <div id="testList" class="test-list"></div>
+    </div>
+
+    <!-- New test creation -->
+    <div class="card">
+      <h2><span class="h-icon">＋</span> Create a new visual test</h2>
       <label class="field-label">Test name <span class="small">(lowercase, hyphens, max 50 chars)</span></label>
       <input id="defineName" type="text" placeholder="e.g. focus-quality"
              pattern="^[a-z0-9][a-z0-9-]{0,49}$" maxlength="50"
              style="margin-bottom: 0.75rem;" />
-      <label class="field-label">Criterion <span class="small">(what makes an image pass vs. fail)</span></label>
-      <textarea id="defineDesc" maxlength="800"
-                placeholder="e.g. PASS: sharp cell outlines, uniform illumination. FAIL: motion blur, saturated regions."></textarea>
-      <div class="field-help">
-        <span>The criterion is fed to the VLM verbatim. Be specific.</span>
-        <span><span id="defineDescCount" class="counter">0</span> / 800</span>
+
+      <label class="field-label">Conditions <span class="small">(both required; reference images below are optional)</span></label>
+      <div class="criterion-grid">
+        <div class="criterion-block pass">
+          <div class="criterion-label">✓ When does it PASS?</div>
+          <textarea id="passCriterion" maxlength="800"
+                    placeholder="e.g. Sharp cell outlines, uniform illumination across the field, no obvious artefacts."></textarea>
+          <div class="criterion-help">
+            <span>Used in the prompt verbatim.</span>
+            <span><span id="passCount" class="counter">0</span> / 800</span>
+          </div>
+        </div>
+        <div class="criterion-block fail">
+          <div class="criterion-label">✗ When does it FAIL?</div>
+          <textarea id="failCriterion" maxlength="800"
+                    placeholder="e.g. Motion blur, saturated regions, dark spots, or out-of-focus areas."></textarea>
+          <div class="criterion-help">
+            <span>Used in the prompt verbatim.</span>
+            <span><span id="failCount" class="counter">0</span> / 800</span>
+          </div>
+        </div>
+      </div>
+
+      <label class="field-label" style="margin-top: 0.85rem;">Visibility</label>
+      <div class="visibility-toggle" role="radiogroup" aria-label="Visibility">
+        <button type="button" id="visPrivateBtn" class="active" data-vis="private" role="radio" aria-checked="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="11" width="18" height="11" rx="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+          <span>Private (only you)</span>
+        </button>
+        <button type="button" id="visPublicBtn" data-vis="public" role="radio" aria-checked="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="2" y1="12" x2="22" y2="12"/>
+            <path d="M12 2a15 15 0 0 1 0 20a15 15 0 0 1 0 -20z"/>
+          </svg>
+          <span>Public (anyone)</span>
+        </button>
       </div>
     </div>
 
     <div class="card">
-      <h2><span class="h-icon">📌</span> Reference examples <span class="small" style="margin-left:auto;font-weight:400;">click a box, then paste or double-click to upload (1–<span class="exMax">5</span> each)</span></h2>
+      <h2><span class="h-icon">📌</span> Reference examples <span class="small" style="margin-left:auto;font-weight:400;">optional · 0–<span class="exMax">5</span> each · skip if you want a text-only test</span></h2>
       <div class="dual-canvas">
         <div id="positiveBox" class="image-canvas" tabindex="0" data-side="positive">
           <div class="canvas-label pass">✓ Should pass <span class="small" style="margin-left:auto;font-weight:400;color:var(--fg-muted);">(<span id="positiveCount">0</span>/<span class="exMax">5</span>)</span></div>
@@ -986,7 +1168,7 @@ async function connectWithToken(token) {
   const sid = SERVICE_ID || APP_FALLBACK;
   qcSvc = await server.getService(sid, { _rkwargs: true });
   log("Service handle ready.", "ok");
-  await Promise.all([refreshTestsDropdown(), refreshModelInfo()]);
+  await Promise.all([refreshTests(), refreshModelInfo()]);
   refreshAnalyzeEnabled();
   refreshDefineEnabled();
 }
@@ -1084,31 +1266,47 @@ function applySourceRadio() {
 $("srcTest").addEventListener("change", applySourceRadio);
 $("srcFreetext").addEventListener("change", applySourceRadio);
 
-async function refreshTestsDropdown() {
+// Shared cache so the Tests-tab list and the Analyze dropdown stay in sync.
+let cachedTests = [];
+
+async function refreshTests() {
   if (!qcSvc) return;
+  try {
+    cachedTests = await qcSvc.list_visual_tests({
+      caller_user_id: userWorkspace, _rkwargs: true,
+    });
+    log(`Loaded ${cachedTests.length} visual test${cachedTests.length === 1 ? "" : "s"}.`);
+  } catch (err) {
+    cachedTests = [];
+    log("list_visual_tests failed: " + err.message, "err");
+  }
+  refreshTestsDropdown();
+  refreshTestList();
+}
+
+function refreshTestsDropdown() {
   const sel = $("testSelect");
   const prior = sel.value;
-  try {
-    const tests = await qcSvc.list_visual_tests({ _rkwargs: true });
-    sel.innerHTML = "";
-    if (tests.length === 0) {
+  sel.innerHTML = "";
+  if (cachedTests.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = ""; opt.textContent = "(no visual tests visible to you yet — switch to Visual tests)";
+    sel.appendChild(opt);
+  } else {
+    for (const t of cachedTests) {
       const opt = document.createElement("option");
-      opt.value = ""; opt.textContent = "(no visual tests defined yet — switch to Define)";
+      opt.value = t.name;
+      const tag = t.owned_by_you ? "" : (t.is_public ? " (public)" : "");
+      opt.textContent = t.name + tag;
+      opt.dataset.pass = t.pass_criterion || t.description || "";
+      opt.dataset.fail = t.fail_criterion || "";
+      opt.dataset.nPos = String(t.n_positive ?? "?");
+      opt.dataset.nNeg = String(t.n_negative ?? "?");
+      opt.dataset.public = t.is_public ? "1" : "0";
+      opt.dataset.mine = t.owned_by_you ? "1" : "0";
       sel.appendChild(opt);
-    } else {
-      for (const t of tests) {
-        const opt = document.createElement("option");
-        opt.value = t.name; opt.textContent = t.name;
-        opt.dataset.description = t.description || "";
-        opt.dataset.nPos = String(t.n_positive ?? "?");
-        opt.dataset.nNeg = String(t.n_negative ?? "?");
-        sel.appendChild(opt);
-      }
-      if (prior && [...sel.options].some(o => o.value === prior)) sel.value = prior;
     }
-    log(`Loaded ${tests.length} visual test${tests.length === 1 ? "" : "s"}.`);
-  } catch (err) {
-    log("list_visual_tests failed: " + err.message, "err");
+    if (prior && [...sel.options].some(o => o.value === prior)) sel.value = prior;
   }
   updateTestMeta();
 }
@@ -1119,18 +1317,116 @@ function updateTestMeta() {
   const meta = $("testMeta");
   if (!sel.value || !opt) { meta.hidden = true; }
   else {
-    const desc = opt.dataset.description || "";
+    const passC = opt.dataset.pass || "";
+    const failC = opt.dataset.fail || "";
     const np = opt.dataset.nPos, nn = opt.dataset.nNeg;
+    const isPublic = opt.dataset.public === "1";
+    const isMine = opt.dataset.mine === "1";
+    const chips = [];
+    if (isPublic) chips.push(`<span class="chip chip-public">Public</span>`);
+    else          chips.push(`<span class="chip chip-private">Private</span>`);
+    if (isMine)   chips.push(`<span class="chip chip-yours">Yours</span>`);
+    const refs = `${np} pos, ${nn} neg reference${np === "1" && nn === "1" ? "" : "s"}`;
     meta.hidden = false;
     meta.innerHTML =
-      `<strong>${escapeHTML(sel.value)}</strong>` +
-      ` · ${np} positive, ${nn} negative reference${np === "1" && nn === "1" ? "" : "s"}` +
-      (desc ? `<br><span style="color:var(--fg);">${escapeHTML(desc)}</span>` : "");
+      `<strong>${escapeHTML(sel.value)}</strong> ${chips.join(" ")} · ${refs}` +
+      (passC ? `<br><span class="label-pass" style="color:var(--pass);font-weight:600;">PASS:</span> <span style="color:var(--fg);">${escapeHTML(passC)}</span>` : "") +
+      (failC ? `<br><span class="label-fail" style="color:var(--fail);font-weight:600;">FAIL:</span> <span style="color:var(--fg);">${escapeHTML(failC)}</span>` : "");
   }
   applySourceRadio();
 }
 $("testSelect").addEventListener("change", updateTestMeta);
-$("refreshTestsBtn").addEventListener("click", () => { refreshTestsDropdown(); });
+$("refreshTestsBtn").addEventListener("click", () => { refreshTests(); });
+
+// ---- Existing-tests list rendering (Visual Tests tab) -------------------
+function refreshTestList() {
+  const wrap = $("testList");
+  wrap.innerHTML = "";
+  if (!cachedTests || cachedTests.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "test-list-empty";
+    empty.textContent = "No visual tests yet. Define your first one below.";
+    wrap.appendChild(empty);
+    return;
+  }
+  // Sort: your own first, then public, then by name.
+  const sorted = cachedTests.slice().sort((a, b) => {
+    if (a.owned_by_you !== b.owned_by_you) return a.owned_by_you ? -1 : 1;
+    if (!!a.is_public !== !!b.is_public) return a.is_public ? -1 : 1;
+    return (a.name || "").localeCompare(b.name || "");
+  });
+  for (const t of sorted) {
+    const row = document.createElement("div");
+    row.className = "test-row";
+
+    const main = document.createElement("div");
+    main.className = "test-row-main";
+
+    const name = document.createElement("div");
+    name.className = "test-row-name";
+    const nameText = document.createElement("span");
+    nameText.textContent = t.name;
+    name.appendChild(nameText);
+    if (t.is_public) {
+      const c = document.createElement("span"); c.className = "chip chip-public";
+      c.textContent = "Public"; name.appendChild(c);
+    } else {
+      const c = document.createElement("span"); c.className = "chip chip-private";
+      c.textContent = "Private"; name.appendChild(c);
+    }
+    if (t.owned_by_you) {
+      const c = document.createElement("span"); c.className = "chip chip-yours";
+      c.textContent = "Yours"; name.appendChild(c);
+    }
+    main.appendChild(name);
+
+    const passC = t.pass_criterion || t.description || "";
+    const failC = t.fail_criterion || "";
+    const crit = document.createElement("div");
+    crit.className = "test-row-criterion";
+    crit.innerHTML =
+      (passC ? `<span class="label-pass">PASS:</span> ${escapeHTML(passC)} ` : "") +
+      (failC ? `<br><span class="label-fail">FAIL:</span> ${escapeHTML(failC)}` : "");
+    main.appendChild(crit);
+
+    const meta = document.createElement("div");
+    meta.className = "test-row-meta";
+    const refStr = `${t.n_positive ?? 0} positive, ${t.n_negative ?? 0} negative reference${(t.n_positive === 1 && t.n_negative === 1) ? "" : "s"}`;
+    meta.textContent = refStr;
+    main.appendChild(meta);
+
+    row.appendChild(main);
+
+    const del = document.createElement("button");
+    del.className = "test-row-delete";
+    del.type = "button";
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1.5 14a2 2 0 0 1 -2 2h-7a2 2 0 0 1 -2 -2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v2"/></svg><span>Delete</span>';
+    if (!t.owned_by_you) {
+      del.disabled = true;
+      del.title = "Only the creator can delete this test.";
+    } else {
+      del.addEventListener("click", async () => {
+        if (!window.confirm(`Delete visual test "${t.name}"? This cannot be undone.`)) return;
+        del.disabled = true;
+        try {
+          await qcSvc.delete_visual_test({
+            name: t.name, caller_user_id: userWorkspace, _rkwargs: true,
+          });
+          log(`Deleted visual test '${t.name}'.`, "ok");
+          await refreshTests();
+        } catch (err) {
+          log(`delete_visual_test(${t.name}) error: ${err.message || err}`, "err");
+          alert("Delete failed: " + (err.message || err));
+          del.disabled = false;
+        }
+      });
+    }
+    row.appendChild(del);
+
+    wrap.appendChild(row);
+  }
+}
 
 // ===== Active-box selection model =========================================
 function setActiveBox(id) {
@@ -1564,6 +1860,7 @@ async function runPipeline() {
       const callArgs = {
         image_ref: tile.remoteUrl,
         max_new_tokens: 512,
+        caller_user_id: userWorkspace,
         _rkwargs: true,
       };
       if (visualTest) callArgs.visual_test_name = visualTest;
@@ -1780,11 +2077,29 @@ function renderDetails(panel, tile) {
 }
 
 // ===== Define mode form ===================================================
+let defineIsPublic = false;
+
+function setVisibility(isPublic) {
+  defineIsPublic = !!isPublic;
+  $("visPrivateBtn").classList.toggle("active", !defineIsPublic);
+  $("visPublicBtn").classList.toggle("active",  defineIsPublic);
+  $("visPrivateBtn").setAttribute("aria-checked", String(!defineIsPublic));
+  $("visPublicBtn").setAttribute("aria-checked",  String(defineIsPublic));
+}
+$("visPrivateBtn").addEventListener("click", () => setVisibility(false));
+$("visPublicBtn").addEventListener("click",  () => setVisibility(true));
+
 $("defineName").addEventListener("input", refreshDefineEnabled);
-$("defineDesc").addEventListener("input", () => {
-  const len = $("defineDesc").value.length;
-  $("defineDescCount").textContent = len;
-  $("defineDescCount").className = "counter" + (len > MAX_DESC_CHARS ? " over" : "");
+$("passCriterion").addEventListener("input", () => {
+  const len = $("passCriterion").value.length;
+  $("passCount").textContent = len;
+  $("passCount").className = "counter" + (len > MAX_DESC_CHARS ? " over" : "");
+  refreshDefineEnabled();
+});
+$("failCriterion").addEventListener("input", () => {
+  const len = $("failCriterion").value.length;
+  $("failCount").textContent = len;
+  $("failCount").className = "counter" + (len > MAX_DESC_CHARS ? " over" : "");
   refreshDefineEnabled();
 });
 
@@ -1799,80 +2114,96 @@ window.__smaTest = {
 function refreshDefineEnabled() {
   if (!qcSvc) { $("defineBtn").disabled = true; return; }
   const name = $("defineName").value.trim();
-  const desc = $("defineDesc").value.trim();
+  const passC = $("passCriterion").value.trim();
+  const failC = $("failCriterion").value.trim();
+  // Refs are optional (0 each side); text-only tests are valid.
   const ok = TEST_NAME_RE.test(name)
-          && desc.length > 0 && desc.length <= MAX_DESC_CHARS
-          && positiveTiles.length >= 1 && positiveTiles.length <= MAX_EXAMPLES_PER_CLASS
-          && negativeTiles.length  >= 1 && negativeTiles.length  <= MAX_EXAMPLES_PER_CLASS;
+          && passC.length > 0 && passC.length <= MAX_DESC_CHARS
+          && failC.length > 0 && failC.length <= MAX_DESC_CHARS
+          && positiveTiles.length <= MAX_EXAMPLES_PER_CLASS
+          && negativeTiles.length <= MAX_EXAMPLES_PER_CLASS;
   $("defineBtn").disabled = !ok;
 }
 
 $("defineBtn").addEventListener("click", async () => {
   if (!qcSvc) return;
   $("defineBtn").disabled = true;
-  setDefine("busy", "Uploading examples…");
   $("defineResultBlock").hidden = true;
   $("defineResultBlock").textContent = "";
 
   const name = $("defineName").value.trim();
-  const desc = $("defineDesc").value.trim();
-  const scratchAlias = `smart-microscopy-assistant-define-${randomSuffix()}`;
-  const scratchId = `${userWorkspace}/${scratchAlias}`;
-  try {
-    await artMgr.create({
-      alias: scratchAlias, type: "generic",
-      manifest: { name: "scratch (visual test)", description: "scratch", type: "generic" },
-      config: { permissions: { "*": "r" } },
-      stage: true, _rkwargs: true,
-    });
-    const posPaths = [];
-    for (let i = 0; i < positiveTiles.length; i++) {
-      const f = positiveTiles[i].file;
-      const p = `positive/${i}.${fileExt(f)}`;
-      await uploadFileToScratch(f, scratchId, p);
-      posPaths.push(p);
-    }
-    const negPaths = [];
-    for (let i = 0; i < negativeTiles.length; i++) {
-      const f = negativeTiles[i].file;
-      const p = `negative/${i}.${fileExt(f)}`;
-      await uploadFileToScratch(f, scratchId, p);
-      negPaths.push(p);
-    }
-    await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
+  const passC = $("passCriterion").value.trim();
+  const failC = $("failCriterion").value.trim();
+  const hasImages = positiveTiles.length > 0 || negativeTiles.length > 0;
+  setDefine("busy", hasImages ? "Uploading examples…" : "Saving…");
 
-    log("Presigning each upload …");
-    const posUrls = []; for (const p of posPaths) posUrls.push(await presignFromScratch(scratchId, p));
-    const negUrls = []; for (const p of negPaths) negUrls.push(await presignFromScratch(scratchId, p));
+  // Skip the scratch artifact entirely for text-only tests.
+  let scratchId = null;
+  try {
+    let posUrls = [], negUrls = [];
+    if (hasImages) {
+      const scratchAlias = `smart-microscopy-assistant-define-${randomSuffix()}`;
+      scratchId = `${userWorkspace}/${scratchAlias}`;
+      await artMgr.create({
+        alias: scratchAlias, type: "generic",
+        manifest: { name: "scratch (visual test)", description: "scratch", type: "generic" },
+        config: { permissions: { "*": "r" } },
+        stage: true, _rkwargs: true,
+      });
+      const posPaths = [];
+      for (let i = 0; i < positiveTiles.length; i++) {
+        const f = positiveTiles[i].file;
+        const p = `positive/${i}.${fileExt(f)}`;
+        await uploadFileToScratch(f, scratchId, p);
+        posPaths.push(p);
+      }
+      const negPaths = [];
+      for (let i = 0; i < negativeTiles.length; i++) {
+        const f = negativeTiles[i].file;
+        const p = `negative/${i}.${fileExt(f)}`;
+        await uploadFileToScratch(f, scratchId, p);
+        negPaths.push(p);
+      }
+      await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
+      log("Presigning each upload …");
+      for (const p of posPaths) posUrls.push(await presignFromScratch(scratchId, p));
+      for (const p of negPaths) negUrls.push(await presignFromScratch(scratchId, p));
+    }
 
     setDefine("busy", "Saving visual test on the worker…");
     const rec = await qcSvc.create_visual_test({
-      name, description: desc,
+      name,
+      pass_criterion: passC,
+      fail_criterion: failC,
       positive_image_refs: posUrls,
       negative_image_refs: negUrls,
+      is_public: defineIsPublic,
+      caller_user_id: userWorkspace,
       _rkwargs: true,
     });
     setDefine("ok", "Saved");
     $("defineResultBlock").hidden = false;
     $("defineResultBlock").textContent =
-      `Visual test '${rec.name}' saved.\n` +
+      `Visual test '${rec.name}' saved (${rec.is_public ? "public" : "private"}).\n` +
       `${rec.n_positive} positive + ${rec.n_negative} negative reference images cached on the worker.\n` +
       `Switch to Analyze — the dropdown now lists this test.`;
-    log(`create_visual_test '${name}' OK (n_positive=${rec.n_positive}, n_negative=${rec.n_negative})`, "ok");
+    log(`create_visual_test '${name}' OK (n_pos=${rec.n_positive}, n_neg=${rec.n_negative}, public=${rec.is_public})`, "ok");
 
-    $("defineName").value = ""; $("defineDesc").value = "";
-    $("defineDescCount").textContent = "0";
+    $("defineName").value = "";
+    $("passCriterion").value = ""; $("failCriterion").value = "";
+    $("passCount").textContent = "0"; $("failCount").textContent = "0";
     positiveTiles = []; negativeTiles = [];
     renderGrid("positive"); renderGrid("negative");
+    setVisibility(false);
 
-    await refreshTestsDropdown();
+    await refreshTests();
   } catch (err) {
     setDefine("error", "Failed");
     $("defineResultBlock").hidden = false;
     $("defineResultBlock").textContent = "Error: " + (err.message || String(err));
     log("create_visual_test error: " + (err.message || String(err)), "err");
   } finally {
-    await deleteScratch(scratchId);
+    if (scratchId) await deleteScratch(scratchId);
     refreshDefineEnabled();
   }
 });

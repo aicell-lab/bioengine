@@ -6,24 +6,29 @@ defined "visual test" (few-shot verdict mode), and returns the VLM's textual
 judgement.
 
 A visual test is a re-usable definition of "what to look for" in an image.
-The replica persists a small library of visual tests on its local workspace
-at $HOME/visual_tests. Each test records a name, a free-text criterion, and
-a set of small reference images (up to 5 positive + 5 negative) downloaded
-once at create_visual_test() time. inspect() then builds a multi-image
-prompt prepending those references and asks the VLM to return one of three
-verdicts: PASSED, FAILED, or UNSURE (when it cannot make a confident
-judgement from the visible content).
+Each test has:
+  - a name
+  - a PASS criterion (free text)
+  - a FAIL criterion (free text)
+  - 0–5 positive reference images and 0–5 negative reference images
+  - an owner (Hypha user id) and a public/private flag
+
+inspect() prepends the references (if any) and the PASS/FAIL criteria to
+the prompt and asks the VLM to return one of three verdicts: PASSED,
+FAILED, or UNSURE (when the visible evidence is ambiguous).
+
+Tests are stored under $HOME/visual_tests/<test-id>/visual_test.json,
+where <test-id> is a hash of owner + name. Each user can have a test
+named "focus-quality" without colliding with another user's. Public
+tests are visible to and usable by everyone; delete is owner-only.
 
 Backed by Qwen2.5-VL-3B-Instruct via HuggingFace transformers on a single
 NVIDIA A40-16C vGPU slice (Ampere, sm_86; 16 GB framebuffer time-shared
-with co-tenants on the host A40). ~6 GB FP16 weights + Qwen's vision
-encoder + KV cache fit comfortably. The 7B-AWQ stack was tried first but
-no viable AWQ kernel path serves Qwen2.5-VL on this cluster (vLLM V0
-multimodal regression / inspector bug / autoawq-kernels lm_head dtype
-mismatch); 3B FP16 lands cleanly without quantisation.
+with co-tenants on the host A40).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -41,47 +46,68 @@ logger = logging.getLogger("ray.serve")
 _MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
 _DEFAULT_SERVER_URL = "https://hypha.aicell.io"
 
-_MAX_IMAGE_BYTES = 25 * 1024 * 1024      # 25 MB
+_MAX_IMAGE_BYTES = 25 * 1024 * 1024
 _MAX_INSTRUCTION_CHARS = 4000
-# Downscale targets: Qwen's native processor cap of 1280 * 28 * 28 pixels
-# (≈ 1003520, about 1000×1000) is the largest tile the model will accept
-# without internal downsampling. Plus a longest-side guard so a 1×10000
-# strip is still reduced.
 _MAX_PIXELS = 1280 * 28 * 28
 _MAX_LONG_SIDE = 2048
-# Hard reject above ~14000² (200 megapixel). At that scale we'd be holding
-# 0.5+ GB of decoded pixels in RAM just to throw them away.
 _HARD_REJECT_PIXELS = 200 * 1024 * 1024
 _DOWNLOAD_TIMEOUT_S = 30
 _GENERATE_TIMEOUT_S = 180
 
-# Visual-test library.
-# Reference images are aggressively downscaled before storage so the prompt
-# stays within Qwen's working-set even when N is at the upper bound.
-# 512x512 -> ~64 vision tokens after Qwen's 28-pixel patch + 2x2 merge,
-# so 5+5 references add ~640 vision tokens on top of the new image.
 _EXAMPLE_MAX_PIXELS = 512 * 512
 _EXAMPLE_MAX_LONG_SIDE = 768
 _MAX_EXAMPLES_PER_CLASS = 5
-_MIN_EXAMPLES_PER_CLASS = 1
+_MIN_EXAMPLES_PER_CLASS = 0  # text-only tests are allowed
 _MAX_TEST_NAME_CHARS = 50
 _MAX_TEST_DESC_CHARS = 800
 _TEST_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,49}$")
 _VERDICT_VALUES = ("passed", "failed", "unsure")
 
+# Reserved owner id for the case where Hypha did not inject a user context
+# (e.g. direct calls bypassing Hypha auth). Tests created under this id are
+# treated as system-owned and cannot be deleted from the UI.
+_ANON_OWNER = "anonymous"
+
 
 def _resolve_tests_dir() -> Path:
-    """Pick a writable directory for the visual-test library at actor startup.
-
-    The Ray runtime_env venv often boots with HOME=/nonexistent (no home
-    for the service account); BioEngine injects the real per-deployment HOME
-    after the process is up. Compute lazily so we never bake the
-    module-import-time value into module state.
-    """
     home = os.environ.get("HOME", "")
     if home and home != "/nonexistent":
         return Path(home) / "visual_tests"
     return Path("/tmp") / "smart-microscopy-assistant" / "visual_tests"
+
+
+def _owner_from_context(
+    context: Optional[Dict[str, Any]],
+    caller_user_id: Optional[str] = None,
+) -> str:
+    """Resolve the caller's stable user id.
+
+    Today the BioEngine proxy consumes Hypha's `require_context` payload at
+    its outer wrapper and does NOT forward it to the deployment method, so
+    `context` here is almost always None. As a pragmatic fix we let the
+    client also pass `caller_user_id` (the workspace name doubles as a
+    stable Hypha identity, e.g. 'ws-user-github|49943582'). Resolution
+    order: explicit caller_user_id -> context -> "anonymous".
+    """
+    if isinstance(caller_user_id, str) and caller_user_id.strip():
+        return caller_user_id.strip()
+    if isinstance(context, dict) and isinstance(context.get("user"), dict):
+        uid = context["user"].get("id")
+        if isinstance(uid, str) and uid:
+            return uid
+    return _ANON_OWNER
+
+
+def _test_id_for(owner: str, name: str) -> str:
+    """Filesystem-safe per-owner test directory name.
+
+    We include the user-visible name as a suffix so directory listings stay
+    debuggable, but the leading hash guarantees per-owner namespacing so two
+    users can both have a test called e.g. "focus-quality".
+    """
+    h = hashlib.sha1(f"{owner}:{name}".encode("utf-8")).hexdigest()[:10]
+    safe_name = re.sub(r"[^a-z0-9-]", "-", name.lower())[:48]
+    return f"{h}-{safe_name}"
 
 
 @serve.deployment(
@@ -91,26 +117,17 @@ def _resolve_tests_dir() -> Path:
         "memory": 12 * 1024**3,
         "runtime_env": {
             "pip": [
-                # Frozen versions. Any change forces a 5-15 min env rebuild.
-                # ray pinned to host: KTH Ray pod runs 2.55.1.
                 "ray[serve]==2.55.1",
-                # vLLM and AutoAWQ were both ruled out for serving
-                # Qwen2.5-VL-7B on this cluster (see module docstring).
-                # 3B FP16 uses the plain transformers loader and runs
-                # without any quantisation kernel.
                 "transformers==4.51.3",
                 "accelerate==1.6.0",
                 "torch==2.5.1",
                 "torchvision==0.20.1",
-                # numpy 1.26 keeps ABI in sync with the host Ray pod's pandas.
                 "numpy==1.26.4",
                 "pillow==10.4.0",
                 "httpx==0.27.2",
                 "hypha-rpc==0.20.54",
             ],
             "env_vars": {
-                # Triton's JIT cache wants a writable dir; runtime_env venv's
-                # default $HOME is read-only on this Ray pod.
                 "TRITON_CACHE_DIR": "/tmp/triton-cache",
                 "HF_HOME": "/tmp/hf-home",
                 "XDG_CACHE_HOME": "/tmp/xdg-cache",
@@ -133,13 +150,12 @@ class SmartMicroscopyAssistant:
         self._tests_dir: Optional[Path] = None
 
     async def async_init(self) -> None:
-        """Load the VLM and connect to Hypha for artifact resolution."""
         import os as _os
         for d in ("/tmp/triton-cache", "/tmp/hf-home", "/tmp/xdg-cache"):
             _os.makedirs(d, exist_ok=True)
         self._tests_dir = _resolve_tests_dir()
         self._tests_dir.mkdir(parents=True, exist_ok=True)
-        existing = self._list_test_records()
+        existing = self._list_all_test_records()
         logger.info(
             "Visual-test library at %s (%d test%s)",
             self._tests_dir, len(existing), "" if len(existing) == 1 else "s",
@@ -176,15 +192,6 @@ class SmartMicroscopyAssistant:
         logger.info("Qwen2.5-VL-3B ready on %s.", next(self._engine.parameters()).device)
 
     async def test_deployment(self) -> None:
-        """No-op smoke test.
-
-        The real first-request smoke happens lazily on the first inspect()
-        call. Keeping this trivial avoids two known frustrations during
-        BioEngine startup: (1) Qwen's processor rejects synthetic tiles
-        below min_pixels, and (2) vLLM's async generate path is sensitive
-        to the nested asyncio loop the BioEngine wrapper uses to launch
-        test_deployment.
-        """
         return None
 
     async def check_health(self) -> None:
@@ -196,13 +203,6 @@ class SmartMicroscopyAssistant:
     # ---------------------------------------------------------------- helpers
 
     async def _ensure_artifact_manager(self) -> Any:
-        """Return a working artifact-manager handle, reconnecting on staleness.
-
-        Long-lived Hypha WebSocket sessions can drop with 'Connection is
-        closed' after idle periods. Detect by sending a cheap probe call;
-        on failure, tear down and rebuild self._server / self._artifact_manager
-        once and return the fresh handle.
-        """
         if self._artifact_manager is not None:
             try:
                 await self._artifact_manager.list(parent_id="public/applications")
@@ -231,7 +231,6 @@ class SmartMicroscopyAssistant:
         return self._artifact_manager
 
     async def _resolve_to_url(self, image_ref: str) -> str:
-        """Map either an HTTPS URL or '<workspace>/<alias>:<path>' to a fetchable URL."""
         if image_ref.startswith(("http://", "https://")):
             return image_ref
         if ":" not in image_ref or "/" not in image_ref.split(":", 1)[0]:
@@ -254,13 +253,6 @@ class SmartMicroscopyAssistant:
         max_pixels: int = _MAX_PIXELS,
         max_long_side: int = _MAX_LONG_SIDE,
     ) -> tuple["Image.Image", Optional[tuple[int, int]]]:
-        """Stream-download up to _MAX_IMAGE_BYTES, decode to RGB PIL image,
-        and downscale to ≤ max_pixels / max_long_side.
-
-        Returns (image, original_size_or_none). original_size is None when no
-        downscale was applied; otherwise it carries the pre-downscale (w, h)
-        so callers can surface it.
-        """
         import io
         import httpx
         from PIL import Image
@@ -312,27 +304,22 @@ class SmartMicroscopyAssistant:
 
     # --------------------------------------------- visual-test library helpers
 
-    def _test_dir(self, name: str) -> Path:
+    def _test_dir(self, owner: str, name: str) -> Path:
         if self._tests_dir is None:
             raise RuntimeError("visual-test library not initialized yet.")
-        return self._tests_dir / name
+        return self._tests_dir / _test_id_for(owner, name)
 
-    def _test_json_path(self, name: str) -> Path:
-        return self._test_dir(name) / "visual_test.json"
+    def _test_json_path(self, owner: str, name: str) -> Path:
+        return self._test_dir(owner, name) / "visual_test.json"
 
-    def _load_test(self, name: str) -> dict:
-        if not _TEST_NAME_RE.match(name):
-            raise ValueError(
-                f"visual-test name must match {_TEST_NAME_RE.pattern} "
-                f"(got: {name!r})"
-            )
-        path = self._test_json_path(name)
+    def _load_test_record(self, owner: str, name: str) -> dict:
+        path = self._test_json_path(owner, name)
         if not path.exists():
             raise ValueError(f"visual test {name!r} not found.")
         with open(path, "r") as f:
             return json.load(f)
 
-    def _list_test_records(self) -> List[dict]:
+    def _list_all_test_records(self) -> List[dict]:
         if self._tests_dir is None or not self._tests_dir.exists():
             return []
         out = []
@@ -349,17 +336,30 @@ class SmartMicroscopyAssistant:
                 logger.warning("Skipping corrupt visual test %s: %s", child.name, e)
         return out
 
+    def _find_test_for_caller(self, name: str, caller_id: str) -> dict:
+        """Return the most specific accessible record for a given test name.
+
+        Resolution order:
+          1. caller's own test (highest priority — your private one wins over
+             a public one with the same name)
+          2. any public test with that name
+        """
+        own = self._test_json_path(caller_id, name)
+        if own.exists():
+            with open(own, "r") as f:
+                return json.load(f)
+        for rec in self._list_all_test_records():
+            if rec.get("name") == name and bool(rec.get("is_public")):
+                return rec
+        raise ValueError(f"visual test {name!r} not found or not accessible.")
+
     async def _save_example_images(
         self,
         test_dir: Path,
         side: str,                 # "positive" or "negative"
         image_refs: List[str],
     ) -> tuple[list[str], list[str]]:
-        """Download each ref, downscale tight, write PNG to disk.
-
-        Returns (list of relative paths under test_dir, list of source urls).
-        """
-        from PIL import Image  # noqa: F401  (touched here only to surface ImportError early)
+        from PIL import Image  # noqa: F401
 
         side_dir = test_dir / side
         side_dir.mkdir(parents=True, exist_ok=True)
@@ -377,9 +377,6 @@ class SmartMicroscopyAssistant:
             source_urls.append(url)
         return rel_paths, source_urls
 
-    # Separate system prompts per mode. The verdict-anchored prompt primes
-    # the 3B model to default to UNSURE on any criterion-shaped question, so
-    # describe mode uses an open-ended analyst prompt instead.
     _SYSTEM_PROMPT_DESCRIBE = (
         "You are a microscopy image analyst. Answer the user's question "
         "about the provided microscopy image, grounded strictly in what is "
@@ -390,16 +387,15 @@ class SmartMicroscopyAssistant:
         "You are a microscopy quality-control assistant. Your job is to "
         "decide whether a microscopy image meets a stated visual-test "
         "criterion. Base every judgement on visible evidence in the image. "
-        "Possible verdicts are PASSED (the criterion is clearly met), "
-        "FAILED (the criterion is clearly violated), or UNSURE (the "
-        "evidence is ambiguous or insufficient). Be precise, do not invent "
-        "details, and keep responses short."
+        "Possible verdicts are PASSED (the PASS condition is clearly met), "
+        "FAILED (the FAIL condition applies), or UNSURE (the evidence is "
+        "ambiguous or insufficient). Be precise, do not invent details, "
+        "and keep responses short."
     )
 
     async def _run_vlm(
         self, image: "Image.Image", instruction: str, max_new_tokens: int
     ) -> tuple[str, int]:
-        """Free-text describe path: single image + free-text instruction."""
         messages = [
             {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT_DESCRIBE}]},
             {"role": "user", "content": [
@@ -415,28 +411,32 @@ class SmartMicroscopyAssistant:
         visual_test: dict,
         positive_images: List["Image.Image"],
         negative_images: List["Image.Image"],
-        instruction_override: Optional[str],
         max_new_tokens: int,
     ) -> tuple[str, int]:
-        """Few-shot verdict path: prepend positive/negative examples, ask for
-        PASSED / FAILED / UNSURE."""
-        criterion = (instruction_override or visual_test["description"]).strip()
+        """Few-shot verdict path; works with 0..N references on either side."""
+        pass_text = (visual_test.get("pass_criterion") or "").strip()
+        fail_text = (visual_test.get("fail_criterion") or "").strip()
+
         user_content: List[Dict[str, Any]] = [
             {"type": "text", "text":
                 f"Visual test: {visual_test['name']}\n"
-                f"Criterion: {criterion}\n\n"
-                f"Reference images that PASS this criterion:"},
+                f"PASS condition: {pass_text or '(none specified)'}\n"
+                f"FAIL condition: {fail_text or '(none specified)'}"},
         ]
-        for img in positive_images:
-            user_content.append({"type": "image", "image": img})
+        if positive_images:
+            user_content.append({"type": "text", "text":
+                "Reference images that PASS this criterion:"})
+            for img in positive_images:
+                user_content.append({"type": "image", "image": img})
+        if negative_images:
+            user_content.append({"type": "text", "text":
+                "Reference images that FAIL this criterion:"})
+            for img in negative_images:
+                user_content.append({"type": "image", "image": img})
         user_content.append({"type": "text", "text":
-            "Reference images that FAIL this criterion:"})
-        for img in negative_images:
-            user_content.append({"type": "image", "image": img})
-        user_content.append({"type": "text", "text":
-            "Now evaluate this new image against the same criterion. Compare "
-            "against the references and decide whether it PASSED, FAILED, or "
-            "is UNSURE:"})
+            "Now evaluate this new image. Decide whether it PASSED, FAILED, "
+            "or is UNSURE based on the conditions above (and the references "
+            "if provided):"})
         user_content.append({"type": "image", "image": new_image})
         user_content.append({"type": "text", "text":
             "Reply on the first line with exactly `VERDICT: passed`, "
@@ -459,11 +459,6 @@ class SmartMicroscopyAssistant:
         ordered_images: List["Image.Image"],
         max_new_tokens: int,
     ) -> tuple[str, int]:
-        """Run the model on a chat-templated prompt with N images. The order in
-        `ordered_images` MUST match the order of <|image_pad|> placeholders the
-        chat template emits — which is the document order of `{"type":"image"}`
-        entries inside `messages`.
-        """
         import torch
 
         def _generate():
@@ -499,9 +494,6 @@ class SmartMicroscopyAssistant:
 
     @staticmethod
     def _parse_verdict(text: str) -> tuple[str, str]:
-        """Parse 'VERDICT: passed|failed|unsure' and 'REASON: ...' out of the
-        model output. Returns (verdict, reason). When the output does not
-        follow the schema the verdict defaults to 'unsure'."""
         verdict = "unsure"
         reason = text.strip()
         m = re.search(r"VERDICT\s*:\s*(passed|failed|unsure)\b", text, flags=re.IGNORECASE)
@@ -555,82 +547,90 @@ class SmartMicroscopyAssistant:
             description=(
                 "Visual-test identifier. Lowercase letters, digits, and "
                 "hyphens; max 50 chars; must start with a letter or digit. "
-                "Example: 'focus-quality'. Re-using an existing name "
-                "overwrites it."
+                "Two different users can each have a test with the same "
+                "name without colliding. Re-using your own name overwrites."
             ),
         ),
-        description: str = Field(
+        pass_criterion: str = Field(
             ...,
             description=(
-                "Free-text criterion describing what makes an image PASS or "
-                "FAIL this visual test. Max 800 chars. Example: 'Sharp cell "
-                "outlines, no motion blur, distinct staining patterns'."
+                "Free-text description of what makes an image PASS this test "
+                "(must hold for the verdict to be 'passed'). Max 800 chars."
+            ),
+        ),
+        fail_criterion: str = Field(
+            ...,
+            description=(
+                "Free-text description of what makes an image FAIL this test "
+                "(must hold for the verdict to be 'failed'). Max 800 chars."
             ),
         ),
         positive_image_refs: list = Field(
-            ...,
+            default_factory=list,
             description=(
-                "List of 1–5 image references that exemplify the criterion "
-                "(i.e. images that should PASS). Each entry can be an HTTPS "
-                "URL (public or presigned) or a Hypha artifact reference "
-                "'<workspace>/<alias>:<file_path>'. Private artifacts must "
-                "be presigned ahead of time or fetched server-side via "
-                "artifact-manager."
+                "Optional 0–5 image references that should PASS. Each entry "
+                "can be an HTTPS URL or a Hypha artifact ref "
+                "'<workspace>/<alias>:<path>'. Omit for a text-only test."
             ),
         ),
         negative_image_refs: list = Field(
-            ...,
+            default_factory=list,
             description=(
-                "List of 1–5 image references that VIOLATE the criterion "
-                "(i.e. images that should FAIL). Same accepted formats as "
-                "positive_image_refs."
+                "Optional 0–5 image references that should FAIL. Same "
+                "accepted formats as positive_image_refs."
             ),
         ),
+        is_public: bool = Field(
+            False,
+            description=(
+                "When True, the test is visible to and usable by every "
+                "user. When False (default) only the creator can list or "
+                "use it. Delete is owner-only regardless."
+            ),
+        ),
+        caller_user_id: Optional[str] = Field(
+            None,
+            description=(
+                "Stable Hypha user / workspace id of the caller. The "
+                "BioEngine proxy currently does not forward Hypha's auth "
+                "context to deployment methods, so the client must pass "
+                "this explicitly to participate in ownership/visibility. "
+                "Falls back to context.user.id then 'anonymous'."
+            ),
+        ),
+        context: Optional[Dict[str, Any]] = Field(
+            None,
+            description="Authentication context, automatically provided by Hypha.",
+        ),
     ) -> dict:
-        """Define or replace a visual test in the on-replica test library.
-
-        Downloads each reference image, downscales it to a small fixed budget
-        (so the few-shot prompt stays within the model's working context),
-        and persists the visual-test record on the replica's local disk under
-        $HOME/visual_tests/<name>/. Subsequent inspect() calls can then
-        reference the test by name via the `visual_test_name` parameter.
-
-        Returns the saved visual-test record (without raw image bytes).
-        """
+        """Define or replace one of your visual tests."""
+        owner = _owner_from_context(context, caller_user_id)
         if not _TEST_NAME_RE.match(name):
             raise ValueError(
                 f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
             )
-        if not isinstance(description, str) or not description.strip():
-            raise ValueError("description must be a non-empty string.")
-        if len(description) > _MAX_TEST_DESC_CHARS:
-            raise ValueError(
-                f"description exceeds {_MAX_TEST_DESC_CHARS}-char limit "
-                f"(got {len(description)})."
-            )
+        for label, value in (("pass_criterion", pass_criterion), ("fail_criterion", fail_criterion)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label} must be a non-empty string.")
+            if len(value) > _MAX_TEST_DESC_CHARS:
+                raise ValueError(
+                    f"{label} exceeds {_MAX_TEST_DESC_CHARS}-char limit "
+                    f"(got {len(value)})."
+                )
         for side_name, refs in (
             ("positive", positive_image_refs),
             ("negative", negative_image_refs),
         ):
             if not isinstance(refs, list):
                 raise ValueError(f"{side_name}_image_refs must be a list.")
-            if len(refs) < _MIN_EXAMPLES_PER_CLASS:
-                raise ValueError(
-                    f"{side_name}_image_refs needs at least "
-                    f"{_MIN_EXAMPLES_PER_CLASS} entr"
-                    f"{'y' if _MIN_EXAMPLES_PER_CLASS == 1 else 'ies'} "
-                    f"(got {len(refs)})."
-                )
             if len(refs) > _MAX_EXAMPLES_PER_CLASS:
                 raise ValueError(
                     f"{side_name}_image_refs exceeds the "
-                    f"{_MAX_EXAMPLES_PER_CLASS}-example cap (got {len(refs)}). "
-                    f"More examples eat the model's context budget without "
-                    f"improving few-shot quality."
+                    f"{_MAX_EXAMPLES_PER_CLASS}-example cap (got {len(refs)})."
                 )
 
         import shutil
-        test_dir = self._test_dir(name)
+        test_dir = self._test_dir(owner, name)
         if test_dir.exists():
             shutil.rmtree(test_dir)
         test_dir.mkdir(parents=True, exist_ok=True)
@@ -647,52 +647,111 @@ class SmartMicroscopyAssistant:
 
         record = {
             "name": name,
-            "description": description.strip(),
+            "pass_criterion": pass_criterion.strip(),
+            "fail_criterion": fail_criterion.strip(),
             "positive_images": pos_paths,
             "negative_images": neg_paths,
             "positive_source_urls": pos_urls,
             "negative_source_urls": neg_urls,
             "n_positive": len(pos_paths),
             "n_negative": len(neg_paths),
+            "is_public": bool(is_public),
+            "created_by": owner,
             "created_at": time.time(),
         }
-        with open(self._test_json_path(name), "w") as f:
+        with open(self._test_json_path(owner, name), "w") as f:
             json.dump(record, f, indent=2)
         logger.info(
-            "Saved visual test %r: %d positive, %d negative examples at %s",
-            name, record["n_positive"], record["n_negative"], test_dir,
+            "Saved visual test %r (owner=%s, public=%s): %d pos / %d neg",
+            name, owner, record["is_public"], record["n_positive"], record["n_negative"],
         )
         return record
 
     @schema_method
-    async def list_visual_tests(self) -> list:
-        """List the visual tests defined on this replica."""
-        return self._list_test_records()
+    async def list_visual_tests(
+        self,
+        caller_user_id: Optional[str] = Field(
+            None,
+            description="Stable Hypha user / workspace id of the caller.",
+        ),
+        context: Optional[Dict[str, Any]] = Field(
+            None,
+            description="Authentication context, automatically provided by Hypha.",
+        ),
+    ) -> list:
+        """List visual tests visible to the caller.
+
+        Returns: the caller's own tests + every public test (regardless of
+        owner). Each record carries `is_public`, `created_by`, and an
+        `owned_by_you` boolean so the UI can branch on it without computing
+        the comparison itself.
+        """
+        caller_id = _owner_from_context(context, caller_user_id)
+        out = []
+        for rec in self._list_all_test_records():
+            owner = rec.get("created_by", _ANON_OWNER)
+            is_public = bool(rec.get("is_public"))
+            if owner == caller_id or is_public:
+                rec = dict(rec)
+                rec["owned_by_you"] = (owner == caller_id)
+                out.append(rec)
+        return out
 
     @schema_method
     async def get_visual_test(
         self,
         name: str = Field(..., description="Visual-test identifier."),
+        caller_user_id: Optional[str] = Field(
+            None,
+            description="Stable Hypha user / workspace id of the caller.",
+        ),
+        context: Optional[Dict[str, Any]] = Field(
+            None,
+            description="Authentication context, automatically provided by Hypha.",
+        ),
     ) -> dict:
-        """Return one visual-test record by name."""
-        return self._load_test(name)
+        """Return one visual-test record visible to the caller."""
+        caller_id = _owner_from_context(context, caller_user_id)
+        rec = dict(self._find_test_for_caller(name, caller_id))
+        rec["owned_by_you"] = (rec.get("created_by") == caller_id)
+        return rec
 
     @schema_method
     async def delete_visual_test(
         self,
         name: str = Field(..., description="Visual-test identifier."),
+        caller_user_id: Optional[str] = Field(
+            None,
+            description="Stable Hypha user / workspace id of the caller.",
+        ),
+        context: Optional[Dict[str, Any]] = Field(
+            None,
+            description="Authentication context, automatically provided by Hypha.",
+        ),
     ) -> dict:
-        """Delete a visual test and its reference images from the replica's disk."""
+        """Delete one of YOUR visual tests. Refuses to delete another user's."""
         import shutil
+        caller_id = _owner_from_context(context, caller_user_id)
         if not _TEST_NAME_RE.match(name):
             raise ValueError(
                 f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
             )
-        test_dir = self._test_dir(name)
+        test_dir = self._test_dir(caller_id, name)
         if not test_dir.exists():
+            # The name may exist as another user's test, but the caller has
+            # no delete permission on it — message accordingly.
+            other = any(
+                rec.get("name") == name and rec.get("created_by") != caller_id
+                for rec in self._list_all_test_records()
+            )
+            if other:
+                raise PermissionError(
+                    f"visual test {name!r} is owned by another user; only its "
+                    f"creator can delete it."
+                )
             raise ValueError(f"visual test {name!r} not found.")
         shutil.rmtree(test_dir)
-        logger.info("Deleted visual test %r at %s", name, test_dir)
+        logger.info("Deleted visual test %r (owner=%s)", name, caller_id)
         return {"name": name, "deleted": True}
 
     @schema_method
@@ -701,30 +760,22 @@ class SmartMicroscopyAssistant:
         image_ref: str = Field(
             ...,
             description=(
-                "Image to inspect. Either an HTTPS URL (public or presigned), "
-                "or a Hypha artifact reference '<workspace>/<alias>:<file_path>' "
-                "(e.g. 'ws-user-github|49943582/qc-samples:images/frame_001.tif'). "
-                "Maximum decoded file size: 25 MB."
+                "Image to inspect. HTTPS URL (public or presigned) or "
+                "Hypha artifact reference '<workspace>/<alias>:<path>'."
             ),
         ),
         instruction: Optional[str] = Field(
             None,
             description=(
-                "Free-text instruction telling the VLM what to look for. "
-                "Either `instruction` OR `visual_test_name` is required. If "
-                "both are given the visual test's pre-defined positive/"
-                "negative examples are used and `instruction` overrides the "
-                "stored description. Max 4000 characters."
+                "Free-text instruction for describe mode. Required if "
+                "`visual_test_name` is not given. Max 4000 chars."
             ),
         ),
         visual_test_name: Optional[str] = Field(
             None,
             description=(
-                "Name of a previously-defined visual test (see "
-                "create_visual_test / list_visual_tests). Switches inspect() "
-                "into few-shot verdict mode: the model is shown the test's "
-                "positive/negative reference images before the new image and "
-                "asked to return PASSED, FAILED, or UNSURE."
+                "Name of a visual test created via create_visual_test. The "
+                "caller must either own the test or the test must be public."
             ),
         ),
         max_new_tokens: int = Field(
@@ -732,24 +783,16 @@ class SmartMicroscopyAssistant:
             description="Maximum response tokens (1-1024).",
             ge=1, le=1024,
         ),
+        caller_user_id: Optional[str] = Field(
+            None,
+            description="Stable Hypha user / workspace id of the caller.",
+        ),
+        context: Optional[Dict[str, Any]] = Field(
+            None,
+            description="Authentication context, automatically provided by Hypha.",
+        ),
     ) -> dict:
-        """Inspect a microscopy image and return a QC judgement.
-
-        Two modes:
-
-        - Free-text describe (instruction set, visual_test_name unset):
-          returns a natural-language description of what the model sees
-          relative to `instruction`.
-
-        - Few-shot verdict (visual_test_name set):
-          looks up the named visual test's reference images, prepends them
-          (positive then negative) to the prompt, asks the model to classify
-          the new image as PASSED, FAILED, or UNSURE against the test's
-          criterion. The response includes parsed `verdict` and `reason`
-          fields plus the raw text in `description`. If `instruction` is
-          also supplied, it overrides the test's stored description for
-          this call only.
-        """
+        """Inspect a microscopy image and return a QC judgement."""
         t0 = time.time()
 
         if not visual_test_name and not (isinstance(instruction, str) and instruction.strip()):
@@ -768,10 +811,12 @@ class SmartMicroscopyAssistant:
 
         if visual_test_name:
             from PIL import Image
-            visual_test = self._load_test(visual_test_name)
-            test_dir = self._test_dir(visual_test_name)
-            pos_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test["positive_images"]]
-            neg_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test["negative_images"]]
+            caller_id = _owner_from_context(context, caller_user_id)
+            visual_test = self._find_test_for_caller(visual_test_name, caller_id)
+            owner = visual_test.get("created_by", _ANON_OWNER)
+            test_dir = self._test_dir(owner, visual_test_name)
+            pos_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test.get("positive_images", [])]
+            neg_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test.get("negative_images", [])]
 
             t_gen0 = time.time()
             raw, n_tokens = await self._run_vlm_few_shot(
@@ -779,7 +824,6 @@ class SmartMicroscopyAssistant:
                 visual_test=visual_test,
                 positive_images=pos_imgs,
                 negative_images=neg_imgs,
-                instruction_override=instruction,
                 max_new_tokens=max_new_tokens,
             )
             gen_dt = time.time() - t_gen0
@@ -787,12 +831,13 @@ class SmartMicroscopyAssistant:
             result = {
                 "mode": "few-shot",
                 "visual_test_name": visual_test_name,
-                "visual_test_description": instruction.strip() if instruction else visual_test["description"],
-                "verdict": verdict,                # "passed" / "failed" / "unsure"
+                "pass_criterion": visual_test.get("pass_criterion", ""),
+                "fail_criterion": visual_test.get("fail_criterion", ""),
+                "verdict": verdict,
                 "reason": reason,
-                "description": raw,                # raw model output
-                "n_positive_examples": visual_test["n_positive"],
-                "n_negative_examples": visual_test["n_negative"],
+                "description": raw,
+                "n_positive_examples": visual_test.get("n_positive", 0),
+                "n_negative_examples": visual_test.get("n_negative", 0),
                 "image_size": list(image.size),
                 "source_url": url,
                 "model": _MODEL_ID,
