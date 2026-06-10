@@ -939,6 +939,7 @@ class AppsManager:
                     "hypha_token": None,
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
+                    "proxy_memory_in_gb": app_data.get("proxy_memory_in_gb", 0.5),
                     "application_resources": app_data["application_resources"],
                     "authorized_users": updated_authorized_users,
                     "available_methods": app_data["available_methods"],
@@ -1548,6 +1549,10 @@ class AppsManager:
             None,
             description="Maximum number of concurrent requests this application instance can handle simultaneously. Higher values allow more parallelism but use more memory. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
         ),
+        proxy_memory_in_gb: float = Field(
+            None,
+            description="Memory reservation (in GiB) for the application's ProxyDeployment — the actor that terminates the WebSocket/WebRTC connection and forwards client payloads to the compute deployments. Ray uses this as a scheduling hint (places the proxy on a node with at least this much free memory), not a hard runtime cap. Together with `max_ongoing_requests`, it bounds the worst-case memory pressure on whatever node receives the proxy, biasing placement away from resource-tight nodes (e.g. the head). If not specified, uses 0.5 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified). Typical values: 0.5-4 GiB; raise for apps expecting large image/array uploads.",
+        ),
         auto_redeploy: bool = Field(
             None,
             description="If set to true, the application will be automatically redeployed if it becomes unhealthy. If not specified, uses False for a new application, or preserves the previous setting if updating an existing application (only when application_id is specified).",
@@ -1666,6 +1671,8 @@ class AppsManager:
                     disable_gpu = existing_app["disable_gpu"]
                 if max_ongoing_requests is None:
                     max_ongoing_requests = existing_app["max_ongoing_requests"]
+                if proxy_memory_in_gb is None:
+                    proxy_memory_in_gb = existing_app.get("proxy_memory_in_gb", 0.5)
                 if auto_redeploy is None:
                     auto_redeploy = existing_app["auto_redeploy"]
                 if debug is None:
@@ -1688,6 +1695,8 @@ class AppsManager:
                     disable_gpu = False
                 if max_ongoing_requests is None:
                     max_ongoing_requests = 10
+                if proxy_memory_in_gb is None:
+                    proxy_memory_in_gb = 0.5
                 if auto_redeploy is None:
                     auto_redeploy = False
                 if debug is None:
@@ -1782,6 +1791,7 @@ class AppsManager:
                 hypha_token=hypha_token,
                 disable_gpu=disable_gpu,
                 max_ongoing_requests=max_ongoing_requests,
+                proxy_memory_in_gb=proxy_memory_in_gb,
                 debug=debug,
                 started_at=started_at,
                 last_updated_at=last_updated_at,
@@ -1819,6 +1829,7 @@ class AppsManager:
                 "hypha_token": hypha_token,
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,
+                "proxy_memory_in_gb": proxy_memory_in_gb,
                 "application_resources": app.metadata["resources"],
                 "authorized_users": app.metadata["authorized_users"],
                 "available_methods": app.metadata["available_methods"],
