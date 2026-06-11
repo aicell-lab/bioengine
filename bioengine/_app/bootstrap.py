@@ -302,6 +302,36 @@ def _safe_default(default: Any) -> Any:
 # ───────────────────────── application builder ───────────────────────────
 
 
+_REQ_NAME_SPLIT = ("==", ">=", "<=", "~=", ">", "<", "[")
+
+
+def _requirement_name(req: str) -> str:
+    """Extract the package name from a pip requirement string.
+
+    ``pandas==2.2.0`` → ``pandas``; ``hypha-rpc>=0.21`` → ``hypha-rpc``;
+    ``httpx[http2]==0.28.1`` → ``httpx``.
+    """
+    out = req.strip()
+    for sep in _REQ_NAME_SPLIT:
+        if sep in out:
+            out = out.split(sep, 1)[0]
+    return out.strip().lower()
+
+
+def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
+    """Append entries from ``to_add`` to ``base`` unless an entry with the
+    same package name already exists. User-declared entries (in ``base``)
+    win on name collision so the framework never silently rewrites a
+    pinned version the user set."""
+    existing_names = {_requirement_name(r) for r in base}
+    merged = list(base)
+    for req in to_add:
+        if _requirement_name(req) not in existing_names:
+            merged.append(req)
+            existing_names.add(_requirement_name(req))
+    return merged
+
+
 def build_and_run_application(
     spec: Dict[str, Any],
     application_kwargs: Dict[str, Dict[str, Any]],
@@ -311,6 +341,7 @@ def build_and_run_application(
     pkg_uri: str,
     bioengine_uri: str,
     proxy_pip: List[str],
+    user_replica_framework_pip: List[str],
     proxy_memory_in_gb: float,
 ) -> Dict[str, Any]:
     """Assemble the Ray Serve bind graph AND call ``serve.run`` in-process.
@@ -349,6 +380,16 @@ def build_and_run_application(
             if uri not in py_modules:
                 py_modules.append(uri)
         runtime_env["py_modules"] = py_modules
+        # Merge the framework-required pip deps (hypha-rpc, pydantic)
+        # into whatever the user declared via ``@bioengine.app(pip=…)``.
+        # The replica needs them at cloudpickle.loads time to resolve
+        # references that the ``@bioengine.method`` wrapping created
+        # via ``hypha_rpc.utils.schema.schema_method``. User-declared
+        # entries take precedence on package name.
+        runtime_env["pip"] = _merge_pip_lists(
+            list(runtime_env.get("pip") or []),
+            user_replica_framework_pip,
+        )
         opts["runtime_env"] = runtime_env
         return cls.options(ray_actor_options=opts)
 
