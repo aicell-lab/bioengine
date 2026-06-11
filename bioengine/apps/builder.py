@@ -79,6 +79,8 @@ class AppBuilder:
         self.proxy_actor_name: Optional[str] = proxy_actor_name
         self.data_server_url: Optional[str] = None
 
+        self._sweep_runtime_env_tmp_files()
+
     def complete_initialization(
         self,
         server: RemoteService,
@@ -146,7 +148,7 @@ class AppBuilder:
         top level. The whole directory is later shipped as ``py_modules``;
         non-Python content (``manifest.yaml``, ``README.md``,
         ``frontend/``, notebooks) is excluded by
-        :meth:`_upload_pkg_to_gcs`.
+        :meth:`_write_pkg_to_runtime_env_dir`.
         """
         target_dir = self.apps_workdir / application_id / "source"
         if target_dir.exists():
@@ -286,10 +288,9 @@ class AppBuilder:
         imported lazily inside method bodies or from sibling modules
         that aren't imported during introspection.
 
-        ``pkg_uri`` is the ``gcs://_ray_pkg_<hash>.zip`` URI returned by
-        :meth:`_upload_pkg_to_gcs`. The caller is responsible for
-        running that upload off the asyncio loop (it makes blocking Ray
-        client calls).
+        ``pkg_uri`` is the ``file://...bioengine_pkg_<hash>.zip`` URI
+        returned by :meth:`_write_pkg_to_runtime_env_dir`. The caller is
+        responsible for running the zip walk off the asyncio loop.
         """
         base_pip = update_requirements(
             [],
@@ -329,39 +330,142 @@ class AppBuilder:
         ".github/**",
     ]
 
-    def _upload_pkg_to_gcs(self, pkg_root_dir: Path) -> str:
-        """Package ``pkg_root_dir`` and upload to Ray's internal GCS storage.
+    #: Subdirectory of ``apps_workdir`` where content-addressed
+    #: ``runtime_env.py_modules`` zips live. On a worker whose
+    #: ``apps_workdir`` is on a shared filesystem with the Ray cluster
+    #: (e.g. NFS) this is exactly the path Ray sees through the
+    #: ``file://`` URI we hand it.
+    _RUNTIME_ENV_PKG_SUBDIR = "_runtime_env_packages"
 
-        Returns a ``gcs://_ray_pkg_<hash>.zip`` URI that Ray accepts in
-        task-level ``py_modules``. Idempotent: if the same content was
-        uploaded before the function returns the cached URI without
-        re-uploading.
+    @staticmethod
+    def _is_excluded(rel_path: str, excludes: List[str]) -> bool:
+        """Match ``rel_path`` against the AppBuilder exclude patterns.
 
-        ``include_gitignore=False`` means Ray applies only our explicit
-        ``excludes``; ``include_parent_dir=False`` keeps the artifact root
-        at the top of the zip so a plain ``import deployment`` succeeds
-        inside the task.
+        Two pattern shapes are supported, mirroring the subset of
+        gitignore semantics ``_PY_MODULES_EXCLUDES`` uses:
+
+        * ``foo`` / ``foo*`` / ``*.ext`` — fnmatch against the basename.
+        * ``dir/**`` — match if ``dir`` appears as any directory
+          component along the path.
         """
-        from ray._private.runtime_env.packaging import (
-            get_uri_for_directory,
-            upload_package_if_needed,
-        )
+        import fnmatch
 
-        pkg_uri = get_uri_for_directory(
-            str(pkg_root_dir),
-            include_gitignore=False,
-            excludes=self._PY_MODULES_EXCLUDES,
+        components = rel_path.split("/")
+        basename = components[-1]
+        for pat in excludes:
+            if pat.endswith("/**"):
+                if pat[:-3] in components[:-1]:
+                    return True
+            elif fnmatch.fnmatch(basename, pat):
+                return True
+        return False
+
+    def _sweep_runtime_env_tmp_files(self) -> None:
+        """Unlink ``*.tmp.<pid>`` files left in ``_runtime_env_packages/``
+        by a prior crashed write (worker SIGKILL'd mid-zip)."""
+        pkg_dir = self.apps_workdir / self._RUNTIME_ENV_PKG_SUBDIR
+        if not pkg_dir.is_dir():
+            return
+        count = 0
+        for orphan in pkg_dir.glob("bioengine_pkg_*.zip.tmp.*"):
+            try:
+                orphan.unlink()
+                count += 1
+            except OSError as exc:
+                self.logger.warning(
+                    f"Could not remove orphan tmp file {orphan}: {exc}"
+                )
+        if count:
+            self.logger.info(
+                f"Swept {count} orphan tmp runtime_env package(s) "
+                f"from {pkg_dir}"
+            )
+
+    def _write_pkg_to_runtime_env_dir(self, pkg_root_dir: Path) -> str:
+        """Build a content-hashed zip of ``pkg_root_dir`` and return a
+        ``file://`` URI Ray accepts in task-level ``py_modules``.
+
+        Why not ``gcs://`` via Ray's ``upload_package_if_needed``? In
+        external-cluster mode the upload routes through the ray-client
+        gRPC bridge to a server-side runtime-env handler that has been
+        observed to never reply, wedging the worker's asyncio loop. A
+        local zip on a path the Ray cluster can read directly (e.g. the
+        shared NFS mount that backs ``apps_workdir`` on the deNBI
+        staging cluster) takes the bridge out of the upload path.
+
+        Same input bytes → same SHA-256 → same destination path, so
+        repeat calls return without re-writing. Atomic publish via
+        ``tmp.<pid>`` + ``os.replace`` keeps readers from ever seeing a
+        partial file. Two writers racing the same content_hash is safe
+        because the bytes are by construction identical.
+
+        The directory ``<apps_workdir>/_runtime_env_packages/`` is
+        content-addressed across every app and grows monotonically; a
+        GC pass keyed on currently-deployed apps will be a follow-up.
+        """
+        import hashlib
+        import os as _os
+        import zipfile
+
+        pkg_root = pkg_root_dir.resolve()
+        included: List[tuple[str, Path]] = []
+        for abs_path in sorted(pkg_root.rglob("*")):
+            if not abs_path.is_file():
+                continue
+            rel = abs_path.relative_to(pkg_root).as_posix()
+            if self._is_excluded(rel, self._PY_MODULES_EXCLUDES):
+                continue
+            included.append((rel, abs_path))
+
+        if not included:
+            raise RuntimeError(
+                f"No Python source files to ship from {pkg_root_dir} "
+                f"after applying excludes."
+            )
+
+        h = hashlib.sha256()
+        total_src_bytes = 0
+        for rel, abs_path in included:
+            h.update(rel.encode("utf-8"))
+            h.update(b"\x00")
+            size = abs_path.stat().st_size
+            total_src_bytes += size
+            h.update(size.to_bytes(8, "big"))
+            h.update(b"\x00")
+            with open(abs_path, "rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            h.update(b"\x00")
+        digest = h.hexdigest()[:16]
+
+        pkg_dir = self.apps_workdir / self._RUNTIME_ENV_PKG_SUBDIR
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        out_path = pkg_dir / f"bioengine_pkg_{digest}.zip"
+        if out_path.is_file():
+            return out_path.as_uri()
+
+        tmp_path = pkg_dir / f"{out_path.name}.tmp.{_os.getpid()}"
+        try:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for rel, abs_path in included:
+                    zf.write(abs_path, arcname=rel)
+            _os.replace(tmp_path, out_path)
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+        self.logger.info(
+            f"Wrote runtime_env package {out_path.name} "
+            f"({len(included)} files, {total_src_bytes} src bytes, "
+            f"{out_path.stat().st_size} zipped bytes)"
         )
-        upload_package_if_needed(
-            pkg_uri,
-            base_directory=str(pkg_root_dir.parent),
-            module_path=str(pkg_root_dir),
-            include_gitignore=False,
-            include_parent_dir=False,
-            excludes=self._PY_MODULES_EXCLUDES,
-            logger=self.logger,
-        )
-        return pkg_uri
+        return out_path.as_uri()
 
     # ───────────────────────── kwargs translation ────────────────────────
 
@@ -550,22 +654,21 @@ class AppBuilder:
             application_id, artifact_id, version,
             non_secret_env_vars, secret_env_vars, hypha_token,
         )
-        # Off-loop: ``upload_package_if_needed`` is blocking Ray client
-        # gRPC; running it on the asyncio loop wedges get_status, the
-        # liveness probe, and every other coroutine. 120s keeps us
-        # under the 150s liveness window so a stuck upload returns a
-        # clean error instead of triggering a pod SIGKILL.
+        # Off-loop: the zip walk hashes and compresses every file in
+        # the artifact root and could block the asyncio loop for large
+        # apps. 120s keeps us under the 150s liveness window so a slow
+        # disk fails cleanly instead of triggering a pod SIGKILL.
         try:
             pkg_uri: str = await asyncio.wait_for(
-                asyncio.to_thread(self._upload_pkg_to_gcs, pkg_root_dir),
+                asyncio.to_thread(
+                    self._write_pkg_to_runtime_env_dir, pkg_root_dir
+                ),
                 timeout=120,
             )
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
-                "Timed out (120s) uploading the application package to "
-                "the Ray cluster. In external-cluster mode this usually "
-                "means the Ray client server's runtime-env handler is "
-                "unreachable or stuck."
+                "Timed out (120s) writing the application package zip "
+                "into the runtime_env packages directory."
             ) from exc
         runtime_env = self._build_introspect_runtime_env(pkg_uri, env_vars)
 
