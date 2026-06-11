@@ -3626,6 +3626,7 @@ def _predict_and_encode(
     cellprob_threshold: float,
     niter: int | None,
     return_flows: bool = False,
+    return_flows_only: bool = False,
     json_safe: bool = False,
 ) -> list[PredictionItemModel]:
     """Run model on images and return encoded mask payloads.
@@ -3641,6 +3642,8 @@ def _predict_and_encode(
         cellprob_threshold: Cell probability threshold
         niter: Number of iterations for dynamics
         return_flows: If True, include flows in the output (HSV flow, XY flows, cellprob, final positions)
+        return_flows_only: If True, skip mask generation and return only the
+            network's (dP, cellprob) outputs as a dict under 'output'.
 
     Returns:
         List of prediction items with masks and optionally flows
@@ -3649,6 +3652,31 @@ def _predict_and_encode(
     for image, path in zip(images, image_paths):
         # Ensure image has 3 channels (required by Cellpose 4.0.7)
         image_3ch = ensure_3_channels(image)
+
+        if return_flows_only:
+            # Browser clients run mask generation locally (e.g. Pyodide) and
+            # only need the network outputs, so flow_threshold / cellprob_threshold /
+            # niter can be tuned without a GPU round-trip.
+            _masks, flows, _styles = model.eval(
+                [image_3ch],
+                diameter=diameter,
+                channel_axis=0,
+                channels=[0, 0],
+                compute_masks=False,
+            )
+            flow_list = (
+                flows[0] if isinstance(flows, list) and len(flows) > 0 else flows
+            )
+            # flow_list[1] = (2, H, W) float32 dP; flow_list[2] = (H, W) float32 cellprob
+            dP_np = np.ascontiguousarray(flow_list[1], dtype=np.float32)
+            cellprob_np = np.ascontiguousarray(flow_list[2], dtype=np.float32)
+            out.append(
+                PredictionItemModel(
+                    input_path=path,
+                    output={"dP": dP_np, "cellprob": cellprob_np},
+                )
+            )
+            continue
 
         # model.eval returns (masks, flows, styles)
         # flows = [HSV flow, XY flows, cellprob, final pixel locations]
@@ -5145,6 +5173,17 @@ BSD-3-Clause (Cellpose license)
                 "[2] cell probability map, [3] final pixel locations after dynamics."
             ),
         ),
+        return_flows_only: bool = Field(
+            False,
+            description=(
+                "Skip mask generation entirely and return only the network's "
+                "(dP, cellprob) outputs as a dict under 'output'. Used by browser "
+                "clients that run mask generation locally (e.g. Pyodide) so that "
+                "flow_threshold / cellprob_threshold / niter / min_size can be "
+                "tuned without a GPU round-trip. When True, flow_threshold, "
+                "cellprob_threshold, and niter are ignored."
+            ),
+        ),
         json_safe: bool = Field(
             False,
             description=(
@@ -5190,6 +5229,9 @@ BSD-3-Clause (Cellpose license)
             niter = wrapped.get("niter", niter)
             enable_clahe = bool(wrapped.get("enable_clahe", enable_clahe))
             return_flows = wrapped.get("return_flows", return_flows)
+            return_flows_only = bool(
+                wrapped.get("return_flows_only", return_flows_only)
+            )
             json_safe = wrapped.get("json_safe", json_safe)
 
         artifact = normalize_optional_param(artifact)
@@ -5247,6 +5289,7 @@ BSD-3-Clause (Cellpose license)
                 cellprob_threshold=cellprob_threshold,
                 niter=niter,
                 return_flows=return_flows,
+                return_flows_only=return_flows_only,
                 json_safe=json_safe,
             )
         except Exception as e:
