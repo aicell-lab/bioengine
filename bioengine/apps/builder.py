@@ -272,7 +272,7 @@ class AppBuilder:
 
     def _build_introspect_runtime_env(
         self,
-        pkg_root_dir: Path,
+        pkg_uri: str,
         env_vars: Dict[str, str],
     ) -> Dict[str, Any]:
         """Compose the runtime_env for the introspection + build Ray tasks.
@@ -286,10 +286,10 @@ class AppBuilder:
         imported lazily inside method bodies or from sibling modules
         that aren't imported during introspection.
 
-        Ray rejects local paths in ``runtime_env.py_modules`` at task or
-        actor level (only ``ray.init`` accepts them). To work around that
-        we pre-package the user's directory and upload it to Ray's GCS
-        storage, then reference the resulting ``gcs://...zip`` URI.
+        ``pkg_uri`` is the ``gcs://_ray_pkg_<hash>.zip`` URI returned by
+        :meth:`_upload_pkg_to_gcs`. The caller is responsible for
+        running that upload off the asyncio loop (it makes blocking Ray
+        client calls).
         """
         base_pip = update_requirements(
             [],
@@ -300,8 +300,6 @@ class AppBuilder:
             k: v for k, v in env_vars.items() if not k.startswith("_BIOENGINE_SECRET_")
         }
         introspect_env.pop("BIOENGINE_DATA_SERVER_URL", None)
-
-        pkg_uri = self._upload_pkg_to_gcs(pkg_root_dir)
 
         return {
             "py_modules": [pkg_uri],
@@ -552,14 +550,24 @@ class AppBuilder:
             application_id, artifact_id, version,
             non_secret_env_vars, secret_env_vars, hypha_token,
         )
-        runtime_env = self._build_introspect_runtime_env(
-            pkg_root_dir, env_vars
-        )
-        # The bootstrap tasks both receive the package URI directly so
-        # they can inject it into each deployment's ``runtime_env`` at
-        # bind time. Pulling it back out of ``runtime_env`` keeps a
-        # single source of truth.
-        pkg_uri = runtime_env["py_modules"][0]
+        # Off-loop: ``upload_package_if_needed`` is blocking Ray client
+        # gRPC; running it on the asyncio loop wedges get_status, the
+        # liveness probe, and every other coroutine. 120s keeps us
+        # under the 150s liveness window so a stuck upload returns a
+        # clean error instead of triggering a pod SIGKILL.
+        try:
+            pkg_uri: str = await asyncio.wait_for(
+                asyncio.to_thread(self._upload_pkg_to_gcs, pkg_root_dir),
+                timeout=120,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "Timed out (120s) uploading the application package to "
+                "the Ray cluster. In external-cluster mode this usually "
+                "means the Ray client server's runtime-env handler is "
+                "unreachable or stuck."
+            ) from exc
+        runtime_env = self._build_introspect_runtime_env(pkg_uri, env_vars)
 
         # 3. Introspect the user package via a Ray task in the app's env.
         try:
