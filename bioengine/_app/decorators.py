@@ -23,11 +23,16 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable, Dict, List, Optional
 
-from hypha_rpc.utils.schema import schema_method
-from ray import serve
-
 from bioengine._app.errors import ReservedMethodNameError
 from bioengine._app.mixin import _make_check_health, wrap_init
+
+# Top-level imports of hypha_rpc and ray.serve were moved inside the
+# decorator function bodies. The introspection task in
+# bioengine._app.bootstrap is pickled-by-reference; unpickling it on the
+# Ray client server (head-pod side, upstream of any runtime_env) re-runs
+# this module's import block in whatever base environment that pod has.
+# That pod is not guaranteed to ship hypha_rpc or ray[serve] — anything
+# the decorators need at *application* time stays a lazy import.
 
 # Method names the framework owns. User code cannot define them as plain
 # methods — the new contract is to mark a method with @bioengine.<hook>
@@ -48,6 +53,8 @@ def method(fn: Callable[..., Any]) -> Callable[..., Any]:
     ``@bioengine.app`` decorator reads at class-creation time to assemble
     ``_bioengine_method_schemas``.
     """
+    from hypha_rpc.utils.schema import schema_method
+
     wrapped = schema_method(fn)
     setattr(wrapped, _KIND_ATTR, "method")
     return wrapped
@@ -135,6 +142,8 @@ def app(
     """
 
     def decorator(cls: type) -> Any:
+        from ray import serve
+
         if not inspect.isclass(cls):
             raise TypeError(
                 "@bioengine.app must be applied to a class, not "
