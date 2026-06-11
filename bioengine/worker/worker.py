@@ -14,7 +14,7 @@ from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 
 from bioengine import __version__
-from bioengine.apps import AppsManager
+from bioengine.apps.manager import AppsManager
 from bioengine.datasets import BioEngineDatasets
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.utils import (
