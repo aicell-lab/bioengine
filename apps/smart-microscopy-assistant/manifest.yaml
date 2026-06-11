@@ -4,7 +4,7 @@ id_emoji: "🔬"
 description: "VLM-backed microscopy assistant. Define re-usable visual tests with a few positive and negative reference images, then run them against new images to get a PASSED / FAILED / UNSURE verdict, or describe an image with a free-text instruction. Powered by Qwen2.5-VL-3B-Instruct."
 type: ray-serve
 format_version: 0.5.0
-version: 0.5.3
+version: 0.5.5
 authors:
   - {name: "BioEngine Team", affiliation: "KTH Royal Institute of Technology"}
 license: MIT
