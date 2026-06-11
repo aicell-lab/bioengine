@@ -885,6 +885,18 @@ class AppBuilder:
             select=["hypha-rpc", "pydantic"],
             extras=[],
         )
+        # The env_vars dict the worker assembled above (HYPHA_SERVER_URL,
+        # HYPHA_WORKSPACE, HYPHA_ARTIFACT_*, BIOENGINE_*, plus the
+        # ``_BIOENGINE_SECRET_*`` secrets including HYPHA_TOKEN) only
+        # made it onto the introspect Ray task's ``runtime_env``. The
+        # per-replica deployments don't carry it: the @bioengine.app
+        # decorator preserves whatever static ``env_vars`` the author
+        # put in ``ray_actor_options`` but cannot see anything computed
+        # at deploy time. Without this, user code that reads
+        # ``os.getenv('HYPHA_TOKEN')`` at ``__init__`` crashes the
+        # replica. Pass the worker-side env_vars through so bootstrap
+        # merges them into every deployment's runtime_env at bind time.
+        replica_env_vars = env_vars
 
         return BuiltApp(
             metadata=metadata,
@@ -896,6 +908,7 @@ class AppBuilder:
             bioengine_uri=bioengine_uri,
             proxy_pip=proxy_pip,
             user_replica_framework_pip=user_replica_framework_pip,
+            replica_env_vars=replica_env_vars,
             proxy_memory_in_gb=proxy_memory_in_gb,
         )
 
@@ -923,6 +936,7 @@ class AppBuilder:
                     built_app.bioengine_uri,
                     built_app.proxy_pip,
                     built_app.user_replica_framework_pip,
+                    built_app.replica_env_vars,
                     built_app.proxy_memory_in_gb,
                 ),
             )
@@ -956,6 +970,7 @@ class BuiltApp:
         "bioengine_uri",
         "proxy_pip",
         "user_replica_framework_pip",
+        "replica_env_vars",
         "proxy_memory_in_gb",
     )
 
@@ -970,6 +985,7 @@ class BuiltApp:
         bioengine_uri: str,
         proxy_pip: List[str],
         user_replica_framework_pip: List[str],
+        replica_env_vars: Dict[str, str],
         proxy_memory_in_gb: float,
     ) -> None:
         self.metadata = metadata
@@ -981,4 +997,5 @@ class BuiltApp:
         self.bioengine_uri = bioengine_uri
         self.proxy_pip = proxy_pip
         self.user_replica_framework_pip = user_replica_framework_pip
+        self.replica_env_vars = replica_env_vars
         self.proxy_memory_in_gb = proxy_memory_in_gb
