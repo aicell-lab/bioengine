@@ -859,17 +859,31 @@ class AppBuilder:
             f"Introspected '{application_id}' "
             f"(methods: {available_methods})"
         )
-        # Compute the proxy's runtime_env.pip list here on the worker —
+        # Compute the proxy + user-replica pip lists here on the worker.
         # ``get_pip_requirements`` uses ``importlib.metadata`` which only
-        # finds bioengine on a host where it was pip-installed. The Ray
-        # actor that runs ``ProxyDeployment`` only has bioengine as raw
-        # source (shipped via py_modules), so resolving the list there
-        # raises ``PackageNotFoundError``. We compute it on the worker
-        # and bootstrap.build_and_run_application applies it at bind
-        # time via ``ProxyDeployment.options(ray_actor_options=…)``.
+        # finds bioengine on a host where it was pip-installed; on the
+        # Ray actor bioengine arrives as raw source via ``py_modules``,
+        # so ``importlib.metadata`` raises. The lists are passed through
+        # ``BuiltApp`` to bootstrap, where they are applied at bind time.
         proxy_pip = get_pip_requirements(
             select=["aiortc", "httpx", "hypha-rpc", "pydantic"],
             extras=["worker"],
+        )
+        # User deployments' ``runtime_env.pip`` only contains what the
+        # author declared via ``@bioengine.app(pip=…)``. But ``@bioengine
+        # .method`` wraps each method with ``hypha_rpc.utils.schema
+        # .schema_method``, and that wrapping creates a cloudpickle
+        # reference into ``hypha_rpc``. When Ray Serve cold-starts a
+        # replica it ``cloudpickle.loads`` the deployment definition,
+        # which re-imports any module the references point at —
+        # so without ``hypha-rpc`` (and the ``pydantic`` it pulls in
+        # via ``schema_method``) on the replica's venv, the replica
+        # crashes at ``__init__`` with ``ModuleNotFoundError: No module
+        # named 'hypha_rpc'``. Same story as Fix #7, just one layer
+        # deeper. Inject both at bind time.
+        user_replica_framework_pip = get_pip_requirements(
+            select=["hypha-rpc", "pydantic"],
+            extras=[],
         )
 
         return BuiltApp(
@@ -881,6 +895,7 @@ class AppBuilder:
             pkg_uri=pkg_uri,
             bioengine_uri=bioengine_uri,
             proxy_pip=proxy_pip,
+            user_replica_framework_pip=user_replica_framework_pip,
             proxy_memory_in_gb=proxy_memory_in_gb,
         )
 
@@ -907,6 +922,7 @@ class AppBuilder:
                     built_app.pkg_uri,
                     built_app.bioengine_uri,
                     built_app.proxy_pip,
+                    built_app.user_replica_framework_pip,
                     built_app.proxy_memory_in_gb,
                 ),
             )
@@ -939,6 +955,7 @@ class BuiltApp:
         "pkg_uri",
         "bioengine_uri",
         "proxy_pip",
+        "user_replica_framework_pip",
         "proxy_memory_in_gb",
     )
 
@@ -952,6 +969,7 @@ class BuiltApp:
         pkg_uri: str,
         bioengine_uri: str,
         proxy_pip: List[str],
+        user_replica_framework_pip: List[str],
         proxy_memory_in_gb: float,
     ) -> None:
         self.metadata = metadata
@@ -962,4 +980,5 @@ class BuiltApp:
         self.pkg_uri = pkg_uri
         self.bioengine_uri = bioengine_uri
         self.proxy_pip = proxy_pip
+        self.user_replica_framework_pip = user_replica_framework_pip
         self.proxy_memory_in_gb = proxy_memory_in_gb
