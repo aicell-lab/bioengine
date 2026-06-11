@@ -509,11 +509,20 @@ class AppBuilder:
         defined under ``bioengine._app`` fails immediately with
         ``ModuleNotFoundError: No module named 'bioengine'``.
 
-        The fix is to ship the worker's own bioengine source as a
-        second ``py_modules`` URI on every runtime_env we hand to Ray.
-        Same content-addressed zip pattern as the user app — written
-        once per worker process, cached by content hash, served over
-        the shared NFS mount that backs ``apps_workdir``.
+        Why the ``_bioengine_wrap/`` prefix: Ray 2.55.1 calls
+        ``unzip_package(remove_top_level_directory=True)`` when the URI
+        protocol is ``file://`` (and every other "remote" scheme); a zip
+        whose entries all live under a single top-level directory has
+        that directory stripped on extraction. If we zipped entries as
+        ``bioengine/__init__.py`` directly, Ray would strip ``bioengine/``
+        and place ``__init__.py`` at the extract dir's root — and
+        ``import bioengine`` would fail. By zipping under
+        ``_bioengine_wrap/bioengine/`` we give Ray a throwaway top-level
+        directory to strip, leaving ``bioengine/__init__.py`` at the
+        extract dir's root, which is what gets added to ``sys.path``.
+        ``gcs://`` URIs do the opposite (no strip) but we cannot use
+        ``gcs://`` here — see PR #106 for the Ray-client wedge that
+        forced the move to ``file://``.
         """
         import bioengine
 
@@ -521,7 +530,7 @@ class AppBuilder:
         return self._write_pkg_to_runtime_env_dir(
             bioengine_dir,
             filename_prefix="bioengine_runtime",
-            arc_prefix="bioengine",
+            arc_prefix="_bioengine_wrap/bioengine",
         )
 
     # ───────────────────────── kwargs translation ────────────────────────
