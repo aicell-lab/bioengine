@@ -376,9 +376,9 @@ class AppBuilder:
                     f"Could not remove orphan tmp file {orphan}: {exc}"
                 )
         if count:
-            self.logger.info(
+            self.logger.warning(
                 f"Swept {count} orphan tmp runtime_env package(s) "
-                f"from {pkg_dir}"
+                f"from {pkg_dir} — signal of a prior unclean shutdown"
             )
 
     def _write_pkg_to_runtime_env_dir(self, pkg_root_dir: Path) -> str:
