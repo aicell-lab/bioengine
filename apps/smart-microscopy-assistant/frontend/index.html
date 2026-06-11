@@ -148,20 +148,58 @@
   .help-btn svg { width: 0.85rem; height: 0.85rem; }
   .help-wrap { position: relative; display: inline-block; }
   #helpPopover {
-    /* Wider than the topbar info popover — it carries prose, not a key/value list. */
-    min-width: 28rem; max-width: min(32rem, calc(100vw - 2rem));
-    padding: 0.85rem 0;
-    transform-origin: top left;
+    /* Carries prose, not a key/value list, so it's wider than the topbar info
+       popover. Centred on the viewport (overrides .popover's anchored
+       positioning) so it doesn't fight the surrounding card layout, and
+       scrolls vertically when the content outgrows the available height. */
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(1);
+    transform-origin: center;
+    min-width: 0;
+    max-width: none;
+    width: min(40rem, calc(100vw - 2rem));
+    max-height: 82vh;
+    overflow-y: auto;
+    padding: 1.05rem 0;
+    z-index: 105;
   }
+  @starting-style {
+    #helpPopover {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.96);
+    }
+  }
+  #helpPopover .help-close {
+    position: absolute; top: 0.55rem; right: 0.55rem;
+    width: 1.85rem; height: 1.85rem; border-radius: 999px;
+    background: transparent; color: var(--fg-dim);
+    border: 1px solid var(--border);
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; padding: 0;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                border-color 0.12s var(--ease-out),
+                transform 0.1s var(--ease-out);
+  }
+  #helpPopover .help-close:hover {
+    background: var(--bg-3); color: var(--fg); border-color: var(--border-strong);
+  }
+  #helpPopover .help-close:active { transform: scale(0.93); }
+  #helpPopover .help-close svg { width: 1rem; height: 1rem; }
+  #helpPopover .heading { padding-right: 3rem; }
   #helpPopover .heading {
-    padding: 0.35rem 1.05rem 0.55rem; font-size: 0.72rem;
-    color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.07em;
-    border-bottom: 1px solid var(--border); margin-bottom: 0.35rem;
+    padding: 0.25rem 1.05rem 0.75rem;
+    font-size: 1rem; font-weight: 700; color: var(--fg);
+    letter-spacing: -0.01em; text-transform: none;
+    border-bottom: 1px solid var(--border); margin-bottom: 0.55rem;
   }
   #helpPopover .h-section {
-    padding: 0.55rem 1.05rem 0.2rem; font-size: 0.74rem;
-    font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-    display: flex; align-items: center; gap: 0.4rem;
+    padding: 0.65rem 1.05rem 0.25rem;
+    font-size: 0.86rem; font-weight: 700; letter-spacing: -0.005em;
+    text-transform: none;
+    display: flex; align-items: center; gap: 0.45rem;
   }
   #helpPopover .h-section.pass-h { color: var(--pass); }
   #helpPopover .h-section.fail-h { color: var(--fail); }
@@ -1006,9 +1044,7 @@
     <p>
       Inspect <strong>2D RGB images</strong> (PNG, JPG, TIFF — ≤ 25 MB each) with reusable
       visual tests or free-text questions. Best for visually-obvious judgements:
-      categorical differences, focus, presence/absence. Not a replacement for
-      precise measurement, counting, or sub-pixel work. Multi-channel, z-stacks,
-      and time series are out of scope.
+      categorical differences, focus, presence/absence.
     </p>
     <p class="header-runtime">
       Backed by Qwen2.5-VL-3B-Instruct on one NVIDIA A40-16C vGPU slice. See
@@ -1116,52 +1152,17 @@
     <div class="card">
       <h2>
         Create a new visual test
-        <span class="help-wrap" style="margin-left: 0.55rem;">
-          <button id="helpBtn" class="help-btn" type="button"
-                  aria-label="What this model can and can't see"
-                  aria-haspopup="dialog">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="10"/>
-              <line x1="12" y1="16" x2="12" y2="12"/>
-              <line x1="12" y1="8" x2="12.01" y2="8"/>
-            </svg>
-          </button>
-          <div id="helpPopover" class="popover" hidden role="dialog" aria-label="Designing a test the model can handle">
-            <div class="heading">Designing a test the model can handle</div>
-
-            <div class="h-section pass-h">Works well for</div>
-            <ul>
-              <li>Categorical judgements where the difference is visually obvious — presence vs. absence, broad type, gross orientation.</li>
-              <li>Focus and sharpness questions: sharp vs. blurry, in-focus vs. out-of-focus areas.</li>
-              <li>Coarse colour and channel description in fluorescence and brightfield images.</li>
-              <li>Locating clearly distinguishable objects via bounding boxes or points (the model was trained for this and is competitive with specialist detectors on common categories).</li>
-              <li>One yes/no question about a single visually-prominent property.</li>
-            </ul>
-
-            <div class="h-section fail-h">Struggles with</div>
-            <ul>
-              <li><strong>Precise counting.</strong> Reliable up to roughly ten distinct objects; large counts drift by 30 %+ in our tests, matching reports in the literature.</li>
-              <li><strong>Reading text.</strong> OCR is unreliable on small, low-contrast, rotated, or stylised text — OCRBench v2 places the 3B well behind dedicated OCR models.</li>
-              <li><strong>Fine geometric judgements.</strong> Small rotations, angle measurements, sub-millimetre offsets and pixel-level localisation drop below 15 % on segmentation benchmarks.</li>
-              <li><strong>Multi-clause "AND" criteria.</strong> When PASS requires several conditions at once the model checks the most prominent one and asserts the rest.</li>
-              <li><strong>3D spatial relationships.</strong> "On top of" / "under" / "behind" are routinely mis-judged, especially when reference images push the wrong way (a well-known anchor-bias failure).</li>
-              <li><strong>Domain-specific patterns it wasn't trained on.</strong> Zero-shot detection on novel medical / microscopy categories is below 7 % mAP — references carry most of the signal.</li>
-              <li><strong>Hallucination under ambiguity.</strong> When visual evidence is weak the model falls back on language priors and can invent details that aren't there.</li>
-            </ul>
-
-            <div class="h-section tip-h">Tips for a useful test</div>
-            <ul>
-              <li>Keep each test to <strong>one axis</strong>. Split "focused AND centred" into two separate tests.</li>
-              <li>Phrase criteria as <strong>visible properties</strong> ("sharp cell outlines", "any saturated pixel"), not abstract quality words ("good image").</li>
-              <li><strong>References do most of the work.</strong> Two positive + two negative examples covering distinct failure modes beat five of the same kind.</li>
-              <li>For domain-specific tasks (e.g. microscopy) the references usually carry more signal than the criterion text — pick them carefully.</li>
-              <li>Always <strong>validate on held-out images</strong> before relying on a new test.</li>
-            </ul>
-
-            <div class="footer">Backed by Qwen2.5-VL-3B-Instruct. A larger model improves precision; the trade-offs above are the baseline for the 3B class.</div>
-          </div>
-        </span>
+        <button id="helpBtn" class="help-btn" type="button"
+                style="margin-left: 0.55rem;"
+                aria-label="What this model can and can't see"
+                aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="16" x2="12" y2="12"/>
+            <line x1="12" y1="8" x2="12.01" y2="8"/>
+          </svg>
+        </button>
       </h2>
 
       <!-- 1. Visibility -->
@@ -1261,6 +1262,49 @@
     <div id="log" class="log-body">Ready.</div>
   </details>
 
+</div>
+
+<!-- Help dialog: "Designing a test the model can handle" -->
+<div id="helpPopover" class="popover" hidden role="dialog" aria-label="Designing a test the model can handle">
+  <button id="helpCloseBtn" class="help-close" type="button" aria-label="Close">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="18" y1="6" x2="6" y2="18"/>
+      <line x1="6" y1="6" x2="18" y2="18"/>
+    </svg>
+  </button>
+  <div class="heading">Designing a test the model can handle</div>
+
+  <div class="h-section pass-h">Works well for</div>
+  <ul>
+    <li>Categorical judgements where the difference is visually obvious — presence vs. absence, broad type, gross orientation.</li>
+    <li>Focus and sharpness questions: sharp vs. blurry, in-focus vs. out-of-focus areas.</li>
+    <li>Coarse colour and channel description in fluorescence and brightfield images.</li>
+    <li>Locating clearly distinguishable objects via bounding boxes or points (the model was trained for this and is competitive with specialist detectors on common categories).</li>
+    <li>One yes/no question about a single visually-prominent property.</li>
+  </ul>
+
+  <div class="h-section fail-h">Struggles with</div>
+  <ul>
+    <li><strong>Precise counting.</strong> Reliable up to roughly ten distinct objects; large counts drift by 30 %+ in our tests, matching reports in the literature.</li>
+    <li><strong>Reading text.</strong> OCR is unreliable on small, low-contrast, rotated, or stylised text — OCRBench v2 places the 3B well behind dedicated OCR models.</li>
+    <li><strong>Fine geometric judgements.</strong> Small rotations, angle measurements, sub-millimetre offsets and pixel-level localisation drop below 15 % on segmentation benchmarks.</li>
+    <li><strong>Multi-clause "AND" criteria.</strong> When PASS requires several conditions at once the model checks the most prominent one and asserts the rest.</li>
+    <li><strong>3D spatial relationships.</strong> "On top of" / "under" / "behind" are routinely mis-judged, especially when reference images push the wrong way (a well-known anchor-bias failure).</li>
+    <li><strong>Domain-specific patterns it wasn't trained on.</strong> Zero-shot detection on novel medical / microscopy categories is below 7 % mAP — references carry most of the signal.</li>
+    <li><strong>Hallucination under ambiguity.</strong> When visual evidence is weak the model falls back on language priors and can invent details that aren't there.</li>
+  </ul>
+
+  <div class="h-section tip-h">Tips for a useful test</div>
+  <ul>
+    <li>Keep each test to <strong>one axis</strong>. Split "focused AND centred" into two separate tests.</li>
+    <li>Phrase criteria as <strong>visible properties</strong> ("sharp cell outlines", "any saturated pixel"), not abstract quality words ("good image").</li>
+    <li><strong>References do most of the work.</strong> Two or three references per side, each covering a <em>distinct</em> failure mode, is the sweet spot. The 5-per-side cap is a ceiling, not a target — five near-duplicates rarely add signal.</li>
+    <li>For domain-specific tasks (e.g. microscopy) the references usually carry more signal than the criterion text — pick them carefully.</li>
+    <li>Always <strong>validate on held-out images</strong> before relying on a new test.</li>
+  </ul>
+
+  <div class="footer">Backed by Qwen2.5-VL-3B-Instruct. A larger model improves precision; the trade-offs above are the baseline for the 3B class.</div>
 </div>
 
 <!-- Confirm dialog -->
@@ -1408,6 +1452,7 @@ $("helpBtn").addEventListener("click", () => {
   $("userMenu").hidden = true;
   $("infoPopover").hidden = true;
 });
+$("helpCloseBtn").addEventListener("click", () => { $("helpPopover").hidden = true; });
 document.addEventListener("mousedown", (e) => {
   for (const [popId, trigId] of [
     ["userMenu", "userBtn"], ["infoPopover", "infoBtn"], ["helpPopover", "helpBtn"],
