@@ -232,18 +232,93 @@ def test_bioengine_source_zip_has_distinct_filename_prefix(
     assert name.endswith(".zip")
 
 
-def test_bioengine_source_zip_entries_are_prefixed_with_package_name(
+def test_bioengine_source_zip_has_throwaway_wrapper_dir(
     builder: AppBuilder,
 ) -> None:
+    """Ray strips the top-level directory from file:// py_modules zips when
+    every entry shares one. We give it a throwaway ``_bioengine_wrap/`` to
+    strip so the actual ``bioengine/`` package directory survives extraction.
+
+    All entries must therefore live under ``_bioengine_wrap/bioengine/``."""
     uri = builder._write_bioengine_source_to_runtime_env_dir()
     entries = _zipped_entries(Path(uri[len("file://"):]))
 
-    assert "bioengine/__init__.py" in entries
-    assert any(e.startswith("bioengine/_app/") for e in entries)
-    assert any(e.startswith("bioengine/apps/") for e in entries)
-
+    assert entries, "expected at least one entry"
     for entry in entries:
-        assert entry.startswith("bioengine/"), entry
+        assert entry.startswith("_bioengine_wrap/bioengine/"), entry
+
+    assert "_bioengine_wrap/bioengine/__init__.py" in entries
+    assert any(
+        e.startswith("_bioengine_wrap/bioengine/_app/") for e in entries
+    )
+    assert any(
+        e.startswith("_bioengine_wrap/bioengine/apps/") for e in entries
+    )
+
+
+def test_bioengine_source_zip_imports_after_simulated_ray_strip(
+    builder: AppBuilder, tmp_path: Path
+) -> None:
+    """End-to-end simulation of Ray's extraction path for the bioengine zip.
+
+    Reproduces ``download_and_unpack_package`` for a ``file://`` URI:
+    Ray's ``unzip_package(remove_top_level_directory=True)`` strips a
+    single top-level directory if one exists. After that step, adding
+    the extract dir to ``sys.path`` must let ``import bioengine`` resolve
+    to a file inside the extracted layout. This is the invariant Fix #4
+    +#5 exists to maintain.
+    """
+    import subprocess
+    import sys
+    import zipfile
+
+    uri = builder._write_bioengine_source_to_runtime_env_dir()
+    zip_path = Path(uri[len("file://"):])
+
+    extract_dir = tmp_path / "ray_extract"
+    extract_dir.mkdir()
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+        top_components = {n.split("/", 1)[0] for n in names if n}
+        assert len(top_components) == 1, (
+            f"expected a single top-level dir for Ray to strip, got "
+            f"{top_components}"
+        )
+        top = next(iter(top_components))
+        for name in names:
+            if name.endswith("/"):
+                continue
+            stripped = name[len(top) + 1:]
+            target = extract_dir / stripped
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(zf.read(name))
+
+    assert (extract_dir / "bioengine" / "__init__.py").is_file()
+    assert (extract_dir / "bioengine" / "_app" / "__init__.py").is_file()
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(extract_dir)!r}); "
+                "import bioengine; "
+                "print(bioengine.__file__)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin"},
+    )
+    assert proc.returncode == 0, (
+        f"import bioengine after simulated Ray strip failed:\n"
+        f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+    )
+    assert str(extract_dir / "bioengine") in proc.stdout, (
+        f"resolved bioengine elsewhere: stdout={proc.stdout!r}"
+    )
 
 
 def test_bioengine_source_zip_excludes_pycache(
