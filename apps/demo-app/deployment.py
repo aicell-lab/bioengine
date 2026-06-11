@@ -112,9 +112,19 @@ class DemoApp:
         """List available datasets and their files.
 
         Returns:
-            Dict mapping dataset id → list of file names.
+            Dict mapping dataset id → list of file names. Empty when the
+            BioEngine worker has no data server configured (which is the
+            normal state on a fresh worker until ``bioengine datasets serve``
+            is started).
         """
-        available_datasets = await bioengine.datasets.list_datasets()
+        try:
+            available_datasets = await bioengine.datasets.list_datasets()
+        except bioengine.MissingDataServerError as exc:
+            logger.info(
+                f"No data server configured on this worker — returning "
+                f"empty dataset listing. ({exc})"
+            )
+            return {}
         logger.info(f"Available datasets: {list(available_datasets.keys())}")
 
         data_files: Dict[str, List[str]] = {}

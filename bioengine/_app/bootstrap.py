@@ -342,6 +342,7 @@ def build_and_run_application(
     bioengine_uri: str,
     proxy_pip: List[str],
     user_replica_framework_pip: List[str],
+    replica_env_vars: Dict[str, str],
     proxy_memory_in_gb: float,
 ) -> Dict[str, Any]:
     """Assemble the Ray Serve bind graph AND call ``serve.run`` in-process.
@@ -390,6 +391,16 @@ def build_and_run_application(
             list(runtime_env.get("pip") or []),
             user_replica_framework_pip,
         )
+        # Merge the worker-side env_vars (HYPHA_SERVER_URL, HYPHA_WORKSPACE,
+        # HYPHA_ARTIFACT_ID/VERSION, BIOENGINE_*, plus the
+        # ``_BIOENGINE_SECRET_*`` secrets the framework unmasks at replica
+        # boot — including HYPHA_TOKEN) into whatever static ``env_vars``
+        # the author declared via ``@bioengine.app(env_vars=…)``. The
+        # author's entries take precedence on key collision.
+        runtime_env["env_vars"] = {
+            **replica_env_vars,
+            **(runtime_env.get("env_vars") or {}),
+        }
         opts["runtime_env"] = runtime_env
         return cls.options(ray_actor_options=opts)
 
@@ -426,6 +437,10 @@ def build_and_run_application(
         if uri not in proxy_py_modules:
             proxy_py_modules.append(uri)
     proxy_runtime_env["py_modules"] = proxy_py_modules
+    proxy_runtime_env["env_vars"] = {
+        **replica_env_vars,
+        **(proxy_runtime_env.get("env_vars") or {}),
+    }
     proxy_actor_options["runtime_env"] = proxy_runtime_env
     proxy_cls = ProxyDeployment.options(ray_actor_options=proxy_actor_options)
 
