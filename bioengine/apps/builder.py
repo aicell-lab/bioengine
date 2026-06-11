@@ -275,6 +275,7 @@ class AppBuilder:
     def _build_introspect_runtime_env(
         self,
         pkg_uri: str,
+        bioengine_uri: str,
         env_vars: Dict[str, str],
     ) -> Dict[str, Any]:
         """Compose the runtime_env for the introspection + build Ray tasks.
@@ -288,9 +289,12 @@ class AppBuilder:
         imported lazily inside method bodies or from sibling modules
         that aren't imported during introspection.
 
-        ``pkg_uri`` is the ``file://...bioengine_pkg_<hash>.zip`` URI
-        returned by :meth:`_write_pkg_to_runtime_env_dir`. The caller is
-        responsible for running the zip walk off the asyncio loop.
+        ``py_modules`` ships two URIs: the worker's own ``bioengine``
+        source (the actor's venv only carries bioengine's *deps* — see
+        :meth:`_write_bioengine_source_to_runtime_env_dir`) and the
+        user app package. Both URIs are ``file://...zip`` returned by
+        :meth:`_write_pkg_to_runtime_env_dir`. The caller is responsible
+        for running the zip walks off the asyncio loop.
         """
         base_pip = update_requirements(
             [],
@@ -303,7 +307,7 @@ class AppBuilder:
         introspect_env.pop("BIOENGINE_DATA_SERVER_URL", None)
 
         return {
-            "py_modules": [pkg_uri],
+            "py_modules": [bioengine_uri, pkg_uri],
             "pip": base_pip,
             "env_vars": introspect_env,
         }
@@ -324,6 +328,9 @@ class AppBuilder:
         "*.gif",
         "*.svg",
         "*.pdf",
+        "*.pyc",
+        "*.pyo",
+        "*.so",
         "frontend/**",
         "__pycache__/**",
         ".git/**",
@@ -367,7 +374,10 @@ class AppBuilder:
         if not pkg_dir.is_dir():
             return
         count = 0
-        for orphan in pkg_dir.glob("bioengine_pkg_*.zip.tmp.*"):
+        orphans = list(pkg_dir.glob("bioengine_pkg_*.zip.tmp.*")) + list(
+            pkg_dir.glob("bioengine_runtime_*.zip.tmp.*")
+        )
+        for orphan in orphans:
             try:
                 orphan.unlink()
                 count += 1
@@ -381,7 +391,13 @@ class AppBuilder:
                 f"from {pkg_dir} — signal of a prior unclean shutdown"
             )
 
-    def _write_pkg_to_runtime_env_dir(self, pkg_root_dir: Path) -> str:
+    def _write_pkg_to_runtime_env_dir(
+        self,
+        pkg_root_dir: Path,
+        *,
+        filename_prefix: str = "bioengine_pkg",
+        arc_prefix: str = "",
+    ) -> str:
         """Build a content-hashed zip of ``pkg_root_dir`` and return a
         ``file://`` URI Ray accepts in task-level ``py_modules``.
 
@@ -424,6 +440,8 @@ class AppBuilder:
             )
 
         h = hashlib.sha256()
+        h.update(arc_prefix.encode("utf-8"))
+        h.update(b"\x00")
         total_src_bytes = 0
         for rel, abs_path in included:
             h.update(rel.encode("utf-8"))
@@ -443,7 +461,7 @@ class AppBuilder:
 
         pkg_dir = self.apps_workdir / self._RUNTIME_ENV_PKG_SUBDIR
         pkg_dir.mkdir(parents=True, exist_ok=True)
-        out_path = pkg_dir / f"bioengine_pkg_{digest}.zip"
+        out_path = pkg_dir / f"{filename_prefix}_{digest}.zip"
         if out_path.is_file():
             return out_path.as_uri()
 
@@ -451,7 +469,8 @@ class AppBuilder:
         try:
             with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for rel, abs_path in included:
-                    zf.write(abs_path, arcname=rel)
+                    arc = f"{arc_prefix}/{rel}" if arc_prefix else rel
+                    zf.write(abs_path, arcname=arc)
             _os.replace(tmp_path, out_path)
         except BaseException:
             try:
@@ -466,6 +485,44 @@ class AppBuilder:
             f"{out_path.stat().st_size} zipped bytes)"
         )
         return out_path.as_uri()
+
+    def _build_py_modules_uris(self, pkg_root_dir: Path) -> tuple[str, str]:
+        """Write both runtime_env zips and return ``(pkg_uri, bioengine_uri)``.
+
+        Wrapped in a single ``asyncio.to_thread`` call by ``build()`` so
+        both blocking zip walks happen off the asyncio loop together.
+        """
+        pkg_uri = self._write_pkg_to_runtime_env_dir(pkg_root_dir)
+        bioengine_uri = self._write_bioengine_source_to_runtime_env_dir()
+        return pkg_uri, bioengine_uri
+
+    def _write_bioengine_source_to_runtime_env_dir(self) -> str:
+        """Bundle the worker's installed ``bioengine`` source as a
+        ``file://`` zip and return its URI for ``runtime_env.py_modules``.
+
+        Why this exists: in external-cluster mode the Ray actor that
+        runs ``introspect_app`` (and every user deployment replica)
+        spins up in a fresh process. ``runtime_env.pip`` installs
+        bioengine's *dependencies* into a venv, but bioengine itself is
+        not on PyPI, so the venv does not contain it. Without bioengine
+        on the actor's ``sys.path``, ``pickle.loads`` of any function
+        defined under ``bioengine._app`` fails immediately with
+        ``ModuleNotFoundError: No module named 'bioengine'``.
+
+        The fix is to ship the worker's own bioengine source as a
+        second ``py_modules`` URI on every runtime_env we hand to Ray.
+        Same content-addressed zip pattern as the user app — written
+        once per worker process, cached by content hash, served over
+        the shared NFS mount that backs ``apps_workdir``.
+        """
+        import bioengine
+
+        bioengine_dir = Path(bioengine.__file__).parent
+        return self._write_pkg_to_runtime_env_dir(
+            bioengine_dir,
+            filename_prefix="bioengine_runtime",
+            arc_prefix="bioengine",
+        )
 
     # ───────────────────────── kwargs translation ────────────────────────
 
@@ -657,20 +714,25 @@ class AppBuilder:
         # Off-loop: the zip walk hashes and compresses every file in
         # the artifact root and could block the asyncio loop for large
         # apps. 120s keeps us under the 150s liveness window so a slow
-        # disk fails cleanly instead of triggering a pod SIGKILL.
+        # disk fails cleanly instead of triggering a pod SIGKILL. We
+        # also bundle the worker's own bioengine source here — the
+        # actor's runtime_env.pip installs bioengine's *deps* into a
+        # venv but bioengine itself is not on PyPI, so without this the
+        # Ray actor crashes at ``pickle.loads(introspect_app)`` with
+        # ``ModuleNotFoundError: No module named 'bioengine'``.
         try:
-            pkg_uri: str = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._write_pkg_to_runtime_env_dir, pkg_root_dir
-                ),
+            pkg_uri, bioengine_uri = await asyncio.wait_for(
+                asyncio.to_thread(self._build_py_modules_uris, pkg_root_dir),
                 timeout=120,
             )
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
-                "Timed out (120s) writing the application package zip "
-                "into the runtime_env packages directory."
+                "Timed out (120s) writing runtime_env package zips into "
+                "the runtime_env packages directory."
             ) from exc
-        runtime_env = self._build_introspect_runtime_env(pkg_uri, env_vars)
+        runtime_env = self._build_introspect_runtime_env(
+            pkg_uri, bioengine_uri, env_vars
+        )
 
         # 3. Introspect the user package via a Ray task in the app's env.
         try:
@@ -794,6 +856,7 @@ class AppBuilder:
             proxy_args=proxy_args,
             runtime_env=runtime_env,
             pkg_uri=pkg_uri,
+            bioengine_uri=bioengine_uri,
             proxy_memory_in_gb=proxy_memory_in_gb,
         )
 
@@ -818,6 +881,7 @@ class AppBuilder:
                     application_id,
                     f"/{application_id}",
                     built_app.pkg_uri,
+                    built_app.bioengine_uri,
                     built_app.proxy_memory_in_gb,
                 ),
             )
@@ -848,6 +912,7 @@ class BuiltApp:
         "proxy_args",
         "runtime_env",
         "pkg_uri",
+        "bioengine_uri",
         "proxy_memory_in_gb",
     )
 
@@ -859,6 +924,7 @@ class BuiltApp:
         proxy_args: Dict[str, Any],
         runtime_env: Dict[str, Any],
         pkg_uri: str,
+        bioengine_uri: str,
         proxy_memory_in_gb: float,
     ) -> None:
         self.metadata = metadata
@@ -867,4 +933,5 @@ class BuiltApp:
         self.proxy_args = proxy_args
         self.runtime_env = runtime_env
         self.pkg_uri = pkg_uri
+        self.bioengine_uri = bioengine_uri
         self.proxy_memory_in_gb = proxy_memory_in_gb

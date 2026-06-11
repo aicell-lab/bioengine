@@ -309,6 +309,7 @@ def build_and_run_application(
     application_id: str,
     route_prefix: str,
     pkg_uri: str,
+    bioengine_uri: str,
     proxy_memory_in_gb: float,
 ) -> Dict[str, Any]:
     """Assemble the Ray Serve bind graph AND call ``serve.run`` in-process.
@@ -318,12 +319,15 @@ def build_and_run_application(
     unpickled deployment is re-accessed, so the graph must stay inside
     the process that built it.
 
-    ``pkg_uri`` is the Ray-internal ``gcs://`` URI of the user's app
-    package. Every deployment's ``runtime_env`` is augmented with this
-    URI so the replica venv can ``import`` the user's modules — without
-    this, cloudpickle on the replica fails with ``ModuleNotFoundError``
-    for deployments whose own ``pip=`` forced a fresh venv that didn't
-    inherit ``py_modules`` from the calling task.
+    ``pkg_uri`` is the ``file://`` URI of the user's app package.
+    ``bioengine_uri`` is the ``file://`` URI of the worker's own
+    bioengine source. Every deployment's ``runtime_env.py_modules`` is
+    augmented with both so the replica venv can ``import`` the user's
+    modules AND ``import bioengine``. Without ``bioengine_uri`` on the
+    replica side, deployments whose own ``pip=`` forced a fresh venv
+    crash at ``pickle.loads`` time with ``ModuleNotFoundError: No
+    module named 'bioengine'`` — bioengine itself is not on PyPI and
+    the venv only ships its deps.
 
     ``proxy_memory_in_gb`` overrides ``ProxyDeployment.ray_actor_options
     .memory`` so the scheduler is biased toward a node with at least
@@ -340,8 +344,9 @@ def build_and_run_application(
         opts = dict(cls.ray_actor_options or {})
         runtime_env = dict(opts.get("runtime_env") or {})
         py_modules = list(runtime_env.get("py_modules") or [])
-        if pkg_uri not in py_modules:
-            py_modules.append(pkg_uri)
+        for uri in (bioengine_uri, pkg_uri):
+            if uri not in py_modules:
+                py_modules.append(uri)
         runtime_env["py_modules"] = py_modules
         opts["runtime_env"] = runtime_env
         return cls.options(ray_actor_options=opts)

@@ -218,3 +218,95 @@ def test_sweep_removes_orphan_tmp_files(workdir: Path) -> None:
 
 def test_sweep_silent_when_dir_absent(workdir: Path) -> None:
     AppBuilder(apps_workdir=workdir)
+
+
+# ─────────────────────── bioengine source bundling ──────────────────────
+
+
+def test_bioengine_source_zip_has_distinct_filename_prefix(
+    builder: AppBuilder,
+) -> None:
+    uri = builder._write_bioengine_source_to_runtime_env_dir()
+    name = Path(uri[len("file://"):]).name
+    assert name.startswith("bioengine_runtime_")
+    assert name.endswith(".zip")
+
+
+def test_bioengine_source_zip_entries_are_prefixed_with_package_name(
+    builder: AppBuilder,
+) -> None:
+    uri = builder._write_bioengine_source_to_runtime_env_dir()
+    entries = _zipped_entries(Path(uri[len("file://"):]))
+
+    assert "bioengine/__init__.py" in entries
+    assert any(e.startswith("bioengine/_app/") for e in entries)
+    assert any(e.startswith("bioengine/apps/") for e in entries)
+
+    for entry in entries:
+        assert entry.startswith("bioengine/"), entry
+
+
+def test_bioengine_source_zip_excludes_pycache(
+    builder: AppBuilder,
+) -> None:
+    uri = builder._write_bioengine_source_to_runtime_env_dir()
+    entries = _zipped_entries(Path(uri[len("file://"):]))
+
+    for entry in entries:
+        assert "__pycache__" not in entry
+        assert not entry.endswith(".pyc")
+        assert not entry.endswith(".pyo")
+        assert not entry.endswith(".so")
+
+
+def test_arc_prefix_changes_hash(builder: AppBuilder, pkg: Path) -> None:
+    """Same source content under different arc_prefix must produce
+    different content hashes — the zip contents differ even though the
+    source files don't."""
+    uri_no_prefix = builder._write_pkg_to_runtime_env_dir(
+        pkg, filename_prefix="case_a"
+    )
+    uri_with_prefix = builder._write_pkg_to_runtime_env_dir(
+        pkg, filename_prefix="case_b", arc_prefix="wrap"
+    )
+    assert Path(uri_no_prefix).name != Path(uri_with_prefix).name
+
+
+def test_arc_prefix_wraps_entries(builder: AppBuilder, pkg: Path) -> None:
+    uri = builder._write_pkg_to_runtime_env_dir(
+        pkg, filename_prefix="wrapped_pkg", arc_prefix="wrap"
+    )
+    entries = _zipped_entries(Path(uri[len("file://"):]))
+    for entry in entries:
+        assert entry.startswith("wrap/"), entry
+
+
+def test_build_py_modules_uris_returns_distinct_pair(
+    builder: AppBuilder, pkg: Path
+) -> None:
+    pkg_uri, bioengine_uri = builder._build_py_modules_uris(pkg)
+
+    assert pkg_uri != bioengine_uri
+    pkg_path = Path(pkg_uri[len("file://"):])
+    bio_path = Path(bioengine_uri[len("file://"):])
+    assert pkg_path.name.startswith("bioengine_pkg_")
+    assert bio_path.name.startswith("bioengine_runtime_")
+    assert pkg_path.parent == bio_path.parent
+    assert pkg_path.is_file()
+    assert bio_path.is_file()
+
+
+def test_sweep_removes_both_filename_prefixes(workdir: Path) -> None:
+    pkg_dir = workdir / "_runtime_env_packages"
+    pkg_dir.mkdir(parents=True)
+    orphan_pkg = pkg_dir / "bioengine_pkg_aaaaaaaaaaaaaaaa.zip.tmp.111"
+    orphan_pkg.write_bytes(b"partial")
+    orphan_runtime = (
+        pkg_dir / "bioengine_runtime_bbbbbbbbbbbbbbbb.zip.tmp.222"
+    )
+    orphan_runtime.write_bytes(b"partial")
+
+    AppBuilder(apps_workdir=workdir)
+
+    assert not orphan_pkg.exists()
+    assert not orphan_runtime.exists()
