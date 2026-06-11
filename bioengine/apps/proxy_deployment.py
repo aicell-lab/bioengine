@@ -15,21 +15,22 @@ from ray.exceptions import RayTaskError
 from ray.serve import deployment, get_replica_context
 from ray.serve.handle import DeploymentHandle
 
-from bioengine.utils import get_pip_requirements
-
 logger = logging.getLogger("ray.serve")
 
 
+# ``ray_actor_options`` is intentionally minimal here. The proxy needs a
+# ``runtime_env.pip`` list (aiortc, httpx, hypha-rpc, pydantic + their pins
+# from ``[worker]``), but computing it requires ``importlib.metadata`` to
+# find bioengine's dist-info — which exists on the worker pod but NOT on
+# the Ray actor pod, where bioengine ships as raw source via
+# ``runtime_env.py_modules``. Evaluating that call at module import time
+# crashed the actor with ``PackageNotFoundError: No package metadata was
+# found for bioengine``. The full options dict (CPUs, memory reservation,
+# runtime_env.pip, runtime_env.py_modules) is assembled on the worker in
+# :func:`bioengine._app.bootstrap.build_and_run_application` and applied
+# via ``ProxyDeployment.options(ray_actor_options=…)`` at bind time, so
+# this module stays importable in any environment.
 @deployment(
-    ray_actor_options={
-        "num_cpus": 0,
-        "runtime_env": {
-            "pip": get_pip_requirements(
-                select=["aiortc", "httpx", "hypha-rpc", "pydantic"],
-                extras=["worker"],
-            ),
-        },
-    },
     # Fixed at one replica. ProxyDeployment is a 0-CPU Hypha bridge — actual
     # compute scaling lives in the inner deployments. Concurrency is bounded
     # by the in-actor semaphore sized by the per-app max_ongoing_requests

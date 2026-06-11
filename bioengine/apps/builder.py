@@ -47,6 +47,7 @@ from bioengine._app.errors import BioEngineUserError
 from bioengine.apps.proxy_deployment import ProxyDeployment
 from bioengine.utils import (
     create_logger,
+    get_pip_requirements,
     update_requirements,
     validate_manifest,
 )
@@ -858,6 +859,19 @@ class AppBuilder:
             f"Introspected '{application_id}' "
             f"(methods: {available_methods})"
         )
+        # Compute the proxy's runtime_env.pip list here on the worker —
+        # ``get_pip_requirements`` uses ``importlib.metadata`` which only
+        # finds bioengine on a host where it was pip-installed. The Ray
+        # actor that runs ``ProxyDeployment`` only has bioengine as raw
+        # source (shipped via py_modules), so resolving the list there
+        # raises ``PackageNotFoundError``. We compute it on the worker
+        # and bootstrap.build_and_run_application applies it at bind
+        # time via ``ProxyDeployment.options(ray_actor_options=…)``.
+        proxy_pip = get_pip_requirements(
+            select=["aiortc", "httpx", "hypha-rpc", "pydantic"],
+            extras=["worker"],
+        )
+
         return BuiltApp(
             metadata=metadata,
             spec=spec,
@@ -866,6 +880,7 @@ class AppBuilder:
             runtime_env=runtime_env,
             pkg_uri=pkg_uri,
             bioengine_uri=bioengine_uri,
+            proxy_pip=proxy_pip,
             proxy_memory_in_gb=proxy_memory_in_gb,
         )
 
@@ -891,6 +906,7 @@ class AppBuilder:
                     f"/{application_id}",
                     built_app.pkg_uri,
                     built_app.bioengine_uri,
+                    built_app.proxy_pip,
                     built_app.proxy_memory_in_gb,
                 ),
             )
@@ -922,6 +938,7 @@ class BuiltApp:
         "runtime_env",
         "pkg_uri",
         "bioengine_uri",
+        "proxy_pip",
         "proxy_memory_in_gb",
     )
 
@@ -934,6 +951,7 @@ class BuiltApp:
         runtime_env: Dict[str, Any],
         pkg_uri: str,
         bioengine_uri: str,
+        proxy_pip: List[str],
         proxy_memory_in_gb: float,
     ) -> None:
         self.metadata = metadata
@@ -943,4 +961,5 @@ class BuiltApp:
         self.runtime_env = runtime_env
         self.pkg_uri = pkg_uri
         self.bioengine_uri = bioengine_uri
+        self.proxy_pip = proxy_pip
         self.proxy_memory_in_gb = proxy_memory_in_gb
