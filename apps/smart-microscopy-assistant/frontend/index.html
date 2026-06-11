@@ -199,7 +199,13 @@
     -webkit-background-clip: text; background-clip: text;
     -webkit-text-fill-color: transparent;
   }
-  header.page p { color: var(--fg-dim); margin-top: 0.35rem; font-size: 0.9rem; }
+  header.page p {
+    color: var(--fg-dim); margin-top: 0.5rem; font-size: 0.88rem;
+    line-height: 1.5; max-width: 44rem; margin-left: auto; margin-right: auto;
+  }
+  header.page p strong { color: var(--fg); font-weight: 600; }
+  header.page p.header-runtime { font-size: 0.78rem; color: var(--fg-muted); margin-top: 0.35rem; }
+  header.page p.header-runtime em { font-style: normal; color: var(--fg-dim); }
 
   /* --- Mode toggle (segmented) ----------------------------------------- */
   .mode-toggle-wrap { display: flex; justify-content: center; margin-bottom: 1.5rem; }
@@ -997,7 +1003,19 @@
 
   <header class="page">
     <h1><span class="accent">Smart Microscopy</span> Assistant</h1>
-    <p>VLM-backed microscopy analyst — reusable visual tests, batched image analysis, plain English.</p>
+    <p>
+      Inspect <strong>2D RGB images</strong> (PNG, JPG, TIFF — ≤ 25 MB each) with reusable
+      visual tests or free-text questions. Best for visually-obvious judgements:
+      categorical differences, focus, presence/absence. Not a replacement for
+      precise measurement, counting, or sub-pixel work. Multi-channel, z-stacks,
+      and time series are out of scope.
+    </p>
+    <p class="header-runtime">
+      Backed by Qwen2.5-VL-3B-Instruct on one NVIDIA A40-16C vGPU slice. See
+      the info button (top right) for the live runtime details, or the help
+      icon next to <em>Create a new visual test</em> for what the model
+      reliably handles.
+    </p>
   </header>
 
   <!-- Auth gate -->
@@ -1114,32 +1132,34 @@
 
             <div class="h-section pass-h">Works well for</div>
             <ul>
-              <li>Sharp vs. blurry, in-focus vs. out-of-focus.</li>
-              <li>Presence or absence of obvious content (visible cells, dye, structures, vs. an empty / flat field).</li>
-              <li>Coarse colour and channel description in fluorescence images ("blue nuclei, green cytoplasm").</li>
-              <li>Big binary failures that change the overall look of the image (right orientation vs. 180° flipped, instrument component visible vs. missing).</li>
-              <li>Simple yes/no questions about one visually-prominent property.</li>
+              <li>Categorical judgements where the difference is visually obvious — presence vs. absence, broad type, gross orientation.</li>
+              <li>Focus and sharpness questions: sharp vs. blurry, in-focus vs. out-of-focus areas.</li>
+              <li>Coarse colour and channel description in fluorescence and brightfield images.</li>
+              <li>Locating clearly distinguishable objects via bounding boxes or points (the model was trained for this and is competitive with specialist detectors on common categories).</li>
+              <li>One yes/no question about a single visually-prominent property.</li>
             </ul>
 
             <div class="h-section fail-h">Struggles with</div>
             <ul>
-              <li>Counting precisely — even 96 wells in a plate came back as 64.</li>
-              <li>Reading text or numbers in the image (OCR is unreliable).</li>
-              <li>Small rotations or sub-millimetre misalignment (~10° tilts are routinely missed).</li>
-              <li>Tests where PASS is a long AND of conditions — the model checks the most prominent one and asserts the rest.</li>
-              <li>"On top of" / "under" / "behind" judgements when the reference images push the answer the wrong way (anchor bias dominates).</li>
-              <li>Subtle defects against an otherwise "good-looking" frame.</li>
+              <li><strong>Precise counting.</strong> Reliable up to roughly ten distinct objects; large counts drift by 30 %+ in our tests, matching reports in the literature.</li>
+              <li><strong>Reading text.</strong> OCR is unreliable on small, low-contrast, rotated, or stylised text — OCRBench v2 places the 3B well behind dedicated OCR models.</li>
+              <li><strong>Fine geometric judgements.</strong> Small rotations, angle measurements, sub-millimetre offsets and pixel-level localisation drop below 15 % on segmentation benchmarks.</li>
+              <li><strong>Multi-clause "AND" criteria.</strong> When PASS requires several conditions at once the model checks the most prominent one and asserts the rest.</li>
+              <li><strong>3D spatial relationships.</strong> "On top of" / "under" / "behind" are routinely mis-judged, especially when reference images push the wrong way (a well-known anchor-bias failure).</li>
+              <li><strong>Domain-specific patterns it wasn't trained on.</strong> Zero-shot detection on novel medical / microscopy categories is below 7 % mAP — references carry most of the signal.</li>
+              <li><strong>Hallucination under ambiguity.</strong> When visual evidence is weak the model falls back on language priors and can invent details that aren't there.</li>
             </ul>
 
             <div class="h-section tip-h">Tips for a useful test</div>
             <ul>
-              <li>Keep each test to one axis — split "focused AND centred" into two tests.</li>
-              <li>Phrase criteria as visible properties ("sharp cell outlines", "any saturated white pixel"), not abstract quality words ("good image").</li>
-              <li>References do most of the work. 2 positives + 2 negatives, each covering a distinct failure mode, beats 5 of the same kind.</li>
-              <li>Test on held-out images before relying on a test — every test you build can be wrong.</li>
+              <li>Keep each test to <strong>one axis</strong>. Split "focused AND centred" into two separate tests.</li>
+              <li>Phrase criteria as <strong>visible properties</strong> ("sharp cell outlines", "any saturated pixel"), not abstract quality words ("good image").</li>
+              <li><strong>References do most of the work.</strong> Two positive + two negative examples covering distinct failure modes beat five of the same kind.</li>
+              <li>For domain-specific tasks (e.g. microscopy) the references usually carry more signal than the criterion text — pick them carefully.</li>
+              <li>Always <strong>validate on held-out images</strong> before relying on a new test.</li>
             </ul>
 
-            <div class="footer">Backed by Qwen2.5-VL-3B-Instruct. A larger model will improve precision; the trade-offs above are baseline.</div>
+            <div class="footer">Backed by Qwen2.5-VL-3B-Instruct. A larger model improves precision; the trade-offs above are the baseline for the 3B class.</div>
           </div>
         </span>
       </h2>
