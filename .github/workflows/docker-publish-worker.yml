@@ -98,16 +98,8 @@ jobs:
         file: docker/worker.Dockerfile
         platforms: linux/amd64,linux/arm64
         push: true
-        # `:latest` is intentionally NOT published automatically. Promotion of
-        # a release to `:latest` is a manual decision per release — retag with
-        #   docker buildx imagetools create \
-        #       -t ghcr.io/aicell-lab/bioengine-worker:latest \
-        #       ghcr.io/aicell-lab/bioengine-worker:<x.y.z>
-        # only once the new version is the one consumers should pick up by
-        # default. This protects users pinned to `:latest` (single-machine
-        # docker-compose, the kth-k8s chart's tag fallback, etc.) from
-        # silently getting a breaking release.
         tags: |
+          ghcr.io/aicell-lab/bioengine-worker:latest
           ghcr.io/aicell-lab/bioengine-worker:${{ env.VERSION }}
         labels: |
           org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
