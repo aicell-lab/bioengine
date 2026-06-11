@@ -131,6 +131,63 @@
     border-bottom: 1px solid var(--border); margin-bottom: 0.35rem;
   }
 
+  /* --- Inline help button (in the Create panel) ----------------------- */
+  .help-btn {
+    background: transparent; color: var(--fg-dim);
+    border: 1px solid var(--border); border-radius: 999px;
+    width: 1.45rem; height: 1.45rem; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; flex-shrink: 0;
+    transition: background 0.12s var(--ease-out),
+                color 0.12s var(--ease-out),
+                border-color 0.12s var(--ease-out),
+                transform 0.1s var(--ease-out);
+  }
+  .help-btn:hover { background: var(--bg-3); color: var(--fg); border-color: var(--border-strong); }
+  .help-btn:active { transform: scale(0.94); }
+  .help-btn svg { width: 0.85rem; height: 0.85rem; }
+  .help-wrap { position: relative; display: inline-block; }
+  #helpPopover {
+    /* Wider than the topbar info popover — it carries prose, not a key/value list. */
+    min-width: 28rem; max-width: min(32rem, calc(100vw - 2rem));
+    padding: 0.85rem 0;
+    transform-origin: top left;
+  }
+  #helpPopover .heading {
+    padding: 0.35rem 1.05rem 0.55rem; font-size: 0.72rem;
+    color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.07em;
+    border-bottom: 1px solid var(--border); margin-bottom: 0.35rem;
+  }
+  #helpPopover .h-section {
+    padding: 0.55rem 1.05rem 0.2rem; font-size: 0.74rem;
+    font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    display: flex; align-items: center; gap: 0.4rem;
+  }
+  #helpPopover .h-section.pass-h { color: var(--pass); }
+  #helpPopover .h-section.fail-h { color: var(--fail); }
+  #helpPopover .h-section.tip-h  { color: var(--accent); }
+  #helpPopover ul {
+    list-style: none; padding: 0 1.05rem 0.55rem; margin: 0;
+    font-size: 0.82rem; color: var(--fg);
+  }
+  #helpPopover ul li {
+    padding: 0.18rem 0; line-height: 1.45;
+    display: flex; gap: 0.45rem;
+  }
+  #helpPopover ul li::before {
+    content: ""; flex-shrink: 0;
+    width: 0.35rem; height: 0.35rem; border-radius: 50%;
+    margin-top: 0.5rem; background: var(--fg-muted);
+  }
+  #helpPopover .h-section.pass-h + ul li::before { background: var(--pass); }
+  #helpPopover .h-section.fail-h + ul li::before { background: var(--fail); }
+  #helpPopover .h-section.tip-h  + ul li::before { background: var(--accent); }
+  #helpPopover .footer {
+    border-top: 1px solid var(--border); margin-top: 0.4rem;
+    padding: 0.55rem 1.05rem 0;
+    font-size: 0.72rem; color: var(--fg-muted);
+  }
+
   /* --- Header ----------------------------------------------------------- */
   header.page { text-align: center; margin-bottom: 1.5rem; }
   header.page h1 {
@@ -1039,7 +1096,53 @@
 
     <!-- New test creation (single combined panel) -->
     <div class="card">
-      <h2>Create a new visual test</h2>
+      <h2>
+        Create a new visual test
+        <span class="help-wrap" style="margin-left: 0.55rem;">
+          <button id="helpBtn" class="help-btn" type="button"
+                  aria-label="What this model can and can't see"
+                  aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="16" x2="12" y2="12"/>
+              <line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+          </button>
+          <div id="helpPopover" class="popover" hidden role="dialog" aria-label="Designing a test the model can handle">
+            <div class="heading">Designing a test the model can handle</div>
+
+            <div class="h-section pass-h">Works well for</div>
+            <ul>
+              <li>Sharp vs. blurry, in-focus vs. out-of-focus.</li>
+              <li>Presence or absence of obvious content (visible cells, dye, structures, vs. an empty / flat field).</li>
+              <li>Coarse colour and channel description in fluorescence images ("blue nuclei, green cytoplasm").</li>
+              <li>Big binary failures that change the overall look of the image (right orientation vs. 180° flipped, instrument component visible vs. missing).</li>
+              <li>Simple yes/no questions about one visually-prominent property.</li>
+            </ul>
+
+            <div class="h-section fail-h">Struggles with</div>
+            <ul>
+              <li>Counting precisely — even 96 wells in a plate came back as 64.</li>
+              <li>Reading text or numbers in the image (OCR is unreliable).</li>
+              <li>Small rotations or sub-millimetre misalignment (~10° tilts are routinely missed).</li>
+              <li>Tests where PASS is a long AND of conditions — the model checks the most prominent one and asserts the rest.</li>
+              <li>"On top of" / "under" / "behind" judgements when the reference images push the answer the wrong way (anchor bias dominates).</li>
+              <li>Subtle defects against an otherwise "good-looking" frame.</li>
+            </ul>
+
+            <div class="h-section tip-h">Tips for a useful test</div>
+            <ul>
+              <li>Keep each test to one axis — split "focused AND centred" into two tests.</li>
+              <li>Phrase criteria as visible properties ("sharp cell outlines", "any saturated white pixel"), not abstract quality words ("good image").</li>
+              <li>References do most of the work. 2 positives + 2 negatives, each covering a distinct failure mode, beats 5 of the same kind.</li>
+              <li>Test on held-out images before relying on a test — every test you build can be wrong.</li>
+            </ul>
+
+            <div class="footer">Backed by Qwen2.5-VL-3B-Instruct. A larger model will improve precision; the trade-offs above are baseline.</div>
+          </div>
+        </span>
+      </h2>
 
       <!-- 1. Visibility -->
       <div class="subsection">
@@ -1273,16 +1376,31 @@ function setLoggedInUI() {
 $("userBtn").addEventListener("click", () => {
   $("userMenu").hidden = !$("userMenu").hidden;
   $("infoPopover").hidden = true;
+  $("helpPopover").hidden = true;
 });
 $("infoBtn").addEventListener("click", () => {
   $("infoPopover").hidden = !$("infoPopover").hidden;
   $("userMenu").hidden = true;
+  $("helpPopover").hidden = true;
+});
+$("helpBtn").addEventListener("click", () => {
+  $("helpPopover").hidden = !$("helpPopover").hidden;
+  $("userMenu").hidden = true;
+  $("infoPopover").hidden = true;
 });
 document.addEventListener("mousedown", (e) => {
-  for (const id of ["userMenu", "infoPopover"]) {
-    const m = $(id);
-    const trig = id === "userMenu" ? $("userBtn") : $("infoBtn");
+  for (const [popId, trigId] of [
+    ["userMenu", "userBtn"], ["infoPopover", "infoBtn"], ["helpPopover", "helpBtn"],
+  ]) {
+    const m = $(popId);
+    const trig = $(trigId);
     if (!m.hidden && !m.contains(e.target) && !trig.contains(e.target)) m.hidden = true;
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  for (const id of ["userMenu", "infoPopover", "helpPopover"]) {
+    if (!$(id).hidden) $(id).hidden = true;
   }
 });
 
