@@ -310,6 +310,7 @@ def build_and_run_application(
     route_prefix: str,
     pkg_uri: str,
     bioengine_uri: str,
+    proxy_pip: List[str],
     proxy_memory_in_gb: float,
 ) -> Dict[str, Any]:
     """Assemble the Ray Serve bind graph AND call ``serve.run`` in-process.
@@ -369,9 +370,22 @@ def build_and_run_application(
     # The default 0 reservation lets Ray place the proxy on any node,
     # including resource-tight ones (e.g. the head). A real reservation
     # biases scheduling toward nodes with headroom for the
-    # WebSocket/WebRTC payloads the proxy terminates.
+    # WebSocket/WebRTC payloads the proxy terminates. ``proxy_pip`` is
+    # computed on the worker (where bioengine has dist-info); the proxy
+    # class deliberately ships with no static ``runtime_env`` because
+    # resolving the pip list at import time crashed the actor pod —
+    # see :mod:`bioengine.apps.proxy_deployment` for the rationale.
     proxy_actor_options = dict(ProxyDeployment.ray_actor_options or {})
+    proxy_actor_options["num_cpus"] = proxy_actor_options.get("num_cpus", 0)
     proxy_actor_options["memory"] = int(proxy_memory_in_gb * (1024**3))
+    proxy_runtime_env = dict(proxy_actor_options.get("runtime_env") or {})
+    proxy_runtime_env["pip"] = proxy_pip
+    proxy_py_modules = list(proxy_runtime_env.get("py_modules") or [])
+    for uri in (bioengine_uri, pkg_uri):
+        if uri not in proxy_py_modules:
+            proxy_py_modules.append(uri)
+    proxy_runtime_env["py_modules"] = proxy_py_modules
+    proxy_actor_options["runtime_env"] = proxy_runtime_env
     proxy_cls = ProxyDeployment.options(ray_actor_options=proxy_actor_options)
 
     app = proxy_cls.bind(

@@ -91,3 +91,34 @@ def test_proxy_deployment_importable_without_haikunator() -> None:
     finally:
         _drop_relevant_modules()
         sys.modules.update(saved)
+
+
+def test_proxy_deployment_importable_without_bioengine_dist_info() -> None:
+    """On the Ray actor, bioengine ships as raw source via
+    ``runtime_env.py_modules`` — no ``.dist-info`` directory exists, so
+    ``importlib.metadata.metadata('bioengine')`` raises
+    ``PackageNotFoundError``. The proxy_deployment module must NOT
+    invoke that call at import time; the proxy's ``runtime_env.pip`` is
+    assembled by the worker side and applied at bind time by
+    ``bioengine._app.bootstrap.build_and_run_application``.
+    """
+    import importlib.metadata as md
+
+    real_metadata = md.metadata
+
+    def fake_metadata(name: str):
+        if name == "bioengine":
+            raise md.PackageNotFoundError(name)
+        return real_metadata(name)
+
+    saved = _snapshot_relevant_modules()
+    try:
+        _drop_relevant_modules()
+        md.metadata = fake_metadata  # type: ignore[assignment]
+        try:
+            importlib.import_module("bioengine.apps.proxy_deployment")
+        finally:
+            md.metadata = real_metadata  # type: ignore[assignment]
+    finally:
+        _drop_relevant_modules()
+        sys.modules.update(saved)
