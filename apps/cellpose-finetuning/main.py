@@ -596,9 +596,25 @@ def to_local_path(root: Path, rel: Path) -> Path:
     return root / strip_leading_slash(rel)
 
 
+def _data_root() -> Path:
+    """Return the writable base directory for cellpose-finetuning training state.
+
+    Honours ``CELLPOSE_DATA_DIR`` so cluster operators can point sessions and
+    artifact caches at a shared NFS mount; falls back to
+    ``/tmp/bioengine/cellpose-finetuning``. We deliberately don't use
+    ``Path.home()`` — the framework sets HOME to ``apps_workdir/<app_id>/``,
+    which on shared-NFS workers may live on a mount the replica's UID cannot
+    create subdirectories on.
+    """
+    return Path(
+        os.environ.get("CELLPOSE_DATA_DIR")
+        or "/tmp/bioengine/cellpose-finetuning"
+    ).expanduser().resolve()
+
+
 def get_sessions_path() -> Path:
     """Return the path to the directory where training sessions are stored."""
-    return Path.home() / "sessions"
+    return _data_root() / "sessions"
 
 
 def get_model_path(session_id: str) -> Path:
@@ -695,7 +711,7 @@ async def ensure_published_model_local_session(model_reference: str) -> str:
 def artifact_cache_dir(artifact_id: str) -> Path:
     """Return local cache dir for an artifact id, ensuring it exists."""
     safe = artifact_id.replace("/", "__")
-    d = Path.home() / "data_cache" / safe
+    d = _data_root() / "data_cache" / safe
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -3753,6 +3769,12 @@ def _predict_and_encode(
         "matplotlib",
         "hypha-artifact==0.1.2",
     ],
+    env_vars={
+        # Shared writable NFS path so training sessions + data caches survive
+        # replica restarts. Override per-cluster via the manifest if a
+        # different shared path is provisioned.
+        "CELLPOSE_DATA_DIR": "/home/bioengine/staging/model-cache/cellpose-finetuning",
+    },
     max_ongoing_requests=1,
     max_queued_requests=10,
     autoscaling_config={
