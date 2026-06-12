@@ -43,16 +43,14 @@ class ModelCache:
         replica_id: str,
     ):
         # Place the model cache under ``$MODEL_CACHE_DIR`` if the operator
-        # configured one; otherwise under the framework-managed ``$TMPDIR``
-        # (set per replica to a writable scratch dir); fall back to
-        # ``/tmp/bioengine/model-runner-cache`` so the replica can always
-        # boot even on a worker whose ``apps_workdir`` is on a
-        # read-only or restrictive shared mount. ``Path().resolve()`` is
-        # not safe — the actor's cwd is the per-app workdir which may
-        # live on NFS without write permission for the replica's UID.
+        # configured one (e.g. an NVMe scratch path), otherwise under
+        # ``/tmp/bioengine/model-runner-cache``. We deliberately *don't*
+        # use ``$TMPDIR`` — the BioEngine framework sets it per-app to
+        # ``<apps_workdir>/<app_id>/tmp``, which on shared-NFS workers
+        # may live on a mount the replica's UID cannot write to. ``/tmp``
+        # is always writable inside the actor process namespace.
         cache_base = (
             os.environ.get("MODEL_CACHE_DIR")
-            or os.environ.get("TMPDIR")
             or "/tmp/bioengine/model-runner-cache"
         )
         self.cache_dir = Path(cache_base).expanduser().resolve() / "models"
