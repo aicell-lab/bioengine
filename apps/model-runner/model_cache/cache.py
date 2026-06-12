@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import httpx
+import yaml
 
 from .package import BioimageioPackage
 
