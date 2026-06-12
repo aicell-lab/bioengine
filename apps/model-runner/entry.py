@@ -71,6 +71,12 @@ SUPPORTED_FILES_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"
         "numpy==1.26.4",
         "tqdm>=4.64.0",
     ],
+    env_vars={
+        # Shared NFS path so EntryApp and RuntimeApp see the same model cache
+        # across pods. Override per-cluster via the manifest if the deployment
+        # has a different writable shared path.
+        "MODEL_CACHE_DIR": "/home/bioengine/staging/model-cache",
+    },
     max_ongoing_requests=10,
     max_queued_requests=30,
     autoscaling_config={

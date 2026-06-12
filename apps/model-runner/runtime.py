@@ -54,6 +54,11 @@ REQUIREMENTS = [
     num_gpus=1,
     memory_mb=12 * 1024,
     pip=REQUIREMENTS,
+    env_vars={
+        # Must match EntryApp's MODEL_CACHE_DIR — both pods read RDFs from
+        # the same shared NFS path.
+        "MODEL_CACHE_DIR": "/home/bioengine/staging/model-cache",
+    },
     max_ongoing_requests=1,
     autoscaling_config={
         "min_replicas": 1,
