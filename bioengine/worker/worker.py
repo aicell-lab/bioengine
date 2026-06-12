@@ -341,6 +341,7 @@ class BioEngineWorker:
             self.apps_manager = AppsManager(
                 ray_cluster=self.ray_cluster,
                 apps_workdir=apps_workdir,
+                server_url=server_url,
                 startup_applications=startup_applications,
                 log_file=self.log_file,
                 debug=debug,

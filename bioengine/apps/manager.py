@@ -80,6 +80,7 @@ class AppsManager:
     def __init__(
         self,
         ray_cluster: RayCluster,
+        server_url: str,
         apps_workdir: Union[str, Path] = f"{os.environ['HOME']}/.bioengine/apps",
         startup_applications: Optional[List[dict]] = None,
         # Logger
@@ -125,6 +126,7 @@ class AppsManager:
 
         self.app_builder = AppBuilder(
             apps_workdir=apps_workdir,
+            server_url=server_url,
             log_file=log_file,
             proxy_actor_name=self.ray_cluster.proxy_actor_name,
             debug=debug,

@@ -64,6 +64,7 @@ class AppBuilder:
     def __init__(
         self,
         apps_workdir: Union[str, Path],
+        server_url: str,
         log_file: Optional[str] = None,
         proxy_actor_name: Optional[str] = None,
         debug: bool = False,
@@ -78,6 +79,7 @@ class AppBuilder:
         self.artifact_manager: Optional[ObjectProxy] = None
         self.worker_service_id: Optional[str] = None
         self.proxy_actor_name: Optional[str] = proxy_actor_name
+        self.server_url: str = server_url
         self.data_server_url: Optional[str] = None
 
         self._sweep_runtime_env_tmp_files()
@@ -254,7 +256,7 @@ class AppBuilder:
         env_vars["TMP"] = tmp_dir
 
         if self.server is not None:
-            env_vars["HYPHA_SERVER_URL"] = self.server.config.public_base_url
+            env_vars["HYPHA_SERVER_URL"] = self.server_url
             env_vars["HYPHA_WORKSPACE"] = self.server.config.workspace
         env_vars["HYPHA_ARTIFACT_ID"] = artifact_id
         if version is not None:
@@ -834,7 +836,7 @@ class AppBuilder:
             "application_description": manifest["description"],
             "app_data": app_data,
             "max_ongoing_requests": max_ongoing_requests,
-            "server_url": self.server.config.public_base_url,
+            "server_url": self.server_url,
             "workspace": self.server.config.workspace,
             "worker_client_id": self.server.config.client_id,
             "proxy_service_token": proxy_service_token,

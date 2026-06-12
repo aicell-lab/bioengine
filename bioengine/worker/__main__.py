@@ -187,7 +187,9 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         type=str,
         metavar="URL",
         help="URL of the Hypha server for service registration and remote access. "
-        "Must be accessible from the deployment environment.",
+        "Used both by the worker itself and by deployed apps (HYPHA_SERVER_URL env "
+        "var + ProxyDeployment's connection URL), so it must be reachable from every "
+        "node hosting an app — including Ray worker pods.",
     )
     hypha_group.add_argument(
         "--workspace",
