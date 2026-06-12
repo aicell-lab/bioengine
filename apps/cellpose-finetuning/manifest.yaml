@@ -5,7 +5,7 @@ covers: []
 description: A BioEngine service for running Cellpose-SAM 4.0.7 inference and fine-tuning cell segmentation models.
 documentation: "README.md"
 tutorial: "https://imjoy-notebook.netlify.app/lab/index.html?load=https://raw.githubusercontent.com/aicell-lab/bioengine/refs/heads/main/apps/cellpose-finetuning/tutorial_cellpose_finetuning.ipynb&open=1"
-format_version: 0.5.0
+format_version: 0.6.0
 git_repo: "https://github.com/aicell-lab/bioengine/tree/main/apps/cellpose-finetuning"
 id: cellpose-finetuning
 id_emoji: "🧬"
@@ -15,7 +15,6 @@ maintainers: []
 name: Cellpose Fine-Tuning
 tags: [cell-segmentation, deep-learning, biomedical-imaging, fine-tuning]
 type: ray-serve
-version: 0.1.5
-deployments:
-  - main:CellposeFinetune
+version: 0.2.0
+entry: main:CellposeFinetune
 frontend_entry: "frontend/index.html"
