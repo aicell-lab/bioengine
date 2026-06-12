@@ -13,7 +13,6 @@ file before the body runs and the ``__aexit__`` removes it + bumps
 ``.last_access`` afterwards.
 """
 
-from __future__ import annotations
 
 import asyncio
 import logging

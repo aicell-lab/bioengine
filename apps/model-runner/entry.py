@@ -14,7 +14,6 @@ Heavier helper modules:
   keep models from being evicted mid-inference
 """
 
-from __future__ import annotations
 
 import asyncio
 import json

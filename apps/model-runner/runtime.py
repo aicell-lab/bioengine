@@ -14,7 +14,6 @@ by the ``@bioengine.app(pip=REQUIREMENTS)`` declaration and imported
 inside method bodies.
 """
 
-from __future__ import annotations
 
 import hashlib
 import json
