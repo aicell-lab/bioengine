@@ -4,6 +4,13 @@ This service downloads training data from a Hypha Artifact, fine-tunes a
 Cellpose model, and exposes training control and inference functions.
 """
 
+# PEP 563 — defer annotation evaluation. Helper signatures elsewhere in this
+# module reference TYPE_CHECKING-only types like AsyncHyphaArtifact and
+# CellposeModel; without this the module fails to import on the introspection
+# task. @bioengine.method-decorated entry points use only builtin annotations,
+# so pydantic still resolves their schemas correctly.
+from __future__ import annotations
+
 import os
 
 # torch._dynamo (>=2.5) calls getpass.getuser() at import; fails when USER is
