@@ -38,7 +38,7 @@ def _merge_via_with_pkg(
     *,
     replica_env_vars: Dict[str, str],
     user_replica_framework_pip: list[str] | None = None,
-    bioengine_path: str = "/opt/bioengine",
+    bioengine_uri: str = "gcs://_ray_pkg_aaaaaaaaaaaaaaaa.zip",
 ) -> Dict[str, Any]:
     """Drive ``_with_pkg`` from bootstrap against a fake class and return
     the assembled ``runtime_env`` dict that bootstrap would hand to Ray
@@ -50,8 +50,8 @@ def _merge_via_with_pkg(
     # build a tiny shim that re-creates the same merge so we can exercise
     # the logic in isolation. The shim has to mirror bootstrap's structure.
     py_modules = list(cls_options.get("runtime_env", {}).get("py_modules") or [])
-    if bioengine_path not in py_modules:
-        py_modules.append(bioengine_path)
+    if bioengine_uri not in py_modules:
+        py_modules.append(bioengine_uri)
     rt = dict(cls_options.get("runtime_env") or {})
     rt["py_modules"] = py_modules
     rt["worker_process_setup_hook"] = bootstrap._REPLICA_SETUP_HOOK

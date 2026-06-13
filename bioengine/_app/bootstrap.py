@@ -344,7 +344,7 @@ def build_and_run_application(
     proxy_args: Dict[str, Any],
     application_id: str,
     route_prefix: str,
-    bioengine_path: str,
+    bioengine_uri: str,
     proxy_pip: List[str],
     user_replica_framework_pip: List[str],
     replica_env_vars: Dict[str, str],
@@ -357,13 +357,14 @@ def build_and_run_application(
     unpickled deployment is re-accessed, so the graph must stay inside
     the process that built it.
 
-    ``bioengine_path`` is the worker's local filesystem path to the
-    ``bioengine`` package directory; Ray's client packages it via the
-    internal upload mechanism and caches by content hash, so the same
-    worker image produces the same hash and the upload happens at most
-    once per cluster lifetime. The replica needs ``bioengine`` on
-    ``sys.path`` before user code is loaded so the venv's pickle round
-    trip can resolve framework references.
+    ``bioengine_uri`` is a Ray ``gcs://`` URI returned by
+    :func:`ray._private.runtime_env.packaging.get_uri_for_directory` for
+    the worker's ``bioengine`` source. The worker uploads the directory
+    once per content hash; Ray Serve replicas extract it onto their
+    ``sys.path`` before the user class is imported. Task-level
+    ``runtime_env.py_modules`` only accepts URIs (not local paths), so
+    we cannot pass the worker's filesystem path here — bypassing this
+    rejection is the whole point of the upload step on the worker side.
 
     Each deployment's ``runtime_env`` is augmented with a
     ``worker_process_setup_hook`` (:data:`_REPLICA_SETUP_HOOK`) that
@@ -388,8 +389,8 @@ def build_and_run_application(
         opts = dict(cls.ray_actor_options or {})
         runtime_env = dict(opts.get("runtime_env") or {})
         py_modules = list(runtime_env.get("py_modules") or [])
-        if bioengine_path not in py_modules:
-            py_modules.append(bioengine_path)
+        if bioengine_uri not in py_modules:
+            py_modules.append(bioengine_uri)
         runtime_env["py_modules"] = py_modules
         runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
         # Merge the framework-required pip deps (hypha-rpc, pydantic)
@@ -444,8 +445,8 @@ def build_and_run_application(
     proxy_runtime_env = dict(proxy_actor_options.get("runtime_env") or {})
     proxy_runtime_env["pip"] = proxy_pip
     proxy_py_modules = list(proxy_runtime_env.get("py_modules") or [])
-    if bioengine_path not in proxy_py_modules:
-        proxy_py_modules.append(bioengine_path)
+    if bioengine_uri not in proxy_py_modules:
+        proxy_py_modules.append(bioengine_uri)
     proxy_runtime_env["py_modules"] = proxy_py_modules
     # ProxyDeployment never touches the user's source, so it skips the
     # replica setup hook; HOME defaults to whatever Ray gives the actor.

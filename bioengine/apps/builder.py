@@ -37,6 +37,10 @@ import yaml
 from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils import ObjectProxy
 from ray import serve
+from ray._private.runtime_env.packaging import (
+    get_uri_for_directory,
+    upload_package_if_needed,
+)
 
 import bioengine
 from bioengine._app.bootstrap import (
@@ -313,19 +317,19 @@ class AppBuilder:
 
     def _build_introspect_runtime_env(
         self,
-        pkg_root_dir: Path,
-        bioengine_path: str,
+        pkg_uri: str,
+        bioengine_uri: str,
         env_vars: Dict[str, str],
     ) -> Dict[str, Any]:
         """Compose the runtime_env for the introspection + build Ray tasks.
 
         Both tasks import the user's entry class (the introspection walks
         type hints, ``build_and_run_application`` calls ``cls.bind(...)``),
-        so the source has to be on their ``sys.path``. We pass ``pkg_root_dir``
-        and ``bioengine_path`` as local directory paths — Ray client packages
-        them on the worker side and uploads via Ray's internal GCS, dedup'd
-        by content hash. No ``file://`` URI is involved, so this works
-        regardless of whether the worker and Ray nodes share a filesystem.
+        so the source has to be on their ``sys.path``. We pass content-
+        hashed ``gcs://`` URIs returned by :meth:`_upload_directory_to_gcs`
+        — Ray client uploads each directory at most once per content hash
+        and Ray nodes pull from the cluster's internal GCS. No worker↔Ray
+        shared filesystem required.
 
         The pip list is the BioEngine baseline only — every module containing
         ``@bioengine.app`` (and anything they transitively import at top
@@ -346,22 +350,43 @@ class AppBuilder:
         introspect_env.pop("BIOENGINE_DATA_SERVER_URL", None)
 
         return {
-            "py_modules": [bioengine_path, str(pkg_root_dir.resolve())],
+            "py_modules": [bioengine_uri, pkg_uri],
             "pip": base_pip,
             "env_vars": introspect_env,
         }
 
-    @staticmethod
-    def _bioengine_source_path() -> str:
-        """Return the worker's local ``bioengine/`` package directory.
+    def _upload_directory_to_gcs(self, path: Path) -> str:
+        """Hash a local directory, upload to Ray's GCS if absent, return its URI.
 
-        Handed to Ray as a ``runtime_env.py_modules`` entry — Ray client
-        zips it on the worker, uploads via Ray's internal GCS exactly once
-        per content hash, and Ray Serve replicas extract it onto their
-        ``sys.path`` before the user class is imported. No worker↔Ray
-        shared filesystem required.
+        Ray's task/deployment-level ``runtime_env.py_modules`` only accepts
+        proper URIs (``gcs://``, ``https://``, …) — passing a local path
+        raises ``ValueError: ... is only supported at the job level``
+        (Ray's :mod:`runtime_env.validation`). We use Ray's content-hashed
+        URI scheme so the same content yields the same URI, and
+        :func:`upload_package_if_needed` short-circuits when the package
+        already lives in GCS (uploaded by an earlier deploy on this
+        worker, or by the worker's own ``ray.init`` py_modules in
+        ``cluster.ray_cluster``).
+
+        The "scratch_dir" the Ray helper writes its working zip into is a
+        per-call temp directory we delete immediately after; we don't want
+        zips piling up on the worker pod's PVC the way v0.11.3 did.
         """
-        return str(Path(bioengine.__file__).parent.resolve())
+        path_str = str(path.resolve())
+        uri = get_uri_for_directory(path_str)
+        with tempfile.TemporaryDirectory(prefix="bioengine-pkg-upload-") as scratch:
+            upload_package_if_needed(
+                uri,
+                scratch,
+                path_str,
+                include_parent_dir=True,
+                logger=self.logger,
+            )
+        return uri
+
+    def _bioengine_source_path(self) -> str:
+        """Return the URI Ray Serve replicas use to fetch the bioengine framework."""
+        return self._upload_directory_to_gcs(Path(bioengine.__file__).parent)
 
     # ───────────────────────── kwargs translation ────────────────────────
 
@@ -632,9 +657,10 @@ class AppBuilder:
             application_id, artifact_id, version,
             non_secret_env_vars, secret_env_vars, hypha_token, download_token,
         )
-        bioengine_path = self._bioengine_source_path()
+        bioengine_uri = self._bioengine_source_path()
+        pkg_uri = self._upload_directory_to_gcs(pkg_root_dir)
         runtime_env = self._build_introspect_runtime_env(
-            pkg_root_dir, bioengine_path, env_vars
+            pkg_uri, bioengine_uri, env_vars
         )
 
         # 4. Introspect the user package via a Ray task in the app's env.
@@ -797,7 +823,7 @@ class AppBuilder:
             translated_kwargs=translated_kwargs,
             proxy_args=proxy_args,
             runtime_env=runtime_env,
-            bioengine_path=bioengine_path,
+            bioengine_uri=bioengine_uri,
             build_dir=pkg_root_dir,
             proxy_pip=proxy_pip,
             user_replica_framework_pip=user_replica_framework_pip,
@@ -830,7 +856,7 @@ class AppBuilder:
                     built_app.proxy_args,
                     application_id,
                     f"/{application_id}",
-                    built_app.bioengine_path,
+                    built_app.bioengine_uri,
                     built_app.proxy_pip,
                     built_app.user_replica_framework_pip,
                     built_app.replica_env_vars,
@@ -869,7 +895,7 @@ class BuiltApp:
         "translated_kwargs",
         "proxy_args",
         "runtime_env",
-        "bioengine_path",
+        "bioengine_uri",
         "build_dir",
         "proxy_pip",
         "user_replica_framework_pip",
@@ -884,7 +910,7 @@ class BuiltApp:
         translated_kwargs: Dict[str, Dict[str, Any]],
         proxy_args: Dict[str, Any],
         runtime_env: Dict[str, Any],
-        bioengine_path: str,
+        bioengine_uri: str,
         build_dir: Optional[Path],
         proxy_pip: List[str],
         user_replica_framework_pip: List[str],
@@ -896,7 +922,7 @@ class BuiltApp:
         self.translated_kwargs = translated_kwargs
         self.proxy_args = proxy_args
         self.runtime_env = runtime_env
-        self.bioengine_path = bioengine_path
+        self.bioengine_uri = bioengine_uri
         self.build_dir = build_dir
         self.proxy_pip = proxy_pip
         self.user_replica_framework_pip = user_replica_framework_pip
