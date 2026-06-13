@@ -344,6 +344,7 @@ def build_and_run_application(
     proxy_args: Dict[str, Any],
     application_id: str,
     route_prefix: str,
+    bioengine_uri: str,
     proxy_pip: List[str],
     user_replica_framework_pip: List[str],
     replica_env_vars: Dict[str, str],
@@ -412,6 +413,19 @@ def build_and_run_application(
     def _with_pkg(cls: Any) -> Any:
         opts = dict(cls.ray_actor_options or {})
         runtime_env = dict(opts.get("runtime_env") or {})
+        # Ray Serve replicas do NOT inherit job-level py_modules (Ray
+        # tasks do, observed empirically on KTH). The bioengine package
+        # has to ride in the deployment's runtime_env to be on sys.path
+        # at ``cloudpickle.loads`` time, otherwise the replica dies at
+        # ``__init__`` with ``ModuleNotFoundError: No module named
+        # 'bioengine'``. ``bioengine_uri`` is a content-hashed gcs URI
+        # already pushed by the worker's ``ray.init`` upload, so handing
+        # it back here re-resolves to the cached package — no second
+        # GCS upload, no ray-client gRPC bridge wedge.
+        py_modules = list(runtime_env.get("py_modules") or [])
+        if bioengine_uri not in py_modules:
+            py_modules.append(bioengine_uri)
+        runtime_env["py_modules"] = py_modules
         runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
         # Merge the framework-required pip deps (hypha-rpc, pydantic)
         # into whatever the user declared via ``@bioengine.app(pip=…)``.
@@ -464,10 +478,12 @@ def build_and_run_application(
     proxy_actor_options["memory"] = int(proxy_memory_in_gb * (1024**3))
     proxy_runtime_env = dict(proxy_actor_options.get("runtime_env") or {})
     proxy_runtime_env["pip"] = proxy_pip
-    # No py_modules: ProxyDeployment lives in bioengine and inherits the
-    # job-level py_modules upload via Ray's runtime_env field inheritance,
-    # same as this task does. The proxy never imports user source so it
-    # skips the replica setup hook too.
+    # Same as user deployments above: replicas don't inherit job-level
+    # py_modules, so include the bioengine gcs URI.
+    proxy_py_modules = list(proxy_runtime_env.get("py_modules") or [])
+    if bioengine_uri not in proxy_py_modules:
+        proxy_py_modules.append(bioengine_uri)
+    proxy_runtime_env["py_modules"] = proxy_py_modules
     proxy_runtime_env["env_vars"] = {
         **replica_env_vars,
         **(proxy_runtime_env.get("env_vars") or {}),

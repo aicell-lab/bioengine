@@ -39,6 +39,7 @@ import yaml
 from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils import ObjectProxy
 from ray import serve
+from ray._private.runtime_env.packaging import get_uri_for_directory
 
 import bioengine
 from bioengine._app.bootstrap import (
@@ -312,6 +313,30 @@ class AppBuilder:
             if not isinstance(value, str):
                 env_vars[key] = str(value)
         return env_vars
+
+    @staticmethod
+    def _bioengine_gcs_uri() -> str:
+        """Content-hashed ``gcs://_ray_pkg_<hash>.zip`` URI for the worker's
+        ``bioengine`` package.
+
+        :func:`get_uri_for_directory` is a pure-Python hash — no upload
+        happens here. The bytes were already pushed to the Ray cluster's
+        internal GCS by the worker's ``ray.init`` job-level py_modules
+        (:meth:`bioengine.cluster.ray_cluster.RayCluster.connect`); we
+        just re-derive the same URI so Ray Serve replica runtime_envs
+        can point at the cached package without going back through the
+        ray-client gRPC bridge that wedges on per-deploy uploads.
+
+        ``include_gitignore`` switched from optional to required between
+        Ray patch versions; the inspect gate keeps us cross-compatible.
+        """
+        import inspect
+
+        bioengine_dir = str(Path(bioengine.__file__).parent.resolve())
+        kwargs: Dict[str, Any] = {}
+        if "include_gitignore" in inspect.signature(get_uri_for_directory).parameters:
+            kwargs["include_gitignore"] = False
+        return get_uri_for_directory(bioengine_dir, **kwargs)
 
     def _build_submit_runtime_env(
         self,
@@ -816,6 +841,7 @@ class AppBuilder:
             translated_kwargs=translated_kwargs,
             proxy_args=proxy_args,
             runtime_env=runtime_env,
+            bioengine_uri=self._bioengine_gcs_uri(),
             build_dir=pkg_root_dir,
             proxy_pip=proxy_pip,
             user_replica_framework_pip=user_replica_framework_pip,
@@ -848,6 +874,7 @@ class AppBuilder:
                     built_app.proxy_args,
                     application_id,
                     f"/{application_id}",
+                    built_app.bioengine_uri,
                     built_app.proxy_pip,
                     built_app.user_replica_framework_pip,
                     built_app.replica_env_vars,
@@ -886,6 +913,7 @@ class BuiltApp:
         "translated_kwargs",
         "proxy_args",
         "runtime_env",
+        "bioengine_uri",
         "build_dir",
         "proxy_pip",
         "user_replica_framework_pip",
@@ -900,6 +928,7 @@ class BuiltApp:
         translated_kwargs: Dict[str, Dict[str, Any]],
         proxy_args: Dict[str, Any],
         runtime_env: Dict[str, Any],
+        bioengine_uri: str,
         build_dir: Optional[Path],
         proxy_pip: List[str],
         user_replica_framework_pip: List[str],
@@ -911,6 +940,7 @@ class BuiltApp:
         self.translated_kwargs = translated_kwargs
         self.proxy_args = proxy_args
         self.runtime_env = runtime_env
+        self.bioengine_uri = bioengine_uri
         self.build_dir = build_dir
         self.proxy_pip = proxy_pip
         self.user_replica_framework_pip = user_replica_framework_pip

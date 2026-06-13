@@ -38,16 +38,19 @@ def _merge_via_with_pkg(
     *,
     replica_env_vars: Dict[str, str],
     user_replica_framework_pip: list[str] | None = None,
+    bioengine_uri: str = "gcs://_ray_pkg_aaaaaaaaaaaaaaaa.zip",
 ) -> Dict[str, Any]:
     """Drive ``_with_pkg`` from bootstrap against a fake class and return
     the assembled ``runtime_env`` dict that bootstrap would hand to Ray
-    Serve at bind time. v0.11.4 drops task-level ``py_modules`` — the
-    framework rides Ray's job-level py_modules inheritance and the user
-    source is materialised by the replica setup hook."""
+    Serve at bind time."""
     from bioengine._app import bootstrap
 
     fake_cls = _FakeOptionsCls(cls_options)
+    py_modules = list(cls_options.get("runtime_env", {}).get("py_modules") or [])
+    if bioengine_uri not in py_modules:
+        py_modules.append(bioengine_uri)
     rt = dict(cls_options.get("runtime_env") or {})
+    rt["py_modules"] = py_modules
     rt["worker_process_setup_hook"] = bootstrap._REPLICA_SETUP_HOOK
     rt["pip"] = bootstrap._merge_pip_lists(
         list(rt.get("pip") or []),
