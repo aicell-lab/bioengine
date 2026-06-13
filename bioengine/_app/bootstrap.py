@@ -332,14 +332,19 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
     return merged
 
 
+#: Importable string for the replica setup hook. Lives at this name so the
+#: hook resolves once Ray extracts the ``bioengine`` directory shipped via
+#: ``runtime_env.py_modules``.
+_REPLICA_SETUP_HOOK = "bioengine._app.replica_init:setup_replica_environment"
+
+
 def build_and_run_application(
     spec: Dict[str, Any],
     application_kwargs: Dict[str, Dict[str, Any]],
     proxy_args: Dict[str, Any],
     application_id: str,
     route_prefix: str,
-    pkg_uri: str,
-    bioengine_uri: str,
+    bioengine_path: str,
     proxy_pip: List[str],
     user_replica_framework_pip: List[str],
     replica_env_vars: Dict[str, str],
@@ -352,15 +357,21 @@ def build_and_run_application(
     unpickled deployment is re-accessed, so the graph must stay inside
     the process that built it.
 
-    ``pkg_uri`` is the ``file://`` URI of the user's app package.
-    ``bioengine_uri`` is the ``file://`` URI of the worker's own
-    bioengine source. Every deployment's ``runtime_env.py_modules`` is
-    augmented with both so the replica venv can ``import`` the user's
-    modules AND ``import bioengine``. Without ``bioengine_uri`` on the
-    replica side, deployments whose own ``pip=`` forced a fresh venv
-    crash at ``pickle.loads`` time with ``ModuleNotFoundError: No
-    module named 'bioengine'`` — bioengine itself is not on PyPI and
-    the venv only ships its deps.
+    ``bioengine_path`` is the worker's local filesystem path to the
+    ``bioengine`` package directory; Ray's client packages it via the
+    internal upload mechanism and caches by content hash, so the same
+    worker image produces the same hash and the upload happens at most
+    once per cluster lifetime. The replica needs ``bioengine`` on
+    ``sys.path`` before user code is loaded so the venv's pickle round
+    trip can resolve framework references.
+
+    Each deployment's ``runtime_env`` is augmented with a
+    ``worker_process_setup_hook`` (:data:`_REPLICA_SETUP_HOOK`) that
+    downloads the artifact from Hypha into the per-app workdir and
+    prepends ``source/`` to ``sys.path`` before Ray Serve unpickles
+    the user class. The worker does not ship the user package itself —
+    every replica fetches it directly, removing the worker↔Ray shared
+    filesystem assumption that v0.11.3's ``file://`` URI relied on.
 
     ``proxy_memory_in_gb`` overrides ``ProxyDeployment.ray_actor_options
     .memory`` so the scheduler is biased toward a node with at least
@@ -377,10 +388,10 @@ def build_and_run_application(
         opts = dict(cls.ray_actor_options or {})
         runtime_env = dict(opts.get("runtime_env") or {})
         py_modules = list(runtime_env.get("py_modules") or [])
-        for uri in (bioengine_uri, pkg_uri):
-            if uri not in py_modules:
-                py_modules.append(uri)
+        if bioengine_path not in py_modules:
+            py_modules.append(bioengine_path)
         runtime_env["py_modules"] = py_modules
+        runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
         # Merge the framework-required pip deps (hypha-rpc, pydantic)
         # into whatever the user declared via ``@bioengine.app(pip=…)``.
         # The replica needs them at cloudpickle.loads time to resolve
@@ -433,10 +444,11 @@ def build_and_run_application(
     proxy_runtime_env = dict(proxy_actor_options.get("runtime_env") or {})
     proxy_runtime_env["pip"] = proxy_pip
     proxy_py_modules = list(proxy_runtime_env.get("py_modules") or [])
-    for uri in (bioengine_uri, pkg_uri):
-        if uri not in proxy_py_modules:
-            proxy_py_modules.append(uri)
+    if bioengine_path not in proxy_py_modules:
+        proxy_py_modules.append(bioengine_path)
     proxy_runtime_env["py_modules"] = proxy_py_modules
+    # ProxyDeployment never touches the user's source, so it skips the
+    # replica setup hook; HOME defaults to whatever Ray gives the actor.
     proxy_runtime_env["env_vars"] = {
         **replica_env_vars,
         **(proxy_runtime_env.get("env_vars") or {}),
