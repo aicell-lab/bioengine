@@ -368,20 +368,31 @@ class AppBuilder:
         worker, or by the worker's own ``ray.init`` py_modules in
         ``cluster.ray_cluster``).
 
+        ``include_gitignore`` toggles whether Ray's packager treats a
+        ``.gitignore`` in the directory as an additional exclude list.
+        Older Ray patch versions don't accept the kwarg; the inspect-based
+        gate keeps us cross-compatible without pinning Ray for the worker
+        and Ray cluster image independently.
+
         The "scratch_dir" the Ray helper writes its working zip into is a
         per-call temp directory we delete immediately after; we don't want
         zips piling up on the worker pod's PVC the way v0.11.3 did.
         """
+        import inspect
+
         path_str = str(path.resolve())
-        uri = get_uri_for_directory(path_str)
+        kwargs: Dict[str, Any] = {}
+        if "include_gitignore" in inspect.signature(get_uri_for_directory).parameters:
+            kwargs["include_gitignore"] = False
+        uri = get_uri_for_directory(path_str, **kwargs)
         with tempfile.TemporaryDirectory(prefix="bioengine-pkg-upload-") as scratch:
-            upload_package_if_needed(
-                uri,
-                scratch,
-                path_str,
-                include_parent_dir=True,
-                logger=self.logger,
-            )
+            upload_kwargs: Dict[str, Any] = {
+                "include_parent_dir": True,
+                "logger": self.logger,
+            }
+            if "include_gitignore" in inspect.signature(upload_package_if_needed).parameters:
+                upload_kwargs["include_gitignore"] = False
+            upload_package_if_needed(uri, scratch, path_str, **upload_kwargs)
         return uri
 
     def _bioengine_source_path(self) -> str:
