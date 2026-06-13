@@ -33,25 +33,12 @@ import httpx
 import numpy as np
 import yaml
 from hypha_rpc import connect_to_server
-from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 
 from bioengine import __version__
 
 from model_cache import BioimageioPackage, ModelCache
 from runtime import RuntimeApp
-
-
-def _arbitrary_types_method(fn):
-    """Marker variant of ``@bioengine.method`` that allows non-pydantic
-    types (``np.ndarray``) in the signature. Used on :meth:`EntryApp.infer`.
-    The framework picks up the schema via ``__schema__`` and the kind
-    marker exactly as it does for ``@bioengine.method``; this helper just
-    plumbs ``arbitrary_types_allowed=True`` through to ``schema_method``.
-    """
-    wrapped = schema_method(fn, arbitrary_types_allowed=True)
-    wrapped._bioengine_kind = "method"
-    return wrapped
 
 
 logger = logging.getLogger("ray.serve")
@@ -71,12 +58,6 @@ SUPPORTED_FILES_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"
         "numpy==1.26.4",
         "tqdm>=4.64.0",
     ],
-    env_vars={
-        # Shared NFS path so EntryApp and RuntimeApp see the same model cache
-        # across pods. Override per-cluster via the manifest if the deployment
-        # has a different writable shared path.
-        "MODEL_CACHE_DIR": "/home/bioengine/staging/model-cache",
-    },
     max_ongoing_requests=10,
     max_queued_requests=30,
     autoscaling_config={
@@ -1007,7 +988,7 @@ class EntryApp:
         logger.info(f"✅ Presigned upload URL generated for '{file_path}'.")
         return {"upload_url": upload_url, "file_path": file_path}
 
-    @_arbitrary_types_method
+    @bioengine.method
     async def infer(
         self,
         model_id: str = Field(

@@ -43,18 +43,7 @@ class ModelCache:
         cache_size_in_gb: float,
         replica_id: str,
     ):
-        # Place the model cache under ``$MODEL_CACHE_DIR`` if the operator
-        # configured one (e.g. an NVMe scratch path), otherwise under
-        # ``/tmp/bioengine/model-runner-cache``. We deliberately *don't*
-        # use ``$TMPDIR`` — the BioEngine framework sets it per-app to
-        # ``<apps_workdir>/<app_id>/tmp``, which on shared-NFS workers
-        # may live on a mount the replica's UID cannot write to. ``/tmp``
-        # is always writable inside the actor process namespace.
-        cache_base = (
-            os.environ.get("MODEL_CACHE_DIR")
-            or "/tmp/bioengine/model-runner-cache"
-        )
-        self.cache_dir = Path(cache_base).expanduser().resolve() / "models"
+        self.cache_dir = Path.home() / "models"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_size_bytes = int(
             cache_size_in_gb * 1024 * 1024 * 1024
