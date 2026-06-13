@@ -332,9 +332,12 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
     return merged
 
 
-#: Importable string for the replica setup hook. Lives at this name so the
-#: hook resolves once Ray extracts the ``bioengine`` directory shipped via
-#: ``runtime_env.py_modules``.
+#: Kept for back-compat with tests that pin the hook name; Ray Serve does
+#: NOT honour ``runtime_env.worker_process_setup_hook`` for its replicas
+#: (no references under ``ray/serve/``) so the actual replica bootstrap
+#: is invoked from ``bioengine/__init__.py`` as an import-time side
+#: effect guarded by ``BIOENGINE_APP_DIR``. See PR #119 commit log for
+#: the empirical sequence of attempts that led here.
 _REPLICA_SETUP_HOOK = "bioengine._app.replica_init:setup_replica_environment"
 
 

@@ -53,6 +53,51 @@ def _get_version() -> str | None:
 __version__ = _get_version()
 
 
+def _bootstrap_replica_environment() -> None:
+    """Materialise the user app source on first ``import bioengine`` in a replica.
+
+    Ray Serve replicas receive a deployment definition with a reference to
+    the user's class (``module:qualname``); ``cloudpickle.loads`` on that
+    definition resolves it via ``importlib.import_module`` — which needs
+    the user package on ``sys.path``. Ray's ``runtime_env.worker_process_setup_hook``
+    is documented as a Ray Core feature but is NOT honoured for Ray Serve
+    replicas (no references in ``ray/serve/`` for it). So the only place
+    we can interpose before cloudpickle.loads runs the user import is on
+    the ``import bioengine`` that cloudpickle does first — proxy / user
+    classes both live under ``bioengine.*``, so this import always
+    precedes the user import.
+
+    Guards: the bootstrap only runs when ``BIOENGINE_APP_DIR`` is set
+    (replica context), only once per process (``_BIOENGINE_REPLICA_BOOTSTRAPPED``
+    sentinel), and swallows all exceptions — a failure here must not
+    block ``import bioengine`` for the worker itself, which never sets
+    ``BIOENGINE_APP_DIR``.
+    """
+    import os as _os
+
+    if not _os.environ.get("BIOENGINE_APP_DIR"):
+        return
+    if _os.environ.get("_BIOENGINE_REPLICA_BOOTSTRAPPED"):
+        return
+    _os.environ["_BIOENGINE_REPLICA_BOOTSTRAPPED"] = "1"
+    try:
+        from bioengine._app.replica_init import setup_replica_environment
+
+        setup_replica_environment()
+    except Exception:
+        import traceback
+
+        print(
+            "BioEngine: replica bootstrap failed — user source will not be "
+            "on sys.path. Traceback:",
+            flush=True,
+        )
+        traceback.print_exc()
+
+
+_bootstrap_replica_environment()
+
+
 _LAZY_FROM_APP = {
     "app",
     "method",
