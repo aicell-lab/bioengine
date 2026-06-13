@@ -4,6 +4,11 @@ This service downloads training data from a Hypha Artifact, fine-tunes a
 Cellpose model, and exposes training control and inference functions.
 """
 
+# PEP 563 — defer annotation evaluation. Helper signatures elsewhere in this
+# module reference TYPE_CHECKING-only types like AsyncHyphaArtifact and
+# CellposeModel; without this the module fails to import on the introspection
+# task. @bioengine.method-decorated entry points use only builtin annotations,
+# so pydantic still resolves their schemas correctly.
 from __future__ import annotations
 
 import os
@@ -30,9 +35,10 @@ from urllib.parse import urlparse
 
 import numpy as np
 import numpy.typing as npt
-from hypha_rpc.utils.schema import schema_method
+import bioengine
 from pydantic import Field
 from ray import serve
+
 
 if TYPE_CHECKING:
     import torch
@@ -3723,22 +3729,18 @@ def _predict_and_encode(
 # ---------------------------------------------------------------------------
 # Ray Serve deployment
 # ---------------------------------------------------------------------------
-@serve.deployment(  # type: ignore
-    ray_actor_options={
-        "num_gpus": 1,
-        "num_cpus": 4,
-        "memory": 12 * GB,
-        "runtime_env": {
-            "pip": [
-                "cellpose==4.0.7",
-                "numpy==1.26.4",
-                "tifffile",
-                "Pillow",
-                "matplotlib",
-                "hypha-artifact==0.1.2",
-            ],
-        },
-    },
+@bioengine.app(
+    num_cpus=4,
+    num_gpus=1,
+    memory_mb=12 * 1024,
+    pip=[
+        "cellpose==4.0.7",
+        "numpy==1.26.4",
+        "tifffile",
+        "Pillow",
+        "matplotlib",
+        "hypha-artifact==0.1.2",
+    ],
     max_ongoing_requests=1,
     max_queued_requests=10,
     autoscaling_config={
@@ -3805,7 +3807,7 @@ class CellposeFinetune:
         )
         raise ValueError(msg)
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def start_training(
         self,
         artifact: str = Field(
@@ -4099,7 +4101,7 @@ class CellposeFinetune:
         status = get_status(session_id)
         return SessionStatusWithId(**status, session_id=session_id)
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def stop_training(
         self,
         session_id: str = Field(
@@ -4140,7 +4142,7 @@ class CellposeFinetune:
 
         return get_status(session_id)
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def debug_task_info(
         self,
         session_id: str = Field(
@@ -4170,7 +4172,7 @@ class CellposeFinetune:
 
         return info
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def get_training_status(
         self,
         session_id: str = Field(
@@ -4240,7 +4242,7 @@ class CellposeFinetune:
             )
         return session_data
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def restart_training(
         self,
         session_id: str = Field(description="Session ID to restart from"),
@@ -4434,7 +4436,7 @@ class CellposeFinetune:
 
         return sessions
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def list_training_sessions(
         self,
         status_types: list[str] | None = Field(
@@ -4473,7 +4475,7 @@ class CellposeFinetune:
             limit = wrapped.get("limit", limit)
         return await asyncio.to_thread(self._list_sessions_sync, status_types, limit, dataset_artifact_ids, labels)
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def delete_training_session(
         self,
         session_id: str = Field(description="Session ID to delete"),
@@ -4535,7 +4537,7 @@ class CellposeFinetune:
         logger.info(f"Deleted training session {session_id} (caller: {caller_id})")
         return {"deleted": session_id}
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def export_model(
         self,
         session_id: str = Field(description="Training session ID to export"),
@@ -4999,7 +5001,7 @@ BSD-3-Clause (Cellpose license)
             except Exception as e:
                 logger.warning(f"Failed to clean up export directory: {e}")
 
-    @schema_method  # type: ignore
+    @bioengine.method
     async def list_models_by_dataset(
         self,
         dataset_id: str = Field(
@@ -5102,7 +5104,7 @@ BSD-3-Clause (Cellpose license)
             logger.error(f"Error listing models by dataset: {e}")
             raise RuntimeError(f"Failed to list models by dataset: {e}") from e
 
-    @schema_method(arbitrary_types_allowed=True)  # type: ignore
+    @bioengine.method
     async def infer(
         self,
         artifact: str | None = Field(
