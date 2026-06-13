@@ -36,21 +36,9 @@ from urllib.parse import urlparse
 import numpy as np
 import numpy.typing as npt
 import bioengine
-from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 from ray import serve
 
-
-def _bioengine_method_arbitrary(fn):
-    """@bioengine.method variant that allows arbitrary types in the pydantic schema.
-
-    Equivalent to @schema_method(arbitrary_types_allowed=True) plus the
-    `_bioengine_kind = "method"` marker that @bioengine.app reads at class
-    creation time.
-    """
-    wrapped = schema_method(arbitrary_types_allowed=True)(fn)
-    wrapped._bioengine_kind = "method"
-    return wrapped
 
 if TYPE_CHECKING:
     import torch
@@ -596,25 +584,9 @@ def to_local_path(root: Path, rel: Path) -> Path:
     return root / strip_leading_slash(rel)
 
 
-def _data_root() -> Path:
-    """Return the writable base directory for cellpose-finetuning training state.
-
-    Honours ``CELLPOSE_DATA_DIR`` so cluster operators can point sessions and
-    artifact caches at a shared NFS mount; falls back to
-    ``/tmp/bioengine/cellpose-finetuning``. We deliberately don't use
-    ``Path.home()`` — the framework sets HOME to ``apps_workdir/<app_id>/``,
-    which on shared-NFS workers may live on a mount the replica's UID cannot
-    create subdirectories on.
-    """
-    return Path(
-        os.environ.get("CELLPOSE_DATA_DIR")
-        or "/tmp/bioengine/cellpose-finetuning"
-    ).expanduser().resolve()
-
-
 def get_sessions_path() -> Path:
     """Return the path to the directory where training sessions are stored."""
-    return _data_root() / "sessions"
+    return Path.home() / "sessions"
 
 
 def get_model_path(session_id: str) -> Path:
@@ -711,7 +683,7 @@ async def ensure_published_model_local_session(model_reference: str) -> str:
 def artifact_cache_dir(artifact_id: str) -> Path:
     """Return local cache dir for an artifact id, ensuring it exists."""
     safe = artifact_id.replace("/", "__")
-    d = _data_root() / "data_cache" / safe
+    d = Path.home() / "data_cache" / safe
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -3769,12 +3741,6 @@ def _predict_and_encode(
         "matplotlib",
         "hypha-artifact==0.1.2",
     ],
-    env_vars={
-        # Shared writable NFS path so training sessions + data caches survive
-        # replica restarts. Override per-cluster via the manifest if a
-        # different shared path is provisioned.
-        "CELLPOSE_DATA_DIR": "/home/bioengine/staging/model-cache/cellpose-finetuning",
-    },
     max_ongoing_requests=1,
     max_queued_requests=10,
     autoscaling_config={
@@ -3841,7 +3807,7 @@ class CellposeFinetune:
         )
         raise ValueError(msg)
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def start_training(
         self,
         artifact: str = Field(
@@ -4135,7 +4101,7 @@ class CellposeFinetune:
         status = get_status(session_id)
         return SessionStatusWithId(**status, session_id=session_id)
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def stop_training(
         self,
         session_id: str = Field(
@@ -4176,7 +4142,7 @@ class CellposeFinetune:
 
         return get_status(session_id)
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def debug_task_info(
         self,
         session_id: str = Field(
@@ -4206,7 +4172,7 @@ class CellposeFinetune:
 
         return info
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def get_training_status(
         self,
         session_id: str = Field(
@@ -4276,7 +4242,7 @@ class CellposeFinetune:
             )
         return session_data
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def restart_training(
         self,
         session_id: str = Field(description="Session ID to restart from"),
@@ -4470,7 +4436,7 @@ class CellposeFinetune:
 
         return sessions
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def list_training_sessions(
         self,
         status_types: list[str] | None = Field(
@@ -4509,7 +4475,7 @@ class CellposeFinetune:
             limit = wrapped.get("limit", limit)
         return await asyncio.to_thread(self._list_sessions_sync, status_types, limit, dataset_artifact_ids, labels)
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def delete_training_session(
         self,
         session_id: str = Field(description="Session ID to delete"),
@@ -4571,7 +4537,7 @@ class CellposeFinetune:
         logger.info(f"Deleted training session {session_id} (caller: {caller_id})")
         return {"deleted": session_id}
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def export_model(
         self,
         session_id: str = Field(description="Training session ID to export"),
@@ -5138,7 +5104,7 @@ BSD-3-Clause (Cellpose license)
             logger.error(f"Error listing models by dataset: {e}")
             raise RuntimeError(f"Failed to list models by dataset: {e}") from e
 
-    @_bioengine_method_arbitrary
+    @bioengine.method
     async def infer(
         self,
         artifact: str | None = Field(

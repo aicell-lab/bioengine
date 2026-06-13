@@ -15,6 +15,6 @@ maintainers: []
 name: Cellpose Fine-Tuning
 tags: [cell-segmentation, deep-learning, biomedical-imaging, fine-tuning]
 type: ray-serve
-version: 0.2.0
+version: 1.0.0
 entry: main:CellposeFinetune
 frontend_entry: "frontend/index.html"
