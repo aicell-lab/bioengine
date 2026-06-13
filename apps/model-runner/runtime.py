@@ -1,3 +1,20 @@
+"""GPU runtime for bioimage.io model inference.
+
+The runtime is the GPU half of the model-runner app. ``EntryApp`` keeps a
+type-hint reference to ``RuntimeApp`` so the v0.6 composition graph wires
+them together; ``EntryApp`` then calls ``await self.runtime.ping()`` /
+``await self.runtime.predict(...)`` / ``await self.runtime.test(...)`` to
+delegate the heavy work.
+
+Module-level imports stay deliberately lightweight (just stdlib + bioengine
++ numpy + ray) so the introspection task can load this file with only the
+BioEngine baseline runtime_env. Heavy deps (``bioimageio.core``,
+``careamics``, ``cellpose``, ``torch``, ``tensorflow``, …) are installed
+by the ``@bioengine.app(pip=REQUIREMENTS)`` declaration and imported
+inside method bodies.
+"""
+
+
 import hashlib
 import json
 import logging
@@ -5,15 +22,19 @@ import os
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
 
+import bioengine
 import numpy as np
 import ray
-from ray import serve
 
 logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
 
-# Deployment default runtime environment
-requirements = [
+# Pinned versions of every heavy dep the runtime needs at replica boot.
+# Mirrors the v0.5 runtime_deployment.py REQUIREMENTS list verbatim — same
+# package set and same pins. ``xarray`` is a transitive dep of
+# ``bioimageio.core`` but must be pinned explicitly here because pip's
+# resolver doesn't otherwise lock it tightly enough.
+REQUIREMENTS = [
     "bioimageio.core==0.10.0",
     "careamics==0.0.16",
     "cellpose==3.1.1.2",
@@ -24,19 +45,15 @@ requirements = [
     "tensorflow==2.16.1",
     "torch==2.5.1",
     "torchvision==0.20.1",
-    "xarray==2025.1.2",  # this is needed for bioimageio.core
+    "xarray==2025.1.2",
 ]
 
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 1,
-        "num_gpus": 1,
-        "memory": 12 * 1024 * 1024 * 1024,  # GB RAM limit
-        "runtime_env": {
-            "pip": requirements,
-        },
-    },
+@bioengine.app(
+    num_cpus=1,
+    num_gpus=1,
+    memory_mb=12 * 1024,
+    pip=REQUIREMENTS,
     max_ongoing_requests=1,
     autoscaling_config={
         "min_replicas": 1,
@@ -53,14 +70,23 @@ requirements = [
     graceful_shutdown_timeout_s=120.0,
     graceful_shutdown_wait_loop_s=2.0,
 )
-class RuntimeDeployment:
-    """Internal deployment for running model inference using bioimageio.core."""
+class RuntimeApp:
+    """GPU-resident bioimage.io model executor."""
 
-    def __init__(self):
-        self._kwargs_cache = {}
+    def __init__(self) -> None:
+        self._kwargs_cache: Dict[str, dict] = {}
+
+    # === Liveness ===
+
+    @bioengine.method
+    async def ping(self) -> str:
+        """Fast liveness probe used by EntryApp before every GPU-bound method."""
+        return "pong"
+
+    # === Memory accounting (used by test/predict log lines) ===
 
     def _get_memory_usage(self) -> tuple:
-        """Return current (cpu_bytes, gpu_bytes) memory usage for this process."""
+        """Return current ``(cpu_bytes, gpu_bytes)`` for this process."""
         import psutil
 
         cpu_mem = psutil.Process().memory_info().rss
@@ -81,42 +107,47 @@ class RuntimeDeployment:
             pass
         return cpu_mem, gpu_mem
 
-    # === Model Testing ===
+    # === Testing ===
 
     def _test(self, rdf_path: str) -> dict:
-        """Run bioimageio.core test_model on the given RDF path."""
+        """Run ``bioimageio.core.test_model`` on the given RDF path."""
         from bioimageio.core import test_model
 
         try:
             if not Path(rdf_path).exists():
                 raise FileNotFoundError(f"RDF not found: {rdf_path}")
             validation_summary = test_model(rdf_path)
-            test_report = validation_summary.model_dump(mode="json")
-
-            return test_report
+            return validation_summary.model_dump(mode="json")
         except Exception as e:
             logger.error(f"❌ Model test failed: {str(e)}")
             raise
 
     async def test(
-        self, rdf_path: str, additional_requirements: Optional[List[str]] = None
+        self,
+        rdf_path: str,
+        additional_requirements: Optional[List[str]] = None,
     ) -> dict:
-        """Test model inference using bioimageio.core with optional additional requirements."""
-        # TODO: add a timeout of 300 seconds
+        """Test model inference with optional additional pip requirements.
+
+        When ``additional_requirements`` adds packages outside the baseline
+        ``REQUIREMENTS`` set, the test runs as a *fresh remote Ray task*
+        in a runtime_env that layers the extra packages on top — keeping
+        the cached replica venv clean.
+        """
         cpu_before, gpu_before = self._get_memory_usage()
         logger.info(
-            f"📊 [test] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, GPU: {gpu_before / (1024 * 1024):.2f} MB"
+            f"📊 [test] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
+            f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
         )
-        additional_packages = []
+        additional_packages: List[str] = []
         if additional_requirements:
             if not isinstance(additional_requirements, list):
                 logger.error("❌ additional_requirements must be a list of strings")
                 raise ValueError("additional_requirements must be a list of strings.")
-
             for ad_req in additional_requirements:
                 ad_req = ad_req.strip()
                 exists = False
-                for req in requirements:
+                for req in REQUIREMENTS:
                     package, _ = req.split("==")
                     if ad_req.startswith(package):
                         exists = True
@@ -128,34 +159,26 @@ class RuntimeDeployment:
             logger.info(
                 f"🚀 Running test with additional packages: {additional_packages}"
             )
-            # Execute remotely and return the result reference (will be awaited by DeploymentHandle)
             remote_function = ray.remote(self._test.__func__)
             remote_function = remote_function.options(
                 num_cpus=1,
                 num_gpus=0,
-                memory=4 * 1024 * 1024 * 1024,  # 4GB RAM limit
-                runtime_env={"pip": requirements + additional_packages},
+                memory=4 * 1024 * 1024 * 1024,
+                runtime_env={"pip": REQUIREMENTS + additional_packages},
             )
             result_ref = remote_function.remote(None, rdf_path)
-            logger.info(f"📋 Submitted remote test job")
+            logger.info("📋 Submitted remote test job")
             return result_ref
-        else:
-            # Run execution in this deployment without additional packages
-            test_report = self._test(rdf_path)
 
+        test_report = self._test(rdf_path)
         cpu_after, gpu_after = self._get_memory_usage()
-        cpu_delta_mb = (cpu_after - cpu_before) / (1024 * 1024)
-        gpu_delta_mb = (gpu_after - gpu_before) / (1024 * 1024)
         logger.info(
-            f"📊 [test] Memory after:  CPU: {cpu_after / (1024 * 1024):.2f} MB, GPU: {gpu_after / (1024 * 1024):.2f} MB"
+            f"📊 [test] Memory after: CPU: {cpu_after / (1024 * 1024):.2f} MB, "
+            f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
         )
-        logger.info(
-            f"📊 [test] Memory change:  CPU: {cpu_delta_mb:+.2f} MB, GPU: {gpu_delta_mb:+.2f} MB"
-        )
-
         return test_report
 
-    # === Model Prediction ===
+    # === Prediction pipeline cache key ===
 
     def _set_prediction_kwargs(
         self,
@@ -168,7 +191,6 @@ class RuntimeDeployment:
         """Generate cache key for prediction pipeline configuration."""
         pipeline_kwargs = {
             "rdf_path": rdf_path,
-            # Include latest tracked remote last-modified time to invalidate cache when remote files change.
             "latest_remote_modified": latest_remote_modified,
             "create_kwargs": {
                 "weights_format": weights_format,
@@ -176,24 +198,21 @@ class RuntimeDeployment:
                 "default_blocksize_parameter": default_blocksize_parameter,
             },
         }
-        # Generate a unique cache key based on the pipeline configuration
         json_str = json.dumps(pipeline_kwargs, sort_keys=True)
         cache_key = hashlib.md5(json_str.encode()).hexdigest()
-
         self._kwargs_cache[cache_key] = pipeline_kwargs
-
         return cache_key
 
-    @serve.multiplexed(
-        max_num_models_per_replica=int(os.environ.get("PIPELINE_CACHE_SIZE", 10))
+    # === Multiplexed pipeline (Ray Serve handles eviction by max_models) ===
+
+    @bioengine.multiplexed(
+        max_models=int(os.environ.get("PIPELINE_CACHE_SIZE", 10)),
     )
     async def _create_prediction_pipeline(self, cache_key: str):
-        """Create and cache prediction pipeline for the given cache key."""
+        """Create + cache the prediction pipeline for ``cache_key``."""
         cpu_before, gpu_before = self._get_memory_usage()
-
         from bioimageio.core import create_prediction_pipeline, load_model_description
 
-        # Get model source and create_kwargs using the cache key
         pipeline_kwargs = self._kwargs_cache.get(cache_key)
         if not pipeline_kwargs:
             logger.error(f"❌ No pipeline kwargs found for cache key: {cache_key}")
@@ -205,31 +224,23 @@ class RuntimeDeployment:
         try:
             model_description = load_model_description(rdf_path)
             pipeline = create_prediction_pipeline(model_description, **create_kwargs)
-
-            # Load the pipeline (this loads the model weights into memory/GPU)
             pipeline.load()
-
             cpu_after, gpu_after = self._get_memory_usage()
-            cpu_delta_mb = (cpu_after - cpu_before) / (1024 * 1024)
-            gpu_delta_mb = (gpu_after - gpu_before) / (1024 * 1024)
-
             logger.info(
                 f"✅ Created and loaded prediction pipeline for model at {rdf_path}"
             )
             logger.info(
-                f"📊 [pipeline load] Memory after:  CPU: {cpu_after / (1024 * 1024):.2f} MB, GPU: {gpu_after / (1024 * 1024):.2f} MB"
+                f"📊 [pipeline load] CPU: {cpu_after / (1024 * 1024):.2f} MB, "
+                f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
             )
-            logger.info(
-                f"📊 [pipeline load] Memory change:  CPU: {cpu_delta_mb:+.2f} MB, GPU: {gpu_delta_mb:+.2f} MB"
-            )
-
             return pipeline
         except Exception as e:
             logger.error(f"❌ Failed to create prediction pipeline: {str(e)}")
             raise
         finally:
-            # Clean up the cache entry after use
             self._kwargs_cache.pop(cache_key, None)
+
+    # === Prediction ===
 
     async def predict(
         self,
@@ -241,12 +252,12 @@ class RuntimeDeployment:
         sample_id: str = "sample",
         latest_remote_modified: Optional[float] = None,
     ) -> Dict[str, np.ndarray]:
-        """Run inference on model using bioimageio.core prediction pipeline."""
+        """Run inference using a cached bioimageio.core prediction pipeline."""
         cpu_before, gpu_before = self._get_memory_usage()
         logger.info(
-            f"📊 [predict] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, GPU: {gpu_before / (1024 * 1024):.2f} MB"
+            f"📊 [predict] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
+            f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
         )
-
         from bioimageio.core.digest_spec import create_sample_for_model
 
         try:
@@ -254,7 +265,8 @@ class RuntimeDeployment:
                 raise FileNotFoundError(f"RDF not found: {rdf_path}")
 
             logger.info(
-                f"🚀 Starting prediction for model at {rdf_path} with device={device} and weights_format={weights_format}"
+                f"🚀 Starting prediction for model at {rdf_path} with "
+                f"device={device} and weights_format={weights_format}"
             )
             cache_key = self._set_prediction_kwargs(
                 rdf_path=rdf_path,
@@ -265,39 +277,28 @@ class RuntimeDeployment:
             )
             pipeline = await self._create_prediction_pipeline(cache_key)
 
-            # Create sample from inputs
-            # Handle single array input by creating a proper dictionary
             sample = create_sample_for_model(
                 pipeline.model_description,
                 inputs=inputs,
                 sample_id=sample_id,
             )
 
-            # Run prediction using the pipeline
             if default_blocksize_parameter:
                 result = pipeline.predict_sample_with_blocking(sample)
             else:
                 result = pipeline.predict_sample_without_blocking(sample)
+
             cpu_after, gpu_after = self._get_memory_usage()
-            cpu_delta_mb = (cpu_after - cpu_before) / (1024 * 1024)
-            gpu_delta_mb = (gpu_after - gpu_before) / (1024 * 1024)
             logger.info(
-                f"📊 [predict] Memory after:  CPU: {cpu_after / (1024 * 1024):.2f} MB, GPU: {gpu_after / (1024 * 1024):.2f} MB"
+                f"📊 [predict] CPU: {cpu_after / (1024 * 1024):.2f} MB, "
+                f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
             )
-            logger.info(
-                f"📊 [predict] Memory change: CPU: {cpu_delta_mb:+.2f} MB, GPU: {gpu_delta_mb:+.2f} MB"
-            )
-
-            # Convert outputs back to numpy arrays
-            outputs = {str(k): v.data.data for k, v in result.members.items()}
-
-            return outputs
+            return {str(k): v.data.data for k, v in result.members.items()}
 
         except Exception as e:
-            # Check for CUDA OOM — the class name varies across PyTorch versions and may
-            # not be importable on the Ray head node (different venv), which causes a
-            # secondary "Failed to unpickle serialized exception" error over RPC.
-            # Re-raise as a plain RuntimeError so it always deserializes cleanly.
+            # CUDA OOM names vary across PyTorch versions and may not be
+            # importable on the receiving end of the RPC. Re-raise as a
+            # plain RuntimeError so the deserialiser doesn't crash.
             import torch
 
             torch.cuda.empty_cache()
@@ -310,68 +311,3 @@ class RuntimeDeployment:
                 raise RuntimeError(oom_msg) from None
             logger.error(f"❌ Prediction failed: {str(e)}")
             raise
-
-
-if __name__ == "__main__":
-    import asyncio
-    import time
-
-    import yaml
-
-    # Set up the environment variables like in the real deployment
-    deployment_workdir = Path.home() / ".bioengine" / "apps" / "model-runner"
-    deployment_workdir.mkdir(parents=True, exist_ok=True)
-    os.environ["TMPDIR"] = str(deployment_workdir)
-    os.environ["HOME"] = str(deployment_workdir)
-    os.chdir(deployment_workdir)
-
-    model_runner = RuntimeDeployment.func_or_class()
-
-    # Log the memory usage before testing
-    cpu_before, gpu_before = model_runner._get_memory_usage()
-    logger.info(
-        f"📊 [main] Memory before testing: CPU: {cpu_before / (1024 * 1024):.2f} MB, GPU: {gpu_before / (1024 * 1024):.2f} MB"
-    )
-
-    # Test the deployment with a model that should pass all checks
-    model_id = "ambitious-ant"
-    rdf_path = deployment_workdir / "models" / model_id / "rdf.yaml"
-
-    # Run the model test (torch is already in requirements, should automatically be skipped)
-    test_report = asyncio.run(
-        model_runner.test(str(rdf_path))  # , additional_requirements=["torch==2.5.1"]
-    )
-
-    # Cache test results in the model package using the same schema as EntryDeployment.
-    package_path = rdf_path.parent
-    test_report_path = package_path / ".test_cache.json"
-    metadata_path = package_path / ".file_metadata.json"
-    latest_remote_modified = 0.0
-    if metadata_path.exists():
-        try:
-            metadata = json.loads(metadata_path.read_text())
-            if isinstance(metadata, dict) and metadata:
-                latest_remote_modified = float(max(metadata.values()))
-        except (json.JSONDecodeError, OSError, ValueError, TypeError):
-            latest_remote_modified = 0.0
-
-    cache_data = {
-        "test_report": test_report,
-        "latest_remote_modified": latest_remote_modified,
-        "tested_at": time.time(),
-        "additional_requirements": None,
-    }
-    test_report_path.write_text(json.dumps(cache_data, indent=2))
-
-    logger.info("Model testing completed successfully")
-
-    # Load the test image from the package
-    model_rdf = yaml.safe_load(rdf_path.read_text())
-    test_input_source = model_rdf["test_inputs"][0]
-
-    test_image_path = str(deployment_workdir / "models" / model_id / test_input_source)
-    test_image = np.load(test_image_path).astype("float32")
-
-    # Run the prediction
-    result = asyncio.run(model_runner.predict(str(rdf_path), inputs=test_image))
-    logger.info(f"Model prediction result: {result}")
