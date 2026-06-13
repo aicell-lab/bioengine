@@ -49,13 +49,15 @@ _KIND_ATTR = "_bioengine_kind"
 def method(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Expose an instance method as a BioEngine API method.
 
-    Equivalent to ``hypha_rpc``'s ``@schema_method`` plus a tag the
-    ``@bioengine.app`` decorator reads at class-creation time to assemble
-    ``_bioengine_method_schemas``.
+    Equivalent to ``hypha_rpc``'s ``@schema_method(arbitrary_types_allowed=True)``
+    plus a tag the ``@bioengine.app`` decorator reads at class-creation time
+    to assemble ``_bioengine_method_schemas``. Arbitrary types are allowed by
+    default so methods can accept ``numpy.ndarray``, ``PIL.Image``, etc.
+    without users having to wire a custom decorator.
     """
     from hypha_rpc.utils.schema import schema_method
 
-    wrapped = schema_method(fn)
+    wrapped = schema_method(arbitrary_types_allowed=True)(fn)
     setattr(wrapped, _KIND_ATTR, "method")
     return wrapped
 

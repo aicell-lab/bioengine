@@ -157,6 +157,19 @@ class AppBuilder:
         if target_dir.exists():
             shutil.rmtree(target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
+        # The app workdir doubles as HOME for the replica (see _build_env_vars).
+        # On shared-NFS workers with root_squash the worker pod's mkdir lands
+        # owned by nobody:nogroup (65534), so the replica's UID can't create
+        # subdirs under Path.home(). Sticky + world-writable lets any replica
+        # UID create state while preventing cross-UID deletes.
+        app_workdir = target_dir.parent
+        try:
+            app_workdir.chmod(0o1777)
+        except OSError as exc:
+            self.logger.warning(
+                f"Could not chmod app workdir {app_workdir}: {exc}. "
+                "Replicas may fail to create subdirectories under Path.home()."
+            )
 
         local_root = self._local_artifact_root(artifact_id)
         if local_root and local_root.is_dir():
