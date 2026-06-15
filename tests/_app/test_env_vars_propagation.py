@@ -52,6 +52,7 @@ def _merge_via_with_pkg(
         py_modules.append(bioengine_uri)
     rt = dict(cls_options.get("runtime_env") or {})
     rt["py_modules"] = py_modules
+    rt["worker_process_setup_hook"] = bootstrap._REPLICA_SETUP_HOOK
     rt["pip"] = bootstrap._merge_pip_lists(
         list(rt.get("pip") or []),
         user_replica_framework_pip or [],

@@ -544,6 +544,16 @@ def build_and_run_application(
         if bioengine_uri not in py_modules:
             py_modules.append(bioengine_uri)
         runtime_env["py_modules"] = py_modules
+        # Ray's default_worker.py honours ``worker_process_setup_hook``
+        # *before* Ray Serve's ServeReplica.__init__ runs cloudpickle.loads.
+        # Setting it to ``bioengine._app.replica_init:setup_replica_environment``
+        # forces ``import bioengine._app.replica_init`` → ``import bioengine``
+        # → ``_install_replica_bootstrap_finder`` BEFORE the user class is
+        # loaded. The hook itself populates ``<app_dir>/source/`` and adds
+        # it to ``sys.path`` so cloudpickle.loads can resolve user
+        # modules like ``main`` (cellpose) or ``entry`` (model-runner)
+        # without by-value vs by-ref pickling tricks.
+        runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
         # Merge the framework-required pip deps (hypha-rpc, pydantic)
         # into whatever the user declared via ``@bioengine.app(pip=…)``.
         # The replica needs them at cloudpickle.loads time to resolve
@@ -601,6 +611,7 @@ def build_and_run_application(
     if bioengine_uri not in proxy_py_modules:
         proxy_py_modules.append(bioengine_uri)
     proxy_runtime_env["py_modules"] = proxy_py_modules
+    proxy_runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
     proxy_runtime_env["env_vars"] = {
         **replica_env_vars,
         "BIOENGINE_APP_SOURCE_URI": app_source_uri,
