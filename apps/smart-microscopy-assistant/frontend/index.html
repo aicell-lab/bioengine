@@ -2298,6 +2298,7 @@ async function runPipeline() {
   // files between commits without re-staging.
   const vlmQueue = [];
   const scratchIds = [];
+  const batchErrors = [];
   let vlmDone = 0, vlmErrs = 0, passed = 0, failed = 0, unsure = 0;
   let vlmActive = false;
 
@@ -2330,6 +2331,7 @@ async function runPipeline() {
       tile.state = "error";
       tile.error = err.message || String(err);
       vlmErrs++;
+      batchErrors.push({ stage: "inspect", file: tile.file.name, detail: formatErr(err) });
       log(`inspect(${tile.file.name}) error: ${tile.error}`, "err");
     }
     renderGrid("analyze");
@@ -2372,6 +2374,7 @@ async function runPipeline() {
       tile.state = "error";
       tile.error = "upload failed: " + (err.message || String(err));
       vlmErrs++;
+      batchErrors.push({ stage: "upload", file: tile.file.name, detail: formatErr(err) });
       log(`upload(${tile.file.name}) error: ${tile.error}`, "err");
       renderGrid("analyze");
     }
@@ -2399,6 +2402,18 @@ async function runPipeline() {
     summary = `Analyzed ${vlmDone}${vlmErrs ? ` · ${vlmErrs} error${vlmErrs === 1 ? "" : "s"}` : ""}`;
   }
   setRun(vlmErrs ? "error" : "ok", `Done. ${summary}`);
+
+  if (batchErrors.length) {
+    const detail = batchErrors
+      .map(e => `[${e.stage}] ${e.file}\n${e.detail}`)
+      .join("\n\n----------\n\n");
+    const total = pending.length;
+    showError({
+      title: `Analyze finished with ${batchErrors.length} error${batchErrors.length === 1 ? "" : "s"}`,
+      message: `${batchErrors.length} of ${total} image${total === 1 ? "" : "s"} failed. Tiles are marked in red; full per-image traces below.`,
+      detail,
+    });
+  }
 }
 
 $("runBtn").addEventListener("click", runPipeline);
