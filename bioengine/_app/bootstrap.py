@@ -171,9 +171,14 @@ def _package_source_to_ray_gcs(source_dir: "Path") -> str:  # type: ignore[name-
     upload_sig = inspect.signature(upload_package_if_needed)
     if "include_gitignore" in upload_sig.parameters:
         upload_kwargs["include_gitignore"] = False
-    # Some Ray versions expect (uri, scratch_dir, package_path) positionally;
-    # others use kwargs. Call positionally with the supported subset.
-    if "package_path" in upload_sig.parameters:
+    # Ray patches disagree on the third positional name:
+    # Ray 2.5x ships ``(pkg_uri, base_directory, module_path, ...)`` and
+    # earlier patches expose ``(pkg_uri, base_directory, ...)`` only. Pass
+    # ``src`` for both base_directory and module_path when the third arg
+    # exists — we want the entire downloaded source dir uploaded as one.
+    if "module_path" in upload_sig.parameters:
+        upload_package_if_needed(uri, src, src, **upload_kwargs)
+    elif "package_path" in upload_sig.parameters:
         upload_package_if_needed(uri, src, src, **upload_kwargs)
     else:
         upload_package_if_needed(uri, src, **upload_kwargs)
