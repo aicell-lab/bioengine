@@ -466,25 +466,37 @@ def _register_user_module_for_by_value_pickling(user_cls: Any) -> None:
     before any bioengine code runs — and ``main`` isn't on ``sys.path``
     yet (the source/ dir is materialised by setup_replica_environment).
 
-    Idempotent: cloudpickle's ``register_pickle_by_value`` skips modules
-    already in its by-value set.
+    Ray bundles its own cloudpickle at ``ray.cloudpickle`` and that's
+    what Ray Serve uses to serialise deployment defs. Register against
+    BOTH that AND the standalone ``cloudpickle`` so the by-value
+    registry takes effect regardless of which pickler Ray Serve happens
+    to instantiate.
     """
     import cloudpickle
+    import ray.cloudpickle as ray_cloudpickle
 
     module_name = user_cls.__module__
+    mods_to_register = []
     mod = sys.modules.get(module_name)
     if mod is None:
         return
-    cloudpickle.register_pickle_by_value(mod)
-    # Walk up the package chain — e.g. for ``demo_app.deployment``,
-    # also register ``demo_app`` so cloudpickle handles relative
-    # references in the same package consistently.
+    mods_to_register.append(mod)
     parent = module_name.rsplit(".", 1)[0] if "." in module_name else None
     while parent:
         parent_mod = sys.modules.get(parent)
         if parent_mod is not None:
-            cloudpickle.register_pickle_by_value(parent_mod)
+            mods_to_register.append(parent_mod)
         parent = parent.rsplit(".", 1)[0] if "." in parent else None
+
+    for m in mods_to_register:
+        try:
+            cloudpickle.register_pickle_by_value(m)
+        except (ValueError, TypeError):
+            pass
+        try:
+            ray_cloudpickle.register_pickle_by_value(m)
+        except (ValueError, TypeError):
+            pass
 
 
 def build_and_run_application(
