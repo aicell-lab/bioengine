@@ -1384,7 +1384,13 @@ import { login, connectToServer }
 
 // ---- URL params ----------------------------------------------------------
 const params     = new URLSearchParams(window.location.search);
-const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
+// Default to the origin that's serving this page (e.g. the Hypha instance
+// hosting the artifact). Falls back to hypha.aicell.io for dev when the
+// page is opened from file:// or a localhost:NNNN that isn't a Hypha server.
+const PAGE_ORIGIN =
+  (window.location.protocol === "http:" || window.location.protocol === "https:")
+    ? window.location.origin : null;
+const SERVER_URL = params.get("server") || PAGE_ORIGIN || "https://hypha.aicell.io";
 const SERVICE_ID = params.get("ws_service_id") || "";
 const URL_TOKEN  = params.get("token") || "";
 
