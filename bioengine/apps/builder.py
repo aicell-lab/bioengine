@@ -1,39 +1,37 @@
 """Build BioEngine apps for Ray Serve from v0.6.0 artifacts.
 
-In the v0.6.0 model the worker never imports user code. It ships the user's
-Python package as ``runtime_env.py_modules`` and delegates introspection and
-binding to two Ray tasks defined in :mod:`bioengine._app.bootstrap`. The
-worker only handles:
+In the v0.11.4 model the worker never imports user code AND never touches
+the filesystem. The worker only handles:
 
-* manifest loading and validation
-* artifact materialisation (download the *package directory*, nothing else)
-* runtime_env composition (base pip + user pip extracted via AST)
-* pydantic-core preflight (so cross-process pickling failures surface early)
-* kwargs validation against the spec
-* authorisation-rule resolution
-* ``ProxyDeployment`` argument assembly
+* manifest loading + ``format_version`` / ``authorized_users`` gate
+* runtime_env composition (base pip + env_vars for the introspect task)
+* mint short-TTL Hypha download token
+* submit :func:`bioengine._app.bootstrap.introspect_app_in_ray_task` —
+  that Ray task downloads source, walks the type-hint composition graph,
+  packages source to Ray's internal GCS, returns ``{spec, app_source_uri}``
+* kwargs validation against the returned spec
+* resource accounting + ``_check_resources`` (the SLURM-aware gate)
+* authorisation-rule resolution + ``ProxyDeployment`` argument assembly
+* submit :func:`bioengine._app.bootstrap.build_and_run_application` — that
+  Ray task does ``cls.bind(...)`` + ``serve.run(blocking=False)``
 
-Everything else — class loading, lifecycle wiring, schema collection,
-``cls.bind(...)`` composition — runs inside the app's runtime_env.
+Every replica receives ``BIOENGINE_APP_SOURCE_URI`` in its ``env_vars``
+and uses Ray-internal GCS to materialise source — no Hypha auth on the
+replica side, so the short-TTL token never matters after step 4.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
+import inspect as _inspect
 import json
 import logging
 import os
-import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import sys
-
-import httpx
 import ray
 import yaml
 from hypha_rpc.rpc import RemoteService
@@ -45,7 +43,7 @@ import bioengine
 from bioengine._app.bootstrap import (
     SPEC_FORMAT_VERSION,
     build_and_run_application,
-    introspect_app,
+    introspect_app_in_ray_task,
     validate_kwargs_against_spec,
 )
 from bioengine._app.errors import BioEngineUserError
@@ -144,107 +142,6 @@ class AppBuilder:
 
         validate_manifest(manifest)
         return manifest, resolved_version
-
-    # ───────────────────────── artifact files ────────────────────────────
-
-    async def _materialize_artifact(
-        self,
-        artifact_id: str,
-        version: Optional[str],
-        application_id: str,
-    ) -> Path:
-        """Download the artifact source into a transient build directory.
-
-        The directory is created with ``tempfile.mkdtemp`` because it only
-        needs to outlive the introspection + ``build_and_run_application``
-        Ray tasks — the actual Ray Serve replicas no longer receive the
-        source via ``py_modules`` (they fetch it themselves from Hypha in
-        :mod:`bioengine._app.replica_init`). The caller cleans up via
-        :meth:`_cleanup_build_dir` once :meth:`submit` returns.
-        """
-        target_dir = Path(
-            tempfile.mkdtemp(prefix=f"bioengine-build-{application_id}-")
-        )
-
-        local_root = self._local_artifact_root(artifact_id)
-        if local_root and local_root.is_dir():
-            self.logger.info(
-                f"Materialising '{artifact_id}' from local path "
-                f"{local_root} → {target_dir}"
-            )
-            shutil.copytree(
-                local_root,
-                target_dir,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("__pycache__", ".git"),
-            )
-            return target_dir
-
-        self.logger.info(
-            f"Downloading artifact root '{artifact_id}' (version={version}) "
-            f"→ {target_dir}"
-        )
-        files = await self.artifact_manager.list_files(
-            artifact_id=artifact_id, version=version
-        )
-        await self._download_files_recursive(
-            artifact_id, version, target_dir, "", files
-        )
-        return target_dir
-
-    def _cleanup_build_dir(self, build_dir: Optional[Path]) -> None:
-        if build_dir is None:
-            return
-        try:
-            shutil.rmtree(build_dir, ignore_errors=True)
-        except OSError as exc:
-            self.logger.warning(
-                f"Could not remove transient build dir {build_dir}: {exc}"
-            )
-
-    def _local_artifact_root(self, artifact_id: str) -> Optional[Path]:
-        local_root_env = os.environ.get("BIOENGINE_LOCAL_ARTIFACT_PATH")
-        if not local_root_env:
-            return None
-        artifact_folder = artifact_id.split("/")[1]
-        candidate = Path(local_root_env) / artifact_folder
-        return candidate if candidate.is_dir() else None
-
-    async def _download_files_recursive(
-        self,
-        artifact_id: str,
-        version: Optional[str],
-        target_dir: Path,
-        prefix: str,
-        files: List[Dict[str, Any]],
-    ) -> None:
-        """Walk ``files`` from ``artifact_manager.list_files`` and download to disk."""
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            for entry in files:
-                name = entry.get("name")
-                if name is None:
-                    continue
-                rel_path = f"{prefix}/{name}" if prefix else name
-                if entry.get("type") == "directory":
-                    sub = await self.artifact_manager.list_files(
-                        artifact_id=artifact_id,
-                        version=version,
-                        dir_path=rel_path,
-                    )
-                    await self._download_files_recursive(
-                        artifact_id, version, target_dir, rel_path, sub
-                    )
-                    continue
-                url = await self.artifact_manager.get_file(
-                    artifact_id=artifact_id,
-                    version=version,
-                    file_path=rel_path,
-                )
-                response = await client.get(url)
-                response.raise_for_status()
-                out_path = target_dir / rel_path
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_bytes(response.content)
 
     # ─────────────────────── runtime_env compose ─────────────────────────
 
@@ -377,38 +274,38 @@ class AppBuilder:
             "env_vars": task_env,
         }
 
-    @staticmethod
-    def _introspect_inprocess(entry_id: str, pkg_root_dir: Path) -> Dict[str, Any]:
-        """Run ``introspect_app`` in the worker process with ``pkg_root_dir``
-        temporarily on ``sys.path``.
+    async def _introspect_via_ray_task(
+        self,
+        entry_id: str,
+        env_vars: Dict[str, str],
+        submit_runtime_env: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Submit :func:`introspect_app_in_ray_task` as a Ray task.
 
-        The decorator-module import rule (CLAUDE.md) guarantees that
-        ``@bioengine.app`` modules — and anything they import at top level
-        — load with just ``bioengine[worker]`` and the standard library,
-        so the worker venv is enough; heavy deps stay inside method
-        bodies. Avoiding a Ray task here keeps every per-deploy round
-        trip off the ray-client bridge that wedged the GCS upload path.
+        The task downloads the user package (Hypha, short-TTL token in
+        ``env_vars``), walks the type-hint composition graph, packages
+        the source to Ray's internal GCS, and returns the
+        ``{spec, app_source_uri}`` payload. We never touch the worker's
+        filesystem.
+
+        Strips the ``_BIOENGINE_SECRET_*`` keys from ``env_vars`` before
+        passing into the task to keep secrets out of Ray's logs; the
+        introspect task only needs the download URL/token + APP_DIR +
+        VERSION, none of which is secret-prefixed.
         """
-        src = str(pkg_root_dir.resolve())
-        added = False
-        if src not in sys.path:
-            sys.path.insert(0, src)
-            added = True
+        task_env_vars = {
+            k: v for k, v in env_vars.items() if not k.startswith("_BIOENGINE_SECRET_")
+        }
         try:
-            return introspect_app(entry_id)
-        finally:
-            if added:
-                try:
-                    sys.path.remove(src)
-                except ValueError:
-                    pass
-            for mod_name in [
-                name
-                for name, mod in list(sys.modules.items())
-                if getattr(mod, "__file__", None)
-                and str(Path(mod.__file__).resolve()).startswith(src)
-            ]:
-                sys.modules.pop(mod_name, None)
+            return await asyncio.to_thread(
+                ray.get,
+                ray.remote(num_cpus=0, runtime_env=submit_runtime_env)(
+                    introspect_app_in_ray_task
+                ).remote(entry_id, task_env_vars),
+            )
+        except ray.exceptions.RayTaskError as exc:
+            cause = exc.cause if isinstance(exc.cause, Exception) else exc
+            raise BioEngineUserError(str(cause)) from exc
 
     # ───────────────────────── kwargs translation ────────────────────────
 
@@ -554,7 +451,7 @@ class AppBuilder:
         ] = None,
         deploying_user: Optional[tuple] = None,
         admin_users: Optional[List[str]] = None,
-    ) -> serve.Application:
+    ) -> "BuiltApp":
         """Construct the Ray Serve application for a v0.6.0 BioEngine app."""
         self.logger.info(
             f"Building application '{application_id}' from artifact "
@@ -573,79 +470,14 @@ class AppBuilder:
         application_kwargs = dict(application_kwargs or {})
         application_env_vars = dict(application_env_vars or {})
 
-        # 1. Materialise the artifact root into a transient build dir
-        # (introspection + build_and_run_application Ray tasks need the
-        # source on their sys.path; the actual replicas fetch it themselves
-        # via the replica setup hook so they don't share this filesystem).
-        pkg_root_dir = await self._materialize_artifact(
-            artifact_id, version, application_id
-        )
-        try:
-            return await self._build_with_source(
-                application_id=application_id,
-                artifact_id=artifact_id,
-                version=version,
-                application_kwargs=application_kwargs,
-                application_env_vars=application_env_vars,
-                hypha_token=hypha_token,
-                disable_gpu=disable_gpu,
-                max_ongoing_requests=max_ongoing_requests,
-                proxy_memory_in_gb=proxy_memory_in_gb,
-                debug=debug,
-                started_at=started_at,
-                last_updated_at=last_updated_at,
-                last_updated_by=last_updated_by,
-                auto_redeploy=auto_redeploy,
-                ice_servers=ice_servers,
-                authorized_users=authorized_users,
-                deploying_user=deploying_user,
-                admin_users=admin_users,
-                manifest=manifest,
-                entry_id=entry_id,
-                pkg_root_dir=pkg_root_dir,
-            )
-        except BaseException:
-            self._cleanup_build_dir(pkg_root_dir)
-            raise
-
-    async def _build_with_source(
-        self,
-        *,
-        application_id: str,
-        artifact_id: str,
-        version: str,
-        application_kwargs: Dict[str, Dict[str, Any]],
-        application_env_vars: Dict[str, Dict[str, Any]],
-        hypha_token: Optional[str],
-        disable_gpu: bool,
-        max_ongoing_requests: int,
-        proxy_memory_in_gb: float,
-        debug: bool,
-        started_at: Optional[float],
-        last_updated_at: Optional[float],
-        last_updated_by: Optional[str],
-        auto_redeploy: bool,
-        ice_servers: Optional[List[Dict[str, Any]]],
-        authorized_users: Optional[Union[Dict[str, List[str]], List[str]]],
-        deploying_user: Optional[tuple],
-        admin_users: Optional[List[str]],
-        manifest: Dict[str, Any],
-        entry_id: str,
-        pkg_root_dir: Path,
-    ) -> "BuiltApp":
-        """Continuation of :meth:`build` once the artifact is on disk.
-
-        Split out so :meth:`build` can guarantee cleanup of the transient
-        download dir on any failure.
-        """
-        # 2. Mint a short-TTL read-only token the replica setup hook will
-        # attach to the create-zip-file download. Public-artifact workspaces
-        # accept the download without auth; the token is harmless there
-        # (Hypha ignores it). For private workspaces, the short TTL means
-        # the token expires before it can be replayed if env_vars leak.
+        # 1. Mint a short-TTL read-only token the introspect Ray task will
+        # attach to its single Hypha create-zip-file download. The token
+        # never crosses to Ray Serve replicas — they pull source from Ray's
+        # internal GCS via ``BIOENGINE_APP_SOURCE_URI`` (uploaded inside the
+        # introspect task), so its TTL only matters for the next ~10 s.
         download_token: Optional[str] = None
+        artifact_workspace = artifact_id.split("/", 1)[0]
         try:
-            artifact_workspace = artifact_id.split("/", 1)[0]
             download_token = await self.server.generate_token(
                 {
                     "workspace": artifact_workspace,
@@ -660,11 +492,7 @@ class AppBuilder:
                 "artifacts)."
             )
 
-        # 3. Compose env_vars and the introspection runtime_env.
-        # The CLI-supplied env_vars are flattened across deployments today;
-        # in the v0.6 model the framework only sees a single env_vars dict
-        # (per-deployment runtime_env extension is via the @app decorator's
-        # env_vars kwarg). We collapse them here.
+        # 2. Compose env_vars + the introspect-task runtime_env.
         flat_env_vars: Dict[str, str] = {}
         for env_dict in application_env_vars.values():
             for k, v in env_dict.items():
@@ -681,17 +509,18 @@ class AppBuilder:
         )
         runtime_env = self._build_submit_runtime_env(env_vars)
 
-        # 4. Introspect the user package in the worker process — see
-        # ``_introspect_inprocess``. Keeps every per-deploy round trip
-        # off the ray-client bridge that wedges Ray's GCS upload.
-        try:
-            spec = await asyncio.to_thread(
-                self._introspect_inprocess, entry_id, pkg_root_dir
-            )
-        except BioEngineUserError:
-            raise
-        except Exception as exc:
-            raise BioEngineUserError(str(exc)) from exc
+        # 3. Introspect the user package via a Ray task — the task
+        # downloads from Hypha, walks @bioengine.app composition, and
+        # packages the source to Ray-internal GCS. Returns spec + URI.
+        introspect_result = await self._introspect_via_ray_task(
+            entry_id, env_vars, runtime_env
+        )
+        spec = introspect_result["spec"]
+        app_source_uri = introspect_result["app_source_uri"]
+        self.logger.info(
+            f"Introspect task returned for '{application_id}' — "
+            f"app_source_uri={app_source_uri}"
+        )
 
         # Sanity check: format_version round-trip.
         if spec.get("format_version") != SPEC_FORMAT_VERSION:
@@ -842,7 +671,7 @@ class AppBuilder:
             proxy_args=proxy_args,
             runtime_env=runtime_env,
             bioengine_uri=self._bioengine_gcs_uri(),
-            build_dir=pkg_root_dir,
+            app_source_uri=app_source_uri,
             proxy_pip=proxy_pip,
             user_replica_framework_pip=user_replica_framework_pip,
             replica_env_vars=replica_env_vars,
@@ -852,16 +681,15 @@ class AppBuilder:
     async def submit(self, built_app: "BuiltApp", application_id: str) -> None:
         """Fire the ``build_and_run_application`` Ray task.
 
-        ``build()`` returns metadata only (after introspection); the
-        manager runs ``_check_resources`` against that metadata and then
-        calls this to actually claim the cluster resources. Splitting
+        ``build()`` returns metadata only (after the introspect Ray task);
+        the manager runs ``_check_resources`` against that metadata and
+        then calls this to actually claim the cluster resources. Splitting
         the steps means the resource check happens *before* ``serve.run``,
-        not after.
+        not after — and preserves the SLURM-scaling fallback.
 
-        Cleans up the transient build dir once the task returns: the Ray
-        client uploaded the contents to the cluster's internal package
-        store before launching the task, so the local source is no longer
-        needed.
+        No worker-side cleanup needed: the worker never wrote anything to
+        its own filesystem. Source bytes live in Ray's GCS package store
+        (uploaded by the introspect task); replicas fetch from there.
         """
         try:
             await asyncio.to_thread(
@@ -875,6 +703,7 @@ class AppBuilder:
                     application_id,
                     f"/{application_id}",
                     built_app.bioengine_uri,
+                    built_app.app_source_uri,
                     built_app.proxy_pip,
                     built_app.user_replica_framework_pip,
                     built_app.replica_env_vars,
@@ -884,8 +713,6 @@ class AppBuilder:
         except ray.exceptions.RayTaskError as exc:
             cause = exc.cause if isinstance(exc.cause, Exception) else exc
             raise BioEngineUserError(str(cause)) from exc
-        finally:
-            self._cleanup_build_dir(built_app.build_dir)
         self.logger.info(f"Submitted '{application_id}' to Ray Serve")
 
 
@@ -902,9 +729,10 @@ class BuiltApp:
     the manager can do ``build → check_resources → submit`` and keep the
     resource check on the right side of the actual claim.
 
-    ``build_dir`` is the transient directory the worker downloaded the
-    artifact source into for the introspection + build Ray tasks; it is
-    deleted by :meth:`AppBuilder.submit` once the task returns.
+    ``app_source_uri`` is the ``gcs://_ray_pkg_<hash>.zip`` URI returned
+    by the introspect Ray task — the build task plus every replica use
+    it to materialise source via Ray's internal package store, no Hypha
+    auth needed.
     """
 
     __slots__ = (
@@ -914,7 +742,7 @@ class BuiltApp:
         "proxy_args",
         "runtime_env",
         "bioengine_uri",
-        "build_dir",
+        "app_source_uri",
         "proxy_pip",
         "user_replica_framework_pip",
         "replica_env_vars",
@@ -929,7 +757,7 @@ class BuiltApp:
         proxy_args: Dict[str, Any],
         runtime_env: Dict[str, Any],
         bioengine_uri: str,
-        build_dir: Optional[Path],
+        app_source_uri: str,
         proxy_pip: List[str],
         user_replica_framework_pip: List[str],
         replica_env_vars: Dict[str, str],
@@ -941,7 +769,7 @@ class BuiltApp:
         self.proxy_args = proxy_args
         self.runtime_env = runtime_env
         self.bioengine_uri = bioengine_uri
-        self.build_dir = build_dir
+        self.app_source_uri = app_source_uri
         self.proxy_pip = proxy_pip
         self.user_replica_framework_pip = user_replica_framework_pip
         self.replica_env_vars = replica_env_vars

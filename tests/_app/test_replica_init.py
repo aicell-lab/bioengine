@@ -237,3 +237,60 @@ def test_authed_url_returns_base_when_no_token() -> None:
     base = "https://hypha.aicell.io/ws/artifacts/x/create-zip-file?version=1"
     assert replica_init._authed_url(base, None) == base
     assert replica_init._authed_url(base, "") == base
+
+
+def test_ray_gcs_uri_branch_skips_hypha(
+    replica_env, monkeypatch, tmp_path, fake_artifact_files
+) -> None:
+    """When BIOENGINE_APP_SOURCE_URI is set, _ensure_source pulls from
+    Ray-internal GCS and never touches Hypha — even if a Hypha URL is
+    also in the env."""
+    app_dir, env = replica_env
+
+    monkeypatch.setenv(
+        "BIOENGINE_APP_SOURCE_URI",
+        "gcs://_ray_pkg_deadbeefdeadbeef.zip",
+    )
+
+    def fake_ray_gcs(uri, dest, logger):
+        # Materialise the artifact bytes the same way Hypha would, so the
+        # downstream version-marker write / sys.path lookup paths still
+        # work identically.
+        assert uri == "gcs://_ray_pkg_deadbeefdeadbeef.zip"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            import shutil
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        for rel, content in fake_artifact_files.items():
+            if replica_init._is_excluded(rel):
+                continue
+            out = dest / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(content)
+
+    def boom(*a, **kw):
+        raise AssertionError(
+            "Hypha _download_and_extract must not be called when "
+            "BIOENGINE_APP_SOURCE_URI is set"
+        )
+
+    monkeypatch.setattr(replica_init, "_download_from_ray_gcs", fake_ray_gcs)
+    monkeypatch.setattr(replica_init, "_download_and_extract", boom)
+
+    replica_init.setup_replica_environment()
+    assert (app_dir / "source" / "entry.py").is_file()
+    assert (app_dir / ".version").read_text().strip() == "1.2.0"
+
+
+def test_neither_uri_set_raises_clear_error(monkeypatch, tmp_path) -> None:
+    app_dir = tmp_path / "app"
+    monkeypatch.setenv("BIOENGINE_APP_DIR", str(app_dir))
+    monkeypatch.setenv("BIOENGINE_ARTIFACT_VERSION", "1.2.0")
+    monkeypatch.delenv("BIOENGINE_APP_SOURCE_URI", raising=False)
+    monkeypatch.delenv("BIOENGINE_ARTIFACT_DOWNLOAD_URL", raising=False)
+    monkeypatch.delenv("BIOENGINE_LOCAL_ARTIFACT_PATH", raising=False)
+    monkeypatch.delenv("BIOENGINE_ARTIFACT_ID", raising=False)
+
+    with pytest.raises(RuntimeError, match="BIOENGINE_APP_SOURCE_URI"):
+        replica_init.setup_replica_environment()
