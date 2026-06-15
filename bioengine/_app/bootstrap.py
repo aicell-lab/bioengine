@@ -171,11 +171,18 @@ def _package_source_to_ray_gcs(source_dir: "Path") -> str:  # type: ignore[name-
     upload_sig = inspect.signature(upload_package_if_needed)
     if "include_gitignore" in upload_sig.parameters:
         upload_kwargs["include_gitignore"] = False
+    # Belt-and-braces: exclude any leftover Ray package zip from the
+    # source tree. Earlier dev iterations of v0.11.4 wrote temp zips
+    # into ``src`` itself (when ``base_directory == src``), Ray's walker
+    # then included its own output back into the package and looped to
+    # 360 GiB on shared NFS before the task was killed. The fix below
+    # uses a scratch ``base_directory``, but if any artifact / pod still
+    # has a stale ``_ray_pkg_*.zip`` sitting in ``source/`` from history,
+    # this exclude keeps it out of the new package.
+    upload_kwargs["excludes"] = ["*.zip", "_ray_pkg_*.zip"]
     # ``base_directory`` is a scratch dir where Ray writes the temporary
     # zip file before pushing to GCS. Must not point at the source dir
-    # itself — Ray writes the zip *inside* base_directory, so packaging
-    # ``src`` with ``base_directory=src`` makes Ray try to include its
-    # own zip output in the next walk and hangs in disk-wait.
+    # itself.
     import tempfile
     base_dir = tempfile.mkdtemp(prefix="bioengine-pkg-")
     try:
