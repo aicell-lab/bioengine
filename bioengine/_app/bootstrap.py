@@ -171,17 +171,26 @@ def _package_source_to_ray_gcs(source_dir: "Path") -> str:  # type: ignore[name-
     upload_sig = inspect.signature(upload_package_if_needed)
     if "include_gitignore" in upload_sig.parameters:
         upload_kwargs["include_gitignore"] = False
-    # Ray patches disagree on the third positional name:
-    # Ray 2.5x ships ``(pkg_uri, base_directory, module_path, ...)`` and
-    # earlier patches expose ``(pkg_uri, base_directory, ...)`` only. Pass
-    # ``src`` for both base_directory and module_path when the third arg
-    # exists — we want the entire downloaded source dir uploaded as one.
-    if "module_path" in upload_sig.parameters:
-        upload_package_if_needed(uri, src, src, **upload_kwargs)
-    elif "package_path" in upload_sig.parameters:
-        upload_package_if_needed(uri, src, src, **upload_kwargs)
-    else:
-        upload_package_if_needed(uri, src, **upload_kwargs)
+    # ``base_directory`` is a scratch dir where Ray writes the temporary
+    # zip file before pushing to GCS. Must not point at the source dir
+    # itself — Ray writes the zip *inside* base_directory, so packaging
+    # ``src`` with ``base_directory=src`` makes Ray try to include its
+    # own zip output in the next walk and hangs in disk-wait.
+    import tempfile
+    base_dir = tempfile.mkdtemp(prefix="bioengine-pkg-")
+    try:
+        # Ray patches disagree on the third positional name:
+        # Ray 2.5x ships ``(pkg_uri, base_directory, module_path, ...)``;
+        # earlier patches expose ``(pkg_uri, base_directory, ...)`` only.
+        if "module_path" in upload_sig.parameters:
+            upload_package_if_needed(uri, base_dir, src, **upload_kwargs)
+        elif "package_path" in upload_sig.parameters:
+            upload_package_if_needed(uri, base_dir, src, **upload_kwargs)
+        else:
+            upload_package_if_needed(uri, base_dir, **upload_kwargs)
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(base_dir, ignore_errors=True)
     return uri
 
 
