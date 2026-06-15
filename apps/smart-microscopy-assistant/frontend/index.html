@@ -846,6 +846,18 @@
     background: var(--fail); color: #450a0a; border-color: var(--fail);
   }
   .dialog .dialog-btn.danger:hover { filter: brightness(1.08); }
+  .dialog.dialog-wide { max-width: 36rem; }
+  .dialog .dialog-detail {
+    margin: 0 0 1.1rem;
+    padding: 0.7rem 0.85rem;
+    background: var(--bg-0); border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    font: 0.78rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--fg-dim);
+    max-height: 50vh; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .dialog .dialog-detail:empty { display: none; }
 
   /* --- Define mode submit result block --------------------------------- */
   .create-result {
@@ -1330,6 +1342,29 @@
   </div>
 </div>
 
+<!-- Error dialog -->
+<div id="errorDialog" class="dialog-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="errorTitle" hidden>
+  <div class="dialog dialog-wide">
+    <div class="dialog-title">
+      <span class="dialog-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="13"/>
+          <line x1="12" y1="16.5" x2="12" y2="16.5"/>
+        </svg>
+      </span>
+      <span id="errorTitle">Something went wrong</span>
+    </div>
+    <div class="dialog-message" id="errorMessage"></div>
+    <pre class="dialog-detail" id="errorDetail"></pre>
+    <div class="dialog-actions">
+      <button class="dialog-btn cancel" type="button" id="errorCopy">Copy</button>
+      <button class="dialog-btn danger" type="button" id="errorClose">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Lightbox -->
 <div id="lightbox" class="lightbox" role="dialog" aria-label="Image preview" hidden>
   <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Close preview">
@@ -1503,6 +1538,11 @@ async function startLogin() {
     await connectWithToken(token);
   } catch (err) {
     log("Login error: " + err.message, "err");
+    showError({
+      title: "Login failed",
+      message: "Could not complete the Hypha auth flow.",
+      detail: formatErr(err),
+    });
     setLoggedOutUI();
   }
 }
@@ -1587,7 +1627,7 @@ $("srcFreetext").addEventListener("change", applySourceRadio);
 // Shared cache so the Tests-tab list and the Analyze dropdown stay in sync.
 let cachedTests = [];
 
-async function refreshTests() {
+async function refreshTests({ popupOnError = false } = {}) {
   if (!qcSvc) return;
   try {
     cachedTests = await qcSvc.list_visual_tests({
@@ -1597,6 +1637,13 @@ async function refreshTests() {
   } catch (err) {
     cachedTests = [];
     log("list_visual_tests failed: " + err.message, "err");
+    if (popupOnError) {
+      showError({
+        title: "Could not refresh visual tests",
+        message: "<code>list_visual_tests</code> failed on the worker.",
+        detail: formatErr(err),
+      });
+    }
   }
   refreshTestsDropdown();
   refreshTestList();
@@ -1654,7 +1701,7 @@ function updateTestMeta() {
   applySourceRadio();
 }
 $("testSelect").addEventListener("change", updateTestMeta);
-$("refreshTestsBtn").addEventListener("click", () => { refreshTests(); });
+$("refreshTestsBtn").addEventListener("click", () => { refreshTests({ popupOnError: true }); });
 
 // ---- Existing-tests list rendering (Visual Tests tab) -------------------
 function refreshTestList() {
@@ -1737,12 +1784,17 @@ function refreshTestList() {
             name: t.name, caller_user_id: userWorkspace, _rkwargs: true,
           });
           log(`Deleted visual test '${t.name}'.`, "ok");
-          await refreshTests();
         } catch (err) {
           log(`delete_visual_test(${t.name}) error: ${err.message || err}`, "err");
-          alert("Delete failed: " + (err.message || err));
+          showError({
+            title: "Delete failed",
+            message: `Could not delete visual test <strong>${escapeHTML(t.name)}</strong>.`,
+            detail: formatErr(err),
+          });
           del.disabled = false;
+          return;
         }
+        await refreshTests({ popupOnError: true });
       });
     }
     row.appendChild(del);
@@ -1792,8 +1844,47 @@ $("confirmCancel").addEventListener("click", () => closeConfirm(false));
 $("confirmDialog").addEventListener("click", (e) => {
   if (e.target === $("confirmDialog")) closeConfirm(false);
 });
+
+// ===== Error dialog ======================================================
+// Surfaces RPC / button-handler failures as a modal with a scrollable detail
+// block, so users see the real error (stack, server message) instead of a
+// silent log line or a chrome alert().
+function formatErr(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  return err.stack || err.message || (() => {
+    try { return JSON.stringify(err, null, 2); } catch { return String(err); }
+  })();
+}
+function showError({ title = "Something went wrong", message = "", detail = "" } = {}) {
+  $("errorTitle").textContent = title;
+  $("errorMessage").innerHTML = message;
+  $("errorDetail").textContent = detail;
+  $("errorDialog").hidden = false;
+  setTimeout(() => $("errorClose").focus(), 0);
+}
+function closeError() { $("errorDialog").hidden = true; }
+$("errorClose").addEventListener("click", closeError);
+$("errorDialog").addEventListener("click", (e) => {
+  if (e.target === $("errorDialog")) closeError();
+});
+$("errorCopy").addEventListener("click", async () => {
+  const text = [
+    $("errorTitle").textContent,
+    $("errorMessage").textContent,
+    $("errorDetail").textContent,
+  ].filter(Boolean).join("\n\n");
+  try {
+    await navigator.clipboard?.writeText(text);
+    $("errorCopy").textContent = "Copied";
+    setTimeout(() => { $("errorCopy").textContent = "Copy"; }, 1200);
+  } catch (_) {}
+});
+
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("confirmDialog").hidden) closeConfirm(false);
+  if (e.key !== "Escape") return;
+  if (!$("errorDialog").hidden) { closeError(); return; }
+  if (!$("confirmDialog").hidden) closeConfirm(false);
 });
 
 // ===== Lightbox ===========================================================
@@ -2560,6 +2651,11 @@ $("defineBtn").addEventListener("click", async () => {
     $("defineResultBlock").hidden = false;
     $("defineResultBlock").textContent = "Error: " + (err.message || String(err));
     log("create_visual_test error: " + (err.message || String(err)), "err");
+    showError({
+      title: "Could not save visual test",
+      message: `<code>create_visual_test</code> failed for <strong>${escapeHTML(name)}</strong>.`,
+      detail: formatErr(err),
+    });
   } finally {
     if (scratchId) await deleteScratch(scratchId);
     refreshDefineEnabled();
