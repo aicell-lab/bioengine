@@ -457,6 +457,36 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
 _REPLICA_SETUP_HOOK = "bioengine._app.replica_init:setup_replica_environment"
 
 
+def _register_user_module_for_by_value_pickling(user_cls: Any) -> None:
+    """Tell cloudpickle to pickle ``user_cls``'s module (and its package
+    ancestors) by value.
+
+    Replicas would otherwise see a by-reference pickle of e.g.
+    ``main:CellposeFinetune`` and call ``importlib.import_module('main')``
+    before any bioengine code runs — and ``main`` isn't on ``sys.path``
+    yet (the source/ dir is materialised by setup_replica_environment).
+
+    Idempotent: cloudpickle's ``register_pickle_by_value`` skips modules
+    already in its by-value set.
+    """
+    import cloudpickle
+
+    module_name = user_cls.__module__
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        return
+    cloudpickle.register_pickle_by_value(mod)
+    # Walk up the package chain — e.g. for ``demo_app.deployment``,
+    # also register ``demo_app`` so cloudpickle handles relative
+    # references in the same package consistently.
+    parent = module_name.rsplit(".", 1)[0] if "." in module_name else None
+    while parent:
+        parent_mod = sys.modules.get(parent)
+        if parent_mod is not None:
+            cloudpickle.register_pickle_by_value(parent_mod)
+        parent = parent.rsplit(".", 1)[0] if "." in parent else None
+
+
 def build_and_run_application(
     spec: Dict[str, Any],
     application_kwargs: Dict[str, Dict[str, Any]],
@@ -581,7 +611,16 @@ def build_and_run_application(
         if cid in handles:
             return handles[cid]
         meta = spec["classes"][cid]
-        cls = _with_pkg(_load_app_class(cid))
+        user_cls = _load_app_class(cid)
+        # Force cloudpickle to serialise the user's module by value rather
+        # than by reference. Otherwise Ray Serve replica startup tries
+        # ``importlib.import_module('main')`` (or 'entry') BEFORE any
+        # bioengine hook runs to populate sys.path — see PR #119 commit
+        # log for the empirical chase. By-value embeds the user module's
+        # source + globals into the pickle so cloudpickle.loads
+        # reconstructs the class without importing.
+        _register_user_module_for_by_value_pickling(user_cls)
+        cls = _with_pkg(user_cls)
         bind_kwargs: Dict[str, Any] = dict(application_kwargs.get(cid, {}))
         for param in meta["init_params"]:
             if param["kind"] == "deployment_handle":
