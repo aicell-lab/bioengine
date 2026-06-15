@@ -30,18 +30,16 @@ with co-tenants on the host A40).
 import asyncio
 import hashlib
 import json
-import logging
 import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hypha_rpc.utils.schema import schema_method
+import bioengine
 from pydantic import Field
-from ray import serve
 
-logger = logging.getLogger("ray.serve")
+logger = bioengine.logger
 
 _MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
 _DEFAULT_SERVER_URL = "https://hypha.aicell.io"
@@ -110,30 +108,25 @@ def _test_id_for(owner: str, name: str) -> str:
     return f"{h}-{safe_name}"
 
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 4,
-        "num_gpus": 1,
-        "memory": 12 * 1024**3,
-        "runtime_env": {
-            "pip": [
-                "ray[serve]==2.55.1",
-                "transformers==4.51.3",
-                "accelerate==1.6.0",
-                "torch==2.5.1",
-                "torchvision==0.20.1",
-                "numpy==1.26.4",
-                "pillow==10.4.0",
-                "httpx==0.27.2",
-                "hypha-rpc==0.20.54",
-            ],
-            "env_vars": {
-                "TRITON_CACHE_DIR": "/tmp/triton-cache",
-                "HF_HOME": "/tmp/hf-home",
-                "XDG_CACHE_HOME": "/tmp/xdg-cache",
-                "VLLM_LOGGING_LEVEL": "INFO",
-            },
-        },
+@bioengine.app(
+    num_cpus=4,
+    num_gpus=1,
+    memory_mb=12 * 1024,
+    pip=[
+        "transformers==4.51.3",
+        "accelerate==1.6.0",
+        "torch==2.5.1",
+        "torchvision==0.20.1",
+        # numpy 1.26 keeps ABI in sync with the host Ray pod's pandas.
+        "numpy==1.26.4",
+        "pillow==10.4.0",
+    ],
+    env_vars={
+        # Triton's JIT cache wants a writable dir; runtime_env venv's
+        # default $HOME is read-only on this Ray pod.
+        "TRITON_CACHE_DIR": "/tmp/triton-cache",
+        "HF_HOME": "/tmp/hf-home",
+        "XDG_CACHE_HOME": "/tmp/xdg-cache",
     },
     max_ongoing_requests=4,
     health_check_period_s=30.0,
@@ -149,7 +142,8 @@ class SmartMicroscopyAssistant:
         self._artifact_manager = None
         self._tests_dir: Optional[Path] = None
 
-    async def async_init(self) -> None:
+    @bioengine.async_init
+    async def _async_init(self) -> None:
         import os as _os
         for d in ("/tmp/triton-cache", "/tmp/hf-home", "/tmp/xdg-cache"):
             _os.makedirs(d, exist_ok=True)
@@ -191,10 +185,12 @@ class SmartMicroscopyAssistant:
         self._engine.eval()
         logger.info("Qwen2.5-VL-3B ready on %s.", next(self._engine.parameters()).device)
 
-    async def test_deployment(self) -> None:
+    @bioengine.smoke_test
+    async def _smoke_test(self) -> None:
         return None
 
-    async def check_health(self) -> None:
+    @bioengine.health_check
+    async def _health_check(self) -> None:
         if self._engine is None or self._processor is None:
             raise RuntimeError("VLM not initialized.")
         if self._artifact_manager is None:
@@ -506,7 +502,7 @@ class SmartMicroscopyAssistant:
 
     # ---------------------------------------------------------------- public API
 
-    @schema_method
+    @bioengine.method
     async def ping(self) -> dict:
         """Liveness probe."""
         return {
@@ -515,7 +511,7 @@ class SmartMicroscopyAssistant:
             "uptime_s": round(time.time() - self.start_time, 1),
         }
 
-    @schema_method
+    @bioengine.method
     async def get_model_info(self) -> dict:
         """Describe the served model and the input/output contract."""
         return {
@@ -539,7 +535,7 @@ class SmartMicroscopyAssistant:
 
     # ----------------------------------------------- visual-test management
 
-    @schema_method
+    @bioengine.method
     async def create_visual_test(
         self,
         name: str = Field(
@@ -667,7 +663,7 @@ class SmartMicroscopyAssistant:
         )
         return record
 
-    @schema_method
+    @bioengine.method
     async def list_visual_tests(
         self,
         caller_user_id: Optional[str] = Field(
@@ -697,7 +693,7 @@ class SmartMicroscopyAssistant:
                 out.append(rec)
         return out
 
-    @schema_method
+    @bioengine.method
     async def get_visual_test(
         self,
         name: str = Field(..., description="Visual-test identifier."),
@@ -716,7 +712,7 @@ class SmartMicroscopyAssistant:
         rec["owned_by_you"] = (rec.get("created_by") == caller_id)
         return rec
 
-    @schema_method
+    @bioengine.method
     async def delete_visual_test(
         self,
         name: str = Field(..., description="Visual-test identifier."),
@@ -754,7 +750,7 @@ class SmartMicroscopyAssistant:
         logger.info("Deleted visual test %r (owner=%s)", name, caller_id)
         return {"name": name, "deleted": True}
 
-    @schema_method
+    @bioengine.method
     async def inspect(
         self,
         image_ref: str = Field(
