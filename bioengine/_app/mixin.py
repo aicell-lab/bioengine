@@ -102,13 +102,23 @@ def _register_with_proxy_actor(logger: logging.Logger) -> None:
 
 
 def _ensure_working_directory(logger: logging.Logger) -> None:
-    """Set CWD to the resolved ``$HOME`` and create it if missing.
+    """Anchor the replica process at the per-app directory.
 
-    The worker sets ``HOME`` to ``apps_workdir/<application_id>`` per replica
-    so each application has an isolated workspace.
+    Reads ``BIOENGINE_APP_DIR`` populated by the worker — the replica setup
+    hook (:mod:`bioengine._app.replica_init`) created the directory tree
+    (``source/``, ``home/``, ``tmp/``) before this runs and pointed ``HOME``
+    + ``TMPDIR`` at the right subdirs.
+
+    Falls back to ``$HOME`` only on legacy single-machine deployments where
+    no app dir was passed (the worker still injects ``HOME`` in that case,
+    pointing at the v0.10-style ``apps_workdir/<app_id>`` layout).
     """
-    workdir = Path.home().resolve()
-    os.environ["HOME"] = str(workdir)
+    app_dir_env = os.environ.get("BIOENGINE_APP_DIR")
+    if app_dir_env:
+        workdir = Path(app_dir_env).resolve()
+    else:
+        workdir = Path.home().resolve()
+        os.environ["HOME"] = str(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     try:
         os.chdir(workdir)

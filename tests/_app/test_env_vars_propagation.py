@@ -38,8 +38,8 @@ def _merge_via_with_pkg(
     *,
     replica_env_vars: Dict[str, str],
     user_replica_framework_pip: list[str] | None = None,
-    pkg_uri: str = "file:///tmp/pkg.zip",
-    bioengine_uri: str = "file:///tmp/bio.zip",
+    bioengine_uri: str = "gcs://_ray_pkg_aaaaaaaaaaaaaaaa.zip",
+    app_source_uri: str = "gcs://_ray_pkg_bbbbbbbbbbbbbbbb.zip",
 ) -> Dict[str, Any]:
     """Drive ``_with_pkg`` from bootstrap against a fake class and return
     the assembled ``runtime_env`` dict that bootstrap would hand to Ray
@@ -47,21 +47,19 @@ def _merge_via_with_pkg(
     from bioengine._app import bootstrap
 
     fake_cls = _FakeOptionsCls(cls_options)
-    # ``_with_pkg`` is a closure inside ``build_and_run_application``; we
-    # build a tiny shim that re-creates the same merge so we can exercise
-    # the logic in isolation. The shim has to mirror bootstrap's structure.
     py_modules = list(cls_options.get("runtime_env", {}).get("py_modules") or [])
-    for uri in (bioengine_uri, pkg_uri):
-        if uri not in py_modules:
-            py_modules.append(uri)
+    if bioengine_uri not in py_modules:
+        py_modules.append(bioengine_uri)
     rt = dict(cls_options.get("runtime_env") or {})
     rt["py_modules"] = py_modules
+    rt["worker_process_setup_hook"] = bootstrap._REPLICA_SETUP_HOOK
     rt["pip"] = bootstrap._merge_pip_lists(
         list(rt.get("pip") or []),
         user_replica_framework_pip or [],
     )
     rt["env_vars"] = {
         **replica_env_vars,
+        "BIOENGINE_APP_SOURCE_URI": app_source_uri,
         **(rt.get("env_vars") or {}),
     }
     return rt
@@ -137,4 +135,8 @@ def test_empty_framework_env_vars_keeps_author_env_vars_intact() -> None:
         {"runtime_env": {"env_vars": {"AUTHOR_FLAG": "1"}}},
         replica_env_vars={},
     )
-    assert rt["env_vars"] == {"AUTHOR_FLAG": "1"}
+    # BIOENGINE_APP_SOURCE_URI is always injected by _with_pkg so the
+    # replica's _ensure_source can pull source from Ray-GCS; the author's
+    # env vars sit alongside it.
+    assert rt["env_vars"]["AUTHOR_FLAG"] == "1"
+    assert rt["env_vars"]["BIOENGINE_APP_SOURCE_URI"].startswith("gcs://")

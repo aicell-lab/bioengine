@@ -1,46 +1,50 @@
 """Build BioEngine apps for Ray Serve from v0.6.0 artifacts.
 
-In the v0.6.0 model the worker never imports user code. It ships the user's
-Python package as ``runtime_env.py_modules`` and delegates introspection and
-binding to two Ray tasks defined in :mod:`bioengine._app.bootstrap`. The
-worker only handles:
+In the v0.11.4 model the worker never imports user code AND never touches
+the filesystem. The worker only handles:
 
-* manifest loading and validation
-* artifact materialisation (download the *package directory*, nothing else)
-* runtime_env composition (base pip + user pip extracted via AST)
-* pydantic-core preflight (so cross-process pickling failures surface early)
-* kwargs validation against the spec
-* authorisation-rule resolution
-* ``ProxyDeployment`` argument assembly
+* manifest loading + ``format_version`` / ``authorized_users`` gate
+* runtime_env composition (base pip + env_vars for the introspect task)
+* mint short-TTL Hypha download token
+* submit :func:`bioengine._app.bootstrap.introspect_app_in_ray_task` —
+  that Ray task downloads source, walks the type-hint composition graph,
+  packages source to Ray's internal GCS, returns ``{spec, app_source_uri}``
+* kwargs validation against the returned spec
+* resource accounting + ``_check_resources`` (the SLURM-aware gate)
+* authorisation-rule resolution + ``ProxyDeployment`` argument assembly
+* submit :func:`bioengine._app.bootstrap.build_and_run_application` — that
+  Ray task does ``cls.bind(...)`` + ``serve.run(blocking=False)``
 
-Everything else — class loading, lifecycle wiring, schema collection,
-``cls.bind(...)`` composition — runs inside the app's runtime_env.
+Every replica receives ``BIOENGINE_APP_SOURCE_URI`` in its ``env_vars``
+and uses Ray-internal GCS to materialise source — no Hypha auth on the
+replica side, so the short-TTL token never matters after step 4.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
+import inspect as _inspect
 import json
 import logging
 import os
-import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import httpx
 import ray
 import yaml
 from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils import ObjectProxy
 from ray import serve
+from ray._private.runtime_env.packaging import get_uri_for_directory
 
+import bioengine
 from bioengine._app.bootstrap import (
     SPEC_FORMAT_VERSION,
+    _ensure_jsonable,
     build_and_run_application,
-    introspect_app,
+    introspect_app_in_ray_task,
     validate_kwargs_against_spec,
 )
 from bioengine._app.errors import BioEngineUserError
@@ -51,6 +55,12 @@ from bioengine.utils import (
     update_requirements,
     validate_manifest,
 )
+
+#: TTL of the short-lived read-only token the worker mints per deploy and
+#: hands the replica setup hook for its create-zip-file download. Bounded
+#: well above the time it takes a typical Ray Serve replica to pull the
+#: ~MB-scale artifact and well under any plausible session-reuse window.
+_DOWNLOAD_TOKEN_TTL_SECONDS = 600
 
 
 class AppBuilder:
@@ -81,8 +91,6 @@ class AppBuilder:
         self.proxy_actor_name: Optional[str] = proxy_actor_name
         self.server_url: str = server_url
         self.data_server_url: Optional[str] = None
-
-        self._sweep_runtime_env_tmp_files()
 
     def complete_initialization(
         self,
@@ -136,111 +144,6 @@ class AppBuilder:
         validate_manifest(manifest)
         return manifest, resolved_version
 
-    # ───────────────────────── artifact files ────────────────────────────
-
-    async def _materialize_artifact(
-        self,
-        artifact_id: str,
-        version: Optional[str],
-        application_id: str,
-    ) -> Path:
-        """Download the whole artifact root into a clean per-app directory.
-
-        In the v0.6.0 layout the artifact root *is* the Python module dir:
-        ``manifest.yaml`` and any ``.py`` files live side by side at the
-        top level. The whole directory is later shipped as ``py_modules``;
-        non-Python content (``manifest.yaml``, ``README.md``,
-        ``frontend/``, notebooks) is excluded by
-        :meth:`_write_pkg_to_runtime_env_dir`.
-        """
-        target_dir = self.apps_workdir / application_id / "source"
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        # The app workdir doubles as HOME for the replica (see _build_env_vars).
-        # On shared-NFS workers with root_squash the worker pod's mkdir lands
-        # owned by nobody:nogroup (65534), so the replica's UID can't create
-        # subdirs under Path.home(). Sticky + world-writable lets any replica
-        # UID create state while preventing cross-UID deletes.
-        app_workdir = target_dir.parent
-        try:
-            app_workdir.chmod(0o1777)
-        except OSError as exc:
-            self.logger.warning(
-                f"Could not chmod app workdir {app_workdir}: {exc}. "
-                "Replicas may fail to create subdirectories under Path.home()."
-            )
-
-        local_root = self._local_artifact_root(artifact_id)
-        if local_root and local_root.is_dir():
-            self.logger.info(
-                f"Materialising '{artifact_id}' from local path "
-                f"{local_root} → {target_dir}"
-            )
-            shutil.copytree(
-                local_root,
-                target_dir,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("__pycache__", ".git"),
-            )
-            return target_dir
-
-        self.logger.info(
-            f"Downloading artifact root '{artifact_id}' (version={version}) "
-            f"→ {target_dir}"
-        )
-        files = await self.artifact_manager.list_files(
-            artifact_id=artifact_id, version=version
-        )
-        await self._download_files_recursive(
-            artifact_id, version, target_dir, "", files
-        )
-        return target_dir
-
-    def _local_artifact_root(self, artifact_id: str) -> Optional[Path]:
-        local_root_env = os.environ.get("BIOENGINE_LOCAL_ARTIFACT_PATH")
-        if not local_root_env:
-            return None
-        artifact_folder = artifact_id.split("/")[1]
-        candidate = Path(local_root_env) / artifact_folder
-        return candidate if candidate.is_dir() else None
-
-    async def _download_files_recursive(
-        self,
-        artifact_id: str,
-        version: Optional[str],
-        target_dir: Path,
-        prefix: str,
-        files: List[Dict[str, Any]],
-    ) -> None:
-        """Walk ``files`` from ``artifact_manager.list_files`` and download to disk."""
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            for entry in files:
-                name = entry.get("name")
-                if name is None:
-                    continue
-                rel_path = f"{prefix}/{name}" if prefix else name
-                if entry.get("type") == "directory":
-                    sub = await self.artifact_manager.list_files(
-                        artifact_id=artifact_id,
-                        version=version,
-                        dir_path=rel_path,
-                    )
-                    await self._download_files_recursive(
-                        artifact_id, version, target_dir, rel_path, sub
-                    )
-                    continue
-                url = await self.artifact_manager.get_file(
-                    artifact_id=artifact_id,
-                    version=version,
-                    file_path=rel_path,
-                )
-                response = await client.get(url)
-                response.raise_for_status()
-                out_path = target_dir / rel_path
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_bytes(response.content)
-
     # ─────────────────────── runtime_env compose ─────────────────────────
 
     def _build_env_vars(
@@ -251,8 +154,19 @@ class AppBuilder:
         non_secret_env_vars: Dict[str, str],
         secret_env_vars: Dict[str, str],
         hypha_token: Optional[str],
+        download_token: Optional[str],
     ) -> Dict[str, str]:
-        """Compose the env_vars dict the replica's runtime_env will receive."""
+        """Compose the env_vars dict the replica's runtime_env will receive.
+
+        The replica setup hook (``bioengine._app.replica_init``) reads
+        ``BIOENGINE_APP_DIR`` + ``BIOENGINE_ARTIFACT_DOWNLOAD_URL`` +
+        ``BIOENGINE_ARTIFACT_VERSION`` + ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN``
+        from this dict to materialise the user source. HOME and TMPDIR are
+        deliberately *not* set here — the setup hook computes them under
+        ``BIOENGINE_APP_DIR`` so they survive app version bumps and stay
+        per-app-per-node (shared across replicas of the same app on the
+        same node by design; see :doc:`v0.11.4 release notes`).
+        """
         env_vars: Dict[str, str] = {}
         env_vars.update(non_secret_env_vars)
         for key, value in secret_env_vars.items():
@@ -261,19 +175,29 @@ class AppBuilder:
         if hypha_token is not None:
             env_vars["_BIOENGINE_SECRET_HYPHA_TOKEN"] = hypha_token
 
-        app_workdir = self.apps_workdir / application_id
-        env_vars["HOME"] = str(app_workdir)
-        tmp_dir = str(app_workdir / "tmp")
-        env_vars["TMPDIR"] = tmp_dir
-        env_vars["TEMP"] = tmp_dir
-        env_vars["TMP"] = tmp_dir
+        worker_workspace = (
+            self.server.config.workspace if self.server is not None else "local"
+        )
+        # Worker-workspace prefix so two workers serving the same Ray
+        # cluster but different Hypha workspaces don't share state on disk.
+        app_dir_name = f"{worker_workspace}-{application_id}"
+        app_dir = self.apps_workdir / app_dir_name
+        env_vars["BIOENGINE_APP_DIR"] = str(app_dir)
 
         if self.server is not None:
             env_vars["HYPHA_SERVER_URL"] = self.server_url
-            env_vars["HYPHA_WORKSPACE"] = self.server.config.workspace
+            env_vars["HYPHA_WORKSPACE"] = worker_workspace
         env_vars["HYPHA_ARTIFACT_ID"] = artifact_id
         if version is not None:
             env_vars["HYPHA_ARTIFACT_VERSION"] = version
+            env_vars["BIOENGINE_ARTIFACT_VERSION"] = version
+            artifact_workspace, alias = artifact_id.split("/", 1)
+            env_vars["BIOENGINE_ARTIFACT_DOWNLOAD_URL"] = (
+                f"{self.server_url.rstrip('/')}/{artifact_workspace}"
+                f"/artifacts/{alias}/create-zip-file?version={version}"
+            )
+            if download_token:
+                env_vars["BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN"] = download_token
 
         if self.worker_service_id:
             env_vars["BIOENGINE_WORKER_SERVICE_ID"] = self.worker_service_id
@@ -288,266 +212,101 @@ class AppBuilder:
                 env_vars[key] = str(value)
         return env_vars
 
-    def _build_introspect_runtime_env(
+    @staticmethod
+    def _bioengine_gcs_uri() -> str:
+        """Content-hashed ``gcs://_ray_pkg_<hash>.zip`` URI for the worker's
+        ``bioengine`` package.
+
+        :func:`get_uri_for_directory` is a pure-Python hash — no upload
+        happens here. The bytes were already pushed to the Ray cluster's
+        internal GCS by the worker's ``ray.init`` job-level py_modules
+        (:meth:`bioengine.cluster.ray_cluster.RayCluster.connect`); we
+        just re-derive the same URI so Ray Serve replica runtime_envs
+        can point at the cached package without going back through the
+        ray-client gRPC bridge that wedges on per-deploy uploads.
+
+        ``include_gitignore`` switched from optional to required between
+        Ray patch versions; the inspect gate keeps us cross-compatible.
+        """
+        import inspect
+
+        bioengine_dir = str(Path(bioengine.__file__).parent.resolve())
+        kwargs: Dict[str, Any] = {}
+        if "include_gitignore" in inspect.signature(get_uri_for_directory).parameters:
+            kwargs["include_gitignore"] = False
+        return get_uri_for_directory(bioengine_dir, **kwargs)
+
+    def _build_submit_runtime_env(
         self,
-        pkg_uri: str,
-        bioengine_uri: str,
         env_vars: Dict[str, str],
     ) -> Dict[str, Any]:
-        """Compose the runtime_env for the introspection + build Ray tasks.
+        """Compose the runtime_env for the ``build_and_run_application`` Ray task.
 
-        The pip list is the BioEngine baseline only — every module
-        containing ``@bioengine.app`` (and anything they transitively
-        import at top level) is required to be importable with just
-        ``bioengine[worker]`` and the standard library. Heavy
-        application dependencies belong in the decorator's ``pip=`` arg
-        (where Ray Serve installs them once per replica) and are
-        imported lazily inside method bodies or from sibling modules
-        that aren't imported during introspection.
+        No ``py_modules`` is set here: the task imports ``bioengine`` via
+        Ray's per-field inheritance of the worker's job-level py_modules
+        (set by :meth:`bioengine.cluster.ray_cluster.RayCluster.connect`).
+        It materialises the user app source itself via
+        :func:`bioengine._app.replica_init._ensure_source` using the
+        ``BIOENGINE_*`` env_vars below — same flow as Ray Serve replicas.
 
-        ``py_modules`` ships two URIs: the worker's own ``bioengine``
-        source (the actor's venv only carries bioengine's *deps* — see
-        :meth:`_write_bioengine_source_to_runtime_env_dir`) and the
-        user app package. Both URIs are ``file://...zip`` returned by
-        :meth:`_write_pkg_to_runtime_env_dir`. The caller is responsible
-        for running the zip walks off the asyncio loop.
+        Task-level ``py_modules`` would need a ``gcs://`` URI Ray could
+        accept; producing one requires ``upload_package_if_needed``, which
+        in external-cluster mode wedges the worker's asyncio loop talking
+        to the ray-client gRPC bridge. Hypha downloads sidestep that.
+
+        ``pip`` is the BioEngine baseline only — every module containing
+        ``@bioengine.app`` (and anything they transitively import at top
+        level) is required to be importable with just ``bioengine[worker]``
+        and the standard library. Heavy application dependencies belong in
+        the decorator's ``pip=`` arg (where Ray Serve installs them once
+        per replica) and are imported lazily inside method bodies or from
+        sibling modules that aren't imported during introspection.
         """
         base_pip = update_requirements(
             [],
             select=["httpx", "hypha-rpc", "pydantic"],
             extras=["worker"],
         )
-        introspect_env = {
+        task_env = {
             k: v for k, v in env_vars.items() if not k.startswith("_BIOENGINE_SECRET_")
         }
-        introspect_env.pop("BIOENGINE_DATA_SERVER_URL", None)
-
         return {
-            "py_modules": [bioengine_uri, pkg_uri],
             "pip": base_pip,
-            "env_vars": introspect_env,
+            "env_vars": task_env,
         }
 
-    #: Files inside the artifact root that are *not* Python source and
-    #: should not ship to Ray Serve replicas. ``manifest.yaml`` is already
-    #: stored as the artifact's native manifest field; ``frontend/`` is
-    #: served by Hypha statically; the others are author-facing docs.
-    _PY_MODULES_EXCLUDES = [
-        "manifest.yaml",
-        "manifest.yml",
-        "README*",
-        "*.md",
-        "*.ipynb",
-        "*.png",
-        "*.jpg",
-        "*.jpeg",
-        "*.gif",
-        "*.svg",
-        "*.pdf",
-        "*.pyc",
-        "*.pyo",
-        "*.so",
-        "frontend/**",
-        "__pycache__/**",
-        ".git/**",
-        ".github/**",
-    ]
-
-    #: Subdirectory of ``apps_workdir`` where content-addressed
-    #: ``runtime_env.py_modules`` zips live. On a worker whose
-    #: ``apps_workdir`` is on a shared filesystem with the Ray cluster
-    #: (e.g. NFS) this is exactly the path Ray sees through the
-    #: ``file://`` URI we hand it.
-    _RUNTIME_ENV_PKG_SUBDIR = "_runtime_env_packages"
-
-    @staticmethod
-    def _is_excluded(rel_path: str, excludes: List[str]) -> bool:
-        """Match ``rel_path`` against the AppBuilder exclude patterns.
-
-        Two pattern shapes are supported, mirroring the subset of
-        gitignore semantics ``_PY_MODULES_EXCLUDES`` uses:
-
-        * ``foo`` / ``foo*`` / ``*.ext`` — fnmatch against the basename.
-        * ``dir/**`` — match if ``dir`` appears as any directory
-          component along the path.
-        """
-        import fnmatch
-
-        components = rel_path.split("/")
-        basename = components[-1]
-        for pat in excludes:
-            if pat.endswith("/**"):
-                if pat[:-3] in components[:-1]:
-                    return True
-            elif fnmatch.fnmatch(basename, pat):
-                return True
-        return False
-
-    def _sweep_runtime_env_tmp_files(self) -> None:
-        """Unlink ``*.tmp.<pid>`` files left in ``_runtime_env_packages/``
-        by a prior crashed write (worker SIGKILL'd mid-zip)."""
-        pkg_dir = self.apps_workdir / self._RUNTIME_ENV_PKG_SUBDIR
-        if not pkg_dir.is_dir():
-            return
-        count = 0
-        orphans = list(pkg_dir.glob("bioengine_pkg_*.zip.tmp.*")) + list(
-            pkg_dir.glob("bioengine_runtime_*.zip.tmp.*")
-        )
-        for orphan in orphans:
-            try:
-                orphan.unlink()
-                count += 1
-            except OSError as exc:
-                self.logger.warning(
-                    f"Could not remove orphan tmp file {orphan}: {exc}"
-                )
-        if count:
-            self.logger.warning(
-                f"Swept {count} orphan tmp runtime_env package(s) "
-                f"from {pkg_dir} — signal of a prior unclean shutdown"
-            )
-
-    def _write_pkg_to_runtime_env_dir(
+    async def _introspect_via_ray_task(
         self,
-        pkg_root_dir: Path,
-        *,
-        filename_prefix: str = "bioengine_pkg",
-        arc_prefix: str = "",
-    ) -> str:
-        """Build a content-hashed zip of ``pkg_root_dir`` and return a
-        ``file://`` URI Ray accepts in task-level ``py_modules``.
+        entry_id: str,
+        env_vars: Dict[str, str],
+        submit_runtime_env: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Submit :func:`introspect_app_in_ray_task` as a Ray task.
 
-        Why not ``gcs://`` via Ray's ``upload_package_if_needed``? In
-        external-cluster mode the upload routes through the ray-client
-        gRPC bridge to a server-side runtime-env handler that has been
-        observed to never reply, wedging the worker's asyncio loop. A
-        local zip on a path the Ray cluster can read directly (e.g. the
-        shared NFS mount that backs ``apps_workdir`` on the deNBI
-        staging cluster) takes the bridge out of the upload path.
+        The task downloads the user package (Hypha, short-TTL token in
+        ``env_vars``), walks the type-hint composition graph, packages
+        the source to Ray's internal GCS, and returns the
+        ``{spec, app_source_uri}`` payload. We never touch the worker's
+        filesystem.
 
-        Same input bytes → same SHA-256 → same destination path, so
-        repeat calls return without re-writing. Atomic publish via
-        ``tmp.<pid>`` + ``os.replace`` keeps readers from ever seeing a
-        partial file. Two writers racing the same content_hash is safe
-        because the bytes are by construction identical.
-
-        The directory ``<apps_workdir>/_runtime_env_packages/`` is
-        content-addressed across every app and grows monotonically; a
-        GC pass keyed on currently-deployed apps will be a follow-up.
+        Strips the ``_BIOENGINE_SECRET_*`` keys from ``env_vars`` before
+        passing into the task to keep secrets out of Ray's logs; the
+        introspect task only needs the download URL/token + APP_DIR +
+        VERSION, none of which is secret-prefixed.
         """
-        import hashlib
-        import os as _os
-        import zipfile
-
-        pkg_root = pkg_root_dir.resolve()
-        included: List[tuple[str, Path]] = []
-        for abs_path in sorted(pkg_root.rglob("*")):
-            if not abs_path.is_file():
-                continue
-            rel = abs_path.relative_to(pkg_root).as_posix()
-            if self._is_excluded(rel, self._PY_MODULES_EXCLUDES):
-                continue
-            included.append((rel, abs_path))
-
-        if not included:
-            raise RuntimeError(
-                f"No Python source files to ship from {pkg_root_dir} "
-                f"after applying excludes."
-            )
-
-        h = hashlib.sha256()
-        h.update(arc_prefix.encode("utf-8"))
-        h.update(b"\x00")
-        total_src_bytes = 0
-        for rel, abs_path in included:
-            h.update(rel.encode("utf-8"))
-            h.update(b"\x00")
-            size = abs_path.stat().st_size
-            total_src_bytes += size
-            h.update(size.to_bytes(8, "big"))
-            h.update(b"\x00")
-            with open(abs_path, "rb") as f:
-                while True:
-                    chunk = f.read(64 * 1024)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-            h.update(b"\x00")
-        digest = h.hexdigest()[:16]
-
-        pkg_dir = self.apps_workdir / self._RUNTIME_ENV_PKG_SUBDIR
-        pkg_dir.mkdir(parents=True, exist_ok=True)
-        out_path = pkg_dir / f"{filename_prefix}_{digest}.zip"
-        if out_path.is_file():
-            return out_path.as_uri()
-
-        tmp_path = pkg_dir / f"{out_path.name}.tmp.{_os.getpid()}"
+        task_env_vars = {
+            k: v for k, v in env_vars.items() if not k.startswith("_BIOENGINE_SECRET_")
+        }
         try:
-            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for rel, abs_path in included:
-                    arc = f"{arc_prefix}/{rel}" if arc_prefix else rel
-                    zf.write(abs_path, arcname=arc)
-            _os.replace(tmp_path, out_path)
-        except BaseException:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-
-        self.logger.info(
-            f"Wrote runtime_env package {out_path.name} "
-            f"({len(included)} files, {total_src_bytes} src bytes, "
-            f"{out_path.stat().st_size} zipped bytes)"
-        )
-        return out_path.as_uri()
-
-    def _build_py_modules_uris(self, pkg_root_dir: Path) -> tuple[str, str]:
-        """Write both runtime_env zips and return ``(pkg_uri, bioengine_uri)``.
-
-        Wrapped in a single ``asyncio.to_thread`` call by ``build()`` so
-        both blocking zip walks happen off the asyncio loop together.
-        """
-        pkg_uri = self._write_pkg_to_runtime_env_dir(pkg_root_dir)
-        bioengine_uri = self._write_bioengine_source_to_runtime_env_dir()
-        return pkg_uri, bioengine_uri
-
-    def _write_bioengine_source_to_runtime_env_dir(self) -> str:
-        """Bundle the worker's installed ``bioengine`` source as a
-        ``file://`` zip and return its URI for ``runtime_env.py_modules``.
-
-        Why this exists: in external-cluster mode the Ray actor that
-        runs ``introspect_app`` (and every user deployment replica)
-        spins up in a fresh process. ``runtime_env.pip`` installs
-        bioengine's *dependencies* into a venv, but bioengine itself is
-        not on PyPI, so the venv does not contain it. Without bioengine
-        on the actor's ``sys.path``, ``pickle.loads`` of any function
-        defined under ``bioengine._app`` fails immediately with
-        ``ModuleNotFoundError: No module named 'bioengine'``.
-
-        Why the ``_bioengine_wrap/`` prefix: Ray 2.55.1 calls
-        ``unzip_package(remove_top_level_directory=True)`` when the URI
-        protocol is ``file://`` (and every other "remote" scheme); a zip
-        whose entries all live under a single top-level directory has
-        that directory stripped on extraction. If we zipped entries as
-        ``bioengine/__init__.py`` directly, Ray would strip ``bioengine/``
-        and place ``__init__.py`` at the extract dir's root — and
-        ``import bioengine`` would fail. By zipping under
-        ``_bioengine_wrap/bioengine/`` we give Ray a throwaway top-level
-        directory to strip, leaving ``bioengine/__init__.py`` at the
-        extract dir's root, which is what gets added to ``sys.path``.
-        ``gcs://`` URIs do the opposite (no strip) but we cannot use
-        ``gcs://`` here — see PR #106 for the Ray-client wedge that
-        forced the move to ``file://``.
-        """
-        import bioengine
-
-        bioengine_dir = Path(bioengine.__file__).parent
-        return self._write_pkg_to_runtime_env_dir(
-            bioengine_dir,
-            filename_prefix="bioengine_runtime",
-            arc_prefix="_bioengine_wrap/bioengine",
-        )
+            return await asyncio.to_thread(
+                ray.get,
+                ray.remote(num_cpus=0, runtime_env=submit_runtime_env)(
+                    introspect_app_in_ray_task
+                ).remote(entry_id, task_env_vars),
+            )
+        except ray.exceptions.RayTaskError as exc:
+            cause = exc.cause if isinstance(exc.cause, Exception) else exc
+            raise BioEngineUserError(str(cause)) from exc
 
     # ───────────────────────── kwargs translation ────────────────────────
 
@@ -693,7 +452,7 @@ class AppBuilder:
         ] = None,
         deploying_user: Optional[tuple] = None,
         admin_users: Optional[List[str]] = None,
-    ) -> serve.Application:
+    ) -> "BuiltApp":
         """Construct the Ray Serve application for a v0.6.0 BioEngine app."""
         self.logger.info(
             f"Building application '{application_id}' from artifact "
@@ -712,16 +471,29 @@ class AppBuilder:
         application_kwargs = dict(application_kwargs or {})
         application_env_vars = dict(application_env_vars or {})
 
-        # 1. Materialise the artifact root.
-        pkg_root_dir = await self._materialize_artifact(
-            artifact_id, version, application_id
-        )
+        # 1. Mint a short-TTL read-only token the introspect Ray task will
+        # attach to its single Hypha create-zip-file download. The token
+        # never crosses to Ray Serve replicas — they pull source from Ray's
+        # internal GCS via ``BIOENGINE_APP_SOURCE_URI`` (uploaded inside the
+        # introspect task), so its TTL only matters for the next ~10 s.
+        download_token: Optional[str] = None
+        artifact_workspace = artifact_id.split("/", 1)[0]
+        try:
+            download_token = await self.server.generate_token(
+                {
+                    "workspace": artifact_workspace,
+                    "permission": "read",
+                    "expires_in": _DOWNLOAD_TOKEN_TTL_SECONDS,
+                }
+            )
+        except Exception as exc:
+            self.logger.warning(
+                f"generate_token for '{artifact_workspace}' failed ({exc}); "
+                "proceeding without a download token (works for public "
+                "artifacts)."
+            )
 
-        # 2. Compose env_vars and the introspection runtime_env.
-        # The CLI-supplied env_vars are flattened across deployments today;
-        # in the v0.6 model the framework only sees a single env_vars dict
-        # (per-deployment runtime_env extension is via the @app decorator's
-        # env_vars kwarg). We collapse them here.
+        # 2. Compose env_vars + the introspect-task runtime_env.
         flat_env_vars: Dict[str, str] = {}
         for env_dict in application_env_vars.values():
             for k, v in env_dict.items():
@@ -734,42 +506,22 @@ class AppBuilder:
         }
         env_vars = self._build_env_vars(
             application_id, artifact_id, version,
-            non_secret_env_vars, secret_env_vars, hypha_token,
+            non_secret_env_vars, secret_env_vars, hypha_token, download_token,
         )
-        # Off-loop: the zip walk hashes and compresses every file in
-        # the artifact root and could block the asyncio loop for large
-        # apps. 120s keeps us under the 150s liveness window so a slow
-        # disk fails cleanly instead of triggering a pod SIGKILL. We
-        # also bundle the worker's own bioengine source here — the
-        # actor's runtime_env.pip installs bioengine's *deps* into a
-        # venv but bioengine itself is not on PyPI, so without this the
-        # Ray actor crashes at ``pickle.loads(introspect_app)`` with
-        # ``ModuleNotFoundError: No module named 'bioengine'``.
-        try:
-            pkg_uri, bioengine_uri = await asyncio.wait_for(
-                asyncio.to_thread(self._build_py_modules_uris, pkg_root_dir),
-                timeout=120,
-            )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                "Timed out (120s) writing runtime_env package zips into "
-                "the runtime_env packages directory."
-            ) from exc
-        runtime_env = self._build_introspect_runtime_env(
-            pkg_uri, bioengine_uri, env_vars
-        )
+        runtime_env = self._build_submit_runtime_env(env_vars)
 
-        # 3. Introspect the user package via a Ray task in the app's env.
-        try:
-            spec = await asyncio.to_thread(
-                ray.get,
-                ray.remote(num_cpus=0, runtime_env=runtime_env)(introspect_app).remote(
-                    entry_id
-                ),
-            )
-        except ray.exceptions.RayTaskError as exc:
-            cause = exc.cause if isinstance(exc.cause, Exception) else exc
-            raise BioEngineUserError(str(cause)) from exc
+        # 3. Introspect the user package via a Ray task — the task
+        # downloads from Hypha, walks @bioengine.app composition, and
+        # packages the source to Ray-internal GCS. Returns spec + URI.
+        introspect_result = await self._introspect_via_ray_task(
+            entry_id, env_vars, runtime_env
+        )
+        spec = introspect_result["spec"]
+        app_source_uri = introspect_result["app_source_uri"]
+        self.logger.info(
+            f"Introspect task returned for '{application_id}' — "
+            f"app_source_uri={app_source_uri}"
+        )
 
         # Sanity check: format_version round-trip.
         if spec.get("format_version") != SPEC_FORMAT_VERSION:
@@ -919,8 +671,8 @@ class AppBuilder:
             translated_kwargs=translated_kwargs,
             proxy_args=proxy_args,
             runtime_env=runtime_env,
-            pkg_uri=pkg_uri,
-            bioengine_uri=bioengine_uri,
+            bioengine_uri=self._bioengine_gcs_uri(),
+            app_source_uri=app_source_uri,
             proxy_pip=proxy_pip,
             user_replica_framework_pip=user_replica_framework_pip,
             replica_env_vars=replica_env_vars,
@@ -930,28 +682,38 @@ class AppBuilder:
     async def submit(self, built_app: "BuiltApp", application_id: str) -> None:
         """Fire the ``build_and_run_application`` Ray task.
 
-        ``build()`` returns metadata only (after introspection); the
-        manager runs ``_check_resources`` against that metadata and then
-        calls this to actually claim the cluster resources. Splitting
+        ``build()`` returns metadata only (after the introspect Ray task);
+        the manager runs ``_check_resources`` against that metadata and
+        then calls this to actually claim the cluster resources. Splitting
         the steps means the resource check happens *before* ``serve.run``,
-        not after.
+        not after — and preserves the SLURM-scaling fallback.
+
+        No worker-side cleanup needed: the worker never wrote anything to
+        its own filesystem. Source bytes live in Ray's GCS package store
+        (uploaded by the introspect task); replicas fetch from there.
         """
+        # The Ray Client server unpickles ``.remote(...)`` args in a
+        # per-client runtime_env that ships bioengine via ``py_modules``
+        # but no ``pip`` — so any class ref in the pickle stream whose
+        # module top-level imports ``hypha_rpc`` crashes the unpickle.
+        # Sanitising dict args to primitives here keeps the
+        # worker↔cluster RPC contract pure-data and cluster-env-agnostic.
         try:
             await asyncio.to_thread(
                 ray.get,
                 ray.remote(num_cpus=0, runtime_env=built_app.runtime_env)(
                     build_and_run_application
                 ).remote(
-                    built_app.spec,
-                    built_app.translated_kwargs,
-                    built_app.proxy_args,
+                    _ensure_jsonable(built_app.spec),
+                    _ensure_jsonable(built_app.translated_kwargs),
+                    _ensure_jsonable(built_app.proxy_args),
                     application_id,
                     f"/{application_id}",
-                    built_app.pkg_uri,
                     built_app.bioengine_uri,
+                    built_app.app_source_uri,
                     built_app.proxy_pip,
                     built_app.user_replica_framework_pip,
-                    built_app.replica_env_vars,
+                    _ensure_jsonable(built_app.replica_env_vars),
                     built_app.proxy_memory_in_gb,
                 ),
             )
@@ -973,6 +735,11 @@ class BuiltApp:
     worker. The Built object stashes everything the submit task needs so
     the manager can do ``build → check_resources → submit`` and keep the
     resource check on the right side of the actual claim.
+
+    ``app_source_uri`` is the ``gcs://_ray_pkg_<hash>.zip`` URI returned
+    by the introspect Ray task — the build task plus every replica use
+    it to materialise source via Ray's internal package store, no Hypha
+    auth needed.
     """
 
     __slots__ = (
@@ -981,8 +748,8 @@ class BuiltApp:
         "translated_kwargs",
         "proxy_args",
         "runtime_env",
-        "pkg_uri",
         "bioengine_uri",
+        "app_source_uri",
         "proxy_pip",
         "user_replica_framework_pip",
         "replica_env_vars",
@@ -996,8 +763,8 @@ class BuiltApp:
         translated_kwargs: Dict[str, Dict[str, Any]],
         proxy_args: Dict[str, Any],
         runtime_env: Dict[str, Any],
-        pkg_uri: str,
         bioengine_uri: str,
+        app_source_uri: str,
         proxy_pip: List[str],
         user_replica_framework_pip: List[str],
         replica_env_vars: Dict[str, str],
@@ -1008,8 +775,8 @@ class BuiltApp:
         self.translated_kwargs = translated_kwargs
         self.proxy_args = proxy_args
         self.runtime_env = runtime_env
-        self.pkg_uri = pkg_uri
         self.bioengine_uri = bioengine_uri
+        self.app_source_uri = app_source_uri
         self.proxy_pip = proxy_pip
         self.user_replica_framework_pip = user_replica_framework_pip
         self.replica_env_vars = replica_env_vars

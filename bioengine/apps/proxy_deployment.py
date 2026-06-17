@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -7,13 +9,34 @@ from typing import Any, Callable, Dict, List, Optional
 
 import ray
 from httpx import AsyncClient, HTTPStatusError, RequestError
-from hypha_rpc import connect_to_server, register_rtc_service
-from hypha_rpc.rpc import RemoteService
-from hypha_rpc.utils.schema import schema_function, schema_method
 from pydantic import Field
 from ray.exceptions import RayTaskError
 from ray.serve import deployment, get_replica_context
 from ray.serve.handle import DeploymentHandle
+
+# The Ray Serve controller imports this module to register the
+# deployment, but runs in the base Python env Ray was started with —
+# which may not have hypha_rpc. Replicas re-import in their own venv
+# (runtime_env.pip) where hypha_rpc is available; the no-op fallbacks
+# below let the module load on the controller without exercising any
+# of the deferred symbols.
+try:
+    from hypha_rpc import connect_to_server, register_rtc_service
+    from hypha_rpc.rpc import RemoteService
+    from hypha_rpc.utils.schema import schema_function, schema_method
+except ImportError:
+    connect_to_server = None
+    register_rtc_service = None
+    RemoteService = None  # only referenced in PEP 563 string annotations
+
+    def schema_function(*args, **kwargs):
+        func = kwargs.get("func") or (args[0] if args and callable(args[0]) else None)
+        if func is not None:
+            return func
+        return lambda fn: fn
+
+    def schema_method(fn):
+        return fn
 
 logger = logging.getLogger("ray.serve")
 

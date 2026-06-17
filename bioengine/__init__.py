@@ -53,6 +53,96 @@ def _get_version() -> str | None:
 __version__ = _get_version()
 
 
+def _install_replica_bootstrap_finder() -> None:
+    """Install a ``sys.meta_path`` finder that materialises user source
+    on the first import Ray Serve issues against an unfindable module.
+
+    Why a meta_path finder instead of a side effect on ``import bioengine``?
+
+    Ray Serve replicas boot like this:
+
+      ServeReplica.__init__
+        → cloudpickle.loads(serialized_deployment_def)
+            → importlib.import_module(entry_module_name)
+
+    For an app whose entry is ``main:CellposeFinetune`` cloudpickle's
+    very first move is ``import main`` — and at that point ``main`` is
+    not on ``sys.path`` because the bootstrap hasn't run. Hooking
+    ``import bioengine`` only worked for model-runner because its
+    ``entry.py`` happens to ``import bioengine`` at line 31 (before any
+    user-submodule import); cellpose's monolithic ``main.py`` doesn't
+    hit ``import bioengine`` until after its own ``from training import
+    …``, so it dies first.
+
+    The finder is appended to ``sys.meta_path`` so it only fires when no
+    other finder resolved the name — i.e. exactly the "module is not on
+    sys.path yet" case. On the first such miss in a replica, it:
+
+      1. Sets a sentinel so the bootstrap can't recurse if any of its
+         own imports also miss.
+      2. Runs ``setup_replica_environment()`` which calls
+         ``_ensure_source`` (Ray-GCS download via
+         ``BIOENGINE_APP_SOURCE_URI``) and ``sys.path.insert(0, source/)``.
+      3. Delegates back to ``importlib.machinery.PathFinder`` to resolve
+         the name against the now-populated ``sys.path`` — so the import
+         that triggered us succeeds without the caller knowing.
+
+    Guards: only active when ``BIOENGINE_APP_DIR`` is set (worker
+    processes never have it); idempotent via a threading lock on the
+    sentinel; failures fall through to the standard ModuleNotFoundError
+    so users see the same error they would without the finder.
+    """
+    import os as _os
+    import sys as _sys
+    import threading as _threading
+
+    if not _os.environ.get("BIOENGINE_APP_DIR"):
+        return
+
+    class _BioEngineImportBootstrap:
+        _lock = _threading.Lock()
+        _fired = False
+
+        def find_spec(self, fullname, path, target=None):
+            if self._fired:
+                return None
+            # bioengine and stdlib are never resolved here — by the time
+            # this finder is consulted, earlier finders have already
+            # answered for any module they own. Skip our own namespace
+            # explicitly so we can't recurse on ``from bioengine._app
+            # .replica_init import …`` below.
+            if fullname.startswith("bioengine") or fullname.startswith("_"):
+                return None
+            with self._lock:
+                if self._fired:
+                    return None
+                self._fired = True
+                try:
+                    from bioengine._app.replica_init import (
+                        setup_replica_environment,
+                    )
+
+                    setup_replica_environment()
+                except Exception:
+                    import traceback
+
+                    print(
+                        "BioEngine: replica source bootstrap failed — user "
+                        "source will not be on sys.path. Traceback:",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                    return None
+            from importlib.machinery import PathFinder
+
+            return PathFinder.find_spec(fullname, path, target)
+
+    _sys.meta_path.append(_BioEngineImportBootstrap())
+
+
+_install_replica_bootstrap_finder()
+
+
 _LAZY_FROM_APP = {
     "app",
     "method",
