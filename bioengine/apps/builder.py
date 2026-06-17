@@ -564,8 +564,15 @@ class AppBuilder:
             json.dumps(spec, sort_keys=True, default=str).encode()
         ).hexdigest()
 
+        # worker_workspace stamps the app with the Hypha workspace of the
+        # worker that deployed it. On recovery after a worker restart,
+        # AppsManager.recover_deployed_applications skips apps whose
+        # worker_workspace differs from this worker's — so multiple
+        # workers from different workspaces sharing a Ray cluster don't
+        # adopt each other's apps.
         app_data = {
             "format_version": SPEC_FORMAT_VERSION,
+            "worker_workspace": self.server.config.workspace,
             "entry": entry_id,
             "spec_hash": spec_hash,
             "display_name": manifest["name"],
