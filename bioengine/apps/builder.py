@@ -42,6 +42,7 @@ from ray._private.runtime_env.packaging import get_uri_for_directory
 import bioengine
 from bioengine._app.bootstrap import (
     SPEC_FORMAT_VERSION,
+    _ensure_jsonable,
     build_and_run_application,
     introspect_app_in_ray_task,
     validate_kwargs_against_spec,
@@ -691,22 +692,28 @@ class AppBuilder:
         its own filesystem. Source bytes live in Ray's GCS package store
         (uploaded by the introspect task); replicas fetch from there.
         """
+        # The Ray Client server unpickles ``.remote(...)`` args in a
+        # per-client runtime_env that ships bioengine via ``py_modules``
+        # but no ``pip`` — so any class ref in the pickle stream whose
+        # module top-level imports ``hypha_rpc`` crashes the unpickle.
+        # Sanitising dict args to primitives here keeps the
+        # worker↔cluster RPC contract pure-data and cluster-env-agnostic.
         try:
             await asyncio.to_thread(
                 ray.get,
                 ray.remote(num_cpus=0, runtime_env=built_app.runtime_env)(
                     build_and_run_application
                 ).remote(
-                    built_app.spec,
-                    built_app.translated_kwargs,
-                    built_app.proxy_args,
+                    _ensure_jsonable(built_app.spec),
+                    _ensure_jsonable(built_app.translated_kwargs),
+                    _ensure_jsonable(built_app.proxy_args),
                     application_id,
                     f"/{application_id}",
                     built_app.bioengine_uri,
                     built_app.app_source_uri,
                     built_app.proxy_pip,
                     built_app.user_replica_framework_pip,
-                    built_app.replica_env_vars,
+                    _ensure_jsonable(built_app.replica_env_vars),
                     built_app.proxy_memory_in_gb,
                 ),
             )
