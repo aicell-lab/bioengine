@@ -25,6 +25,49 @@ from bioengine.utils import (
 )
 
 
+def _belongs_to_worker_workspace(
+    application_id: str,
+    app_data: Dict[str, Any],
+    current_workspace: str,
+    logger: logging.Logger,
+) -> bool:
+    """Whether a Ray Serve app belongs to this worker's Hypha workspace.
+
+    Called during ``AppsManager.recover_deployed_applications`` to filter
+    cluster-wide ``serve.status()`` results down to apps the current worker
+    is allowed to manage. Multiple bioengine workers from different Hypha
+    workspaces can share a Ray cluster; each one should only adopt apps it
+    deployed itself.
+
+    Logs (and returns False) for two skip cases:
+
+    * The ``app_data`` blob has no ``worker_workspace`` marker — the app
+      was deployed by a worker predating this filter. Logged as a warning
+      because the user almost certainly wants to redeploy it.
+    * The marker is present and points at a different workspace — the app
+      belongs to a sibling worker. Logged at DEBUG since this is the
+      expected steady-state when multiple workers share a Ray cluster.
+    """
+    recovered_workspace = app_data.get("worker_workspace")
+    if recovered_workspace is None:
+        logger.warning(
+            f"Refusing to recover application '{application_id}': app_data "
+            "has no worker_workspace marker. Either the app was deployed by "
+            "a worker predating the cross-workspace filter, or it belongs to "
+            "a sibling worker. Redeploy it explicitly to stamp it with the "
+            "current worker's workspace."
+        )
+        return False
+    if recovered_workspace != current_workspace:
+        logger.debug(
+            f"Skipping application '{application_id}' during recovery: "
+            f"belongs to workspace {recovered_workspace!r}, this worker "
+            f"serves {current_workspace!r}."
+        )
+        return False
+    return True
+
+
 class AppsManager:
     """
     Manages Ray Serve deployments using Hypha artifact manager integration.
@@ -893,6 +936,18 @@ class AppsManager:
                         f"BioEngine major version break — redeploy this app "
                         f"explicitly to bring it under the new builder."
                     )
+                    continue
+
+                # When multiple bioengine workers from different Hypha
+                # workspaces share a Ray cluster, serve.status() returns
+                # every workspace's apps. Adopt only the ones stamped with
+                # this worker's workspace.
+                if not _belongs_to_worker_workspace(
+                    application_id=application_id,
+                    app_data=app_data,
+                    current_workspace=self.server.config.workspace,
+                    logger=self.logger,
+                ):
                     continue
 
                 required_keys = {
