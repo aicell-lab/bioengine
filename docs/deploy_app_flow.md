@@ -1,192 +1,219 @@
-# `deploy_app` flow: v0.11.3 vs v0.11.4
+# How `deploy_app` works
 
-A side-by-side walkthrough of what the BioEngine worker does between the
+Step-by-step walkthrough of what the BioEngine worker does between the
 moment a Hypha client calls `worker.deploy_app(...)` and the moment the
-deployed app's first replica answers a request. The two versions reach the
-same outcome through very different code paths; this document is the
-reference for why the v0.11.4 redesign happened and what changed underneath
-the public API.
+deployed app's first replica answers a request.
 
-The public API is unchanged. App authors do not need to migrate anything.
+The worker is filesystem-thin. It never downloads source, never writes
+zips, and never hands Ray a `file://` URI. Everything that touches the
+artifact happens inside Ray tasks the worker submits.
 
-## Why v0.11.4
+## 1. The RPC arrives
 
-v0.11.3 worked only when the worker pod and the Ray cluster nodes shared
-a filesystem. On the KTH KubeRay cluster they do not — the bioengine
-worker runs in the `hypha` Kubernetes namespace with its own Trident NFS
-export, the Ray pods run in `ray-cluster` namespace with a different
-Trident NFS export, and the `file://` URIs the worker handed Ray Serve
-pointed at paths the Ray nodes could not see. v0.11.4 removes the shared
-filesystem assumption by making the worker filesystem-thin: it never
-downloads source, never writes zips, and never hands Ray a `file://`
-URI. Everything happens inside Ray tasks the worker submits.
+The worker receives the call, validates the caller has admin permission
+on this worker, and looks up (or creates) the per-app tracking entry in
+`AppsManager._deployed_applications`. The entry is keyed by
+`application_id` — the deploy-time name, distinct from the underlying
+`artifact_id`.
 
-## The flow, step by step
+If an entry already exists, the call is treated as an *update*. The
+old `is_deployed` event is cleared so any in-flight RPCs can be
+short-circuited, but the entry itself is kept until the new deployment
+takes over.
 
-### 1. `deploy_app()` RPC arrives at the worker
+## 2. Manifest load
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker process | worker process |
-| **Action** | Receives the call, looks up or creates the per-app tracking entry in `AppsManager._deployed_applications`. | Identical. |
+`artifact_manager.read(artifact_id, version)` returns the manifest dict.
+Metadata only — no files yet. The worker validates `format_version`
+(must be `0.6.0`) and resolves the entry class id (`entry: "main:MyApp"`
+or similar).
 
-No difference.
+If the caller did not pin a version, the manifest read also surfaces
+the latest committed version, which the worker stamps into the
+deployment record so it can be reproduced exactly on a recovery
+restart.
 
-### 2. Manifest load
+## 3. Mint a short-TTL Hypha download token
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker process | worker process |
-| **Action** | `artifact_manager.read(artifact_id, version)` returns the manifest dict. Metadata only — no files. | Identical. |
+The worker calls `server.generate_token({permission: "read", workspace, expires_in: 600})` to mint a 10-minute, read-only, single-workspace
+token. It is the only credential the introspect Ray task needs to
+reach Hypha. By the time replicas boot, this token has expired —
+replicas pull source from Ray's internal package store instead, so
+they don't need a Hypha credential at all.
 
-No difference.
+## 4. Submit the introspect Ray task
 
-### 3. Mint short-TTL Hypha download token
+The worker submits `bioengine._app.bootstrap.introspect_app_in_ray_task`
+as a short Ray task. The task's `runtime_env` carries:
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | — | worker process |
-| **Action** | Not done. The worker authenticates via its long-lived `HYPHA_TOKEN` for the per-file downloads below. | `server.generate_token({permission: "read", workspace, expires_in: 600})` mints a 10-minute, read-only, single-workspace token. Passed to the introspect Ray task. By the time replicas boot the token has expired — they pull source from Ray's internal package store instead. |
+- `pip` — the framework baseline (hypha-rpc, pydantic, …) plus the app's
+  declared `@bioengine.app(pip=…)` dependencies
+- `env_vars` — `BIOENGINE_APP_DIR`, `BIOENGINE_ARTIFACT_DOWNLOAD_URL`
+  (Hypha `create-zip-file` URL), `BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`,
+  `BIOENGINE_ARTIFACT_VERSION`
 
-### 4. Materialise the artifact source
+No `py_modules`. The worker doesn't ship the source — the task fetches
+it itself.
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker pod's local PVC | inside the introspect Ray task on the Ray cluster |
-| **Action** | `_materialize_artifact` walks the artifact tree and downloads every file via per-file `artifact_manager.get_file()` to `<apps_workdir>/<app_id>/source/`. Accumulates on the worker's PVC across deploys. | The Ray task calls `replica_init._ensure_source` with `BIOENGINE_ARTIFACT_DOWNLOAD_URL` (Hypha `create-zip-file` endpoint) and the short-TTL token. One HTTP GET, one zip, extracted into `<app_dir>/source/` on the Ray node's filesystem. `fcntl.flock` on `<app_dir>/.lock` serialises concurrent same-node starts. |
+## 5. The introspect task materialises the source
 
-### 5. Package the source for Ray
+The task calls `replica_init._ensure_source`, which:
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker pod | inside the introspect Ray task |
-| **Action** | `_write_pkg_to_runtime_env_dir` walks the downloaded tree, content-hashes it (SHA-256), zips it (excluding `manifest.yaml`, `README*`, `*.md`, `*.ipynb`, `frontend/`, etc.) into `<apps_workdir>/_runtime_env_packages/bioengine_pkg_<hash>.zip`. Same again for the worker's own `bioengine/` source → `bioengine_runtime_<hash>.zip` (with a `_bioengine_wrap/` arc-prefix so Ray's `remove_top_level_directory=True` doesn't strip `bioengine/`). Both files are referenced by `file://` URIs in `runtime_env.py_modules`. | `ray._private.runtime_env.packaging.get_uri_for_directory` + `upload_package_if_needed` hash the source tree and upload it to Ray's content-addressed GCS as `gcs://_ray_pkg_<hash>.zip`. The URI is what's returned to the worker as `app_source_uri`. The worker never sees the bytes. |
+1. Acquires an `fcntl.flock` on `<app_dir>/.lock`. Two replicas booting on
+   the same Ray node at the same time block here briefly; the second
+   reads the up-to-date `.version` marker written by the first and
+   skips the download.
+2. Streams `<BIOENGINE_ARTIFACT_DOWNLOAD_URL>?token=<…>` (the Hypha
+   `create-zip-file` endpoint) into a tempfile, then extracts it into
+   `<app_dir>/source/` — excluding `manifest.yaml`, `README*`, `*.md`,
+   `*.ipynb`, `frontend/`, images, `__pycache__/`, and dotfiles.
+3. Writes the resolved version into `<app_dir>/.version` so subsequent
+   ensure-source calls on the same node can short-circuit.
 
-### 6. Introspect the user's class graph
+## 6. The introspect task packages the source into Ray's GCS
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | a Ray task that runs in the app's `runtime_env` (so `pip` deps are installed) | the same Ray task that did steps 4 + 5 |
-| **Action** | Worker submits `introspect_app` as a separate Ray task with `runtime_env={py_modules: [bioengine_runtime_uri, bioengine_pkg_uri], pip: app_pip}`. The task imports the user's entry class, walks `__init__` type hints for composition references, and returns a JSON spec. | The same introspect task that downloaded + GCS-packaged the source then walks the type-hint graph in-process via the same `introspect_app` helper. Returns `{spec, app_source_uri}` so the worker has the spec and the URI for the build task. |
+Once `source/` exists, the task hashes it with
+`ray._private.runtime_env.packaging.get_uri_for_directory` and uploads
+it via `upload_package_if_needed` to Ray's content-addressed package
+store as `gcs://_ray_pkg_<hash>.zip`.
 
-The shape of the returned `AppSpec` is identical between versions.
+This is the `app_source_uri` the worker hands the build task and the
+replicas later. Source bytes never travel back to the worker — only the
+URI does.
 
-### 7. Validate kwargs + check resources
+## 7. The introspect task walks the type-hint composition graph
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker process | worker process |
-| **Action** | `validate_kwargs_against_spec` + `_check_resources` against the returned spec. | Identical. |
+With `source/` on `sys.path`, the task imports the user's entry class
+and walks its `__init__` type hints to discover composition references
+(`def __init__(self, runtime: RuntimeA, batch_size: int = 32)`). It
+returns a JSON-compatible `AppSpec` dict containing the class graph,
+method schemas, resource requirements, and lifecycle method names.
 
-No difference.
+## 8. The worker checks resources and kwargs
 
-### 8. Mint the proxy service token
+The worker receives `{spec, app_source_uri}` from the introspect task.
+It runs `validate_kwargs_against_spec` against the spec, computes the
+total resource requirements, and gates against
+`AppsManager._check_resources` (on SLURM clusters, this may queue or
+reject the deploy if the cluster is saturated).
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker process | worker process |
-| **Action** | `server.generate_token({workspace, permission: "read_write", expires_in: 30 days})` so the per-app ProxyDeployment can re-register its Hypha service across replica restarts. | Identical. |
+## 9. Mint the long-lived proxy service token
 
-### 9. Build `proxy_args` + `app_data`
+The worker calls `server.generate_token({workspace, permission: "read_write", expires_in: 30 days})`. This is the credential the
+per-app `ProxyDeployment` actor uses to register `workspace/<application_id>`
+as a Hypha service and to keep that registration alive across replica
+restarts.
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker process | worker process |
-| **Action** | Assemble the dict the `ProxyDeployment` will keep around to identify the app: `display_name`, `description`, `artifact_id`, `version`, `application_kwargs`, `application_env_vars`, `disable_gpu`, `max_ongoing_requests`, `application_resources`, `authorized_users`, `available_methods`, `started_at`, `last_updated_at`, `last_updated_by`, `auto_redeploy`, `debug`. | Identical structure. |
+## 10. Assemble `proxy_args` and `app_data`
 
-### 10. Submit `build_and_run_application`
+The worker assembles the dict the `ProxyDeployment` actor keeps for the
+lifetime of the app:
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | worker submits, runs on the Ray head | worker submits, runs on the Ray head |
-| **Action** | Ray task launched with `runtime_env={py_modules: [bioengine_runtime_uri, bioengine_pkg_uri], pip}`. The task imports the user class, calls `cls.bind(...)` to assemble the Ray Serve graph (composition handles wired up via type hints), wraps the entry deployment in `ProxyDeployment`, and calls `serve.run(blocking=False)`. | Ray task launched with `runtime_env={env_vars: {BIOENGINE_APP_SOURCE_URI: …, BIOENGINE_APP_DIR: …, …}, pip}`. The task calls `replica_init._ensure_source` first — on shared-FS clusters this no-ops because `<app_dir>/source/` already exists from step 4; on non-shared clusters it pulls from Ray's GCS using the URI. Then the same `cls.bind` + `serve.run` as v0.11.3. |
+```python
+app_data = {
+    "format_version": "0.6.0",
+    "entry": "<module>:<ClassName>",
+    "spec_hash": "<sha256>",
+    "display_name": …, "description": …,
+    "artifact_id": …, "version": …,
+    "application_kwargs": …, "application_env_vars": …,  # sanitised
+    "disable_gpu": …, "max_ongoing_requests": …,
+    "application_resources": …,
+    "authorized_users": …, "available_methods": …,
+    "started_at": …, "last_updated_at": …, "last_updated_by": …,
+    "auto_redeploy": …, "debug": …,
+}
+proxy_args = {
+    "application_id": …,
+    "app_data": app_data,
+    "server_url": …, "workspace": …,
+    "proxy_service_token": <30-day token from step 9>,
+    "authorized_users": …,
+    ...
+}
+```
 
-The `serve.run` call returns immediately because `blocking=False`. The
-worker's RPC reply happens *after* the build task returns, while Ray
-Serve continues to spin up replicas asynchronously.
+`app_data` is what `AppsManager.recover_deployed_applications` reads
+back from the live actor on a worker restart, so it has to be
+self-describing.
 
-### 11. Ray Serve schedules replicas
+## 11. Submit `build_and_run_application`
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | each replica = a new actor process on some Ray node | identical |
-| **Action** | Each actor's `runtime_env` carries the same two `file://` URIs from step 5. Ray's `runtime_env_agent` on each node runs `download_and_unpack_package` against those URIs — which on `file://` schemes opens the path directly. If the worker pod's `<apps_workdir>` is not visible on this Ray node, this is `FileNotFoundError`. Replica `__init__` aborts; Ray Serve retries up to 3 times then marks the deployment `DEPLOY_FAILED`. | Each actor's `runtime_env` carries `env_vars: {BIOENGINE_APP_SOURCE_URI, BIOENGINE_APP_DIR, …}`. No `py_modules` URI for the user source. Ray's standard runtime_env setup does not materialise the source — that's the meta-path finder's job. |
+The worker submits a second Ray task,
+`bioengine._app.bootstrap.build_and_run_application`. Its `runtime_env`
+carries:
 
-This is the step that fails on KTH under v0.11.3.
+- `pip` — same baseline + app deps as in step 4
+- `env_vars` — same as step 4 plus `BIOENGINE_APP_SOURCE_URI` (the
+  `gcs://…` URI from step 6)
 
-### 12. User source on `sys.path`
+No `py_modules`. The task calls `replica_init._ensure_source` first —
+on shared-filesystem clusters this no-ops because `<app_dir>/source/`
+already exists from step 5; on non-shared clusters it pulls the bytes
+back via `download_and_unpack_package` against the Ray-GCS URI. Then
+it imports the user classes, calls `cls.bind(…)` to assemble the Ray
+Serve graph (composition handles wired up via the type hints), wraps
+the entry deployment in `ProxyDeployment`, and calls
+`serve.run(blocking=False)`.
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | each replica process | each replica process |
-| **Action** | Ray's `runtime_env_agent` already extracted the zip and prepended the unzip directory to `sys.path`. `cloudpickle.loads(serialized_deployment_def)` then resolves the user's `module:qualname` reference, finds the module on `sys.path`, and instantiates the class. | `bioengine/__init__.py` installs a `sys.meta_path` finder at import time. When `cloudpickle.loads` tries to import the user's module and the standard import machinery returns `ImportError`, the meta-path finder catches that, calls `replica_init.setup_replica_environment` (which calls `_ensure_source` to materialise the source via the `BIOENGINE_APP_SOURCE_URI` GCS download), and prepends `<app_dir>/source/` to `sys.path`. The original import then succeeds. |
+The `blocking=False` is intentional: the task returns immediately,
+the worker's RPC reply happens shortly after, and Ray Serve continues
+spinning up replicas asynchronously. The client knows the call
+succeeded as soon as the build task returned, not when replicas
+finished warming up.
 
-The meta-path finder is what makes the cloudpickle round-trip work
-without the user's module having to import `bioengine` itself first.
-v0.11.3 didn't need this because Ray Serve put the source on `sys.path`
-before any user code ran.
+## 12. Ray Serve schedules replicas
 
-### 13. ProxyDeployment registers the Hypha service
+For each `Deployment` in the bound graph, Ray Serve allocates one or
+more actor processes on Ray nodes that satisfy the resource
+requirements. Each actor's `runtime_env` carries the same `env_vars`
+the build task had, including `BIOENGINE_APP_SOURCE_URI`. No
+`py_modules` is set at this layer — the source materialisation is
+the meta-path finder's job, next step.
 
-| | v0.11.3 | v0.11.4 |
-|---|---|---|
-| **Where** | the per-app ProxyDeployment replica | identical |
-| **Action** | Uses the long-lived proxy service token (step 8) to register `workspace/<application_id>` as a Hypha service. From here, all client RPCs route through this proxy. | Identical. |
+## 13. Replica startup and `sys.path`
 
-## Side-by-side summary
+A Ray Serve replica process starts. Ray runtime_env_agent installs
+the `pip` deps and sets the env vars, then hands off to Ray Serve's
+replica wrapper. That wrapper calls
+`cloudpickle.loads(serialized_deployment_def)` to reconstitute the
+user's deployment class. cloudpickle tries to import the user's
+`module:qualname`. The standard `sys.meta_path` finders look on
+`sys.path` and find nothing (because the source hasn't been
+materialised yet) — and `ImportError` propagates.
 
-| Step | v0.11.3 location | v0.11.4 location | Same? |
-|---|---|---|---|
-| 1. `deploy_app()` arrives | worker | worker | ✓ |
-| 2. Manifest load | worker | worker | ✓ |
-| 3. Mint download token | — | worker | new in 0.11.4 |
-| 4. Download artifact source | worker (per-file) → worker PVC | introspect Ray task (single zip) → Ray node PVC | moved + simplified |
-| 5. Hash + package source | worker → `_runtime_env_packages/*.zip` (file://) | introspect Ray task → Ray GCS (gcs://) | moved |
-| 6. Introspect user classes | separate Ray task with `py_modules=[…]` | same introspect Ray task | merged |
-| 7. Validate kwargs + resources | worker | worker | ✓ |
-| 8. Mint proxy service token | worker | worker | ✓ |
-| 9. Assemble proxy_args + app_data | worker | worker | ✓ |
-| 10. Submit `build_and_run_application` | Ray task with `py_modules=[…]` | Ray task with `env_vars={BIOENGINE_APP_SOURCE_URI}` | same task, different inputs |
-| 11. Ray Serve spawns replicas | each replica's runtime_env pulls source from `file://` URI | each replica's runtime_env carries env_vars only; no source pull at runtime_env layer | the bug-fix |
-| 12. User source on `sys.path` | Ray's runtime_env_agent puts it there before any user code runs | bioengine's `sys.meta_path` finder puts it there on the first `ImportError` cloudpickle hits | new mechanism |
-| 13. ProxyDeployment registers Hypha service | per-app proxy replica | per-app proxy replica | ✓ |
+At this point a `sys.meta_path` finder installed by
+`bioengine/__init__.py` at framework-import time catches the failed
+lookup. The finder:
 
-## What this fixes and what it costs
+1. Calls `replica_init.setup_replica_environment`, which calls
+   `_ensure_source` — on Ray Serve replicas, the URI backend is
+   `BIOENGINE_APP_SOURCE_URI` (the `gcs://` URI), so the source is
+   pulled from Ray's package store with no Hypha auth.
+2. Prepends `<app_dir>/source/` to `sys.path`.
+3. Re-delegates to the standard import machinery, which now finds
+   the module.
 
-**Fixes:**
+cloudpickle's import succeeds, the class is reconstituted, and
+`Deployment.__init__` runs.
 
-- Cluster topology assumption is gone. v0.11.4 works on KubeRay clusters
-  where the worker pod and the Ray pods are in different Kubernetes
-  namespaces with different PVCs, on single-machine deployments where
-  the worker shells out to a local Ray, on SLURM clusters with one
-  shared `$HOME`, and on any other topology where Hypha and Ray's GCS
-  are reachable.
-- The worker's PVC stops accumulating per-deploy artifact downloads
-  and `_runtime_env_packages/*.zip`. The PVC contains only logs and
-  per-app tracking dirs that survive across version bumps.
-- No more "the worker's `bioengine_runtime_*.zip` URI from the previous
-  deploy was reused but the file is on the wrong PVC" partial failures.
+The finder fires at most once per replica process. Subsequent
+imports use the populated `sys.path` directly.
 
-**Costs:**
+## 14. ProxyDeployment registers the Hypha service
 
-- The introspect Ray task is now responsible for the download. Failure
-  surface is different — a network blip between the Ray cluster and
-  Hypha now fails the task; previously it would have failed the worker
-  RPC.
-- A meta-path finder runs on every replica import that fails through
-  the standard finders. Negligible overhead in practice (one extra
-  `find_spec` call per failed import), but it's new code in the hot
-  path for `cloudpickle.loads`.
-- The short-TTL download token is one extra `generate_token` RPC per
-  `deploy_app` call.
+The per-app `ProxyDeployment` replica calls
+`server.register_service` using the 30-day proxy service token. From
+here, all client RPCs to `workspace/<application_id>` route through
+this proxy. Per-replica WebSocket service IDs are derived under it.
 
-## Pointers
+## What lives where
 
-- The introspect + build Ray tasks live in
-  [`bioengine/_app/bootstrap.py`](../bioengine/_app/bootstrap.py).
-- The replica-side source materialisation lives in
-  [`bioengine/_app/replica_init.py`](../bioengine/_app/replica_init.py).
-- The meta-path finder is installed in
-  [`bioengine/__init__.py`](../bioengine/__init__.py).
-- The worker-side orchestration (manifest load, token mint, task
-  submission) lives in [`bioengine/apps/builder.py`](../bioengine/apps/builder.py).
+| Concern | Code |
+|---|---|
+| Worker-side orchestration (steps 1–4, 8–11) | [`bioengine/apps/builder.py`](../bioengine/apps/builder.py) |
+| Introspect + build Ray tasks (steps 4–7, 11) | [`bioengine/_app/bootstrap.py`](../bioengine/_app/bootstrap.py) |
+| Replica + build-task source materialisation (steps 5, 11, 13) | [`bioengine/_app/replica_init.py`](../bioengine/_app/replica_init.py) |
+| `sys.meta_path` finder (step 13) | [`bioengine/__init__.py`](../bioengine/__init__.py) |
+| `_deployed_applications` tracking, recovery, monitoring | [`bioengine/apps/manager.py`](../bioengine/apps/manager.py) |
+| ProxyDeployment actor (step 14) | [`bioengine/apps/proxy_deployment.py`](../bioengine/apps/proxy_deployment.py) |
