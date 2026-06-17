@@ -390,6 +390,10 @@
     padding: 1.25rem 0.5rem;
   }
   .canvas-hint .hint-primary { color: var(--fg); font-weight: 600; }
+  .canvas-hint .hint-types {
+    margin-top: 0.4rem; font-size: 0.74rem; color: var(--fg-muted);
+    letter-spacing: 0.01em;
+  }
   .canvas-hint .kbd {
     display: inline-block; padding: 0.05rem 0.4rem;
     background: var(--bg-2); border: 1px solid var(--border-strong);
@@ -846,6 +850,18 @@
     background: var(--fail); color: #450a0a; border-color: var(--fail);
   }
   .dialog .dialog-btn.danger:hover { filter: brightness(1.08); }
+  .dialog.dialog-wide { max-width: 36rem; }
+  .dialog .dialog-detail {
+    margin: 0 0 1.1rem;
+    padding: 0.7rem 0.85rem;
+    background: var(--bg-0); border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    font: 0.78rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--fg-dim);
+    max-height: 50vh; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .dialog .dialog-detail:empty { display: none; }
 
   /* --- Define mode submit result block --------------------------------- */
   .create-result {
@@ -1042,9 +1058,9 @@
   <header class="page">
     <h1><span class="accent">Smart Microscopy</span> Assistant</h1>
     <p>
-      Inspect <strong>2D RGB images</strong> (PNG, JPG, TIFF — ≤ 25 MB each) with reusable
-      visual tests or free-text questions. Best for visually-obvious judgements:
-      categorical differences, focus, presence/absence.
+      Inspect <strong>2D RGB images</strong> with reusable visual tests or
+      free-text questions. Best for visually-obvious judgements: categorical
+      differences, focus, presence/absence.
     </p>
     <p class="header-runtime">
       Backed by Qwen2.5-VL-3B-Instruct on one NVIDIA A40-16C vGPU slice. See
@@ -1100,7 +1116,7 @@
       <div id="testMeta" class="test-meta" hidden></div>
 
       <div id="freetextChooser" hidden>
-        <textarea id="instruction" placeholder="What should the model look for? Max 4000 chars. Tip: ask for a single-word category if you want categorical badges."></textarea>
+        <textarea id="instruction" placeholder="What should the model look for? Max 4000 chars."></textarea>
         <div class="field-help">
           <span>If your prompt asks for a category, the badge will show it; otherwise it shows "Analyzed".</span>
           <span><span id="charCount" class="counter">0</span> / <span id="charCap">4000</span></span>
@@ -1114,6 +1130,7 @@
         <div class="canvas-hint" id="analyzeHint">
           <div class="hint-primary">Click to select this area</div>
           <div>then paste with <span class="kbd">⌘V</span> / <span class="kbd">Ctrl</span>+<span class="kbd">V</span>, or double-click to upload from disk</div>
+          <div class="hint-types">PNG, JPG, TIFF · ≤ 25 MB each</div>
         </div>
         <div id="analyzeGrid" class="image-grid"></div>
       </div>
@@ -1230,6 +1247,7 @@
             <div class="canvas-hint">
               <div class="hint-primary">Click to select</div>
               <div>then paste, or double-click</div>
+              <div class="hint-types">PNG, JPG, TIFF · ≤ 25 MB</div>
             </div>
             <div id="positiveGrid" class="image-grid"></div>
           </div>
@@ -1238,6 +1256,7 @@
             <div class="canvas-hint">
               <div class="hint-primary">Click to select</div>
               <div>then paste, or double-click</div>
+              <div class="hint-types">PNG, JPG, TIFF · ≤ 25 MB</div>
             </div>
             <div id="negativeGrid" class="image-grid"></div>
           </div>
@@ -1330,6 +1349,29 @@
   </div>
 </div>
 
+<!-- Error dialog -->
+<div id="errorDialog" class="dialog-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="errorTitle" hidden>
+  <div class="dialog dialog-wide">
+    <div class="dialog-title">
+      <span class="dialog-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="13"/>
+          <line x1="12" y1="16.5" x2="12" y2="16.5"/>
+        </svg>
+      </span>
+      <span id="errorTitle">Something went wrong</span>
+    </div>
+    <div class="dialog-message" id="errorMessage"></div>
+    <pre class="dialog-detail" id="errorDetail"></pre>
+    <div class="dialog-actions">
+      <button class="dialog-btn cancel" type="button" id="errorCopy">Copy</button>
+      <button class="dialog-btn danger" type="button" id="errorClose">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Lightbox -->
 <div id="lightbox" class="lightbox" role="dialog" aria-label="Image preview" hidden>
   <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Close preview">
@@ -1349,7 +1391,13 @@ import { login, connectToServer }
 
 // ---- URL params ----------------------------------------------------------
 const params     = new URLSearchParams(window.location.search);
-const SERVER_URL = params.get("server")        || "https://hypha.aicell.io";
+// Default to the origin that's serving this page (e.g. the Hypha instance
+// hosting the artifact). Falls back to hypha.aicell.io for dev when the
+// page is opened from file:// or a localhost:NNNN that isn't a Hypha server.
+const PAGE_ORIGIN =
+  (window.location.protocol === "http:" || window.location.protocol === "https:")
+    ? window.location.origin : null;
+const SERVER_URL = params.get("server") || PAGE_ORIGIN || "https://hypha.aicell.io";
 const SERVICE_ID = params.get("ws_service_id") || "";
 const URL_TOKEN  = params.get("token") || "";
 
@@ -1503,6 +1551,11 @@ async function startLogin() {
     await connectWithToken(token);
   } catch (err) {
     log("Login error: " + err.message, "err");
+    showError({
+      title: "Login failed",
+      message: "Could not complete the Hypha auth flow.",
+      detail: formatErr(err),
+    });
     setLoggedOutUI();
   }
 }
@@ -1587,7 +1640,7 @@ $("srcFreetext").addEventListener("change", applySourceRadio);
 // Shared cache so the Tests-tab list and the Analyze dropdown stay in sync.
 let cachedTests = [];
 
-async function refreshTests() {
+async function refreshTests({ popupOnError = false } = {}) {
   if (!qcSvc) return;
   try {
     cachedTests = await qcSvc.list_visual_tests({
@@ -1597,6 +1650,13 @@ async function refreshTests() {
   } catch (err) {
     cachedTests = [];
     log("list_visual_tests failed: " + err.message, "err");
+    if (popupOnError) {
+      showError({
+        title: "Could not refresh visual tests",
+        message: "<code>list_visual_tests</code> failed on the worker.",
+        detail: formatErr(err),
+      });
+    }
   }
   refreshTestsDropdown();
   refreshTestList();
@@ -1654,7 +1714,7 @@ function updateTestMeta() {
   applySourceRadio();
 }
 $("testSelect").addEventListener("change", updateTestMeta);
-$("refreshTestsBtn").addEventListener("click", () => { refreshTests(); });
+$("refreshTestsBtn").addEventListener("click", () => { refreshTests({ popupOnError: true }); });
 
 // ---- Existing-tests list rendering (Visual Tests tab) -------------------
 function refreshTestList() {
@@ -1737,12 +1797,17 @@ function refreshTestList() {
             name: t.name, caller_user_id: userWorkspace, _rkwargs: true,
           });
           log(`Deleted visual test '${t.name}'.`, "ok");
-          await refreshTests();
         } catch (err) {
           log(`delete_visual_test(${t.name}) error: ${err.message || err}`, "err");
-          alert("Delete failed: " + (err.message || err));
+          showError({
+            title: "Delete failed",
+            message: `Could not delete visual test <strong>${escapeHTML(t.name)}</strong>.`,
+            detail: formatErr(err),
+          });
           del.disabled = false;
+          return;
         }
+        await refreshTests({ popupOnError: true });
       });
     }
     row.appendChild(del);
@@ -1792,8 +1857,47 @@ $("confirmCancel").addEventListener("click", () => closeConfirm(false));
 $("confirmDialog").addEventListener("click", (e) => {
   if (e.target === $("confirmDialog")) closeConfirm(false);
 });
+
+// ===== Error dialog ======================================================
+// Surfaces RPC / button-handler failures as a modal with a scrollable detail
+// block, so users see the real error (stack, server message) instead of a
+// silent log line or a chrome alert().
+function formatErr(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  return err.stack || err.message || (() => {
+    try { return JSON.stringify(err, null, 2); } catch { return String(err); }
+  })();
+}
+function showError({ title = "Something went wrong", message = "", detail = "" } = {}) {
+  $("errorTitle").textContent = title;
+  $("errorMessage").innerHTML = message;
+  $("errorDetail").textContent = detail;
+  $("errorDialog").hidden = false;
+  setTimeout(() => $("errorClose").focus(), 0);
+}
+function closeError() { $("errorDialog").hidden = true; }
+$("errorClose").addEventListener("click", closeError);
+$("errorDialog").addEventListener("click", (e) => {
+  if (e.target === $("errorDialog")) closeError();
+});
+$("errorCopy").addEventListener("click", async () => {
+  const text = [
+    $("errorTitle").textContent,
+    $("errorMessage").textContent,
+    $("errorDetail").textContent,
+  ].filter(Boolean).join("\n\n");
+  try {
+    await navigator.clipboard?.writeText(text);
+    $("errorCopy").textContent = "Copied";
+    setTimeout(() => { $("errorCopy").textContent = "Copy"; }, 1200);
+  } catch (_) {}
+});
+
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("confirmDialog").hidden) closeConfirm(false);
+  if (e.key !== "Escape") return;
+  if (!$("errorDialog").hidden) { closeError(); return; }
+  if (!$("confirmDialog").hidden) closeConfirm(false);
 });
 
 // ===== Lightbox ===========================================================
@@ -2207,6 +2311,7 @@ async function runPipeline() {
   // files between commits without re-staging.
   const vlmQueue = [];
   const scratchIds = [];
+  const batchErrors = [];
   let vlmDone = 0, vlmErrs = 0, passed = 0, failed = 0, unsure = 0;
   let vlmActive = false;
 
@@ -2239,6 +2344,7 @@ async function runPipeline() {
       tile.state = "error";
       tile.error = err.message || String(err);
       vlmErrs++;
+      batchErrors.push({ stage: "inspect", file: tile.file.name, detail: formatErr(err) });
       log(`inspect(${tile.file.name}) error: ${tile.error}`, "err");
     }
     renderGrid("analyze");
@@ -2281,6 +2387,7 @@ async function runPipeline() {
       tile.state = "error";
       tile.error = "upload failed: " + (err.message || String(err));
       vlmErrs++;
+      batchErrors.push({ stage: "upload", file: tile.file.name, detail: formatErr(err) });
       log(`upload(${tile.file.name}) error: ${tile.error}`, "err");
       renderGrid("analyze");
     }
@@ -2308,6 +2415,18 @@ async function runPipeline() {
     summary = `Analyzed ${vlmDone}${vlmErrs ? ` · ${vlmErrs} error${vlmErrs === 1 ? "" : "s"}` : ""}`;
   }
   setRun(vlmErrs ? "error" : "ok", `Done. ${summary}`);
+
+  if (batchErrors.length) {
+    const detail = batchErrors
+      .map(e => `[${e.stage}] ${e.file}\n${e.detail}`)
+      .join("\n\n----------\n\n");
+    const total = pending.length;
+    showError({
+      title: `Analyze finished with ${batchErrors.length} error${batchErrors.length === 1 ? "" : "s"}`,
+      message: `${batchErrors.length} of ${total} image${total === 1 ? "" : "s"} failed. Tiles are marked in red; full per-image traces below.`,
+      detail,
+    });
+  }
 }
 
 $("runBtn").addEventListener("click", runPipeline);
@@ -2560,6 +2679,11 @@ $("defineBtn").addEventListener("click", async () => {
     $("defineResultBlock").hidden = false;
     $("defineResultBlock").textContent = "Error: " + (err.message || String(err));
     log("create_visual_test error: " + (err.message || String(err)), "err");
+    showError({
+      title: "Could not save visual test",
+      message: `<code>create_visual_test</code> failed for <strong>${escapeHTML(name)}</strong>.`,
+      detail: formatErr(err),
+    });
   } finally {
     if (scratchId) await deleteScratch(scratchId);
     refreshDefineEnabled();
