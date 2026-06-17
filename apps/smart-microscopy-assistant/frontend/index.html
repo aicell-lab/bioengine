@@ -390,6 +390,10 @@
     padding: 1.25rem 0.5rem;
   }
   .canvas-hint .hint-primary { color: var(--fg); font-weight: 600; }
+  .canvas-hint .hint-types {
+    margin-top: 0.4rem; font-size: 0.74rem; color: var(--fg-muted);
+    letter-spacing: 0.01em;
+  }
   .canvas-hint .kbd {
     display: inline-block; padding: 0.05rem 0.4rem;
     background: var(--bg-2); border: 1px solid var(--border-strong);
@@ -1054,9 +1058,9 @@
   <header class="page">
     <h1><span class="accent">Smart Microscopy</span> Assistant</h1>
     <p>
-      Inspect <strong>2D RGB images</strong> (PNG, JPG, TIFF — ≤ 25 MB each) with reusable
-      visual tests or free-text questions. Best for visually-obvious judgements:
-      categorical differences, focus, presence/absence.
+      Inspect <strong>2D RGB images</strong> with reusable visual tests or
+      free-text questions. Best for visually-obvious judgements: categorical
+      differences, focus, presence/absence.
     </p>
     <p class="header-runtime">
       Backed by Qwen2.5-VL-3B-Instruct on one NVIDIA A40-16C vGPU slice. See
@@ -1112,7 +1116,7 @@
       <div id="testMeta" class="test-meta" hidden></div>
 
       <div id="freetextChooser" hidden>
-        <textarea id="instruction" placeholder="What should the model look for? Max 4000 chars. Tip: ask for a single-word category if you want categorical badges."></textarea>
+        <textarea id="instruction" placeholder="What should the model look for? Max 4000 chars."></textarea>
         <div class="field-help">
           <span>If your prompt asks for a category, the badge will show it; otherwise it shows "Analyzed".</span>
           <span><span id="charCount" class="counter">0</span> / <span id="charCap">4000</span></span>
@@ -1126,6 +1130,7 @@
         <div class="canvas-hint" id="analyzeHint">
           <div class="hint-primary">Click to select this area</div>
           <div>then paste with <span class="kbd">⌘V</span> / <span class="kbd">Ctrl</span>+<span class="kbd">V</span>, or double-click to upload from disk</div>
+          <div class="hint-types">PNG, JPG, TIFF · ≤ 25 MB each</div>
         </div>
         <div id="analyzeGrid" class="image-grid"></div>
       </div>
@@ -1242,6 +1247,7 @@
             <div class="canvas-hint">
               <div class="hint-primary">Click to select</div>
               <div>then paste, or double-click</div>
+              <div class="hint-types">PNG, JPG, TIFF · ≤ 25 MB</div>
             </div>
             <div id="positiveGrid" class="image-grid"></div>
           </div>
@@ -1250,6 +1256,7 @@
             <div class="canvas-hint">
               <div class="hint-primary">Click to select</div>
               <div>then paste, or double-click</div>
+              <div class="hint-types">PNG, JPG, TIFF · ≤ 25 MB</div>
             </div>
             <div id="negativeGrid" class="image-grid"></div>
           </div>
