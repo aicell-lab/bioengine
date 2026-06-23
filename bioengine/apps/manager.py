@@ -1281,6 +1281,20 @@ class AppsManager:
 
         return created_artifact_id
 
+    def _resolve_app_directory(self, application_id: str) -> Path:
+        """Return the on-disk cache directory for ``application_id``.
+
+        Prefers the v0.11.4+ ``<worker-workspace>-<app-id>`` layout; falls
+        back to a bare ``<app-id>`` directory for compatibility with caches
+        left over from earlier worker releases.
+        """
+        apps_workdir = self.app_builder.apps_workdir
+        worker_workspace = self.server.config.workspace if self.server else "local"
+        prefixed = apps_workdir / f"{worker_workspace}-{application_id}"
+        if prefixed.exists():
+            return prefixed
+        return apps_workdir / application_id
+
     @schema_method
     async def list_app_directories(
         self,
@@ -1293,14 +1307,21 @@ class AppsManager:
         Lists all application working directories under the BioEngine apps workspace.
 
         Returns one entry per subdirectory found under the apps working directory,
-        including whether that directory belongs to a currently running application.
+        including the resolved application_id (when the directory follows the
+        ``<worker-workspace>-<app-id>`` layout), total size on disk, the latest
+        file modification time (a proxy for "last used"), and whether the
+        directory belongs to a currently running application.
 
         Returns:
             List of dictionaries, each with:
-            - name: directory name (matches application_id for deployed apps)
+            - name: directory name as it exists on disk
+            - application_id: the deployment id (worker-workspace prefix stripped),
+              or None for legacy or unrecognised directories
             - path: absolute path to the directory
-            - is_running: True if the directory belongs to a currently running app
+            - is_running: True if a currently running app maps to this directory
             - size_bytes: total disk usage of the directory in bytes
+            - last_used_unix: the most recent file mtime in the tree, as a
+              Unix timestamp (float seconds). None if the directory is empty.
 
         Raises:
             PermissionError: If the caller is not a worker admin
@@ -1323,17 +1344,40 @@ class AppsManager:
             if info["is_deployed"].is_set()
         }
 
+        worker_workspace = self.server.config.workspace if self.server else "local"
+        prefix = f"{worker_workspace}-"
+
         result = []
         for entry in sorted(apps_workdir.iterdir()):
             if not entry.is_dir():
                 continue
-            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+
+            size = 0
+            latest_mtime: Optional[float] = None
+            for f in entry.rglob("*"):
+                if not f.is_file():
+                    continue
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                size += st.st_size
+                if latest_mtime is None or st.st_mtime > latest_mtime:
+                    latest_mtime = st.st_mtime
+
+            if entry.name.startswith(prefix):
+                application_id = entry.name[len(prefix):]
+            else:
+                application_id = None
+
             result.append(
                 {
                     "name": entry.name,
+                    "application_id": application_id,
                     "path": str(entry),
-                    "is_running": entry.name in running,
+                    "is_running": application_id in running if application_id else False,
                     "size_bytes": size,
+                    "last_used_unix": latest_mtime,
                 }
             )
         return result
@@ -1343,7 +1387,7 @@ class AppsManager:
         self,
         application_id: str = Field(
             ...,
-            description="Application ID whose working directory should be deleted. Must match a subdirectory of the apps workspace (e.g. 'model-runner').",
+            description="Application ID whose working directory should be deleted (e.g. 'model-runner'). Resolves to the worker-workspace-prefixed directory created by the builder, with a fallback to a bare directory name for legacy layouts.",
         ),
         context: Dict[str, Any] = Field(
             ...,
@@ -1353,12 +1397,15 @@ class AppsManager:
         """
         Deletes an application working directory from the BioEngine apps workspace.
 
-        The directory is identified by application_id (as returned in the 'name' field
-        of list_app_directories). Raises an error if the application is currently running —
-        stop it first with stop_app() before clearing its directory.
+        Raises an error if the application is currently running — stop it first
+        with stop_app() before clearing its directory.
 
         Args:
-            application_id: ID of the application whose directory should be deleted (e.g. "model-runner").
+            application_id: Deployment id (e.g. ``"model-runner"``). The worker
+                resolves the actual on-disk directory using its own workspace
+                prefix (``<worker-workspace>-<application_id>``); a bare
+                ``<application_id>`` directory is accepted as a fallback for
+                caches created by earlier worker releases.
 
         Raises:
             PermissionError: If the caller is not a worker admin
@@ -1378,14 +1425,6 @@ class AppsManager:
                 f"application_id must be a plain name, not a path: '{application_id}'"
             )
 
-        target = self.app_builder.apps_workdir / application_id
-        if not target.exists():
-            raise ValueError(
-                f"No directory found for application '{application_id}' in the apps workspace."
-            )
-        if not target.is_dir():
-            raise ValueError(f"'{application_id}' is not a directory.")
-
         # Refuse if the app is currently running
         if application_id in self._deployed_applications:
             info = self._deployed_applications[application_id]
@@ -1394,6 +1433,14 @@ class AppsManager:
                     f"Cannot clear directory for '{application_id}': application is currently running. "
                     "Stop it first with stop_app()."
                 )
+
+        target = self._resolve_app_directory(application_id)
+        if not target.exists():
+            raise ValueError(
+                f"No directory found for application '{application_id}' in the apps workspace."
+            )
+        if not target.is_dir():
+            raise ValueError(f"'{application_id}' is not a directory.")
 
         import shutil
         try:
