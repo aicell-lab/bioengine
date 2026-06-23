@@ -175,8 +175,14 @@ resources
 # MacOS
 .DS_STORE
 
-# Claude
-.claude/
+# Claude — personal state ignored. `.claude/skills/` is tracked so
+# Claude Code's auto-discovery picks up maintainer-facing docs for
+# any contributor's agent. Subpath-level ignores instead of a
+# directory `.claude/` exclusion because git won't honour `!`
+# re-includes inside an excluded parent dir.
+.claude/settings.local.json
+.claude/agents/
+.claude/projects/
 
 # Data
 # IMPORTANT: keep the leading slash. An unanchored `data*` pattern matches
