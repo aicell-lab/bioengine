@@ -39,6 +39,7 @@ dependencies = [
     "httpx[http2]>=0.28.1",
     "hypha-rpc>=0.21.40",
     "numpy==1.26.4",
+    "packaging>=21.0",
     "pyyaml>=6.0.2",
 ]
 
