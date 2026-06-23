@@ -10,6 +10,7 @@ from hypha_rpc import connect_to_server
 from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
+import ray
 from ray import serve
 
 from bioengine import __version__
@@ -1281,20 +1282,6 @@ class AppsManager:
 
         return created_artifact_id
 
-    def _resolve_app_directory(self, application_id: str) -> Path:
-        """Return the on-disk cache directory for ``application_id``.
-
-        Prefers the v0.11.4+ ``<worker-workspace>-<app-id>`` layout; falls
-        back to a bare ``<app-id>`` directory for compatibility with caches
-        left over from earlier worker releases.
-        """
-        apps_workdir = self.app_builder.apps_workdir
-        worker_workspace = self.server.config.workspace if self.server else "local"
-        prefixed = apps_workdir / f"{worker_workspace}-{application_id}"
-        if prefixed.exists():
-            return prefixed
-        return apps_workdir / application_id
-
     @schema_method
     async def list_app_directories(
         self,
@@ -1306,18 +1293,20 @@ class AppsManager:
         """
         Lists all application working directories under the BioEngine apps workspace.
 
-        Returns one entry per subdirectory found under the apps working directory,
-        including the resolved application_id (when the directory follows the
-        ``<worker-workspace>-<app-id>`` layout), total size on disk, the latest
-        file modification time (a proxy for "last used"), and whether the
-        directory belongs to a currently running application.
+        In v0.11.4+ the worker pod is filesystem-thin — app caches live on the
+        Ray actor pods, not on the worker. This call dispatches a tiny Ray task
+        that walks ``apps_workdir`` on whichever Ray node it lands on and
+        reports per-directory size + latest mtime + the resolved
+        ``application_id`` (the ``<worker-workspace>-`` prefix the builder
+        adds is stripped). Within a single Ray cluster all nodes mount the
+        same NFS PVC at ``apps_workdir``, so one task suffices.
 
         Returns:
             List of dictionaries, each with:
             - name: directory name as it exists on disk
             - application_id: the deployment id (worker-workspace prefix stripped),
               or None for legacy or unrecognised directories
-            - path: absolute path to the directory
+            - path: absolute path to the directory on the Ray actor pod
             - is_running: True if a currently running app maps to this directory
             - size_bytes: total disk usage of the directory in bytes
             - last_used_unix: the most recent file mtime in the tree, as a
@@ -1334,53 +1323,59 @@ class AppsManager:
             resource_name="listing app directories",
         )
 
-        apps_workdir = self.app_builder.apps_workdir
-        if not apps_workdir.exists():
-            return []
-
-        running = {
+        running = sorted(
             app_id
             for app_id, info in self._deployed_applications.items()
             if info["is_deployed"].is_set()
-        }
-
+        )
         worker_workspace = self.server.config.workspace if self.server else "local"
-        prefix = f"{worker_workspace}-"
+        apps_workdir = str(self.app_builder.apps_workdir)
 
-        result = []
-        for entry in sorted(apps_workdir.iterdir()):
-            if not entry.is_dir():
-                continue
+        @ray.remote(num_cpus=0)
+        def _list_dirs(apps_workdir_str: str, prefix: str, running_ids: list) -> list:
+            from pathlib import Path
 
-            size = 0
-            latest_mtime: Optional[float] = None
-            for f in entry.rglob("*"):
-                if not f.is_file():
+            apps_workdir = Path(apps_workdir_str)
+            if not apps_workdir.exists():
+                return []
+            running_set = set(running_ids)
+            result = []
+            for entry in sorted(apps_workdir.iterdir()):
+                if not entry.is_dir():
                     continue
-                try:
-                    st = f.stat()
-                except OSError:
-                    continue
-                size += st.st_size
-                if latest_mtime is None or st.st_mtime > latest_mtime:
-                    latest_mtime = st.st_mtime
+                size = 0
+                latest_mtime = None
+                for f in entry.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    try:
+                        st = f.stat()
+                    except OSError:
+                        continue
+                    size += st.st_size
+                    if latest_mtime is None or st.st_mtime > latest_mtime:
+                        latest_mtime = st.st_mtime
+                application_id = (
+                    entry.name[len(prefix):] if entry.name.startswith(prefix) else None
+                )
+                result.append(
+                    {
+                        "name": entry.name,
+                        "application_id": application_id,
+                        "path": str(entry),
+                        "is_running": application_id in running_set
+                        if application_id
+                        else False,
+                        "size_bytes": size,
+                        "last_used_unix": latest_mtime,
+                    }
+                )
+            return result
 
-            if entry.name.startswith(prefix):
-                application_id = entry.name[len(prefix):]
-            else:
-                application_id = None
-
-            result.append(
-                {
-                    "name": entry.name,
-                    "application_id": application_id,
-                    "path": str(entry),
-                    "is_running": application_id in running if application_id else False,
-                    "size_bytes": size,
-                    "last_used_unix": latest_mtime,
-                }
-            )
-        return result
+        return await asyncio.to_thread(
+            ray.get,
+            _list_dirs.remote(apps_workdir, f"{worker_workspace}-", running),
+        )
 
     @schema_method
     async def clear_app_directory(
@@ -1397,8 +1392,10 @@ class AppsManager:
         """
         Deletes an application working directory from the BioEngine apps workspace.
 
-        Raises an error if the application is currently running — stop it first
-        with stop_app() before clearing its directory.
+        Routes through a Ray task because the cache lives on the Ray actor
+        pods, not on the worker (see ``list_app_directories``). Raises an
+        error if the application is currently running — stop it first with
+        ``stop_app()`` before clearing its directory.
 
         Args:
             application_id: Deployment id (e.g. ``"model-runner"``). The worker
@@ -1434,21 +1431,44 @@ class AppsManager:
                     "Stop it first with stop_app()."
                 )
 
-        target = self._resolve_app_directory(application_id)
-        if not target.exists():
-            raise ValueError(
-                f"No directory found for application '{application_id}' in the apps workspace."
+        apps_workdir = str(self.app_builder.apps_workdir)
+        worker_workspace = self.server.config.workspace if self.server else "local"
+
+        @ray.remote(num_cpus=0)
+        def _clear_dir(apps_workdir_str: str, worker_workspace: str, app_id: str) -> dict:
+            import shutil
+            from pathlib import Path
+
+            apps_workdir = Path(apps_workdir_str)
+            prefixed = apps_workdir / f"{worker_workspace}-{app_id}"
+            bare = apps_workdir / app_id
+            target = prefixed if prefixed.exists() else bare
+            if not target.exists():
+                return {"ok": False, "error": "not_found", "path": str(target)}
+            if not target.is_dir():
+                return {"ok": False, "error": "not_a_dir", "path": str(target)}
+            try:
+                shutil.rmtree(target)
+            except Exception as e:
+                return {"ok": False, "error": f"rmtree_failed: {e}", "path": str(target)}
+            return {"ok": True, "path": str(target)}
+
+        result = await asyncio.to_thread(
+            ray.get,
+            _clear_dir.remote(apps_workdir, worker_workspace, application_id),
+        )
+        if not result["ok"]:
+            if result["error"] == "not_found":
+                raise ValueError(
+                    f"No directory found for application '{application_id}' in the apps workspace."
+                )
+            if result["error"] == "not_a_dir":
+                raise ValueError(f"'{application_id}' is not a directory.")
+            raise RuntimeError(
+                f"Failed to delete directory for '{application_id}': {result['error']}"
             )
-        if not target.is_dir():
-            raise ValueError(f"'{application_id}' is not a directory.")
 
-        import shutil
-        try:
-            shutil.rmtree(target)
-        except Exception as e:
-            raise RuntimeError(f"Failed to delete directory for '{application_id}': {e}")
-
-        self.logger.info(f"Cleared app directory: {target}")
+        self.logger.info(f"Cleared app directory: {result['path']}")
 
     @schema_method
     async def list_apps(
