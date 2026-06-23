@@ -379,6 +379,10 @@ class ProxyDeployment:
             Callable proxy function decorated with @schema_function
         """
         method_name = method_schema["name"]
+        # Methods declared with @bioengine.method(context=True) receive the
+        # Hypha caller context as a kwarg. The flag is set by the
+        # introspect task; default False keeps legacy methods unchanged.
+        wants_context = bool(method_schema.get("wants_context", False))
 
         async def deployment_function(*args, context: Dict[str, Any], **kwargs) -> Any:
             # Semaphore bounds concurrency for both WebSocket and WebRTC entry paths —
@@ -402,6 +406,9 @@ class ProxyDeployment:
                         raise AttributeError(
                             f"Method '{method_name}' not found on entry deployment"
                         )
+
+                    if wants_context:
+                        kwargs = {**kwargs, "context": context}
 
                     try:
                         result = await method.remote(*args, **kwargs)

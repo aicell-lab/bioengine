@@ -21,6 +21,7 @@ Ray Serve replicas via the ``py_modules`` upload.
 from __future__ import annotations
 
 import inspect
+from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
 
 from bioengine._app.errors import ReservedMethodNameError
@@ -42,11 +43,20 @@ _RESERVED_NAMES = ("check_health", "async_init", "test_deployment")
 # Tag attached to functions by the marker decorators below.
 _KIND_ATTR = "_bioengine_kind"
 
+# Flag attached by ``@bioengine.method(context=True)``; read by the
+# introspect task and surfaced to ProxyDeployment so the proxy knows to
+# forward the Hypha caller's context as a kwarg.
+_WANTS_CONTEXT_ATTR = "_bioengine_wants_context"
+
 
 # ─────────────────────────── method markers ──────────────────────────────
 
 
-def method(fn: Callable[..., Any]) -> Callable[..., Any]:
+def method(
+    fn: Optional[Callable[..., Any]] = None,
+    *,
+    context: bool = False,
+) -> Callable[..., Any]:
     """Expose an instance method as a BioEngine API method.
 
     Equivalent to ``hypha_rpc``'s ``@schema_method(arbitrary_types_allowed=True)``
@@ -54,12 +64,87 @@ def method(fn: Callable[..., Any]) -> Callable[..., Any]:
     to assemble ``_bioengine_method_schemas``. Arbitrary types are allowed by
     default so methods can accept ``numpy.ndarray``, ``PIL.Image``, etc.
     without users having to wire a custom decorator.
-    """
-    from hypha_rpc.utils.schema import schema_method
 
-    wrapped = schema_method(arbitrary_types_allowed=True)(fn)
-    setattr(wrapped, _KIND_ATTR, "method")
-    return wrapped
+    Set ``context=True`` to receive the Hypha caller's context dict as a
+    ``context`` kwarg::
+
+        @bioengine.method(context=True)
+        async def whoami(self, context):
+            return context["user"]["id"]
+
+    The ``context`` parameter is **not** exposed in the schema Hypha
+    publishes to clients — it is auto-injected by Hypha at the service
+    boundary and forwarded by the ProxyDeployment so the user method
+    receives the live caller identity on every call.
+    """
+
+    def _wrap(f: Callable[..., Any]) -> Callable[..., Any]:
+        from hypha_rpc.utils.schema import schema_method
+
+        if not context:
+            wrapped = schema_method(arbitrary_types_allowed=True)(f)
+            setattr(wrapped, _KIND_ATTR, "method")
+            setattr(wrapped, _WANTS_CONTEXT_ATTR, False)
+            return wrapped
+
+        # context=True: the user method must declare a ``context``
+        # parameter. We build the schema from the full signature first
+        # (so the parameter types still pick up annotations), then strip
+        # ``context`` out of the published parameters dict and wrap the
+        # original function in a pass-through that forwards everything —
+        # including the proxy-injected ``context`` kwarg — to the user
+        # code. The wrapped function intentionally bypasses pydantic
+        # validation on the replica side because ``context`` reaches the
+        # replica as an extra kwarg that the public schema does not
+        # describe; the Hypha service boundary still validates the public
+        # parameters before the call ever leaves the proxy.
+        sig = inspect.signature(f)
+        if "context" not in sig.parameters:
+            raise TypeError(
+                f"@bioengine.method(context=True) on "
+                f"'{getattr(f, '__qualname__', f.__name__)}': the method "
+                f"must declare a 'context' parameter (e.g. "
+                f"'async def {f.__name__}(self, ..., context): ...')."
+            )
+
+        full_schema = schema_method(arbitrary_types_allowed=True)(f).__schema__
+        params_schema = dict(full_schema.get("parameters") or {})
+        properties = dict(params_schema.get("properties") or {})
+        properties.pop("context", None)
+        params_schema["properties"] = properties
+        required = [
+            r for r in (params_schema.get("required") or []) if r != "context"
+        ]
+        if required:
+            params_schema["required"] = required
+        else:
+            params_schema.pop("required", None)
+        public_schema = {
+            "name": full_schema.get("name") or f.__name__,
+            "description": full_schema.get("description") or f.__doc__,
+            "parameters": params_schema,
+        }
+
+        if inspect.iscoroutinefunction(f):
+
+            @wraps(f)
+            async def wrapper(self, *args, **kwargs):
+                return await f(self, *args, **kwargs)
+
+        else:
+
+            @wraps(f)
+            def wrapper(self, *args, **kwargs):
+                return f(self, *args, **kwargs)
+
+        wrapper.__schema__ = public_schema
+        setattr(wrapper, _KIND_ATTR, "method")
+        setattr(wrapper, _WANTS_CONTEXT_ATTR, True)
+        return wrapper
+
+    if fn is not None:
+        return _wrap(fn)
+    return _wrap
 
 
 def async_init(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -227,7 +312,15 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         if kind is None:
             continue
         if kind == "method":
-            method_schemas.append(member.__schema__)
+            # Carry the wants_context flag in the schema dict so the
+            # introspect task ships it to the proxy, which uses it to
+            # decide whether to inject the Hypha caller context on each
+            # call. The flag survives JSON serialisation via _sanitise_schemas.
+            entry = dict(member.__schema__)
+            entry["wants_context"] = bool(
+                getattr(member, _WANTS_CONTEXT_ATTR, False)
+            )
+            method_schemas.append(entry)
         elif kind == "multiplexed":
             lifecycle["multiplexed"].append(attr_name)
         elif kind in lifecycle:
