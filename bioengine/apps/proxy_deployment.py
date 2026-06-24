@@ -384,6 +384,26 @@ class ProxyDeployment:
         # introspect task; default False keeps legacy methods unchanged.
         wants_context = bool(method_schema.get("wants_context", False))
 
+        def _context_to_plain_dict(obj: Any) -> Any:
+            """Convert Hypha's munch-style context proxy into a plain dict.
+
+            Hypha auto-injects ``context`` as a ``munch.Munch`` (attribute-
+            accessible dict subclass) on the service side. Cloudpickling that
+            across the ServeHandle to a replica that has no ``hypha_rpc``
+            install would leave the user with a broken proxy; walking the
+            tree once here produces a plain dict the replica can
+            ``isinstance(context, dict)``-check, ``json.dumps``-round-trip,
+            and store without surprise.
+            """
+            if isinstance(obj, dict) or hasattr(obj, "items"):
+                try:
+                    return {k: _context_to_plain_dict(v) for k, v in obj.items()}
+                except Exception:
+                    pass
+            if isinstance(obj, (list, tuple)):
+                return [_context_to_plain_dict(v) for v in obj]
+            return obj
+
         async def deployment_function(*args, context: Dict[str, Any], **kwargs) -> Any:
             # Semaphore bounds concurrency for both WebSocket and WebRTC entry paths —
             # they share this single wrapper, so a long-running call from either
@@ -408,7 +428,7 @@ class ProxyDeployment:
                         )
 
                     if wants_context:
-                        kwargs = {**kwargs, "context": context}
+                        kwargs = {**kwargs, "context": _context_to_plain_dict(context)}
 
                     try:
                         result = await method.remote(*args, **kwargs)
