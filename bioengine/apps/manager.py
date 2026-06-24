@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -10,6 +11,7 @@ from hypha_rpc import connect_to_server
 from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
+import ray
 from ray import serve
 
 from bioengine import __version__
@@ -66,6 +68,20 @@ def _belongs_to_worker_workspace(
         )
         return False
     return True
+
+
+# Ray-task helpers for the app cache API live in a stdlib-only sibling
+# module: the Ray Client server unpickles ``ray.remote(fn)`` references by
+# re-importing the function's module, and the manager namespace pulls in
+# haikunator / hypha_rpc / ray.serve which the Ray Client server's base
+# venv doesn't have. Keeping the helpers in their own module sidesteps that.
+from bioengine.apps._cache_fs_tasks import (
+    clear_dir_on_node as _clear_dir_on_node,
+    fs_probe_delete as _fs_probe_delete,
+    fs_probe_read as _fs_probe_read,
+    fs_probe_write as _fs_probe_write,
+    list_dirs_on_node as _list_dirs_on_node,
+)
 
 
 class AppsManager:
@@ -193,6 +209,12 @@ class AppsManager:
         self.worker_service_id = None
         self._deployment_lock = asyncio.Lock()
         self._deployed_applications = {}
+
+        # Cache the result of the one-time FS-topology probe across Ray
+        # nodes. None until the first list/clear-cache call from the
+        # dashboard triggers the probe; never re-runs automatically.
+        self._fs_topology_mode: Optional[str] = None  # "shared" | "per_node"
+        self._fs_topology_lock = asyncio.Lock()
         self.debug = debug
 
     def _check_initialized(self) -> None:
@@ -1281,6 +1303,80 @@ class AppsManager:
 
         return created_artifact_id
 
+    async def _detect_fs_topology(self) -> str:
+        """One-time probe: do all Ray nodes share ``apps_workdir`` on disk?
+
+        Writes a unique marker file on one node, reads it from a Ray task on
+        every other live node, and infers ``"shared"`` iff every node sees
+        the same bytes. Falls back to ``"per_node"`` if any read disagrees
+        or fails. Cleans up the marker on all nodes regardless of outcome.
+
+        The result is cached for the AppsManager's lifetime — the probe is
+        only triggered lazily by the first ``list_app_directories`` or
+        ``clear_app_directory`` call from the dashboard, never at worker
+        startup or anywhere else.
+        """
+        if self._fs_topology_mode is not None:
+            return self._fs_topology_mode
+        async with self._fs_topology_lock:
+            if self._fs_topology_mode is not None:
+                return self._fs_topology_mode
+
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+            apps_workdir = str(self.app_builder.apps_workdir)
+            alive_nodes = [n for n in ray.nodes() if n.get("Alive")]
+            alive_node_ids = [n["NodeID"] for n in alive_nodes]
+
+            if len(alive_node_ids) <= 1:
+                self._fs_topology_mode = "shared"
+                self.logger.info(
+                    f"FS topology: single Ray node ⇒ shared (trivially)."
+                )
+                return self._fs_topology_mode
+
+            marker_name = f".bioengine_fs_probe_{uuid.uuid4().hex}.txt"
+            marker_content = uuid.uuid4().hex
+
+            def _affinity(node_id: str):
+                return NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+
+            try:
+                write_ref = ray.remote(num_cpus=0)(
+                    _fs_probe_write
+                ).options(scheduling_strategy=_affinity(alive_node_ids[0])).remote(
+                    apps_workdir, marker_name, marker_content
+                )
+                await asyncio.to_thread(ray.get, write_ref)
+
+                read_refs = [
+                    ray.remote(num_cpus=0)(_fs_probe_read)
+                    .options(scheduling_strategy=_affinity(nid))
+                    .remote(apps_workdir, marker_name, marker_content)
+                    for nid in alive_node_ids
+                ]
+                read_results = await asyncio.to_thread(ray.get, read_refs)
+                mode = "shared" if all(read_results) else "per_node"
+            finally:
+                cleanup_refs = [
+                    ray.remote(num_cpus=0)(_fs_probe_delete)
+                    .options(scheduling_strategy=_affinity(nid))
+                    .remote(apps_workdir, marker_name)
+                    for nid in alive_node_ids
+                ]
+                try:
+                    await asyncio.to_thread(ray.get, cleanup_refs)
+                except Exception as exc:
+                    self.logger.warning(
+                        f"FS probe marker cleanup raised (continuing): {exc}"
+                    )
+
+            self._fs_topology_mode = mode
+            self.logger.info(
+                f"FS topology probe across {len(alive_node_ids)} Ray nodes ⇒ {mode}."
+            )
+            return mode
+
     @schema_method
     async def list_app_directories(
         self,
@@ -1292,15 +1388,32 @@ class AppsManager:
         """
         Lists all application working directories under the BioEngine apps workspace.
 
-        Returns one entry per subdirectory found under the apps working directory,
-        including whether that directory belongs to a currently running application.
+        In v0.11.4+ the worker pod is filesystem-thin — app caches live on
+        the Ray actor pods, not on the worker. The first call probes whether
+        ``apps_workdir`` is shared across every Ray node (NFS RWX) or
+        per-node (local disk), caches the result, then:
+
+        - **shared FS**: dispatches one Ray task on any node and returns
+          its entries directly.
+        - **per-node FS**: dispatches one Ray task per Ray node, tags each
+          entry with the source node, and returns the union (so the same
+          ``application_id`` can appear once per node that cached it).
+
+        This call is meant to be invoked on-demand from the BioEngine
+        dashboard. The worker never runs it automatically.
 
         Returns:
             List of dictionaries, each with:
-            - name: directory name (matches application_id for deployed apps)
-            - path: absolute path to the directory
-            - is_running: True if the directory belongs to a currently running app
+            - name: directory name as it exists on disk
+            - application_id: the deployment id (worker-workspace prefix stripped),
+              or None for legacy or unrecognised directories
+            - path: absolute path to the directory on the Ray actor pod
+            - is_running: True if a currently running app maps to this directory
             - size_bytes: total disk usage of the directory in bytes
+            - last_used_unix: the most recent file mtime in the tree, as a
+              Unix timestamp (float seconds). None if the directory is empty.
+            - node_id: Ray node ID where this entry was observed (useful in
+              per-node FS topologies; identifies which node holds the cache).
 
         Raises:
             PermissionError: If the caller is not a worker admin
@@ -1313,58 +1426,87 @@ class AppsManager:
             resource_name="listing app directories",
         )
 
-        apps_workdir = self.app_builder.apps_workdir
-        if not apps_workdir.exists():
-            return []
-
-        running = {
+        running = sorted(
             app_id
             for app_id, info in self._deployed_applications.items()
             if info["is_deployed"].is_set()
-        }
+        )
+        worker_workspace = self.server.config.workspace if self.server else "local"
+        apps_workdir = str(self.app_builder.apps_workdir)
+        prefix = f"{worker_workspace}-"
 
-        result = []
-        for entry in sorted(apps_workdir.iterdir()):
-            if not entry.is_dir():
-                continue
-            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
-            result.append(
-                {
-                    "name": entry.name,
-                    "path": str(entry),
-                    "is_running": entry.name in running,
-                    "size_bytes": size,
-                }
+        mode = await self._detect_fs_topology()
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        alive_nodes = [n for n in ray.nodes() if n.get("Alive")]
+        if not alive_nodes:
+            return []
+
+        if mode == "shared":
+            target_nodes = [alive_nodes[0]]
+        else:
+            target_nodes = alive_nodes
+
+        refs = [
+            ray.remote(num_cpus=0)(_list_dirs_on_node)
+            .options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=n["NodeID"], soft=False
+                )
             )
-        return result
+            .remote(apps_workdir, prefix, running, n["NodeID"])
+            for n in target_nodes
+        ]
+        per_node_results = await asyncio.to_thread(ray.get, refs)
+        merged: List[Dict[str, Any]] = []
+        for chunk in per_node_results:
+            merged.extend(chunk)
+        merged.sort(key=lambda e: (e["name"], e.get("node_id") or ""))
+        return merged
 
     @schema_method
     async def clear_app_directory(
         self,
         application_id: str = Field(
             ...,
-            description="Application ID whose working directory should be deleted. Must match a subdirectory of the apps workspace (e.g. 'model-runner').",
+            description="Application ID whose working directory should be deleted (e.g. 'model-runner'). Resolves to the worker-workspace-prefixed directory created by the builder, with a fallback to a bare directory name for legacy layouts.",
         ),
         context: Dict[str, Any] = Field(
             ...,
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
-    ) -> None:
+    ) -> Dict[str, Any]:
         """
         Deletes an application working directory from the BioEngine apps workspace.
 
-        The directory is identified by application_id (as returned in the 'name' field
-        of list_app_directories). Raises an error if the application is currently running —
-        stop it first with stop_app() before clearing its directory.
+        Routes through Ray tasks because the cache lives on the Ray actor
+        pods, not on the worker (see ``list_app_directories``). On shared
+        FS the deletion runs once on any node; on per-node FS it fans out
+        to every node and deletes the directory wherever it exists.
+
+        Refuses to delete if the application is currently running — stop it
+        first with ``stop_app()``. Meant to be invoked on-demand from the
+        BioEngine dashboard; the worker never runs it automatically.
 
         Args:
-            application_id: ID of the application whose directory should be deleted (e.g. "model-runner").
+            application_id: Deployment id (e.g. ``"model-runner"``). The worker
+                resolves the actual on-disk directory using its own workspace
+                prefix (``<worker-workspace>-<application_id>``); a bare
+                ``<application_id>`` directory is accepted as a fallback for
+                caches created by earlier worker releases.
+
+        Returns:
+            Dict with ``mode`` (shared|per_node), ``deleted_on`` (list of node
+            IDs where a directory was actually removed), and ``not_found_on``
+            (list of node IDs that had no matching directory).
 
         Raises:
             PermissionError: If the caller is not a worker admin
-            RuntimeError: If the worker is not initialized, the app is currently running,
-                         or deletion fails
-            ValueError: If the directory does not exist or application_id contains path separators
+            RuntimeError: If the worker is not initialized, the app is currently
+                running, or every node's delete failed for a reason other than
+                "not_found".
+            ValueError: If no node had a matching directory, or
+                application_id contains path separators.
         """
         self._check_initialized()
         check_permissions(
@@ -1378,14 +1520,6 @@ class AppsManager:
                 f"application_id must be a plain name, not a path: '{application_id}'"
             )
 
-        target = self.app_builder.apps_workdir / application_id
-        if not target.exists():
-            raise ValueError(
-                f"No directory found for application '{application_id}' in the apps workspace."
-            )
-        if not target.is_dir():
-            raise ValueError(f"'{application_id}' is not a directory.")
-
         # Refuse if the app is currently running
         if application_id in self._deployed_applications:
             info = self._deployed_applications[application_id]
@@ -1395,13 +1529,57 @@ class AppsManager:
                     "Stop it first with stop_app()."
                 )
 
-        import shutil
-        try:
-            shutil.rmtree(target)
-        except Exception as e:
-            raise RuntimeError(f"Failed to delete directory for '{application_id}': {e}")
+        apps_workdir = str(self.app_builder.apps_workdir)
+        worker_workspace = self.server.config.workspace if self.server else "local"
 
-        self.logger.info(f"Cleared app directory: {target}")
+        mode = await self._detect_fs_topology()
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        alive_nodes = [n for n in ray.nodes() if n.get("Alive")]
+        if not alive_nodes:
+            raise RuntimeError(
+                f"No Ray nodes alive — cannot clear directory for '{application_id}'."
+            )
+
+        target_nodes = [alive_nodes[0]] if mode == "shared" else alive_nodes
+        refs = [
+            ray.remote(num_cpus=0)(_clear_dir_on_node)
+            .options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=n["NodeID"], soft=False
+                )
+            )
+            .remote(apps_workdir, worker_workspace, application_id, n["NodeID"])
+            for n in target_nodes
+        ]
+        results = await asyncio.to_thread(ray.get, refs)
+
+        deleted_on = [r["node_id"] for r in results if r["ok"]]
+        not_found_on = [r["node_id"] for r in results if r["error"] == "not_found"]
+        hard_failures = [
+            r for r in results if not r["ok"] and r["error"] != "not_found"
+        ]
+
+        if hard_failures:
+            details = "; ".join(
+                f"node={r['node_id']}: {r['error']}" for r in hard_failures
+            )
+            raise RuntimeError(
+                f"Failed to delete directory for '{application_id}': {details}"
+            )
+        if not deleted_on:
+            raise ValueError(
+                f"No directory found for application '{application_id}' on any Ray node."
+            )
+
+        self.logger.info(
+            f"Cleared app directory for '{application_id}' on nodes: {deleted_on}"
+        )
+        return {
+            "mode": mode,
+            "deleted_on": deleted_on,
+            "not_found_on": not_found_on,
+        }
 
     @schema_method
     async def list_apps(
