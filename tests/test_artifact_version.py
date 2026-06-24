@@ -1,16 +1,17 @@
 """
-Targeted test for artifact version commit behaviour.
+Targeted tests for ``upload_app`` artifact version handling.
 
-Verifies that upload_app commits the artifact under the version
-declared in manifest.yaml instead of always defaulting to "latest".
+The worker enforces strict version monotonicity on upload: the manifest
+``version`` must be strictly greater than every existing tag on the artifact.
+This file verifies four cases:
 
-Three cases are tested:
-1. New version tag → creates an isolated snapshot (previous versions intact)
-2. Re-saving the latest version → updates in place (no duplicate tag)
-3. Re-saving an older non-latest version → raises ValueError
+1. New artifact → committed under the manifest version tag.
+2. Bumping the version → both tags are independently readable.
+3. Re-saving the same version → rejected (would overwrite a published release).
+4. Saving an older version → rejected.
 
 Run with:
-    conda activate bioengine-worker
+    conda activate bioengine
     source .env
     pytest tests/test_artifact_version.py -v
 """
@@ -34,25 +35,23 @@ id: {artifact_id}
 id_emoji: "🧪"
 description: "Temporary app used to test artifact version commits"
 type: ray-serve
-format_version: 0.5.0
+format_version: 0.6.0
 version: {version}
+entry: test_dep:TestDep
 authors:
   - {{name: "Test"}}
 license: MIT
-deployments:
-  - test_dep:TestDep
 authorized_users:
   - "*"
 """
 
 DEPLOYMENT_SRC = """\
-from ray import serve
+import bioengine
 
-@serve.deployment(ray_actor_options={"num_cpus": 0, "num_gpus": 0, "memory": 128*1024**2, "runtime_env": {"pip": []}})
+
+@bioengine.app(ray_actor_options={"num_cpus": 0, "num_gpus": 0})
 class TestDep:
-    async def async_init(self): pass
-    async def test_deployment(self): pass
-    async def check_health(self): pass
+    pass
 """
 
 
@@ -108,13 +107,9 @@ async def test_upload_app_commits_manifest_version(worker, artifact_manager):
         saved_id = await worker.upload_app(files=_make_files(artifact_alias, test_version))
         assert saved_id == artifact_id, f"Unexpected artifact ID: {saved_id}"
 
-        # The artifact must be retrievable by its version tag
         artifact = await artifact_manager.read(artifact_id=artifact_id, version=test_version)
-        assert artifact is not None, "Artifact not found at expected version tag"
-        assert artifact.manifest.get("version") == test_version, (
-            f"Manifest version mismatch: expected {test_version!r}, "
-            f"got {artifact.manifest.get('version')!r}"
-        )
+        assert artifact is not None
+        assert artifact.manifest.get("version") == test_version
     finally:
         try:
             await artifact_manager.delete(artifact_id)
@@ -124,11 +119,7 @@ async def test_upload_app_commits_manifest_version(worker, artifact_manager):
 
 @pytest.mark.asyncio
 async def test_upload_app_new_version_creates_isolated_snapshot(worker, artifact_manager):
-    """Bumping the version in manifest.yaml creates a new isolated snapshot.
-
-    After saving v1 and then v2, both version tags must be independently
-    readable and reflect the manifest version they were saved with.
-    """
+    """Bumping the version creates a new isolated snapshot; old tag still readable."""
     artifact_alias = "version-bump-test-pytest"
     artifact_id = f"bioimage-io/{artifact_alias}"
     v1, v2 = "1.0.0", "1.1.0"
@@ -141,20 +132,14 @@ async def test_upload_app_new_version_creates_isolated_snapshot(worker, artifact
     try:
         await worker.upload_app(files=_make_files(artifact_alias, v1))
         a1 = await artifact_manager.read(artifact_id=artifact_id, version=v1)
-        assert a1 is not None, f"Artifact not found at version {v1}"
         assert a1.manifest.get("version") == v1
 
         await worker.upload_app(files=_make_files(artifact_alias, v2))
         a2 = await artifact_manager.read(artifact_id=artifact_id, version=v2)
-        assert a2 is not None, f"Artifact not found at version {v2}"
         assert a2.manifest.get("version") == v2
 
-        # v1 must still be independently readable
         a1_after = await artifact_manager.read(artifact_id=artifact_id, version=v1)
-        assert a1_after is not None, f"v1 disappeared after saving v2"
-        assert a1_after.manifest.get("version") == v1, (
-            f"v1 manifest was mutated after saving v2: got {a1_after.manifest.get('version')!r}"
-        )
+        assert a1_after.manifest.get("version") == v1
     finally:
         try:
             await artifact_manager.delete(artifact_id)
@@ -163,12 +148,8 @@ async def test_upload_app_new_version_creates_isolated_snapshot(worker, artifact
 
 
 @pytest.mark.asyncio
-async def test_upload_app_resave_latest_version_updates_inplace(worker, artifact_manager):
-    """Re-saving the same (latest) version updates the artifact in place.
-
-    No new version tag is created; the existing version tag reflects the
-    updated content.
-    """
+async def test_upload_app_resave_same_version_rejected(worker, artifact_manager):
+    """Re-saving the same version must be rejected (would overwrite a release)."""
     artifact_alias = "version-resave-pytest"
     artifact_id = f"bioimage-io/{artifact_alias}"
     version = "1.0.0"
@@ -180,12 +161,8 @@ async def test_upload_app_resave_latest_version_updates_inplace(worker, artifact
 
     try:
         await worker.upload_app(files=_make_files(artifact_alias, version))
-        # Re-saving the same version must not raise
-        await worker.upload_app(files=_make_files(artifact_alias, version))
-
-        artifact = await artifact_manager.read(artifact_id=artifact_id, version=version)
-        assert artifact is not None
-        assert artifact.manifest.get("version") == version
+        with pytest.raises(Exception, match=r"strictly greater|already exists"):
+            await worker.upload_app(files=_make_files(artifact_alias, version))
     finally:
         try:
             await artifact_manager.delete(artifact_id)
@@ -194,13 +171,9 @@ async def test_upload_app_resave_latest_version_updates_inplace(worker, artifact
 
 
 @pytest.mark.asyncio
-async def test_upload_app_resave_older_version_raises(worker, artifact_manager):
-    """Re-saving an older (non-latest) version must raise a ValueError.
-
-    Once a newer version exists, trying to overwrite an older version is
-    not supported by Hypha. The worker must surface a clear error.
-    """
-    artifact_alias = "version-older-resave-pytest"
+async def test_upload_app_older_version_rejected(worker, artifact_manager):
+    """Saving a lower version than the highest existing tag must be rejected."""
+    artifact_alias = "version-older-pytest"
     artifact_id = f"bioimage-io/{artifact_alias}"
     v1, v2 = "1.0.0", "1.1.0"
 
@@ -213,8 +186,7 @@ async def test_upload_app_resave_older_version_raises(worker, artifact_manager):
         await worker.upload_app(files=_make_files(artifact_alias, v1))
         await worker.upload_app(files=_make_files(artifact_alias, v2))
 
-        # Attempting to re-save v1 when v2 is the latest must raise
-        with pytest.raises(Exception, match=r"[Cc]annot re-save|newer version|already exists"):
+        with pytest.raises(Exception, match=r"strictly greater|already exists"):
             await worker.upload_app(files=_make_files(artifact_alias, v1))
     finally:
         try:

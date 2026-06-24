@@ -56,8 +56,8 @@ class HttpZarrStore(Store):
     An optional ``token`` is appended as ``?token=`` for the local-server case.
     """
 
-    dataset_id: str
-    zarr_path: str
+    dataset_id: Optional[str] = None
+    zarr_path: Optional[str] = None
     _read_only: bool = True
 
     supports_writes: bool = False
@@ -77,6 +77,8 @@ class HttpZarrStore(Store):
             os.getenv("BIOENGINE_DATASETS_ZARR_STORE_CONNECTIONS", 100)
         ),
         logger: logging.Logger = logging.getLogger("HttpZarrStore"),
+        dataset_id: Optional[str] = None,
+        zarr_path: Optional[str] = None,
     ):
         """
         Initialize the HTTP-based Zarr store for remote dataset access.
@@ -95,12 +97,20 @@ class HttpZarrStore(Store):
             max_concurrent_requests: Maximum number of concurrent HTTP requests
             max_connections: Maximum number of HTTP connections in pool
             logger: Logger instance for logging messages
+            dataset_id: BioEngine dataset id this store points at, when the
+                URL came from ``BioEngineDatasets.get_file`` — exposed for
+                downstream consumers that need to round-trip the identifier.
+                Left as ``None`` for arbitrary external Zarr roots.
+            zarr_path: Zarr path within the dataset, complementary to
+                ``dataset_id``. ``None`` for external roots.
         """
         super().__init__(read_only=True)
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.logger = logger
         self._chunk_cache = chunk_cache
+        self.dataset_id = dataset_id
+        self.zarr_path = zarr_path
 
         # Concurrency control
         self._request_semaphore = Semaphore(max_concurrent_requests)
