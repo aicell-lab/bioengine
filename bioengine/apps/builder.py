@@ -452,6 +452,7 @@ class AppBuilder:
         ] = None,
         deploying_user: Optional[tuple] = None,
         admin_users: Optional[List[str]] = None,
+        scaling: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> "BuiltApp":
         """Construct the Ray Serve application for a v0.6.0 BioEngine app."""
         self.logger.info(
@@ -586,6 +587,7 @@ class AppBuilder:
             "disable_gpu": disable_gpu,
             "max_ongoing_requests": max_ongoing_requests,
             "proxy_memory_in_gb": proxy_memory_in_gb,
+            "scaling": dict(scaling or {}),
             "application_resources": required_resources,
             "authorized_users": effective_authorized_users,
             "available_methods": available_methods,
@@ -684,6 +686,7 @@ class AppBuilder:
             user_replica_framework_pip=user_replica_framework_pip,
             replica_env_vars=replica_env_vars,
             proxy_memory_in_gb=proxy_memory_in_gb,
+            scaling=dict(scaling or {}),
         )
 
     async def submit(self, built_app: "BuiltApp", application_id: str) -> None:
@@ -722,6 +725,7 @@ class AppBuilder:
                     built_app.user_replica_framework_pip,
                     _ensure_jsonable(built_app.replica_env_vars),
                     built_app.proxy_memory_in_gb,
+                    _ensure_jsonable(built_app.scaling),
                 ),
             )
         except ray.exceptions.RayTaskError as exc:
@@ -761,6 +765,7 @@ class BuiltApp:
         "user_replica_framework_pip",
         "replica_env_vars",
         "proxy_memory_in_gb",
+        "scaling",
     )
 
     def __init__(
@@ -776,6 +781,7 @@ class BuiltApp:
         user_replica_framework_pip: List[str],
         replica_env_vars: Dict[str, str],
         proxy_memory_in_gb: float,
+        scaling: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         self.metadata = metadata
         self.spec = spec
@@ -788,3 +794,7 @@ class BuiltApp:
         self.user_replica_framework_pip = user_replica_framework_pip
         self.replica_env_vars = replica_env_vars
         self.proxy_memory_in_gb = proxy_memory_in_gb
+        # Map of {user_deployment_class_name: {num_replicas, autoscaling_config}}.
+        # Empty default means every user deployment runs at Ray Serve's default
+        # of one replica with no autoscaling.
+        self.scaling = dict(scaling or {})
