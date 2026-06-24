@@ -372,6 +372,8 @@ class BioEngineDatasets:
                 token=token,
                 chunk_cache=self.chunk_cache,
                 logger=self.logger,
+                dataset_id=dataset_id,
+                zarr_path=zarr_path,
             )
         else:
             from bioengine.datasets.utils import get_url_with_retry
