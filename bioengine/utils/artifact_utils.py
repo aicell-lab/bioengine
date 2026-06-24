@@ -8,11 +8,54 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import httpx
 import yaml
+from packaging.version import InvalidVersion, Version
 
 if TYPE_CHECKING:
     from hypha_rpc.rpc import ObjectProxy
 
 from .logger import create_logger
+
+
+def _enforce_version_increases(
+    new_version: Optional[str],
+    existing_versions: List[str],
+    artifact_id: str,
+) -> None:
+    """Reject uploads that would overwrite or downgrade an existing version.
+
+    The manifest version must be strictly greater than every existing tag on
+    the artifact, using PEP 440 ordering (``packaging.version.Version``). If
+    either side is not PEP-440-parseable, fall back to rejecting any exact
+    match by string.
+    """
+    if not new_version:
+        raise ValueError(
+            f"Cannot upload '{artifact_id}': manifest is missing a 'version' "
+            f"field. Add a semver-style version (e.g. '1.2.3') to manifest.yaml."
+        )
+    if not existing_versions:
+        return
+
+    try:
+        new_parsed = Version(str(new_version))
+        existing_parsed = [(v, Version(str(v))) for v in existing_versions]
+    except InvalidVersion:
+        if str(new_version) in {str(v) for v in existing_versions}:
+            raise ValueError(
+                f"Cannot upload '{artifact_id}' at version '{new_version}': "
+                f"that version already exists. Bump the version in "
+                f"manifest.yaml (existing: {existing_versions})."
+            )
+        return
+
+    highest_str, highest_parsed = max(existing_parsed, key=lambda x: x[1])
+    if new_parsed <= highest_parsed:
+        raise ValueError(
+            f"Cannot upload '{artifact_id}' at version '{new_version}': "
+            f"must be strictly greater than the highest existing version "
+            f"'{highest_str}'. Bump the version in manifest.yaml "
+            f"(existing: {existing_versions})."
+        )
 
 
 def create_file_list_from_directory(
@@ -371,17 +414,15 @@ async def stage_artifact(
     manifest: Dict[str, Any],
     logger: Optional[logging.Logger] = None,
     permissions: Optional[Dict[str, Any]] = None,
-) -> tuple:
+) -> "ObjectProxy":
     """
     Put an artifact into stage mode. Creates a new artifact if it doesn't exist.
 
-    Versioning behaviour:
-    - New artifact or version tag not yet present → branches a new version snapshot
-      (``edit(version='new')``); the caller should commit with the version tag.
-    - Version tag already exists → stages on top of the current head without
-      branching (``edit(version=None)``); the caller should commit *without* a tag
-      so the existing named version is updated in place and other versions are
-      left untouched.
+    Always branches a fresh version snapshot (``edit(version='new')``); the
+    caller commits with the manifest version as the tag. The manifest version
+    must be strictly greater than every existing tag on the artifact — same
+    or lower versions are rejected to prevent silent overwrites of published
+    releases.
 
     Args:
         artifact_manager: Hypha artifact manager service instance
@@ -391,11 +432,12 @@ async def stage_artifact(
         permissions: Optional permissions to set on the artifact
 
     Returns:
-        Tuple of (artifact, version_is_new) where version_is_new is True when the
-        manifest version did not previously exist and should be tagged on commit.
+        The staged artifact handle.
 
     Raises:
-        RuntimeError: If artifact creation fails
+        ValueError: If the manifest is missing a version or the version is not
+            strictly greater than every existing version of the artifact.
+        RuntimeError: If artifact creation fails.
     """
     if logger is None:
         logger = create_logger("ArtifactUtils")
@@ -421,7 +463,6 @@ async def stage_artifact(
 
     # Check if artifact exists and handle collection placement
     artifact = None
-    version_is_new = True  # new artifact always gets a version tag on commit
     manifest_version = manifest.get("version")
 
     try:
@@ -447,52 +488,33 @@ async def stage_artifact(
             if view_config is not None:
                 artifact_config["view_config"] = view_config
 
-            # Decide how to stage based on whether the manifest version is new:
-            #
-            # - New version tag: edit(version='new') branches a fresh snapshot so
-            #   all previous versions stay intact; caller commits with the tag.
-            # - Same version as the LATEST: edit(version=None) stages on the
-            #   current head; caller commits without a tag — updates in place.
-            # - Same version as an OLDER (non-latest) tag: not supported by Hypha
-            #   (edit always targets the latest head), so raise a clear error.
+            # Enforce strict version monotonicity — uploading the same or a
+            # lower version than the highest existing tag would overwrite a
+            # published release. Force the author to bump manifest.yaml.
             existing_versions = [
                 v["version"] for v in (existing_artifact.versions or [])
             ]
-            version_is_new = bool(
-                manifest_version and manifest_version not in existing_versions
+            _enforce_version_increases(
+                new_version=manifest_version,
+                existing_versions=existing_versions,
+                artifact_id=artifact_id,
             )
-
-            if not version_is_new and existing_versions:
-                latest_version = existing_versions[-1]
-                if manifest_version and manifest_version != latest_version:
-                    raise ValueError(
-                        f"Cannot re-save artifact '{artifact_id}' at version "
-                        f"'{manifest_version}': a newer version '{latest_version}' "
-                        f"already exists. Bump the version in manifest.yaml to save "
-                        f"changes (existing versions: {existing_versions})."
-                    )
 
             edit_kwargs = {
                 "artifact_id": artifact_id,
                 "manifest": manifest,
                 "type": "application",
                 "stage": True,
-                "version": "new" if version_is_new else None,
+                "version": "new",
             }
             if artifact_config:
                 edit_kwargs["config"] = artifact_config
 
             artifact = await artifact_manager.edit(**edit_kwargs)
-            if version_is_new:
-                logger.info(
-                    f"Editing existing artifact '{artifact_id}' "
-                    f"(new version: {manifest_version})"
-                )
-            else:
-                logger.info(
-                    f"Editing existing artifact '{artifact_id}' "
-                    f"(updating existing version: {manifest_version or 'latest'})"
-                )
+            logger.info(
+                f"Editing existing artifact '{artifact_id}' "
+                f"(new version: {manifest_version})"
+            )
 
     except Exception as e:
         expected_error = f"KeyError: \"Artifact with ID '{artifact_id}' does not exist."
@@ -523,7 +545,7 @@ async def stage_artifact(
         except Exception as e:
             raise RuntimeError(f"Failed to create artifact '{artifact_id}': {e}")
 
-    return artifact, version_is_new
+    return artifact
 
 
 async def upload_file_to_artifact(
@@ -752,9 +774,10 @@ async def create_application_from_files(
     # Add created_by field to the manifest
     application_manifest["created_by"] = user_id
 
-    # Edit or create artifact, put in stage mode.
-    # version_is_new tells us whether to tag the commit with the manifest version.
-    artifact, version_is_new = await stage_artifact(
+    # Edit or create artifact, put in stage mode. Strict version monotonicity
+    # is enforced inside stage_artifact, so the staged snapshot always gets a
+    # fresh manifest-version tag on commit.
+    artifact = await stage_artifact(
         artifact_manager=artifact_manager,
         workspace=workspace,
         manifest=application_manifest,
@@ -823,15 +846,12 @@ async def create_application_from_files(
                     f"Failed to remove old file '{file_name}': {e}. Continuing anyway..."
                 )
 
-    # Commit the artifact.
-    # Only tag with the manifest version when it is genuinely new; if the version
-    # tag already existed we commit without a tag (updates the artifact in place
-    # without creating a duplicate version entry).
-    commit_version = application_manifest.get("version") if version_is_new else None
+    # Commit the artifact under the manifest version tag (always a new tag —
+    # stage_artifact rejects same-or-lower versions before we reach this point).
     await commit_artifact(
         artifact_manager=artifact_manager,
         artifact_id=artifact.id,
-        version=commit_version,
+        version=application_manifest.get("version"),
         logger=logger,
     )
 
