@@ -469,6 +469,7 @@ def build_and_run_application(
     user_replica_framework_pip: List[str],
     replica_env_vars: Dict[str, str],
     proxy_memory_in_gb: float,
+    scaling: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Assemble the Ray Serve bind graph AND call ``serve.run`` in-process.
 
@@ -587,11 +588,24 @@ def build_and_run_application(
         opts["runtime_env"] = runtime_env
         return cls.options(ray_actor_options=opts)
 
+    scaling_map = dict(scaling or {})
+
     def bind(cid: str) -> Any:
         if cid in handles:
             return handles[cid]
         meta = spec["classes"][cid]
         cls = _with_pkg(_load_app_class(cid))
+        # Per-deployment scaling: the user keys the dict by class name
+        # (matching what get_app_status reports). Multi-class apps can
+        # mix fixed and autoscaling configs across deployments.
+        class_name = meta["qualname"].split(".")[-1]
+        per_class = scaling_map.get(class_name) or {}
+        per_class_autoscale = per_class.get("autoscaling_config")
+        per_class_replicas = per_class.get("num_replicas")
+        if per_class_autoscale:
+            cls = cls.options(autoscaling_config=per_class_autoscale)
+        elif per_class_replicas is not None and per_class_replicas != 1:
+            cls = cls.options(num_replicas=per_class_replicas)
         bind_kwargs: Dict[str, Any] = dict(application_kwargs.get(cid, {}))
         for param in meta["init_params"]:
             if param["kind"] == "deployment_handle":

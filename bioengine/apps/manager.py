@@ -850,6 +850,7 @@ class AppsManager:
             "authorized_users": application_info["authorized_users"],
             "available_methods": application_info["available_methods"],
             "max_ongoing_requests": application_info["max_ongoing_requests"],
+            "scaling": dict(application_info.get("scaling") or {}),
             "static_site_url": static_site_url,
             "service_ids": service_ids,
             "start_time": application_info["started_at"],
@@ -1028,6 +1029,7 @@ class AppsManager:
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
                     "proxy_memory_in_gb": app_data.get("proxy_memory_in_gb", 0.5),
+                    "scaling": dict(app_data.get("scaling") or {}),
                     "application_resources": app_data["application_resources"],
                     "authorized_users": updated_authorized_users,
                     "available_methods": app_data["available_methods"],
@@ -1825,6 +1827,14 @@ class AppsManager:
                 {"train": ["admin@lab.edu"], "infer": ["*"]},
             ],
         ),
+        scaling: Optional[Dict[str, Dict[str, Any]]] = Field(
+            None,
+            description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. Classes not in the map run at Ray Serve's default of one fixed replica. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
+            examples=[
+                {"DemoApp": {"num_replicas": 3}},
+                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_num_ongoing_requests_per_replica": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
+            ],
+        ),
         context: Dict[str, Any] = Field(
             ...,
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
@@ -1925,6 +1935,10 @@ class AppsManager:
                     ice_servers = existing_app.get("ice_servers", None)
                 if authorized_users is None:
                     authorized_users = existing_app.get("authorized_users", None)
+                # Inherit per-deployment scaling when caller didn't provide one
+                # (same pattern as the other update-inheritance fields above).
+                if scaling is None:
+                    scaling = dict(existing_app.get("scaling") or {})
             else:
                 # For new applications, set creation time and default values
                 started_at = time.time()
@@ -1947,6 +1961,8 @@ class AppsManager:
                     debug = False
                 # ice_servers defaults to None (fetch from URL)
                 # authorized_users defaults to None (use manifest value)
+                if scaling is None:
+                    scaling = {}
 
             # Caller identity and admin users for injection into authorized_users by the builder
             user_email = context["user"].get("email", "")
@@ -2045,7 +2061,45 @@ class AppsManager:
                 authorized_users=authorized_users,
                 deploying_user=(user_id, user_email),
                 admin_users=self.admin_users,
+                scaling=scaling,
             )
+
+            # Validate scaling map against the user @bioengine.app classes the
+            # introspect task discovered. The ProxyDeployment is intentionally
+            # not in the spec — it always runs as a single replica.
+            user_deployment_names = sorted(
+                meta["qualname"].split(".")[-1]
+                for meta in app.spec["classes"].values()
+            )
+            for dep_name, dep_scaling in (scaling or {}).items():
+                if dep_name not in user_deployment_names:
+                    raise ValueError(
+                        f"scaling key '{dep_name}' is not a user deployment in "
+                        f"app '{application_id}'. Valid deployments: "
+                        f"{user_deployment_names}."
+                    )
+                if not isinstance(dep_scaling, dict):
+                    raise ValueError(
+                        f"scaling entry for '{dep_name}' must be a dict; got "
+                        f"{type(dep_scaling).__name__}."
+                    )
+                nr = dep_scaling.get("num_replicas")
+                asc = dep_scaling.get("autoscaling_config")
+                if nr is None and not asc:
+                    raise ValueError(
+                        f"scaling entry for '{dep_name}' must set exactly one "
+                        f"of num_replicas or autoscaling_config; got neither."
+                    )
+                if nr is not None and asc:
+                    raise ValueError(
+                        f"scaling entry for '{dep_name}' must set exactly one "
+                        f"of num_replicas or autoscaling_config; got both."
+                    )
+                if nr is not None and nr < 0:
+                    raise ValueError(
+                        f"scaling entry for '{dep_name}' has num_replicas="
+                        f"{nr}; must be >= 0."
+                    )
 
             # Check resources before creating deployment task
             await self._check_resources(
@@ -2074,6 +2128,7 @@ class AppsManager:
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,
                 "proxy_memory_in_gb": proxy_memory_in_gb,
+                "scaling": dict(app.scaling or {}),
                 "application_resources": app.metadata["resources"],
                 "authorized_users": app.metadata["authorized_users"],
                 "available_methods": app.metadata["available_methods"],
