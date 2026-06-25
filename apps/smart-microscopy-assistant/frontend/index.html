@@ -1414,12 +1414,15 @@ document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
 for (const el of document.querySelectorAll(".exMax")) el.textContent = MAX_EXAMPLES_PER_CLASS;
 
 // ---- Module state --------------------------------------------------------
-let server = null, qcSvc = null, artMgr = null, userWorkspace = null, userEmail = null;
+let server = null, qcSvc = null, s3 = null, userWorkspace = null, userEmail = null;
 let activeBoxId = null;          // currently selected canvas box id
 let currentMode = "analyze";
 let pipelineRunning = false;     // analyze-mode: blocks add + Run button
-let analyzeScratchId = null;     // batched scratch artifact id (committed once per run)
 let openDetailsTileId = null;    // id of tile whose details panel is currently open
+
+// TTL for short-lived uploads. The server auto-deletes after this many
+// seconds, so closing the tab mid-run can't orphan files in the workspace.
+const SCRATCH_TTL_SEC = 600;
 
 // Per-mode tile arrays. Each tile is an object:
 //   { id, file, src, state, remoteUrl, result, error }
@@ -1524,7 +1527,7 @@ async function connectWithToken(token) {
   userEmail = (server.config.user && server.config.user.email) || userWorkspace;
   setLoggedInUI();
   log(`Connected as ${userEmail} (workspace=${userWorkspace})`, "ok");
-  artMgr = await server.getService("public/artifact-manager", { _rkwargs: true });
+  s3 = await server.getService("public/s3-storage", { _rkwargs: true });
   if (!SERVICE_ID) {
     log("No ws_service_id in the URL — open the app from the BioEngine dashboard or append `?ws_service_id=<id>`.", "err");
     throw new Error(
@@ -1564,7 +1567,7 @@ $("gateLoginBtn").addEventListener("click", startLogin);
 
 $("logoutBtn").addEventListener("click", async () => {
   clearSavedToken();
-  qcSvc = null; artMgr = null; userWorkspace = null; userEmail = null;
+  qcSvc = null; s3 = null; userWorkspace = null; userEmail = null;
   try { if (server?.disconnect) await server.disconnect(); } catch (_) {}
   server = null;
   setLoggedOutUI();
@@ -2263,31 +2266,24 @@ function refreshAnalyzeEnabled() {
   $("runBtnLabel").textContent = analyzeTiles.some(t => t.state === "done") ? "Analyze new images" : "Analyze images";
 }
 
-// ===== Scratch artifact helpers ===========================================
-async function uploadFileToScratch(file, artifactId, remotePath) {
-  const putUrl = await artMgr.put_file({ artifact_id: artifactId, file_path: remotePath, _rkwargs: true });
+// ===== Scratch upload helpers =============================================
+// Files live in the user's workspace S3 bucket at a workspace-scoped path
+// (not as Hypha artifacts — they don't show up in `hypha art ls`) and are
+// auto-deleted by the server after SCRATCH_TTL_SEC, so an abandoned run
+// can't orphan blobs in the user's workspace.
+async function uploadScratchFile(file, scratchPath) {
+  const putUrl = await s3.put_file({ file_path: scratchPath, ttl: SCRATCH_TTL_SEC, _rkwargs: true });
   const resp = await fetch(putUrl, { method: "PUT", body: await file.arrayBuffer() });
-  if (!resp.ok) throw new Error(`PUT ${remotePath} failed: ${resp.status}`);
-}
-async function presignFromScratch(artifactId, remotePath) {
-  return await artMgr.get_file({ artifact_id: artifactId, file_path: remotePath, _rkwargs: true });
-}
-async function deleteScratch(artifactId) {
-  if (!artifactId) return;
-  try {
-    await artMgr.delete({ artifact_id: artifactId, delete_files: true, recursive: true, _rkwargs: true });
-  } catch (err) {
-    log(`Cleanup FAILED for ${artifactId}: ${err.message}`, "err");
-  }
+  if (!resp.ok) throw new Error(`PUT ${scratchPath} failed: ${resp.status}`);
+  return await s3.get_file({ file_path: scratchPath, _rkwargs: true });
 }
 
 // ===== Analyze pipeline ===================================================
 // Two serial channels running concurrently:
 //   uploadWorker: image LOCAL -> UPLOADING -> UPLOADED
 //   vlmWorker:    image UPLOADED -> ANALYZING -> DONE|ERROR
-// We process a batch (snapshot of LOCAL tiles at click time) and create one
-// scratch artifact for all of them so the worker can reuse a single
-// staged-then-committed artifact.
+// Each image is uploaded to a per-run S3 path with a TTL; the server
+// expires the blob after SCRATCH_TTL_SEC, so no cleanup pass is needed.
 
 async function runPipeline() {
   if (!qcSvc) return;
@@ -2302,15 +2298,8 @@ async function runPipeline() {
   const visualTest = useTest ? $("testSelect").value : null;
   const instruction = !useTest ? $("instruction").value.trim() : null;
 
-  // Pipeline:
-  //   uploadWorker: tile -> create per-image scratch artifact -> put_file ->
-  //                 commit -> presign -> push tile to VLM queue
-  //   vlmWorker:    pops UPLOADED tiles, runs inspect, marks done/error
-  // Per-image scratch artifacts because a Hypha artifact transitions out of
-  // the staged state on commit, so a single shared artifact can't accept new
-  // files between commits without re-staging.
+  const runId = randomSuffix();
   const vlmQueue = [];
-  const scratchIds = [];
   const batchErrors = [];
   let vlmDone = 0, vlmErrs = 0, passed = 0, failed = 0, unsure = 0;
   let vlmActive = false;
@@ -2365,21 +2354,10 @@ async function runPipeline() {
     tile.state = "uploading";
     renderGrid("analyze");
     setRun("busy", `Uploading ${tile.file.name} (${i+1}/${pending.length})`);
-    const alias = `smart-microscopy-assistant-img-${randomSuffix()}`;
-    const scratchId = `${userWorkspace}/${alias}`;
-    const remotePath = `image.${fileExt(tile.file)}`;
+    const scratchPath = `smart-microscopy-assistant/analyze/${runId}/${i}.${fileExt(tile.file)}`;
     try {
-      await artMgr.create({
-        alias, type: "generic",
-        manifest: { name: "scratch", description: "scratch", type: "generic" },
-        config: { permissions: { "*": "r" } },
-        stage: true, _rkwargs: true,
-      });
-      await uploadFileToScratch(tile.file, scratchId, remotePath);
-      await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
-      tile.remoteUrl = await presignFromScratch(scratchId, remotePath);
+      tile.remoteUrl = await uploadScratchFile(tile.file, scratchPath);
       tile.state = "uploaded";
-      scratchIds.push(scratchId);
       renderGrid("analyze");
       vlmQueue.push(tile);
       drainVlm(); // fire-and-forget; runs concurrently with the next upload
@@ -2397,8 +2375,6 @@ async function runPipeline() {
     await new Promise(r => setTimeout(r, 80));
   }
 
-  // Cleanup all per-image scratch artifacts.
-  await Promise.allSettled(scratchIds.map(deleteScratch));
   pipelineRunning = false;
   $("clearAllBtn").disabled = false;
   refreshAnalyzeEnabled();
@@ -2614,37 +2590,19 @@ $("defineBtn").addEventListener("click", async () => {
   const hasImages = positiveTiles.length > 0 || negativeTiles.length > 0;
   setDefine("busy", hasImages ? "Uploading examples…" : "Saving…");
 
-  // Skip the scratch artifact entirely for text-only tests.
-  let scratchId = null;
   try {
     let posUrls = [], negUrls = [];
     if (hasImages) {
-      const scratchAlias = `smart-microscopy-assistant-define-${randomSuffix()}`;
-      scratchId = `${userWorkspace}/${scratchAlias}`;
-      await artMgr.create({
-        alias: scratchAlias, type: "generic",
-        manifest: { name: "scratch (visual test)", description: "scratch", type: "generic" },
-        config: { permissions: { "*": "r" } },
-        stage: true, _rkwargs: true,
-      });
-      const posPaths = [];
+      const runId = randomSuffix();
+      const prefix = `smart-microscopy-assistant/define/${runId}`;
       for (let i = 0; i < positiveTiles.length; i++) {
         const f = positiveTiles[i].file;
-        const p = `positive/${i}.${fileExt(f)}`;
-        await uploadFileToScratch(f, scratchId, p);
-        posPaths.push(p);
+        posUrls.push(await uploadScratchFile(f, `${prefix}/positive/${i}.${fileExt(f)}`));
       }
-      const negPaths = [];
       for (let i = 0; i < negativeTiles.length; i++) {
         const f = negativeTiles[i].file;
-        const p = `negative/${i}.${fileExt(f)}`;
-        await uploadFileToScratch(f, scratchId, p);
-        negPaths.push(p);
+        negUrls.push(await uploadScratchFile(f, `${prefix}/negative/${i}.${fileExt(f)}`));
       }
-      await artMgr.commit({ artifact_id: scratchId, _rkwargs: true });
-      log("Presigning each upload …");
-      for (const p of posPaths) posUrls.push(await presignFromScratch(scratchId, p));
-      for (const p of negPaths) negUrls.push(await presignFromScratch(scratchId, p));
     }
 
     setDefine("busy", "Saving visual test on the worker…");
@@ -2685,7 +2643,6 @@ $("defineBtn").addEventListener("click", async () => {
       detail: formatErr(err),
     });
   } finally {
-    if (scratchId) await deleteScratch(scratchId);
     refreshDefineEnabled();
   }
 });
