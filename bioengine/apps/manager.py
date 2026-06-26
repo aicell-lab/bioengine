@@ -647,7 +647,9 @@ class AppsManager:
         application_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
+        deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> Dict[str, Dict[str, Any]]:
+        overrides = deployment_logs_overrides or {}
         deployments_info = {}
         for deployment_name, deployment_info in (
             application_details.get("deployments") or {}
@@ -667,12 +669,15 @@ class AppsManager:
                 "logs": None,
             }
 
+            override = overrides.get(deployment_name) or {}
+            this_tail = override.get("logs_tail", logs_tail)
+            this_prev = override.get("n_previous_replica", n_previous_replica)
             try:
                 deployment_logs = await self.ray_cluster.proxy_actor_handle.get_deployment_logs.remote(
                     application_id=application_id,
                     deployment_name=deployment_name,
-                    n_previous_replica=n_previous_replica,
-                    tail=logs_tail,
+                    n_previous_replica=this_prev,
+                    tail=this_tail,
                 )
                 deployments_info[deployment_name]["logs"] = deployment_logs
             except Exception as e:
@@ -772,6 +777,7 @@ class AppsManager:
         instance_details: Dict[str, Any],
         n_previous_replica: int,
         logs_tail: int,
+        deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> Dict[str, Any]:
         """
         Application States: [NOT_STARTED, DEPLOYING, DEPLOY_FAILED, RUNNING, UNHEALTHY, DELETING]
@@ -803,6 +809,7 @@ class AppsManager:
                 application_details=application_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
+                deployment_logs_overrides=deployment_logs_overrides,
             )
         else:
             if application_info["is_deployed"].is_set():
@@ -2335,11 +2342,19 @@ class AppsManager:
         ),
         logs_tail: int = Field(
             30,
-            description="Number of log lines to retrieve for each deployment replica. If set to -1, retrieves all available logs.",
+            description="Default number of log lines to retrieve for each deployment replica. Applied to every deployment unless overridden via deployment_logs. If set to -1, retrieves all available logs.",
         ),
         n_previous_replica: int = Field(
             0,
-            description="Number of previous replicas to include in the status for each deployment. Set to -1 to retrieve all previous replicas.",
+            description="Default number of previous replicas to include in the status for each deployment. Applied to every deployment unless overridden via deployment_logs. Set to -1 to retrieve all previous replicas.",
+        ),
+        deployment_logs: Optional[Dict[str, Dict[str, int]]] = Field(
+            None,
+            description="Per-deployment overrides for logs_tail and n_previous_replica, keyed by the user @bioengine.app class name (e.g. {'RuntimeApp': {'logs_tail': 200, 'n_previous_replica': 3}}). Each entry may set either or both keys; missing keys fall back to the top-level defaults. Overrides naming a deployment that doesn't exist in any queried app are ignored silently — the dashboard may carry stale overrides while the user mutates the app's class set.",
+            examples=[
+                {"RuntimeApp": {"logs_tail": 200, "n_previous_replica": 3}},
+                {"ProxyDeployment": {"logs_tail": 0}},
+            ],
         ),
         context: Dict[str, Any] = Field(
             ...,
@@ -2429,6 +2444,7 @@ class AppsManager:
                 instance_details=instance_details,
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
+                deployment_logs_overrides=deployment_logs,
             )
             for application_id in apps_to_check
         ]
