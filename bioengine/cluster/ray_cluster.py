@@ -745,21 +745,16 @@ class RayCluster:
             Exception: If connection to the Ray cluster fails.
         """
         try:
-            # Connect to the Ray cluster.
-            # For external clusters, upload the bioengine package via py_modules so
-            # remote workers can import it without a pip install. In single-machine
-            # and SLURM modes, the workers share the same environment/container image
-            # where bioengine is already installed, so the upload is unnecessary.
-            job_runtime_env = {}
-            if self.mode == "external-cluster":
-                job_runtime_env["py_modules"] = [os.path.dirname(bioengine.__file__)]
-
+            # bootstrap.py references this upload via a content-hashed GCS URI
+            # in every replica's py_modules; required in all cluster modes.
             context = await asyncio.to_thread(
                 ray.init,
                 address=self.address,
                 namespace="bioengine",
                 logging_format=stream_logging_format,
-                runtime_env=job_runtime_env,
+                runtime_env={
+                    "py_modules": [os.path.dirname(bioengine.__file__)],
+                },
             )
 
             # Update Ray's logger formatters to use timezone-aware date format
