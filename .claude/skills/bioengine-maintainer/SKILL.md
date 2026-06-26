@@ -190,13 +190,13 @@ The BioEngineWorker registers as a Hypha service. Key methods:
 
 ## Dev image testing workflow
 
-For deployment-side PRs (changes under `bioengine/**`, `bioengine/cluster/**`, `bioengine/apps/builder.py`, `bioengine/_app/bootstrap.py`, runtime_env transport, Ray client/server plumbing, Hypha service registration in the worker), validate on a live cluster before marking the PR ready. CI catches unit failures; it doesn't catch deployment topology issues.
+For deployment-side PRs (changes under `bioengine/**`, `bioengine/cluster/**`, `bioengine/apps/builder.py`, `bioengine/_app/bootstrap.py`, runtime_env transport, Ray client/server plumbing, Hypha service registration in the worker), validate on a live cluster before marking the PR ready. CI catches unit failures; it doesn't catch deployment topology issues. Validation must cover **both** modes — external-cluster and single-machine — because they exercise different code paths (the KubeRay-mode worker delegates to a remote Ray cluster carrying its own deps, the single-machine worker runs `ray.init` in-process). A change that's green on one mode can be broken on the other (e.g. an in-process `ray.init` exposes pip-resolved dep skew the kuberay pod hides).
 
 1. Pick the next bioengine version (one above current `pyproject.toml` on `main` AND the latest published GHCR tag — bump from the higher) and append `-devN`. Example: next release `0.11.5` → `ghcr.io/aicell-lab/bioengine-worker:0.11.5-dev1`. Bump the suffix (`-dev2`, …) for each follow-up fix in the PR cycle.
 2. Build + push directly with `docker buildx build --builder multiarch-builder --platform linux/amd64 -f docker/worker.Dockerfile -t ghcr.io/aicell-lab/bioengine-worker:<version>-devN --push .` using `GITHUB_PAT`. Bypasses `docker-publish-worker.yml` (which enforces strictly-increasing canonical tags).
-3. `helm upgrade` the test worker to the dev tag. The dev tag lives **only** on a feature branch of `kth-k8s` (or a transient local edit) — never on `kth-k8s` main.
-4. Smoke-verify via the live worker. Deploy production apps at canonical versions, confirm RUNNING + ping/inference.
-5. Only after the test worker is green: bump `pyproject.toml` to the canonical version in a separate commit, push, `gh pr ready <PR>`. CI publishes the canonical image.
+3. **External-cluster validation** (KTH): `helm upgrade` the test worker to the dev tag. The dev tag lives **only** on a feature branch of `kth-k8s` (or a transient local edit) — never on `kth-k8s` main. Smoke-verify via the live worker — deploy production apps at canonical versions, confirm RUNNING + ping/inference.
+4. **Single-machine validation** (local docker): run the dev image as `docker run … python -m bioengine.worker --mode single-machine …` against the maintainer's personal Hypha workspace. Deploy a small CPU-only `@bioengine.app` and confirm it reaches RUNNING and serves over the Hypha proxy. This catches `ray.init` / replica-startup regressions the external-cluster path doesn't exercise.
+5. Only after **both** modes are green: bump `pyproject.toml` to the canonical version in a separate commit, push, `gh pr ready <PR>`. CI publishes the canonical image.
 6. After merge + canonical image published:
    - `helm upgrade` the test worker from `<version>-devN` → canonical. Commit the values.yaml bump back to canonical on `kth-k8s` main.
    - Delete every dev image tag from GHCR. The PAT has `delete:packages`.
