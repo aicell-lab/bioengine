@@ -83,6 +83,14 @@ from bioengine.apps._cache_fs_tasks import (
     list_dirs_on_node as _list_dirs_on_node,
 )
 
+# Per-app exponential backoff schedule for auto-redeploy. Initial=10 s matches
+# one default monitor tick (so a single transient unhealthy observation still
+# fires immediately); cap=600 s (10 min) bounds the storm if the app is
+# persistently broken (bad artifact, missing GPU, downstream Hypha outage).
+# Schedule: 10, 20, 40, 80, 160, 320, 600, 600 … s.
+_REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
+_REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
+
 
 class AppsManager:
     """
@@ -209,6 +217,11 @@ class AppsManager:
         self.worker_service_id = None
         self._deployment_lock = asyncio.Lock()
         self._deployed_applications = {}
+
+        # Per-app auto-redeploy backoff state. Keyed by application_id; each
+        # entry holds {consecutive_failures, next_attempt_at}. Cleared the
+        # moment an app is observed healthy again. See monitor_applications.
+        self._redeploy_backoff: Dict[str, Dict[str, Any]] = {}
 
         # Cache the result of the one-time FS-topology probe across Ray
         # nodes. None until the first list/clear-cache call from the
@@ -616,6 +629,7 @@ class AppsManager:
 
         # Remove from internal tracking after all cleanup operations complete
         self._deployed_applications.pop(application_id, None)
+        self._redeploy_backoff.pop(application_id, None)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
     def _project_replicas(
@@ -1132,29 +1146,35 @@ class AppsManager:
                 application_ids.append(application_id)
 
     async def monitor_applications(self) -> None:
-        """
-        Monitor the health of all deployed applications and handle failures automatically.
+        """Auto-redeploy unhealthy apps with per-app exponential backoff.
 
-        Continuously monitors application health by checking Ray Serve status against
-        internal deployment tracking. Handles failure recovery, redeployment, and
-        cleanup of consistently failing applications.
+        Each monitor tick walks every app whose ``deploy_app(..., auto_redeploy=True)``
+        flag is set and pulls its Ray Serve status. An app is considered unhealthy
+        when ``serve.status`` reports ``DEPLOY_FAILED`` / ``UNHEALTHY`` or has
+        dropped out of the response entirely. The recovery rule:
 
-        Monitoring Actions:
-        - Tracks consecutive failures for each application
-        - Triggers redeployment for applications experiencing issues
-        - Removes applications that fail repeatedly (>3 consecutive failures)
-        - Resets failure counters for healthy applications
+        - On the first unhealthy observation, fire a fresh ``_deploy_application``
+          task immediately and seed the backoff state (1 consecutive failure,
+          next attempt allowed after ``_REDEPLOY_BACKOFF_INITIAL_SECONDS``).
+        - On every subsequent tick while still unhealthy, skip the redeploy
+          unless the current time has passed the per-app deadline; when it has,
+          fire the redeploy and double the backoff (capped at
+          ``_REDEPLOY_BACKOFF_MAX_SECONDS``).
+        - The moment the app is observed healthy again, the per-app backoff
+          state is dropped — the next failure restarts from the initial delay.
 
-        Failure Handling:
-        - 1-3 failures: Attempts automatic redeployment
-        - >3 failures: Removes application and stops monitoring
-        - Logs warnings and status changes for debugging
-
-        This method is typically called periodically by the worker to ensure
-        application health and availability.
+        With initial=10 s, max=600 s the retry schedule is
+        10, 20, 40, 80, 160, 320, 600, 600, 600 s … — fast for transient
+        crashes (controller restart, replica OOM), bounded for persistent
+        failures (bad artifact, missing GPU, downstream Hypha outage). Without
+        this guard the loop fires a redeploy on every monitor tick (default
+        every 10 s) for the entire duration of any persistent crash, which
+        spams the worker logs and wastes Ray scheduling cycles.
 
         Raises:
-            Exception: If monitoring process encounters unrecoverable errors
+            Exception: If the monitoring step itself errors (e.g. Ray Serve
+                unreachable). The outer monitoring loop catches and applies
+                its own exponential backoff.
         """
         apps_to_redeploy = [
             app_id
@@ -1164,42 +1184,83 @@ class AppsManager:
         if not apps_to_redeploy:
             return
 
-        try:
-            # Get status of actively running deployments
-            await self.ray_cluster.check_connection()
-            serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
+        # Get status of actively running deployments
+        await self.ray_cluster.check_connection()
+        serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
 
-            for application_id in apps_to_redeploy:
-                application_info = self._deployed_applications.get(application_id)
-                if not application_info:
-                    # Application no longer tracked, skip monitoring
-                    continue
-                if not application_info["is_deployed"].is_set():
-                    # Application not yet deployed, skip monitoring
-                    continue
+        now = time.time()
 
-                # Get the application status from Ray Serve
-                application = serve_status.applications.get(application_id)
-                if not application or application.status.value in [
-                    "DEPLOY_FAILED",
-                    "UNHEALTHY",
-                ]:
-                    # Application is experiencing issues, trigger redeployment
-                    self.logger.warning(
-                        f"Application '{application_id}' for artifact '{application_info['artifact_id']}' "
-                        f"is experiencing issues. Triggering redeployment..."
+        for application_id in apps_to_redeploy:
+            application_info = self._deployed_applications.get(application_id)
+            if not application_info:
+                continue
+            if not application_info["is_deployed"].is_set():
+                continue
+
+            application = serve_status.applications.get(application_id)
+            state = application.status.value if application else None
+            backoff_state = self._redeploy_backoff.get(application_id)
+
+            if state == "RUNNING":
+                # Truly healthy — reset the backoff so the next failure
+                # restarts from the initial delay.
+                if backoff_state is not None:
+                    self._redeploy_backoff.pop(application_id, None)
+                    self.logger.info(
+                        f"Application '{application_id}' recovered; "
+                        f"auto-redeploy backoff cleared."
                     )
+                continue
 
-                    # Re-deploy the application
-                    deployment_task = asyncio.create_task(
-                        self._deploy_application(application_id=application_id),
-                        name=f"Deploy_{application_id}",
-                    )
-                    # Overwrite the existing deployment task
-                    application_info["deployment_task"] = deployment_task
-        except Exception as e:
-            self.logger.error(f"Error monitoring applications: {e}")
-            raise e
+            unhealthy = application is None or state in (
+                "DEPLOY_FAILED",
+                "UNHEALTHY",
+            )
+            if not unhealthy:
+                # Transitional state (NOT_STARTED, DEPLOYING, DELETING) —
+                # keep any existing backoff state but wait for the in-flight
+                # transition to settle before deciding to retry.
+                continue
+
+            if backoff_state is None:
+                # First failure observation — fire immediately, seed backoff.
+                self._fire_redeploy(application_id, application_info, attempt=1)
+                self._redeploy_backoff[application_id] = {
+                    "consecutive_failures": 1,
+                    "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
+                }
+                continue
+
+            # Subsequent failure — honour the per-app deadline.
+            if now < backoff_state["next_attempt_at"]:
+                continue
+
+            attempt = backoff_state["consecutive_failures"] + 1
+            self._fire_redeploy(application_id, application_info, attempt=attempt)
+            delay = min(
+                _REDEPLOY_BACKOFF_MAX_SECONDS,
+                _REDEPLOY_BACKOFF_INITIAL_SECONDS * (2 ** (attempt - 1)),
+            )
+            backoff_state["consecutive_failures"] = attempt
+            backoff_state["next_attempt_at"] = now + delay
+
+    def _fire_redeploy(
+        self,
+        application_id: str,
+        application_info: Dict[str, Any],
+        attempt: int,
+    ) -> None:
+        """Schedule a redeploy task and log the attempt number."""
+        self.logger.warning(
+            f"Application '{application_id}' for artifact "
+            f"'{application_info['artifact_id']}' is unhealthy; triggering "
+            f"redeployment (attempt #{attempt})."
+        )
+        deployment_task = asyncio.create_task(
+            self._deploy_application(application_id=application_id),
+            name=f"Deploy_{application_id}",
+        )
+        application_info["deployment_task"] = deployment_task
 
     @schema_method
     async def upload_app(
@@ -1808,7 +1869,7 @@ class AppsManager:
         ),
         auto_redeploy: bool = Field(
             None,
-            description="If set to true, the application will be automatically redeployed if it becomes unhealthy. If not specified, uses False for a new application, or preserves the previous setting if updating an existing application (only when application_id is specified).",
+            description="If set to true, the worker's monitoring loop fires a fresh deploy_app whenever Ray Serve reports this application as DEPLOY_FAILED, UNHEALTHY, or missing. Subsequent failures back off exponentially per-app (10s, 20s, 40s, … capped at 10 min) so a persistently broken app does not retry-storm; the backoff clears the moment the app is observed healthy again. If not specified, uses False for a new application, or preserves the previous setting if updating an existing application (only when application_id is specified).",
         ),
         debug: bool = Field(
             None,
