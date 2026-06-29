@@ -1198,19 +1198,28 @@ class AppsManager:
                 continue
 
             application = serve_status.applications.get(application_id)
-            unhealthy = not application or application.status.value in (
-                "DEPLOY_FAILED",
-                "UNHEALTHY",
-            )
+            state = application.status.value if application else None
             backoff_state = self._redeploy_backoff.get(application_id)
 
-            if not unhealthy:
+            if state == "RUNNING":
+                # Truly healthy — reset the backoff so the next failure
+                # restarts from the initial delay.
                 if backoff_state is not None:
                     self._redeploy_backoff.pop(application_id, None)
                     self.logger.info(
                         f"Application '{application_id}' recovered; "
                         f"auto-redeploy backoff cleared."
                     )
+                continue
+
+            unhealthy = application is None or state in (
+                "DEPLOY_FAILED",
+                "UNHEALTHY",
+            )
+            if not unhealthy:
+                # Transitional state (NOT_STARTED, DEPLOYING, DELETING) —
+                # keep any existing backoff state but wait for the in-flight
+                # transition to settle before deciding to retry.
                 continue
 
             if backoff_state is None:
