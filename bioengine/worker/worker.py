@@ -589,13 +589,12 @@ class BioEngineWorker:
             f"'{self.client_id}' to workspace '{self.workspace}' on server '{self.server_url}'."
         )
 
-        # Update admin users list with authenticated user (ensure at top of list)
-        if user_id in self.admin_users:
-            self.admin_users.remove(user_id)
+        # Inject only the email — generate_token issues a fresh haikunated
+        # `sub` per token, so adding user_id accumulates a new entry on
+        # every reconnect / 3-hour refresh and never matches a human admin.
         if user_email in self.admin_users:
             self.admin_users.remove(user_email)
-        self.admin_users.insert(0, user_id)
-        self.admin_users.insert(1, user_email)
+        self.admin_users.insert(0, user_email)
 
         # Create admin context for internal operations
         self._admin_context = create_context(user_id, user_email)
