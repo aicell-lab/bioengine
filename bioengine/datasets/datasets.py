@@ -1,11 +1,25 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 import httpx
 
 from bioengine.datasets.chunk_cache import ChunkCache, _DEFAULT_CACHE_SIZE_GB
+
+# Transport errors that signal the cached data-server URL may now point at
+# the wrong endpoint (container restarted on a new IP, pod rescheduled,
+# bridge re-attached). On any of these we re-discover via refresh() and
+# retry the request once. 4xx/5xx HTTP status errors are deliberately NOT
+# in this list — those indicate the server is reachable but unhappy with
+# the request, and re-discovering wouldn't help.
+_STALE_URL_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+)
 
 
 class BioEngineDatasets:
@@ -163,6 +177,39 @@ class BioEngineDatasets:
         self._resolve_service_url(initial=False)
         return self.service_url
 
+    async def _with_url_recovery(
+        self, op: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        """Run ``op``; on transport error, refresh the URL and retry once.
+
+        Catches the connection/read/timeout shapes that signal the cached
+        data-server URL has gone stale (data-server container restarted on
+        a new IP, pod rescheduled, etc.) and re-runs ``op`` once after
+        ``refresh()`` updates ``self.service_url`` from the discovery file.
+
+        ``op`` is a zero-arg async callable that must reference
+        ``self.service_url`` at *call time* (not bake it into a literal
+        before invocation), so the retry picks up the refreshed value.
+        4xx/5xx HTTP errors are re-raised without a retry — those mean the
+        server is reachable but unhappy, and re-discovery wouldn't help.
+        """
+        try:
+            return await op()
+        except _STALE_URL_TRANSPORT_ERRORS as exc:
+            self.logger.warning(
+                f"Data server transport error against '{self.service_url}' "
+                f"({type(exc).__name__}: {exc}); forcing re-discovery and "
+                f"retrying once."
+            )
+            new_url = await self.refresh()
+            if new_url is None:
+                # No new URL available; nothing more we can do.
+                raise
+            self.logger.info(
+                f"Data server re-discovered at '{new_url}'; retrying."
+            )
+            return await op()
+
     async def set_chunk_cache_size_gb(self, gb: int) -> None:
         """
         Change the chunk cache size limit at runtime.
@@ -192,13 +239,16 @@ class BioEngineDatasets:
 
         from bioengine.datasets.utils import get_url_with_retry
 
-        try:
+        async def _ping() -> None:
             await get_url_with_retry(
                 url=f"{self.service_url}/ping",
                 raise_for_status=True,
                 http_client=httpx.AsyncClient(timeout=3.0),  # short timeout for ping
                 logger=self.logger,
             )
+
+        try:
+            await self._with_url_recovery(_ping)
         except Exception as e:
             self.logger.error(f"Connection to data server failed: {e}")
             raise RuntimeError("Connection to data server failed")
@@ -225,12 +275,16 @@ class BioEngineDatasets:
         from bioengine.datasets.utils import get_url_with_retry
 
         start_time = asyncio.get_event_loop().time()
-        response = await get_url_with_retry(
-            url=f"{self.service_url}/datasets",
-            raise_for_status=True,
-            http_client=self.http_client,
-            logger=self.logger,
-        )
+
+        async def _list():
+            return await get_url_with_retry(
+                url=f"{self.service_url}/datasets",
+                raise_for_status=True,
+                http_client=self.http_client,
+                logger=self.logger,
+            )
+
+        response = await self._with_url_recovery(_list)
         datasets = response.json()
         end_time = asyncio.get_event_loop().time()
         self.logger.debug(
@@ -282,13 +336,16 @@ class BioEngineDatasets:
         if token is not None:
             params["token"] = token
 
-        response = await get_url_with_retry(
-            url=f"{self.service_url}/datasets/{dataset_id}/files",
-            params=params,
-            raise_for_status=True,
-            http_client=self.http_client,
-            logger=self.logger,
-        )
+        async def _list_files():
+            return await get_url_with_retry(
+                url=f"{self.service_url}/datasets/{dataset_id}/files",
+                params=params,
+                raise_for_status=True,
+                http_client=self.http_client,
+                logger=self.logger,
+            )
+
+        response = await self._with_url_recovery(_list_files)
         files = response.json()
         end_time = asyncio.get_event_loop().time()
         self.logger.debug(
@@ -379,13 +436,17 @@ class BioEngineDatasets:
             from bioengine.datasets.utils import get_url_with_retry
 
             params = {"token": token} if token else {}
-            response = await get_url_with_retry(
-                url=f"{self.service_url}/data/{dataset_id}/{_file_path.as_posix()}",
-                params=params,
-                raise_for_status=True,
-                http_client=self.http_client,
-                logger=self.logger,
-            )
+
+            async def _get():
+                return await get_url_with_retry(
+                    url=f"{self.service_url}/data/{dataset_id}/{_file_path.as_posix()}",
+                    params=params,
+                    raise_for_status=True,
+                    http_client=self.http_client,
+                    logger=self.logger,
+                )
+
+            response = await self._with_url_recovery(_get)
             file_output = response.content
 
         end_time = asyncio.get_event_loop().time()
