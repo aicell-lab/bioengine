@@ -875,6 +875,19 @@ class RayCluster:
 
         if not ray.is_initialized():
             self.logger.warning(f"Ray client disconnected. Reconnecting...")
+            # In external-cluster mode the Ray Client global state retains
+            # `allow_multiple=True` from the previous gRPC session even after
+            # is_initialized() returns False — a bare ray.init() then raises
+            # "client has already connected with allow_multiple=True" and
+            # the auto-recovery loop wedges. Shut down first to clear it.
+            # Skip the shutdown in single-machine / SLURM modes where it
+            # would stop the local cluster itself.
+            if self.mode == "external-cluster":
+                try:
+                    await asyncio.to_thread(ray.shutdown)
+                except Exception as e:
+                    self.logger.debug(f"ray.shutdown() during reconnect raised: {e}")
+                self.proxy_actor_handle = None
             await self._connect_to_cluster()
 
     async def reconnect(self) -> None:
