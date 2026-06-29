@@ -616,16 +616,14 @@ def build_and_run_application(
     entry_handle = bind(spec["entry_id"])
 
     # Override the proxy's ray_actor_options.memory at deployment time.
-    # The default 0 reservation lets Ray place the proxy on any node,
-    # including resource-tight ones (e.g. the head). A real reservation
-    # biases scheduling toward nodes with headroom for the
-    # WebSocket/WebRTC payloads the proxy terminates. ``proxy_pip`` is
-    # computed on the worker (where bioengine has dist-info); the proxy
+    # ``num_cpus=0`` is set on the decorator (see proxy_deployment.py); a
+    # real memory reservation biases scheduling toward nodes with headroom
+    # for the WebSocket/WebRTC payloads the proxy terminates. ``proxy_pip``
+    # is computed on the worker (where bioengine has dist-info); the proxy
     # class deliberately ships with no static ``runtime_env`` because
     # resolving the pip list at import time crashed the actor pod —
     # see :mod:`bioengine.apps.proxy_deployment` for the rationale.
     proxy_actor_options = dict(ProxyDeployment.ray_actor_options or {})
-    proxy_actor_options["num_cpus"] = proxy_actor_options.get("num_cpus", 0)
     proxy_actor_options["memory"] = int(proxy_memory_in_gb * (1024**3))
     proxy_runtime_env = dict(proxy_actor_options.get("runtime_env") or {})
     proxy_runtime_env["pip"] = proxy_pip

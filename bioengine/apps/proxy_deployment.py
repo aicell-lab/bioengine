@@ -48,8 +48,8 @@ logger = logging.getLogger("ray.serve")
 # the Ray actor pod, where bioengine ships as raw source via
 # ``runtime_env.py_modules``. Evaluating that call at module import time
 # crashed the actor with ``PackageNotFoundError: No package metadata was
-# found for bioengine``. The full options dict (CPUs, memory reservation,
-# runtime_env.pip, runtime_env.py_modules) is assembled on the worker in
+# found for bioengine``. The memory reservation, runtime_env.pip, and
+# runtime_env.py_modules are assembled on the worker in
 # :func:`bioengine._app.bootstrap.build_and_run_application` and applied
 # via ``ProxyDeployment.options(ray_actor_options=…)`` at bind time, so
 # this module stays importable in any environment.
@@ -62,6 +62,10 @@ logger = logging.getLogger("ray.serve")
     max_ongoing_requests=10,
     health_check_period_s=10,
     health_check_timeout_s=5,
+    # ``num_cpus`` must be set explicitly: omitting ``ray_actor_options`` lets
+    # Ray Serve's decorator backfill ``{"num_cpus": 1}``, which then shadows
+    # any 0-default set later in bootstrap and reserves 1 CPU per proxy.
+    ray_actor_options={"num_cpus": 0},
 )
 class ProxyDeployment:
     """
