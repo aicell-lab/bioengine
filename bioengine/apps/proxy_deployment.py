@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -245,15 +246,13 @@ class ProxyDeployment:
         self.workspace = workspace
         self.proxy_service_token = proxy_service_token
 
-        if replica_id:
-            self.client_id = f"{worker_client_id}-{replica_id}"
-        else:
-            # Fallback to generating a UUID-based ID for hypha client_id
-            uuid_str = f"uuid-{str(uuid.uuid4())[:8]}"
-            self.client_id = f"{worker_client_id}-{uuid_str}"
-            logger.warning(
-                f"⚠️ Using fallback client_id '{self.client_id}' due to missing replica ID."
-            )
+        # Deterministic client_id derived from the application_id — stable across
+        # replica restarts so consumers holding a service handle auto-route to
+        # the new replica once it registers under the same client_id. Using a
+        # hash (not the raw application_id) keeps the segment fixed-length and
+        # immune to whatever characters a user picks for the application_id.
+        app_hash = hashlib.sha1(application_id.encode("utf-8")).hexdigest()[:8]
+        self.client_id = f"{worker_client_id}-{app_hash}"
 
         # Store entry deployment readiness
         self.entry_deployment_ready = False
@@ -943,6 +942,30 @@ class ProxyDeployment:
 
         # All checks passed - deployment is healthy
         logger.debug(f"🩺 Health check passed for '{self.application_id}'.")
+
+    async def __del__(self) -> None:
+        """Free the Hypha client_id before Ray Serve tears the replica down.
+
+        Ray Serve awaits async destructors on replica shutdown. Unregistering
+        the services and disconnecting here means the client_id is released
+        immediately — the next replica (rolling update, health-driven restart,
+        node reschedule) can reconnect under the same stable id without
+        hitting 'Client already exists and is active'.
+        """
+        try:
+            await self._deregister_services()
+        except Exception as e:
+            logger.warning(f"⚠️ __del__ deregister failed: {e}")
+        if self.server:
+            try:
+                await self.server.disconnect()
+                logger.info(
+                    f"👋 Disconnected Hypha client '{self.client_id}' on replica shutdown."
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ __del__ disconnect failed: {e}")
+            finally:
+                self.server = None
 
 
 if __name__ == "__main__":

@@ -545,11 +545,13 @@ class AppBuilder:
         required_resources = self._sum_resources(spec, proxy_memory_in_gb)
 
         # 6. Generate the proxy service token.
+        proxy_service_token_ttl_seconds = 3600 * 24 * 30
+        proxy_service_token_issued_at = time.time()
         proxy_service_token = await self.server.generate_token(
             {
                 "workspace": self.server.config.workspace,
                 "permission": "read_write",
-                "expires_in": 3600 * 24 * 30,
+                "expires_in": proxy_service_token_ttl_seconds,
             }
         )
 
@@ -574,6 +576,9 @@ class AppBuilder:
         app_data = {
             "format_version": SPEC_FORMAT_VERSION,
             "worker_workspace": self.server.config.workspace,
+            "deployed_by_worker_client_id": self.server.config.client_id,
+            "proxy_service_token_issued_at": proxy_service_token_issued_at,
+            "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
             "entry": entry_id,
             "spec_hash": spec_hash,
             "display_name": manifest["name"],
@@ -630,6 +635,9 @@ class AppBuilder:
             "application_kwargs": application_kwargs,
             "application_env_vars": application_env_vars,
             "frontend_entry": manifest.get("frontend_entry"),
+            "deployed_by_worker_client_id": self.server.config.client_id,
+            "proxy_service_token_issued_at": proxy_service_token_issued_at,
+            "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
         }
         self.logger.info(
             f"Introspected '{application_id}' "

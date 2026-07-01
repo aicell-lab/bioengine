@@ -49,6 +49,7 @@ import argparse
 import asyncio
 import json
 import shlex
+import signal
 import sys
 from typing import Dict
 
@@ -573,6 +574,29 @@ async def main(group_configs):
             **group_configs["Ray Autoscaler Options"],
         },
     )
+
+    # Route k8s SIGTERM (and SIGINT) through the worker's own graceful
+    # shutdown path — otherwise the process exits without running
+    # BioEngineWorker._cleanup(), leaving the Hypha connection registered
+    # under this pod's client_id until the server's stale-client TTL sweeps
+    # it. That stranded registration blocks any future pod (rolling update,
+    # crash-restart) that tries to reconnect with the same stable client_id.
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(signame: str) -> None:
+        print(f"Received {signame}, initiating graceful worker shutdown...")
+        asyncio.create_task(bioengine_worker._stop(blocking=False))
+
+    for signame in ("SIGTERM", "SIGINT"):
+        try:
+            loop.add_signal_handler(
+                getattr(signal, signame), _request_shutdown, signame
+            )
+        except (NotImplementedError, RuntimeError):
+            # add_signal_handler is not supported on Windows and inside
+            # some embedded event loops. The KeyboardInterrupt path in
+            # BioEngineWorker.start covers those cases.
+            pass
 
     # Start the worker and wait until shutdown is triggered
     await bioengine_worker.start(blocking=True)
