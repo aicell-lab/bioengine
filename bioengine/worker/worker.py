@@ -721,22 +721,37 @@ class BioEngineWorker:
         if hasattr(self, "is_ready"):
             self.is_ready.clear()
 
-        # Clean up apps manager
+        # Clean up apps manager. In external-cluster mode the Ray Serve
+        # deployments live on the shared KubeRay cluster and are supposed
+        # to survive the worker pod restart — the next worker's
+        # recover_deployed_applications adopts them. Calling
+        # stop_all_apps here would run serve.delete on each of them and
+        # defeat that mechanism, so we skip it. In single-machine and
+        # SLURM modes the head Ray process is torn down by the worker
+        # itself (see RayCluster.stop), so the apps die regardless;
+        # letting stop_all_apps unregister cleanly first is just hygiene.
+        ray_mode = getattr(getattr(self, "ray_cluster", None), "mode", None)
         if hasattr(self, "apps_manager") and self.apps_manager:
-            try:
-                admin_context = getattr(self, "_admin_context", None)
-                if admin_context is None:
-                    self.logger.debug(
-                        "No admin context (shutdown before Hypha login completed); "
-                        "skipping apps manager cleanup."
-                    )
-                else:
-                    # stop_all_apps is a @schema_method whose first positional
-                    # parameter is timeout_seconds; the required context must
-                    # be passed by name.
-                    await self.apps_manager.stop_all_apps(context=admin_context)
-            except Exception as e:
-                self.logger.error(f"Error cleaning up apps manager: {e}")
+            if ray_mode == "external-cluster":
+                self.logger.info(
+                    "External-cluster mode: leaving deployed apps in place on the "
+                    "shared Ray cluster so the next worker can recover them."
+                )
+            else:
+                try:
+                    admin_context = getattr(self, "_admin_context", None)
+                    if admin_context is None:
+                        self.logger.debug(
+                            "No admin context (shutdown before Hypha login completed); "
+                            "skipping apps manager cleanup."
+                        )
+                    else:
+                        # stop_all_apps is a @schema_method whose first positional
+                        # parameter is timeout_seconds; the required context must
+                        # be passed by name.
+                        await self.apps_manager.stop_all_apps(context=admin_context)
+                except Exception as e:
+                    self.logger.error(f"Error cleaning up apps manager: {e}")
 
         # Stop Ray cluster
         if hasattr(self, "ray_cluster") and self.ray_cluster:

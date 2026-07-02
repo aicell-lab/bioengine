@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -765,8 +766,12 @@ class AppsManager:
     async def _get_application_service_ids(
         self, application_id: str
     ) -> Dict[str, Optional[str]]:
-        # ProxyDeployment is fixed at one replica per application — one concrete
-        # service ID for each transport, no wildcards, no per-replica lists.
+        # The proxy's Hypha client_id is derived deterministically from the
+        # worker's client_id and a hash of application_id (see
+        # bioengine.apps.proxy_deployment.ProxyDeployment.__init__). The URL
+        # is therefore stable across ProxyDeployment restarts and doesn't
+        # need the live replica_tag; we still gate on "is a replica alive"
+        # so the dashboard doesn't advertise a URL that would 404 right now.
         replica_ids = (
             await self.ray_cluster.proxy_actor_handle.get_deployment_replicas.remote(
                 application_id=application_id,
@@ -776,13 +781,22 @@ class AppsManager:
         if not replica_ids:
             return {"websocket_service_id": None, "webrtc_service_id": None}
 
-        # get_deployment_replicas returns Dict[replica_id -> actor_id], not a list.
-        replica_id = next(iter(replica_ids))
         workspace = self.server.config.workspace
-        worker_client_id = self.server.config.client_id
+        # For a recovered app, the ProxyDeployment is still registered
+        # under the previous worker's client_id — advertise the URL that
+        # is actually serving right now (not the URL that a fresh deploy
+        # under THIS worker would produce). The client_id mismatch is
+        # surfaced separately via deployed_by_worker_client_id.
+        info = self._deployed_applications.get(application_id, {})
+        base_worker_client_id = (
+            info.get("deployed_by_worker_client_id")
+            or self.server.config.client_id
+        )
+        app_hash = hashlib.sha1(application_id.encode("utf-8")).hexdigest()[:8]
+        proxy_client_id = f"{base_worker_client_id}-{app_hash}"
         return {
-            "websocket_service_id": f"{workspace}/{worker_client_id}-{replica_id}:{application_id}",
-            "webrtc_service_id": f"{workspace}/{worker_client_id}-{replica_id}:{application_id}-rtc",
+            "websocket_service_id": f"{workspace}/{proxy_client_id}:{application_id}",
+            "webrtc_service_id": f"{workspace}/{proxy_client_id}:{application_id}-rtc",
         }
 
     async def _get_app_status(
@@ -878,6 +892,15 @@ class AppsManager:
             "last_updated_at": application_info["last_updated_at"],
             "last_updated_by": application_info["last_updated_by"],
             "auto_redeploy": application_info["auto_redeploy"],
+            "deployed_by_worker_client_id": application_info.get(
+                "deployed_by_worker_client_id"
+            ),
+            "proxy_service_token_issued_at": application_info.get(
+                "proxy_service_token_issued_at"
+            ),
+            "proxy_service_token_ttl_seconds": application_info.get(
+                "proxy_service_token_ttl_seconds"
+            ),
         }
 
     async def complete_initialization(
@@ -1058,6 +1081,15 @@ class AppsManager:
                     "started_at": app_data["started_at"],
                     "last_updated_at": app_data["last_updated_at"],
                     "last_updated_by": app_data["last_updated_by"],
+                    "deployed_by_worker_client_id": app_data.get(
+                        "deployed_by_worker_client_id"
+                    ),
+                    "proxy_service_token_issued_at": app_data.get(
+                        "proxy_service_token_issued_at"
+                    ),
+                    "proxy_service_token_ttl_seconds": app_data.get(
+                        "proxy_service_token_ttl_seconds"
+                    ),
                     "built_app": None,
                     "auto_redeploy": app_data["auto_redeploy"],
                     "debug": app_data["debug"],
@@ -2204,6 +2236,15 @@ class AppsManager:
                 "started_at": started_at,  # Preserved from original deployment or set for new application
                 "last_updated_at": last_updated_at,  # Same as started_at for new, current time for updates
                 "last_updated_by": user_id,
+                "deployed_by_worker_client_id": app.metadata[
+                    "deployed_by_worker_client_id"
+                ],
+                "proxy_service_token_issued_at": app.metadata[
+                    "proxy_service_token_issued_at"
+                ],
+                "proxy_service_token_ttl_seconds": app.metadata[
+                    "proxy_service_token_ttl_seconds"
+                ],
                 "built_app": app,
                 "auto_redeploy": auto_redeploy,
                 "ice_servers": ice_servers,

@@ -488,11 +488,25 @@ class AppBuilder:
                 }
             )
         except Exception as exc:
-            self.logger.warning(
-                f"generate_token for '{artifact_workspace}' failed ({exc}); "
-                "proceeding without a download token (works for public "
-                "artifacts)."
-            )
+            # The common expected case: this worker's token has no permission
+            # on the artifact's workspace (e.g. a personal-workspace worker
+            # deploying a public artifact from a shared collection). Hypha
+            # wraps the server-side PermissionError in a RemoteException, so
+            # we match on the message text — it's stable across recent Hypha
+            # versions and the alternative (matching on RemoteError attrs) is
+            # more fragile. Public artifacts still work via anonymous read.
+            if "any permission for workspace" in str(exc):
+                self.logger.info(
+                    f"No cross-workspace grant on '{artifact_workspace}'; "
+                    f"downloading '{artifact_id}' anonymously "
+                    f"(works for public artifacts)."
+                )
+            else:
+                self.logger.warning(
+                    f"generate_token for '{artifact_workspace}' failed ({exc}); "
+                    "proceeding without a download token (works for public "
+                    "artifacts)."
+                )
 
         # 2. Compose env_vars + the introspect-task runtime_env.
         flat_env_vars: Dict[str, str] = {}
@@ -545,11 +559,13 @@ class AppBuilder:
         required_resources = self._sum_resources(spec, proxy_memory_in_gb)
 
         # 6. Generate the proxy service token.
+        proxy_service_token_ttl_seconds = 3600 * 24 * 30
+        proxy_service_token_issued_at = time.time()
         proxy_service_token = await self.server.generate_token(
             {
                 "workspace": self.server.config.workspace,
                 "permission": "read_write",
-                "expires_in": 3600 * 24 * 30,
+                "expires_in": proxy_service_token_ttl_seconds,
             }
         )
 
@@ -574,6 +590,9 @@ class AppBuilder:
         app_data = {
             "format_version": SPEC_FORMAT_VERSION,
             "worker_workspace": self.server.config.workspace,
+            "deployed_by_worker_client_id": self.server.config.client_id,
+            "proxy_service_token_issued_at": proxy_service_token_issued_at,
+            "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
             "entry": entry_id,
             "spec_hash": spec_hash,
             "display_name": manifest["name"],
@@ -630,6 +649,9 @@ class AppBuilder:
             "application_kwargs": application_kwargs,
             "application_env_vars": application_env_vars,
             "frontend_entry": manifest.get("frontend_entry"),
+            "deployed_by_worker_client_id": self.server.config.client_id,
+            "proxy_service_token_issued_at": proxy_service_token_issued_at,
+            "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
         }
         self.logger.info(
             f"Introspected '{application_id}' "
