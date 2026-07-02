@@ -41,6 +41,14 @@ except ImportError:
 
 logger = logging.getLogger("ray.serve")
 
+# How many consecutive Hypha ping/health-check failures we tolerate before
+# concluding the connection is dead and forcing a re-register. A single
+# failed ping usually means bridge tail-latency, not a broken socket —
+# treating each one as fatal caused a flap loop against personal-workspace
+# Hypha bridges where ping p99 sits above the Ray Serve health_check_timeout
+# (PR #135 field report from Chiron/Tabula on ws-user-google-oauth2…).
+_MAX_CONSECUTIVE_PING_FAILURES = 3
+
 
 # ``ray_actor_options`` is intentionally minimal here. The proxy needs a
 # ``runtime_env.pip`` list (aiortc, httpx, hypha-rpc, pydantic + their pins
@@ -266,6 +274,7 @@ class ProxyDeployment:
         self.mcp_service_id: str = None
         self.rtc_service_id: str = None
         self.service_semaphore = asyncio.Semaphore(self.max_ongoing_requests)
+        self._consecutive_ping_failures = 0
 
         # WebRTC peer connection tracking
         self._active_peer_connections: Dict[str, Dict[str, Any]] = {}
@@ -717,6 +726,29 @@ class ProxyDeployment:
         # Reset so the next successful entry health check triggers re-registration
         self.entry_deployment_ready = False
 
+    async def _reset_server_connection(self) -> None:
+        """Cleanly disconnect ``self.server`` before we forget about it.
+
+        Nulling ``self.server`` without telling Hypha we're gone leaves a
+        registration lingering server-side; the next ``connect_to_server``
+        with the same ``client_id`` is rejected with 'Client already exists
+        and is active' until Hypha's own stale-client TTL sweeps it (~30-60s).
+        Calling ``disconnect`` here frees the client_id immediately.
+
+        Idempotent — safe to call even when ``self.server`` is already None.
+        Bounded timeout so a wedged transport can't stall the caller.
+        """
+        if self.server is not None:
+            try:
+                await asyncio.wait_for(self.server.disconnect(), timeout=2.0)
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Disconnect during connection reset failed "
+                    f"for '{self.application_id}': {e}"
+                )
+        self.server = None
+        self._consecutive_ping_failures = 0
+
     async def _register_services(self) -> None:
         """
         Register WebSocket, WebRTC, and MCP services with the Hypha server.
@@ -733,6 +765,12 @@ class ProxyDeployment:
         functional with WebSocket-only communication. The main WebSocket service
         registration is required for the deployment to be considered healthy.
         """
+        # Any prior connection under our client_id must be released before
+        # ``connect_to_server`` — otherwise the new attempt hits
+        # 'Client already exists and is active' and Ray Serve flaps the
+        # replica until Hypha's stale-client TTL times the old registration
+        # out. See _reset_server_connection for details.
+        await self._reset_server_connection()
         # Connect to Hypha server
         try:
             # Connect to the Hypha server
@@ -911,18 +949,44 @@ class ProxyDeployment:
                 if not self.server or not self.websocket_service_id:
                     await self._register_services()
 
-        # Check if Hypha server can be reached
+        # Check if Hypha server can be reached. A single failure isn't
+        # decisive — on some Hypha bridges ping p99 sits well above the
+        # 5s Ray Serve health_check_timeout, so occasional tail-latency
+        # spikes must NOT flap the replica. Only after
+        # _MAX_CONSECUTIVE_PING_FAILURES do we conclude the socket is
+        # dead, release the client_id, and hand a failure to Ray Serve.
         try:
             logger.debug("Pinging Hypha server to check connection...")
             await self.server.echo("ping")
             logger.debug("Received ping response from Hypha server.")
+            if self._consecutive_ping_failures:
+                logger.info(
+                    f"✅ Hypha ping recovered for '{self.application_id}' "
+                    f"after {self._consecutive_ping_failures} transient "
+                    f"failure(s)."
+                )
+                self._consecutive_ping_failures = 0
         except Exception as e:
+            self._consecutive_ping_failures += 1
+            if self._consecutive_ping_failures < _MAX_CONSECUTIVE_PING_FAILURES:
+                logger.warning(
+                    f"⚠️ Hypha ping failed "
+                    f"({self._consecutive_ping_failures}/"
+                    f"{_MAX_CONSECUTIVE_PING_FAILURES}) for "
+                    f"'{self.application_id}' — likely bridge tail latency, "
+                    f"keeping replica healthy: {e}"
+                )
+                # Transient. Skip the downstream service round-trip too
+                # (it uses the same transport) and return healthy; the
+                # next tick will re-ping.
+                return
             logger.error(
-                f"❌ Hypha server connection failed for '{self.application_id}': {e}"
+                f"❌ Hypha ping failed {self._consecutive_ping_failures} "
+                f"times consecutively for '{self.application_id}'; "
+                f"resetting the connection: {e}"
             )
-            # Reset server connection to trigger re-connection on next call
-            self.server = None
-            raise RuntimeError("Hypha server connection failed")
+            await self._reset_server_connection()
+            raise RuntimeError("Hypha server connection failed") from e
 
         # Check if the WebSocket service can be reached
         try:
@@ -956,16 +1020,12 @@ class ProxyDeployment:
             await self._deregister_services()
         except Exception as e:
             logger.warning(f"⚠️ __del__ deregister failed: {e}")
-        if self.server:
-            try:
-                await self.server.disconnect()
-                logger.info(
-                    f"👋 Disconnected Hypha client '{self.client_id}' on replica shutdown."
-                )
-            except Exception as e:
-                logger.warning(f"⚠️ __del__ disconnect failed: {e}")
-            finally:
-                self.server = None
+        had_server = self.server is not None
+        await self._reset_server_connection()
+        if had_server:
+            logger.info(
+                f"👋 Disconnected Hypha client '{self.client_id}' on replica shutdown."
+            )
 
 
 if __name__ == "__main__":
