@@ -488,11 +488,25 @@ class AppBuilder:
                 }
             )
         except Exception as exc:
-            self.logger.warning(
-                f"generate_token for '{artifact_workspace}' failed ({exc}); "
-                "proceeding without a download token (works for public "
-                "artifacts)."
-            )
+            # The common expected case: this worker's token has no permission
+            # on the artifact's workspace (e.g. a personal-workspace worker
+            # deploying a public artifact from a shared collection). Hypha
+            # wraps the server-side PermissionError in a RemoteException, so
+            # we match on the message text — it's stable across recent Hypha
+            # versions and the alternative (matching on RemoteError attrs) is
+            # more fragile. Public artifacts still work via anonymous read.
+            if "any permission for workspace" in str(exc):
+                self.logger.info(
+                    f"No cross-workspace grant on '{artifact_workspace}'; "
+                    f"downloading '{artifact_id}' anonymously "
+                    f"(works for public artifacts)."
+                )
+            else:
+                self.logger.warning(
+                    f"generate_token for '{artifact_workspace}' failed ({exc}); "
+                    "proceeding without a download token (works for public "
+                    "artifacts)."
+                )
 
         # 2. Compose env_vars + the introspect-task runtime_env.
         flat_env_vars: Dict[str, str] = {}
