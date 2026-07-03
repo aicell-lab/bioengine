@@ -278,6 +278,15 @@ class ProxyDeployment:
         # WebRTC peer connection tracking
         self._active_peer_connections: Dict[str, Dict[str, Any]] = {}
 
+        # WebRTC ICE rotation state — populated by _register_services.
+        # hypha_rpc.register_rtc_service captures our rtc_config dict by
+        # reference inside its offer callback, so mutating
+        # ``self._rtc_config["ice_servers"]`` here is picked up by every
+        # subsequent WebRTC connection request without re-registering the
+        # RTC service. See _refresh_ice_if_expiring for the refresh logic.
+        self._rtc_config: Optional[Dict[str, Any]] = None
+        self._ice_expires_at: Optional[float] = None
+
         # Lock for service registration
         self._registration_lock = asyncio.Lock()
 
@@ -611,6 +620,89 @@ class ProxyDeployment:
             )
             return None
 
+    # Refresh the ICE list once we're inside this many seconds of the
+    # coturn-returned expiration. 15 min gives us enough buffer to survive
+    # a couple of failed fetches at the periodic health-check cadence
+    # (10 s) without letting the credentials go stale on live peers.
+    _ICE_REFRESH_MARGIN_SECONDS = 900
+
+    @staticmethod
+    def _parse_ice_expiry(ice_servers: List[Dict[str, Any]]) -> Optional[float]:
+        """Extract the credential expiry timestamp from a coturn response.
+
+        Coturn returns TURN entries whose ``username`` field is
+        ``"<unix_timestamp>:<user>"`` — the timestamp is when the shared
+        secret HMAC becomes invalid. Multiple entries in the same
+        response share the same timestamp (verified live), so we return
+        the first one we can parse. Returns ``None`` when no entry has a
+        parseable timestamp — e.g. a custom ice_servers list supplied at
+        deploy time via the ``ice_servers`` constructor kwarg — which
+        disables refresh for that deployment.
+        """
+        for entry in ice_servers or []:
+            username = entry.get("username", "")
+            if not isinstance(username, str) or ":" not in username:
+                continue
+            head = username.split(":", 1)[0]
+            if head.isdigit():
+                return float(head)
+        return None
+
+    async def _refresh_ice_if_expiring(self) -> None:
+        """If our TURN credentials are close to expiring, fetch a fresh
+        set and mutate the shared RTC config in place.
+
+        ``register_rtc_service`` captured ``self._rtc_config`` by
+        reference inside its offer callback; any WebRTC connection
+        opened AFTER this call sees the new ``ice_servers`` list without
+        re-registering the service (verified against
+        hypha_rpc.webrtc_client._create_offer, which reads
+        ``config["ice_servers"]`` on each invocation). Existing
+        connections keep the credentials they were established with,
+        which is fine — RTCPeerConnection only consults ice servers
+        during the initial negotiation.
+
+        No-op when:
+        - WebRTC was disabled at deploy time (rtc_config is None)
+        - The current ice_servers had no parseable expiry (custom static
+          list — nothing to refresh against)
+        - We still have more than _ICE_REFRESH_MARGIN_SECONDS of validity
+        """
+        if self._rtc_config is None:
+            return
+        if "ice_servers" not in self._rtc_config:
+            return
+        if self._ice_expires_at is None:
+            return
+        remaining = self._ice_expires_at - time.time()
+        if remaining > self._ICE_REFRESH_MARGIN_SECONDS:
+            return
+
+        logger.info(
+            f"🔄 Refreshing ICE credentials for '{self.application_id}' "
+            f"({int(remaining)}s until current credentials expire)."
+        )
+        new_ice = await self._fetch_ice_servers()
+        if not new_ice:
+            # _fetch_ice_servers already logged a warning; leave the
+            # existing (possibly-expired) list in place so late-arriving
+            # WebRTC connections at least have SOMETHING to try. The
+            # health-check tick will retry ~10 s later.
+            return
+        new_expiry = self._parse_ice_expiry(new_ice)
+        # Mutate the shared dict in place — do NOT replace it, or we'd
+        # break the closure reference hypha_rpc captured at registration.
+        self._rtc_config["ice_servers"] = new_ice
+        self._ice_expires_at = new_expiry
+        logger.info(
+            f"✅ Rotated ICE credentials for '{self.application_id}' "
+            + (
+                f"(next expiry in {int(new_expiry - time.time())}s)."
+                if new_expiry is not None
+                else "(new credentials have no parseable expiry — refresh disabled)."
+            )
+        )
+
     @schema_method
     async def _get_service_load(
         self,
@@ -728,6 +820,10 @@ class ProxyDeployment:
         self.websocket_service_id = None
         self.rtc_service_id = None
         self.mcp_service_id = None
+        # Clear the RTC-refresh state so a fresh registration re-populates
+        # both the config reference and the expiry timestamp.
+        self._rtc_config = None
+        self._ice_expires_at = None
         # Reset so the next successful entry health check triggers re-registration
         self.entry_deployment_ready = False
 
@@ -871,6 +967,15 @@ class ProxyDeployment:
             # Add custom ICE servers if available, otherwise hypha-rpc will use defaults
             if ice_servers:
                 rtc_config["ice_servers"] = ice_servers
+                self._ice_expires_at = self._parse_ice_expiry(ice_servers)
+
+            # Hold a reference to the config dict so we can update
+            # ``ice_servers`` on it later without re-registering the RTC
+            # service (see _refresh_ice_if_expiring). The offer callback
+            # inside hypha_rpc.register_rtc_service captures this exact
+            # dict via partial(...), so a mutation here is picked up by
+            # every subsequent WebRTC connection request.
+            self._rtc_config = rtc_config
 
             # Register WebRTC service
             rtc_service_info = await register_rtc_service(
@@ -1008,6 +1113,21 @@ class ProxyDeployment:
             # Reset service ID to trigger re-registration on next call
             self.websocket_service_id = None
             raise RuntimeError("WebSocket service connection failed")
+
+        # Rotate WebRTC TURN credentials before they expire so long-
+        # running deployments don't silently drop TURN relay after ~1h
+        # (coturn's default TTL on hypha.aicell.io). See
+        # _refresh_ice_if_expiring for the mutate-in-place mechanism.
+        # Any exception is logged and swallowed — a stale ICE list is
+        # still better than a health-check failure at this point (the
+        # replica itself is fine).
+        try:
+            await self._refresh_ice_if_expiring()
+        except Exception as e:
+            logger.warning(
+                f"⚠️ ICE credential refresh raised for '{self.application_id}': {e}. "
+                f"Existing credentials remain in place; will retry next tick."
+            )
 
         # All checks passed - deployment is healthy
         logger.debug(f"🩺 Health check passed for '{self.application_id}'.")
