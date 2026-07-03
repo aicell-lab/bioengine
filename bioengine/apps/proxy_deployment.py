@@ -9,7 +9,6 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 import ray
-from httpx import AsyncClient, HTTPStatusError, RequestError
 from pydantic import Field
 from ray.exceptions import RayTaskError
 from ray.serve import deployment, get_replica_context
@@ -279,6 +278,15 @@ class ProxyDeployment:
         # WebRTC peer connection tracking
         self._active_peer_connections: Dict[str, Dict[str, Any]] = {}
 
+        # WebRTC ICE rotation state — populated by _register_services.
+        # hypha_rpc.register_rtc_service captures our rtc_config dict by
+        # reference inside its offer callback, so mutating
+        # ``self._rtc_config["ice_servers"]`` here is picked up by every
+        # subsequent WebRTC connection request without re-registering the
+        # RTC service. See _refresh_ice_if_expiring for the refresh logic.
+        self._rtc_config: Optional[Dict[str, Any]] = None
+        self._ice_expires_at: Optional[float] = None
+
         # Lock for service registration
         self._registration_lock = asyncio.Lock()
 
@@ -509,10 +517,15 @@ class ProxyDeployment:
                 f"(Connection ID: {connection_id[:8]}...)"
             )
 
-            # Add to active connections tracking
+            # Add to active connections tracking. ``state_changed_at`` is
+            # bumped on every connectionstatechange so the periodic sweep
+            # can distinguish "in this state briefly" from "stuck here for
+            # ages" (browser tab closed without emitting close, mobile
+            # network vanished, etc.).
             self._active_peer_connections[connection_id] = {
                 "peer_connection": peer_connection,
-                "created_at": current_time,  # TODO: call peer_connection.close() after a timeout
+                "created_at": current_time,
+                "state_changed_at": current_time,
                 "state": "new",
             }
 
@@ -528,6 +541,9 @@ class ProxyDeployment:
                 # Update connection state
                 if connection_id in self._active_peer_connections:
                     self._active_peer_connections[connection_id]["state"] = state
+                    self._active_peer_connections[connection_id]["state_changed_at"] = (
+                        time.time()
+                    )
 
                     # Remove connection if it's closed or failed
                     if state in ["closed", "failed"]:
@@ -550,9 +566,7 @@ class ProxyDeployment:
                 f"❌ Failed to initialize WebRTC connection for '{self.application_id}': {e}"
             )
 
-    ICE_SERVERS_URL = (
-        "https://hypha.aicell.io/turn-server/services/coturn/get_rtc_ice_servers"
-    )
+    _ICE_SERVERS_SERVICE = "turn-server/coturn"
 
     async def _fetch_ice_servers(self) -> Optional[List[Dict[str, Any]]]:
         """
@@ -563,8 +577,12 @@ class ProxyDeployment:
 
         Resolution order:
         1. If custom ICE servers were provided at deploy time, use them directly.
-        2. Otherwise, fetch from the Hypha TURN server endpoint.
-        3. If the fetch fails, fall back to None (hypha-rpc uses built-in defaults).
+        2. Otherwise, call the Hypha ``turn-server/coturn`` service through the
+           authenticated ``self.server`` connection. The endpoint requires auth
+           — raw HTTP (which used to be the code path here) always 403'd.
+        3. If the RPC fails, fall back to ``None`` and let hypha-rpc /
+           aiortc use built-in STUN defaults. WebRTC then works P2P for
+           friendly networks but has no TURN relay for restrictive NATs.
 
         Returns:
             List of ICE server configurations, or None to use defaults.
@@ -575,36 +593,192 @@ class ProxyDeployment:
         """
         if self.ice_servers is not None:
             logger.info(
-                f"✅ Using custom ICE servers provided at deploy time for {self.application_id}"
+                f"✅ Using custom ICE servers provided at deploy time for '{self.application_id}'"
             )
             return self.ice_servers
 
-        try:
-            async with AsyncClient(timeout=30) as client:
-                response = await client.get(self.ICE_SERVERS_URL)
-                response.raise_for_status()
-                ice_servers = response.json()
-                logger.info(
-                    f"✅ Successfully fetched ICE servers for {self.application_id}"
-                )
-                return ice_servers
-        except HTTPStatusError as e:
-            logger.error(
-                f"❌ HTTP error fetching ICE servers for {self.application_id}: {e}"
+        if self.server is None:
+            # We only reach here from _register_services, which sets
+            # self.server just above. Defensive check kept anyway so a
+            # future refactor doesn't silently break WebRTC by rearranging
+            # the callsite.
+            logger.warning(
+                f"⚠️ No Hypha connection while fetching ICE servers for "
+                f"'{self.application_id}'; using aiortc built-in defaults."
             )
-        except RequestError as e:
-            logger.error(
-                f"❌ Request error fetching ICE servers for {self.application_id}: {e}"
-            )
-        except Exception as e:
-            logger.error(
-                f"❌ Unexpected error fetching ICE servers for {self.application_id}: {e}"
-            )
+            return None
 
-        logger.warning(
-            f"⚠️ Falling back to default ICE servers for {self.application_id}"
-        )
+        try:
+            coturn = await self.server.get_service(self._ICE_SERVERS_SERVICE)
+            ice_servers = await coturn.get_rtc_ice_servers()
+            logger.info(
+                f"✅ Fetched {len(ice_servers)} ICE server(s) from "
+                f"'{self._ICE_SERVERS_SERVICE}' for '{self.application_id}'"
+            )
+            return ice_servers
+        except Exception as e:
+            # Non-fatal: WebRTC still works with aiortc's built-in STUN
+            # defaults, just without the private TURN relay. Log at
+            # warning so operators can still notice — but no traceback,
+            # since the fallback path is well-defined.
+            logger.warning(
+                f"⚠️ Could not fetch ICE servers via '{self._ICE_SERVERS_SERVICE}' "
+                f"for '{self.application_id}': {e}. Falling back to aiortc "
+                f"built-in defaults (P2P only, no TURN relay)."
+            )
+            return None
+
+    # Refresh the ICE list once we're inside this many seconds of the
+    # coturn-returned expiration. 15 min gives us enough buffer to survive
+    # a couple of failed fetches at the periodic health-check cadence
+    # (10 s) without letting the credentials go stale on live peers.
+    _ICE_REFRESH_MARGIN_SECONDS = 900
+
+    # WebRTC peers can vanish without ever emitting a ``closed`` or
+    # ``failed`` state (mobile network cut, browser tab killed, kernel
+    # SIGKILL of the client process). The state-change handler only
+    # cleans up on those two events, so a long-running ProxyDeployment
+    # would otherwise accumulate ghost RTCPeerConnection objects in
+    # ``_active_peer_connections`` forever. These bounds put a lid on
+    # how long each transient state may persist before we consider the
+    # peer dead and close the connection ourselves.
+    _PEER_STUCK_HANDSHAKE_TIMEOUT_SECONDS = 120
+    _PEER_STUCK_DISCONNECTED_TIMEOUT_SECONDS = 300
+
+    @staticmethod
+    def _parse_ice_expiry(ice_servers: List[Dict[str, Any]]) -> Optional[float]:
+        """Extract the credential expiry timestamp from a coturn response.
+
+        Coturn returns TURN entries whose ``username`` field is
+        ``"<unix_timestamp>:<user>"`` — the timestamp is when the shared
+        secret HMAC becomes invalid. Multiple entries in the same
+        response share the same timestamp (verified live), so we return
+        the first one we can parse. Returns ``None`` when no entry has a
+        parseable timestamp — e.g. a custom ice_servers list supplied at
+        deploy time via the ``ice_servers`` constructor kwarg — which
+        disables refresh for that deployment.
+        """
+        for entry in ice_servers or []:
+            username = entry.get("username", "")
+            if not isinstance(username, str) or ":" not in username:
+                continue
+            head = username.split(":", 1)[0]
+            if head.isdigit():
+                return float(head)
         return None
+
+    async def _refresh_ice_if_expiring(self) -> None:
+        """If our TURN credentials are close to expiring, fetch a fresh
+        set and mutate the shared RTC config in place.
+
+        ``register_rtc_service`` captured ``self._rtc_config`` by
+        reference inside its offer callback; any WebRTC connection
+        opened AFTER this call sees the new ``ice_servers`` list without
+        re-registering the service (verified against
+        hypha_rpc.webrtc_client._create_offer, which reads
+        ``config["ice_servers"]`` on each invocation). Existing
+        connections keep the credentials they were established with,
+        which is fine — RTCPeerConnection only consults ice servers
+        during the initial negotiation.
+
+        No-op when:
+        - WebRTC was disabled at deploy time (rtc_config is None)
+        - The current ice_servers had no parseable expiry (custom static
+          list — nothing to refresh against)
+        - We still have more than _ICE_REFRESH_MARGIN_SECONDS of validity
+        """
+        if self._rtc_config is None:
+            return
+        if "ice_servers" not in self._rtc_config:
+            return
+        if self._ice_expires_at is None:
+            return
+        remaining = self._ice_expires_at - time.time()
+        if remaining > self._ICE_REFRESH_MARGIN_SECONDS:
+            return
+
+        logger.info(
+            f"🔄 Refreshing ICE credentials for '{self.application_id}' "
+            f"({int(remaining)}s until current credentials expire)."
+        )
+        new_ice = await self._fetch_ice_servers()
+        if not new_ice:
+            # _fetch_ice_servers already logged a warning; leave the
+            # existing (possibly-expired) list in place so late-arriving
+            # WebRTC connections at least have SOMETHING to try. The
+            # health-check tick will retry ~10 s later.
+            return
+        new_expiry = self._parse_ice_expiry(new_ice)
+        # Mutate the shared dict in place — do NOT replace it, or we'd
+        # break the closure reference hypha_rpc captured at registration.
+        self._rtc_config["ice_servers"] = new_ice
+        self._ice_expires_at = new_expiry
+        logger.info(
+            f"✅ Rotated ICE credentials for '{self.application_id}' "
+            + (
+                f"(next expiry in {int(new_expiry - time.time())}s)."
+                if new_expiry is not None
+                else "(new credentials have no parseable expiry — refresh disabled)."
+            )
+        )
+
+    async def _sweep_stale_peer_connections(self) -> None:
+        """Close and drop WebRTC peers stuck in a transient state too long.
+
+        Called from ``check_health``. The state-change handler installed
+        in ``_on_webrtc_init`` cleans up on ``closed`` and ``failed``
+        events, but the peer's browser tab (or mobile app, or Python
+        client) can vanish without emitting either — the ICE connection
+        just goes silent. Without this sweep, a long-running deployment
+        accumulates ghost ``RTCPeerConnection`` objects forever:
+
+        - ``new`` / ``connecting`` older than
+          ``_PEER_STUCK_HANDSHAKE_TIMEOUT_SECONDS``: never completed the
+          handshake — client abandoned before the datachannel opened.
+        - ``disconnected`` older than
+          ``_PEER_STUCK_DISCONNECTED_TIMEOUT_SECONDS``: temporary
+          disconnect never recovered. aiortc normally emits ``failed``
+          within its own ICE consent-freshness deadline, but silent
+          network death defeats that.
+
+        ``connected`` peers are never touched no matter their age — we
+        only close what looks abandoned.
+        """
+        if not self._active_peer_connections:
+            return
+        now = time.time()
+        stale: List[str] = []
+        for connection_id, entry in list(self._active_peer_connections.items()):
+            state = entry.get("state", "new")
+            since = entry.get("state_changed_at") or entry.get("created_at") or now
+            age = now - since
+            if state in ("new", "connecting"):
+                if age > self._PEER_STUCK_HANDSHAKE_TIMEOUT_SECONDS:
+                    stale.append(connection_id)
+            elif state == "disconnected":
+                if age > self._PEER_STUCK_DISCONNECTED_TIMEOUT_SECONDS:
+                    stale.append(connection_id)
+        for connection_id in stale:
+            entry = self._active_peer_connections.pop(connection_id, None)
+            if entry is None:
+                continue
+            pc = entry.get("peer_connection")
+            state = entry.get("state", "?")
+            logger.info(
+                f"🧹 Closing abandoned WebRTC peer '{connection_id[:8]}...' for "
+                f"'{self.application_id}' (state='{state}', stuck {int(now - (entry.get('state_changed_at') or entry.get('created_at') or now))}s)."
+            )
+            if pc is not None:
+                try:
+                    await asyncio.wait_for(pc.close(), timeout=2.0)
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Error closing abandoned peer connection '{connection_id[:8]}...': {e}"
+                    )
+        if stale:
+            logger.info(
+                f"📊 Active WebRTC connections: {len(self._active_peer_connections)}"
+            )
 
     @schema_method
     async def _get_service_load(
@@ -723,6 +897,10 @@ class ProxyDeployment:
         self.websocket_service_id = None
         self.rtc_service_id = None
         self.mcp_service_id = None
+        # Clear the RTC-refresh state so a fresh registration re-populates
+        # both the config reference and the expiry timestamp.
+        self._rtc_config = None
+        self._ice_expires_at = None
         # Reset so the next successful entry health check triggers re-registration
         self.entry_deployment_ready = False
 
@@ -866,6 +1044,15 @@ class ProxyDeployment:
             # Add custom ICE servers if available, otherwise hypha-rpc will use defaults
             if ice_servers:
                 rtc_config["ice_servers"] = ice_servers
+                self._ice_expires_at = self._parse_ice_expiry(ice_servers)
+
+            # Hold a reference to the config dict so we can update
+            # ``ice_servers`` on it later without re-registering the RTC
+            # service (see _refresh_ice_if_expiring). The offer callback
+            # inside hypha_rpc.register_rtc_service captures this exact
+            # dict via partial(...), so a mutation here is picked up by
+            # every subsequent WebRTC connection request.
+            self._rtc_config = rtc_config
 
             # Register WebRTC service
             rtc_service_info = await register_rtc_service(
@@ -1003,6 +1190,34 @@ class ProxyDeployment:
             # Reset service ID to trigger re-registration on next call
             self.websocket_service_id = None
             raise RuntimeError("WebSocket service connection failed")
+
+        # Rotate WebRTC TURN credentials before they expire so long-
+        # running deployments don't silently drop TURN relay after ~1h
+        # (coturn's default TTL on hypha.aicell.io). See
+        # _refresh_ice_if_expiring for the mutate-in-place mechanism.
+        # Any exception is logged and swallowed — a stale ICE list is
+        # still better than a health-check failure at this point (the
+        # replica itself is fine).
+        try:
+            await self._refresh_ice_if_expiring()
+        except Exception as e:
+            logger.warning(
+                f"⚠️ ICE credential refresh raised for '{self.application_id}': {e}. "
+                f"Existing credentials remain in place; will retry next tick."
+            )
+
+        # Sweep abandoned WebRTC peer connections. Same rationale as the
+        # ICE refresh: for long-running deployments the accumulation of
+        # ghost RTCPeerConnection objects is a real leak we've traced
+        # to peers vanishing without a clean state transition. See
+        # _sweep_stale_peer_connections.
+        try:
+            await self._sweep_stale_peer_connections()
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Peer-connection sweep raised for '{self.application_id}': {e}. "
+                f"Will retry next tick."
+            )
 
         # All checks passed - deployment is healthy
         logger.debug(f"🩺 Health check passed for '{self.application_id}'.")
