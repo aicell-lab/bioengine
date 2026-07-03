@@ -9,7 +9,6 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 import ray
-from httpx import AsyncClient, HTTPStatusError, RequestError
 from pydantic import Field
 from ray.exceptions import RayTaskError
 from ray.serve import deployment, get_replica_context
@@ -550,9 +549,7 @@ class ProxyDeployment:
                 f"❌ Failed to initialize WebRTC connection for '{self.application_id}': {e}"
             )
 
-    ICE_SERVERS_URL = (
-        "https://hypha.aicell.io/turn-server/services/coturn/get_rtc_ice_servers"
-    )
+    _ICE_SERVERS_SERVICE = "turn-server/coturn"
 
     async def _fetch_ice_servers(self) -> Optional[List[Dict[str, Any]]]:
         """
@@ -563,8 +560,12 @@ class ProxyDeployment:
 
         Resolution order:
         1. If custom ICE servers were provided at deploy time, use them directly.
-        2. Otherwise, fetch from the Hypha TURN server endpoint.
-        3. If the fetch fails, fall back to None (hypha-rpc uses built-in defaults).
+        2. Otherwise, call the Hypha ``turn-server/coturn`` service through the
+           authenticated ``self.server`` connection. The endpoint requires auth
+           — raw HTTP (which used to be the code path here) always 403'd.
+        3. If the RPC fails, fall back to ``None`` and let hypha-rpc /
+           aiortc use built-in STUN defaults. WebRTC then works P2P for
+           friendly networks but has no TURN relay for restrictive NATs.
 
         Returns:
             List of ICE server configurations, or None to use defaults.
@@ -575,36 +576,40 @@ class ProxyDeployment:
         """
         if self.ice_servers is not None:
             logger.info(
-                f"✅ Using custom ICE servers provided at deploy time for {self.application_id}"
+                f"✅ Using custom ICE servers provided at deploy time for '{self.application_id}'"
             )
             return self.ice_servers
 
-        try:
-            async with AsyncClient(timeout=30) as client:
-                response = await client.get(self.ICE_SERVERS_URL)
-                response.raise_for_status()
-                ice_servers = response.json()
-                logger.info(
-                    f"✅ Successfully fetched ICE servers for {self.application_id}"
-                )
-                return ice_servers
-        except HTTPStatusError as e:
-            logger.error(
-                f"❌ HTTP error fetching ICE servers for {self.application_id}: {e}"
+        if self.server is None:
+            # We only reach here from _register_services, which sets
+            # self.server just above. Defensive check kept anyway so a
+            # future refactor doesn't silently break WebRTC by rearranging
+            # the callsite.
+            logger.warning(
+                f"⚠️ No Hypha connection while fetching ICE servers for "
+                f"'{self.application_id}'; using aiortc built-in defaults."
             )
-        except RequestError as e:
-            logger.error(
-                f"❌ Request error fetching ICE servers for {self.application_id}: {e}"
-            )
-        except Exception as e:
-            logger.error(
-                f"❌ Unexpected error fetching ICE servers for {self.application_id}: {e}"
-            )
+            return None
 
-        logger.warning(
-            f"⚠️ Falling back to default ICE servers for {self.application_id}"
-        )
-        return None
+        try:
+            coturn = await self.server.get_service(self._ICE_SERVERS_SERVICE)
+            ice_servers = await coturn.get_rtc_ice_servers()
+            logger.info(
+                f"✅ Fetched {len(ice_servers)} ICE server(s) from "
+                f"'{self._ICE_SERVERS_SERVICE}' for '{self.application_id}'"
+            )
+            return ice_servers
+        except Exception as e:
+            # Non-fatal: WebRTC still works with aiortc's built-in STUN
+            # defaults, just without the private TURN relay. Log at
+            # warning so operators can still notice — but no traceback,
+            # since the fallback path is well-defined.
+            logger.warning(
+                f"⚠️ Could not fetch ICE servers via '{self._ICE_SERVERS_SERVICE}' "
+                f"for '{self.application_id}': {e}. Falling back to aiortc "
+                f"built-in defaults (P2P only, no TURN relay)."
+            )
+            return None
 
     @schema_method
     async def _get_service_load(
