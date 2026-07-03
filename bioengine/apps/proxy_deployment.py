@@ -517,10 +517,15 @@ class ProxyDeployment:
                 f"(Connection ID: {connection_id[:8]}...)"
             )
 
-            # Add to active connections tracking
+            # Add to active connections tracking. ``state_changed_at`` is
+            # bumped on every connectionstatechange so the periodic sweep
+            # can distinguish "in this state briefly" from "stuck here for
+            # ages" (browser tab closed without emitting close, mobile
+            # network vanished, etc.).
             self._active_peer_connections[connection_id] = {
                 "peer_connection": peer_connection,
-                "created_at": current_time,  # TODO: call peer_connection.close() after a timeout
+                "created_at": current_time,
+                "state_changed_at": current_time,
                 "state": "new",
             }
 
@@ -536,6 +541,9 @@ class ProxyDeployment:
                 # Update connection state
                 if connection_id in self._active_peer_connections:
                     self._active_peer_connections[connection_id]["state"] = state
+                    self._active_peer_connections[connection_id]["state_changed_at"] = (
+                        time.time()
+                    )
 
                     # Remove connection if it's closed or failed
                     if state in ["closed", "failed"]:
@@ -626,6 +634,17 @@ class ProxyDeployment:
     # (10 s) without letting the credentials go stale on live peers.
     _ICE_REFRESH_MARGIN_SECONDS = 900
 
+    # WebRTC peers can vanish without ever emitting a ``closed`` or
+    # ``failed`` state (mobile network cut, browser tab killed, kernel
+    # SIGKILL of the client process). The state-change handler only
+    # cleans up on those two events, so a long-running ProxyDeployment
+    # would otherwise accumulate ghost RTCPeerConnection objects in
+    # ``_active_peer_connections`` forever. These bounds put a lid on
+    # how long each transient state may persist before we consider the
+    # peer dead and close the connection ourselves.
+    _PEER_STUCK_HANDSHAKE_TIMEOUT_SECONDS = 120
+    _PEER_STUCK_DISCONNECTED_TIMEOUT_SECONDS = 300
+
     @staticmethod
     def _parse_ice_expiry(ice_servers: List[Dict[str, Any]]) -> Optional[float]:
         """Extract the credential expiry timestamp from a coturn response.
@@ -702,6 +721,64 @@ class ProxyDeployment:
                 else "(new credentials have no parseable expiry — refresh disabled)."
             )
         )
+
+    async def _sweep_stale_peer_connections(self) -> None:
+        """Close and drop WebRTC peers stuck in a transient state too long.
+
+        Called from ``check_health``. The state-change handler installed
+        in ``_on_webrtc_init`` cleans up on ``closed`` and ``failed``
+        events, but the peer's browser tab (or mobile app, or Python
+        client) can vanish without emitting either — the ICE connection
+        just goes silent. Without this sweep, a long-running deployment
+        accumulates ghost ``RTCPeerConnection`` objects forever:
+
+        - ``new`` / ``connecting`` older than
+          ``_PEER_STUCK_HANDSHAKE_TIMEOUT_SECONDS``: never completed the
+          handshake — client abandoned before the datachannel opened.
+        - ``disconnected`` older than
+          ``_PEER_STUCK_DISCONNECTED_TIMEOUT_SECONDS``: temporary
+          disconnect never recovered. aiortc normally emits ``failed``
+          within its own ICE consent-freshness deadline, but silent
+          network death defeats that.
+
+        ``connected`` peers are never touched no matter their age — we
+        only close what looks abandoned.
+        """
+        if not self._active_peer_connections:
+            return
+        now = time.time()
+        stale: List[str] = []
+        for connection_id, entry in list(self._active_peer_connections.items()):
+            state = entry.get("state", "new")
+            since = entry.get("state_changed_at") or entry.get("created_at") or now
+            age = now - since
+            if state in ("new", "connecting"):
+                if age > self._PEER_STUCK_HANDSHAKE_TIMEOUT_SECONDS:
+                    stale.append(connection_id)
+            elif state == "disconnected":
+                if age > self._PEER_STUCK_DISCONNECTED_TIMEOUT_SECONDS:
+                    stale.append(connection_id)
+        for connection_id in stale:
+            entry = self._active_peer_connections.pop(connection_id, None)
+            if entry is None:
+                continue
+            pc = entry.get("peer_connection")
+            state = entry.get("state", "?")
+            logger.info(
+                f"🧹 Closing abandoned WebRTC peer '{connection_id[:8]}...' for "
+                f"'{self.application_id}' (state='{state}', stuck {int(now - (entry.get('state_changed_at') or entry.get('created_at') or now))}s)."
+            )
+            if pc is not None:
+                try:
+                    await asyncio.wait_for(pc.close(), timeout=2.0)
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Error closing abandoned peer connection '{connection_id[:8]}...': {e}"
+                    )
+        if stale:
+            logger.info(
+                f"📊 Active WebRTC connections: {len(self._active_peer_connections)}"
+            )
 
     @schema_method
     async def _get_service_load(
@@ -1127,6 +1204,19 @@ class ProxyDeployment:
             logger.warning(
                 f"⚠️ ICE credential refresh raised for '{self.application_id}': {e}. "
                 f"Existing credentials remain in place; will retry next tick."
+            )
+
+        # Sweep abandoned WebRTC peer connections. Same rationale as the
+        # ICE refresh: for long-running deployments the accumulation of
+        # ghost RTCPeerConnection objects is a real leak we've traced
+        # to peers vanishing without a clean state transition. See
+        # _sweep_stale_peer_connections.
+        try:
+            await self._sweep_stale_peer_connections()
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Peer-connection sweep raised for '{self.application_id}': {e}. "
+                f"Will retry next tick."
             )
 
         # All checks passed - deployment is healthy
