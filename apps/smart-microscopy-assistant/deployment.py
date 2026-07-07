@@ -108,19 +108,21 @@ def _test_id_for(owner: str, name: str) -> str:
     return f"{h}-{safe_name}"
 
 
+def _read_pip(name: str) -> List[str]:
+    """Load a ``requirements-*.txt`` file next to this module."""
+    text = (Path(__file__).parent / name).read_text()
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 @bioengine.app(
     num_cpus=4,
     num_gpus=1,
     memory_mb=12 * 1024,
-    pip=[
-        "transformers==4.51.3",
-        "accelerate==1.6.0",
-        "torch==2.5.1",
-        "torchvision==0.20.1",
-        # numpy 1.26 keeps ABI in sync with the host Ray pod's pandas.
-        "numpy==1.26.4",
-        "pillow==10.4.0",
-    ],
+    pip=_read_pip("requirements-deployment.txt"),
     env_vars={
         # Triton's JIT cache wants a writable dir; runtime_env venv's
         # default $HOME is read-only on this Ray pod.

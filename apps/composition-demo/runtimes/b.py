@@ -6,6 +6,8 @@ sibling ``numpy_ops`` module which is imported lazily inside method
 bodies.
 """
 
+from pathlib import Path
+
 import bioengine
 
 from utils import base_status
@@ -13,11 +15,21 @@ from utils import base_status
 logger = bioengine.logger
 
 
+def _read_pip(name: str) -> list[str]:
+    """Load a ``requirements-*.txt`` file next to this module."""
+    text = (Path(__file__).parent / name).read_text()
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 @bioengine.app(
     num_cpus=1,
     num_gpus=0,
     memory_mb=512,
-    pip=["numpy==1.26.4"],
+    pip=_read_pip("requirements-b.txt"),
     max_ongoing_requests=5,
 )
 class RuntimeB:

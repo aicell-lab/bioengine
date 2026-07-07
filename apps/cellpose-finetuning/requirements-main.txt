@@ -1,0 +1,6 @@
+cellpose==4.0.7
+numpy==1.26.4
+tifffile
+Pillow
+matplotlib
+hypha-artifact==0.1.2

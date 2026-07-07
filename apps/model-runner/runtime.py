@@ -29,31 +29,27 @@ import ray
 logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
 
-# Pinned versions of every heavy dep the runtime needs at replica boot.
-# Mirrors the v0.5 runtime_deployment.py REQUIREMENTS list verbatim — same
-# package set and same pins. ``xarray`` is a transitive dep of
-# ``bioimageio.core`` but must be pinned explicitly here because pip's
-# resolver doesn't otherwise lock it tightly enough.
-REQUIREMENTS = [
-    "bioimageio.core==0.10.0",
-    "careamics==0.0.16",
-    "cellpose==3.1.1.2",
-    "nvidia-ml-py==12.555.43",
-    "numpy==1.26.4",
-    "onnxruntime==1.20.1",
-    "psutil==6.1.1",
-    "tensorflow==2.16.1",
-    "torch==2.5.1",
-    "torchvision==0.20.1",
-    "xarray==2025.1.2",
-]
+
+def _read_pip(name: str) -> List[str]:
+    """Load a ``requirements-*.txt`` file next to this module.
+
+    Keeps the heavy pin list out of the ``@bioengine.app`` decorator so
+    the deps look like a real requirements file — Dependabot / pip-audit
+    can point at the file directly and PR diffs isolate dep bumps.
+    """
+    text = (Path(__file__).parent / name).read_text()
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
 
 
 @bioengine.app(
     num_cpus=1,
     num_gpus=1,
     memory_mb=12 * 1024,
-    pip=REQUIREMENTS,
+    pip=_read_pip("requirements-runtime.txt"),
     max_ongoing_requests=1,
     autoscaling_config={
         "min_replicas": 1,

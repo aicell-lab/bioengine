@@ -3729,18 +3729,21 @@ def _predict_and_encode(
 # ---------------------------------------------------------------------------
 # Ray Serve deployment
 # ---------------------------------------------------------------------------
+def _read_pip(name: str) -> list[str]:
+    """Load a ``requirements-*.txt`` file next to this module."""
+    text = (Path(__file__).parent / name).read_text()
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 @bioengine.app(
     num_cpus=4,
     num_gpus=1,
     memory_mb=12 * 1024,
-    pip=[
-        "cellpose==4.0.7",
-        "numpy==1.26.4",
-        "tifffile",
-        "Pillow",
-        "matplotlib",
-        "hypha-artifact==0.1.2",
-    ],
+    pip=_read_pip("requirements-main.txt"),
     max_ongoing_requests=1,
     max_queued_requests=10,
     autoscaling_config={

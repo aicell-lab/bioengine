@@ -18,6 +18,7 @@ lazily inside the smoke test below.
 
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Union
 
 from pydantic import Field
@@ -27,11 +28,21 @@ import bioengine
 logger = bioengine.logger
 
 
+def _read_pip(name: str) -> List[str]:
+    """Load a ``requirements-*.txt`` file next to this module."""
+    text = (Path(__file__).parent / name).read_text()
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 @bioengine.app(
     num_cpus=1,
     num_gpus=0,
     memory_mb=512,
-    pip=["pandas"],
+    pip=_read_pip("requirements-deployment.txt"),
     env_vars={"EXAMPLE_ENV_VAR": "example_value"},
 )
 class DemoApp:

@@ -47,17 +47,26 @@ logger.setLevel("INFO")
 SUPPORTED_FILES_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 
 
+def _read_pip(name: str) -> List[str]:
+    """Load a ``requirements-*.txt`` file next to this module.
+
+    Same helper as ``runtime.py:_read_pip`` — duplicated instead of
+    imported so each module is self-contained even if the composition
+    graph changes.
+    """
+    text = (Path(__file__).parent / name).read_text()
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 @bioengine.app(
     num_cpus=1,
     num_gpus=0,
     memory_mb=4 * 1024,
-    pip=[
-        "aiofiles>=23.0.0",
-        "bioimageio.core==0.10.0",
-        "imageio>=2.37.0",
-        "numpy==1.26.4",
-        "tqdm>=4.64.0",
-    ],
+    pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=10,
     max_queued_requests=30,
     autoscaling_config={
