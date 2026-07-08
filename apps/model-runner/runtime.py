@@ -24,7 +24,6 @@ from typing import Dict, List, Literal, Optional, Union
 
 import bioengine
 import numpy as np
-import ray
 
 logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
@@ -71,6 +70,18 @@ class RuntimeApp:
 
     def __init__(self) -> None:
         self._kwargs_cache: Dict[str, dict] = {}
+        # Route bioimageio.spec + bioimageio.core log messages through
+        # loguru. Their loggers are ``logger.disable()``-d by default
+        # (standard convention for libraries), so per-weight-format
+        # progress, conda subprocess spawns, and the like never surface
+        # in the replica's stderr otherwise. Enabling once at replica
+        # init is idempotent.
+        try:
+            from loguru import logger as _loguru_logger
+
+            _loguru_logger.enable("bioimageio")
+        except Exception as e:
+            logger.warning(f"Could not enable bioimageio loguru sink: {e}")
 
     # === Liveness ===
 
@@ -105,15 +116,84 @@ class RuntimeApp:
 
     # === Testing ===
 
-    def _test(self, rdf_path: str) -> dict:
-        """Run ``bioimageio.core.test_model`` on the given RDF path."""
-        from bioimageio.core import test_model
+    def _test(self, rdf_path: str, custom_environment: bool = False) -> dict:
+        """Run ``bioimageio.core.test_description`` on the given RDF path.
+
+        By default (``custom_environment=False``) the test runs in the
+        currently-active interpreter — i.e. the RuntimeApp's own venv,
+        which is what the model's inference will use in production.
+
+        When ``custom_environment=True`` the test runs inside the
+        conda environment declared by the model's own weights
+        description (``runtime_env="as-described"``). ``test_description``
+        drives that through ``run_command`` for every conda operation
+        it needs — env create, env exec, ``bioimageio test`` inside the
+        env, etc. We swap ``conda`` for ``mamba`` on the first arg of
+        every such call so env creation uses the faster libmamba
+        solver (both binaries ship with the replica image at
+        ``/home/ray/anaconda3/bin/``). We also capture every env name
+        seen through ``-n <name>`` / ``--name=<name>`` so we can
+        ``mamba env remove`` them after the call — success or
+        failure — instead of leaving multi-GB envs on the pod disk.
+
+        Enabling ``loguru`` output for the ``bioimageio`` namespace
+        (spec + core) at replica init makes conda subprocess spawns
+        and per-weight-format progress visible in the replica's stderr.
+        """
+        from bioimageio.core import test_description
 
         try:
             if not Path(rdf_path).exists():
                 raise FileNotFoundError(f"RDF not found: {rdf_path}")
-            validation_summary = test_model(rdf_path)
-            return validation_summary.model_dump(mode="json")
+
+            if not custom_environment:
+                validation_summary = test_description(
+                    rdf_path,
+                    expected_type="model",
+                    runtime_env="currently-active",
+                )
+                return validation_summary.model_dump(mode="json")
+
+            # custom_environment=True: run inside the model's declared
+            # conda env via mamba. Track env names for cleanup.
+            import subprocess
+
+            created_env_names: set[str] = set()
+
+            def mamba_run_command(args):
+                args = list(args)
+                if args and args[0] == "conda":
+                    args[0] = "mamba"
+                for i, a in enumerate(args):
+                    if a == "-n" and i + 1 < len(args):
+                        created_env_names.add(args[i + 1])
+                    elif a.startswith("--name="):
+                        created_env_names.add(a[len("--name=") :])
+                logger.info(f"🐍 [conda] running: {' '.join(args)}")
+                subprocess.check_call(args)
+
+            try:
+                validation_summary = test_description(
+                    rdf_path,
+                    expected_type="model",
+                    runtime_env="as-described",
+                    run_command=mamba_run_command,
+                )
+                return validation_summary.model_dump(mode="json")
+            finally:
+                # Best-effort cleanup — remove any envs seen through
+                # run_command so the pod doesn't accumulate multi-GB
+                # per-model envs. Runs on both success and failure.
+                for name in created_env_names:
+                    try:
+                        subprocess.check_call(
+                            ["mamba", "env", "remove", "-n", name, "--yes"]
+                        )
+                        logger.info(f"🧹 Removed conda env '{name}'")
+                    except Exception as cleanup_err:
+                        logger.warning(
+                            f"⚠️ Failed to remove conda env '{name}': {cleanup_err}"
+                        )
         except Exception as e:
             logger.error(f"❌ Model test failed: {str(e)}")
             raise
@@ -121,62 +201,39 @@ class RuntimeApp:
     async def test(
         self,
         rdf_path: str,
-        additional_requirements: Optional[List[str]] = None,
+        custom_environment: bool = False,
     ) -> dict:
-        """Test model inference with optional additional pip requirements.
+        """Test model inference.
 
-        When ``additional_requirements`` adds packages outside the baseline
-        ``REQUIREMENTS`` set, the test runs as a *fresh remote Ray task*
-        in a runtime_env that layers the extra packages on top — keeping
-        the cached replica venv clean.
+        When ``custom_environment=False`` (default), the test runs in
+        the currently-active RuntimeApp venv — same interpreter that
+        serves inference. Fast, and validates what the caller will
+        actually use.
+
+        When ``custom_environment=True``, the test runs inside the
+        conda environment declared by the model's weights description
+        (``bioimageio.core`` ``runtime_env="as-described"``). Env
+        creation uses ``mamba`` (via a swapping ``run_command``) and
+        the env is removed after the call.
         """
         cpu_before, gpu_before = self._get_memory_usage()
         logger.info(
             f"📊 [test] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
             f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
         )
-        additional_packages: List[str] = []
-        if additional_requirements:
-            if not isinstance(additional_requirements, list):
-                logger.error("❌ additional_requirements must be a list of strings")
-                raise ValueError("additional_requirements must be a list of strings.")
-            for ad_req in additional_requirements:
-                ad_req = ad_req.strip()
-                exists = False
-                for req in REQUIREMENTS:
-                    package, _ = req.split("==")
-                    if ad_req.startswith(package):
-                        exists = True
-                        break
-                if not exists:
-                    additional_packages.append(ad_req)
 
-        if additional_packages:
-            logger.info(
-                f"🚀 Running test with additional packages: {additional_packages}"
-            )
-            remote_function = ray.remote(self._test.__func__)
-            remote_function = remote_function.options(
-                num_cpus=1,
-                num_gpus=0,
-                memory=4 * 1024 * 1024 * 1024,
-                runtime_env={"pip": REQUIREMENTS + additional_packages},
-            )
-            result_ref = remote_function.remote(None, rdf_path)
-            logger.info("📋 Submitted remote test job")
-            return result_ref
-
-        # Free the GPU before ``bioimageio.core.test_model`` loads the
-        # tested model — any cached prediction pipelines from prior
-        # ``predict()`` calls on this replica would otherwise contend
-        # for VRAM against the tested model's fresh load and OOM on
-        # foundation-scale weights. The eviction path calls each cached
-        # model's ``__del__``, which releases GPU memory eagerly (same
-        # code path Ray Serve uses on natural LRU overflow). The
-        # ``max_ongoing_requests=1`` on this deployment already keeps
-        # every other call queued behind us on the same replica, so
-        # once we've evicted the tested model has the full GPU to
-        # itself for the duration of the ``test_model`` call.
+        # Free the GPU before ``bioimageio.core.test_description``
+        # loads the tested model — any cached prediction pipelines
+        # from prior ``predict()`` calls on this replica would
+        # otherwise contend for VRAM against the tested model's
+        # fresh load and OOM on foundation-scale weights. The
+        # eviction path calls each cached model's ``__del__``, which
+        # releases GPU memory eagerly (same code path Ray Serve uses
+        # on natural LRU overflow). The ``max_ongoing_requests=1``
+        # on this deployment already keeps every other call queued
+        # behind us on the same replica, so once we've evicted the
+        # tested model has the full GPU to itself for the duration
+        # of the ``test_description`` call.
         evicted_count = await bioengine.multiplex.evict_all_models(self)
         if evicted_count:
             logger.info(
@@ -184,7 +241,7 @@ class RuntimeApp:
                 f"the GPU for test."
             )
 
-        test_report = self._test(rdf_path)
+        test_report = self._test(rdf_path, custom_environment=custom_environment)
         cpu_after, gpu_after = self._get_memory_usage()
         logger.info(
             f"📊 [test] Memory after: CPU: {cpu_after / (1024 * 1024):.2f} MB, "

@@ -593,25 +593,25 @@ class EntryApp:
             False,
             description="Whether to get the staged version of the model (True) or the committed version (False)",
         ),
-        additional_requirements: Optional[List[str]] = Field(
-            None,
-            description='Extra Python packages to install in the test environment (e.g., ["scipy>=1.7.0", "scikit-image"])',
+        custom_environment: Optional[bool] = Field(
+            False,
+            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation, env removed after the call). If False (default), run in the model-runner RuntimeApp's own venv — the same interpreter that serves inference.",
         ),
         skip_cache: Optional[bool] = Field(
             False,
             description="Force a complete model package re-download and bypass cached test results before testing",
         ),
-        publish_test_report: Optional[bool] = Field(
+        attach_test_report: Optional[bool] = Field(
             False,
-            description="Automatically publish the test report to the model artifact after testing",
+            description="If True, upload ``test_report.json`` to the model artifact and add a compact ``test_summary`` entry to its manifest after testing. Renamed from the older ``publish_test_report`` to avoid confusion with the bioimage.io model zoo ``staged`` / ``published`` lifecycle — this parameter does NOT change the artifact's publication status.",
         ),
         hypha_token: Optional[str] = Field(
             None,
-            description="Caller's personal Hypha token, required when ``publish_test_report=True``. All artifact writes for the publish are performed under this token — the runner does not use its own workspace credentials to edit user artifacts.",
+            description="Caller's personal Hypha token, required when ``attach_test_report=True``. All artifact writes for the attach are performed under this token — the runner does not use its own workspace credentials to edit user artifacts.",
         ),
     ) -> Dict[str, Union[str, bool, List, Dict]]:
         """
-        Execute comprehensive model testing using the `bioimageio.core.test_model` test suite.
+        Execute comprehensive model testing using ``bioimageio.core.test_description``.
 
         Caching behavior:
         - Cached test reports are locally stored at ``<model_package>/.test_cache.json``.
@@ -622,21 +622,31 @@ class EntryApp:
         - ``skip_cache=True`` forces a complete model package re-download,
             bypasses cached test results, and runs a fresh test.
 
-        Additional requirements:
-        - ``additional_requirements`` are persisted in the cache metadata for
-            observability but are NOT part of automatic cache invalidation.
-            If you change them, use ``skip_cache=True`` to force re-testing.
+        Environment mode:
+        - ``custom_environment=False`` (default): the test runs in the
+            RuntimeApp's own venv — the same interpreter that will serve
+            ``infer()``. Fast, and validates the environment the caller
+            will actually hit in production.
+        - ``custom_environment=True``: the test runs inside the conda
+            environment declared by the model's own weights description
+            (``bioimageio.core`` ``runtime_env="as-described"``). Env
+            creation is driven by ``mamba``; the env is removed after
+            the call on both success and failure paths, so no multi-GB
+            per-model envs accumulate on the pod.
 
-        Publishing behavior:
-        - If ``publish_test_report=True``, a compact ``test_summary`` entry is
+        Attach-to-artifact behavior:
+        - If ``attach_test_report=True``, a compact ``test_summary`` entry is
             written to the artifact manifest and ``test_report.json`` is
-            uploaded.
-        - **All publish-time reads and writes run under the caller's
-            ``hypha_token``**, not the runner's workspace credentials. The
-            caller must have write access to the target artifact; if the
-            token is missing or under-privileged the publish fails with a
-            clear ``PermissionError`` / hypha-side rejection. The runner's
-            own token never touches user artifacts on the publish path.
+            uploaded to the artifact. This attaches the report to the
+            artifact — it does NOT alter the artifact's ``staged`` /
+            ``published`` lifecycle status.
+        - **All artifact reads and writes on the attach path run under
+            the caller's ``hypha_token``**, not the runner's workspace
+            credentials. The caller must have write access to the
+            target artifact; if the token is missing or under-privileged
+            the attach fails with a clear ``PermissionError`` /
+            hypha-side rejection. The runner's own token never touches
+            user artifacts on the attach path.
         - **The runner commits only when the artifact was NOT already staged
             before the test call.** If a stage was already open — whoever put
             it there, whatever it contains, whatever ``manifest.status`` says —
@@ -649,27 +659,31 @@ class EntryApp:
         import aiofiles
 
         await self._check_runtime_available()
-        # Fail fast if the caller wants to publish without providing a
-        # token — writes go through the caller's token, not the runner's
-        # workspace credentials, so no token → no publish. Doing this
-        # before compute avoids burning GPU time on a call that can't
-        # complete.
-        if publish_test_report and not hypha_token:
+        # Fail fast if the caller wants to attach without providing a
+        # token — writes go through the caller's token, not the
+        # runner's workspace credentials, so no token → no attach.
+        # Doing this before compute avoids burning GPU time on a call
+        # that can't complete.
+        if attach_test_report and not hypha_token:
             raise PermissionError(
-                f"Cannot publish test report for '{model_id}': "
-                f"``publish_test_report=True`` requires a personal "
+                f"Cannot attach test report to '{model_id}': "
+                f"``attach_test_report=True`` requires a personal "
                 f"``hypha_token`` with write access to the target "
-                f"artifact's workspace. All publish-time writes are "
-                f"performed under the caller's token so edits are "
-                f"attributed to and authorized as the actual user — the "
-                f"runner never uses its own workspace credentials for "
-                f"user artifacts. Get a personal token from "
-                f"https://hypha.aicell.io (Profile → Access tokens) and "
-                f"pass it as ``hypha_token=<token>``, or call test() with "
-                f"``publish_test_report=False``."
+                f"artifact's workspace. All artifact writes on the "
+                f"attach path are performed under the caller's token "
+                f"so edits are attributed to and authorized as the "
+                f"actual user — the runner never uses its own "
+                f"workspace credentials for user artifacts. Get a "
+                f"personal token from https://hypha.aicell.io "
+                f"(Profile → Access tokens) and pass it as "
+                f"``hypha_token=<token>``, or call test() with "
+                f"``attach_test_report=False``."
             )
         logger.info(
-            f"🧪 Testing model '{model_id}' (stage={stage}, skip_cache={skip_cache}, publish_test_report={publish_test_report})."
+            f"🧪 Testing model '{model_id}' (stage={stage}, "
+            f"skip_cache={skip_cache}, "
+            f"custom_environment={custom_environment}, "
+            f"attach_test_report={attach_test_report})."
         )
 
         # Get model package with access tracking
@@ -758,7 +772,7 @@ class EntryApp:
                 try:
                     test_report = await self.runtime.test(
                         rdf_path=package.source,
-                        additional_requirements=additional_requirements,
+                        custom_environment=custom_environment,
                     )
                     logger.info(f"✅ Model test completed for '{model_id}'.")
                 except Exception as e:
@@ -824,7 +838,7 @@ class EntryApp:
                     cache_data = {
                         "test_report": test_report,
                         "latest_remote_modified": package.latest_remote_modified,
-                        "additional_requirements": additional_requirements,
+                        "custom_environment": custom_environment,
                     }
                     async with aiofiles.open(test_report_path, "w") as f:
                         await f.write(json.dumps(cache_data, indent=2))
@@ -834,17 +848,17 @@ class EntryApp:
                         f"⚠️ Failed to cache test report for '{model_id}': {e}"
                     )
 
-            # Publish test report to artifact under the CALLER'S token —
-            # not the runner's workspace credentials. The runner opens a
-            # short-lived hypha client scoped to the caller and routes
-            # every read + write in the publish block through it, so
-            # every artifact edit is authorised as and attributed to the
-            # actual user. Presence of ``hypha_token`` was already
+            # Attach test report to artifact under the CALLER'S token —
+            # not the runner's workspace credentials. The runner opens
+            # a short-lived hypha client scoped to the caller and routes
+            # every read + write in the attach block through it, so
+            # every artifact edit is authorised as and attributed to
+            # the actual user. Presence of ``hypha_token`` was already
             # validated at the top of ``test()``.
-            if publish_test_report:
+            if attach_test_report:
                 artifact_id = f"bioimage-io/{model_id}"
                 report_file_name = "test_report.json"
-                should_publish_report = True
+                should_attach_report = True
 
                 caller_client = await connect_to_server(
                     {
@@ -873,16 +887,16 @@ class EntryApp:
                             remote_test_report.get("tested_at", 0.0)
                         )
                         local_tested_at = test_report["tested_at"]
-                        should_publish_report = remote_tested_at != local_tested_at
+                        should_attach_report = remote_tested_at != local_tested_at
                     except Exception as e:
                         logger.warning(
-                            f"⚠️ Failed to load remote test report for '{artifact_id}' before publishing: {e}"
+                            f"⚠️ Failed to load remote test report for '{artifact_id}' before attaching: {e}"
                         )
-                        should_publish_report = True
+                        should_attach_report = True
 
-                    if not should_publish_report:
+                    if not should_attach_report:
                         logger.info(
-                            f"ℹ️ Existing test report for '{artifact_id}' is up to date; skipping publish."
+                            f"ℹ️ Existing test report for '{artifact_id}' is up to date; skipping attach."
                         )
                         return test_report
 
@@ -976,14 +990,14 @@ class EntryApp:
                     # bioimage.io #0006 amusing-angelfish incident: a
                     # ``deletion-requested`` stage got published to v0
                     # when the user ran a test with
-                    # ``publish_test_report=True`` because the runner
+                    # ``attach_test_report=True`` because the runner
                     # unconditionally committed). Leave the stage open
                     # for the artifact owner / reviewer to commit
                     # atomically alongside their own changes.
                     if not was_already_staged:
                         await caller_am.commit(artifact_id=artifact.id)
                         logger.info(
-                            f"📤 Published test report for model '{model_id}' to "
+                            f"📤 Attached test report for model '{model_id}' to "
                             f"artifact '{artifact_id}' (no prior stage — committed)."
                         )
                     else:
@@ -998,7 +1012,7 @@ class EntryApp:
                         await caller_client.disconnect()
                     except Exception as e:
                         logger.warning(
-                            f"⚠️ Failed to close caller Hypha client after publish: {e}"
+                            f"⚠️ Failed to close caller Hypha client after attach: {e}"
                         )
 
         return test_report
