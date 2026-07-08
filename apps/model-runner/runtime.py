@@ -166,6 +166,24 @@ class RuntimeApp:
             logger.info("📋 Submitted remote test job")
             return result_ref
 
+        # Free the GPU before ``bioimageio.core.test_model`` loads the
+        # tested model — any cached prediction pipelines from prior
+        # ``predict()`` calls on this replica would otherwise contend
+        # for VRAM against the tested model's fresh load and OOM on
+        # foundation-scale weights. The eviction path calls each cached
+        # model's ``__del__``, which releases GPU memory eagerly (same
+        # code path Ray Serve uses on natural LRU overflow). The
+        # ``max_ongoing_requests=1`` on this deployment already keeps
+        # every other call queued behind us on the same replica, so
+        # once we've evicted the tested model has the full GPU to
+        # itself for the duration of the ``test_model`` call.
+        evicted_count = await bioengine.multiplex.evict_all_models(self)
+        if evicted_count:
+            logger.info(
+                f"🧹 Evicted {evicted_count} cached pipeline(s) to free "
+                f"the GPU for test."
+            )
+
         test_report = self._test(rdf_path)
         cpu_after, gpu_after = self._get_memory_usage()
         logger.info(
