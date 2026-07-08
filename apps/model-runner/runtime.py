@@ -117,46 +117,77 @@ class RuntimeApp:
     # === Testing ===
 
     def _test(self, rdf_path: str, custom_environment: bool = False) -> dict:
-        """Run ``bioimageio.core.test_description`` on the given RDF path.
+        """Run ``bioimageio.core.test_description`` in a subprocess.
 
-        By default (``custom_environment=False``) the test runs in the
-        currently-active interpreter — i.e. the RuntimeApp's own venv,
-        which is what the model's inference will use in production.
+        **Both paths spawn a subprocess.** The point is GPU / CUDA
+        context isolation: PyTorch caches allocator arenas inside
+        its Python process's CUDA context and does not release them
+        across calls even after ``torch.cuda.empty_cache()``. Running
+        the model in the RuntimeApp's own process therefore leaves
+        multi-GB of VRAM pinned across tests. Testing in a child
+        process side-steps this — the OS reclaims the entire context
+        (and all its VRAM) when the subprocess exits, no matter what
+        state the model left behind.
 
-        When ``custom_environment=True`` the test runs inside the
-        conda environment declared by the model's own weights
-        description (``runtime_env="as-described"``). ``test_description``
-        drives that through ``run_command`` for every conda operation
-        it needs — env create, env exec, ``bioimageio test`` inside the
-        env, etc. We swap ``conda`` for ``mamba`` on the first arg of
-        every such call so env creation uses the faster libmamba
-        solver (both binaries ship with the replica image at
-        ``/home/ray/anaconda3/bin/``). We also capture every env name
-        seen through ``-n <name>`` / ``--name=<name>`` so we can
-        ``mamba env remove`` them after the call — success or
-        failure — instead of leaving multi-GB envs on the pod disk.
+        ``custom_environment=False`` (default):
+            Spawn ``sys.executable -c <script>`` where the script
+            imports ``test_description`` and runs it with
+            ``runtime_env="currently-active"``. The child inherits
+            the replica's venv via ``sys.executable`` + Ray's
+            virtualenv layout, so the same package pins are in
+            effect — this is the environment ``infer()`` will use in
+            production. See ``_run_bioimageio_test_subprocess``.
+
+        ``custom_environment=True``:
+            Delegates to
+            ``test_description(runtime_env="as-described")`` which
+            already shells out through ``run_command`` (env create,
+            env exec, ``bioimageio test`` inside the env). We swap
+            ``conda`` → ``mamba`` on the first arg for the faster
+            libmamba solver (both binaries ship in the replica image
+            at ``/home/ray/anaconda3/bin/``). Every env name seen
+            through ``-n <name>`` / ``--name=<name>`` is captured
+            and removed after the call — success or failure —
+            instead of leaving multi-GB envs on the pod disk.
 
         Enabling ``loguru`` output for the ``bioimageio`` namespace
         (spec + core) at replica init makes conda subprocess spawns
-        and per-weight-format progress visible in the replica's stderr.
+        and per-weight-format progress visible in the replica's
+        stderr.
         """
-        from bioimageio.core import test_description
+        import subprocess
+
+        if not Path(rdf_path).exists():
+            raise FileNotFoundError(f"RDF not found: {rdf_path}")
 
         try:
-            if not Path(rdf_path).exists():
-                raise FileNotFoundError(f"RDF not found: {rdf_path}")
-
             if not custom_environment:
-                validation_summary = test_description(
-                    rdf_path,
-                    expected_type="model",
-                    runtime_env="currently-active",
-                )
-                return validation_summary.model_dump(mode="json")
+                return self._run_bioimageio_test_subprocess(rdf_path)
 
             # custom_environment=True: run inside the model's declared
-            # conda env via mamba. Track env names for cleanup.
-            import subprocess
+            # conda env via mamba. bioimageio.core spawns its own
+            # subprocess for the actual test (conda run -n <env>
+            # bioimageio test ...), so GPU/CUDA context is isolated
+            # by process boundary just as in the standard-env path.
+            # We track env names for cleanup.
+            from bioimageio.core import test_description
+
+            # ``/home/ray/anaconda3/envs/`` and ``/home/ray/.mamba/pkgs``
+            # are on a read-only mount inside the Ray worker pod, so
+            # mamba's default env prefix and package cache locations
+            # fail with ``Read-only file system``. Redirect both to
+            # this replica's writable HOME (set by
+            # ``bioengine._app.replica_init`` to
+            # ``<app_dir>/home/``, backed by the app's PVC). Same env
+            # prefix across tests → mamba's pkg cache is reused between
+            # calls, cutting env-create time from ~minutes to ~10s once
+            # warm.
+            mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
+            (mamba_root / "envs").mkdir(parents=True, exist_ok=True)
+            (mamba_root / "pkgs").mkdir(parents=True, exist_ok=True)
+            mamba_env_vars = os.environ.copy()
+            mamba_env_vars["CONDA_ENVS_PATH"] = str(mamba_root / "envs")
+            mamba_env_vars["CONDA_PKGS_DIRS"] = str(mamba_root / "pkgs")
 
             created_env_names: set[str] = set()
 
@@ -170,12 +201,37 @@ class RuntimeApp:
                     elif a.startswith("--name="):
                         created_env_names.add(a[len("--name=") :])
                 logger.info(f"🐍 [conda] running: {' '.join(args)}")
-                subprocess.check_call(args)
+                proc = subprocess.run(
+                    args, capture_output=True, text=True, env=mamba_env_vars
+                )
+                # Route child stdio through the replica logger — a compact
+                # tail is enough to diagnose mamba failures without
+                # flooding the log ring with libmamba trace lines.
+                if proc.stdout:
+                    for line in proc.stdout.rstrip().splitlines()[-20:]:
+                        logger.info(f"[mamba:stdout] {line}")
+                if proc.stderr:
+                    for line in proc.stderr.rstrip().splitlines()[-20:]:
+                        logger.info(f"[mamba:stderr] {line}")
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        proc.returncode, args, output=proc.stdout,
+                        stderr=proc.stderr,
+                    )
 
             try:
+                # Deliberately omit ``expected_type`` here — the model's
+                # declared conda env often pins an older ``bioimageio.core``
+                # whose ``bioimageio test`` CLI does not recognise
+                # ``--expected-type=<type>``. ``test_description`` would
+                # otherwise pass that flag into the subprocess and fail
+                # with ``unrecognized arguments: --expected-type=model``.
+                # We know ``model_id`` resolves to a model artifact
+                # (the ``bioimage-io/model-runner`` service is scoped to
+                # models), so losing the type assertion is not a real
+                # gap.
                 validation_summary = test_description(
                     rdf_path,
-                    expected_type="model",
                     runtime_env="as-described",
                     run_command=mamba_run_command,
                 )
@@ -186,8 +242,11 @@ class RuntimeApp:
                 # per-model envs. Runs on both success and failure.
                 for name in created_env_names:
                     try:
-                        subprocess.check_call(
-                            ["mamba", "env", "remove", "-n", name, "--yes"]
+                        subprocess.run(
+                            ["mamba", "env", "remove", "-n", name, "--yes"],
+                            capture_output=True,
+                            check=True,
+                            env=mamba_env_vars,
                         )
                         logger.info(f"🧹 Removed conda env '{name}'")
                     except Exception as cleanup_err:
@@ -197,6 +256,69 @@ class RuntimeApp:
         except Exception as e:
             logger.error(f"❌ Model test failed: {str(e)}")
             raise
+
+    def _run_bioimageio_test_subprocess(self, rdf_path: str) -> dict:
+        """Run ``test_description(runtime_env="currently-active")`` in a
+        child Python process and return the summary dict.
+
+        We spawn via ``sys.executable`` so the child lands in the same
+        Ray-managed virtualenv as this replica (same package pins),
+        then drive ``test_description`` via a small inline script. The
+        subprocess writes the ``ValidationSummary`` model-dump to a
+        JSON temp file and we read that back — round-tripping through
+        JSON keeps the data flat and avoids any cross-process
+        cloudpickle. RDF path and output path are passed as
+        ``argv[1:]`` so the script has no interpolated string content
+        (safe against filenames with quotes / backslashes).
+        """
+        import json
+        import subprocess
+        import sys
+        import tempfile
+
+        script = (
+            "import json, sys\n"
+            "from bioimageio.core import test_description\n"
+            "rdf_path, out_path = sys.argv[1], sys.argv[2]\n"
+            "summary = test_description(\n"
+            "    rdf_path, expected_type='model', runtime_env='currently-active'\n"
+            ")\n"
+            "with open(out_path, 'w') as f:\n"
+            "    json.dump(summary.model_dump(mode='json'), f)\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = str(Path(tmpdir) / "summary.json")
+            logger.info(
+                f"🐍 [test] Spawning bioimageio subprocess for CUDA "
+                f"context isolation: {sys.executable} -c <inline> "
+                f"{rdf_path} {summary_path}"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(rdf_path), summary_path],
+                capture_output=True,
+                text=True,
+            )
+            # Route child stdio through the replica's logger so
+            # bioimageio's own log lines (progress, per-weight-format
+            # status) surface here — without this, replica stderr is
+            # silent about what the child actually did.
+            if result.stdout:
+                for line in result.stdout.rstrip().splitlines()[-40:]:
+                    logger.info(f"[test:stdout] {line}")
+            if result.stderr:
+                for line in result.stderr.rstrip().splitlines()[-40:]:
+                    logger.info(f"[test:stderr] {line}")
+
+            summary_file = Path(summary_path)
+            if not summary_file.exists():
+                raise RuntimeError(
+                    f"bioimageio test subprocess exited with code "
+                    f"{result.returncode} without producing a summary "
+                    f"(stderr tail: {(result.stderr or '')[-500:]!r})"
+                )
+            with summary_file.open() as f:
+                return json.load(f)
 
     async def test(
         self,
@@ -241,7 +363,22 @@ class RuntimeApp:
                 f"the GPU for test."
             )
 
-        test_report = self._test(rdf_path, custom_environment=custom_environment)
+        # Run the sync ``_test`` in a thread so it doesn't block this
+        # replica's asyncio loop. ``_test`` blocks on
+        # ``subprocess.run`` / ``check_call`` (bioimageio subprocess
+        # for the standard path, mamba env-create + ``bioimageio
+        # test`` inside the env for the custom path). A multi-minute
+        # mamba env build would otherwise starve Ray Serve's health
+        # probes on this replica — three consecutive
+        # ``health_check_timeout_s=30`` misses and Ray Serve issues
+        # ``ray.kill`` (observed on resourceful-lizard custom-env at
+        # 372s). ``asyncio.to_thread`` keeps ``ping()`` responsive
+        # for the duration of the subprocess wait.
+        import asyncio
+
+        test_report = await asyncio.to_thread(
+            self._test, rdf_path, custom_environment
+        )
         cpu_after, gpu_after = self._get_memory_usage()
         logger.info(
             f"📊 [test] Memory after: CPU: {cpu_after / (1024 * 1024):.2f} MB, "
