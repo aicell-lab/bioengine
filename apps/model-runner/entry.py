@@ -245,6 +245,221 @@ class EntryApp:
         test_report["env"] = env
         return test_report
 
+    # === Subprocess env hardening ===
+
+    _SENSITIVE_ENV_NEEDLES = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
+
+    def _safe_subprocess_env(self) -> Dict[str, str]:
+        """Return ``os.environ`` minus obviously-sensitive entries.
+
+        Test subprocesses (bioimageio CLI, mamba, the standard-env
+        ``sys.executable -c`` wrapper) don't need the RuntimeApp's
+        Hypha credentials. Denylist any env-var name containing
+        ``TOKEN`` / ``SECRET`` / ``PASSWORD`` / ``CREDENTIAL`` /
+        ``API_KEY`` — covers ``HYPHA_TOKEN``,
+        ``BIOENGINE_ARTIFACT_TOKEN``, ``BIOIMAGE_IO_TOKEN``, and any
+        generic cloud credentials leaking through. Everything else
+        (``PATH``, ``HOME``, ``TMPDIR``, ``PYTHONPATH``, ``LANG``,
+        ``CUDA_VISIBLE_DEVICES``, ``BIOENGINE_APP_DIR``,
+        ``HYPHA_ARTIFACT_VERSION`` — anything the bioengine bootstrap
+        or the bioimageio CLI needs to identify itself) is
+        preserved.
+        """
+        return {
+            k: v
+            for k, v in os.environ.items()
+            if not any(needle in k.upper() for needle in self._SENSITIVE_ENV_NEEDLES)
+        }
+
+    def _mamba_env_vars(self) -> Dict[str, str]:
+        """Scrubbed env with mamba's env-prefix + package cache
+        redirected to the replica's writable HOME.
+
+        ``/home/ray/anaconda3/envs/`` and ``/home/ray/.mamba/pkgs``
+        are on a read-only mount inside the Ray worker pod. HOME is
+        set by ``bioengine._app.replica_init`` to
+        ``<app_dir>/home/`` on the app's PVC, which is
+        cross-replica RWX under the bioengine layout, so envs built
+        by EntryApp are visible to RuntimeApp on the same path.
+        """
+        env_vars = self._safe_subprocess_env()
+        mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
+        (mamba_root / "envs").mkdir(parents=True, exist_ok=True)
+        (mamba_root / "pkgs").mkdir(parents=True, exist_ok=True)
+        env_vars["CONDA_ENVS_PATH"] = str(mamba_root / "envs")
+        env_vars["CONDA_PKGS_DIRS"] = str(mamba_root / "pkgs")
+        return env_vars
+
+    # === Conda env pre-creation for custom_environment tests ===
+
+    async def _prebuild_conda_envs(self, rdf_path: str, model_id: str) -> None:
+        """CPU-side, non-blocking pre-creation of every conda env the
+        model needs for ``custom_environment=True`` tests.
+
+        Runs entirely on this EntryApp replica (no GPU held). Loads
+        the model description, walks the present weight formats,
+        computes each weight format's ``BioimageioCondaEnv`` spec
+        via ``bioimageio.spec.get_conda_env``, and hashes the dumped
+        YAML with SHA256 — matching ``bioimageio.core 0.10.4``'s
+        env-name algorithm exactly so the pre-created envs are the
+        same names ``test_description`` looks for on the RuntimeApp
+        side.
+
+        Each ``mamba env create`` is spawned via
+        ``asyncio.create_subprocess_exec`` — a real async subprocess
+        awaited through the event loop, so this call NEVER blocks
+        the loop, no matter how long mamba takes. Multiple weight
+        formats' envs build **concurrently** via ``asyncio.gather``
+        rather than sequentially — a model with pytorch+onnx envs
+        finishes in one env's wall-clock time, not two.
+
+        Existence check runs first (also parallel) so already-cached
+        envs on the PVC are skipped instantly — first call to a
+        given model is slow, subsequent calls are near-free.
+        """
+        from io import StringIO
+        import hashlib
+
+        from bioimageio.spec import get_conda_env, load_description
+        from bioimageio.spec._internal.io_utils import write_yaml
+
+        # Load description off-loop — file I/O + validation.
+        descr = await asyncio.to_thread(load_description, rdf_path)
+
+        # Enumerate present weight formats. Skip ``tensorflow_js``
+        # because ``bioimageio.core`` explicitly rejects testing
+        # it; skip anything the descr doesn't carry at all (v0.4
+        # pydantic-v2 raises AttributeError on missing fields, so
+        # guard with getattr default).
+        weight_formats = [
+            "pytorch_state_dict",
+            "torchscript",
+            "keras_hdf5",
+            "onnx",
+            "tensorflow_saved_model_bundle",
+            "keras_v3",
+        ]
+        env_specs: List[tuple] = []  # (wf, env_name, encoded_yaml)
+        for wf_name in weight_formats:
+            wf = getattr(descr.weights, wf_name, None)
+            if not wf:
+                continue
+            conda_env = get_conda_env(entry=wf)
+            conda_env.name = None
+            dumped_env = conda_env.model_dump(mode="json", exclude_none=True)
+            buf = StringIO()
+            write_yaml(dumped_env, file=buf)
+            encoded = buf.getvalue().encode()
+            env_name = hashlib.sha256(encoded).hexdigest()
+            env_specs.append((wf_name, env_name, encoded))
+
+        if not env_specs:
+            logger.info(f"🐍 No custom conda envs to prebuild for '{model_id}'.")
+            return
+
+        env_vars = self._mamba_env_vars()
+
+        logger.info(
+            f"🐍 Prebuild: checking {len(env_specs)} conda env(s) for "
+            f"'{model_id}' ({[wf for wf, _, _ in env_specs]})"
+        )
+        exists_results = await asyncio.gather(
+            *(self._mamba_env_exists(name, env_vars) for _, name, _ in env_specs)
+        )
+
+        to_create = [
+            (wf, name, enc)
+            for (wf, name, enc), exists in zip(env_specs, exists_results)
+            if not exists
+        ]
+        cached = [wf for (wf, _, _), e in zip(env_specs, exists_results) if e]
+        if cached:
+            logger.info(f"✅ Reusing cached conda env(s) for {cached}.")
+        if not to_create:
+            return
+
+        logger.info(
+            f"🐍 Building {len(to_create)} missing conda env(s) concurrently: "
+            f"{[wf for wf, _, _ in to_create]}"
+        )
+        await asyncio.gather(
+            *(
+                self._mamba_env_create(name, enc, env_vars, wf=wf)
+                for wf, name, enc in to_create
+            )
+        )
+        logger.info(
+            f"✅ Prebuilt {len(to_create)} conda env(s) for '{model_id}'."
+        )
+
+    async def _mamba_env_exists(self, env_name: str, env_vars: Dict[str, str]) -> bool:
+        """Non-blocking existence check via
+        ``mamba run -n <env_name> python --version``. Returns True
+        iff the child exits 0.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "mamba",
+            "run",
+            "-n",
+            env_name,
+            "python",
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env_vars,
+        )
+        await proc.communicate()
+        return proc.returncode == 0
+
+    async def _mamba_env_create(
+        self,
+        env_name: str,
+        yaml_bytes: bytes,
+        env_vars: Dict[str, str],
+        wf: str = "",
+    ) -> None:
+        """Non-blocking ``mamba env create`` from encoded YAML bytes.
+
+        Writes the env spec to a tempfile (mamba only accepts
+        ``--file=<path>``, not stdin) and awaits the child. On
+        non-zero exit, raises a compact error with the last ~1 KB of
+        the child's stderr — enough to diagnose solver failures
+        without dumping the full libmamba trace.
+        """
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".yaml", delete=False
+        ) as tmp:
+            tmp.write(yaml_bytes)
+            tmp_path = tmp.name
+        try:
+            logger.info(f"🐍 mamba env create ({wf!r}) → {env_name}")
+            proc = await asyncio.create_subprocess_exec(
+                "mamba",
+                "env",
+                "create",
+                "--yes",
+                f"--file={tmp_path}",
+                f"--name={env_name}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env_vars,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                tail = (stderr or b"").decode(errors="replace")[-1000:]
+                raise RuntimeError(
+                    f"mamba env create failed for weight format "
+                    f"{wf!r} (env {env_name}): {tail}"
+                )
+            logger.info(f"✅ Built conda env for {wf!r}: {env_name}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
     async def _get_download_url(self, file_path: str) -> str:
         # Temporary S3 file path — resolve to a presigned download URL
         try:
@@ -770,6 +985,28 @@ class EntryApp:
             if should_run_test:
                 tested_at = time.time()
                 try:
+                    # For ``custom_environment=True``: build every conda
+                    # env the model needs on THIS EntryApp replica
+                    # first — Entry is CPU-only, so a ~10-min mamba
+                    # solve doesn't hold the GPU-bound RuntimeApp
+                    # replica. Multiple envs (one per weight format)
+                    # are built concurrently. RuntimeApp then invokes
+                    # ``bioimageio.core.test_description`` which does
+                    # its own env-existence check (``mamba run -n
+                    # <hash> python --version``) and finds the envs
+                    # already present on the shared PVC-backed HOME,
+                    # so ``mamba env create`` is a no-op there and the
+                    # RuntimeApp only spends time on the actual test
+                    # inference. If HOME is NOT shared cross-replica
+                    # for some reason, RuntimeApp falls through to
+                    # its normal env-create flow — graceful degrade
+                    # to pre-1.10.0 behavior with no correctness gap.
+                    if custom_environment:
+                        await self._prebuild_conda_envs(
+                            rdf_path=package.source,
+                            model_id=model_id,
+                        )
+
                     test_report = await self.runtime.test(
                         rdf_path=package.source,
                         custom_environment=custom_environment,

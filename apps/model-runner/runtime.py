@@ -114,6 +114,49 @@ class RuntimeApp:
             pass
         return cpu_mem, gpu_mem
 
+    # === Subprocess env hardening ===
+
+    _SENSITIVE_ENV_NEEDLES = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
+
+    def _safe_subprocess_env(self) -> Dict[str, str]:
+        """Return ``os.environ`` minus obviously-sensitive entries.
+
+        Test subprocesses (bioimageio CLI, mamba) don't need the
+        RuntimeApp's Hypha credentials. Denylist any env-var name
+        containing ``TOKEN`` / ``SECRET`` / ``PASSWORD`` /
+        ``CREDENTIAL`` / ``API_KEY`` — covers ``HYPHA_TOKEN``,
+        ``BIOENGINE_ARTIFACT_TOKEN``, ``BIOIMAGE_IO_TOKEN``, and any
+        generic cloud credentials leaking through. Everything else
+        (``PATH``, ``HOME``, ``TMPDIR``, ``PYTHONPATH``, ``LANG``,
+        ``CUDA_VISIBLE_DEVICES``, ``BIOENGINE_APP_DIR``,
+        ``HYPHA_ARTIFACT_VERSION``) is preserved.
+        """
+        return {
+            k: v
+            for k, v in os.environ.items()
+            if not any(needle in k.upper() for needle in self._SENSITIVE_ENV_NEEDLES)
+        }
+
+    def _mamba_env_vars(self) -> Dict[str, str]:
+        """Scrubbed env with mamba's env-prefix + package cache
+        redirected to the replica's writable HOME.
+
+        ``/home/ray/anaconda3/envs/`` and ``/home/ray/.mamba/pkgs``
+        are on a read-only mount inside the Ray worker pod. HOME is
+        set by ``bioengine._app.replica_init`` to
+        ``<app_dir>/home/`` on the app's PVC, which is
+        cross-replica RWX under the bioengine layout, so envs built
+        by EntryApp are visible to this RuntimeApp on the same
+        path.
+        """
+        env_vars = self._safe_subprocess_env()
+        mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
+        (mamba_root / "envs").mkdir(parents=True, exist_ok=True)
+        (mamba_root / "pkgs").mkdir(parents=True, exist_ok=True)
+        env_vars["CONDA_ENVS_PATH"] = str(mamba_root / "envs")
+        env_vars["CONDA_PKGS_DIRS"] = str(mamba_root / "pkgs")
+        return env_vars
+
     # === Testing ===
 
     def _test(self, rdf_path: str, custom_environment: bool = False) -> dict:
@@ -165,48 +208,36 @@ class RuntimeApp:
                 return self._run_bioimageio_test_subprocess(rdf_path)
 
             # custom_environment=True: run inside the model's declared
-            # conda env via mamba. bioimageio.core spawns its own
-            # subprocess for the actual test (conda run -n <env>
-            # bioimageio test ...), so GPU/CUDA context is isolated
-            # by process boundary just as in the standard-env path.
-            # We track env names for cleanup.
+            # conda env via mamba. Env creation is now owned by the
+            # EntryApp (``_prebuild_conda_envs``) so this replica's
+            # GPU isn't held during a multi-minute mamba solve.
+            # ``bioimageio.core.test_description(runtime_env="as-described")``
+            # still does its own existence probe
+            # (``mamba run -n <hash> python --version``) — that lands
+            # on the PVC-backed HOME that Entry populated → env
+            # found → mamba env create is skipped → straight to the
+            # actual ``bioimageio test`` subprocess.
+            #
+            # Envs are cached across calls in
+            # ``$HOME/.bioengine-conda/envs/`` so a second test of
+            # the same model reuses the same env in seconds. No
+            # auto-cleanup here — Entry decides lifecycle.
             from bioimageio.core import test_description
 
-            # ``/home/ray/anaconda3/envs/`` and ``/home/ray/.mamba/pkgs``
-            # are on a read-only mount inside the Ray worker pod, so
-            # mamba's default env prefix and package cache locations
-            # fail with ``Read-only file system``. Redirect both to
-            # this replica's writable HOME (set by
-            # ``bioengine._app.replica_init`` to
-            # ``<app_dir>/home/``, backed by the app's PVC). Same env
-            # prefix across tests → mamba's pkg cache is reused between
-            # calls, cutting env-create time from ~minutes to ~10s once
-            # warm.
-            mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
-            (mamba_root / "envs").mkdir(parents=True, exist_ok=True)
-            (mamba_root / "pkgs").mkdir(parents=True, exist_ok=True)
-            mamba_env_vars = os.environ.copy()
-            mamba_env_vars["CONDA_ENVS_PATH"] = str(mamba_root / "envs")
-            mamba_env_vars["CONDA_PKGS_DIRS"] = str(mamba_root / "pkgs")
-
-            created_env_names: set[str] = set()
+            mamba_env_vars = self._mamba_env_vars()
 
             def mamba_run_command(args):
                 args = list(args)
                 if args and args[0] == "conda":
                     args[0] = "mamba"
-                for i, a in enumerate(args):
-                    if a == "-n" and i + 1 < len(args):
-                        created_env_names.add(args[i + 1])
-                    elif a.startswith("--name="):
-                        created_env_names.add(a[len("--name=") :])
                 logger.info(f"🐍 [conda] running: {' '.join(args)}")
                 proc = subprocess.run(
                     args, capture_output=True, text=True, env=mamba_env_vars
                 )
-                # Route child stdio through the replica logger — a compact
-                # tail is enough to diagnose mamba failures without
-                # flooding the log ring with libmamba trace lines.
+                # Route child stdio through the replica logger — a
+                # compact tail is enough to diagnose mamba failures
+                # without flooding the log ring with libmamba trace
+                # lines.
                 if proc.stdout:
                     for line in proc.stdout.rstrip().splitlines()[-20:]:
                         logger.info(f"[mamba:stdout] {line}")
@@ -215,44 +246,27 @@ class RuntimeApp:
                         logger.info(f"[mamba:stderr] {line}")
                 if proc.returncode != 0:
                     raise subprocess.CalledProcessError(
-                        proc.returncode, args, output=proc.stdout,
+                        proc.returncode,
+                        args,
+                        output=proc.stdout,
                         stderr=proc.stderr,
                     )
 
-            try:
-                # Deliberately omit ``expected_type`` here — the model's
-                # declared conda env often pins an older ``bioimageio.core``
-                # whose ``bioimageio test`` CLI does not recognise
-                # ``--expected-type=<type>``. ``test_description`` would
-                # otherwise pass that flag into the subprocess and fail
-                # with ``unrecognized arguments: --expected-type=model``.
-                # We know ``model_id`` resolves to a model artifact
-                # (the ``bioimage-io/model-runner`` service is scoped to
-                # models), so losing the type assertion is not a real
-                # gap.
-                validation_summary = test_description(
-                    rdf_path,
-                    runtime_env="as-described",
-                    run_command=mamba_run_command,
-                )
-                return validation_summary.model_dump(mode="json")
-            finally:
-                # Best-effort cleanup — remove any envs seen through
-                # run_command so the pod doesn't accumulate multi-GB
-                # per-model envs. Runs on both success and failure.
-                for name in created_env_names:
-                    try:
-                        subprocess.run(
-                            ["mamba", "env", "remove", "-n", name, "--yes"],
-                            capture_output=True,
-                            check=True,
-                            env=mamba_env_vars,
-                        )
-                        logger.info(f"🧹 Removed conda env '{name}'")
-                    except Exception as cleanup_err:
-                        logger.warning(
-                            f"⚠️ Failed to remove conda env '{name}': {cleanup_err}"
-                        )
+            # Deliberately omit ``expected_type`` here — the model's
+            # declared conda env often pins an older ``bioimageio.core``
+            # whose ``bioimageio test`` CLI does not recognise
+            # ``--expected-type=<type>``. ``test_description`` would
+            # otherwise pass that flag into the subprocess and fail
+            # with ``unrecognized arguments: --expected-type=model``.
+            # We know ``model_id`` resolves to a model artifact (the
+            # ``bioimage-io/model-runner`` service is scoped to models),
+            # so losing the type assertion is not a real gap.
+            validation_summary = test_description(
+                rdf_path,
+                runtime_env="as-described",
+                run_command=mamba_run_command,
+            )
+            return validation_summary.model_dump(mode="json")
         except Exception as e:
             logger.error(f"❌ Model test failed: {str(e)}")
             raise
@@ -298,6 +312,7 @@ class RuntimeApp:
                 [sys.executable, "-c", script, str(rdf_path), summary_path],
                 capture_output=True,
                 text=True,
+                env=self._safe_subprocess_env(),
             )
             # Route child stdio through the replica's logger so
             # bioimageio's own log lines (progress, per-weight-format
