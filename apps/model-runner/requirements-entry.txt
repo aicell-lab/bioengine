@@ -1,5 +1,5 @@
 aiofiles>=23.0.0
-bioimageio.core==0.10.0
+bioimageio.core==0.10.4
 imageio>=2.37.0
 numpy==1.26.4
 tqdm>=4.64.0
