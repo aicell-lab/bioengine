@@ -143,46 +143,6 @@ class EntryApp:
         self.s3_controller = await self.hypha_client.get_service("public/s3-storage")
         logger.info(f"Connected to Hypha Server at {self.server_url}")
 
-        # Decide once at startup whether this deployment's HYPHA_TOKEN can
-        # write back to the upstream bioimage-io/* model artifacts (used by
-        # the publish-test-report path in test()). Reads of public artifacts
-        # work for any token, so the rest of the service is unaffected.
-        self._can_publish_to_bioimage_io = self._check_bioimage_io_write_access()
-        if self._can_publish_to_bioimage_io:
-            logger.info(
-                "✅ HYPHA_TOKEN has write access to bioimage-io workspace; "
-                "test reports can be published to source artifacts."
-            )
-        else:
-            logger.warning(
-                "⚠️ HYPHA_TOKEN does not have write access to bioimage-io workspace; "
-                "calls to test(publish_test_report=True) will raise a PermissionError "
-                "(test(publish_test_report=False) still works)."
-            )
-
-    def _check_bioimage_io_write_access(self) -> bool:
-        """Return True if the deployment's HYPHA_TOKEN can write to the bioimage-io workspace.
-
-        Inspects ``self.hypha_client.config.user["scope"]["workspaces"]`` —
-        Hypha exposes per-workspace permission letters there
-        (``r`` read, ``rw`` write, ``rw+`` write+create, ``a`` admin).
-        Anything that includes ``w`` or equals ``a`` is sufficient for the
-        edit/put_file/commit flow used in publish_test_report.
-        """
-        try:
-            scope = self.hypha_client.config.user.get("scope", {}) or {}
-            workspaces = scope.get("workspaces", {}) or {}
-            perm = workspaces.get("bioimage-io", "")
-            return bool(perm) and ("w" in perm or "a" in perm)
-        except Exception as e:
-            # Conservative fallback: assume no write access. Better to skip
-            # publishing than to crash an inference deployment.
-            logger.warning(
-                f"Could not introspect HYPHA_TOKEN scope for bioimage-io write access: {e}. "
-                f"Treating as read-only."
-            )
-            return False
-
     # === Ray Serve Health Check Method - will be called periodically to check the health of the deployment ===
 
     async def _check_runtime_available(self) -> None:
@@ -645,6 +605,10 @@ class EntryApp:
             False,
             description="Automatically publish the test report to the model artifact after testing",
         ),
+        hypha_token: Optional[str] = Field(
+            None,
+            description="Caller's personal Hypha token, required when ``publish_test_report=True``. All artifact writes for the publish are performed under this token — the runner does not use its own workspace credentials to edit user artifacts.",
+        ),
     ) -> Dict[str, Union[str, bool, List, Dict]]:
         """
         Execute comprehensive model testing using the `bioimageio.core.test_model` test suite.
@@ -667,6 +631,12 @@ class EntryApp:
         - If ``publish_test_report=True``, a compact ``test_summary`` entry is
             written to the artifact manifest and ``test_report.json`` is
             uploaded.
+        - **All publish-time reads and writes run under the caller's
+            ``hypha_token``**, not the runner's workspace credentials. The
+            caller must have write access to the target artifact; if the
+            token is missing or under-privileged the publish fails with a
+            clear ``PermissionError`` / hypha-side rejection. The runner's
+            own token never touches user artifacts on the publish path.
         - **The runner commits only when the artifact was NOT already staged
             before the test call.** If a stage was already open — whoever put
             it there, whatever it contains, whatever ``manifest.status`` says —
@@ -679,18 +649,24 @@ class EntryApp:
         import aiofiles
 
         await self._check_runtime_available()
-        # Fail fast before running any compute if the caller wants to publish
-        # but this deployment's HYPHA_TOKEN has no write access to the
-        # bioimage-io workspace. Better than burning GPU time and surprising
-        # the caller with a permission error from artifact_manager.edit() at
-        # the end.
-        if publish_test_report and not self._can_publish_to_bioimage_io:
+        # Fail fast if the caller wants to publish without providing a
+        # token — writes go through the caller's token, not the runner's
+        # workspace credentials, so no token → no publish. Doing this
+        # before compute avoids burning GPU time on a call that can't
+        # complete.
+        if publish_test_report and not hypha_token:
             raise PermissionError(
                 f"Cannot publish test report for '{model_id}': "
-                f"this deployment's HYPHA_TOKEN has no write access to the "
-                f"bioimage-io workspace. Either deploy with a HYPHA_TOKEN that "
-                f"has bioimage-io write permission, or call test() with "
-                f"publish_test_report=False."
+                f"``publish_test_report=True`` requires a personal "
+                f"``hypha_token`` with write access to the target "
+                f"artifact's workspace. All publish-time writes are "
+                f"performed under the caller's token so edits are "
+                f"attributed to and authorized as the actual user — the "
+                f"runner never uses its own workspace credentials for "
+                f"user artifacts. Get a personal token from "
+                f"https://hypha.aicell.io (Profile → Access tokens) and "
+                f"pass it as ``hypha_token=<token>``, or call test() with "
+                f"``publish_test_report=False``."
             )
         logger.info(
             f"🧪 Testing model '{model_id}' (stage={stage}, skip_cache={skip_cache}, publish_test_report={publish_test_report})."
@@ -858,137 +834,172 @@ class EntryApp:
                         f"⚠️ Failed to cache test report for '{model_id}': {e}"
                     )
 
-            # Publish test report to artifact (caller already validated as
-            # having bioimage-io write access at the top of this method).
+            # Publish test report to artifact under the CALLER'S token —
+            # not the runner's workspace credentials. The runner opens a
+            # short-lived hypha client scoped to the caller and routes
+            # every read + write in the publish block through it, so
+            # every artifact edit is authorised as and attributed to the
+            # actual user. Presence of ``hypha_token`` was already
+            # validated at the top of ``test()``.
             if publish_test_report:
                 artifact_id = f"bioimage-io/{model_id}"
                 report_file_name = "test_report.json"
                 should_publish_report = True
 
+                caller_client = await connect_to_server(
+                    {
+                        "server_url": self.server_url,
+                        "token": hypha_token,
+                    }
+                )
                 try:
-                    download_url = await self.artifact_manager.get_file(
-                        artifact_id=artifact_id,
-                        file_path=report_file_name,
+                    caller_am = await caller_client.get_service(
+                        "public/artifact-manager"
                     )
+
+                    try:
+                        download_url = await caller_am.get_file(
+                            artifact_id=artifact_id,
+                            file_path=report_file_name,
+                        )
+                        async with httpx.AsyncClient(timeout=30) as client:
+                            response = await client.get(download_url)
+                            response.raise_for_status()
+
+                        remote_test_report = await asyncio.to_thread(
+                            json.loads, response.text
+                        )
+                        remote_tested_at = float(
+                            remote_test_report.get("tested_at", 0.0)
+                        )
+                        local_tested_at = test_report["tested_at"]
+                        should_publish_report = remote_tested_at != local_tested_at
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ Failed to load remote test report for '{artifact_id}' before publishing: {e}"
+                        )
+                        should_publish_report = True
+
+                    if not should_publish_report:
+                        logger.info(
+                            f"ℹ️ Existing test report for '{artifact_id}' is up to date; skipping publish."
+                        )
+                        return test_report
+
+                    # Check current staging state. ``read()`` without
+                    # ``stage=True`` returns the committed manifest and
+                    # reports ``staging=None`` even when a stage exists,
+                    # so we must explicitly read the staged view —
+                    # that's the only surface that exposes an open
+                    # stage. This was the latent bug: the original code
+                    # called ``read()`` and trusted
+                    # ``artifact.get("staging")``, which was always
+                    # None, so any downstream "was staged?" branching
+                    # was dead code and the commit path ran
+                    # unconditionally.
+                    stage_view = await caller_am.read(artifact_id, stage=True)
+                    was_already_staged = bool(stage_view.get("staging"))
+
+                    # Base the ``updated_manifest`` on the STAGE's
+                    # manifest when one exists, so any pending edits (a
+                    # reviewer's ``status`` change, RDF tweaks, doc
+                    # updates) are preserved. Reading the committed
+                    # manifest and calling
+                    # ``edit(stage=True, manifest=...)`` would silently
+                    # overwrite those changes — the bioimage.io #0006
+                    # amusing-angelfish incident showed a
+                    # ``status=deletion-requested`` stage being
+                    # flattened back to ``status=published`` by exactly
+                    # this path.
+                    if was_already_staged:
+                        artifact = stage_view
+                    else:
+                        artifact = await caller_am.read(artifact_id)
+
+                    # Compact ``test_summary`` for the manifest (drops
+                    # details + env to keep the manifest small); the
+                    # full report is uploaded as ``test_report.json``.
+                    test_report_summary = {
+                        "status": test_report["status"],
+                        "tested_at": test_report["tested_at"],
+                        "env": test_report["env"],
+                    }
+
+                    # 'test_reports' and 'test_report' are legacy manifest keys.
+                    updated_manifest = dict(artifact["manifest"])
+                    updated_manifest.pop("test_reports", None)
+                    updated_manifest.pop("test_report", None)
+                    updated_manifest.pop("score", None)
+                    updated_manifest["test_summary"] = test_report_summary
+
+                    # Edit the artifact and stage the test-report
+                    # additions. When a stage was already open,
+                    # ``edit(stage=True)`` layers our changes onto that
+                    # stage; when there was no stage, this opens a
+                    # fresh one just for the report.
+                    artifact = await caller_am.edit(
+                        artifact_id=artifact.id,
+                        manifest=updated_manifest,
+                        stage=True,
+                    )
+
+                    upload_url = await caller_am.put_file(
+                        artifact.id, file_path=report_file_name
+                    )
+
                     async with httpx.AsyncClient(timeout=30) as client:
-                        response = await client.get(download_url)
+                        response = await client.put(
+                            upload_url, data=json.dumps(test_report)
+                        )
                         response.raise_for_status()
 
-                    remote_test_report = await asyncio.to_thread(
-                        json.loads, response.text
-                    )
-                    remote_tested_at = float(remote_test_report.get("tested_at", 0.0))
-                    local_tested_at = test_report["tested_at"]
-                    should_publish_report = remote_tested_at != local_tested_at
-                except Exception as e:
-                    logger.warning(
-                        f"⚠️ Failed to load remote test report for '{artifact_id}' before publishing: {e}"
-                    )
-                    should_publish_report = True
-
-                if not should_publish_report:
-                    logger.info(
-                        f"ℹ️ Existing test report for '{artifact_id}' is up to date; skipping publish."
-                    )
-                    return test_report
-
-                # Check current staging state. ``read()`` without
-                # ``stage=True`` returns the committed manifest and
-                # reports ``staging=None`` even when a stage exists, so
-                # we must explicitly read the staged view — that's the
-                # only surface that exposes an open stage. This was the
-                # latent bug: the original code called ``read()`` and
-                # trusted ``artifact.get("staging")``, which was always
-                # None, so any downstream "was staged?" branching was
-                # dead code and the commit path ran unconditionally.
-                stage_view = await self.artifact_manager.read(
-                    artifact_id, stage=True
-                )
-                was_already_staged = bool(stage_view.get("staging"))
-
-                # Base the ``updated_manifest`` on the STAGE's manifest
-                # when one exists, so any pending edits (a reviewer's
-                # ``status`` change, RDF tweaks, doc updates) are
-                # preserved. Reading the committed manifest and calling
-                # ``edit(stage=True, manifest=...)`` would silently
-                # overwrite those changes — the bioimage.io #0006
-                # amusing-angelfish incident showed a
-                # ``status=deletion-requested`` stage being flattened
-                # back to ``status=published`` by exactly this path.
-                if was_already_staged:
-                    artifact = stage_view
-                else:
-                    artifact = await self.artifact_manager.read(artifact_id)
-
-                # Create a compact test report for the artifact manifest (excluding details and env to save space) and merge it with existing manifest data.
-                test_report_summary = {
-                    "status": test_report["status"],
-                    "tested_at": test_report["tested_at"],
-                    "env": test_report["env"],
-                }
-
-                # 'test_reports' and 'test_report' are legacy manifest keys.
-                updated_manifest = dict(artifact["manifest"])
-                updated_manifest.pop("test_reports", None)
-                updated_manifest.pop("test_report", None)
-                updated_manifest.pop("score", None)
-                updated_manifest["test_summary"] = test_report_summary
-
-                # Edit the artifact and stage the test-report additions. When
-                # a stage was already open, ``edit(stage=True)`` layers our
-                # changes onto that stage; when there was no stage, this
-                # opens a fresh one just for the report.
-                artifact = await self.artifact_manager.edit(
-                    artifact_id=artifact.id,
-                    manifest=updated_manifest,
-                    stage=True,
-                )
-
-                upload_url = await self.artifact_manager.put_file(
-                    artifact.id, file_path=report_file_name
-                )
-
-                async with httpx.AsyncClient(timeout=30) as client:
-                    response = await client.put(
-                        upload_url, data=json.dumps(test_report)
-                    )
-                    response.raise_for_status()
-
-                # 'test_reports.json' is a legacy file name
-                try:
-                    existing_files = await self.artifact_manager.list_files(artifact.id)
-                    if any(file.name == "test_reports.json" for file in existing_files):
-                        await self.artifact_manager.remove_file(
-                            artifact.id, file_path="test_reports.json"
+                    # 'test_reports.json' is a legacy file name
+                    try:
+                        existing_files = await caller_am.list_files(artifact.id)
+                        if any(
+                            file.name == "test_reports.json" for file in existing_files
+                        ):
+                            await caller_am.remove_file(
+                                artifact.id, file_path="test_reports.json"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ Failed to remove legacy test report file for '{artifact_id}': {e}"
                         )
-                except Exception as e:
-                    logger.warning(
-                        f"⚠️ Failed to remove legacy test report file for '{artifact_id}': {e}"
-                    )
 
-                # Commit only if we opened the stage ourselves. If the artifact
-                # was already staged when the test call arrived — whoever put
-                # it there, whatever it contains, whatever ``manifest.status``
-                # says — committing here would publish someone else's pending
-                # edits alongside the test report (the bioimage.io #0006
-                # amusing-angelfish incident: a `deletion-requested` stage
-                # got published to v0 when the user ran a test with
-                # ``publish_test_report=True`` because the runner unconditionally
-                # committed). Leave the stage open for the artifact owner /
-                # reviewer to commit atomically alongside their own changes.
-                if not was_already_staged:
-                    await self.artifact_manager.commit(artifact_id=artifact.id)
-                    logger.info(
-                        f"📤 Published test report for model '{model_id}' to "
-                        f"artifact '{artifact_id}' (no prior stage — committed)."
-                    )
-                else:
-                    logger.info(
-                        f"📋 Added test report for model '{model_id}' to the "
-                        f"existing stage on '{artifact_id}' — leaving the "
-                        f"stage open for the artifact owner / reviewer to "
-                        f"commit alongside their own changes."
-                    )
+                    # Commit only if we opened the stage ourselves. If
+                    # the artifact was already staged when the test
+                    # call arrived — whoever put it there, whatever it
+                    # contains, whatever ``manifest.status`` says —
+                    # committing here would publish someone else's
+                    # pending edits alongside the test report (the
+                    # bioimage.io #0006 amusing-angelfish incident: a
+                    # ``deletion-requested`` stage got published to v0
+                    # when the user ran a test with
+                    # ``publish_test_report=True`` because the runner
+                    # unconditionally committed). Leave the stage open
+                    # for the artifact owner / reviewer to commit
+                    # atomically alongside their own changes.
+                    if not was_already_staged:
+                        await caller_am.commit(artifact_id=artifact.id)
+                        logger.info(
+                            f"📤 Published test report for model '{model_id}' to "
+                            f"artifact '{artifact_id}' (no prior stage — committed)."
+                        )
+                    else:
+                        logger.info(
+                            f"📋 Added test report for model '{model_id}' to the "
+                            f"existing stage on '{artifact_id}' — leaving the "
+                            f"stage open for the artifact owner / reviewer to "
+                            f"commit alongside their own changes."
+                        )
+                finally:
+                    try:
+                        await caller_client.disconnect()
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ Failed to close caller Hypha client after publish: {e}"
+                        )
 
         return test_report
 
