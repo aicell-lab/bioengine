@@ -179,11 +179,45 @@ def health_check(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def multiplexed(*, max_models: int = 3) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Mark a method as a Ray Serve multiplexed model loader.
+    """Mark a method as an LRU-cached, per-replica multiplexed model loader.
 
     Equivalent to ``@serve.multiplexed(max_num_models_per_replica=N)`` —
     ``@bioengine.app`` applies the underlying Ray Serve decorator at the
-    right point in the pipeline.
+    right point in the pipeline. On cache overflow the least-recently-used
+    model is unloaded automatically; the loaded model's ``__del__`` is
+    called (if defined) so GPU memory / disk handles / etc. are released
+    eagerly.
+
+    Manual cache control is available via the ``bioengine.multiplex``
+    submodule — useful when a downstream call needs the full GPU (e.g.
+    running ``bioimageio.core.test_model`` on a foundation model that
+    won't fit alongside cached siblings):
+
+    .. code-block:: python
+
+        import bioengine
+
+        class RuntimeApp:
+            @bioengine.multiplexed(max_models=3)
+            async def load_model(self, model_id: str): ...
+
+            @bioengine.method
+            async def free_gpu_for_test(self) -> int:
+                # Drop every cached model right now. Each ``__del__`` fires
+                # the same way it does on natural LRU eviction.
+                return await bioengine.multiplex.evict_all_models(self)
+
+    ``bioengine.multiplex`` also exposes ``evict_lru_model``, ``evict_model``,
+    and ``cached_model_ids`` — see that module for details.
+
+    **Only one ``@bioengine.multiplexed`` method per class.** Ray Serve's
+    multiplexing stores its cache wrapper at a single hardcoded attribute
+    on ``self``, so a second decorated method would silently share the
+    first method's cache and loader function — leading to the wrong
+    ``model_id`` being routed to the wrong loader with no error. bioengine
+    rejects a second ``@multiplexed`` at ``@bioengine.app`` scan time. If
+    you need multiple caches, split them into separate deployment classes
+    or use ``functools.lru_cache`` inside a plain ``@bioengine.method``.
     """
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         setattr(fn, _KIND_ATTR, "multiplexed")
@@ -331,6 +365,29 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
                     f"'{lifecycle[kind]}' and '{attr_name}'. Only one is allowed."
                 )
             lifecycle[kind] = attr_name
+
+    if len(lifecycle["multiplexed"]) > 1:
+        # Ray Serve's ``@serve.multiplexed`` stores its cache wrapper on
+        # ``self`` at a hardcoded attribute name (``__serve_multiplex_wrapper``
+        # in ``ray/serve/api.py``). A second decorated method silently
+        # reuses the first method's wrapper — so calls to the second
+        # method are dispatched to the first method's loader with the
+        # wrong ``model_id``. Ray does not error, just silently produces
+        # wrong results. Raise loudly at ``@bioengine.app`` scan time
+        # instead of letting authors chase the mis-loaded model at runtime.
+        names = ", ".join(f"'{n}'" for n in lifecycle["multiplexed"])
+        raise ReservedMethodNameError(
+            f"{cls.__module__}.{cls.__qualname__} has more than one "
+            f"@bioengine.multiplexed method ({names}). Only one is "
+            f"allowed per deployment class — Ray Serve's underlying "
+            f"multiplexing keeps its LRU cache on a single hardcoded "
+            f"attribute on ``self``, so a second decorated method would "
+            f"silently share the first method's cache and loader. If "
+            f"you need multiple model caches, split the loaders into "
+            f"separate @bioengine.app deployment classes, or use "
+            f"``functools.lru_cache`` inside a plain @bioengine.method "
+            f"if the entries fit CPU memory."
+        )
 
     return lifecycle, method_schemas
 
