@@ -99,12 +99,13 @@ jobs:
         echo "✅ Version updated from $PREVIOUS_VERSION to $NEW_VERSION."
 
     - name: Ensure bioengine/_version.py matches pyproject.toml
-      if: env.RELEVANT_CHANGE == 'true'
       # ``bioengine/_version.py`` is the version string that Ray Serve
       # replicas see (``pyproject.toml`` is not on the replica; only the
       # module source is, via ``runtime_env.py_modules``). It MUST stay
       # in lock-step with pyproject.toml or ``__version__`` diverges
-      # between worker and replicas.
+      # between worker and replicas. Always runs — even for docs-only
+      # PRs — so a stray edit to ``_version.py`` in an unrelated PR
+      # can never slip through.
       run: |
         VERSION_PY=$(python3 -c "import re; m = re.search(r'^__version__\s*=\s*[\"\\'](.*?)[\"\\']', open('bioengine/_version.py').read(), re.M); print(m.group(1) if m else '')")
         PROJECT_VERSION=$(grep -E '^version\s*=' pyproject.toml | sed -E 's/version\s*=\s*"(.*)"/\1/')
