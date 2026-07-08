@@ -665,10 +665,16 @@ class EntryApp:
 
         Publishing behavior:
         - If ``publish_test_report=True``, a compact ``test_summary`` entry is
-            written to the artifact manifest, ``test_report.json`` is uploaded,
-            and the artifact is committed.
-        - If the artifact had an open staging version before publishing, staging is
-            re-opened after commit.
+            written to the artifact manifest and ``test_report.json`` is
+            uploaded.
+        - **The runner commits only when the artifact was NOT already staged
+            before the test call.** If a stage was already open — whoever put
+            it there, whatever it contains, whatever ``manifest.status`` says —
+            the runner adds the test report to the existing stage and leaves
+            it open. The artifact owner / reviewer commits later, atomically,
+            alongside whatever changes they already had in flight. This
+            prevents the runner from accidentally publishing someone else's
+            pending edits (bioimage.io #0006 amusing-angelfish incident).
         """
         import aiofiles
 
@@ -886,9 +892,33 @@ class EntryApp:
                     )
                     return test_report
 
-                # Check current staging state.
-                artifact = await self.artifact_manager.read(artifact_id)
-                is_staged = artifact.get("staging") is not None
+                # Check current staging state. ``read()`` without
+                # ``stage=True`` returns the committed manifest and
+                # reports ``staging=None`` even when a stage exists, so
+                # we must explicitly read the staged view — that's the
+                # only surface that exposes an open stage. This was the
+                # latent bug: the original code called ``read()`` and
+                # trusted ``artifact.get("staging")``, which was always
+                # None, so any downstream "was staged?" branching was
+                # dead code and the commit path ran unconditionally.
+                stage_view = await self.artifact_manager.read(
+                    artifact_id, stage=True
+                )
+                was_already_staged = bool(stage_view.get("staging"))
+
+                # Base the ``updated_manifest`` on the STAGE's manifest
+                # when one exists, so any pending edits (a reviewer's
+                # ``status`` change, RDF tweaks, doc updates) are
+                # preserved. Reading the committed manifest and calling
+                # ``edit(stage=True, manifest=...)`` would silently
+                # overwrite those changes — the bioimage.io #0006
+                # amusing-angelfish incident showed a
+                # ``status=deletion-requested`` stage being flattened
+                # back to ``status=published`` by exactly this path.
+                if was_already_staged:
+                    artifact = stage_view
+                else:
+                    artifact = await self.artifact_manager.read(artifact_id)
 
                 # Create a compact test report for the artifact manifest (excluding details and env to save space) and merge it with existing manifest data.
                 test_report_summary = {
@@ -904,7 +934,10 @@ class EntryApp:
                 updated_manifest.pop("score", None)
                 updated_manifest["test_summary"] = test_report_summary
 
-                # Edit the artifact and stage it for review.
+                # Edit the artifact and stage the test-report additions. When
+                # a stage was already open, ``edit(stage=True)`` layers our
+                # changes onto that stage; when there was no stage, this
+                # opens a fresh one just for the report.
                 artifact = await self.artifact_manager.edit(
                     artifact_id=artifact.id,
                     manifest=updated_manifest,
@@ -933,19 +966,29 @@ class EntryApp:
                         f"⚠️ Failed to remove legacy test report file for '{artifact_id}': {e}"
                     )
 
-                # Commit the artifact.
-                await self.artifact_manager.commit(artifact_id=artifact.id)
-
-                # If it was staged before this update, put it back into stage mode.
-                if is_staged:
-                    await self.artifact_manager.edit(
-                        artifact_id=artifact.id,
-                        stage=True,
+                # Commit only if we opened the stage ourselves. If the artifact
+                # was already staged when the test call arrived — whoever put
+                # it there, whatever it contains, whatever ``manifest.status``
+                # says — committing here would publish someone else's pending
+                # edits alongside the test report (the bioimage.io #0006
+                # amusing-angelfish incident: a `deletion-requested` stage
+                # got published to v0 when the user ran a test with
+                # ``publish_test_report=True`` because the runner unconditionally
+                # committed). Leave the stage open for the artifact owner /
+                # reviewer to commit atomically alongside their own changes.
+                if not was_already_staged:
+                    await self.artifact_manager.commit(artifact_id=artifact.id)
+                    logger.info(
+                        f"📤 Published test report for model '{model_id}' to "
+                        f"artifact '{artifact_id}' (no prior stage — committed)."
                     )
-
-                logger.info(
-                    f"📤 Published test report for model '{model_id}' to artifact '{artifact_id}'."
-                )
+                else:
+                    logger.info(
+                        f"📋 Added test report for model '{model_id}' to the "
+                        f"existing stage on '{artifact_id}' — leaving the "
+                        f"stage open for the artifact owner / reviewer to "
+                        f"commit alongside their own changes."
+                    )
 
         return test_report
 

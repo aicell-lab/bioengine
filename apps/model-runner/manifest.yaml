@@ -13,5 +13,5 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: []
 type: ray-serve
-version: 1.3.0
+version: 1.4.2
 entry: entry:EntryApp
