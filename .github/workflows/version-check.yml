@@ -98,6 +98,26 @@ jobs:
         fi
         echo "✅ Version updated from $PREVIOUS_VERSION to $NEW_VERSION."
 
+    - name: Ensure bioengine/_version.py matches pyproject.toml
+      if: env.RELEVANT_CHANGE == 'true'
+      # ``bioengine/_version.py`` is the version string that Ray Serve
+      # replicas see (``pyproject.toml`` is not on the replica; only the
+      # module source is, via ``runtime_env.py_modules``). It MUST stay
+      # in lock-step with pyproject.toml or ``__version__`` diverges
+      # between worker and replicas.
+      run: |
+        VERSION_PY=$(python3 -c "import re; m = re.search(r'^__version__\s*=\s*[\"\\'](.*?)[\"\\']', open('bioengine/_version.py').read(), re.M); print(m.group(1) if m else '')")
+        PROJECT_VERSION=$(grep -E '^version\s*=' pyproject.toml | sed -E 's/version\s*=\s*"(.*)"/\1/')
+        if [ -z "$VERSION_PY" ]; then
+          echo "❌ Could not extract __version__ from bioengine/_version.py"
+          exit 1
+        fi
+        if [ "$VERSION_PY" != "$PROJECT_VERSION" ]; then
+          echo "❌ bioengine/_version.py __version__ ($VERSION_PY) does not match pyproject.toml version ($PROJECT_VERSION). Bump both together."
+          exit 1
+        fi
+        echo "✅ bioengine/_version.py in sync with pyproject.toml ($PROJECT_VERSION)."
+
     - name: Skip version check (no relevant changes)
       if: env.RELEVANT_CHANGE == 'false'
       run: echo "✅ No relevant files changed. Skipping version check."

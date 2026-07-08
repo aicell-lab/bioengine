@@ -20,8 +20,9 @@ imports only happen when the decorators are actually applied.
 
 from __future__ import annotations
 
-import importlib.metadata as _md
 from typing import TYPE_CHECKING, Any
+
+from bioengine._version import __version__
 
 if TYPE_CHECKING:
     # Type-checker-only re-exports so editors auto-complete bioengine.app etc.
@@ -40,17 +41,6 @@ if TYPE_CHECKING:
         ReservedMethodNameError,
     )
     from bioengine._app.runtime_handle import BioEngineRuntimeHandle
-
-
-def _get_version() -> str | None:
-    try:
-        return _md.metadata("bioengine")["Version"]
-    except Exception:
-        print("Could not get version from package metadata. Is the package installed?")
-        return None
-
-
-__version__ = _get_version()
 
 
 def _install_replica_bootstrap_finder() -> None:
