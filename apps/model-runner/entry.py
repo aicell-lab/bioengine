@@ -149,6 +149,24 @@ class EntryApp:
         # in the common case.
         self._env_build_lock = asyncio.Lock()
 
+        # Async test-job registry. Populated by every ``test()`` call
+        # (both async_mode=True and async_mode=False so state can be
+        # inspected via ``get_test_status`` for either). Keys are
+        # opaque job IDs (``tj-<hex12>``); values track state,
+        # metadata, and an asyncio.Future that resolves on
+        # completion. Purely in-memory per replica; jobs from a
+        # killed replica just disappear, ``get_test_status`` raises
+        # KeyError for them and callers can retry / fall back to
+        # sync mode.
+        self._test_jobs: Dict[str, dict] = {}
+        self._test_jobs_ttl_sec: int = 24 * 3600
+        # Map from ``id(asyncio.Task)`` → job dict, so the recursive
+        # ``test(async_mode=False)`` call inside the async-mode
+        # wrapper finds the same job the wrapper allocated. Plain
+        # dict — pickles fine (unlike ContextVar, which cloudpickle
+        # trips on when Ray serialises the Serve deployment class).
+        self._task_to_job: Dict[int, dict] = {}
+
         # Get replica identifier for logging
         try:
             from ray import serve as _serve
@@ -502,6 +520,153 @@ class EntryApp:
             await self._mamba_env_remove(name, env_vars)
             total -= size
 
+    # === Async test-job registry ===
+
+    def _sweep_expired_test_jobs(self) -> None:
+        """Drop finished jobs older than ``_test_jobs_ttl_sec``.
+
+        Runs opportunistically on each new job creation — cheaper than a
+        background task and good enough for a low-traffic registry.
+        """
+        now = time.time()
+        expired = [
+            jid
+            for jid, j in self._test_jobs.items()
+            if j.get("completed_at") is not None
+            and (now - j["completed_at"]) > self._test_jobs_ttl_sec
+        ]
+        for jid in expired:
+            self._test_jobs.pop(jid, None)
+
+    def _new_test_job(self, model_id: str, custom_environment: bool) -> dict:
+        """Create a job record and return it. Sweeps expired jobs on the
+        way in.
+        """
+        self._sweep_expired_test_jobs()
+        job_id = f"tj-{uuid.uuid4().hex[:12]}"
+        now = time.time()
+        loop = asyncio.get_running_loop()
+        job = {
+            "job_id": job_id,
+            "model_id": model_id,
+            "custom_environment": custom_environment,
+            "state": "queued",
+            "started_at": now,
+            "updated_at": now,
+            "completed_at": None,
+            "result": None,
+            "error": None,
+            "future": loop.create_future(),
+        }
+        self._test_jobs[job_id] = job
+        return job
+
+    def _update_test_job(
+        self,
+        job: dict,
+        *,
+        state: Optional[str] = None,
+        result: Optional[dict] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Idempotent state update. Sets ``completed_at`` and resolves the
+        future on terminal states.
+        """
+        if state is not None:
+            job["state"] = state
+        if result is not None:
+            job["result"] = result
+        if error is not None:
+            job["error"] = error
+        job["updated_at"] = time.time()
+        if state in ("completed", "failed"):
+            job["completed_at"] = job["updated_at"]
+            fut = job.get("future")
+            if fut is not None and not fut.done():
+                if state == "failed":
+                    fut.set_exception(RuntimeError(error or "test job failed"))
+                else:
+                    fut.set_result(result)
+
+    def _job_public_view(self, job: dict) -> dict:
+        """Serialize a job dict for the RPC response — strips the
+        internal ``future`` handle and computes derived fields.
+        """
+        now = time.time()
+        state = job["state"]
+        queue_position = 0
+        if job["custom_environment"] and state in ("queued", "env_setup"):
+            queue_position = sum(
+                1
+                for other in self._test_jobs.values()
+                if other is not job
+                and other["custom_environment"]
+                and other["state"] in ("queued", "env_setup")
+                and other["started_at"] < job["started_at"]
+            )
+        completed_at = job["completed_at"]
+        elapsed_end = completed_at if completed_at is not None else now
+        return {
+            "job_id": job["job_id"],
+            "model_id": job["model_id"],
+            "custom_environment": job["custom_environment"],
+            "state": state,
+            "queue_position": queue_position,
+            "started_at": job["started_at"],
+            "updated_at": job["updated_at"],
+            "completed_at": completed_at,
+            "elapsed_seconds": round(elapsed_end - job["started_at"], 2),
+            "result": job["result"],
+            "error": job["error"],
+        }
+
+    # === Conda env name computation (matches bioimageio.core) ===
+
+    def _compute_conda_env_name(self, wf) -> tuple:
+        """Return ``(env_name, encoded_yaml)`` for a weight-format entry.
+
+        This is a MECHANICAL REPRODUCTION of the env-name algorithm inline
+        in ``bioimageio.core 0.10.4`` at
+        ``src/bioimageio/core/_resource_tests.py:425-435``:
+
+            conda_env = get_conda_env(entry=wf)
+            conda_env.name = None
+            dumped_env = conda_env.model_dump(mode="json", exclude_none=True)
+            env_io = StringIO()
+            write_yaml(dumped_env, file=env_io)
+            encoded_env = env_io.getvalue().encode()
+            env_name = hashlib.sha256(encoded_env).hexdigest()
+
+        Bit-identical hashes are load-bearing: the whole point of
+        pre-building envs on EntryApp is that ``test_description``
+        on RuntimeApp finds an env with the SAME name and skips its
+        own ``mamba env create`` step. If any of the four upstream
+        primitives changes (a new pydantic dump mode, a different YAML
+        flow style, added metadata fields), the two silently diverge
+        and every custom-env test starts paying the cold-build cost
+        again. This function is the anchor — if hashes stop matching,
+        this is the file to update.
+
+        Reuses the helpers ``bioimageio.spec`` exports:
+        ``get_conda_env``, ``write_yaml``, ``BioimageioCondaEnv``. The
+        hash calculation itself has no upstream export — it is inline
+        in ``_test_in_env`` — hence this local helper.
+        """
+        from io import StringIO
+        import hashlib
+
+        from bioimageio.spec import get_conda_env
+        from bioimageio.spec._internal.io_utils import write_yaml
+
+        conda_env = get_conda_env(entry=wf)
+        conda_env.name = None
+        dumped_env = conda_env.model_dump(mode="json", exclude_none=True)
+        buf = StringIO()
+        write_yaml(dumped_env, file=buf)
+        encoded = buf.getvalue().encode()
+        env_name = hashlib.sha256(encoded).hexdigest()
+        return env_name, encoded
+
     # === Conda env pre-creation for custom_environment tests ===
 
     async def _prebuild_conda_envs(self, rdf_path: str, model_id: str) -> None:
@@ -529,11 +694,7 @@ class EntryApp:
         envs on the PVC are skipped instantly — first call to a
         given model is slow, subsequent calls are near-free.
         """
-        from io import StringIO
-        import hashlib
-
-        from bioimageio.spec import get_conda_env, load_description
-        from bioimageio.spec._internal.io_utils import write_yaml
+        from bioimageio.spec import load_description
 
         # Load description off-loop — file I/O + validation.
         descr = await asyncio.to_thread(load_description, rdf_path)
@@ -556,13 +717,7 @@ class EntryApp:
             wf = getattr(descr.weights, wf_name, None)
             if not wf:
                 continue
-            conda_env = get_conda_env(entry=wf)
-            conda_env.name = None
-            dumped_env = conda_env.model_dump(mode="json", exclude_none=True)
-            buf = StringIO()
-            write_yaml(dumped_env, file=buf)
-            encoded = buf.getvalue().encode()
-            env_name = hashlib.sha256(encoded).hexdigest()
+            env_name, encoded = self._compute_conda_env_name(wf)
             env_specs.append((wf_name, env_name, encoded))
 
         if not env_specs:
@@ -1060,6 +1215,10 @@ class EntryApp:
             None,
             description="Caller's personal Hypha token, required when ``attach_test_report=True``. All artifact writes for the attach are performed under this token — the runner does not use its own workspace credentials to edit user artifacts.",
         ),
+        async_mode: Optional[bool] = Field(
+            False,
+            description="If True, schedule the test as a background job and return {job_id, state} immediately. Poll ``get_test_status(job_id)`` for progress and the final report. Job state is in-memory per replica and drops on replica restart. If False (default), block until the test completes and return the full report — behavior unchanged from previous versions.",
+        ),
     ) -> Dict[str, Union[str, bool, List, Dict]]:
         """
         Execute comprehensive model testing using ``bioimageio.core.test_description``.
@@ -1130,13 +1289,55 @@ class EntryApp:
                 f"``hypha_token=<token>``, or call test() with "
                 f"``attach_test_report=False``."
             )
+
+        # Find (or allocate) the state-tracking job. When we're inside
+        # the async-mode wrapper (``async_mode=True`` recursed here as
+        # ``async_mode=False``), the wrapper's asyncio task carries a
+        # ``_task_to_job`` entry the recursive call picks up — state
+        # updates land in the right registry entry. Direct sync-mode
+        # callers get a fresh best-effort job (they receive the report
+        # directly on return; the job entry is available via
+        # ``get_test_status`` if the caller wants queue/progress info
+        # after the fact).
+        current_task = asyncio.current_task()
+        job = self._task_to_job.get(id(current_task)) if current_task else None
+        if job is None:
+            job = self._new_test_job(model_id, custom_environment)
+
+        if async_mode:
+            async def _bg_execute():
+                bg_task = asyncio.current_task()
+                self._task_to_job[id(bg_task)] = job
+                try:
+                    result = await self.test(
+                        model_id=model_id,
+                        stage=stage,
+                        custom_environment=custom_environment,
+                        skip_cache=skip_cache,
+                        attach_test_report=attach_test_report,
+                        hypha_token=hypha_token,
+                        async_mode=False,
+                    )
+                    self._update_test_job(job, state="completed", result=result)
+                except Exception as exc:
+                    logger.error(
+                        f"❌ Async test job {job['job_id']} for '{model_id}' failed: {exc}"
+                    )
+                    self._update_test_job(job, state="failed", error=str(exc))
+                finally:
+                    self._task_to_job.pop(id(bg_task), None)
+
+            asyncio.create_task(_bg_execute())
+            return self._job_public_view(job)
+
         logger.info(
-            f"🧪 Testing model '{model_id}' (stage={stage}, "
+            f"🧪 Testing model '{model_id}' (job {job['job_id']}, stage={stage}, "
             f"skip_cache={skip_cache}, "
             f"custom_environment={custom_environment}, "
             f"attach_test_report={attach_test_report})."
         )
 
+        self._update_test_job(job, state="model_download")
         # Get model package with access tracking
         package = await self.model_cache.get_model_package(
             model_id=model_id,
@@ -1238,11 +1439,13 @@ class EntryApp:
                     # its normal env-create flow — graceful degrade
                     # to pre-1.10.0 behavior with no correctness gap.
                     if custom_environment:
+                        self._update_test_job(job, state="env_setup")
                         await self._prebuild_conda_envs(
                             rdf_path=package.source,
                             model_id=model_id,
                         )
 
+                    self._update_test_job(job, state="running")
                     test_report = await self.runtime.test(
                         rdf_path=package.source,
                         custom_environment=custom_environment,
@@ -1488,7 +1691,59 @@ class EntryApp:
                             f"⚠️ Failed to close caller Hypha client after attach: {e}"
                         )
 
+        # Terminal state for the sync-mode job. Async-mode wrapper
+        # sees the same result via the return value and does its own
+        # update (with completed_at set for the "wall clock stops on
+        # background completion, not on return-to-caller" semantic).
+        self._update_test_job(job, state="completed", result=test_report)
         return test_report
+
+    @bioengine.method
+    async def get_test_status(
+        self,
+        job_id: str = Field(
+            ...,
+            description="Opaque job identifier returned by ``test(..., async_mode=True)``.",
+        ),
+    ) -> Dict[str, Union[str, bool, int, float, list, dict, None]]:
+        """Return the current state of an async test job.
+
+        Response shape:
+        - ``job_id`` — echoes the input.
+        - ``model_id`` — the model this job is testing.
+        - ``custom_environment`` — whether the test runs in the
+          model's declared conda env (True) or the shared runtime
+          (False).
+        - ``state`` — one of ``queued``, ``model_download``,
+          ``env_setup``, ``running``, ``completed``, ``failed``.
+        - ``queue_position`` — for custom-env jobs still in
+          ``queued`` / ``env_setup``, the count of custom-env jobs
+          ahead of this one in start-time order. ``0`` otherwise.
+        - ``started_at`` / ``updated_at`` / ``completed_at`` —
+          Unix timestamps; ``completed_at`` is ``None`` until the
+          job finishes.
+        - ``elapsed_seconds`` — wall clock from ``started_at`` to
+          either ``completed_at`` (terminal) or ``now`` (in-flight).
+        - ``result`` — the full ``test_report`` dict on
+          ``state=completed``, ``None`` otherwise.
+        - ``error`` — human-readable message on ``state=failed``,
+          ``None`` otherwise.
+
+        Jobs are held for 24 hours after completion, then dropped.
+        Registries are per-Entry replica and in-memory — jobs
+        started on one replica are unknown to others, and replica
+        restarts drop everything. Callers who need durability
+        should use ``test(async_mode=False)`` and hold the RPC.
+        """
+        job = self._test_jobs.get(job_id)
+        if job is None:
+            raise KeyError(
+                f"Unknown test job_id {job_id!r}. Jobs live in-memory per "
+                f"Entry replica and expire 24 hours after completion. "
+                f"Fresh call: retry via test(..., async_mode=True), or "
+                f"fall back to test(..., async_mode=False) to block."
+            )
+        return self._job_public_view(job)
 
     @bioengine.method
     async def get_upload_url(
