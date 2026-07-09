@@ -178,53 +178,89 @@ def health_check(fn: Callable[..., Any]) -> Callable[..., Any]:
     return fn
 
 
-def multiplexed(*, max_models: int = 3) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Mark a method as an LRU-cached, per-replica multiplexed model loader.
+def cached(*, max_models: int = 3) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a method as an LRU-cached model loader.
 
-    Equivalent to ``@serve.multiplexed(max_num_models_per_replica=N)`` —
-    ``@bioengine.app`` applies the underlying Ray Serve decorator at the
-    right point in the pipeline. On cache overflow the least-recently-used
-    model is unloaded automatically; the loaded model's ``__del__`` is
-    called (if defined) so GPU memory / disk handles / etc. are released
-    eagerly.
+    The first non-``self`` positional argument is the cache key. The
+    method body is the loader — called on cache miss to produce the
+    entry. On cache overflow the least-recently-used entry is evicted
+    BEFORE the new load, and every eviction path runs
+    ``gc.collect()`` + ``torch.cuda.empty_cache()`` under the same
+    asyncio lock as the pop, so ``pynvml`` reflects freed VRAM
+    immediately.
 
-    Manual cache control is available via the ``bioengine.multiplex``
-    submodule — useful when a downstream call needs the full GPU (e.g.
-    running ``bioimageio.core.test_model`` on a foundation model that
-    won't fit alongside cached siblings):
+    Manual cache control is available via the ``bioengine.cache``
+    submodule — useful when a downstream call needs the full GPU
+    (e.g. running ``bioimageio.core.test_model`` on a foundation
+    model that won't fit alongside cached siblings):
 
     .. code-block:: python
 
         import bioengine
 
         class RuntimeApp:
-            @bioengine.multiplexed(max_models=3)
+            @bioengine.cached(max_models=3)
             async def load_model(self, model_id: str): ...
 
             @bioengine.method
             async def free_gpu_for_test(self) -> int:
-                # Drop every cached model right now. Each ``__del__`` fires
-                # the same way it does on natural LRU eviction.
-                return await bioengine.multiplex.evict_all_models(self)
+                # Drop every cached model right now. GPU memory is
+                # returned to the CUDA driver in the same critical
+                # section, so pynvml reflects the free immediately.
+                return await bioengine.cache.evict_all_models(self)
 
-    ``bioengine.multiplex`` also exposes ``evict_lru_model``, ``evict_model``,
-    and ``cached_model_ids`` — see that module for details.
+    ``bioengine.cache`` also exposes ``evict_lru_model``,
+    ``evict_model``, and ``cached_model_ids``.
 
-    **Only one ``@bioengine.multiplexed`` method per class.** Ray Serve's
-    multiplexing stores its cache wrapper at a single hardcoded attribute
-    on ``self``, so a second decorated method would silently share the
-    first method's cache and loader function — leading to the wrong
-    ``model_id`` being routed to the wrong loader with no error. bioengine
-    rejects a second ``@multiplexed`` at ``@bioengine.app`` scan time. If
-    you need multiple caches, split them into separate deployment classes
-    or use ``functools.lru_cache`` inside a plain ``@bioengine.method``.
+    Multiple ``@bioengine.cached`` methods per class are allowed —
+    each gets its own independent ``PipelineCache`` under its method
+    name. Pass ``method_name=`` to the ``bioengine.cache`` helpers to
+    disambiguate when there is more than one.
+
+    This decorator replaces the older ``@bioengine.multiplexed``,
+    which forwarded to Ray Serve's ``@serve.multiplexed``. Ray's
+    ``unload_model_lru`` dropped Python refs but did not call
+    ``torch.cuda.empty_cache()`` — pipelines evicted from the
+    multiplex cache left ~200 MB of VRAM stuck per model, observable
+    via ``pynvml`` across subsequent calls. The home-grown cache
+    fixes that; ``@bioengine.multiplexed`` is preserved as a
+    deprecated alias.
     """
+
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-        setattr(fn, _KIND_ATTR, "multiplexed")
-        fn._bioengine_multiplexed_max_models = max_models  # type: ignore[attr-defined]
+        setattr(fn, _KIND_ATTR, "cached")
+        fn._bioengine_cache_max_models = max_models  # type: ignore[attr-defined]
         return fn
 
     return decorator
+
+
+def multiplexed(*, max_models: int = 3) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """DEPRECATED — use ``@bioengine.cached`` instead.
+
+    Previously forwarded to Ray Serve's
+    ``@serve.multiplexed(max_num_models_per_replica=N)``. Now aliases
+    ``@bioengine.cached``, which uses a home-grown LRU cache that
+    properly releases GPU memory on every eviction (Ray Serve's
+    path leaks torch's caching allocator blocks — pipelines evicted
+    from the multiplex cache left ~200 MB per model stuck in VRAM,
+    observable via ``pynvml``).
+
+    Emits ``DeprecationWarning`` at decorator time. Existing app code
+    keeps working; migrate at leisure by renaming to
+    ``@bioengine.cached``.
+    """
+    import warnings
+
+    warnings.warn(
+        "@bioengine.multiplexed is deprecated; use @bioengine.cached. "
+        "Same semantics, but the new home-grown cache properly runs "
+        "gc.collect() + torch.cuda.empty_cache() on every eviction — "
+        "Ray Serve's multiplex path leaks torch's allocator blocks.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return cached(max_models=max_models)
 
 
 # ───────────────────────────── @bioengine.app ────────────────────────────
@@ -284,14 +320,16 @@ def app(
         cls.__init__ = wrap_init(cls, orig_init)
         cls.check_health = _make_check_health(cls, lifecycle)
 
-        for mname in lifecycle["multiplexed"]:
+        # Wrap every @bioengine.cached method with a thin dispatcher
+        # that resolves the per-method ``PipelineCache`` instance from
+        # the deployment and drives ``get_or_load`` around the raw
+        # loader function. Cache instances are created lazily on first
+        # call so the ``asyncio.Lock`` binds to whatever loop Ray Serve
+        # runs the replica on.
+        for mname in lifecycle["cached"]:
             raw = getattr(cls, mname)
-            max_models = getattr(raw, "_bioengine_multiplexed_max_models", 3)
-            setattr(
-                cls,
-                mname,
-                serve.multiplexed(max_num_models_per_replica=max_models)(raw),
-            )
+            max_models = getattr(raw, "_bioengine_cache_max_models", 3)
+            setattr(cls, mname, _make_cached_wrapper(raw, mname, max_models))
 
         opts = _build_ray_actor_options(
             num_cpus=num_cpus,
@@ -311,6 +349,44 @@ def app(
 
 
 # ────────────────────────── internal helpers ─────────────────────────────
+
+
+def _make_cached_wrapper(
+    raw: Callable[..., Any], method_name: str, max_models: int
+) -> Callable[..., Any]:
+    """Wrap a ``@bioengine.cached`` method so calls go through the
+    per-replica ``PipelineCache``.
+
+    On first call for a given deployment instance, lazily instantiates
+    the cache (or picks up one already installed by ``wrap_init``) and
+    stashes it on ``self._bioengine_caches[method_name]``. Subsequent
+    calls hit the same cache. The first positional arg after ``self``
+    is the cache key; the raw function is the loader.
+    """
+    from bioengine._app.cache import PipelineCache
+
+    @wraps(raw)
+    async def wrapped(self: Any, cache_key: Any, *args: Any, **kwargs: Any) -> Any:
+        caches = getattr(self, "_bioengine_caches", None)
+        if caches is None:
+            caches = {}
+            self._bioengine_caches = caches
+        cache = caches.get(method_name)
+        if cache is None:
+            cache = PipelineCache(max_models=max_models)
+            caches[method_name] = cache
+
+        async def _loader() -> Any:
+            return await raw(self, cache_key, *args, **kwargs)
+
+        return await cache.get_or_load(str(cache_key), _loader)
+
+    # Preserve the marker so downstream introspection still sees this
+    # method was ``@bioengine.cached``, and re-attach the max_models
+    # attribute in case someone inspects it.
+    setattr(wrapped, _KIND_ATTR, "cached")
+    wrapped._bioengine_cache_max_models = max_models  # type: ignore[attr-defined]
+    return wrapped
 
 
 def _reject_reserved_names(cls: type) -> None:
@@ -336,7 +412,11 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         "async_init": None,
         "smoke_test": None,
         "health_check": None,
-        "multiplexed": [],
+        # Every ``@bioengine.cached`` method name — allowed multiple
+        # per class (each gets its own ``PipelineCache``). The now-
+        # deprecated ``@bioengine.multiplexed`` decorator aliases
+        # ``@bioengine.cached`` so its methods land in the same bucket.
+        "cached": [],
     }
     method_schemas: List[Dict[str, Any]] = []
 
@@ -355,8 +435,8 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
                 getattr(member, _WANTS_CONTEXT_ATTR, False)
             )
             method_schemas.append(entry)
-        elif kind == "multiplexed":
-            lifecycle["multiplexed"].append(attr_name)
+        elif kind == "cached":
+            lifecycle["cached"].append(attr_name)
         elif kind in lifecycle:
             if lifecycle[kind] is not None:
                 raise ReservedMethodNameError(
@@ -365,29 +445,6 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
                     f"'{lifecycle[kind]}' and '{attr_name}'. Only one is allowed."
                 )
             lifecycle[kind] = attr_name
-
-    if len(lifecycle["multiplexed"]) > 1:
-        # Ray Serve's ``@serve.multiplexed`` stores its cache wrapper on
-        # ``self`` at a hardcoded attribute name (``__serve_multiplex_wrapper``
-        # in ``ray/serve/api.py``). A second decorated method silently
-        # reuses the first method's wrapper — so calls to the second
-        # method are dispatched to the first method's loader with the
-        # wrong ``model_id``. Ray does not error, just silently produces
-        # wrong results. Raise loudly at ``@bioengine.app`` scan time
-        # instead of letting authors chase the mis-loaded model at runtime.
-        names = ", ".join(f"'{n}'" for n in lifecycle["multiplexed"])
-        raise ReservedMethodNameError(
-            f"{cls.__module__}.{cls.__qualname__} has more than one "
-            f"@bioengine.multiplexed method ({names}). Only one is "
-            f"allowed per deployment class — Ray Serve's underlying "
-            f"multiplexing keeps its LRU cache on a single hardcoded "
-            f"attribute on ``self``, so a second decorated method would "
-            f"silently share the first method's cache and loader. If "
-            f"you need multiple model caches, split the loaders into "
-            f"separate @bioengine.app deployment classes, or use "
-            f"``functools.lru_cache`` inside a plain @bioengine.method "
-            f"if the entries fit CPU memory."
-        )
 
     return lifecycle, method_schemas
 

@@ -371,7 +371,7 @@ class RuntimeApp:
         # behind us on the same replica, so once we've evicted the
         # tested model has the full GPU to itself for the duration
         # of the ``test_description`` call.
-        evicted_count = await bioengine.multiplex.evict_all_models(self)
+        evicted_count = await bioengine.cache.evict_all_models(self)
         if evicted_count:
             logger.info(
                 f"🧹 Evicted {evicted_count} cached pipeline(s) to free "
@@ -428,7 +428,7 @@ class RuntimeApp:
 
     # === Multiplexed pipeline (Ray Serve handles eviction by max_models) ===
 
-    @bioengine.multiplexed(
+    @bioengine.cached(
         max_models=int(os.environ.get("PIPELINE_CACHE_SIZE", 10)),
     )
     async def _create_prediction_pipeline(self, cache_key: str):

@@ -176,31 +176,28 @@ async def test_evict_specific_returns_false_when_no_wrapper() -> None:
 # ---------- decorator "one per class" enforcement ----------
 
 
-def test_multiple_multiplexed_methods_raises_at_scan_time() -> None:
-    """Ray Serve stores its multiplex cache on ``self`` at a single
-    hardcoded attribute. A second ``@bioengine.multiplexed`` method would
-    silently share the first one's wrapper — mis-dispatching model_ids
-    to the wrong loader. bioengine rejects the class outright.
+def test_multiple_cached_methods_per_class_allowed() -> None:
+    """The pre-0.11.22 framework rejected multiple ``@bioengine.multiplexed``
+    methods per class because Ray Serve stored its wrapper at a single
+    hardcoded attribute — a second decorated method silently shared the
+    first's cache. The 0.11.22 home-grown cache lifts that constraint
+    (each decorated method gets its own ``PipelineCache``), so a class
+    with two decorated methods now decorates cleanly.
 
-    Note: ``pytest.raises(ReservedMethodNameError, ...)`` would be nicer
-    but ``test_decorators_baseline_imports.py`` reloads ``bioengine._app``
-    mid-suite — that gives ``ReservedMethodNameError`` a fresh class
-    identity that mismatches whatever this file imported at collection
-    time. Matching on the class name string is the same failure mode
-    check without the identity trap.
+    This test locks in the new relaxed semantic — regression fence
+    against accidentally re-introducing the old single-per-class limit.
     """
-    with pytest.raises(Exception) as exc_info:
 
-        @bioengine.app(num_cpus=1, num_gpus=0, memory_mb=128)
-        class TwoCaches:  # noqa: D401 — test fixture
-            @bioengine.multiplexed(max_models=2)
-            async def load_a(self, model_id: str): ...
+    @bioengine.app(num_cpus=1, num_gpus=0, memory_mb=128)
+    class TwoCaches:  # noqa: D401 — test fixture
+        @bioengine.cached(max_models=2)
+        async def load_a(self, model_id: str): ...
 
-            @bioengine.multiplexed(max_models=2)
-            async def load_b(self, model_id: str): ...
+        @bioengine.cached(max_models=2)
+        async def load_b(self, model_id: str): ...
 
-    assert type(exc_info.value).__name__ == "ReservedMethodNameError"
-    assert "more than one @bioengine.multiplexed" in str(exc_info.value)
+    lc = TwoCaches.func_or_class._bioengine_lifecycle
+    assert set(lc["cached"]) == {"load_a", "load_b"}
 
 
 def test_single_multiplexed_method_is_accepted() -> None:
