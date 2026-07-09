@@ -96,6 +96,21 @@ class EntryApp:
     - Graceful error handling for filesystem race conditions and I/O errors
     """
 
+    # === Conda env cache tuning ===
+    #
+    # Custom-environment tests build conda envs on the shared PVC
+    # ``$HOME/.bioengine-conda/envs/``. Envs are ~5-10 GB apiece; a
+    # given model has up to 3 (one per framework family: torch,
+    # onnx, tensorflow) — models that declare multiple torch weight
+    # formats (pytorch_state_dict + torchscript) can have more.
+    # ``CONDA_ENV_CACHE_MAX_GB`` (env var, default 30) is the soft
+    # ceiling — the LRU eviction step keeps the cache under it as
+    # a rough estimate (``du -sk``, not exact). Minimum 30 so a
+    # single 3-env model always fits without evicting envs it
+    # itself needs.
+    _CONDA_ENV_CACHE_MIN_GB = 30
+    _CONDA_ENV_MAX_AGE_DAYS = 7  # weekly age-based sweep
+
     def __init__(
         self,
         runtime: RuntimeApp,
@@ -108,6 +123,31 @@ class EntryApp:
         self._hypha_token = os.getenv("HYPHA_TOKEN")
         if not self._hypha_token:
             raise RuntimeError("HYPHA_TOKEN environment variable is not set")
+
+        # Conda env cache soft ceiling
+        raw = os.getenv("CONDA_ENV_CACHE_MAX_GB", str(self._CONDA_ENV_CACHE_MIN_GB))
+        try:
+            configured = float(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"CONDA_ENV_CACHE_MAX_GB must be a number, got {raw!r}"
+            ) from exc
+        if configured < self._CONDA_ENV_CACHE_MIN_GB:
+            raise RuntimeError(
+                f"CONDA_ENV_CACHE_MAX_GB={configured} is below the minimum "
+                f"of {self._CONDA_ENV_CACHE_MIN_GB} GB — a single model with 3 "
+                f"framework-family envs (torch, onnx, tensorflow) at ~10 GB "
+                f"apiece would evict envs it itself needs."
+            )
+        self._conda_env_cache_max_gb = configured
+
+        # Serializes ``mamba env create`` so only one custom-env test
+        # can be building conda envs at a time on THIS replica. Two
+        # concurrent solves would compete for memory + fight over
+        # mamba's package cache locks. Cache-hit path
+        # (all envs already exist) is fast; the lock is uncontended
+        # in the common case.
+        self._env_build_lock = asyncio.Lock()
 
         # Get replica identifier for logging
         try:
@@ -125,6 +165,10 @@ class EntryApp:
         logger.info(
             f"🚀 {self.__class__.__name__} initialized with models directory: "
             f"{self.model_cache.cache_dir} (cache_size={self.model_cache.cache_size_bytes / (1024*1024*1024):.3f} GB)"
+        )
+        logger.info(
+            f"🐍 Conda env cache: max {self._conda_env_cache_max_gb:.0f} GB, "
+            f"age sweep every {self._CONDA_ENV_MAX_AGE_DAYS} days"
         )
 
     # === BioEngine App Method - will be called when the deployment is started ===
@@ -292,6 +336,174 @@ class EntryApp:
 
     # === Conda env pre-creation for custom_environment tests ===
 
+    # === Conda env cache housekeeping (sweep + LRU eviction) ===
+
+    def _conda_envs_dir(self) -> Path:
+        return Path(os.environ["HOME"]) / ".bioengine-conda" / "envs"
+
+    async def _du_bytes(self, path: Path) -> int:
+        """Compact wrapper around ``du -sk`` — used for env sizing.
+
+        Walking a 10 GB env with Python's ``rglob`` + ``stat`` takes
+        several seconds per env; ``du`` finishes in ~100 ms. Returns
+        0 on any error (missing path, du unavailable) so callers can
+        continue safely.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "du",
+                "-sk",
+                str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return 0
+            return int(stdout.decode().split()[0]) * 1024
+        except Exception:
+            return 0
+
+    async def _mamba_env_remove(self, env_name: str, env_vars: Dict[str, str]) -> None:
+        """Non-blocking ``mamba env remove``. Best-effort — logs
+        warnings on failure but never raises, since the caller
+        (sweep + LRU eviction) shouldn't fail the whole test call
+        because one stale env couldn't be reaped.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "mamba",
+                "env",
+                "remove",
+                "-n",
+                env_name,
+                "--yes",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env_vars,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                logger.info(f"🧹 Removed conda env {env_name}")
+            else:
+                tail = (stderr or b"").decode(errors="replace")[-300:]
+                logger.warning(
+                    f"⚠️ Could not remove conda env {env_name}: rc="
+                    f"{proc.returncode}, tail={tail!r}"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ Exception removing conda env {env_name}: {e}")
+
+    def _touch_env(self, env_name: str) -> None:
+        """Bump the env directory's mtime so LRU tracks actual use
+        (mamba's ``run -n <env>`` only reads, so mtime wouldn't
+        move otherwise).
+        """
+        try:
+            env_dir = self._conda_envs_dir() / env_name
+            if env_dir.exists():
+                os.utime(env_dir, None)
+        except OSError as e:
+            logger.debug(f"could not touch env {env_name}: {e}")
+
+    async def _sweep_old_envs_if_due(self, env_vars: Dict[str, str]) -> None:
+        """Age-based sweep: at most once per ``_CONDA_ENV_MAX_AGE_DAYS``.
+
+        Uses a ``.last-sweep`` marker file next to the envs dir.
+        First call on a fresh replica also runs (marker missing).
+        """
+        marker = self._conda_envs_dir().parent / ".last-sweep"
+        now = time.time()
+        try:
+            age_hours = (now - marker.stat().st_mtime) / 3600.0
+        except FileNotFoundError:
+            age_hours = float("inf")
+        if age_hours < self._CONDA_ENV_MAX_AGE_DAYS * 24:
+            return
+
+        cutoff = now - self._CONDA_ENV_MAX_AGE_DAYS * 86400
+        envs_dir = self._conda_envs_dir()
+        if not envs_dir.exists():
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+            return
+
+        candidates = []
+        for entry in envs_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    candidates.append(entry.name)
+            except FileNotFoundError:
+                continue
+        if candidates:
+            logger.info(
+                f"🧹 Weekly conda env sweep: removing "
+                f"{len(candidates)} env(s) older than "
+                f"{self._CONDA_ENV_MAX_AGE_DAYS} days"
+            )
+            await asyncio.gather(
+                *(self._mamba_env_remove(name, env_vars) for name in candidates)
+            )
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+
+    async def _evict_lru_if_over_budget(
+        self,
+        protected: List[str],
+        env_vars: Dict[str, str],
+    ) -> None:
+        """LRU eviction: while the on-disk cache exceeds
+        ``_conda_env_cache_max_gb``, remove the least-recently-used
+        env that isn't in ``protected`` (the envs the current test
+        needs).
+
+        Approximate: uses ``du -sk`` per env, not fsync-accurate,
+        and ``mamba env remove`` on an in-use env silently fails.
+        Both are acceptable — the ceiling is a soft target.
+        """
+        envs_dir = self._conda_envs_dir()
+        if not envs_dir.exists():
+            return
+        max_bytes = int(self._conda_env_cache_max_gb * 1024**3)
+
+        entries = []
+        for entry in envs_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            entries.append((entry.name, entry, mtime))
+
+        sizes = await asyncio.gather(*(self._du_bytes(p) for _, p, _ in entries))
+        total = sum(sizes)
+        if total <= max_bytes:
+            return
+
+        logger.info(
+            f"🧹 Conda env cache at {total / 1024**3:.1f} GB > "
+            f"{self._conda_env_cache_max_gb:.0f} GB ceiling — LRU eviction"
+        )
+        protected_set = set(protected)
+        ranked = sorted(
+            [
+                (mtime, name, size)
+                for (name, _, mtime), size in zip(entries, sizes)
+                if name not in protected_set
+            ],
+            key=lambda t: t[0],
+        )
+        for mtime, name, size in ranked:
+            if total <= max_bytes:
+                break
+            await self._mamba_env_remove(name, env_vars)
+            total -= size
+
+    # === Conda env pre-creation for custom_environment tests ===
+
     async def _prebuild_conda_envs(self, rdf_path: str, model_id: str) -> None:
         """CPU-side, non-blocking pre-creation of every conda env the
         model needs for ``custom_environment=True`` tests.
@@ -358,39 +570,63 @@ class EntryApp:
             return
 
         env_vars = self._mamba_env_vars()
+        needed_env_names = [name for _, name, _ in env_specs]
 
-        logger.info(
-            f"🐍 Prebuild: checking {len(env_specs)} conda env(s) for "
-            f"'{model_id}' ({[wf for wf, _, _ in env_specs]})"
-        )
-        exists_results = await asyncio.gather(
-            *(self._mamba_env_exists(name, env_vars) for _, name, _ in env_specs)
-        )
+        # ``_env_build_lock`` serializes env-build across concurrent
+        # ``test()`` calls on this Entry replica. Cache-hit path
+        # (all envs already exist) still holds the lock briefly, but
+        # that's OK — mamba probes take <1s and eviction/sweep are
+        # cheap when there's nothing to do.
+        async with self._env_build_lock:
+            # Weekly age-based sweep — remove envs untouched for
+            # more than ``_CONDA_ENV_MAX_AGE_DAYS`` days. Marker
+            # file gates frequency so this is at most a per-week
+            # cost.
+            await self._sweep_old_envs_if_due(env_vars)
 
-        to_create = [
-            (wf, name, enc)
-            for (wf, name, enc), exists in zip(env_specs, exists_results)
-            if not exists
-        ]
-        cached = [wf for (wf, _, _), e in zip(env_specs, exists_results) if e]
-        if cached:
-            logger.info(f"✅ Reusing cached conda env(s) for {cached}.")
-        if not to_create:
-            return
+            # LRU eviction if we're already over the ceiling. Envs
+            # this test itself needs (``needed_env_names``) are
+            # protected regardless of age.
+            await self._evict_lru_if_over_budget(needed_env_names, env_vars)
 
-        logger.info(
-            f"🐍 Building {len(to_create)} missing conda env(s) concurrently: "
-            f"{[wf for wf, _, _ in to_create]}"
-        )
-        await asyncio.gather(
-            *(
-                self._mamba_env_create(name, enc, env_vars, wf=wf)
-                for wf, name, enc in to_create
+            logger.info(
+                f"🐍 Prebuild: checking {len(env_specs)} conda env(s) for "
+                f"'{model_id}' ({[wf for wf, _, _ in env_specs]})"
             )
-        )
-        logger.info(
-            f"✅ Prebuilt {len(to_create)} conda env(s) for '{model_id}'."
-        )
+            exists_results = await asyncio.gather(
+                *(self._mamba_env_exists(name, env_vars) for _, name, _ in env_specs)
+            )
+
+            to_create = [
+                (wf, name, enc)
+                for (wf, name, enc), exists in zip(env_specs, exists_results)
+                if not exists
+            ]
+            cached = [wf for (wf, _, _), e in zip(env_specs, exists_results) if e]
+            if cached:
+                logger.info(f"✅ Reusing cached conda env(s) for {cached}.")
+
+            if to_create:
+                logger.info(
+                    f"🐍 Building {len(to_create)} missing conda env(s) concurrently: "
+                    f"{[wf for wf, _, _ in to_create]}"
+                )
+                await asyncio.gather(
+                    *(
+                        self._mamba_env_create(name, enc, env_vars, wf=wf)
+                        for wf, name, enc in to_create
+                    )
+                )
+                logger.info(
+                    f"✅ Prebuilt {len(to_create)} conda env(s) for '{model_id}'."
+                )
+
+            # Bump mtime on every env this test uses (cached or
+            # just built) so subsequent LRU eviction treats them as
+            # "recently used" — mamba's ``run -n <env>`` only reads,
+            # so mtime wouldn't move otherwise.
+            for name in needed_env_names:
+                self._touch_env(name)
 
     async def _mamba_env_exists(self, env_name: str, env_vars: Dict[str, str]) -> bool:
         """Non-blocking existence check via
