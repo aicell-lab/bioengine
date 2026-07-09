@@ -19,7 +19,6 @@ from bioengine._app.decorators import (
     cached,
     health_check,
     method,
-    multiplexed,
     smoke_test,
 )
 from bioengine._app.errors import (
@@ -36,7 +35,6 @@ __all__ = [
     "cached",
     "health_check",
     "method",
-    "multiplexed",
     "smoke_test",
     "BioEngineRuntimeHandle",
     "BioEngineUserError",

@@ -217,14 +217,15 @@ def cached(*, max_models: int = 3) -> Callable[[Callable[..., Any]], Callable[..
     name. Pass ``method_name=`` to the ``bioengine.cache`` helpers to
     disambiguate when there is more than one.
 
-    This decorator replaces the older ``@bioengine.multiplexed``,
+    Replaces the pre-0.11.22 ``@bioengine.multiplexed`` decorator,
     which forwarded to Ray Serve's ``@serve.multiplexed``. Ray's
     ``unload_model_lru`` dropped Python refs but did not call
     ``torch.cuda.empty_cache()`` — pipelines evicted from the
     multiplex cache left ~200 MB of VRAM stuck per model, observable
     via ``pynvml`` across subsequent calls. The home-grown cache
-    fixes that; ``@bioengine.multiplexed`` is preserved as a
-    deprecated alias.
+    here fixes that. ``@bioengine.multiplexed`` and the
+    ``bioengine.multiplex`` submodule are gone in 0.11.22; apps must
+    migrate to ``@bioengine.cached`` and ``bioengine.cache``.
     """
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -233,34 +234,6 @@ def cached(*, max_models: int = 3) -> Callable[[Callable[..., Any]], Callable[..
         return fn
 
     return decorator
-
-
-def multiplexed(*, max_models: int = 3) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """DEPRECATED — use ``@bioengine.cached`` instead.
-
-    Previously forwarded to Ray Serve's
-    ``@serve.multiplexed(max_num_models_per_replica=N)``. Now aliases
-    ``@bioengine.cached``, which uses a home-grown LRU cache that
-    properly releases GPU memory on every eviction (Ray Serve's
-    path leaks torch's caching allocator blocks — pipelines evicted
-    from the multiplex cache left ~200 MB per model stuck in VRAM,
-    observable via ``pynvml``).
-
-    Emits ``DeprecationWarning`` at decorator time. Existing app code
-    keeps working; migrate at leisure by renaming to
-    ``@bioengine.cached``.
-    """
-    import warnings
-
-    warnings.warn(
-        "@bioengine.multiplexed is deprecated; use @bioengine.cached. "
-        "Same semantics, but the new home-grown cache properly runs "
-        "gc.collect() + torch.cuda.empty_cache() on every eviction — "
-        "Ray Serve's multiplex path leaks torch's allocator blocks.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return cached(max_models=max_models)
 
 
 # ───────────────────────────── @bioengine.app ────────────────────────────
@@ -413,9 +386,7 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         "smoke_test": None,
         "health_check": None,
         # Every ``@bioengine.cached`` method name — allowed multiple
-        # per class (each gets its own ``PipelineCache``). The now-
-        # deprecated ``@bioengine.multiplexed`` decorator aliases
-        # ``@bioengine.cached`` so its methods land in the same bucket.
+        # per class (each gets its own ``PipelineCache``).
         "cached": [],
     }
     method_schemas: List[Dict[str, Any]] = []

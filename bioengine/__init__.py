@@ -32,7 +32,6 @@ if TYPE_CHECKING:
         cached,
         health_check,
         method,
-        multiplexed,
         smoke_test,
     )
     from bioengine._app.errors import (
@@ -141,7 +140,6 @@ _LAZY_FROM_APP = {
     "smoke_test",
     "health_check",
     "cached",
-    "multiplexed",
     "BioEngineRuntimeHandle",
     "BioEngineUserError",
     "CompositionCycleError",
@@ -179,13 +177,6 @@ def __getattr__(name: str) -> Any:
         from bioengine._app import cache as _cache_module
 
         return _cache_module
-    if name == "multiplex":
-        # DEPRECATED — delegates to ``bioengine.cache``. Kept so
-        # existing app code migrates at leisure. Lazy for the same
-        # reason.
-        from bioengine._app import multiplex as _multiplex_module
-
-        return _multiplex_module
     if name == "logger":
         from bioengine._app.accessors import _get_logger
 
@@ -198,6 +189,4 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted(
-        {"__version__", "datasets", "logger", "cache", "multiplex", *_LAZY_FROM_APP}
-    )
+    return sorted({"__version__", "datasets", "logger", "cache", *_LAZY_FROM_APP})

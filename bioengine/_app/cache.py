@@ -155,8 +155,8 @@ class PipelineCache:
 
 # === Module-level helpers ===
 #
-# Mirror the public shape of the (now-deprecated) ``bioengine.multiplex``
-# submodule so app code can migrate with a one-line find/replace:
+# Mirror the public shape of the pre-0.11.22 ``bioengine.multiplex``
+# submodule so migrating app code is a one-line find/replace:
 #   ``bioengine.multiplex.evict_all_models(self)`` →
 #   ``bioengine.cache.evict_all_models(self)``.
 
