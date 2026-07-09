@@ -29,9 +29,9 @@ if TYPE_CHECKING:
     from bioengine._app.decorators import (
         app,
         async_init,
+        cached,
         health_check,
         method,
-        multiplexed,
         smoke_test,
     )
     from bioengine._app.errors import (
@@ -139,7 +139,7 @@ _LAZY_FROM_APP = {
     "async_init",
     "smoke_test",
     "health_check",
-    "multiplexed",
+    "cached",
     "BioEngineRuntimeHandle",
     "BioEngineUserError",
     "CompositionCycleError",
@@ -169,13 +169,14 @@ def __getattr__(name: str) -> Any:
         import bioengine.datasets as _datasets_module
 
         return _datasets_module
-    if name == "multiplex":
-        # Public helpers for the ``@bioengine.multiplexed`` cache — manual
-        # LRU / specific-model / evict-all + introspection. Lazy so that
-        # plain ``import bioengine`` doesn't drag in the wrapper class.
-        from bioengine._app import multiplex as _multiplex_module
+    if name == "cache":
+        # Public helpers for the ``@bioengine.cached`` cache — manual
+        # LRU / specific-model / evict-all + introspection. Lazy so
+        # that plain ``import bioengine`` doesn't drag in the cache
+        # module.
+        from bioengine._app import cache as _cache_module
 
-        return _multiplex_module
+        return _cache_module
     if name == "logger":
         from bioengine._app.accessors import _get_logger
 
@@ -188,4 +189,4 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted({"__version__", "datasets", "logger", "multiplex", *_LAZY_FROM_APP})
+    return sorted({"__version__", "datasets", "logger", "cache", *_LAZY_FROM_APP})

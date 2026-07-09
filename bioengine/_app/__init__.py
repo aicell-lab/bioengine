@@ -16,9 +16,9 @@ machinery set the submodule as an attribute on the package.
 from bioengine._app.decorators import (
     app,
     async_init,
+    cached,
     health_check,
     method,
-    multiplexed,
     smoke_test,
 )
 from bioengine._app.errors import (
@@ -32,9 +32,9 @@ from bioengine._app.runtime_handle import BioEngineRuntimeHandle
 __all__ = [
     "app",
     "async_init",
+    "cached",
     "health_check",
     "method",
-    "multiplexed",
     "smoke_test",
     "BioEngineRuntimeHandle",
     "BioEngineUserError",
