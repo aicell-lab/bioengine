@@ -111,6 +111,12 @@ class EntryApp:
     _CONDA_ENV_CACHE_MIN_GB = 30
     _CONDA_ENV_MAX_AGE_DAYS = 7  # weekly age-based sweep
 
+    # Test reports are published to per-model child artifacts under this
+    # collection. Writes require the app token to be scoped to this
+    # workspace; otherwise reports are cached locally but not published.
+    _TEST_REPORTS_WORKSPACE = "bioimage-io"
+    _TEST_REPORTS_COLLECTION = "bioimage-io/test-reports"
+
     def __init__(
         self,
         runtime: RuntimeApp,
@@ -149,23 +155,20 @@ class EntryApp:
         # in the common case.
         self._env_build_lock = asyncio.Lock()
 
-        # Async test-job registry. Populated by every ``test()`` call
-        # (both async_mode=True and async_mode=False so state can be
-        # inspected via ``get_test_status`` for either). Keys are
-        # opaque job IDs (``tj-<hex12>``); values track state,
-        # metadata, and an asyncio.Future that resolves on
-        # completion. Purely in-memory per replica; jobs from a
-        # killed replica just disappear, ``get_test_status`` raises
-        # KeyError for them and callers can retry / fall back to
-        # sync mode.
+        # Async test-run registry. Every ``test()`` call schedules a
+        # background job keyed by an opaque run id (``tj-<hex12>``);
+        # values track state, metadata, and an asyncio.Future that
+        # resolves on completion. Purely in-memory per replica; runs
+        # from a killed replica just disappear and ``get_test_status``
+        # raises KeyError for them.
         self._test_jobs: Dict[str, dict] = {}
         self._test_jobs_ttl_sec: int = 24 * 3600
-        # Map from ``id(asyncio.Task)`` → job dict, so the recursive
-        # ``test(async_mode=False)`` call inside the async-mode
-        # wrapper finds the same job the wrapper allocated. Plain
-        # dict — pickles fine (unlike ContextVar, which cloudpickle
-        # trips on when Ray serialises the Serve deployment class).
-        self._task_to_job: Dict[int, dict] = {}
+        # Per-report-artifact locks serialize concurrent uploads to the
+        # same ``test-report-<model>`` artifact (a published and a staged
+        # test of one model would otherwise race on its single staging area).
+        self._report_locks: Dict[str, asyncio.Lock] = {}
+        # Set in ``_async_init`` once the workspace of the app token is known.
+        self._test_reports_writable: bool = False
 
         # Get replica identifier for logging
         try:
@@ -204,6 +207,29 @@ class EntryApp:
         )
         self.s3_controller = await self.hypha_client.get_service("public/s3-storage")
         logger.info(f"Connected to Hypha Server at {self.server_url}")
+
+        # Reports are published under the app's own token. Publishing
+        # requires that token to carry at least read-write scope on the
+        # test-reports workspace (``rw`` or ``a``); ``r`` or absent means
+        # no publish. The startup app gets the bioimage-io workspace token
+        # injected; manual deploys must pass it via ``--hypha-token``.
+        # Otherwise reports are cached + returned only.
+        user = dict(self.hypha_client.config.user or {})
+        scope = dict(user.get("scope") or {})
+        workspace_perms = dict(scope.get("workspaces") or {})
+        token_permission = workspace_perms.get(self._TEST_REPORTS_WORKSPACE)
+        self._test_reports_writable = token_permission in ("rw", "a")
+        if self._test_reports_writable:
+            logger.info(
+                f"📤 Test reports will be published to '{self._TEST_REPORTS_COLLECTION}'."
+            )
+        else:
+            logger.warning(
+                f"⚠️ App token lacks read-write scope on workspace "
+                f"'{self._TEST_REPORTS_WORKSPACE}' (permission={token_permission!r}) — "
+                f"test reports will be cached and returned but NOT published to "
+                f"'{self._TEST_REPORTS_COLLECTION}'."
+            )
 
     # === Ray Serve Health Check Method - will be called periodically to check the health of the deployment ===
 
@@ -545,7 +571,6 @@ class EntryApp:
         self._sweep_expired_test_jobs()
         job_id = f"tj-{uuid.uuid4().hex[:12]}"
         now = time.time()
-        loop = asyncio.get_running_loop()
         job = {
             "job_id": job_id,
             "model_id": model_id,
@@ -556,7 +581,6 @@ class EntryApp:
             "completed_at": None,
             "result": None,
             "error": None,
-            "future": loop.create_future(),
         }
         self._test_jobs[job_id] = job
         return job
@@ -569,9 +593,7 @@ class EntryApp:
         result: Optional[dict] = None,
         error: Optional[str] = None,
     ) -> None:
-        """Idempotent state update. Sets ``completed_at`` and resolves the
-        future on terminal states.
-        """
+        """Idempotent state update. Sets ``completed_at`` on terminal states."""
         if state is not None:
             job["state"] = state
         if result is not None:
@@ -581,16 +603,11 @@ class EntryApp:
         job["updated_at"] = time.time()
         if state in ("completed", "failed"):
             job["completed_at"] = job["updated_at"]
-            fut = job.get("future")
-            if fut is not None and not fut.done():
-                if state == "failed":
-                    fut.set_exception(RuntimeError(error or "test job failed"))
-                else:
-                    fut.set_result(result)
 
-    def _job_public_view(self, job: dict) -> dict:
-        """Serialize a job dict for the RPC response — strips the
-        internal ``future`` handle and computes derived fields.
+    def _job_progress(self, job: dict) -> dict:
+        """Build the ``progress`` sub-dict describing the current step of a
+        test run. Excludes the report itself — callers read ``test_report``
+        alongside it.
         """
         now = time.time()
         state = job["state"]
@@ -607,7 +624,7 @@ class EntryApp:
         completed_at = job["completed_at"]
         elapsed_end = completed_at if completed_at is not None else now
         return {
-            "job_id": job["job_id"],
+            "test_run_id": job["job_id"],
             "model_id": job["model_id"],
             "custom_environment": job["custom_environment"],
             "state": state,
@@ -616,7 +633,6 @@ class EntryApp:
             "updated_at": job["updated_at"],
             "completed_at": completed_at,
             "elapsed_seconds": round(elapsed_end - job["started_at"], 2),
-            "result": job["result"],
             "error": job["error"],
         }
 
@@ -1197,7 +1213,7 @@ class EntryApp:
         ),
         stage: Optional[bool] = Field(
             False,
-            description="Whether to get the staged version of the model (True) or the committed version (False)",
+            description="Whether to test the staged version of the model (True) or the committed version (False). The report is published to the matching slot: staged/ or published/.",
         ),
         custom_environment: Optional[bool] = Field(
             False,
@@ -1207,21 +1223,18 @@ class EntryApp:
             False,
             description="Force a complete model package re-download and bypass cached test results before testing",
         ),
-        attach_test_report: Optional[bool] = Field(
-            False,
-            description="If True, upload ``test_report.json`` to the model artifact and add a compact ``test_summary`` entry to its manifest after testing. Renamed from the older ``publish_test_report`` to avoid confusion with the bioimage.io model zoo ``staged`` / ``published`` lifecycle — this parameter does NOT change the artifact's publication status.",
-        ),
-        hypha_token: Optional[str] = Field(
-            None,
-            description="Caller's personal Hypha token, required when ``attach_test_report=True``. All artifact writes for the attach are performed under this token — the runner does not use its own workspace credentials to edit user artifacts.",
-        ),
-        async_mode: Optional[bool] = Field(
-            False,
-            description="If True, schedule the test as a background job and return {job_id, state} immediately. Poll ``get_test_status(job_id)`` for progress and the final report. Job state is in-memory per replica and drops on replica restart. If False (default), block until the test completes and return the full report — behavior unchanged from previous versions.",
-        ),
-    ) -> Dict[str, Union[str, bool, List, Dict]]:
+    ) -> Dict[str, str]:
         """
-        Execute comprehensive model testing using ``bioimageio.core.test_description``.
+        Schedule comprehensive model testing and return a run id immediately.
+
+        Testing (``bioimageio.core.test_description``) runs as a background
+        job. This call returns right away with just ``{"test_run_id": ...}``;
+        poll ``get_test_status(test_run_id)`` for the current step and, once
+        the run finishes, the full report::
+
+            {"test_run_id": "tj-…"}
+            # then poll get_test_status(test_run_id) →
+            # {"progress": {"state": "completed", ...}, "test_report": {...}}
 
         Caching behavior:
         - Cached test reports are locally stored at ``<model_package>/.test_cache.json``.
@@ -1235,106 +1248,70 @@ class EntryApp:
         Environment mode:
         - ``custom_environment=False`` (default): the test runs in the
             RuntimeApp's own venv — the same interpreter that will serve
-            ``infer()``. Fast, and validates the environment the caller
-            will actually hit in production.
+            ``infer()``.
         - ``custom_environment=True``: the test runs inside the conda
             environment declared by the model's own weights description
-            (``bioimageio.core`` ``runtime_env="as-described"``). Env
-            creation is driven by ``mamba``; the env is removed after
-            the call on both success and failure paths, so no multi-GB
-            per-model envs accumulate on the pod.
+            (``bioimageio.core`` ``runtime_env="as-described"``), removed
+            after the call.
 
-        Attach-to-artifact behavior:
-        - If ``attach_test_report=True``, a compact ``test_summary`` entry is
-            written to the artifact manifest and ``test_report.json`` is
-            uploaded to the artifact. This attaches the report to the
-            artifact — it does NOT alter the artifact's ``staged`` /
-            ``published`` lifecycle status.
-        - **All artifact reads and writes on the attach path run under
-            the caller's ``hypha_token``**, not the runner's workspace
-            credentials. The caller must have write access to the
-            target artifact; if the token is missing or under-privileged
-            the attach fails with a clear ``PermissionError`` /
-            hypha-side rejection. The runner's own token never touches
-            user artifacts on the attach path.
-        - **The runner commits only when the artifact was NOT already staged
-            before the test call.** If a stage was already open — whoever put
-            it there, whatever it contains, whatever ``manifest.status`` says —
-            the runner adds the test report to the existing stage and leaves
-            it open. The artifact owner / reviewer commits later, atomically,
-            alongside whatever changes they already had in flight. This
-            prevents the runner from accidentally publishing someone else's
-            pending edits (bioimage.io #0006 amusing-angelfish incident).
+        Report publishing:
+        - The report is published to the dedicated
+            ``bioimage-io/test-report-<model-id>`` artifact under the
+            ``bioimage-io/test-reports`` collection — ``staged/test_report.json``
+            when ``stage=True`` else ``published/test_report.json`` — using the
+            app's own bioimage-io workspace token. Model contributors have no
+            write access to that collection; reports are world-readable.
+        - Every report embeds ``latest_remote_modified`` (the model artifact's
+            last file-change time) so consumers can tell whether a report is
+            current with the artifact.
+        - If the app token is not scoped to the ``bioimage-io`` workspace,
+            publishing is skipped — the report is still cached locally and
+            returned via ``get_test_status``.
+        """
+        await self._check_runtime_available()
+
+        job = self._new_test_job(model_id, custom_environment)
+
+        async def _bg_execute():
+            try:
+                report = await self._execute_test(
+                    job=job,
+                    model_id=model_id,
+                    stage=stage,
+                    custom_environment=custom_environment,
+                    skip_cache=skip_cache,
+                )
+                self._update_test_job(job, state="completed", result=report)
+            except Exception as exc:
+                logger.error(
+                    f"❌ Test run {job['job_id']} for '{model_id}' failed: {exc}"
+                )
+                self._update_test_job(job, state="failed", error=str(exc))
+
+        asyncio.create_task(_bg_execute())
+        return {"test_run_id": job["job_id"]}
+
+    async def _execute_test(
+        self,
+        job: dict,
+        model_id: str,
+        stage: bool,
+        custom_environment: bool,
+        skip_cache: bool,
+    ) -> dict:
+        """Run the full test pipeline for a scheduled run and return the report.
+
+        Advances ``job`` state through ``model_download`` → ``env_setup`` →
+        ``running`` and publishes the report to the ``bioimage-io/test-reports``
+        collection on completion. Raising here marks the run ``failed``; a test
+        that runs but fails validation instead returns a report with
+        ``status="failed"``.
         """
         import aiofiles
 
-        await self._check_runtime_available()
-        # Fail fast if the caller wants to attach without providing a
-        # token — writes go through the caller's token, not the
-        # runner's workspace credentials, so no token → no attach.
-        # Doing this before compute avoids burning GPU time on a call
-        # that can't complete.
-        if attach_test_report and not hypha_token:
-            raise PermissionError(
-                f"Cannot attach test report to '{model_id}': "
-                f"``attach_test_report=True`` requires a personal "
-                f"``hypha_token`` with write access to the target "
-                f"artifact's workspace. All artifact writes on the "
-                f"attach path are performed under the caller's token "
-                f"so edits are attributed to and authorized as the "
-                f"actual user — the runner never uses its own "
-                f"workspace credentials for user artifacts. Get a "
-                f"personal token from https://hypha.aicell.io "
-                f"(Profile → Access tokens) and pass it as "
-                f"``hypha_token=<token>``, or call test() with "
-                f"``attach_test_report=False``."
-            )
-
-        # Find (or allocate) the state-tracking job. When we're inside
-        # the async-mode wrapper (``async_mode=True`` recursed here as
-        # ``async_mode=False``), the wrapper's asyncio task carries a
-        # ``_task_to_job`` entry the recursive call picks up — state
-        # updates land in the right registry entry. Direct sync-mode
-        # callers get a fresh best-effort job (they receive the report
-        # directly on return; the job entry is available via
-        # ``get_test_status`` if the caller wants queue/progress info
-        # after the fact).
-        current_task = asyncio.current_task()
-        job = self._task_to_job.get(id(current_task)) if current_task else None
-        if job is None:
-            job = self._new_test_job(model_id, custom_environment)
-
-        if async_mode:
-            async def _bg_execute():
-                bg_task = asyncio.current_task()
-                self._task_to_job[id(bg_task)] = job
-                try:
-                    result = await self.test(
-                        model_id=model_id,
-                        stage=stage,
-                        custom_environment=custom_environment,
-                        skip_cache=skip_cache,
-                        attach_test_report=attach_test_report,
-                        hypha_token=hypha_token,
-                        async_mode=False,
-                    )
-                    self._update_test_job(job, state="completed", result=result)
-                except Exception as exc:
-                    logger.error(
-                        f"❌ Async test job {job['job_id']} for '{model_id}' failed: {exc}"
-                    )
-                    self._update_test_job(job, state="failed", error=str(exc))
-                finally:
-                    self._task_to_job.pop(id(bg_task), None)
-
-            asyncio.create_task(_bg_execute())
-            return self._job_public_view(job)
-
         logger.info(
-            f"🧪 Testing model '{model_id}' (job {job['job_id']}, stage={stage}, "
-            f"skip_cache={skip_cache}, "
-            f"custom_environment={custom_environment}, "
-            f"attach_test_report={attach_test_report})."
+            f"🧪 Testing model '{model_id}' (run {job['job_id']}, stage={stage}, "
+            f"skip_cache={skip_cache}, custom_environment={custom_environment})."
         )
 
         self._update_test_job(job, state="model_download")
@@ -1508,6 +1485,11 @@ class EntryApp:
                 # Add tested_at timestamp to the test report so the report is self-contained.
                 test_report["tested_at"] = tested_at
 
+            # Record the model artifact's last file-change time in the report
+            # so consumers can tell whether a stored report is current with the
+            # artifact. Set on both the fresh and the cached path.
+            test_report["latest_remote_modified"] = package.latest_remote_modified
+
             # Save test results only for fresh, successful calculations.
             if should_cache_report:
                 try:
@@ -1524,226 +1506,147 @@ class EntryApp:
                         f"⚠️ Failed to cache test report for '{model_id}': {e}"
                     )
 
-            # Attach test report to artifact under the CALLER'S token —
-            # not the runner's workspace credentials. The runner opens
-            # a short-lived hypha client scoped to the caller and routes
-            # every read + write in the attach block through it, so
-            # every artifact edit is authorised as and attributed to
-            # the actual user. Presence of ``hypha_token`` was already
-            # validated at the top of ``test()``.
-            if attach_test_report:
-                artifact_id = f"bioimage-io/{model_id}"
-                report_file_name = "test_report.json"
-                should_attach_report = True
+            await self._upload_test_report(model_id, stage, test_report)
 
-                caller_client = await connect_to_server(
-                    {
-                        "server_url": self.server_url,
-                        "token": hypha_token,
-                    }
-                )
-                try:
-                    caller_am = await caller_client.get_service(
-                        "public/artifact-manager"
-                    )
-
-                    try:
-                        download_url = await caller_am.get_file(
-                            artifact_id=artifact_id,
-                            file_path=report_file_name,
-                        )
-                        async with httpx.AsyncClient(timeout=30) as client:
-                            response = await client.get(download_url)
-                            response.raise_for_status()
-
-                        remote_test_report = await asyncio.to_thread(
-                            json.loads, response.text
-                        )
-                        remote_tested_at = float(
-                            remote_test_report.get("tested_at", 0.0)
-                        )
-                        local_tested_at = test_report["tested_at"]
-                        should_attach_report = remote_tested_at != local_tested_at
-                    except Exception as e:
-                        logger.warning(
-                            f"⚠️ Failed to load remote test report for '{artifact_id}' before attaching: {e}"
-                        )
-                        should_attach_report = True
-
-                    if not should_attach_report:
-                        logger.info(
-                            f"ℹ️ Existing test report for '{artifact_id}' is up to date; skipping attach."
-                        )
-                        return test_report
-
-                    # Check current staging state. ``read()`` without
-                    # ``stage=True`` returns the committed manifest and
-                    # reports ``staging=None`` even when a stage exists,
-                    # so we must explicitly read the staged view —
-                    # that's the only surface that exposes an open
-                    # stage. This was the latent bug: the original code
-                    # called ``read()`` and trusted
-                    # ``artifact.get("staging")``, which was always
-                    # None, so any downstream "was staged?" branching
-                    # was dead code and the commit path ran
-                    # unconditionally.
-                    stage_view = await caller_am.read(artifact_id, stage=True)
-                    was_already_staged = bool(stage_view.get("staging"))
-
-                    # Base the ``updated_manifest`` on the STAGE's
-                    # manifest when one exists, so any pending edits (a
-                    # reviewer's ``status`` change, RDF tweaks, doc
-                    # updates) are preserved. Reading the committed
-                    # manifest and calling
-                    # ``edit(stage=True, manifest=...)`` would silently
-                    # overwrite those changes — the bioimage.io #0006
-                    # amusing-angelfish incident showed a
-                    # ``status=deletion-requested`` stage being
-                    # flattened back to ``status=published`` by exactly
-                    # this path.
-                    if was_already_staged:
-                        artifact = stage_view
-                    else:
-                        artifact = await caller_am.read(artifact_id)
-
-                    # Compact ``test_summary`` for the manifest (drops
-                    # details + env to keep the manifest small); the
-                    # full report is uploaded as ``test_report.json``.
-                    test_report_summary = {
-                        "status": test_report["status"],
-                        "tested_at": test_report["tested_at"],
-                        "env": test_report["env"],
-                    }
-
-                    # 'test_reports' and 'test_report' are legacy manifest keys.
-                    updated_manifest = dict(artifact["manifest"])
-                    updated_manifest.pop("test_reports", None)
-                    updated_manifest.pop("test_report", None)
-                    updated_manifest.pop("score", None)
-                    updated_manifest["test_summary"] = test_report_summary
-
-                    # Edit the artifact and stage the test-report
-                    # additions. When a stage was already open,
-                    # ``edit(stage=True)`` layers our changes onto that
-                    # stage; when there was no stage, this opens a
-                    # fresh one just for the report.
-                    artifact = await caller_am.edit(
-                        artifact_id=artifact.id,
-                        manifest=updated_manifest,
-                        stage=True,
-                    )
-
-                    upload_url = await caller_am.put_file(
-                        artifact.id, file_path=report_file_name
-                    )
-
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        response = await client.put(
-                            upload_url, data=json.dumps(test_report)
-                        )
-                        response.raise_for_status()
-
-                    # 'test_reports.json' is a legacy file name
-                    try:
-                        existing_files = await caller_am.list_files(artifact.id)
-                        if any(
-                            file.name == "test_reports.json" for file in existing_files
-                        ):
-                            await caller_am.remove_file(
-                                artifact.id, file_path="test_reports.json"
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            f"⚠️ Failed to remove legacy test report file for '{artifact_id}': {e}"
-                        )
-
-                    # Commit only if we opened the stage ourselves. If
-                    # the artifact was already staged when the test
-                    # call arrived — whoever put it there, whatever it
-                    # contains, whatever ``manifest.status`` says —
-                    # committing here would publish someone else's
-                    # pending edits alongside the test report (the
-                    # bioimage.io #0006 amusing-angelfish incident: a
-                    # ``deletion-requested`` stage got published to v0
-                    # when the user ran a test with
-                    # ``attach_test_report=True`` because the runner
-                    # unconditionally committed). Leave the stage open
-                    # for the artifact owner / reviewer to commit
-                    # atomically alongside their own changes.
-                    if not was_already_staged:
-                        await caller_am.commit(artifact_id=artifact.id)
-                        logger.info(
-                            f"📤 Attached test report for model '{model_id}' to "
-                            f"artifact '{artifact_id}' (no prior stage — committed)."
-                        )
-                    else:
-                        logger.info(
-                            f"📋 Added test report for model '{model_id}' to the "
-                            f"existing stage on '{artifact_id}' — leaving the "
-                            f"stage open for the artifact owner / reviewer to "
-                            f"commit alongside their own changes."
-                        )
-                finally:
-                    try:
-                        await caller_client.disconnect()
-                    except Exception as e:
-                        logger.warning(
-                            f"⚠️ Failed to close caller Hypha client after attach: {e}"
-                        )
-
-        # Terminal state for the sync-mode job. Async-mode wrapper
-        # sees the same result via the return value and does its own
-        # update (with completed_at set for the "wall clock stops on
-        # background completion, not on return-to-caller" semantic).
-        self._update_test_job(job, state="completed", result=test_report)
         return test_report
+
+    async def _upload_test_report(
+        self, model_id: str, stage: bool, test_report: dict
+    ) -> None:
+        """Publish ``test_report`` to the per-model artifact under the
+        ``bioimage-io/test-reports`` collection.
+
+        Writes ``staged/test_report.json`` when ``stage=True`` else
+        ``published/test_report.json``, using the app's own workspace token.
+        Skipped (report still cached + returned) when the app token is not
+        scoped to the ``bioimage-io`` workspace. A per-artifact lock serializes
+        a published and a staged upload for the same model so they don't race
+        on the artifact's single staging area. Failures are logged and
+        swallowed — the report is already cached and returned regardless.
+        """
+        if not self._test_reports_writable:
+            return
+
+        model_alias = model_id.rsplit("/", 1)[-1]
+        report_artifact_id = (
+            f"{self._TEST_REPORTS_WORKSPACE}/test-report-{model_alias}"
+        )
+        slot = "staged" if stage else "published"
+        file_path = f"{slot}/test_report.json"
+
+        lock = self._report_locks.setdefault(report_artifact_id, asyncio.Lock())
+        async with lock:
+            try:
+                try:
+                    await self.artifact_manager.read(report_artifact_id, silent=True)
+                except Exception:
+                    await self._create_report_artifact(report_artifact_id, model_alias)
+
+                # Skip a redundant commit when the stored report is identical
+                # (same ``tested_at`` — e.g. a cache-hit re-run).
+                try:
+                    existing = await self.artifact_manager.read_file(
+                        report_artifact_id, file_path, format="json"
+                    )
+                    if float(existing["content"].get("tested_at", -1.0)) == float(
+                        test_report.get("tested_at", 0.0)
+                    ):
+                        logger.info(
+                            f"ℹ️ {slot} test report for '{model_alias}' is up to "
+                            f"date; skipping upload."
+                        )
+                        return
+                except Exception:
+                    pass
+
+                await self.artifact_manager.edit(report_artifact_id, stage=True)
+                upload_url = await self.artifact_manager.put_file(
+                    report_artifact_id, file_path=file_path
+                )
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.put(
+                        upload_url, data=json.dumps(test_report)
+                    )
+                    response.raise_for_status()
+                await self.artifact_manager.commit(report_artifact_id)
+                logger.info(
+                    f"📤 Published {slot} test report for '{model_alias}' to "
+                    f"'{report_artifact_id}'."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Failed to publish test report for '{model_alias}' to "
+                    f"'{report_artifact_id}': {e}"
+                )
+
+    async def _create_report_artifact(
+        self, report_artifact_id: str, model_alias: str
+    ) -> None:
+        """Create the per-model report artifact under the test-reports
+        collection, tolerating a concurrent creator by re-reading on failure.
+        """
+        try:
+            await self.artifact_manager.create(
+                parent_id=self._TEST_REPORTS_COLLECTION,
+                alias=f"test-report-{model_alias}",
+                type="generic",
+                manifest={
+                    "name": f"Test report for {model_alias}",
+                    "description": (
+                        f"BioEngine model-runner test reports for "
+                        f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}. "
+                        f"published/test_report.json is the report for the "
+                        f"published model; staged/test_report.json for the "
+                        f"staged model."
+                    ),
+                },
+            )
+            logger.info(f"🆕 Created report artifact '{report_artifact_id}'.")
+        except Exception:
+            # A concurrent call likely created it first; confirm it now exists,
+            # else re-raise so the caller logs a real failure.
+            await self.artifact_manager.read(report_artifact_id, silent=True)
 
     @bioengine.method
     async def get_test_status(
         self,
-        job_id: str = Field(
+        test_run_id: str = Field(
             ...,
-            description="Opaque job identifier returned by ``test(..., async_mode=True)``.",
+            description="Run id returned by ``test()``.",
         ),
-    ) -> Dict[str, Union[str, bool, int, float, list, dict, None]]:
-        """Return the current state of an async test job.
+    ) -> Dict[str, Union[dict, None]]:
+        """Return the progress and (when finished) the report of a test run.
 
-        Response shape:
-        - ``job_id`` — echoes the input.
-        - ``model_id`` — the model this job is testing.
-        - ``custom_environment`` — whether the test runs in the
-          model's declared conda env (True) or the shared runtime
-          (False).
-        - ``state`` — one of ``queued``, ``model_download``,
-          ``env_setup``, ``running``, ``completed``, ``failed``.
-        - ``queue_position`` — for custom-env jobs still in
-          ``queued`` / ``env_setup``, the count of custom-env jobs
-          ahead of this one in start-time order. ``0`` otherwise.
-        - ``started_at`` / ``updated_at`` / ``completed_at`` —
-          Unix timestamps; ``completed_at`` is ``None`` until the
-          job finishes.
-        - ``elapsed_seconds`` — wall clock from ``started_at`` to
-          either ``completed_at`` (terminal) or ``now`` (in-flight).
-        - ``result`` — the full ``test_report`` dict on
-          ``state=completed``, ``None`` otherwise.
-        - ``error`` — human-readable message on ``state=failed``,
-          ``None`` otherwise.
+        Response shape::
 
-        Jobs are held for 24 hours after completion, then dropped.
-        Registries are per-Entry replica and in-memory — jobs
-        started on one replica are unknown to others, and replica
-        restarts drop everything. Callers who need durability
-        should use ``test(async_mode=False)`` and hold the RPC.
+            {"progress": {...}, "test_report": {...} | null}
+
+        ``progress`` carries ``test_run_id``, ``model_id``,
+        ``custom_environment``, ``state`` (one of ``queued``,
+        ``model_download``, ``env_setup``, ``running``, ``completed``,
+        ``failed``), ``queue_position`` (custom-env runs still waiting on the
+        env-build lock), ``started_at`` / ``updated_at`` / ``completed_at``,
+        ``elapsed_seconds``, and ``error`` (set when ``state=failed``).
+
+        ``test_report`` is the full report dict once ``state=completed`` and
+        ``null`` before that (also ``null`` on ``failed`` — read
+        ``progress.error``).
+
+        Runs are held for 24 hours after completion, then dropped. The
+        registry is per-Entry replica and in-memory — a run started on one
+        replica is unknown to others, and replica restarts drop everything.
         """
-        job = self._test_jobs.get(job_id)
+        job = self._test_jobs.get(test_run_id)
         if job is None:
             raise KeyError(
-                f"Unknown test job_id {job_id!r}. Jobs live in-memory per "
-                f"Entry replica and expire 24 hours after completion. "
-                f"Fresh call: retry via test(..., async_mode=True), or "
-                f"fall back to test(..., async_mode=False) to block."
+                f"Unknown test_run_id {test_run_id!r}. Runs live in-memory per "
+                f"Entry replica and expire 24 hours after completion. Start a "
+                f"fresh run via test()."
             )
-        return self._job_public_view(job)
+        return {
+            "progress": self._job_progress(job),
+            "test_report": job["result"],
+        }
 
     @bioengine.method
     async def get_upload_url(

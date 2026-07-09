@@ -130,8 +130,11 @@ models = await svc.search_models(keywords=["nuclei", "segmentation"], limit=10)
 # Get model metadata
 rdf = await svc.get_model_rdf(model_id="affable-shark")
 
-# Run BioImage.IO compliance tests
-result = await svc.test(model_id="affable-shark")
+# Run BioImage.IO compliance tests (async: returns a run id, then poll)
+run = await svc.test(model_id="affable-shark")
+status = await svc.get_test_status(test_run_id=run["test_run_id"])
+# poll until status["progress"]["state"] in ("completed", "failed");
+# status["test_report"] holds the report once state == "completed"
 
 # Get model documentation (README) to verify domain compatibility
 doc = await svc.get_model_documentation(model_id="affable-shark")
