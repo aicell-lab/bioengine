@@ -1223,16 +1223,16 @@ class EntryApp:
             False,
             description="Force a complete model package re-download and bypass cached test results before testing",
         ),
-    ) -> Dict[str, str]:
+    ) -> str:
         """
         Schedule comprehensive model testing and return a run id immediately.
 
         Testing (``bioimageio.core.test_description``) runs as a background
-        job. This call returns right away with just ``{"test_run_id": ...}``;
-        poll ``get_test_status(test_run_id)`` for the current step and, once
-        the run finishes, the full report::
+        job. This call returns right away with just the ``test_run_id``
+        string; poll ``get_test_status(test_run_id)`` for the current step
+        and, once the run finishes, the full report::
 
-            {"test_run_id": "tj-…"}
+            "tj-…"  # the returned test_run_id
             # then poll get_test_status(test_run_id) →
             # {"progress": {"state": "completed", ...}, "test_report": {...}}
 
@@ -1289,7 +1289,7 @@ class EntryApp:
                 self._update_test_job(job, state="failed", error=str(exc))
 
         asyncio.create_task(_bg_execute())
-        return {"test_run_id": job["job_id"]}
+        return job["job_id"]
 
     async def _execute_test(
         self,
