@@ -85,6 +85,8 @@ The end-to-end deploy_app flow is documented step-by-step in `docs/deploy_app_fl
 - `bioengine/apps/builder.py` — `build()` constructs Ray Serve app from artifact
 - `bioengine/_app/bootstrap.py` — `introspect_app_in_ray_task`, `build_and_run_application`
 - `bioengine/_app/replica_init.py` — replica-side source materialisation
+- `bioengine/_app/cache.py` — `PipelineCache` + `bioengine.cache` module (`@bioengine.cached` backend)
+- `bioengine/_app/decorators.py` — `@bioengine.app` / `@bioengine.method` / `@bioengine.cached` / lifecycle hooks + `_scan_class`
 - `apps/demo-app/` — reference single-deployment app (keep at version 1.0.0)
 - `apps/composition-demo/` — reference multi-deployment app (keep at version 1.0.0)
 - `apps/model-runner/` — production model-runner
@@ -169,6 +171,43 @@ The CLI runs the same validator the worker uses — legacy manifests fail fast w
 | `single-machine` | Local Ray cluster (dev, small-scale) |
 | `external-cluster` | Connect to existing Ray cluster (e.g. KubeRay) |
 | `slurm` | Auto-scaling via SLURM job scheduler (HPC) |
+
+## Production deployments (external-cluster mode) — example targets
+
+**Production BioEngine only runs in external-cluster mode.** The active production deployments as of `0.11.22` are on KTH (SciLifeLab 2) and deNBI. The `bioimage.io` UI pins its canonical worker to KTH. NOT every maintainer will have credentials to these clusters — the notes below describe the shape so a maintainer with access can act, and let a maintainer without access hand off cleanly.
+
+Different maintainers may run production on entirely different clusters — the pattern (KubeRay + helm chart with `values.yaml` `image.tag` + startup-application pins) is what generalizes; the specific repos below are the current KTH/deNBI examples.
+
+| Target | Compute backend | Worker service ID pattern | Helm chart | Notes |
+|---|---|---|---|---|
+| **KTH (SciLifeLab 2 K8s)** | KubeRay on `scilifelab-2-dev` cluster, `hypha` namespace + `ray-cluster` namespace | `bioimage-io/bioengine-worker-kth-<hash>:bioengine-worker` | `aicell-lab/kth-k8s` repo, chart at `bioengine-worker/`. `values.yaml` `image.tag` + startup-app pins; `Chart.yaml` `appVersion` mirrors the bioengine version. `helm upgrade bioengine-worker-kth <chart> -f values.yaml -n hypha` | Split PVCs (hypha `bioengine-pvc` 10 GiB, ray-cluster `bioengine-pvc` 500 GiB Trident RWX NFS) — Entry↔Runtime can share HOME cross-node. **Canonical production endpoint the bioimage.io UI pins to `bioimage-io/bioengine-worker-kth-*:bioengine-worker`** — flip only when necessary. |
+| **deNBI cloud K8s + Ray** | deNBI K8s | `bioimage-io/bioengine-worker-denbi-<hash>:bioengine-worker` | `denbi-k8s` repo (NOT `aicell-lab/kth-k8s`). Uses the **startup-application** mechanism — apps are pinned in `values.yaml` and cycled with the worker. `helm upgrade -f values.yaml` is REQUIRED (a plain `helm upgrade` silently reuses stored user-supplied values and drops the new pins) | Manila NFS RWX for HOME — Entry↔Runtime env sharing works cross-node. If the maintainer doesn't own `denbi-k8s`, the change is a coordination task: describe the values.yaml bump (image tag + startup-app version) and hand off. |
+
+**Coordinated framework + app upgrades.** A bioengine version bump that changes app-facing API (0.11.22's rename `@bioengine.multiplexed → @bioengine.cached` was one) requires a matching app version bump landing at the same helm upgrade. On a single-commit helm upgrade the worker pod cycles → boots the new worker image → deploys the new app version → all in one atomic hop. Bumping the worker image alone would boot on 0.11.22 and immediately `AttributeError` while trying to deploy an app that still uses the removed API. The clean-break style used in 0.11.22 (no deprecation shim) makes this coordination mandatory rather than merely advisable.
+
+## Other deployment modes — dev and HPC examples
+
+Beyond the production external-cluster deployments, the other two supported modes each have their own workflow. Concrete targets vary per maintainer — the examples below happen to be the current maintainer's setup.
+
+- **`single-machine` mode** — local Ray cluster on a workstation. Used for dev validation of the `ray.init(...)` path (different code path from KubeRay-mode; regressions in one won't necessarily show in the other). Launch with `python -m bioengine.worker --mode single-machine` or via docker-compose. Example: the current maintainer runs this on a machine called Europa; other maintainers will have their own dev box.
+- **`slurm` mode** — on-demand worker per SLURM job on an HPC cluster, launched via apptainer. The bioengine version is picked up from `bioengine[worker]==<version>` in the job's env at submission time — no persistent helm, no active push required for framework bumps. Watch out for cluster-specific apptainer gotchas: e.g. `apptainer build sif` may fail on newer apptainer versions with `yama.ptrace_scope=2` — `apptainer build --sandbox` is the workaround (and the `start_hpc_worker.sh` script accepts sandbox dirs from 0.9.8+). Example: the current maintainer runs this on NSC's Berzelius (A100-SXM4-80GB); other maintainers will have their own HPC.
+
+## Framework model cache (`bioengine._app.cache`)
+
+`@bioengine.cached(max_models=N)` is the user-facing decorator; the details are in the sibling user-facing skill. This section describes the internals a maintainer needs when touching the code.
+
+**What lives where:**
+- `bioengine/_app/cache.py` — `PipelineCache` class + module-level helpers (`evict_all_models`, `evict_lru_model`, `evict_model`, `cached_model_ids`) + `_release_gpu_caches` (the `gc.collect()` + optional `torch.cuda.empty_cache()`).
+- `bioengine/_app/decorators.py::cached` — the decorator marker. `_scan_class` collects `"cached"`-marked methods into `lifecycle["cached"]`; `@bioengine.app` wraps each with `_make_cached_wrapper` which lazy-instantiates the cache on first call.
+- Cache lives on the deployment instance at `self._bioengine_caches: Dict[str, PipelineCache]` — one entry per decorated method, keyed by method name.
+
+**Key invariants (regressions to look out for):**
+- Every eviction path must call `_release_gpu_caches` **inside** the `asyncio.Lock`. If it's called after releasing the lock, a concurrent `get_or_load` sees a torch pool still holding the evicted VRAM and allocates on top — pynvml reports growth. Tests in `tests/_app/test_cache.py` mock `_release_gpu_caches` to assert it fires exactly once per eviction.
+- `_release_gpu_caches` runs `gc.collect()` before `torch.cuda.empty_cache()`. Python may still hold refs via frames / weak refs / `__del__` closures; skipping the GC leaves the allocator's blocks unavailable to be returned.
+- `torch` is imported inside the try — the framework does not hard-require torch. Apps without GPU/torch skip the empty_cache but still get correct cache semantics.
+- `bioengine/_app/cache.py` MUST stay importable with just `bioengine[worker]` + stdlib (no torch, no numpy imports at module top). The introspection Ray task loads any module that touches `@bioengine.app` in a clean baseline `runtime_env`.
+
+**What the refactor replaced (context for git-archaeology).** Before 0.11.22 `@bioengine.multiplexed` forwarded to `ray.serve.multiplexed(max_num_models_per_replica=N)` and `bioengine.multiplex.*` reached into Ray's private `__serve_multiplex_wrapper.unload_model_lru` for manual eviction. That path dropped Python refs but did not call `torch.cuda.empty_cache()` — pipelines evicted from the cache left ~200 MB of VRAM stuck per model, observable via `pynvml` and accumulating across sequential test calls (~626 MB pinned indefinitely on the model-runner in a common 3-model test scenario). The clean break (no shim) means older apps must migrate their decorator + module names before their worker upgrades.
 
 ## Worker service API
 
