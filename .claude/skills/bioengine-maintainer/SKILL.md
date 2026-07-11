@@ -255,6 +255,41 @@ curl -X DELETE -H "Authorization: Bearer $GITHUB_PAT" \
 
 Don't blanket-delete: dev tags + `:latest` move-tags are intentional. Only purge what you explicitly created.
 
+## Dev app testing workflow
+
+For app-side changes (anything under `apps/<name>/**` that changes the deployment's API surface or behaviour — e.g. a new method signature, changed return shape, a new dependency), validate on a live cluster by running the dev version SIDE-BY-SIDE with production, not by replacing it. The pattern:
+
+1. **One artifact, many versions.** `bioimage-io/<app>` holds every version the artifact has ever shipped. `worker.upload_app` appends a new committed version to the same artifact — it does not create a separate artifact per version. Never make a `bioimage-io/<app>-v2` or `bioimage-io/<app>-dev` artifact; that fragments history and breaks the version-comparison stories consumers rely on.
+
+2. **Distinct application_id for the dev deployment.** `application_id` is a *deployment* identity (Ray Serve service name + Hypha service alias), not an artifact identity. Production keeps `application_id="<app>"` pinned to the current released version. The dev deployment uses a distinct id — the canonical name is `application_id="<app>-dev"` — pinned to the new version. Both come from the same artifact.
+
+   ```python
+   # Production — pinned via the startup-app list in kth-k8s / denbi-k8s
+   # values.yaml. Untouched during dev.
+   {"artifact_id": "bioimage-io/model-runner",
+    "application_id": "model-runner", "version": "1.14.0", ...}
+
+   # Dev — deployed manually, side-by-side, same artifact, new version
+   await worker.deploy_app(
+       artifact_id="bioimage-io/model-runner",
+       application_id="model-runner-dev",   # ← distinct
+       version="1.15.0",                    # ← new
+       hypha_token=os.environ["BIOIMAGE_IO_TOKEN"],
+   )
+   ```
+
+3. **Registration.** The dev app registers as `bioimage-io/<app>-dev` on Hypha. Consumers that call `bioimage-io/<app>` stay on the production version until you promote. Iterate against `bioimage-io/<app>-dev` directly.
+
+4. **Iteration is a fresh upload + redeploy.** For each dev iteration bump the `apps/<app>/manifest.yaml` version (the artifact rejects re-uploading the same version), `worker.upload_app` again, then `worker.deploy_app(artifact_id, application_id="<app>-dev", version=<new>)`. The application_id is stable across iterations, so `deploy_app` updates the existing dev deployment in place rather than spawning a new random-name instance (see the `application_id ≠ artifact_id` warning in CLAUDE.md).
+
+5. **Promoting to production.** When the dev version is validated:
+   - Bump the pin in `kth-k8s/bioengine-worker/values.yaml` (and `denbi-k8s/…/values.yaml`) to the new version. Commit + `helm upgrade -f values.yaml`. Per `model_runner_kth_denbi_sync.md` these two sites must ship in the same session.
+   - After the production restart picks up the new version, `worker.stop_app(application_id="<app>-dev")` to reclaim cluster resources. The dev version stays in the artifact history — do NOT delete versions off the artifact.
+
+6. **Cleanup on abandon.** If the dev version is abandoned rather than promoted, still `worker.stop_app("<app>-dev")` to free the replica slot. Leave the version on the artifact; artifact-version deletes rewrite history and break consumers of `worker.list_apps(...).artifact_versions`.
+
+Compare with the worker-side dev image workflow above: that pattern varies the **image tag** (`0.11.5-dev1`), this pattern varies the **application_id** (`<app>-dev`). Both let you drive a live-cluster smoke test without disturbing the running production surface, at different layers of the stack.
+
 ## Cleanup rules
 
 ### Test deployments
