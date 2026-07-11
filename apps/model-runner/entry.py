@@ -117,6 +117,20 @@ class EntryApp:
     _TEST_REPORTS_WORKSPACE = "bioimage-io"
     _TEST_REPORTS_COLLECTION = "bioimage-io/test-reports"
 
+    # Async infer-request registry TTL — how long a completed/failed
+    # infer job stays in memory after completion before being swept.
+    # Also bounds how long the on-disk request dir survives if the
+    # caller never polls after the runtime completes.
+    _INFER_JOBS_TTL_SEC = 3600
+
+    # Per-request scratch on the app's shared PVC-backed HOME. EntryApp
+    # writes ``input/<key>.npy`` here on ``infer()`` receipt so large
+    # images don't sit in RAM through the queue+download wait; RuntimeApp
+    # reads inputs from the same directory, deletes them, writes outputs
+    # to ``output/<key>.npy``, and records state timestamps in
+    # ``state.json``. Kept in sync with ``RuntimeApp._INFERENCE_DIR_NAME``.
+    _INFERENCE_DIR_NAME = ".model-runner-inference"
+
     def __init__(
         self,
         runtime: RuntimeApp,
@@ -157,12 +171,23 @@ class EntryApp:
 
         # Async test-run registry. Every ``test()`` call schedules a
         # background job keyed by an opaque run id (``tj-<hex12>``);
-        # values track state, metadata, and an asyncio.Future that
-        # resolves on completion. Purely in-memory per replica; runs
-        # from a killed replica just disappear and ``get_test_status``
-        # raises KeyError for them.
+        # values track state, step timestamps and (on completion) the
+        # test report. Purely in-memory per replica; runs from a killed
+        # replica just disappear and ``get_test_status`` raises
+        # KeyError for them.
         self._test_jobs: Dict[str, dict] = {}
         self._test_jobs_ttl_sec: int = 24 * 3600
+
+        # Async infer-request registry — same shape as ``_test_jobs``.
+        # Keyed by opaque request id (``ij-<hex12>``); each value
+        # tracks state, step timestamps and (once completed) the
+        # in-memory result cached after its first successful poll. Also
+        # per-replica in-memory; a restart drops everything and orphan
+        # on-disk request dirs are swept in ``_async_init``.
+        self._infer_jobs: Dict[str, dict] = {}
+        # Filled in ``_async_init`` — HOME isn't guaranteed to be the
+        # final PVC path until then.
+        self._inference_dir: Optional[Path] = None
         # Per-report-artifact locks serialize concurrent uploads to the
         # same ``test-report-<model>`` artifact (a published and a staged
         # test of one model would otherwise race on its single staging area).
@@ -207,6 +232,28 @@ class EntryApp:
         )
         self.s3_controller = await self.hypha_client.get_service("public/s3-storage")
         logger.info(f"Connected to Hypha Server at {self.server_url}")
+
+        # Per-request scratch directory on the shared PVC. On a fresh
+        # replica life the in-memory registry is empty, so any lingering
+        # request dirs belong to a previous replica and are safe to
+        # reap (their in-memory job records went away with the replica).
+        self._inference_dir = Path(os.environ["HOME"]) / self._INFERENCE_DIR_NAME
+        self._inference_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            leftovers = await asyncio.to_thread(
+                lambda: [p for p in self._inference_dir.iterdir() if p.is_dir()]
+            )
+        except FileNotFoundError:
+            leftovers = []
+        for leftover in leftovers:
+            await asyncio.to_thread(
+                shutil.rmtree, str(leftover), ignore_errors=True
+            )
+        if leftovers:
+            logger.info(
+                f"🧹 Cleaned {len(leftovers)} stale inference request dir(s) "
+                f"from a previous replica."
+            )
 
         # Reports are published under the app's own token. Publishing
         # requires that token to carry at least read-write scope on the
@@ -575,12 +622,21 @@ class EntryApp:
             "job_id": job_id,
             "model_id": model_id,
             "custom_environment": custom_environment,
+            # Step timestamps surfaced through the shared progress
+            # schema. ``env_setup_ts`` only ever fires when
+            # ``custom_environment=True``. The other two fire for every
+            # run. ``model_download_ts`` is collapsed back to None in
+            # ``_execute_test`` when the cache was already up-to-date.
+            "model_download_ts": None,
+            "env_setup_ts": None,
+            "running_ts": None,
             "state": "queued",
             "started_at": now,
-            "updated_at": now,
             "completed_at": None,
+            # For a test run this holds the full test report on
+            # success, ``{"error": str}`` on failure, or None while
+            # still running.
             "result": None,
-            "error": None,
         }
         self._test_jobs[job_id] = job
         return job
@@ -591,29 +647,50 @@ class EntryApp:
         *,
         state: Optional[str] = None,
         result: Optional[dict] = None,
-        error: Optional[str] = None,
     ) -> None:
-        """Idempotent state update. Sets ``completed_at`` on terminal states."""
+        """Idempotent state update. Stamps the matching step timestamp
+        when transitioning into ``model_download`` / ``env_setup`` /
+        ``running`` and records ``completed_at`` on terminal states.
+        """
         if state is not None:
             job["state"] = state
+            now = time.time()
+            if state == "model_download" and job["model_download_ts"] is None:
+                job["model_download_ts"] = now
+            elif state == "env_setup" and job["env_setup_ts"] is None:
+                job["env_setup_ts"] = now
+            elif state == "running" and job["running_ts"] is None:
+                job["running_ts"] = now
+            if state in ("completed", "failed"):
+                job["completed_at"] = now
         if result is not None:
             job["result"] = result
-        if error is not None:
-            job["error"] = error
-        job["updated_at"] = time.time()
-        if state in ("completed", "failed"):
-            job["completed_at"] = job["updated_at"]
 
     def _job_progress(self, job: dict) -> dict:
-        """Build the ``progress`` sub-dict describing the current step of a
-        test run. Excludes the report itself — callers read ``test_report``
-        alongside it.
+        """Return the 5-key progress dict for a test run.
+
+        Schema is shared with ``_infer_job_progress`` so both endpoints
+        speak the same shape:
+
+        * ``queue_position`` — 0 while running or terminal; N when
+          N-th in the entry-side queue behind the conda env-build
+          lock. Only ``custom_environment=True`` runs actually queue;
+          non-custom test runs are dispatched immediately.
+        * ``model_download`` — unix ts when download started, or None
+          when the cache was already up to date.
+        * ``env_setup`` — unix ts when conda-env prebuild started, or
+          None on non-custom-env runs.
+        * ``running`` — unix ts when ``runtime.test`` was invoked.
+        * ``result`` — the test report on success, ``{"error": str}``
+          on failure, else None.
         """
-        now = time.time()
         state = job["state"]
         queue_position = 0
         if job["custom_environment"] and state in ("queued", "env_setup"):
-            queue_position = sum(
+            # 1-based rank: the currently running custom-env test has
+            # queue_position=0 (state != queued/env_setup — running),
+            # so the next in line is 1, and so on.
+            queue_position = 1 + sum(
                 1
                 for other in self._test_jobs.values()
                 if other is not job
@@ -621,19 +698,174 @@ class EntryApp:
                 and other["state"] in ("queued", "env_setup")
                 and other["started_at"] < job["started_at"]
             )
-        completed_at = job["completed_at"]
-        elapsed_end = completed_at if completed_at is not None else now
         return {
-            "test_run_id": job["job_id"],
-            "model_id": job["model_id"],
-            "custom_environment": job["custom_environment"],
-            "state": state,
             "queue_position": queue_position,
-            "started_at": job["started_at"],
-            "updated_at": job["updated_at"],
-            "completed_at": completed_at,
-            "elapsed_seconds": round(elapsed_end - job["started_at"], 2),
-            "error": job["error"],
+            "model_download": job["model_download_ts"],
+            "env_setup": job["env_setup_ts"],
+            "running": job["running_ts"],
+            "result": job["result"],
+        }
+
+    # === Async infer-job registry ===
+
+    def _sweep_expired_infer_jobs(self) -> None:
+        """Drop finished infer jobs older than ``_INFER_JOBS_TTL_SEC``
+        AND clean up any lingering on-disk request dir. Runs
+        opportunistically on each new job creation.
+        """
+        now = time.time()
+        expired = [
+            rid
+            for rid, j in self._infer_jobs.items()
+            if j.get("completed_at") is not None
+            and (now - j["completed_at"]) > self._INFER_JOBS_TTL_SEC
+        ]
+        for rid in expired:
+            self._infer_jobs.pop(rid, None)
+            if self._inference_dir is not None:
+                request_dir = self._inference_dir / rid
+                try:
+                    shutil.rmtree(request_dir, ignore_errors=True)
+                except OSError:
+                    pass
+
+    def _new_infer_job(
+        self, model_id: str, return_download_url: bool
+    ) -> dict:
+        """Create an infer-job record and return it. Sweeps expired
+        jobs on the way in.
+        """
+        self._sweep_expired_infer_jobs()
+        request_id = f"ij-{uuid.uuid4().hex[:12]}"
+        now = time.time()
+        job = {
+            "job_id": request_id,
+            "model_id": model_id,
+            "return_download_url": return_download_url,
+            # Step timestamps that surface in the progress dict.
+            # ``env_setup`` is never populated for infer (no per-model
+            # env prebuild on the infer path) but is kept in the schema
+            # for symmetry with test.
+            "model_download_ts": None,
+            "env_setup_ts": None,
+            "running_ts": None,
+            "state": "queued",
+            "started_at": now,
+            "completed_at": None,
+            # Holds the inference result dict on success or
+            # ``{"error": str}`` on failure. Materialized from disk on
+            # the FIRST successful poll after completion; subsequent
+            # polls read this cached value until the job TTL sweeps it.
+            "result": None,
+            # Only meaningful once ``state == "completed"``: True once
+            # the first poll has read the outputs off disk and deleted
+            # the request dir. Guards against re-reading a deleted dir.
+            "_result_materialized": False,
+        }
+        self._infer_jobs[request_id] = job
+        return job
+
+    def _update_infer_job(
+        self,
+        job: dict,
+        *,
+        state: Optional[str] = None,
+        result: Optional[dict] = None,
+    ) -> None:
+        """Idempotent state update for infer jobs — same semantics as
+        ``_update_test_job`` (auto-stamp step timestamps, set
+        ``completed_at`` on terminal states).
+        """
+        if state is not None:
+            job["state"] = state
+            now = time.time()
+            if state == "model_download" and job["model_download_ts"] is None:
+                job["model_download_ts"] = now
+            elif state == "running" and job["running_ts"] is None:
+                job["running_ts"] = now
+            if state in ("completed", "failed"):
+                job["completed_at"] = now
+        if result is not None:
+            job["result"] = result
+
+    def _read_runtime_state_file(self, request_id: str) -> Optional[dict]:
+        """Read ``<request_id>/state.json`` and return the parsed dict,
+        or None if the file doesn't exist yet.
+
+        Runtime writes ``state.json`` twice: once with just
+        ``runtime_started_at`` right after it acquires ``_gpu_lock``,
+        then again with both start and completion timestamps after the
+        outputs are written. Entry uses this to distinguish "still
+        queued at runtime" from "actively running" when computing
+        ``queue_position``.
+        """
+        if self._inference_dir is None:
+            return None
+        state_file = self._inference_dir / request_id / "state.json"
+        try:
+            content = state_file.read_text()
+        except (FileNotFoundError, IsADirectoryError):
+            return None
+        except OSError as e:
+            logger.debug(f"Could not read state.json for {request_id}: {e}")
+            return None
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            # Runtime writes atomically via rename, so a torn read is
+            # only possible between .tmp creation and rename. Treat as
+            # "not ready yet" — next poll will succeed.
+            return None
+
+    def _infer_job_progress(self, job: dict) -> dict:
+        """Return the 5-key progress dict for an infer request.
+
+        Same schema as ``_job_progress`` (test); ``env_setup`` is
+        always None on the infer path since there's no per-model
+        environment prebuild.
+        """
+        # Lazy-fill ``running_ts`` from ``state.json`` on the shared
+        # PVC. Once the runtime has acquired ``_gpu_lock`` for this
+        # request it writes ``runtime_started_at`` — the entry treats
+        # that moment as the true "start of GPU work" so the reported
+        # ``running`` ts reflects when the request actually left the
+        # runtime-side queue.
+        if job["running_ts"] is None and job["state"] not in (
+            "queued",
+            "model_download",
+            "completed",
+            "failed",
+        ):
+            state_file = self._read_runtime_state_file(job["job_id"])
+            if state_file and "runtime_started_at" in state_file:
+                job["running_ts"] = float(state_file["runtime_started_at"])
+
+        # Queue position — 1-based rank among jobs that haven't yet had
+        # ``runtime_started_at`` (equivalently: still queued at entry
+        # or at runtime). A job with a running timestamp OR in a
+        # terminal state has position 0.
+        is_pending = (
+            job["state"] not in ("completed", "failed")
+            and job["running_ts"] is None
+        )
+        if is_pending:
+            queue_position = 1 + sum(
+                1
+                for other in self._infer_jobs.values()
+                if other is not job
+                and other["state"] not in ("completed", "failed")
+                and other["running_ts"] is None
+                and other["started_at"] < job["started_at"]
+            )
+        else:
+            queue_position = 0
+
+        return {
+            "queue_position": queue_position,
+            "model_download": job["model_download_ts"],
+            "env_setup": job["env_setup_ts"],  # always None on the infer path
+            "running": job["running_ts"],
+            "result": job["result"],
         }
 
     # === Conda env name computation (matches bioimageio.core) ===
@@ -684,6 +916,37 @@ class EntryApp:
         return env_name, encoded
 
     # === Conda env pre-creation for custom_environment tests ===
+
+    @staticmethod
+    def _model_declares_custom_env(rdf_path: str) -> bool:
+        """True iff any weight-format entry carries an explicit
+        ``dependencies.source`` (an authored ``environment.yaml`` bundled
+        with the model).
+
+        When False, ``bioimageio.spec.get_conda_env`` builds a
+        framework-default env from the framework name alone. Those
+        defaults are frequently unsolvable in practice — the classic
+        example is ``pytorch_state_dict`` without deps, where
+        ``mkl==2024.*`` is pinned against ``pytorch<1.14`` which
+        requires ``mkl<2023``. ``_execute_test`` uses this to force
+        ``custom_environment=False`` silently rather than surfacing a
+        confusing mamba-solve failure to the caller.
+        """
+        try:
+            with open(rdf_path, "r") as f:
+                rdf = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError):
+            return False
+        weights = (rdf or {}).get("weights") or {}
+        if not isinstance(weights, dict):
+            return False
+        for wf in weights.values():
+            if not isinstance(wf, dict):
+                continue
+            deps = wf.get("dependencies")
+            if isinstance(deps, dict) and deps.get("source"):
+                return True
+        return False
 
     async def _prebuild_conda_envs(self, rdf_path: str, model_id: str) -> None:
         """CPU-side, non-blocking pre-creation of every conda env the
@@ -1229,12 +1492,15 @@ class EntryApp:
 
         Testing (``bioimageio.core.test_description``) runs as a background
         job. This call returns right away with just the ``test_run_id``
-        string; poll ``get_test_status(test_run_id)`` for the current step
-        and, once the run finishes, the full report::
+        string; poll ``get_test_status(test_run_id)`` for the shared
+        5-key progress dict and, once the run finishes, the full report
+        in ``result``::
 
             "tj-…"  # the returned test_run_id
             # then poll get_test_status(test_run_id) →
-            # {"progress": {"state": "completed", ...}, "test_report": {...}}
+            # {"queue_position": 0, "model_download": 1735689600.0,
+            #  "env_setup": None, "running": 1735689630.0,
+            #  "result": {...test_report...}}
 
         Caching behavior:
         - Cached test reports are locally stored at ``<model_package>/.test_cache.json``.
@@ -1286,7 +1552,12 @@ class EntryApp:
                 logger.error(
                     f"❌ Test run {job['job_id']} for '{model_id}' failed: {exc}"
                 )
-                self._update_test_job(job, state="failed", error=str(exc))
+                # Failure surfaces via ``result = {"error": ...}`` so the
+                # progress dict shape stays uniform across success and
+                # failure (no separate ``error`` field).
+                self._update_test_job(
+                    job, state="failed", result={"error": str(exc)}
+                )
 
         asyncio.create_task(_bg_execute())
         return job["job_id"]
@@ -1322,6 +1593,32 @@ class EntryApp:
             allow_unpublished=True,
             skip_cache=skip_cache,
         )
+        # Collapse the ``model_download`` timestamp to None on a cache
+        # hit so the progress dict reports "no download happened" per
+        # the shared schema. If files were fetched (or another replica
+        # was fetching and we waited on it), keep the ts we stamped
+        # above.
+        if not package.newly_downloaded:
+            job["model_download_ts"] = None
+
+        # Silent fallback: models that declare no custom env yaml (no
+        # ``dependencies.source`` on any weight format) get an
+        # auto-generated framework-default env from bioimageio.spec
+        # which is often unsolvable (mkl↔old-pytorch conflict on
+        # pytorch_state_dict, etc.). Treat ``custom_environment=True``
+        # as a no-op in that case rather than surfacing a mamba solver
+        # error. Update the job flag too so the queue_position math
+        # matches actual behaviour (only real custom-env runs queue).
+        if custom_environment and not await asyncio.to_thread(
+            self._model_declares_custom_env, package.source
+        ):
+            logger.info(
+                f"🔁 '{model_id}' has no environment.yaml on any weight "
+                f"format — falling back to standard environment "
+                f"(custom_environment ignored)."
+            )
+            custom_environment = False
+            job["custom_environment"] = False
 
         # Use context manager to track access and prevent eviction during test
         async with package:
@@ -1614,27 +1911,24 @@ class EntryApp:
             ...,
             description="Run id returned by ``test()``.",
         ),
-    ) -> Dict[str, Union[dict, None]]:
-        """Return the progress and (when finished) the report of a test run.
+    ) -> Dict[str, Union[int, float, dict, None]]:
+        """Return the shared 5-key progress dict for a test run.
 
-        Response shape::
+        Response shape (same schema as ``get_infer_status``)::
 
-            {"progress": {...}, "test_report": {...} | null}
-
-        ``progress`` carries ``test_run_id``, ``model_id``,
-        ``custom_environment``, ``state`` (one of ``queued``,
-        ``model_download``, ``env_setup``, ``running``, ``completed``,
-        ``failed``), ``queue_position`` (custom-env runs still waiting on the
-        env-build lock), ``started_at`` / ``updated_at`` / ``completed_at``,
-        ``elapsed_seconds``, and ``error`` (set when ``state=failed``).
-
-        ``test_report`` is the full report dict once ``state=completed`` and
-        ``null`` before that (also ``null`` on ``failed`` — read
-        ``progress.error``).
+            {
+              "queue_position": int,          # 0 while running or terminal
+              "model_download": float | None, # ts when download started, None on cache hit
+              "env_setup":      float | None, # ts (custom-env runs only)
+              "running":        float | None, # ts when runtime.test was called
+              "result":         dict | None,  # test report on success,
+                                              # {"error": str} on failure
+            }
 
         Runs are held for 24 hours after completion, then dropped. The
-        registry is per-Entry replica and in-memory — a run started on one
-        replica is unknown to others, and replica restarts drop everything.
+        registry is per-Entry replica and in-memory — a run started on
+        one replica is unknown to others, and replica restarts drop
+        everything.
         """
         job = self._test_jobs.get(test_run_id)
         if job is None:
@@ -1643,10 +1937,7 @@ class EntryApp:
                 f"Entry replica and expire 24 hours after completion. Start a "
                 f"fresh run via test()."
             )
-        return {
-            "progress": self._job_progress(job),
-            "test_report": job["result"],
-        }
+        return self._job_progress(job)
 
     @bioengine.method
     async def get_upload_url(
@@ -1734,91 +2025,299 @@ class EntryApp:
             False,
             description="If True, each array in the output will be saved to a temporary .npy file in S3 and the output value will be a presigned download URL (str) instead of the raw np.ndarray. The URL is valid for 1 hour.",
         ),
-    ) -> Dict[str, Union[np.ndarray, str]]:
+    ) -> str:
         """
-        Execute inference on a bioimage.io model with provided input data.
+        Submit an inference request and return a ``request_id`` immediately.
 
-        Performs end-to-end inference including:
-        - Automatic input preprocessing according to model specification
-        - Model execution with optimized framework backend
-        - Output postprocessing and format standardization
-        - Memory-efficient processing for large inputs using tiling if supported
+        The call resolves URL / S3-path inputs to numpy arrays, spills
+        them to disk under ``$HOME/.model-runner-inference/<request_id>/input/``
+        so large images don't sit in RAM during the queue+download
+        wait, then schedules the model download + GPU work as a
+        background job and returns::
 
-        Returns:
-            Dictionary mapping output names to inference results. By default each value is a
-            ``np.ndarray`` whose shape and data type match the model's output specification
-            (e.g. ``{"output": result_array}``). When ``return_download_url=True``, each value
-            is instead a presigned S3 download URL (``str``) pointing to the result serialised
-            as a ``.npy`` file; the URL is valid for 1 hour.
+            "ij-…"  # the returned request_id
+
+        Poll ``get_infer_status(request_id)`` for the shared 5-key
+        progress dict::
+
+            {"queue_position": 3, "model_download": None,
+             "env_setup": None, "running": None, "result": None}
+
+        Once ``result`` is populated, the outputs are read off disk on
+        that first poll and the request dir is deleted; subsequent
+        polls return the cached result. Jobs are held for 1 hour after
+        completion, then swept.
+
+        When ``return_download_url=True`` the ``result`` maps output
+        keys to presigned S3 URLs instead of raw arrays; the S3 upload
+        happens on the poll that materialises the result.
 
         Raises:
-            ValueError: If model_id is a URL (only model IDs allowed) or inputs don't match specification
-            FileNotFoundError: If a URL or temporary file path is provided but the resource does not exist or has expired
-            RuntimeError: If model loading, preprocessing, inference, or postprocessing fails
-
-        Note:
-            Only published models from the bioimage.io model zoo are supported for inference.
-            This method delegates to the model_inference deployment for optimized execution.
-            String inputs are resolved via ``_load_image_from_source``: direct HTTP/HTTPS URLs are
-            fetched as-is; all other strings are treated as temporary S3 file paths and resolved
-            through BioEngine S3 storage. To upload large inputs, first call ``get_upload_url``
-            to obtain a presigned URL, upload the file, then pass the returned ``file_path`` as ``inputs``.
+            ValueError: if ``model_id`` is a URL, or the resolved
+                inputs are empty / not decodeable.
+            FileNotFoundError: if a URL / temporary file path is
+                provided but the resource does not exist or has expired.
+            RuntimeError: if the runtime deployment is not available.
         """
-        from ray.exceptions import RayTaskError
-
         await self._check_runtime_available()
-        logger.info(f"🤖 Running inference for model '{model_id}'...")
+        logger.info(f"🤖 Queuing inference for model '{model_id}'...")
 
-        # Resolve any URL or temporary file path strings to numpy arrays
+        # Resolve any URL or temporary file path strings to numpy
+        # arrays BEFORE handing off — matches the user's spec ("save
+        # the image the moment it's received") and surfaces broken
+        # URLs to the caller synchronously instead of hiding them in
+        # the background task.
         if isinstance(inputs, str):
             inputs = await self._load_image_from_source(inputs)
         elif isinstance(inputs, dict):
             resolved: Dict[str, np.ndarray] = {}
             for key, value in inputs.items():
                 if isinstance(value, str):
-                    array = await self._load_image_from_source(value)
-                    resolved[key] = array
+                    resolved[key] = await self._load_image_from_source(value)
                 else:
                     resolved[key] = value
             inputs = resolved
 
+        # Normalize to Dict[str, np.ndarray] so the on-disk layout has
+        # one file per input key. A bare ndarray becomes {"input": arr}
+        # which matches the bioimageio.core default when models expose
+        # a single input tensor.
+        if isinstance(inputs, np.ndarray):
+            inputs = {"input": inputs}
+        if not isinstance(inputs, dict) or not inputs:
+            raise ValueError(
+                "``inputs`` must resolve to a non-empty dict of numpy arrays."
+            )
+        for key, value in inputs.items():
+            if not isinstance(value, np.ndarray):
+                raise ValueError(
+                    f"Input {key!r} did not resolve to a numpy array (got "
+                    f"{type(value).__name__})."
+                )
+
+        job = self._new_infer_job(
+            model_id=model_id, return_download_url=bool(return_download_url)
+        )
+        request_id = job["job_id"]
+        request_dir = self._inference_dir / request_id
+        input_dir = request_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write inputs as uncompressed .npy — spec is speed over disk
+        # space. ``np.save`` writes atomically (single ``open`` +
+        # ``write``), and the runtime only touches this dir after we
+        # dispatch, so no partial-read race.
+        def _save_inputs() -> None:
+            for key, arr in inputs.items():
+                np.save(str(input_dir / f"{key}.npy"), arr)
+
+        await asyncio.to_thread(_save_inputs)
+        logger.info(
+            f"💾 Staged {len(inputs)} input tensor(s) for request "
+            f"{request_id!r} at {input_dir}"
+        )
+
+        # Kick off the background task. Any exception it raises is
+        # captured onto the job record — never propagates up through
+        # the asyncio task's default exception handler.
+        asyncio.create_task(
+            self._execute_infer(
+                job=job,
+                model_id=model_id,
+                weights_format=weights_format,
+                device=device,
+                default_blocksize_parameter=default_blocksize_parameter,
+                sample_id=sample_id,
+                skip_cache=skip_cache,
+            )
+        )
+        return request_id
+
+    async def _execute_infer(
+        self,
+        job: dict,
+        model_id: str,
+        weights_format: Optional[str],
+        device: Optional[Literal["cuda", "cpu"]],
+        default_blocksize_parameter: Optional[int],
+        sample_id: Optional[str],
+        skip_cache: Optional[bool],
+    ) -> None:
+        """Background inference driver — model download → runtime dispatch.
+
+        Mirrors ``_execute_test`` for the infer path. State transitions:
+
+        * ``queued`` → ``model_download`` (ts stamped)
+        * → ``running`` (entry timestamp — the true ``runtime_started_at``
+          is filled lazily on poll from ``state.json``)
+        * → ``completed`` on success (result NOT read here; the first
+          poll after completion reads outputs off disk)
+        * → ``failed`` on any exception; the on-disk request dir is
+          cleaned up so we don't leak files.
+        """
+        from ray.exceptions import RayTaskError
+
+        request_id = job["job_id"]
         try:
-            # Get model package with access tracking
+            self._update_infer_job(job, state="model_download")
             package = await self.model_cache.get_model_package(
                 model_id=model_id,
                 stage=False,
                 allow_unpublished=False,
                 skip_cache=skip_cache,
             )
+            # Cache hit → collapse the model_download timestamp back to
+            # None per the shared progress schema.
+            if not package.newly_downloaded:
+                job["model_download_ts"] = None
 
-            # Use context manager to track access and prevent eviction during inference
             async with package:
                 logger.info(
-                    f"📍 Model source for '{model_id}': {package.source} "
+                    f"📍 Model source for request {request_id!r}: "
+                    f"{package.source} "
                     f"(latest_remote_modified: {package.latest_remote_modified})"
                 )
-
-                result = await self.runtime.predict(
+                # Move to ``running`` before the RPC. The RPC itself
+                # may queue at the runtime router; the poll refines
+                # ``running_ts`` from the state.json marker.
+                self._update_infer_job(job, state="running")
+                await self.runtime.predict_from_disk(
+                    request_id=request_id,
                     rdf_path=package.source,
-                    inputs=inputs,
                     weights_format=weights_format,
                     device=device,
                     default_blocksize_parameter=default_blocksize_parameter,
                     sample_id=sample_id,
                     latest_remote_modified=package.latest_remote_modified,
                 )
-        except RayTaskError as e:
-            error_msg = f"Failed to run inference for model '{model_id}': {e}"
-            logger.error(f"❌ {error_msg}")
-            raise RuntimeError(error_msg)
 
-        if return_download_url:
-            new_result = {}
-            for key, value in result.items():
-                new_result[key] = await self._save_array_to_temp_file(value)
-            result = new_result
+            self._update_infer_job(job, state="completed")
+            logger.info(f"✅ Inference completed for request {request_id!r}.")
+        except Exception as exc:
+            # Wrap RayTaskError so the caller sees a plain RuntimeError
+            # (matches the sync-path error surface of the previous API).
+            if isinstance(exc, RayTaskError):
+                exc = RuntimeError(
+                    f"Runtime call failed for request {request_id!r}: {exc}"
+                )
+            logger.error(
+                f"❌ Infer run {request_id!r} for '{model_id}' failed: {exc}"
+            )
+            # Clean up any staged on-disk data — we don't want it
+            # sitting around after failure.
+            if self._inference_dir is not None:
+                await asyncio.to_thread(
+                    shutil.rmtree,
+                    str(self._inference_dir / request_id),
+                    ignore_errors=True,
+                )
+            self._update_infer_job(
+                job, state="failed", result={"error": str(exc)}
+            )
 
-        logger.info(f"✅ Inference completed for model '{model_id}'.")
-        return result
+    async def _materialize_infer_result(self, job: dict) -> None:
+        """Read outputs off disk, apply ``return_download_url`` conversion
+        if requested, cache the result on the job, and delete the
+        request dir. Called at most once per job — guarded by
+        ``job["_result_materialized"]``.
+        """
+        request_id = job["job_id"]
+        request_dir = self._inference_dir / request_id
+        output_dir = request_dir / "output"
+
+        def _load_outputs() -> Dict[str, np.ndarray]:
+            loaded: Dict[str, np.ndarray] = {}
+            if not output_dir.is_dir():
+                return loaded
+            for entry in sorted(output_dir.iterdir()):
+                if entry.is_file() and entry.suffix == ".npy":
+                    loaded[entry.stem] = np.load(str(entry))
+            return loaded
+
+        outputs = await asyncio.to_thread(_load_outputs)
+        if not outputs:
+            # Runtime completed the RPC without writing any output —
+            # surface as an error rather than an empty success.
+            job["result"] = {
+                "error": (
+                    f"Runtime returned no outputs for request {request_id!r}. "
+                    f"Expected .npy files under {output_dir}."
+                )
+            }
+            job["_result_materialized"] = True
+            await asyncio.to_thread(
+                shutil.rmtree, str(request_dir), ignore_errors=True
+            )
+            return
+
+        if job["return_download_url"]:
+            converted: Dict[str, str] = {}
+            for key, array in outputs.items():
+                converted[key] = await self._save_array_to_temp_file(array)
+            job["result"] = converted
+        else:
+            job["result"] = outputs
+
+        job["_result_materialized"] = True
+        # Free the disk immediately — user's spec: read the result,
+        # delete it from disk, return the result in the ``result`` key.
+        await asyncio.to_thread(
+            shutil.rmtree, str(request_dir), ignore_errors=True
+        )
+        logger.info(
+            f"📤 Materialized {len(outputs)} output(s) for request "
+            f"{request_id!r} and cleaned up on-disk data."
+        )
+
+    @bioengine.method
+    async def get_infer_status(
+        self,
+        request_id: str = Field(
+            ...,
+            description="Request id returned by ``infer()``.",
+        ),
+    ) -> Dict[str, Union[int, float, dict, None]]:
+        """Return the shared 5-key progress dict for an infer request.
+
+        Response shape (same schema as ``get_test_status``)::
+
+            {
+              "queue_position": int,          # 0 while running or terminal
+              "model_download": float | None, # ts when download started, None on cache hit
+              "env_setup":      float | None, # always None on the infer path
+              "running":        float | None, # ts when runtime acquired the GPU lock
+              "result":         dict | None,  # inference dict on success,
+                                              # {"error": str} on failure
+            }
+
+        On the FIRST poll after ``result`` becomes available the
+        outputs are read off ``<request_id>/output/*.npy``, converted
+        to presigned S3 URLs if ``return_download_url=True`` was set
+        on submit, cached in memory, and the request dir is deleted.
+        Subsequent polls return the cached result until the job TTL
+        (1 hour after completion) sweeps it.
+
+        Requests live in-memory per Entry replica and disappear on
+        replica restart. Unknown ids raise ``KeyError``.
+        """
+        job = self._infer_jobs.get(request_id)
+        if job is None:
+            raise KeyError(
+                f"Unknown request_id {request_id!r}. Requests live in-memory "
+                f"per Entry replica and expire {self._INFER_JOBS_TTL_SEC // 60} "
+                f"minutes after completion. Start a fresh request via infer()."
+            )
+
+        # Materialise the result on the first poll after completion —
+        # reading a completed job's outputs off disk exactly once, then
+        # holding them in memory. A ``failed`` state already has the
+        # error stored via ``_execute_infer``, so nothing to materialise.
+        if (
+            job["state"] == "completed"
+            and not job["_result_materialized"]
+        ):
+            await self._materialize_infer_result(job)
+
+        return self._infer_job_progress(job)
 
 

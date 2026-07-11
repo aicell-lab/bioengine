@@ -3,8 +3,11 @@
 The runtime is the GPU half of the model-runner app. ``EntryApp`` keeps a
 type-hint reference to ``RuntimeApp`` so the v0.6 composition graph wires
 them together; ``EntryApp`` then calls ``await self.runtime.ping()`` /
-``await self.runtime.predict(...)`` / ``await self.runtime.test(...)`` to
-delegate the heavy work.
+``await self.runtime.predict_from_disk(...)`` /
+``await self.runtime.test(...)`` to delegate the heavy work. Inputs and
+outputs for ``predict_from_disk`` stream through the shared PVC-backed
+inference dir instead of over the RPC, so large arrays don't sit in RAM
+while the request queues on ``_gpu_lock``.
 
 Module-level imports stay deliberately lightweight (just stdlib + bioengine
 + numpy + ray) so the introspection task can load this file with only the
@@ -15,10 +18,13 @@ inside method bodies.
 """
 
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
 
@@ -49,27 +55,57 @@ def _read_pip(name: str) -> List[str]:
     num_gpus=1,
     memory_mb=12 * 1024,
     pip=_read_pip("requirements-runtime.txt"),
-    max_ongoing_requests=1,
+    # ``max_ongoing_requests=10`` intentionally lets requests queue at
+    # the replica's asyncio queue behind ``_gpu_lock``. Ray Serve's
+    # autoscaler only counts ongoing requests that reached a replica
+    # (not those waiting at the router), so keeping this at 1 would
+    # hide backlog and never trigger scale-up. With 10 and the internal
+    # lock, the router forwards up to 10 concurrent RPCs per replica
+    # and the lock serialises GPU work — autoscaler observes queue
+    # depth. Precedent: apps/cell-image-search/main.py uses the same
+    # pattern with max_ongoing_requests=10 and target=3.
+    max_ongoing_requests=10,
     autoscaling_config={
         "min_replicas": 1,
         "initial_replicas": 1,
         "max_replicas": 2,
-        "target_num_ongoing_requests_per_replica": 0.8,
+        # Scale up when >3 ongoing per replica — with 1 replica and
+        # 4 ongoing (1 running + 3 queued behind the lock), metric
+        # 4/1 > 3 triggers a scale-up to 2. Then 4/2 = 2 ≤ 3 → stay.
+        "target_num_ongoing_requests_per_replica": 3.0,
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
-        "downscale_delay_s": 300,
+        # 10 min after the last scale-up condition clears before
+        # scaling down — avoids thrashing on bursty traffic.
+        "downscale_delay_s": 600,
         "upscale_delay_s": 0.0,
     },
     health_check_period_s=30.0,
     health_check_timeout_s=30.0,
-    graceful_shutdown_timeout_s=120.0,
+    # Bumped from 120s: with ``max_ongoing_requests=10`` a full backlog
+    # may need several minutes to drain through the lock-serialised
+    # GPU work before the replica exits cleanly.
+    graceful_shutdown_timeout_s=300.0,
     graceful_shutdown_wait_loop_s=2.0,
 )
 class RuntimeApp:
     """GPU-resident bioimage.io model executor."""
 
+    # Per-request scratch on the app's shared PVC-backed HOME. EntryApp
+    # writes ``input/<key>.npy`` here on ``infer()`` receipt; this app
+    # reads inputs from disk, deletes the input dir, writes outputs to
+    # ``output/<key>.npy``, and records step timestamps in
+    # ``state.json``. Kept in sync with ``EntryApp._INFERENCE_DIR_NAME``.
+    _INFERENCE_DIR_NAME = ".model-runner-inference"
+
     def __init__(self) -> None:
         self._kwargs_cache: Dict[str, dict] = {}
+        # Serialises GPU work — predict + test both acquire this lock
+        # so only one request touches the GPU at a time even when
+        # ``max_ongoing_requests=10`` lets multiple RPCs reach the
+        # replica. That extra queue is intentional: Ray Serve's
+        # autoscaler needs to see it to scale up.
+        self._gpu_lock = asyncio.Lock()
         # Route bioimageio.spec + bioimageio.core log messages through
         # loguru. Their loggers are ``logger.disable()``-d by default
         # (standard convention for libraries), so per-weight-format
@@ -82,6 +118,19 @@ class RuntimeApp:
             _loguru_logger.enable("bioimageio")
         except Exception as e:
             logger.warning(f"Could not enable bioimageio loguru sink: {e}")
+
+    def _inference_dir(self) -> Path:
+        """Base directory for per-request input/output/state files."""
+        return Path(os.environ["HOME"]) / self._INFERENCE_DIR_NAME
+
+    @staticmethod
+    def _write_state_file(state_path: Path, state: Dict[str, float]) -> None:
+        """Write ``state.json`` atomically via rename so the entry
+        never observes a half-written file when polling.
+        """
+        tmp = state_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(state_path)
 
     # === Liveness ===
 
@@ -353,53 +402,52 @@ class RuntimeApp:
         creation uses ``mamba`` (via a swapping ``run_command``) and
         the env is removed after the call.
         """
-        cpu_before, gpu_before = self._get_memory_usage()
-        logger.info(
-            f"📊 [test] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
-            f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
-        )
-
-        # Free the GPU before ``bioimageio.core.test_description``
-        # loads the tested model — any cached prediction pipelines
-        # from prior ``predict()`` calls on this replica would
-        # otherwise contend for VRAM against the tested model's
-        # fresh load and OOM on foundation-scale weights. The
-        # eviction path calls each cached model's ``__del__``, which
-        # releases GPU memory eagerly (same code path Ray Serve uses
-        # on natural LRU overflow). The ``max_ongoing_requests=1``
-        # on this deployment already keeps every other call queued
-        # behind us on the same replica, so once we've evicted the
-        # tested model has the full GPU to itself for the duration
-        # of the ``test_description`` call.
-        evicted_count = await bioengine.cache.evict_all_models(self)
-        if evicted_count:
+        # GPU serialisation: ``max_ongoing_requests=10`` allows requests
+        # to queue at the replica so the autoscaler sees them, but only
+        # one may hold the GPU at a time.
+        async with self._gpu_lock:
+            cpu_before, gpu_before = self._get_memory_usage()
             logger.info(
-                f"🧹 Evicted {evicted_count} cached pipeline(s) to free "
-                f"the GPU for test."
+                f"📊 [test] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
+                f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
             )
 
-        # Run the sync ``_test`` in a thread so it doesn't block this
-        # replica's asyncio loop. ``_test`` blocks on
-        # ``subprocess.run`` / ``check_call`` (bioimageio subprocess
-        # for the standard path, mamba env-create + ``bioimageio
-        # test`` inside the env for the custom path). A multi-minute
-        # mamba env build would otherwise starve Ray Serve's health
-        # probes on this replica — three consecutive
-        # ``health_check_timeout_s=30`` misses and Ray Serve issues
-        # ``ray.kill`` (observed on resourceful-lizard custom-env at
-        # 372s). ``asyncio.to_thread`` keeps ``ping()`` responsive
-        # for the duration of the subprocess wait.
-        import asyncio
+            # Free the GPU before ``bioimageio.core.test_description``
+            # loads the tested model — any cached prediction pipelines
+            # from prior predict calls on this replica would otherwise
+            # contend for VRAM against the tested model's fresh load
+            # and OOM on foundation-scale weights. The eviction path
+            # calls each cached model's ``__del__``, which releases GPU
+            # memory eagerly (same code path Ray Serve uses on natural
+            # LRU overflow). Holding ``_gpu_lock`` here keeps every
+            # other call queued behind us so once we've evicted the
+            # tested model has the full GPU to itself for the duration
+            # of the ``test_description`` call.
+            evicted_count = await bioengine.cache.evict_all_models(self)
+            if evicted_count:
+                logger.info(
+                    f"🧹 Evicted {evicted_count} cached pipeline(s) to free "
+                    f"the GPU for test."
+                )
 
-        test_report = await asyncio.to_thread(
-            self._test, rdf_path, custom_environment
-        )
-        cpu_after, gpu_after = self._get_memory_usage()
-        logger.info(
-            f"📊 [test] Memory after: CPU: {cpu_after / (1024 * 1024):.2f} MB, "
-            f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
-        )
-        return test_report
+            # Run the sync ``_test`` in a thread so it doesn't block
+            # this replica's asyncio loop. ``_test`` blocks on
+            # ``subprocess.run`` / ``check_call`` (bioimageio subprocess
+            # for the standard path, mamba env-create + ``bioimageio
+            # test`` inside the env for the custom path). A multi-minute
+            # mamba env build would otherwise starve Ray Serve's health
+            # probes on this replica. ``asyncio.to_thread`` keeps
+            # ``ping()`` responsive for the duration of the subprocess
+            # wait (ping isn't guarded by the lock).
+            test_report = await asyncio.to_thread(
+                self._test, rdf_path, custom_environment
+            )
+            cpu_after, gpu_after = self._get_memory_usage()
+            logger.info(
+                f"📊 [test] Memory after: CPU: {cpu_after / (1024 * 1024):.2f} MB, "
+                f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
+            )
+            return test_report
 
     # === Prediction pipeline cache key ===
 
@@ -465,7 +513,7 @@ class RuntimeApp:
 
     # === Prediction ===
 
-    async def predict(
+    async def _predict_impl(
         self,
         rdf_path: str,
         inputs: Union[np.ndarray, Dict[str, np.ndarray]],
@@ -475,7 +523,11 @@ class RuntimeApp:
         sample_id: str = "sample",
         latest_remote_modified: Optional[float] = None,
     ) -> Dict[str, np.ndarray]:
-        """Run inference using a cached bioimageio.core prediction pipeline."""
+        """Run inference on already-loaded numpy inputs.
+
+        Internal helper: the caller (``predict_from_disk``) is holding
+        ``self._gpu_lock`` and has already read inputs off disk.
+        """
         cpu_before, gpu_before = self._get_memory_usage()
         logger.info(
             f"📊 [predict] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
@@ -534,3 +586,96 @@ class RuntimeApp:
                 raise RuntimeError(oom_msg) from None
             logger.error(f"❌ Prediction failed: {str(e)}")
             raise
+
+    async def predict_from_disk(
+        self,
+        request_id: str,
+        rdf_path: str,
+        weights_format: Optional[str] = None,
+        device: Literal["cuda", "cpu"] = None,
+        default_blocksize_parameter: Optional[int] = None,
+        sample_id: str = "sample",
+        latest_remote_modified: Optional[float] = None,
+    ) -> None:
+        """Read inputs from disk, run inference, write outputs to disk.
+
+        Called by ``EntryApp._execute_infer`` after it has staged
+        ``<inference_dir>/<request_id>/input/<key>.npy`` on the shared
+        PVC. This method:
+
+        1. Acquires ``self._gpu_lock`` so only one request runs on the
+           GPU at a time — the extra RPCs sitting on the lock are what
+           the Ray Serve autoscaler measures.
+        2. Writes ``state.json`` with ``runtime_started_at`` so the
+           entry can distinguish "still queued at runtime" from
+           "actively running" when computing ``queue_position``.
+        3. Loads each ``.npy`` input into memory, then ``rmtree``s the
+           input directory — the user wants the input off disk as soon
+           as the runtime has read it.
+        4. Runs ``_predict_impl``.
+        5. Writes each output array to ``output/<key>.npy``.
+        6. Updates ``state.json`` with ``runtime_completed_at``.
+
+        The entry's poll (``get_infer_status``) reads the outputs off
+        disk and deletes the request dir after the caller collects them.
+        """
+        request_dir = self._inference_dir() / request_id
+        input_dir = request_dir / "input"
+        output_dir = request_dir / "output"
+        state_file = request_dir / "state.json"
+
+        async with self._gpu_lock:
+            # Signal to the entry that this request has left the
+            # (Ray Serve replica-side) queue and is now on the GPU.
+            # Written before any expensive work so the ``running``
+            # timestamp reflects the true start.
+            state: Dict[str, float] = {"runtime_started_at": time.time()}
+            await asyncio.to_thread(self._write_state_file, state_file, state)
+
+            if not await asyncio.to_thread(input_dir.is_dir):
+                raise FileNotFoundError(
+                    f"Input directory missing for request {request_id!r}: "
+                    f"{input_dir}"
+                )
+
+            # Load every .npy under input/ into a dict. Uncompressed
+            # so this is a fast read on the PVC.
+            def _load_inputs() -> Dict[str, np.ndarray]:
+                loaded: Dict[str, np.ndarray] = {}
+                for entry in sorted(input_dir.iterdir()):
+                    if entry.is_file() and entry.suffix == ".npy":
+                        loaded[entry.stem] = np.load(str(entry))
+                return loaded
+
+            inputs = await asyncio.to_thread(_load_inputs)
+            if not inputs:
+                raise ValueError(
+                    f"No .npy input files found for request {request_id!r} "
+                    f"under {input_dir}"
+                )
+
+            # Free disk immediately — the user wants input images off
+            # disk as soon as the runtime has read them.
+            await asyncio.to_thread(
+                shutil.rmtree, str(input_dir), ignore_errors=True
+            )
+
+            result = await self._predict_impl(
+                rdf_path=rdf_path,
+                inputs=inputs,
+                weights_format=weights_format,
+                device=device,
+                default_blocksize_parameter=default_blocksize_parameter,
+                sample_id=sample_id,
+                latest_remote_modified=latest_remote_modified,
+            )
+
+            def _write_outputs() -> None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for key, array in result.items():
+                    np.save(str(output_dir / f"{key}.npy"), array)
+
+            await asyncio.to_thread(_write_outputs)
+
+            state["runtime_completed_at"] = time.time()
+            await asyncio.to_thread(self._write_state_file, state_file, state)
