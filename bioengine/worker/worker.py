@@ -845,38 +845,55 @@ class BioEngineWorker:
 
                     self._last_monitoring = current_time
 
+                    # Each step runs independently so an earlier failure (e.g.
+                    # a stale proxy handle in cluster monitoring) can't skip
+                    # application monitoring, which fires auto-redeploy.
+                    # Failures are re-raised at tick end so backoff still runs.
+                    step_errors: List[tuple] = []
+
+                    async def _step(name, coro):
+                        try:
+                            await coro
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as step_exc:
+                            step_errors.append((name, step_exc))
+                            self.logger.warning(
+                                f"Monitoring step '{name}' failed: {step_exc}"
+                            )
+
                     # ===== 0. Geo location =====
-                    await self._fetch_geo_location()
+                    await _step("geo_location", self._fetch_geo_location())
 
                     # ===== 1. Hypha server connection check =====
-                    # Check connection to Hypha server
-                    await self._check_hypha_connection()
-
-                    # Check token expiry
-                    await self._check_token_expiry()
+                    await _step("hypha_connection", self._check_hypha_connection())
+                    await _step("token_expiry", self._check_token_expiry())
 
                     # ===== 2. Ray cluster monitoring =====
-                    # Check connection to Ray cluster
-                    await self.ray_cluster.check_connection()
-
-                    # Run cluster monitoring
-                    await self.ray_cluster.monitor_cluster()
+                    await _step(
+                        "ray_check_connection", self.ray_cluster.check_connection()
+                    )
+                    await _step(
+                        "cluster_monitoring", self.ray_cluster.monitor_cluster()
+                    )
 
                     # ===== 3. Data server monitoring =====
+                    await _step("data_server_ping", self._ping_data_server())
+                    await _step("data_server_discover", self._discover_data_server())
+                    await _step("dataset_refresh", self._refresh_datasets())
 
-                    # Ping the data server to verify connectivity
-                    await self._ping_data_server()
+                    # ===== 4. Applications monitoring (auto-redeploy) =====
+                    await _step(
+                        "applications_monitoring",
+                        self.apps_manager.monitor_applications(),
+                    )
 
-                    # If not connected to a data server, attempt discovery
-                    await self._discover_data_server()
-
-                    # Refresh datasets if connected to data server
-                    await self._refresh_datasets()
-
-                    # ===== 4. Applications monitoring =====
-
-                    # Run BioEngine Applications monitoring
-                    await self.apps_manager.monitor_applications()
+                    if step_errors:
+                        names = ", ".join(name for name, _ in step_errors)
+                        raise RuntimeError(
+                            f"{len(step_errors)} monitoring step(s) failed this "
+                            f"tick: {names}"
+                        )
 
                     # Run BioEngine Datasets monitoring
                     # await self.dataset_manager.monitor_datasets()
