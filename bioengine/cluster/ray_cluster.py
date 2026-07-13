@@ -179,6 +179,9 @@ class RayCluster:
         self.address = None
         self.serve_http_url = None
         self.proxy_actor_handle = None
+        # Serializes reconnect paths; concurrent callers each racing into
+        # ray.init() trigger "Ray Client is already connected".
+        self._connect_lock = asyncio.Lock()
         # Version-suffix the actor name so workers on different BioEngine
         # versions get their own detached actor — they don't fight over the
         # same one. Strip characters that aren't safe in a Ray actor name.
@@ -873,8 +876,14 @@ class RayCluster:
         if not self.is_ready.is_set():
             raise RuntimeError("Ray cluster is not running")
 
-        if not ray.is_initialized():
-            self.logger.warning(f"Ray client disconnected. Reconnecting...")
+        if ray.is_initialized():
+            return
+
+        async with self._connect_lock:
+            # Re-check: a peer may have reconnected while we waited.
+            if ray.is_initialized():
+                return
+            self.logger.warning("Ray client disconnected. Reconnecting...")
             # In external-cluster mode the Ray Client global state retains
             # `allow_multiple=True` from the previous gRPC session even after
             # is_initialized() returns False — a bare ray.init() then raises
@@ -912,16 +921,19 @@ class RayCluster:
                 f"current mode is '{self.mode}'."
             )
 
-        self.logger.warning("Reconnecting Ray Client to refresh stale handles...")
-        try:
-            await asyncio.to_thread(ray.shutdown)
-        except Exception as e:
-            self.logger.debug(f"ray.shutdown() during reconnect raised: {e}")
-        # Drop the stale proxy actor handle before re-acquiring it; otherwise
-        # callers racing against the reconnect could hold and use it.
-        self.proxy_actor_handle = None
-        await self._connect_to_cluster()
-        self.logger.info("Ray Client reconnected; handles refreshed.")
+        async with self._connect_lock:
+            self.logger.warning(
+                "Reconnecting Ray Client to refresh stale handles..."
+            )
+            try:
+                await asyncio.to_thread(ray.shutdown)
+            except Exception as e:
+                self.logger.debug(f"ray.shutdown() during reconnect raised: {e}")
+            # Drop the stale proxy actor handle before re-acquiring it; otherwise
+            # callers racing against the reconnect could hold and use it.
+            self.proxy_actor_handle = None
+            await self._connect_to_cluster()
+            self.logger.info("Ray Client reconnected; handles refreshed.")
 
     async def call_with_reconnect(self, fn, *args, **kwargs):
         """Run a blocking Ray API call with one automatic stale-handle recovery.
@@ -957,11 +969,30 @@ class RayCluster:
             await self.reconnect()
             return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def _get_cluster_state_with_reconnect(self):
+        """Fetch cluster state, recovering once from a stale proxy handle.
+
+        The cached ``proxy_actor_handle`` is invalidated when the head node /
+        proxy actor is recycled; reconnect re-acquires it via
+        ``get_if_exists=True`` so the retry lands on a live actor.
+        """
+        try:
+            return await self.proxy_actor_handle.get_cluster_state.remote()
+        except Exception as exc:
+            if not _is_stale_handle_error(exc):
+                raise
+            self.logger.warning(
+                f"Stale proxy actor handle in monitor_cluster: {exc!s}. "
+                f"Reconnecting and retrying once."
+            )
+            await self.reconnect()
+            return await self.proxy_actor_handle.get_cluster_state.remote()
+
     async def monitor_cluster(self) -> None:
         """Monitor cluster status and update worker nodes history."""
         try:
             # Get the current status of the cluster from the BioEngineProxy
-            cluster_status = await self.proxy_actor_handle.get_cluster_state.remote()
+            cluster_status = await self._get_cluster_state_with_reconnect()
 
             self.cluster_status_history[time.time()] = cluster_status
 
