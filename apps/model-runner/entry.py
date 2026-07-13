@@ -667,20 +667,25 @@ class EntryApp:
             job["result"] = result
 
     def _job_progress(self, job: dict) -> dict:
-        """Return the 5-key progress dict for a test run.
+        """Return the progress dict for a test run.
 
         Schema is shared with ``_infer_job_progress`` so both endpoints
-        speak the same shape:
+        speak the same shape — a monotonic timeline bracketed by
+        ``submitted_at`` / ``completed_at`` plus a live queue gauge:
 
-        * ``queue_position`` — 0 while running or terminal; N when
-          N-th in the entry-side queue behind the conda env-build
-          lock. Only ``custom_environment=True`` runs actually queue;
-          non-custom test runs are dispatched immediately.
+        * ``queue_position`` — live count that counts down to 0; N while
+          N-th in the entry-side queue behind the conda env-build lock,
+          0 once running or terminal. Only ``custom_environment=True``
+          runs actually queue; non-custom test runs dispatch immediately.
+        * ``submitted_at`` — unix ts when the run was accepted (queued).
         * ``model_download`` — unix ts when download started, or None
           when the cache was already up to date.
         * ``env_setup`` — unix ts when conda-env prebuild started, or
           None on non-custom-env runs.
         * ``running`` — unix ts when ``runtime.test`` was invoked.
+        * ``completed_at`` — unix ts when the run finished (result ready
+          or failed), recorded server-side at completion so the elapsed
+          time is accurate regardless of poll cadence; None until then.
         * ``result`` — the test report on success, ``{"error": str}``
           on failure, else None.
         """
@@ -700,9 +705,11 @@ class EntryApp:
             )
         return {
             "queue_position": queue_position,
+            "submitted_at": job["started_at"],
             "model_download": job["model_download_ts"],
             "env_setup": job["env_setup_ts"],
             "running": job["running_ts"],
+            "completed_at": job["completed_at"],
             "result": job["result"],
         }
 
@@ -818,11 +825,12 @@ class EntryApp:
             return None
 
     def _infer_job_progress(self, job: dict) -> dict:
-        """Return the 5-key progress dict for an infer request.
+        """Return the progress dict for an infer request.
 
-        Same schema as ``_job_progress`` (test); ``env_setup`` is
-        always None on the infer path since there's no per-model
-        environment prebuild.
+        Same schema as ``_job_progress`` (test): a monotonic timeline
+        bracketed by ``submitted_at`` / ``completed_at`` plus the live
+        ``queue_position`` gauge. ``env_setup`` is always None on the
+        infer path since there's no per-model environment prebuild.
         """
         # Lazy-fill ``running_ts`` from ``state.json`` on the shared
         # PVC. Once the runtime has acquired ``_gpu_lock`` for this
@@ -862,9 +870,11 @@ class EntryApp:
 
         return {
             "queue_position": queue_position,
+            "submitted_at": job["started_at"],
             "model_download": job["model_download_ts"],
             "env_setup": job["env_setup_ts"],  # always None on the infer path
             "running": job["running_ts"],
+            "completed_at": job["completed_at"],
             "result": job["result"],
         }
 
@@ -1493,13 +1503,14 @@ class EntryApp:
         Testing (``bioimageio.core.test_description``) runs as a background
         job. This call returns right away with just the ``test_run_id``
         string; poll ``get_test_status(test_run_id)`` for the shared
-        5-key progress dict and, once the run finishes, the full report
+        progress dict and, once the run finishes, the full report
         in ``result``::
 
             "tj-…"  # the returned test_run_id
             # then poll get_test_status(test_run_id) →
-            # {"queue_position": 0, "model_download": 1735689600.0,
-            #  "env_setup": None, "running": 1735689630.0,
+            # {"queue_position": 0, "submitted_at": 1735689590.0,
+            #  "model_download": 1735689600.0, "env_setup": None,
+            #  "running": 1735689630.0, "completed_at": 1735689645.0,
             #  "result": {...test_report...}}
 
         Caching behavior:
@@ -1912,15 +1923,17 @@ class EntryApp:
             description="Run id returned by ``test()``.",
         ),
     ) -> Dict[str, Union[int, float, dict, None]]:
-        """Return the shared 5-key progress dict for a test run.
+        """Return the shared progress dict for a test run.
 
         Response shape (same schema as ``get_infer_status``)::
 
             {
-              "queue_position": int,          # 0 while running or terminal
+              "queue_position": int,          # live count down to 0
+              "submitted_at":   float,        # ts when the run was queued
               "model_download": float | None, # ts when download started, None on cache hit
               "env_setup":      float | None, # ts (custom-env runs only)
               "running":        float | None, # ts when runtime.test was called
+              "completed_at":   float | None, # ts when finished, None until then
               "result":         dict | None,  # test report on success,
                                               # {"error": str} on failure
             }
@@ -2037,11 +2050,12 @@ class EntryApp:
 
             "ij-…"  # the returned request_id
 
-        Poll ``get_infer_status(request_id)`` for the shared 5-key
+        Poll ``get_infer_status(request_id)`` for the shared
         progress dict::
 
-            {"queue_position": 3, "model_download": None,
-             "env_setup": None, "running": None, "result": None}
+            {"queue_position": 3, "submitted_at": 1735689590.0,
+             "model_download": None, "env_setup": None, "running": None,
+             "completed_at": None, "result": None}
 
         Once ``result`` is populated, the outputs are read off disk on
         that first poll and the request dir is deleted; subsequent
@@ -2277,15 +2291,17 @@ class EntryApp:
             description="Request id returned by ``infer()``.",
         ),
     ) -> Dict[str, Union[int, float, dict, None]]:
-        """Return the shared 5-key progress dict for an infer request.
+        """Return the shared progress dict for an infer request.
 
         Response shape (same schema as ``get_test_status``)::
 
             {
-              "queue_position": int,          # 0 while running or terminal
+              "queue_position": int,          # live count down to 0
+              "submitted_at":   float,        # ts when the request was queued
               "model_download": float | None, # ts when download started, None on cache hit
               "env_setup":      float | None, # always None on the infer path
               "running":        float | None, # ts when runtime acquired the GPU lock
+              "completed_at":   float | None, # ts when finished, None until then
               "result":         dict | None,  # inference dict on success,
                                               # {"error": str} on failure
             }
