@@ -15,6 +15,7 @@ maintainers: []
 name: Cellpose Fine-Tuning
 tags: [cell-segmentation, deep-learning, biomedical-imaging, fine-tuning]
 type: ray-serve
-version: 1.0.0
+version: 1.0.1
 entry: main:CellposeFinetune
-frontend_entry: "frontend/index.html"
+# frontend_entry disabled — in-app UI moved to bioimage.io/#/colab; code kept in _frontend/
+# frontend_entry: "_frontend/index.html"
