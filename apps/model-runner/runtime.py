@@ -34,6 +34,12 @@ import numpy as np
 logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
 
+# Filename key under which EntryApp.infer stages a bare (single, unnamed)
+# input array. On read-back the runtime unwraps it to a bare array so
+# bioimageio.core maps it to the model's sole input member id itself,
+# rather than us guessing a member id that differs across spec versions.
+SINGLE_INPUT_KEY = "__single_input__"
+
 
 def _read_pip(name: str) -> List[str]:
     """Load a ``requirements-*.txt`` file next to this module.
@@ -552,9 +558,17 @@ class RuntimeApp:
             )
             pipeline = await self._create_prediction_pipeline(cache_key)
 
+            # A bare single input arrives under the sentinel key; hand it
+            # to core as a bare array so it maps to the model's sole input
+            # member id. Explicit multi/named inputs pass through as-is.
+            sample_inputs = (
+                inputs[SINGLE_INPUT_KEY]
+                if list(inputs) == [SINGLE_INPUT_KEY]
+                else inputs
+            )
             sample = create_sample_for_model(
                 pipeline.model_description,
-                inputs=inputs,
+                inputs=sample_inputs,
                 sample_id=sample_id,
             )
 

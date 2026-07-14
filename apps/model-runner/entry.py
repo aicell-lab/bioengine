@@ -38,7 +38,7 @@ from pydantic import Field
 from bioengine import __version__
 
 from model_cache import BioimageioPackage, ModelCache
-from runtime import RuntimeApp
+from runtime import SINGLE_INPUT_KEY, RuntimeApp
 
 
 logger = logging.getLogger("ray.serve")
@@ -2087,11 +2087,15 @@ class EntryApp:
             inputs = resolved
 
         # Normalize to Dict[str, np.ndarray] so the on-disk layout has
-        # one file per input key. A bare ndarray becomes {"input": arr}
-        # which matches the bioimageio.core default when models expose
-        # a single input tensor.
+        # one file per input key. A bare ndarray is the "single unnamed
+        # input" case: stage it under a sentinel key so the runtime can
+        # hand it to bioimageio.core as a bare array, letting core map it
+        # to the model's sole input member id. Inventing a real-looking
+        # key here (e.g. "input") breaks every model whose input member
+        # id differs — v0.4 models key on the input's ``name`` (e.g.
+        # "input0"), so a hardcoded "input" is rejected as unexpected.
         if isinstance(inputs, np.ndarray):
-            inputs = {"input": inputs}
+            inputs = {SINGLE_INPUT_KEY: inputs}
         if not isinstance(inputs, dict) or not inputs:
             raise ValueError(
                 "``inputs`` must resolve to a non-empty dict of numpy arrays."
