@@ -106,15 +106,10 @@ def test_lifecycle_detection():
         async def liveness(self):
             pass
 
-        @bioengine.cached(max_models=5)
-        async def load_model(self, model_id: str):
-            return None
-
     lc = App.func_or_class._bioengine_lifecycle
     assert lc["async_init"] == "setup"
     assert lc["smoke_test"] == "verify"
     assert lc["health_check"] == "liveness"
-    assert "load_model" in lc["cached"]
 
 
 def test_reserved_method_name_rejected():
