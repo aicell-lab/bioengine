@@ -85,8 +85,7 @@ The end-to-end deploy_app flow is documented step-by-step in `docs/deploy_app_fl
 - `bioengine/apps/builder.py` — `build()` constructs Ray Serve app from artifact
 - `bioengine/_app/bootstrap.py` — `introspect_app_in_ray_task`, `build_and_run_application`
 - `bioengine/_app/replica_init.py` — replica-side source materialisation
-- `bioengine/_app/cache.py` — `PipelineCache` + `bioengine.cache` module (`@bioengine.cached` backend)
-- `bioengine/_app/decorators.py` — `@bioengine.app` / `@bioengine.method` / `@bioengine.cached` / lifecycle hooks + `_scan_class`
+- `bioengine/_app/decorators.py` — `@bioengine.app` / `@bioengine.method` / lifecycle hooks + `_scan_class` (no `@bioengine.cached` since 0.11.24 — see "No framework GPU model cache")
 - `apps/demo-app/` — reference single-deployment app (keep at version 1.0.0)
 - `apps/composition-demo/` — reference multi-deployment app (keep at version 1.0.0)
 - `apps/model-runner/` — production model-runner
@@ -192,22 +191,15 @@ Beyond the production external-cluster deployments, the other two supported mode
 - **`single-machine` mode** — local Ray cluster on a workstation. Used for dev validation of the `ray.init(...)` path (different code path from KubeRay-mode; regressions in one won't necessarily show in the other). Launch with `python -m bioengine.worker --mode single-machine` or via docker-compose. Example: the current maintainer runs this on a machine called Europa; other maintainers will have their own dev box.
 - **`slurm` mode** — on-demand worker per SLURM job on an HPC cluster, launched via apptainer. The bioengine version is picked up from `bioengine[worker]==<version>` in the job's env at submission time — no persistent helm, no active push required for framework bumps. Watch out for cluster-specific apptainer gotchas: e.g. `apptainer build sif` may fail on newer apptainer versions with `yama.ptrace_scope=2` — `apptainer build --sandbox` is the workaround (and the `start_hpc_worker.sh` script accepts sandbox dirs from 0.9.8+). Example: the current maintainer runs this on NSC's Berzelius (A100-SXM4-80GB); other maintainers will have their own HPC.
 
-## Framework model cache (`bioengine._app.cache`)
+## No framework GPU model cache (removed in 0.11.24)
 
-`@bioengine.cached(max_models=N)` is the user-facing decorator; the details are in the sibling user-facing skill. This section describes the internals a maintainer needs when touching the code.
+**There is no `@bioengine.cached` / `bioengine.cache` / `bioengine/_app/cache.py` any more.** The in-memory GPU pipeline cache was removed in bioengine **0.11.24** (PR #141). Don't reach for it, and don't reintroduce a framework-level GPU cache.
 
-**What lives where:**
-- `bioengine/_app/cache.py` — `PipelineCache` class + module-level helpers (`evict_all_models`, `evict_lru_model`, `evict_model`, `cached_model_ids`) + `_release_gpu_caches` (the `gc.collect()` + optional `torch.cuda.empty_cache()`).
-- `bioengine/_app/decorators.py::cached` — the decorator marker. `_scan_class` collects `"cached"`-marked methods into `lifecycle["cached"]`; `@bioengine.app` wraps each with `_make_cached_wrapper` which lazy-instantiates the cache on first call.
-- Cache lives on the deployment instance at `self._bioengine_caches: Dict[str, PipelineCache]` — one entry per decorated method, keyed by method name.
+**Why it was removed.** The cache's only GPU cleanup was `torch.cuda.empty_cache()`, so it silently assumed a torch runtime. It could not reclaim TensorFlow's whole-GPU grab or onnxruntime's CUDA arena — those leaked until replica restart — and BioEngine apps don't require torch, so a torch-only GPU cache was the wrong primitive to bake into the framework. (It also evicted by model *count*, not VRAM, so a big model OOM'd while the cache still had free slots.)
 
-**Key invariants (regressions to look out for):**
-- Every eviction path must call `_release_gpu_caches` **inside** the `asyncio.Lock`. If it's called after releasing the lock, a concurrent `get_or_load` sees a torch pool still holding the evicted VRAM and allocates on top — pynvml reports growth. Tests in `tests/_app/test_cache.py` mock `_release_gpu_caches` to assert it fires exactly once per eviction.
-- `_release_gpu_caches` runs `gc.collect()` before `torch.cuda.empty_cache()`. Python may still hold refs via frames / weak refs / `__del__` closures; skipping the GC leaves the allocator's blocks unavailable to be returned.
-- `torch` is imported inside the try — the framework does not hard-require torch. Apps without GPU/torch skip the empty_cache but still get correct cache semantics.
-- `bioengine/_app/cache.py` MUST stay importable with just `bioengine[worker]` + stdlib (no torch, no numpy imports at module top). The introspection Ray task loads any module that touches `@bioengine.app` in a clean baseline `runtime_env`.
+**What replaced it.** The only consumer was `apps/model-runner`. From **1.15.8** it runs each inference in a **child process** (`RuntimeApp._run_prediction_subprocess`), mirroring the test path: the OS reclaims the entire CUDA context on process exit, which frees VRAM framework-agnostically (torch / TF / ONNX) with no accumulation. If a future GPU app needs "no VRAM left over between calls," use subprocess isolation — not a resurrected cache.
 
-**What the refactor replaced (context for git-archaeology).** Before 0.11.22 `@bioengine.multiplexed` forwarded to `ray.serve.multiplexed(max_num_models_per_replica=N)` and `bioengine.multiplex.*` reached into Ray's private `__serve_multiplex_wrapper.unload_model_lru` for manual eviction. That path dropped Python refs but did not call `torch.cuda.empty_cache()` — pipelines evicted from the cache left ~200 MB of VRAM stuck per model, observable via `pynvml` and accumulating across sequential test calls (~626 MB pinned indefinitely on the model-runner in a common 3-model test scenario). The clean break (no shim) means older apps must migrate their decorator + module names before their worker upgrades.
+**Historical context (git-archaeology).** `@bioengine.cached` itself replaced the even-older `@bioengine.multiplexed` (→ `ray.serve.multiplexed`) in 0.11.22; that path leaked ~200 MB VRAM per evicted model because Ray's `unload_model_lru` never called `empty_cache()`. Both are gone now — the lineage is `multiplexed` (≤0.11.21) → `cached` (0.11.22–0.11.23) → subprocess isolation in the app, no framework cache (0.11.24+).
 
 ## Worker service API
 
