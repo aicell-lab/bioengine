@@ -624,9 +624,8 @@ class EntryApp:
             "custom_environment": custom_environment,
             # Step timestamps surfaced through the shared progress
             # schema. ``env_setup_ts`` only ever fires when
-            # ``custom_environment=True``. The other two fire for every
-            # run. ``model_download_ts`` is collapsed back to None in
-            # ``_execute_test`` when the cache was already up-to-date.
+            # ``custom_environment=True``; the other two fire for every
+            # run.
             "model_download_ts": None,
             "env_setup_ts": None,
             "running_ts": None,
@@ -678,8 +677,10 @@ class EntryApp:
           0 once running or terminal. Only ``custom_environment=True``
           runs actually queue; non-custom test runs dispatch immediately.
         * ``submitted_at`` — unix ts when the run was accepted (queued).
-        * ``model_download`` — unix ts when download started, or None
-          when the cache was already up to date.
+        * ``model_download`` — unix ts when the download step started;
+          always set. The step checks the remote file list and updates
+          only outdated files, so its duration is near-zero on a fully
+          cached model and grows with how much needs downloading.
         * ``env_setup`` — unix ts when conda-env prebuild started, or
           None on non-custom-env runs.
         * ``running`` — unix ts when ``runtime.test`` was invoked.
@@ -1604,13 +1605,6 @@ class EntryApp:
             allow_unpublished=True,
             skip_cache=skip_cache,
         )
-        # Collapse the ``model_download`` timestamp to None on a cache
-        # hit so the progress dict reports "no download happened" per
-        # the shared schema. If files were fetched (or another replica
-        # was fetching and we waited on it), keep the ts we stamped
-        # above.
-        if not package.newly_downloaded:
-            job["model_download_ts"] = None
 
         # Silent fallback: models that declare no custom env yaml (no
         # ``dependencies.source`` on any weight format) get an
@@ -1930,7 +1924,7 @@ class EntryApp:
             {
               "queue_position": int,          # live count down to 0
               "submitted_at":   float,        # ts when the run was queued
-              "model_download": float | None, # ts when download started, None on cache hit
+              "model_download": float | None, # ts when download step started (always set once reached)
               "env_setup":      float | None, # ts (custom-env runs only)
               "running":        float | None, # ts when runtime.test was called
               "completed_at":   float | None, # ts when finished, None until then
@@ -2180,11 +2174,6 @@ class EntryApp:
                 allow_unpublished=False,
                 skip_cache=skip_cache,
             )
-            # Cache hit → collapse the model_download timestamp back to
-            # None per the shared progress schema.
-            if not package.newly_downloaded:
-                job["model_download_ts"] = None
-
             async with package:
                 logger.info(
                     f"📍 Model source for request {request_id!r}: "
@@ -2298,7 +2287,7 @@ class EntryApp:
             {
               "queue_position": int,          # live count down to 0
               "submitted_at":   float,        # ts when the request was queued
-              "model_download": float | None, # ts when download started, None on cache hit
+              "model_download": float | None, # ts when download step started (always set once reached)
               "env_setup":      float | None, # always None on the infer path
               "running":        float | None, # ts when runtime acquired the GPU lock
               "completed_at":   float | None, # ts when finished, None until then

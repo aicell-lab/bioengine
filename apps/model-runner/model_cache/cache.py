@@ -671,17 +671,13 @@ class ModelCache:
             "skipped": list(remote_file_names - {name for name, _ in results}),
         }
 
-    async def _create_package(self, model_id: str, stage: bool) -> bool:
+    async def _create_package(self, model_id: str, stage: bool) -> None:
         """
         Create or update a model package in the cache directory.
 
         Downloads all files of a model artifact from the bioimage.io workspace.
         If files already exist, they are updated only if newer versions are available.
         Uses atomic operations to prevent conflicts between replicas.
-
-        Returns True if files were fetched — either by this replica or while
-        waiting for another replica's download — and False if the cached
-        package was already up to date and nothing was downloaded.
         """
         import aiofiles
 
@@ -765,7 +761,7 @@ class ModelCache:
                         logger.warning(
                             f"⚠️ Failed to update access time for existing model: {e}"
                         )
-                    return False
+                    return
 
                 logger.info(
                     f"🔄 Model '{model_id}' needs updates, proceeding with download..."
@@ -798,7 +794,7 @@ class ModelCache:
                     await asyncio.to_thread(access_file.write_text, str(time.time()))
                 except (OSError, IOError) as e:
                     logger.warning(f"⚠️ Failed to update access time after waiting: {e}")
-                return True
+                return
             else:
                 # Download failed or timed out, try to claim it ourselves
 
@@ -935,7 +931,6 @@ class ModelCache:
                 logger.warning(f"⚠️ Failed to remove downloading marker: {e}")
 
         logger.info(f"🎉 Successfully completed download of model '{model_id}'.")
-        return True
 
     async def _get_latest_remote_modified_time(self, package_path: Path) -> float:
         """Get the latest tracked remote last-modified time from .file_metadata.json."""
@@ -968,7 +963,7 @@ class ModelCache:
             await self._remove_package(package_path)
 
         # Create or update the local package
-        newly_downloaded = await self._create_package(model_id, stage=stage)
+        await self._create_package(model_id, stage=stage)
 
         # Get latest tracked remote last-modified time from .file_metadata.json
         latest_remote_modified = await self._get_latest_remote_modified_time(
@@ -979,5 +974,4 @@ class ModelCache:
             package_path=package_path,
             latest_remote_modified=latest_remote_modified,
             replica_id=self.replica_id,
-            newly_downloaded=newly_downloaded,
         )

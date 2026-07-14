@@ -31,18 +31,11 @@ class BioimageioPackage:
         package_path: Path,
         latest_remote_modified: float,
         replica_id: str,
-        newly_downloaded: bool = False,
     ) -> None:
         self.package_path = package_path
         self.source = str(self.package_path / "rdf.yaml")
         self.latest_remote_modified = latest_remote_modified
         self.replica_id = replica_id
-        # True when the just-completed ``get_model_package`` fetched or
-        # refreshed files; False when the cache was already up to date.
-        # EntryApp uses this to decide whether the ``model_download``
-        # progress timestamp is a real ts or should collapse to None per
-        # the shared progress schema.
-        self.newly_downloaded = newly_downloaded
         self._lock_file: Optional[Path] = None
 
     async def __aenter__(self):
