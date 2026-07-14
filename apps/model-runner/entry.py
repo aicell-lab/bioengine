@@ -117,6 +117,15 @@ class EntryApp:
     _TEST_REPORTS_WORKSPACE = "bioimage-io"
     _TEST_REPORTS_COLLECTION = "bioimage-io/test-reports"
 
+    # Inference results published by the bioimage.io inference workflow
+    # (``scripts/bioengine_model_infer.py``) live in a single artifact
+    # under the test-reports collection: ``inference_report.json`` is a
+    # flat ``{model_id: {status, message, tested_at, runner_version}}``
+    # mapping. ``search_models`` reads it to filter to models whose
+    # latest inference passed.
+    _INFERENCE_REPORT_ARTIFACT = "bioimage-io/inference-report"
+    _INFERENCE_REPORT_FILE = "inference_report.json"
+
     # Async infer-request registry TTL — how long a completed/failed
     # infer job stays in memory after completion before being swept.
     # Also bounds how long the on-disk request dir survives if the
@@ -1292,13 +1301,17 @@ class EntryApp:
             )
 
             if not ignore_checks:
-                collection = await self.artifact_manager.read(collection_id)
-                bioengine_inference_results = collection["manifest"][
-                    "bioengine_inference"
-                ]
+                report = await self.artifact_manager.read_file(
+                    self._INFERENCE_REPORT_ARTIFACT,
+                    file_path=self._INFERENCE_REPORT_FILE,
+                    format="json",
+                )
+                inference_results = (
+                    report.get("content") if isinstance(report, dict) else None
+                ) or {}
                 runnable_models = {
                     model_id
-                    for model_id, result in bioengine_inference_results.items()
+                    for model_id, result in inference_results.items()
                     if result.get("status") == "passed"
                 }
 
@@ -2178,7 +2191,6 @@ class EntryApp:
                     device=device,
                     default_blocksize_parameter=default_blocksize_parameter,
                     sample_id=sample_id,
-                    latest_remote_modified=package.latest_remote_modified,
                 )
 
             self._update_infer_job(job, state="completed")

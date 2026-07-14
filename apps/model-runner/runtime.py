@@ -9,27 +9,25 @@ outputs for ``predict_from_disk`` stream through the shared PVC-backed
 inference dir instead of over the RPC, so large arrays don't sit in RAM
 while the request queues on ``_gpu_lock``.
 
-Module-level imports stay deliberately lightweight (just stdlib + bioengine
-+ numpy + ray) so the introspection task can load this file with only the
+Module-level imports stay deliberately lightweight (just stdlib +
+bioengine) so the introspection task can load this file with only the
 BioEngine baseline runtime_env. Heavy deps (``bioimageio.core``,
 ``careamics``, ``cellpose``, ``torch``, ``tensorflow``, …) are installed
 by the ``@bioengine.app(pip=REQUIREMENTS)`` declaration and imported
-inside method bodies.
+inside method bodies (or, for prediction, inside the child process).
 """
 
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import shutil
 import time
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional
 
 import bioengine
-import numpy as np
 
 logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
@@ -105,7 +103,6 @@ class RuntimeApp:
     _INFERENCE_DIR_NAME = ".model-runner-inference"
 
     def __init__(self) -> None:
-        self._kwargs_cache: Dict[str, dict] = {}
         # Serialises GPU work — predict + test both acquire this lock
         # so only one request touches the GPU at a time even when
         # ``max_ongoing_requests=10`` lets multiple RPCs reach the
@@ -418,23 +415,11 @@ class RuntimeApp:
                 f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
             )
 
-            # Free the GPU before ``bioimageio.core.test_description``
-            # loads the tested model — any cached prediction pipelines
-            # from prior predict calls on this replica would otherwise
-            # contend for VRAM against the tested model's fresh load
-            # and OOM on foundation-scale weights. The eviction path
-            # calls each cached model's ``__del__``, which releases GPU
-            # memory eagerly (same code path Ray Serve uses on natural
-            # LRU overflow). Holding ``_gpu_lock`` here keeps every
-            # other call queued behind us so once we've evicted the
-            # tested model has the full GPU to itself for the duration
-            # of the ``test_description`` call.
-            evicted_count = await bioengine.cache.evict_all_models(self)
-            if evicted_count:
-                logger.info(
-                    f"🧹 Evicted {evicted_count} cached pipeline(s) to free "
-                    f"the GPU for test."
-                )
+            # Both the test and the infer path run the model in a child
+            # process (CUDA-context isolation), so no GPU-resident model
+            # from a prior call survives in this replica to contend for
+            # VRAM — the tested model has the whole GPU to itself once we
+            # hold ``_gpu_lock``. Nothing to evict here.
 
             # Run the sync ``_test`` in a thread so it doesn't block
             # this replica's asyncio loop. ``_test`` blocks on
@@ -455,151 +440,126 @@ class RuntimeApp:
             )
             return test_report
 
-    # === Prediction pipeline cache key ===
-
-    def _set_prediction_kwargs(
-        self,
-        rdf_path: str,
-        weights_format: str,
-        device: str,
-        default_blocksize_parameter: int,
-        latest_remote_modified: Optional[float] = None,
-    ) -> str:
-        """Generate cache key for prediction pipeline configuration."""
-        pipeline_kwargs = {
-            "rdf_path": rdf_path,
-            "latest_remote_modified": latest_remote_modified,
-            "create_kwargs": {
-                "weights_format": weights_format,
-                "device": device,
-                "default_blocksize_parameter": default_blocksize_parameter,
-            },
-        }
-        json_str = json.dumps(pipeline_kwargs, sort_keys=True)
-        cache_key = hashlib.md5(json_str.encode()).hexdigest()
-        self._kwargs_cache[cache_key] = pipeline_kwargs
-        return cache_key
-
-    # === Multiplexed pipeline (Ray Serve handles eviction by max_models) ===
-
-    @bioengine.cached(
-        max_models=int(os.environ.get("PIPELINE_CACHE_SIZE", 10)),
-    )
-    async def _create_prediction_pipeline(self, cache_key: str):
-        """Create + cache the prediction pipeline for ``cache_key``."""
-        cpu_before, gpu_before = self._get_memory_usage()
-        from bioimageio.core import create_prediction_pipeline, load_model_description
-
-        pipeline_kwargs = self._kwargs_cache.get(cache_key)
-        if not pipeline_kwargs:
-            logger.error(f"❌ No pipeline kwargs found for cache key: {cache_key}")
-            raise ValueError(f"No pipeline kwargs found for cache key: {cache_key}")
-
-        rdf_path = pipeline_kwargs["rdf_path"]
-        create_kwargs = pipeline_kwargs["create_kwargs"]
-
-        try:
-            model_description = load_model_description(rdf_path)
-            pipeline = create_prediction_pipeline(model_description, **create_kwargs)
-            pipeline.load()
-            cpu_after, gpu_after = self._get_memory_usage()
-            logger.info(
-                f"✅ Created and loaded prediction pipeline for model at {rdf_path}"
-            )
-            logger.info(
-                f"📊 [pipeline load] CPU: {cpu_after / (1024 * 1024):.2f} MB, "
-                f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
-            )
-            return pipeline
-        except Exception as e:
-            logger.error(f"❌ Failed to create prediction pipeline: {str(e)}")
-            raise
-        finally:
-            self._kwargs_cache.pop(cache_key, None)
-
     # === Prediction ===
 
-    async def _predict_impl(
+    def _run_prediction_subprocess(
         self,
         rdf_path: str,
-        inputs: Union[np.ndarray, Dict[str, np.ndarray]],
-        weights_format: Optional[str] = None,
-        device: Literal["cuda", "cpu"] = None,
-        default_blocksize_parameter: Optional[int] = None,
-        sample_id: str = "sample",
-        latest_remote_modified: Optional[float] = None,
-    ) -> Dict[str, np.ndarray]:
-        """Run inference on already-loaded numpy inputs.
+        input_dir: str,
+        output_dir: str,
+        params: Dict[str, object],
+    ) -> None:
+        """Load the model, run inference, and write outputs — all in a
+        child Python process for CUDA-context isolation.
 
-        Internal helper: the caller (``predict_from_disk``) is holding
-        ``self._gpu_lock`` and has already read inputs off disk.
+        Mirrors ``_run_bioimageio_test_subprocess``. A subprocess is the
+        only framework-agnostic way to guarantee the model's VRAM is
+        fully reclaimed: the OS tears down the entire CUDA context on
+        exit, so torch's caching allocator, TensorFlow's greedy
+        whole-GPU grab, and onnxruntime's CUDA arena are all released no
+        matter what state the model left behind. An in-process pipeline
+        cache plus ``torch.cuda.empty_cache()`` only ever freed torch
+        memory and left TF / ONNX VRAM pinned until replica restart —
+        the cause of OOM piling up across repeated infer calls.
+
+        The child reads ``input_dir/<key>.npy`` and writes
+        ``output_dir/<key>.npy`` itself so large arrays never cross the
+        process boundary; ``params`` travels as a small JSON file.
         """
-        cpu_before, gpu_before = self._get_memory_usage()
-        logger.info(
-            f"📊 [predict] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
-            f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
-        )
-        from bioimageio.core.digest_spec import create_sample_for_model
+        import subprocess
+        import sys
+        import tempfile
 
-        try:
-            if not Path(rdf_path).exists():
-                raise FileNotFoundError(f"RDF not found: {rdf_path}")
+        script = """
+import json, sys
+from pathlib import Path
+import numpy as np
+from bioimageio.core import create_prediction_pipeline, load_model_description
+from bioimageio.core.digest_spec import create_sample_for_model
 
+rdf_path, input_dir, output_dir, params_path = sys.argv[1:5]
+with open(params_path) as f:
+    params = json.load(f)
+single_input_key = params["single_input_key"]
+
+inputs = {}
+for entry in sorted(Path(input_dir).iterdir()):
+    if entry.is_file() and entry.suffix == ".npy":
+        inputs[entry.stem] = np.load(str(entry))
+if not inputs:
+    raise ValueError("No .npy input files found under " + input_dir)
+
+model_description = load_model_description(rdf_path)
+pipeline = create_prediction_pipeline(
+    model_description,
+    weights_format=params["weights_format"],
+    device=params["device"],
+    default_blocksize_parameter=params["default_blocksize_parameter"],
+)
+pipeline.load()
+
+# A bare single input arrives under the sentinel key; hand it to core as
+# a bare array so it maps to the model's sole input member id. Explicit
+# multi/named inputs pass through as-is.
+sample_inputs = (
+    inputs[single_input_key]
+    if list(inputs) == [single_input_key]
+    else inputs
+)
+sample = create_sample_for_model(
+    pipeline.model_description,
+    inputs=sample_inputs,
+    sample_id=params["sample_id"],
+)
+if params["default_blocksize_parameter"]:
+    result = pipeline.predict_sample_with_blocking(sample)
+else:
+    result = pipeline.predict_sample_without_blocking(sample)
+
+out = Path(output_dir)
+out.mkdir(parents=True, exist_ok=True)
+for key, member in result.members.items():
+    np.save(str(out / (str(key) + ".npy")), member.data.data)
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            params_path = str(Path(tmpdir) / "params.json")
+            with open(params_path, "w") as f:
+                json.dump(params, f)
             logger.info(
-                f"🚀 Starting prediction for model at {rdf_path} with "
-                f"device={device} and weights_format={weights_format}"
+                f"🐍 [predict] Spawning bioimageio subprocess for CUDA "
+                f"context isolation: {sys.executable} -c <inline> {rdf_path}"
             )
-            cache_key = self._set_prediction_kwargs(
-                rdf_path=rdf_path,
-                weights_format=weights_format,
-                device=device,
-                default_blocksize_parameter=default_blocksize_parameter,
-                latest_remote_modified=latest_remote_modified,
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    rdf_path,
+                    input_dir,
+                    output_dir,
+                    params_path,
+                ],
+                capture_output=True,
+                text=True,
+                env=self._safe_subprocess_env(),
             )
-            pipeline = await self._create_prediction_pipeline(cache_key)
-
-            # A bare single input arrives under the sentinel key; hand it
-            # to core as a bare array so it maps to the model's sole input
-            # member id. Explicit multi/named inputs pass through as-is.
-            sample_inputs = (
-                inputs[SINGLE_INPUT_KEY]
-                if list(inputs) == [SINGLE_INPUT_KEY]
-                else inputs
-            )
-            sample = create_sample_for_model(
-                pipeline.model_description,
-                inputs=sample_inputs,
-                sample_id=sample_id,
-            )
-
-            if default_blocksize_parameter:
-                result = pipeline.predict_sample_with_blocking(sample)
-            else:
-                result = pipeline.predict_sample_without_blocking(sample)
-
-            cpu_after, gpu_after = self._get_memory_usage()
-            logger.info(
-                f"📊 [predict] CPU: {cpu_after / (1024 * 1024):.2f} MB, "
-                f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
-            )
-            return {str(k): v.data.data for k, v in result.members.items()}
-
-        except Exception as e:
-            # CUDA OOM names vary across PyTorch versions and may not be
-            # importable on the receiving end of the RPC. Re-raise as a
-            # plain RuntimeError so the deserialiser doesn't crash.
-            import torch
-
-            torch.cuda.empty_cache()
-            err_type = type(e).__name__
-            if err_type in ("OutOfMemoryError", "CUDAOutOfMemoryError") or (
-                "out of memory" in str(e).lower()
-            ):
-                oom_msg = f"CUDA out of memory during inference: {str(e)}"
-                logger.error(f"❌ {oom_msg}")
-                raise RuntimeError(oom_msg) from None
-            logger.error(f"❌ Prediction failed: {str(e)}")
-            raise
+            if result.stdout:
+                for line in result.stdout.rstrip().splitlines()[-40:]:
+                    logger.info(f"[predict:stdout] {line}")
+            if result.stderr:
+                for line in result.stderr.rstrip().splitlines()[-40:]:
+                    logger.info(f"[predict:stderr] {line}")
+            if result.returncode != 0:
+                stderr_tail = (result.stderr or "")[-800:]
+                if "out of memory" in stderr_tail.lower():
+                    raise RuntimeError(
+                        f"CUDA out of memory during inference: {stderr_tail}"
+                    )
+                raise RuntimeError(
+                    f"Inference subprocess exited with code "
+                    f"{result.returncode} (stderr tail: {stderr_tail!r})"
+                )
 
     async def predict_from_disk(
         self,
@@ -609,9 +569,9 @@ class RuntimeApp:
         device: Literal["cuda", "cpu"] = None,
         default_blocksize_parameter: Optional[int] = None,
         sample_id: str = "sample",
-        latest_remote_modified: Optional[float] = None,
     ) -> None:
-        """Read inputs from disk, run inference, write outputs to disk.
+        """Read inputs from disk, run inference in a subprocess, write
+        outputs to disk.
 
         Called by ``EntryApp._execute_infer`` after it has staged
         ``<inference_dir>/<request_id>/input/<key>.npy`` on the shared
@@ -623,12 +583,11 @@ class RuntimeApp:
         2. Writes ``state.json`` with ``runtime_started_at`` so the
            entry can distinguish "still queued at runtime" from
            "actively running" when computing ``queue_position``.
-        3. Loads each ``.npy`` input into memory, then ``rmtree``s the
-           input directory — the user wants the input off disk as soon
-           as the runtime has read it.
-        4. Runs ``_predict_impl``.
-        5. Writes each output array to ``output/<key>.npy``.
-        6. Updates ``state.json`` with ``runtime_completed_at``.
+        3. Runs the model in a child process
+           (``_run_prediction_subprocess``) which reads the inputs,
+           predicts, and writes ``output/<key>.npy``. The subprocess exit
+           reclaims all of the model's VRAM regardless of framework.
+        4. Deletes the input dir and records ``runtime_completed_at``.
 
         The entry's poll (``get_infer_status``) reads the outputs off
         disk and deletes the request dir after the caller collects them.
@@ -639,6 +598,12 @@ class RuntimeApp:
         state_file = request_dir / "state.json"
 
         async with self._gpu_lock:
+            cpu_before, gpu_before = self._get_memory_usage()
+            logger.info(
+                f"📊 [predict] Memory before: CPU: {cpu_before / (1024 * 1024):.2f} MB, "
+                f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
+            )
+
             # Signal to the entry that this request has left the
             # (Ray Serve replica-side) queue and is now on the GPU.
             # Written before any expensive work so the ``running``
@@ -651,45 +616,38 @@ class RuntimeApp:
                     f"Input directory missing for request {request_id!r}: "
                     f"{input_dir}"
                 )
+            if not await asyncio.to_thread(Path(rdf_path).exists):
+                raise FileNotFoundError(f"RDF not found: {rdf_path}")
 
-            # Load every .npy under input/ into a dict. Uncompressed
-            # so this is a fast read on the PVC.
-            def _load_inputs() -> Dict[str, np.ndarray]:
-                loaded: Dict[str, np.ndarray] = {}
-                for entry in sorted(input_dir.iterdir()):
-                    if entry.is_file() and entry.suffix == ".npy":
-                        loaded[entry.stem] = np.load(str(entry))
-                return loaded
+            logger.info(
+                f"🚀 Starting prediction for model at {rdf_path} with "
+                f"device={device} and weights_format={weights_format}"
+            )
+            params: Dict[str, object] = {
+                "weights_format": weights_format,
+                "device": device,
+                "default_blocksize_parameter": default_blocksize_parameter,
+                "sample_id": sample_id,
+                "single_input_key": SINGLE_INPUT_KEY,
+            }
+            await asyncio.to_thread(
+                self._run_prediction_subprocess,
+                rdf_path,
+                str(input_dir),
+                str(output_dir),
+                params,
+            )
 
-            inputs = await asyncio.to_thread(_load_inputs)
-            if not inputs:
-                raise ValueError(
-                    f"No .npy input files found for request {request_id!r} "
-                    f"under {input_dir}"
-                )
-
-            # Free disk immediately — the user wants input images off
-            # disk as soon as the runtime has read them.
+            # Free the input images now the child has consumed them.
             await asyncio.to_thread(
                 shutil.rmtree, str(input_dir), ignore_errors=True
             )
 
-            result = await self._predict_impl(
-                rdf_path=rdf_path,
-                inputs=inputs,
-                weights_format=weights_format,
-                device=device,
-                default_blocksize_parameter=default_blocksize_parameter,
-                sample_id=sample_id,
-                latest_remote_modified=latest_remote_modified,
+            cpu_after, gpu_after = self._get_memory_usage()
+            logger.info(
+                f"📊 [predict] Memory after: CPU: {cpu_after / (1024 * 1024):.2f} MB, "
+                f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
             )
-
-            def _write_outputs() -> None:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                for key, array in result.items():
-                    np.save(str(output_dir / f"{key}.npy"), array)
-
-            await asyncio.to_thread(_write_outputs)
 
             state["runtime_completed_at"] = time.time()
             await asyncio.to_thread(self._write_state_file, state_file, state)
