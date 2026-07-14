@@ -6,7 +6,6 @@ Demonstrates the modern authoring model:
 * Lifecycle hooks via decorators (``@async_init``, ``@smoke_test``,
   ``@health_check``) — method names are free.
 * API methods via ``@bioengine.method`` instead of ``@schema_method``.
-* LRU-cached model loading via ``@bioengine.cached``.
 * Module-level access to datasets and the logger.
 
 Import rule: this module contains ``@bioengine.app`` and is loaded by
@@ -79,9 +78,8 @@ class DemoApp:
         if self.fail_health_check:
             raise Exception("Simulated health check failure.")
 
-    @bioengine.cached(max_models=3)
     async def _get_model(self, model_id: str) -> Any:
-        """LRU-cached model loader (mock)."""
+        """Mock model loader."""
         logger.info(f"Loading model with ID: {model_id}")
         return None
 
