@@ -665,6 +665,25 @@ class EntryApp:
         if result is not None:
             job["result"] = result
 
+    def _queue_position(self, job: dict, registry: dict) -> int:
+        """1-based rank of ``job`` among the live (non-terminal) jobs in
+        ``registry``, ordered by submission time.
+
+        Position 1 is the job at the front of the line — the one
+        currently running the infer/test call; position N has N-1 calls
+        ahead of it. A completed or failed job has left the queue and
+        reports 0.
+        """
+        if job["state"] in ("completed", "failed"):
+            return 0
+        return 1 + sum(
+            1
+            for other in registry.values()
+            if other is not job
+            and other["state"] not in ("completed", "failed")
+            and other["started_at"] < job["started_at"]
+        )
+
     def _job_progress(self, job: dict) -> dict:
         """Return the progress dict for a test run.
 
@@ -672,10 +691,9 @@ class EntryApp:
         speak the same shape — a monotonic timeline bracketed by
         ``submitted_at`` / ``completed_at`` plus a live queue gauge:
 
-        * ``queue_position`` — live count that counts down to 0; N while
-          N-th in the entry-side queue behind the conda env-build lock,
-          0 once running or terminal. Only ``custom_environment=True``
-          runs actually queue; non-custom test runs dispatch immediately.
+        * ``queue_position`` — 1-based rank in line: 1 while this run is
+          the one currently being processed, N while N-1 runs are ahead
+          of it, 0 once terminal. See ``_queue_position``.
         * ``submitted_at`` — unix ts when the run was accepted (queued).
         * ``model_download`` — unix ts when the download step started;
           always set. The step checks the remote file list and updates
@@ -690,22 +708,8 @@ class EntryApp:
         * ``result`` — the test report on success, ``{"error": str}``
           on failure, else None.
         """
-        state = job["state"]
-        queue_position = 0
-        if job["custom_environment"] and state in ("queued", "env_setup"):
-            # 1-based rank: the currently running custom-env test has
-            # queue_position=0 (state != queued/env_setup — running),
-            # so the next in line is 1, and so on.
-            queue_position = 1 + sum(
-                1
-                for other in self._test_jobs.values()
-                if other is not job
-                and other["custom_environment"]
-                and other["state"] in ("queued", "env_setup")
-                and other["started_at"] < job["started_at"]
-            )
         return {
-            "queue_position": queue_position,
+            "queue_position": self._queue_position(job, self._test_jobs),
             "submitted_at": job["started_at"],
             "model_download": job["model_download_ts"],
             "env_setup": job["env_setup_ts"],
@@ -803,9 +807,8 @@ class EntryApp:
         Runtime writes ``state.json`` twice: once with just
         ``runtime_started_at`` right after it acquires ``_gpu_lock``,
         then again with both start and completion timestamps after the
-        outputs are written. Entry uses this to distinguish "still
-        queued at runtime" from "actively running" when computing
-        ``queue_position``.
+        outputs are written. Entry uses this to refine the reported
+        ``running`` timestamp to the moment GPU work actually started.
         """
         if self._inference_dir is None:
             return None
@@ -849,28 +852,8 @@ class EntryApp:
             if state_file and "runtime_started_at" in state_file:
                 job["running_ts"] = float(state_file["runtime_started_at"])
 
-        # Queue position — 1-based rank among jobs that haven't yet had
-        # ``runtime_started_at`` (equivalently: still queued at entry
-        # or at runtime). A job with a running timestamp OR in a
-        # terminal state has position 0.
-        is_pending = (
-            job["state"] not in ("completed", "failed")
-            and job["running_ts"] is None
-        )
-        if is_pending:
-            queue_position = 1 + sum(
-                1
-                for other in self._infer_jobs.values()
-                if other is not job
-                and other["state"] not in ("completed", "failed")
-                and other["running_ts"] is None
-                and other["started_at"] < job["started_at"]
-            )
-        else:
-            queue_position = 0
-
         return {
-            "queue_position": queue_position,
+            "queue_position": self._queue_position(job, self._infer_jobs),
             "submitted_at": job["started_at"],
             "model_download": job["model_download_ts"],
             "env_setup": job["env_setup_ts"],  # always None on the infer path
@@ -1922,7 +1905,7 @@ class EntryApp:
         Response shape (same schema as ``get_infer_status``)::
 
             {
-              "queue_position": int,          # live count down to 0
+              "queue_position": int,          # 1-based rank; 1 = running, 0 = done
               "submitted_at":   float,        # ts when the run was queued
               "model_download": float | None, # ts when download step started (always set once reached)
               "env_setup":      float | None, # ts (custom-env runs only)
@@ -2289,7 +2272,7 @@ class EntryApp:
         Response shape (same schema as ``get_test_status``)::
 
             {
-              "queue_position": int,          # live count down to 0
+              "queue_position": int,          # 1-based rank; 1 = running, 0 = done
               "submitted_at":   float,        # ts when the request was queued
               "model_download": float | None, # ts when download step started (always set once reached)
               "env_setup":      float | None, # always None on the infer path
