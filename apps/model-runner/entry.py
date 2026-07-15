@@ -1156,6 +1156,173 @@ class EntryApp:
             except OSError:
                 pass
 
+    # === HuggingFace-gated weight localization (package preparation) ===
+
+    # ``bioimageio.core`` resolves a remote weight ``source`` with a plain
+    # ``httpx.get`` and no auth header, so a gated ``huggingface.co`` URL
+    # (e.g. ``facebook/sam3``) returns 401 in the test/infer subprocess —
+    # which is also where ``_safe_subprocess_env`` strips every ``*TOKEN*``
+    # var. So we fetch such weights here instead, during package
+    # preparation in the trusted EntryApp process, with the read-only HF
+    # token, and repoint the local RDF ``source`` at the downloaded file.
+    # The subprocess then loads a local file with no HF access and never
+    # sees the token. Same shape as ``_prebuild_conda_envs``: EntryApp
+    # prepares artifacts on the shared PVC-backed HOME, the RuntimeApp
+    # subprocess consumes them.
+    _HF_WEIGHTS_DIRNAME = ".hf_weights"
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        import hashlib
+
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    async def _stream_download(
+        self, url: str, dest: Path, headers: Dict[str, str]
+    ) -> None:
+        """Stream a (potentially multi-GB) file to ``dest`` off the loop.
+
+        Never holds the whole body in memory — chunks are written through
+        ``aiofiles`` so the event loop stays responsive during the download.
+        """
+        import aiofiles
+
+        timeout = httpx.Timeout(60.0, read=300.0)
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True
+        ) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                resp.raise_for_status()
+                async with aiofiles.open(dest, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                        await f.write(chunk)
+
+    async def _ensure_hf_weight_file(
+        self,
+        url: str,
+        local_path: Path,
+        expected_sha: Optional[str],
+        token: str,
+        model_id: str,
+        fmt: str,
+    ) -> bool:
+        """Download ``url`` to ``local_path`` (HF-authenticated) if not
+        already present with the expected sha256. Returns True iff the file
+        is in place and (when a sha is declared) verified.
+        """
+        if await asyncio.to_thread(local_path.exists):
+            if not expected_sha or await asyncio.to_thread(
+                self._sha256_file, local_path
+            ) == expected_sha:
+                logger.info(
+                    f"✅ Reusing cached HF weight for '{model_id}' [{fmt}]: "
+                    f"{local_path.name}"
+                )
+                return True
+            await asyncio.to_thread(local_path.unlink, True)
+
+        await asyncio.to_thread(
+            lambda: local_path.parent.mkdir(parents=True, exist_ok=True)
+        )
+        tmp = local_path.with_name(local_path.name + ".partial")
+        logger.info(
+            f"🤗 Downloading gated HF weight for '{model_id}' [{fmt}] from {url}"
+        )
+        try:
+            await self._stream_download(
+                url, tmp, {"Authorization": f"Bearer {token}"}
+            )
+        except Exception as e:
+            await asyncio.to_thread(tmp.unlink, True)
+            logger.error(
+                f"❌ Failed to download HF weight for '{model_id}' [{fmt}]: {e}"
+            )
+            return False
+
+        if expected_sha:
+            actual = await asyncio.to_thread(self._sha256_file, tmp)
+            if actual != expected_sha:
+                await asyncio.to_thread(tmp.unlink, True)
+                logger.error(
+                    f"❌ HF weight sha256 mismatch for '{model_id}' [{fmt}]: "
+                    f"expected {expected_sha}, got {actual}"
+                )
+                return False
+
+        await asyncio.to_thread(tmp.rename, local_path)
+        logger.info(
+            f"✅ Downloaded HF weight for '{model_id}' [{fmt}]: {local_path.name}"
+        )
+        return True
+
+    async def _localize_hf_weights(self, package, model_id: str) -> None:
+        """Replace gated ``huggingface.co`` weight sources in the cached RDF
+        with locally-downloaded copies (see the section comment above).
+
+        No-op for models without such a source. Idempotent — the weight file
+        persists under a dot-dir the cache's file-delete step ignores, so a
+        re-run only re-downloads after a real package refresh.
+        """
+        import aiofiles
+
+        rdf_path = Path(package.source)
+        try:
+            async with aiofiles.open(rdf_path, "r") as f:
+                content = await f.read()
+            rdf = await asyncio.to_thread(yaml.safe_load, content)
+        except (OSError, yaml.YAMLError) as e:
+            logger.warning(
+                f"⚠️ Could not read RDF for HF weight localization of "
+                f"'{model_id}': {e}"
+            )
+            return
+
+        weights = (rdf or {}).get("weights") or {}
+        if not isinstance(weights, dict):
+            return
+
+        token = os.getenv("HF_READ_TOKEN")
+        changed = False
+        for fmt, entry in weights.items():
+            if not isinstance(entry, dict):
+                continue
+            source = entry.get("source")
+            if not isinstance(source, str) or not source.startswith(
+                "https://huggingface.co/"
+            ):
+                continue
+            basename = source.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+            if not basename:
+                continue
+            if not token:
+                logger.warning(
+                    f"⚠️ Model '{model_id}' weight '{fmt}' has gated HuggingFace "
+                    f"source '{source}' but HF_READ_TOKEN is not set — leaving it "
+                    f"unchanged; bioimageio will fail to download it."
+                )
+                continue
+            local_path = package.package_path / self._HF_WEIGHTS_DIRNAME / basename
+            if not await self._ensure_hf_weight_file(
+                source, local_path, entry.get("sha256"), token, model_id, fmt
+            ):
+                continue
+            entry["source"] = f"{self._HF_WEIGHTS_DIRNAME}/{basename}"
+            changed = True
+
+        if changed:
+            rewritten = await asyncio.to_thread(
+                yaml.safe_dump, rdf, sort_keys=False
+            )
+            async with aiofiles.open(rdf_path, "w") as f:
+                await f.write(rewritten)
+            logger.info(
+                f"🤗 Localized gated HuggingFace weight source(s) for '{model_id}'."
+            )
+
     async def _get_download_url(self, file_path: str) -> str:
         # Temporary S3 file path — resolve to a presigned download URL
         try:
@@ -1652,6 +1819,11 @@ class EntryApp:
         # Use context manager to track access and prevent eviction during test
         async with package:
             logger.info(f"📍 Model source for '{model_id}': {package.source}")
+
+            # Package preparation: fetch any gated huggingface.co weight
+            # source with the HF token and repoint the RDF at the local copy,
+            # so the test subprocess loads it offline without the token.
+            await self._localize_hf_weights(package, model_id)
             test_report: Optional[dict] = None
             tested_at: Optional[float] = None
             should_run_test = True
@@ -2228,6 +2400,13 @@ class EntryApp:
                     f"{package.source} "
                     f"(latest_remote_modified: {package.latest_remote_modified})"
                 )
+
+                # Package preparation: fetch any gated huggingface.co weight
+                # source with the HF token and repoint the RDF at the local
+                # copy, so the infer subprocess loads it offline without the
+                # token.
+                await self._localize_hf_weights(package, model_id)
+
                 # Move to ``running`` before the RPC. The RPC itself
                 # may queue at the runtime router; the poll refines
                 # ``running_ts`` from the state.json marker.
