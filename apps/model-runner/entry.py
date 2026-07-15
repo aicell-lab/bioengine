@@ -341,6 +341,29 @@ class EntryApp:
         logger.debug(f"📦 Bioimage.io package versions: {versions}")
         return versions
 
+    def _report_is_current(
+        self, report: dict, package, current_versions: Dict[str, str]
+    ) -> bool:
+        """Whether ``report`` can be reused instead of re-running the test.
+
+        A report is current when the model files have not changed since it
+        was produced (same ``latest_remote_modified``) and every tracked
+        runtime package matches the installed version. Same criteria used
+        for the on-disk ``.test_cache.json`` and the collection fallback.
+        """
+        if report.get("latest_remote_modified") != package.latest_remote_modified:
+            return False
+        report_versions = {
+            str(row[0]): str(row[1])
+            for row in report.get("env", [])
+            if isinstance(row, (list, tuple)) and len(row) >= 2
+            and str(row[0]) in current_versions
+        }
+        return all(
+            report_versions.get(name) == installed
+            for name, installed in current_versions.items()
+        )
+
     def _stamp_runtime_versions_in_test_env(self, test_report: dict) -> dict:
         """Upsert runtime-identity rows in ``test_report['env']``.
 
@@ -1516,6 +1539,11 @@ class EntryApp:
             package has not changed (same ``latest_remote_modified``) AND the cached
             ``test_report['env']`` versions for ``bioimageio.core`` and
             ``bioimageio.spec`` match the currently installed versions.
+        - When the local cache is absent (evicted / fresh package download),
+            the published report in the ``bioimage-io/test-reports`` collection
+            is reused instead — subject to the same currency check — and the
+            local cache is warmed from it. This survives package eviction and
+            replica restarts without re-running the test.
         - ``skip_cache=True`` forces a complete model package re-download,
             bypasses cached test results, and runs a fresh test.
 
@@ -1628,6 +1656,9 @@ class EntryApp:
             tested_at: Optional[float] = None
             should_run_test = True
             should_cache_report = True
+            # A loaded-but-stale local report means the model or env changed,
+            # so the collection report is stale too — skip the fallback then.
+            local_report_stale = False
 
             # Check for cached test results
             test_report_path = package.package_path / ".test_cache.json"
@@ -1635,63 +1666,54 @@ class EntryApp:
 
             if not skip_cache and await asyncio.to_thread(test_report_path.exists):
                 try:
-                    # Load cached test results
                     async with aiofiles.open(test_report_path, "r") as f:
                         content = await f.read()
                         cached_data = await asyncio.to_thread(json.loads, content)
 
-                    # Check if model files have changed since last test
-                    cached_remote_modified = cached_data["latest_remote_modified"]
-                    model_unchanged = (
-                        package.latest_remote_modified == cached_remote_modified
-                    )
-
-                    # Validate cached environment versions against currently installed packages.
-                    cached_test_report = cached_data["test_report"]
-                    cached_env = cached_test_report.get("env", [])
-                    cached_env_versions: Dict[str, str] = {}
-
-                    for row in cached_env:
-                        if isinstance(row, (list, tuple)) and len(row) >= 2:
-                            pkg_name = str(row[0])
-                            pkg_version = str(row[1])
-                            if pkg_name in current_versions:
-                                cached_env_versions[pkg_name] = pkg_version
-
-                    env_versions_match = True
-                    for pkg_name, installed_version in current_versions.items():
-                        cached_version = cached_env_versions.get(pkg_name)
-                        if cached_version != installed_version:
-                            env_versions_match = False
-                            logger.info(
-                                f"🔄 Cached test env mismatch for '{model_id}' on {pkg_name}: "
-                                f"cached={cached_version}, installed={installed_version}. "
-                                f"Re-running tests."
-                            )
-
-                    if model_unchanged and env_versions_match:
-                        # Model hasn't changed, return cached results
+                    cached_report = cached_data["test_report"]
+                    if self._report_is_current(
+                        cached_report, package, current_versions
+                    ):
                         logger.info(
                             f"💾 Model '{model_id}' unchanged since last test, using cached results."
                         )
-                        test_report = cached_data["test_report"]
+                        test_report = cached_report
                         tested_at = test_report["tested_at"]
                         should_run_test = False
                         should_cache_report = False
                     else:
-                        if model_unchanged and not env_versions_match:
-                            logger.info(
-                                f"🔄 Model '{model_id}' unchanged but test environment changed, re-running tests."
-                            )
-                        elif not model_unchanged:
+                        local_report_stale = True
+                        cached_remote_modified = cached_data["latest_remote_modified"]
+                        if package.latest_remote_modified != cached_remote_modified:
                             logger.info(
                                 f"🔄 Model '{model_id}' has been updated, re-running tests "
                                 f"(cached: {cached_remote_modified}, current: {package.latest_remote_modified})"
+                            )
+                        else:
+                            logger.info(
+                                f"🔄 Model '{model_id}' unchanged but test environment changed, re-running tests."
                             )
                 except (json.JSONDecodeError, KeyError, OSError, IOError) as e:
                     logger.warning(
                         f"⚠️ Failed to load cached test results for '{model_id}': {e}. Running fresh test."
                     )
+
+            # Fall back to the published report in the collection when the
+            # local cache is absent (evicted / fresh package download).
+            if should_run_test and not skip_cache and not local_report_stale:
+                model_alias = model_id.rsplit("/", 1)[-1]
+                published = await self._read_published_report(model_alias, stage)
+                if published and self._report_is_current(
+                    published, package, current_versions
+                ):
+                    logger.info(
+                        f"💾 Reusing published test report for '{model_id}' from "
+                        f"'{self._TEST_REPORTS_COLLECTION}'."
+                    )
+                    test_report = published
+                    tested_at = test_report["tested_at"]
+                    should_run_test = False
+                    should_cache_report = True
 
             # Run the test unless we already accepted a cached result
             if should_run_test:
@@ -1788,7 +1810,9 @@ class EntryApp:
             # artifact. Set on both the fresh and the cached path.
             test_report["latest_remote_modified"] = package.latest_remote_modified
 
-            # Save test results only for fresh, successful calculations.
+            # Persist to disk for fresh successful runs and for reports
+            # reused from the collection, so the next run loads from disk
+            # instead of re-fetching the report from the collection.
             if should_cache_report:
                 try:
                     cache_data = {
@@ -1807,6 +1831,30 @@ class EntryApp:
             await self._upload_test_report(model_id, stage, test_report)
 
         return test_report
+
+    async def _read_published_report(
+        self, model_alias: str, stage: bool
+    ) -> Optional[dict]:
+        """Fetch the published test report for a model from the collection.
+
+        The report artifact is world-readable, so this is a plain HTTP GET
+        of the committed file — no artifact-manager RPC. Slot-aware:
+        ``staged/test_report.json`` when ``stage=True`` else
+        ``published/test_report.json``. Returns ``None`` when the artifact
+        or slot does not exist yet, so callers fall through to a fresh test.
+        """
+        slot = "staged" if stage else "published"
+        url = (
+            f"{self.server_url}/{self._TEST_REPORTS_WORKSPACE}/artifacts/"
+            f"test-report-{model_alias}/files/{slot}/test_report.json"
+        )
+        try:
+            response = await self.model_cache._get_url_with_retry(url, params=None)
+            if response.status_code != 200:
+                return None
+            return response.json()
+        except Exception:
+            return None
 
     async def _upload_test_report(
         self, model_id: str, stage: bool, test_report: dict
