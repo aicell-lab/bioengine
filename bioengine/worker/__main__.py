@@ -48,10 +48,11 @@ License: MIT
 import argparse
 import asyncio
 import json
+import os
 import shlex
 import signal
 import sys
-from typing import Dict
+from typing import Any, Dict
 
 from bioengine.worker import BioEngineWorker
 
@@ -487,6 +488,30 @@ def get_args_by_group(parser: argparse.ArgumentParser) -> Dict[str, Dict[str, an
     return group_configs
 
 
+def _expand_env_in_config(value: Any) -> Any:
+    """Recursively expand ``${VAR}`` / ``$VAR`` from the worker's own
+    environment in every string within a startup-application config.
+
+    This runs ONLY on operator-supplied ``--startup-applications`` config
+    (never on a tenant's ``deploy_app`` call), so it is safe to source
+    values from the worker's environment — including secrets mounted via
+    ``valueFrom.secretKeyRef`` (the same way ``HYPHA_TOKEN`` reaches the
+    worker). It lets a startup app pull a k8s secret into an app's env
+    without writing the secret value into git-tracked helm values, e.g.::
+
+        "application_env_vars": {"*": {"_HF_READ_TOKEN": "${HF_READ_TOKEN}"}}
+
+    An unset ``${VAR}`` is left verbatim (``os.path.expandvars`` semantics).
+    """
+    if isinstance(value, str):
+        return os.path.expandvars(value)
+    if isinstance(value, dict):
+        return {k: _expand_env_in_config(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env_in_config(v) for v in value]
+    return value
+
+
 def read_startup_applications(
     group_configs: Dict[str, Dict[str, any]],
 ) -> Dict[str, Dict[str, any]]:
@@ -526,6 +551,11 @@ def read_startup_applications(
             application_config = json.loads(json_str.strip())
             if not isinstance(application_config, dict):
                 raise ValueError("Application configuration must be a JSON object")
+
+            # Resolve ${VAR} references (e.g. secrets injected into the
+            # worker env via valueFrom.secretKeyRef) so a startup app can
+            # carry a secret in its env without the value living in git.
+            application_config = _expand_env_in_config(application_config)
 
             # Validate required fields
             if "artifact_id" not in application_config:
