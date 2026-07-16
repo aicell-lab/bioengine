@@ -56,7 +56,13 @@ class ModelCache:
 
         self.timeout_threshold = self.per_file_download_timeout + 60.0  # 60s buffer
 
-        num_existing_models = len(list(self.cache_dir.glob("**/rdf.yaml")))
+        num_existing_models = len(
+            {
+                p.parent
+                for name in ("bioimageio.yaml", "rdf.yaml")
+                for p in self.cache_dir.glob(f"**/{name}")
+            }
+        )
         logger.info(
             f"🔄 Found {num_existing_models} existing models in cache at "
             f"{self.cache_dir}/. {'Starting model validation in the background.' if num_existing_models > 0 else ''}"

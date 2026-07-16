@@ -240,10 +240,10 @@ class RuntimeApp:
             env exec, ``bioimageio test`` inside the env). We swap
             ``conda`` → ``mamba`` on the first arg for the faster
             libmamba solver (both binaries ship in the replica image
-            at ``/home/ray/anaconda3/bin/``). Every env name seen
-            through ``-n <name>`` / ``--name=<name>`` is captured
-            and removed after the call — success or failure —
-            instead of leaving multi-GB envs on the pod disk.
+            at ``/home/ray/anaconda3/bin/``). Envs are pre-built and
+            cached on the shared PVC by the EntryApp (LRU eviction under
+            a size ceiling), so this side normally finds them present
+            and does not create or remove them.
 
         Enabling ``loguru`` output for the ``bioimageio`` namespace
         (spec + core) at replica init makes conda subprocess spawns
@@ -402,8 +402,9 @@ class RuntimeApp:
         When ``custom_environment=True``, the test runs inside the
         conda environment declared by the model's weights description
         (``bioimageio.core`` ``runtime_env="as-described"``). Env
-        creation uses ``mamba`` (via a swapping ``run_command``) and
-        the env is removed after the call.
+        creation uses ``mamba`` (via a swapping ``run_command``); envs
+        are pre-built and cached on the shared PVC by the EntryApp
+        (LRU-evicted under a size ceiling), not removed per call.
         """
         # GPU serialisation: ``max_ongoing_requests=10`` allows requests
         # to queue at the replica so the autoscaler sees them, but only

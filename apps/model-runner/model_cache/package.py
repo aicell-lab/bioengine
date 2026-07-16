@@ -33,10 +33,23 @@ class BioimageioPackage:
         replica_id: str,
     ) -> None:
         self.package_path = package_path
-        self.source = str(self.package_path / "rdf.yaml")
+        self.source = self._resolve_source(package_path)
         self.latest_remote_modified = latest_remote_modified
         self.replica_id = replica_id
         self._lock_file: Optional[Path] = None
+
+    @staticmethod
+    def _resolve_source(package_path: Path) -> str:
+        """Resolve the RDF path, preferring the new ``bioimageio.yaml`` name
+        over the legacy ``rdf.yaml``. Downloads preserve the artifact's own
+        filename, so a model may ship either. Falls back to ``rdf.yaml`` (also
+        what a not-found error message reads) when neither is present yet.
+        """
+        for name in ("bioimageio.yaml", "rdf.yaml"):
+            candidate = package_path / name
+            if candidate.exists():
+                return str(candidate)
+        return str(package_path / "rdf.yaml")
 
     async def __aenter__(self):
         """Create a per-use lock file so the model is not evicted while in use."""

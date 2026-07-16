@@ -178,6 +178,15 @@ class EntryApp:
         # in the common case.
         self._env_build_lock = asyncio.Lock()
 
+        # Refcount of conda envs currently needed by a live test (env name →
+        # number of in-flight tests using it). Env-build (this replica,
+        # ``_env_build_lock``) is decoupled from the GPU run (RuntimeApp
+        # ``_gpu_lock``), so a second test's prebuild could otherwise evict an
+        # env the first test is still running against. Eviction + the weekly
+        # sweep read this under ``_env_build_lock`` and never remove an env
+        # with a positive count.
+        self._env_inuse: Dict[str, int] = {}
+
         # Async test-run registry. Every ``test()`` call schedules a
         # background job keyed by an opaque run id (``tj-<hex12>``);
         # values track state, step timestamps and (on completion) the
@@ -529,6 +538,30 @@ class EntryApp:
         except OSError as e:
             logger.debug(f"could not touch env {env_name}: {e}")
 
+    def _acquire_inuse_envs(self, names: List[str]) -> None:
+        """Mark envs as in use for the duration of a test. Call under
+        ``_env_build_lock`` so eviction/sweep (which read the counter under
+        the same lock) can never race an acquire.
+        """
+        for name in names:
+            self._env_inuse[name] = self._env_inuse.get(name, 0) + 1
+
+    def _release_inuse_envs(self, names: List[str]) -> None:
+        """Release envs once a test no longer needs them. Synchronous (never
+        awaits), so it can't interleave with a locked eviction read; no lock
+        needed.
+        """
+        for name in names:
+            remaining = self._env_inuse.get(name, 0) - 1
+            if remaining > 0:
+                self._env_inuse[name] = remaining
+            else:
+                self._env_inuse.pop(name, None)
+
+    def _inuse_env_names(self) -> set:
+        """Env names with a live test using them (positive refcount)."""
+        return {name for name, count in self._env_inuse.items() if count > 0}
+
     async def _sweep_old_envs_if_due(self, env_vars: Dict[str, str]) -> None:
         """Age-based sweep: at most once per ``_CONDA_ENV_MAX_AGE_DAYS``.
 
@@ -551,9 +584,10 @@ class EntryApp:
             marker.touch()
             return
 
+        in_use = self._inuse_env_names()
         candidates = []
         for entry in envs_dir.iterdir():
-            if not entry.is_dir():
+            if not entry.is_dir() or entry.name in in_use:
                 continue
             try:
                 if entry.stat().st_mtime < cutoff:
@@ -579,12 +613,12 @@ class EntryApp:
     ) -> None:
         """LRU eviction: while the on-disk cache exceeds
         ``_conda_env_cache_max_gb``, remove the least-recently-used
-        env that isn't in ``protected`` (the envs the current test
-        needs).
+        env that isn't protected. Protected = ``protected`` (the envs the
+        current test needs) plus every env a concurrently running test is
+        using (``_inuse_env_names``), so a running test never loses its env.
 
-        Approximate: uses ``du -sk`` per env, not fsync-accurate,
-        and ``mamba env remove`` on an in-use env silently fails.
-        Both are acceptable — the ceiling is a soft target.
+        Approximate: uses ``du -sk`` per env, not fsync-accurate, so the
+        ceiling is a soft target.
         """
         envs_dir = self._conda_envs_dir()
         if not envs_dir.exists():
@@ -610,7 +644,7 @@ class EntryApp:
             f"🧹 Conda env cache at {total / 1024**3:.1f} GB > "
             f"{self._conda_env_cache_max_gb:.0f} GB ceiling — LRU eviction"
         )
-        protected_set = set(protected)
+        protected_set = set(protected) | self._inuse_env_names()
         ranked = sorted(
             [
                 (mtime, name, size)
@@ -974,9 +1008,13 @@ class EntryApp:
                 return True
         return False
 
-    async def _prebuild_conda_envs(self, rdf_path: str, model_id: str) -> None:
+    async def _prebuild_conda_envs(self, rdf_path: str, model_id: str) -> List[str]:
         """CPU-side, non-blocking pre-creation of every conda env the
         model needs for ``custom_environment=True`` tests.
+
+        Returns the env names this test needs, each marked in use so
+        eviction/sweep won't reap them. The caller MUST pass the returned
+        list to ``_release_inuse_envs`` once ``runtime.test`` returns.
 
         Runs entirely on this EntryApp replica (no GPU held). Loads
         the model description, walks the present weight formats,
@@ -1027,7 +1065,7 @@ class EntryApp:
 
         if not env_specs:
             logger.info(f"🐍 No custom conda envs to prebuild for '{model_id}'.")
-            return
+            return []
 
         env_vars = self._mamba_env_vars()
         needed_env_names = [name for _, name, _ in env_specs]
@@ -1087,6 +1125,14 @@ class EntryApp:
             # so mtime wouldn't move otherwise.
             for name in needed_env_names:
                 self._touch_env(name)
+
+            # Mark in use before releasing the lock so a concurrent test's
+            # eviction (which also holds the lock) can't reap these while the
+            # GPU run below is using them. The caller MUST release via
+            # ``_release_inuse_envs`` once ``runtime.test`` returns.
+            self._acquire_inuse_envs(needed_env_names)
+
+        return needed_env_names
 
     async def _mamba_env_exists(self, env_name: str, env_vars: Dict[str, str]) -> bool:
         """Non-blocking existence check via
@@ -1550,19 +1596,24 @@ class EntryApp:
         """
         logger.info(f"📋 Downloading RDF for model '{model_id}' (stage={stage}).")
 
-        rdf_url = f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/rdf.yaml"
-        response = await self.model_cache._get_url_with_retry(
-            rdf_url, params={"stage": str(stage).lower()}
-        )
-
-        if response.status_code == 404 and stage:
-            # If staged version doesn't exist, try with stage=false
-            logger.warning(
-                f"⚠️ Staged RDF not found for model '{model_id}', trying committed version..."
-            )
+        # Prefer the new ``bioimageio.yaml`` name; fall back to legacy ``rdf.yaml``.
+        response = None
+        rdf_url = None
+        for rdf_name in ("bioimageio.yaml", "rdf.yaml"):
+            rdf_url = f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/{rdf_name}"
             response = await self.model_cache._get_url_with_retry(
-                rdf_url, params={"stage": "false"}
+                rdf_url, params={"stage": str(stage).lower()}
             )
+            if response.status_code == 404 and stage:
+                # If staged version doesn't exist, try with stage=false
+                logger.warning(
+                    f"⚠️ Staged RDF not found for model '{model_id}', trying committed version..."
+                )
+                response = await self.model_cache._get_url_with_retry(
+                    rdf_url, params={"stage": "false"}
+                )
+            if response.status_code != 404:
+                break
 
         try:
             response.raise_for_status()
@@ -1677,7 +1728,7 @@ class EntryApp:
         ),
         custom_environment: Optional[bool] = Field(
             False,
-            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation, env removed after the call). If False (default), run in the model-runner RuntimeApp's own venv — the same interpreter that serves inference.",
+            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False (default), run in the model-runner RuntimeApp's own venv — the same interpreter that serves inference.",
         ),
         skip_cache: Optional[bool] = Field(
             False,
@@ -1720,8 +1771,9 @@ class EntryApp:
             ``infer()``.
         - ``custom_environment=True``: the test runs inside the conda
             environment declared by the model's own weights description
-            (``bioimageio.core`` ``runtime_env="as-described"``), removed
-            after the call.
+            (``bioimageio.core`` ``runtime_env="as-described"``). The env is
+            cached on the shared PVC (LRU-evicted under a size ceiling, not
+            removed per call) and protected from eviction while in use.
 
         Report publishing:
         - The report is published to the dedicated
@@ -1890,6 +1942,7 @@ class EntryApp:
             # Run the test unless we already accepted a cached result
             if should_run_test:
                 tested_at = time.time()
+                needed_envs: List[str] = []
                 try:
                     # For ``custom_environment=True``: build every conda
                     # env the model needs on THIS EntryApp replica
@@ -1909,7 +1962,7 @@ class EntryApp:
                     # to pre-1.10.0 behavior with no correctness gap.
                     if custom_environment:
                         self._update_test_job(job, state="env_setup")
-                        await self._prebuild_conda_envs(
+                        needed_envs = await self._prebuild_conda_envs(
                             rdf_path=package.source,
                             model_id=model_id,
                         )
@@ -1971,6 +2024,10 @@ class EntryApp:
                     logger.warning(
                         f"⚠️ Generated fallback test report for '{model_id}' due to test error."
                     )
+                finally:
+                    # Release conda envs once the GPU run is done (success or
+                    # failure) so eviction can reclaim them again.
+                    self._release_inuse_envs(needed_envs)
 
                 test_report = self._stamp_runtime_versions_in_test_env(test_report)
 
