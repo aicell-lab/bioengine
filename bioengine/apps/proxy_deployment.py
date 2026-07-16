@@ -428,6 +428,26 @@ class ProxyDeployment:
             # Semaphore bounds concurrency for both WebSocket and WebRTC entry paths —
             # they share this single wrapper, so a long-running call from either
             # transport consumes one slot until it returns.
+            #
+            # Fail fast instead of queueing unboundedly when at capacity: a
+            # blocked caller still holds its decoded payload (e.g. an inference
+            # image) in this actor's memory while it waits, so an open-ended
+            # backlog grows proxy memory without limit. Because we reject rather
+            # than await, the semaphore never accumulates waiters — so
+            # ``.locked()`` means "no free slot", and there is no ``await``
+            # between this check and the acquire below, making the decision
+            # race-free.
+            if self.service_semaphore.locked():
+                logger.warning(
+                    f"⚠️ '{self.application_id}' at capacity "
+                    f"({self.max_ongoing_requests} concurrent requests); "
+                    f"rejecting '{method_name}'."
+                )
+                raise RuntimeError(
+                    f"Application '{self.application_id}' has reached its maximum "
+                    f"of {self.max_ongoing_requests} concurrent requests. Please "
+                    f"try again in a moment."
+                )
             async with self.service_semaphore:
                 try:
                     await self._check_permissions(context, method_name=method_name)
