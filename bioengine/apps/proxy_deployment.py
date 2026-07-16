@@ -445,8 +445,8 @@ class ProxyDeployment:
                 )
                 raise RuntimeError(
                     f"Application '{self.application_id}' has reached its maximum "
-                    f"of {self.max_ongoing_requests} concurrent requests and is "
-                    f"currently very busy. Please try again in a moment."
+                    f"of {self.max_ongoing_requests} concurrent requests. Please "
+                    f"try again in a moment."
                 )
             async with self.service_semaphore:
                 try:
