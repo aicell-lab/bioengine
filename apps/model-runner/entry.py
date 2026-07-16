@@ -1537,14 +1537,23 @@ class EntryApp:
             )
 
             if not ignore_checks:
-                report = await self.artifact_manager.read_file(
-                    self._INFERENCE_REPORT_ARTIFACT,
-                    file_path=self._INFERENCE_REPORT_FILE,
-                    format="json",
+                # Fetch the inference report over HTTP instead of
+                # artifact_manager.read_file(format="json"): read_file
+                # truncates the payload near 64 KB, and this report has
+                # grown past that (JSONDecodeError: Unterminated string),
+                # breaking search for every non-ignore_checks call. The
+                # files endpoint returns the whole file, matching how
+                # get_model_rdf / _read_published_report already fetch.
+                workspace, alias = self._INFERENCE_REPORT_ARTIFACT.split("/", 1)
+                report_url = (
+                    f"{self.server_url}/{workspace}/artifacts/{alias}"
+                    f"/files/{self._INFERENCE_REPORT_FILE}"
                 )
-                inference_results = (
-                    report.get("content") if isinstance(report, dict) else None
-                ) or {}
+                response = await self.model_cache._get_url_with_retry(
+                    report_url, params=None
+                )
+                response.raise_for_status()
+                inference_results = response.json()
                 runnable_models = {
                     model_id
                     for model_id, result in inference_results.items()
