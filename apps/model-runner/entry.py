@@ -2034,6 +2034,14 @@ class EntryApp:
                 # Add tested_at timestamp to the test report so the report is self-contained.
                 test_report["tested_at"] = tested_at
 
+                # Label which environment the test actually ran in. Uses the
+                # possibly-downgraded ``custom_environment`` (a model that
+                # declares no environment.yaml falls back to standard above),
+                # so the label reflects reality, not just the request.
+                test_report["test_environment"] = (
+                    "custom" if custom_environment else "standard"
+                )
+
             # Record the model artifact's last file-change time in the report
             # so consumers can tell whether a stored report is current with the
             # artifact. Set on both the fresh and the cached path.
