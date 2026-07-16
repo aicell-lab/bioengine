@@ -119,6 +119,7 @@ Notes:
 **Service ID**: `bioimage-io/model-runner` · **Server**: `https://hypha.aicell.io`
 
 ```python
+import asyncio
 from hypha_rpc import connect_to_server
 
 server = await connect_to_server({"server_url": "https://hypha.aicell.io", "token": token})
@@ -130,25 +131,33 @@ models = await svc.search_models(keywords=["nuclei", "segmentation"], limit=10)
 # Get model metadata
 rdf = await svc.get_model_rdf(model_id="affable-shark")
 
-# Run BioImage.IO compliance tests (async: returns a run id, then poll)
+# Run BioImage.IO compliance tests (async: test() returns a run id, then poll)
 test_run_id = await svc.test(model_id="affable-shark")
-status = await svc.get_test_status(test_run_id=test_run_id)
-# poll until status["progress"]["state"] in ("completed", "failed");
-# status["test_report"] holds the report once state == "completed"
+while True:
+    status = await svc.get_test_status(test_run_id=test_run_id)
+    if status["completed_at"] is not None:   # terminal; queue_position == 0
+        break
+    await asyncio.sleep(2)
+report = status["result"]                    # the test report, or {"error": ...} on failure
+print(report["status"])                      # "passed", "valid-format", or "failed"
 
 # Get model documentation (README) to verify domain compatibility
 doc = await svc.get_model_documentation(model_id="affable-shark")
 ```
 
-For inference, use the `scripts/utils.py` helpers — they handle upload, RPC, and download automatically:
+Inference is also asynchronous — `infer()` returns a `request_id`; poll `get_infer_status`
+until the result is ready. `inputs` accepts an HTTPS URL or a file path from `get_upload_url`:
 
 ```python
-# From skills/bioengine/apps/model-runner/scripts/utils.py
-from scripts.utils import infer_http, normalize_image, prepare_image_for_model
+import asyncio
 
-image = normalize_image(raw_image)                   # percentile normalization (p1–p99.8)
-tensor = prepare_image_for_model(image, axes="bcyx") # reshape to model input axes
-pred = infer_http(model_id, tensor)                  # upload → infer → download
+request_id = await svc.infer(model_id="affable-shark", inputs="<url-or-upload-file-path>")
+while True:
+    status = await svc.get_infer_status(request_id=request_id)
+    if status["completed_at"] is not None:
+        break
+    await asyncio.sleep(1)
+result = status["result"]                    # dict keyed by output id, or {"error": ...}
 ```
 
 ### Key pitfalls
