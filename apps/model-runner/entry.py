@@ -2169,7 +2169,14 @@ class EntryApp:
                         f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}", silent=True
                     )
                     model_manifest = model_artifact.get("manifest") or {}
-                    for key in ("name", "id", "description", "id_emoji"):
+                    for key in (
+                        "name",
+                        "id",
+                        "description",
+                        "id_emoji",
+                        "tags",
+                        "covers",
+                    ):
                         if key in model_manifest:
                             model_meta[key] = model_manifest[key]
                 except Exception as e:
