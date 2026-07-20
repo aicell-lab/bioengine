@@ -117,6 +117,10 @@ class EntryApp:
     _TEST_REPORTS_WORKSPACE = "bioimage-io"
     _TEST_REPORTS_COLLECTION = "bioimage-io/test-reports"
 
+    # Test outcome mapped to a numeric quality score, surfaced on the
+    # published test-report artifact's manifest for ranking.
+    _SCORE_BY_STATUS = {"failed": 0.0, "valid-format": 0.5, "passed": 1.0}
+
     # Inference results published by the bioimage.io inference workflow
     # (``scripts/bioengine_model_infer.py``) live in a single artifact
     # under the test-reports collection: ``inference_report.json`` is a
@@ -2127,33 +2131,69 @@ class EntryApp:
         async with lock:
             try:
                 try:
-                    await self.artifact_manager.read(report_artifact_id, silent=True)
+                    artifact = await self.artifact_manager.read(
+                        report_artifact_id, silent=True
+                    )
+                    manifest = dict(artifact.get("manifest") or {})
                 except Exception:
-                    await self._create_report_artifact(report_artifact_id, model_alias)
+                    manifest = None
 
                 # Skip a redundant commit when the stored report is identical
                 # (same ``tested_at`` — e.g. a cache-hit re-run).
-                try:
-                    existing_url = await self.artifact_manager.get_file(
-                        report_artifact_id, file_path=file_path
-                    )
-                    existing = (
-                        await self.model_cache._get_url_with_retry(
-                            existing_url, params=None
+                if manifest is not None:
+                    try:
+                        existing_url = await self.artifact_manager.get_file(
+                            report_artifact_id, file_path=file_path
                         )
-                    ).json()
-                    if float(existing.get("tested_at", -1.0)) == float(
-                        test_report.get("tested_at", 0.0)
-                    ):
-                        logger.info(
-                            f"ℹ️ {slot} test report for '{model_alias}' is up to "
-                            f"date; skipping upload."
-                        )
-                        return
-                except Exception:
-                    pass
+                        existing = (
+                            await self.model_cache._get_url_with_retry(
+                                existing_url, params=None
+                            )
+                        ).json()
+                        if float(existing.get("tested_at", -1.0)) == float(
+                            test_report.get("tested_at", 0.0)
+                        ):
+                            logger.info(
+                                f"ℹ️ {slot} test report for '{model_alias}' is up to "
+                                f"date; skipping upload."
+                            )
+                            return
+                    except Exception:
+                        pass
 
-                await self.artifact_manager.edit(report_artifact_id, stage=True)
+                # Mirror the model's identifying metadata from the bioimage.io
+                # collection so the test-reports collection is self-describing.
+                model_meta = {}
+                try:
+                    model_artifact = await self.artifact_manager.read(
+                        f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}", silent=True
+                    )
+                    model_manifest = model_artifact.get("manifest") or {}
+                    for key in ("name", "id", "description", "id_emoji"):
+                        if key in model_manifest:
+                            model_meta[key] = model_manifest[key]
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Could not copy model metadata for '{model_alias}': {e}"
+                    )
+
+                if manifest is None:
+                    manifest = await self._create_report_artifact(
+                        report_artifact_id, model_alias, model_meta
+                    )
+                else:
+                    manifest.update(model_meta)
+
+                # Only the published slot scores an artifact — a staged-only
+                # model has no committed version to rank.
+                if not stage:
+                    manifest["score"] = self._SCORE_BY_STATUS.get(
+                        test_report.get("status"), 0.0
+                    )
+
+                await self.artifact_manager.edit(
+                    report_artifact_id, manifest=manifest, stage=True
+                )
                 upload_url = await self.artifact_manager.put_file(
                     report_artifact_id, file_path=file_path
                 )
@@ -2174,32 +2214,30 @@ class EntryApp:
                 )
 
     async def _create_report_artifact(
-        self, report_artifact_id: str, model_alias: str
-    ) -> None:
+        self, report_artifact_id: str, model_alias: str, manifest: dict
+    ) -> dict:
         """Create the per-model report artifact under the test-reports
         collection, tolerating a concurrent creator by re-reading on failure.
+
+        ``manifest`` carries the model's identifying metadata copied by the
+        caller; a minimal name is substituted only when that copy came back
+        empty, since the artifact manager requires a non-empty manifest.
+        Returns the manifest the artifact was created with.
         """
+        manifest = dict(manifest) or {"name": f"test-report-{model_alias}"}
         try:
             await self.artifact_manager.create(
                 parent_id=self._TEST_REPORTS_COLLECTION,
                 alias=f"test-report-{model_alias}",
                 type="generic",
-                manifest={
-                    "name": f"Test report for {model_alias}",
-                    "description": (
-                        f"BioEngine model-runner test reports for "
-                        f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}. "
-                        f"published/test_report.json is the report for the "
-                        f"published model; staged/test_report.json for the "
-                        f"staged model."
-                    ),
-                },
+                manifest=manifest,
             )
             logger.info(f"🆕 Created report artifact '{report_artifact_id}'.")
         except Exception:
             # A concurrent call likely created it first; confirm it now exists,
             # else re-raise so the caller logs a real failure.
             await self.artifact_manager.read(report_artifact_id, silent=True)
+        return manifest
 
     @bioengine.method
     async def get_test_status(
