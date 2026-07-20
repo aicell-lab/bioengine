@@ -2192,10 +2192,15 @@ class EntryApp:
                     manifest.update(model_meta)
 
                 # Only the published slot scores an artifact — a staged-only
-                # model has no committed version to rank.
+                # model has no committed version to rank. ``score`` is the
+                # primary rank key, ``metadata_completeness`` the secondary;
+                # both default to 0.0 so an incomplete report ranks low.
                 if not stage:
                     manifest["score"] = self._SCORE_BY_STATUS.get(
                         test_report.get("status"), 0.0
+                    )
+                    manifest["metadata_completeness"] = test_report.get(
+                        "metadata_completeness", 0.0
                     )
 
                 await self.artifact_manager.edit(
