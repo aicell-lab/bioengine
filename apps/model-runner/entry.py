@@ -699,6 +699,12 @@ class EntryApp:
             "model_download_ts": None,
             "env_setup_ts": None,
             "running_ts": None,
+            # Execution-start timestamps (position #0 reached), distinct
+            # from the ``*_ts`` queue-entry marks above. ``env_started_ts``
+            # is stamped when the env-build lock is acquired;
+            # ``run_started_ts`` when the GPU run actually starts.
+            "env_started_ts": None,
+            "run_started_ts": None,
             "state": "queued",
             "started_at": now,
             "completed_at": None,
@@ -735,57 +741,158 @@ class EntryApp:
         if result is not None:
             job["result"] = result
 
-    def _queue_position(self, job: dict, registry: dict) -> int:
-        """1-based rank of ``job`` among the live (non-terminal) jobs in
-        ``registry``, ordered by submission time.
+    def _env_queue_position(self, job: dict) -> Optional[int]:
+        """0-based position in the env-build queue, or None when the job
+        is not currently in the ``env_setup`` stage.
 
-        Position 1 is the job at the front of the line — the one
-        currently running the infer/test call; position N has N-1 calls
-        ahead of it. A completed or failed job has left the queue and
-        reports 0.
+        The single ``_env_build_lock`` serializes conda-env prebuild across
+        test runs, so this is a real FIFO queue: 0 = building now, N = N
+        env-setup jobs entered the stage ahead of this one. Ordered by
+        ``env_setup_ts`` (stage-entry time) so the number only decreases.
+        Infer never enters ``env_setup``, so this is test-only.
         """
-        if job["state"] in ("completed", "failed"):
-            return 0
-        return 1 + sum(
+        if job["state"] != "env_setup":
+            return None
+        ts = job["env_setup_ts"]
+        return sum(
             1
-            for other in registry.values()
-            if other is not job
-            and other["state"] not in ("completed", "failed")
-            and other["started_at"] < job["started_at"]
+            for other in self._test_jobs.values()
+            if other["state"] == "env_setup"
+            and other["env_setup_ts"] is not None
+            and other["env_setup_ts"] < ts
         )
+
+    def _run_queue_position(self, job: dict) -> Optional[int]:
+        """0-based position in the combined test+infer GPU queue, or None
+        when the job is not currently in the ``running`` stage.
+
+        Test and infer share one ``_gpu_lock`` per runtime replica, so the
+        queue counts jobs of BOTH kinds. Ordered by ``running_ts``
+        (stage-entry time): 0 = on the GPU, N = N run-stage jobs ahead. The
+        runtime autoscales to 2 replicas, so up to 2 jobs legitimately run
+        at once — a job can drop 2→0 when both free together.
+        """
+        if job["state"] != "running":
+            return None
+        ts = job["running_ts"]
+        if ts is None:
+            return 0
+        return sum(
+            1
+            for registry in (self._test_jobs, self._infer_jobs)
+            for other in registry.values()
+            if other["state"] == "running"
+            and other["running_ts"] is not None
+            and other["running_ts"] < ts
+        )
+
+    def _queue_position(self, job: dict) -> int:
+        """Flat 0-based position in the queue of the job's CURRENT stage.
+
+        Bridges the pre-``stages`` schema: 0 while executing (or
+        downloading, queued, or terminal — model download is never
+        queued), N while N jobs are ahead in the active env-build or GPU
+        queue. See ``_env_queue_position`` / ``_run_queue_position``.
+        """
+        if job["state"] == "env_setup":
+            return self._env_queue_position(job)
+        if job["state"] == "running":
+            return self._run_queue_position(job)
+        return 0
+
+    def _stage_timeline(self, job: dict) -> dict:
+        """Per-stage ``{start, end[, queue_position]}`` timeline, shared by
+        the test and infer progress dicts.
+
+        Each stage's ``start`` is the *execution* start — the moment it
+        reaches queue position #0 and actually begins (env-build lock
+        acquired / GPU run started), not when it joined the queue. So
+        ``start`` is None while a stage is still queued (position > 0), and
+        set once it runs. A stage's ``end`` is the next stage's queue-entry
+        mark, falling back to ``completed_at`` once terminal.
+        ``model_download`` carries no ``queue_position`` — distinct models
+        download concurrently, so it is never queued.
+        """
+        download_ts = job["model_download_ts"]
+        env_entry_ts = job["env_setup_ts"]
+        run_entry_ts = job["running_ts"]
+        done_ts = job["completed_at"]
+        run_start = job["run_started_ts"]
+        if run_start is None and job["state"] in ("completed", "failed"):
+            # A run that finished before any poll caught it at position #0
+            # never got a live execution stamp; fall back to its GPU-queue
+            # entry mark so a terminal stage still reports a start.
+            run_start = run_entry_ts
+        return {
+            "model_download": {
+                "start": download_ts,
+                "end": env_entry_ts or run_entry_ts or done_ts,
+            },
+            "env_setup": {
+                "start": job["env_started_ts"],
+                "end": run_entry_ts or done_ts,
+                "queue_position": self._env_queue_position(job),
+            },
+            "run": {
+                "start": run_start,
+                "end": done_ts,
+                "queue_position": self._run_queue_position(job),
+            },
+        }
 
     def _job_progress(self, job: dict) -> dict:
         """Return the progress dict for a test run.
 
         Schema is shared with ``_infer_job_progress`` so both endpoints
         speak the same shape — a monotonic timeline bracketed by
-        ``submitted_at`` / ``completed_at`` plus a live queue gauge:
+        ``submitted_at`` / ``completed_at``:
 
-        * ``queue_position`` — 1-based rank in line: 1 while this run is
-          the one currently being processed, N while N-1 runs are ahead
-          of it, 0 once terminal. See ``_queue_position``.
+        * ``queue_position`` — flat 0-based position in the job's current
+          stage: 0 while executing/downloading/terminal, N while N jobs are
+          ahead in the active env-build or GPU queue. See ``stages`` for
+          the per-stage breakdown; model download is never queued.
         * ``submitted_at`` — unix ts when the run was accepted (queued).
         * ``model_download`` — unix ts when the download step started;
           always set. The step checks the remote file list and updates
           only outdated files, so its duration is near-zero on a fully
           cached model and grows with how much needs downloading.
-        * ``env_setup`` — unix ts when conda-env prebuild started, or
-          None on non-custom-env runs.
-        * ``running`` — unix ts when ``runtime.test`` was invoked.
+        * ``env_setup`` — unix ts when conda-env prebuild joined the queue,
+          or None on non-custom-env runs. See ``stages.env_setup.start``
+          for the execution start.
+        * ``running`` — unix ts when the GPU run actually started (position
+          #0), or the dispatch ts while still queued for the GPU.
         * ``completed_at`` — unix ts when the run finished (result ready
           or failed), recorded server-side at completion so the elapsed
           time is accurate regardless of poll cadence; None until then.
         * ``result`` — the test report on success, ``{"error": str}``
           on failure, else None.
+        * ``stages`` — per-stage ``{start, end[, queue_position]}`` map for
+          model_download / env_setup / run. See ``_stage_timeline``.
         """
+        # Lazy-stamp the run execution-start the first time this job is
+        # observed at GPU-queue position #0. The test path has no runtime
+        # state.json (infer reads ``runtime_started_at`` instead), so the
+        # entry records the moment it sees the run reach the front.
+        if (
+            job["run_started_ts"] is None
+            and job["state"] == "running"
+            and self._run_queue_position(job) == 0
+        ):
+            job["run_started_ts"] = time.time()
+        run_start = (
+            job["run_started_ts"]
+            if job["run_started_ts"] is not None
+            else job["running_ts"]
+        )
         return {
-            "queue_position": self._queue_position(job, self._test_jobs),
+            "queue_position": self._queue_position(job),
             "submitted_at": job["started_at"],
             "model_download": job["model_download_ts"],
             "env_setup": job["env_setup_ts"],
-            "running": job["running_ts"],
+            "running": run_start,
             "completed_at": job["completed_at"],
             "result": job["result"],
+            "stages": self._stage_timeline(job),
         }
 
     # === Async infer-job registry ===
@@ -831,6 +938,12 @@ class EntryApp:
             "model_download_ts": None,
             "env_setup_ts": None,
             "running_ts": None,
+            # Execution-start timestamps (position #0 reached).
+            # ``env_started_ts`` is never set on the infer path (no env
+            # prebuild); ``run_started_ts`` is filled from the runtime's
+            # ``runtime_started_at`` marker.
+            "env_started_ts": None,
+            "run_started_ts": None,
             "state": "queued",
             "started_at": now,
             "completed_at": None,
@@ -902,17 +1015,17 @@ class EntryApp:
         """Return the progress dict for an infer request.
 
         Same schema as ``_job_progress`` (test): a monotonic timeline
-        bracketed by ``submitted_at`` / ``completed_at`` plus the live
-        ``queue_position`` gauge. ``env_setup`` is always None on the
-        infer path since there's no per-model environment prebuild.
+        bracketed by ``submitted_at`` / ``completed_at`` plus the flat
+        ``queue_position`` and the per-stage ``stages`` map. ``env_setup``
+        is always None on the infer path since there's no per-model
+        environment prebuild, so its ``stages`` entry never queues.
         """
-        # Lazy-fill ``running_ts`` from ``state.json`` on the shared
-        # PVC. Once the runtime has acquired ``_gpu_lock`` for this
-        # request it writes ``runtime_started_at`` — the entry treats
-        # that moment as the true "start of GPU work" so the reported
-        # ``running`` ts reflects when the request actually left the
-        # runtime-side queue.
-        if job["running_ts"] is None and job["state"] not in (
+        # Fill the run execution-start from ``state.json`` on the shared
+        # PVC. Once the runtime has acquired ``_gpu_lock`` for this request
+        # it writes ``runtime_started_at`` — the true "start of GPU work",
+        # kept distinct from ``running_ts`` (the dispatch mark used for
+        # queue ordering).
+        if job["run_started_ts"] is None and job["state"] not in (
             "queued",
             "model_download",
             "completed",
@@ -920,16 +1033,22 @@ class EntryApp:
         ):
             state_file = self._read_runtime_state_file(job["job_id"])
             if state_file and "runtime_started_at" in state_file:
-                job["running_ts"] = float(state_file["runtime_started_at"])
+                job["run_started_ts"] = float(state_file["runtime_started_at"])
 
+        run_start = (
+            job["run_started_ts"]
+            if job["run_started_ts"] is not None
+            else job["running_ts"]
+        )
         return {
-            "queue_position": self._queue_position(job, self._infer_jobs),
+            "queue_position": self._queue_position(job),
             "submitted_at": job["started_at"],
             "model_download": job["model_download_ts"],
             "env_setup": job["env_setup_ts"],  # always None on the infer path
-            "running": job["running_ts"],
+            "running": run_start,
             "completed_at": job["completed_at"],
             "result": job["result"],
+            "stages": self._stage_timeline(job),
         }
 
     # === Conda env name computation (matches bioimageio.core) ===
@@ -1012,7 +1131,9 @@ class EntryApp:
                 return True
         return False
 
-    async def _prebuild_conda_envs(self, rdf_path: str, model_id: str) -> List[str]:
+    async def _prebuild_conda_envs(
+        self, rdf_path: str, model_id: str, job: Optional[dict] = None
+    ) -> List[str]:
         """CPU-side, non-blocking pre-creation of every conda env the
         model needs for ``custom_environment=True`` tests.
 
@@ -1080,6 +1201,11 @@ class EntryApp:
         # that's OK — mamba probes take <1s and eviction/sweep are
         # cheap when there's nothing to do.
         async with self._env_build_lock:
+            # Lock acquired ⇒ this job is now at env-queue position #0 and
+            # the build actually begins; stamp the execution-start.
+            if job is not None and job["env_started_ts"] is None:
+                job["env_started_ts"] = time.time()
+
             # Weekly age-based sweep — remove envs untouched for
             # more than ``_CONDA_ENV_MAX_AGE_DAYS`` days. Marker
             # file gates frequency so this is at most a per-week
@@ -1975,6 +2101,7 @@ class EntryApp:
                         needed_envs = await self._prebuild_conda_envs(
                             rdf_path=package.source,
                             model_id=model_id,
+                            job=job,
                         )
 
                     self._update_test_job(job, state="running")
@@ -2203,8 +2330,14 @@ class EntryApp:
                         "metadata_completeness", 0.0
                     )
 
+                # Publishing a committed model upgrades the report artifact
+                # type to ``published-model`` (sticky — a later staged
+                # upload omits ``type`` so it never downgrades).
+                edit_kwargs = {"manifest": manifest, "stage": True}
+                if not stage:
+                    edit_kwargs["type"] = "published-model"
                 await self.artifact_manager.edit(
-                    report_artifact_id, manifest=manifest, stage=True
+                    report_artifact_id, **edit_kwargs
                 )
                 upload_url = await self.artifact_manager.put_file(
                     report_artifact_id, file_path=file_path
@@ -2241,7 +2374,7 @@ class EntryApp:
             await self.artifact_manager.create(
                 parent_id=self._TEST_REPORTS_COLLECTION,
                 alias=f"test-report-{model_alias}",
-                type="generic",
+                type="staged-model",
                 manifest=manifest,
             )
             logger.info(f"🆕 Created report artifact '{report_artifact_id}'.")
@@ -2264,7 +2397,9 @@ class EntryApp:
         Response shape (same schema as ``get_infer_status``)::
 
             {
-              "queue_position": int,          # 1-based rank; 1 = running, 0 = done
+              "queue_position": int,          # 0-based position in the current stage's
+                                              # queue: 0 = running/downloading/done,
+                                              # N = N jobs ahead. Download is never queued.
               "submitted_at":   float,        # ts when the run was queued
               "model_download": float | None, # ts when download step started (always set once reached)
               "env_setup":      float | None, # ts (custom-env runs only)
@@ -2272,7 +2407,18 @@ class EntryApp:
               "completed_at":   float | None, # ts when finished, None until then
               "result":         dict | None,  # test report on success,
                                               # {"error": str} on failure
+              "stages": {                     # per-stage timeline + queue position
+                "model_download": {"start": float|None, "end": float|None},
+                "env_setup": {"start": float|None, "end": float|None,
+                              "queue_position": int|None},  # single-slot env-build queue
+                "run":       {"start": float|None, "end": float|None,
+                              "queue_position": int|None},  # combined test+infer GPU queue
+              },
             }
+
+        ``queue_position`` inside a stage is non-None only while the job is
+        in that stage: 0 = executing, N = N jobs ahead (up to 2 GPU jobs
+        may run at once, so ``run`` can drop 2→0).
 
         Runs are held for 24 hours after completion, then dropped. The
         registry is per-Entry replica and in-memory — a run started on
@@ -2637,7 +2783,9 @@ class EntryApp:
         Response shape (same schema as ``get_test_status``)::
 
             {
-              "queue_position": int,          # 1-based rank; 1 = running, 0 = done
+              "queue_position": int,          # 0-based position in the current stage's
+                                              # queue: 0 = running/downloading/done,
+                                              # N = N jobs ahead. Download is never queued.
               "submitted_at":   float,        # ts when the request was queued
               "model_download": float | None, # ts when download step started (always set once reached)
               "env_setup":      float | None, # always None on the infer path
@@ -2645,6 +2793,13 @@ class EntryApp:
               "completed_at":   float | None, # ts when finished, None until then
               "result":         dict | None,  # inference dict on success,
                                               # {"error": str} on failure
+              "stages": {                     # per-stage timeline + queue position
+                "model_download": {"start": float|None, "end": float|None},
+                "env_setup": {"start": None, "end": None,
+                              "queue_position": None},  # unused on the infer path
+                "run":       {"start": float|None, "end": float|None,
+                              "queue_position": int|None},  # combined test+infer GPU queue
+              },
             }
 
         On the FIRST poll after ``result`` becomes available the
