@@ -2134,10 +2134,15 @@ class EntryApp:
                 # Skip a redundant commit when the stored report is identical
                 # (same ``tested_at`` — e.g. a cache-hit re-run).
                 try:
-                    existing = await self.artifact_manager.read_file(
-                        report_artifact_id, file_path, format="json"
+                    existing_url = await self.artifact_manager.get_file(
+                        report_artifact_id, file_path=file_path
                     )
-                    if float(existing["content"].get("tested_at", -1.0)) == float(
+                    existing = (
+                        await self.model_cache._get_url_with_retry(
+                            existing_url, params=None
+                        )
+                    ).json()
+                    if float(existing.get("tested_at", -1.0)) == float(
                         test_report.get("tested_at", 0.0)
                     ):
                         logger.info(
