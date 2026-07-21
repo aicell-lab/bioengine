@@ -113,9 +113,11 @@ def introspect_app_in_ray_task(
     from bioengine._app.replica_init import _ensure_source
 
     # Apply env_vars from runtime_env onto the process so _ensure_source
-    # reads the same keys as the eventual replicas.
+    # reads the same keys as the eventual replicas. Overwrite (not
+    # setdefault): this build's version/URI must win even on a worker whose
+    # process env somehow already carries a prior build's values.
     for key, value in env_vars.items():
-        os.environ.setdefault(key, value)
+        os.environ[key] = value
 
     app_dir = Path(env_vars["BIOENGINE_APP_DIR"])
     version = env_vars.get("BIOENGINE_ARTIFACT_VERSION", "")
@@ -510,11 +512,12 @@ def build_and_run_application(
 
     # Re-apply env_vars from the task's runtime_env so the source loader
     # below sees the same BIOENGINE_* keys as the eventual replicas.
+    # Overwrite (not setdefault) so this build's values win.
     for key, value in replica_env_vars.items():
-        os.environ.setdefault(key, value)
+        os.environ[key] = value
     # The Ray-GCS source URI lives on the task env explicitly; replicas
     # get it via per-deployment env_vars injected in `_with_pkg`.
-    os.environ.setdefault("BIOENGINE_APP_SOURCE_URI", app_source_uri)
+    os.environ["BIOENGINE_APP_SOURCE_URI"] = app_source_uri
 
     head_app_dir = Path(replica_env_vars["BIOENGINE_APP_DIR"])
     head_version = replica_env_vars.get("BIOENGINE_ARTIFACT_VERSION") or spec.get(
