@@ -638,6 +638,7 @@ class BioEngineWorker:
             "list_apps": self.apps_manager.list_apps,  # Requires admin permissions
             "get_app_manifest": self.apps_manager.get_app_manifest,  # Requires admin permissions
             "delete_app": self.apps_manager.delete_app,  # Requires admin permissions
+            "delete_app_version": self.apps_manager.delete_app_version,  # Requires admin permissions; only 'dev' pre-releases
             "deploy_app": self.apps_manager.deploy_app,  # Requires admin permissions
             "stop_app": self.apps_manager.stop_app,  # Requires admin permissions
             "stop_all_apps": self.apps_manager.stop_all_apps,  # Requires admin permissions

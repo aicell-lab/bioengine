@@ -1904,6 +1904,82 @@ class AppsManager:
         self.logger.info(f"Successfully deleted artifact '{artifact_id}'.")
 
     @schema_method
+    async def delete_app_version(
+        self,
+        artifact_id: str = Field(
+            ...,
+            description="Identifier of the application artifact. Full ID (workspace/artifact-name) or just the name if it belongs to the current workspace.",
+        ),
+        version: str = Field(
+            ...,
+            description="Pre-release version to delete. Its tag must contain 'dev' (e.g. '1.2.3-dev1') — released versions are immutable and cannot be deleted through this method.",
+        ),
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> None:
+        """
+        Delete a single PRE-RELEASE version of an application artifact.
+
+        For the dev-iteration workflow: iterate on 'X.Y.Z-devN' pre-releases,
+        publish the verified bundle once as 'X.Y.Z', then drop the throwaway
+        pre-releases with this method. Only versions whose tag contains 'dev'
+        are deletable, so released versions stay permanent, and the version
+        must not be currently deployed on this worker.
+
+        Args:
+            artifact_id: The artifact whose version to delete (current workspace).
+            version: The pre-release version tag (must contain 'dev').
+
+        Raises:
+            ValueError: version isn't a 'dev' pre-release, is currently deployed,
+                or the artifact isn't in this workspace.
+            PermissionError: If the caller lacks admin permissions.
+            RuntimeError: If the worker is not initialized.
+        """
+        self._check_initialized()
+
+        check_permissions(
+            context=context,
+            authorized_users=self.admin_users,
+            resource_name=f"deleting version '{version}' of artifact '{artifact_id}'",
+        )
+
+        # Only pre-releases are deletable — a released version is immutable and
+        # something may reference it (test-reports, the website version list).
+        if "dev" not in str(version).lower():
+            raise ValueError(
+                f"Refusing to delete version '{version}': only pre-release versions "
+                f"whose tag contains 'dev' (e.g. '1.2.3-dev1') can be deleted. "
+                f"Released versions are permanent."
+            )
+
+        artifact_id = self._get_full_artifact_id(artifact_id)
+        workspace = self.server.config.workspace
+        if not artifact_id.startswith(f"{workspace}/"):
+            raise ValueError(
+                f"Artifact ID '{artifact_id}' does not belong to the current workspace '{workspace}'."
+            )
+
+        alias = artifact_id.split("/", 1)[1]
+        for app_id, info in self._deployed_applications.items():
+            if (
+                info.get("artifact_id") in (artifact_id, alias)
+                and str(info.get("version")) == str(version)
+                and info["is_deployed"].is_set()
+            ):
+                raise ValueError(
+                    f"Version '{version}' of '{artifact_id}' is currently deployed "
+                    f"as application '{app_id}'. Stop it first with stop_app()."
+                )
+
+        await self.artifact_manager.delete(artifact_id, version=version)
+        self.logger.info(
+            f"Successfully deleted version '{version}' of artifact '{artifact_id}'."
+        )
+
+    @schema_method
     async def deploy_app(
         self,
         artifact_id: str = Field(
