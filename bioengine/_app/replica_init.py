@@ -221,15 +221,25 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     with open(lock_path, "w") as lock_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
-            current = version_marker.read_text().strip() if version_marker.exists() else None
-            if current == identity and source.is_dir():
-                logger.info(
-                    f"BioEngine: source already at {identity} — skip download"
-                )
-                return source
+            current = (
+                version_marker.read_text().strip()
+                if version_marker.exists()
+                else None
+            )
 
             gcs_uri = os.environ.get("BIOENGINE_APP_SOURCE_URI")
             if gcs_uri:
+                # Replica/build path. The introspect for this deploy always
+                # re-materialises the source (below), so a matching identity
+                # marker means the current content is already on disk — on a
+                # shared FS the build/replicas reuse it (and the flock
+                # serialises concurrent same-node replicas). Only pull from the
+                # content-addressed GCS package when the source is absent.
+                if current == identity and source.is_dir():
+                    logger.info(
+                        f"BioEngine: source already at {identity} — skip download"
+                    )
+                    return source
                 _download_from_ray_gcs(gcs_uri, source, logger)
                 version_marker.write_text(identity)
                 return source
@@ -243,6 +253,12 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
                     "populate one of these env_vars when constructing the "
                     "runtime_env for the task or deployment."
                 )
+            # Introspect path: the authoritative per-deploy fetch from Hypha.
+            # Always re-download — a version string is NOT a content identity
+            # (a version can be re-staged / re-uploaded with new code, and one
+            # artifact_id can be recreated), so skipping on it would serve
+            # stale source. One download per deploy; the content-addressed GCS
+            # branch above dedupes for the replicas.
             token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
             _download_and_extract(url, token, source, logger)
             version_marker.write_text(identity)
