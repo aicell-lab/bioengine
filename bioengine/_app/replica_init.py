@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 #: Excludes mirror v0.11.3's ``AppBuilder._PY_MODULES_EXCLUDES`` with one
 #: addition (``.dotfiles`` per user request) — the artifact zip carries
@@ -172,6 +172,63 @@ def _download_from_ray_gcs(uri: str, dest: Path, logger: logging.Logger) -> None
         logger.info(f"BioEngine: extracted {kept} source files → {dest}")
 
 
+def _artifact_source_signature(
+    files_url: str, version: str, token: Optional[str], logger: logging.Logger
+) -> Optional[str]:
+    """Content signature over the artifact's non-excluded (source) files.
+
+    Walks the artifact file listing (cheap metadata, not the content) and
+    hashes each kept file's ``(path, size, last_modified)``. Only files that
+    would actually be extracted into ``source/`` are included, so a change to
+    an excluded file (README, notebook, cover image, manifest) does not force
+    a re-download. Returns ``None`` if the listing can't be fetched — the
+    caller then falls back to an unconditional download.
+    """
+    import hashlib
+    import json as _json
+
+    def _list(subpath: str) -> Optional[List[Dict[str, Any]]]:
+        url = f"{files_url}/{subpath}"
+        query = []
+        if version:
+            query.append(f"version={urllib.parse.quote(version)}")
+        if token:
+            query.append(f"token={urllib.parse.quote(token, safe='')}")
+        if query:
+            url = f"{url}?{'&'.join(query)}"
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return _json.loads(resp.read().decode())
+
+    entries: List[tuple] = []
+
+    def _walk(subpath: str) -> None:
+        for item in _list(subpath) or []:
+            name = item.get("name")
+            if not name:
+                continue
+            rel = f"{subpath}{name}"
+            if item.get("type") == "directory":
+                if _is_excluded(f"{rel}/_"):
+                    continue
+                _walk(f"{rel}/")
+            else:
+                if _is_excluded(rel):
+                    continue
+                entries.append((rel, item.get("size"), item.get("last_modified")))
+
+    try:
+        _walk("")
+    except Exception as exc:
+        logger.info(f"BioEngine: artifact file listing failed ({exc}); will re-download")
+        return None
+
+    entries.sort()
+    digest = hashlib.sha256()
+    for rel, size, last_modified in entries:
+        digest.update(f"{rel}\t{size}\t{last_modified}\n".encode())
+    return digest.hexdigest()
+
+
 def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     """Atomically populate ``app_dir/source`` so it matches ``version``.
 
@@ -254,13 +311,36 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
                     "runtime_env for the task or deployment."
                 )
             # Introspect path: the authoritative per-deploy fetch from Hypha.
-            # Always re-download — a version string is NOT a content identity
-            # (a version can be re-staged / re-uploaded with new code, and one
-            # artifact_id can be recreated), so skipping on it would serve
-            # stale source. One download per deploy; the content-addressed GCS
-            # branch above dedupes for the replicas.
+            # A version string is NOT a content identity (a version can be
+            # re-staged / re-uploaded with new code, an artifact_id recreated),
+            # so we cannot skip on it. Instead gate the (potentially heavy)
+            # re-download on a content signature over the artifact's file
+            # listing — path + size + last_modified of the files that land in
+            # source/. Unchanged ⇒ skip the download and keep the cached
+            # source; changed / unavailable ⇒ re-download and re-extract (which
+            # also drops files deleted from the artifact).
             token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
+            files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
+            signature = (
+                _artifact_source_signature(files_url, version, token, logger)
+                if files_url
+                else None
+            )
+            sig_marker = app_dir / ".source_signature"
+            if signature is not None and source.is_dir():
+                prev = (
+                    sig_marker.read_text().strip() if sig_marker.exists() else None
+                )
+                if prev == signature:
+                    logger.info(
+                        "BioEngine: artifact source signature unchanged — "
+                        "skip download"
+                    )
+                    version_marker.write_text(identity)
+                    return source
             _download_and_extract(url, token, source, logger)
+            if signature is not None:
+                sig_marker.write_text(signature)
             version_marker.write_text(identity)
             return source
         finally:
