@@ -434,12 +434,87 @@ class RuntimeApp:
             test_report = await asyncio.to_thread(
                 self._test, rdf_path, custom_environment
             )
+
+            # Extend the report with a default-environment inference
+            # smoke test: run the model on its own example input in THIS
+            # replica's active venv (not the model's declared conda env)
+            # to confirm it actually runs where infer() will serve it.
+            # Fully guarded — any failure is recorded as a report field,
+            # never propagated, so it cannot fail the test itself.
+            try:
+                inference_check = await asyncio.to_thread(
+                    self._run_inference_smoke_test, rdf_path
+                )
+            except Exception as e:  # pragma: no cover - defensive backstop
+                inference_check = {
+                    "status": "failed",
+                    "error": f"inference smoke-test harness error: {e}",
+                }
+            if isinstance(test_report, dict):
+                test_report["inference_check"] = inference_check
+
             cpu_after, gpu_after = self._get_memory_usage()
             logger.info(
                 f"📊 [test] Memory after: CPU: {cpu_after / (1024 * 1024):.2f} MB, "
                 f"GPU: {gpu_after / (1024 * 1024):.2f} MB"
             )
             return test_report
+
+    def _run_inference_smoke_test(self, rdf_path: str) -> dict:
+        """Run the model on its own declared test input in THIS replica's
+        active venv (the default environment ``infer()`` serves in) and
+        report whether it produced output.
+
+        A *runs-at-all* check in the default env — distinct from the
+        reproducibility test, which may run in the model's declared conda
+        env and also checks output correctness. Runs in an isolated child
+        process (CUDA-context cleanup) with a hard timeout so a hung model
+        cannot pin the GPU lock. Returns ``{"status": "passed", "error":
+        None}`` or ``{"status": "failed", "error": str}``; never raises.
+        """
+        import subprocess
+        import sys
+
+        script = (
+            "import sys\n"
+            "from bioimageio.core import load_model_description, create_prediction_pipeline\n"
+            "from bioimageio.core.digest_spec import get_test_inputs\n"
+            "descr = load_model_description(sys.argv[1])\n"
+            "pipeline = create_prediction_pipeline(descr)\n"
+            "pipeline.load()\n"
+            "sample = get_test_inputs(descr)\n"
+            "pipeline.predict_sample_without_blocking(sample)\n"
+            "print('SMOKE_OK')\n"
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script, rdf_path],
+                capture_output=True,
+                text=True,
+                env=self._safe_subprocess_env(),
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "error": "inference smoke test timed out"}
+        except Exception as e:  # pragma: no cover - defensive
+            return {
+                "status": "failed",
+                "error": f"could not launch inference smoke test: {e}",
+            }
+
+        if result.stdout:
+            for line in result.stdout.rstrip().splitlines()[-20:]:
+                logger.info(f"[smoke:stdout] {line}")
+        if result.stderr:
+            for line in result.stderr.rstrip().splitlines()[-20:]:
+                logger.info(f"[smoke:stderr] {line}")
+        if result.returncode == 0 and "SMOKE_OK" in (result.stdout or ""):
+            return {"status": "passed", "error": None}
+        stderr_tail = (result.stderr or "")[-800:]
+        return {
+            "status": "failed",
+            "error": f"inference failed (returncode={result.returncode}): {stderr_tail}",
+        }
 
     # === Prediction ===
 

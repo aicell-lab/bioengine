@@ -119,7 +119,6 @@ class EntryApp:
 
     # Test outcome mapped to a numeric quality score, surfaced on the
     # published test-report artifact's manifest for ranking.
-    _SCORE_BY_STATUS = {"failed": 0.0, "valid-format": 0.5, "passed": 1.0}
 
     # Inference results published by the bioimage.io inference workflow
     # (``scripts/bioengine_model_infer.py``) live in a single artifact
@@ -2230,6 +2229,29 @@ class EntryApp:
         except Exception:
             return None
 
+    def _compute_report_score(self, test_report: dict) -> float:
+        """Additive ranking score for a published model's test report.
+
+        0 unless the format is valid; then +1 (valid format) +2 (default-env
+        inference passed) +4 (reproducibility passed) + metadata completeness
+        (0..1). Tier gaps exceed the max metadata bonus, so a higher tier
+        always outranks a lower one. Each tier presupposes the one below it.
+        """
+        status = test_report.get("status")
+        if status not in ("valid-format", "passed"):
+            return 0.0
+        score = 1.0
+        inference_check = test_report.get("inference_check") or {}
+        if inference_check.get("status") == "passed":
+            score += 2.0
+        if status == "passed":
+            score += 4.0
+        try:
+            score += float(test_report.get("metadata_completeness") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        return score
+
     async def _upload_test_report(
         self, model_id: str, stage: bool, test_report: dict
     ) -> None:
@@ -2319,16 +2341,15 @@ class EntryApp:
                     manifest.update(model_meta)
 
                 # Only the published slot scores an artifact — a staged-only
-                # model has no committed version to rank. ``score`` is the
-                # primary rank key, ``metadata_completeness`` the secondary;
-                # both default to 0.0 so an incomplete report ranks low.
+                # model has no committed version to rank. The score is an
+                # additive ladder whose tiers can't tie: valid format (+1)
+                # < passed default-env inference (+2) < passed
+                # reproducibility (+4), with metadata completeness (0..1) as
+                # a sub-tier tiebreaker. Each tier presupposes the one below
+                # (inference needs a valid format, reproducibility needs a
+                # runnable model), so the gaps guarantee a strict ordering.
                 if not stage:
-                    manifest["score"] = self._SCORE_BY_STATUS.get(
-                        test_report.get("status"), 0.0
-                    )
-                    manifest["metadata_completeness"] = test_report.get(
-                        "metadata_completeness", 0.0
-                    )
+                    manifest["score"] = self._compute_report_score(test_report)
 
                 # Publishing a committed model upgrades the report artifact
                 # type to ``published-model`` (sticky — a later staged
