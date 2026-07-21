@@ -799,6 +799,30 @@ class AppsManager:
             "webrtc_service_id": f"{workspace}/{proxy_client_id}:{application_id}-rtc",
         }
 
+    async def _get_running_version(
+        self, application_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the live ProxyDeployment what version its entry replica booted
+        with. Best-effort — returns None if the app/handle is unreachable.
+
+        Ray Serve can keep an old replica serving after a version bump (an
+        in-place update with no surge headroom), so the stored version is not
+        proof of what is actually running; this reads it from the replica's
+        own env.
+        """
+        try:
+            app_handle = await self.ray_cluster.call_with_reconnect(
+                serve.get_app_handle, application_id
+            )
+            return await asyncio.wait_for(
+                app_handle.get_running_version.remote(), timeout=10.0
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not read running version for '{application_id}': {exc}"
+            )
+            return None
+
     async def _get_app_status(
         self,
         application_id: str,
@@ -854,6 +878,17 @@ class AppsManager:
 
         service_ids = await self._get_application_service_ids(application_id)
 
+        # Report what the entry replica actually loaded, not just the
+        # requested version — a stale reused replica reads as "healthy"
+        # otherwise. version_verified is None when it can't be determined.
+        running_version = None
+        version_verified = None
+        if status == "RUNNING":
+            rv = await self._get_running_version(application_id)
+            if rv is not None:
+                running_version = rv.get("version")
+                version_verified = running_version == application_info["version"]
+
         # Build static site URL with runtime config params so the frontend
         # knows which Hypha server and service to connect to.
         base_static_url = application_info.get("static_site_url")
@@ -872,6 +907,8 @@ class AppsManager:
             "description": application_info["description"],
             "artifact_id": application_info["artifact_id"],
             "version": application_info["version"] or "latest",
+            "running_version": running_version,
+            "version_verified": version_verified,
             "recovered_app": application_info["recovered_app"],
             "status": status,
             "message": message,
@@ -1242,6 +1279,26 @@ class AppsManager:
                         f"Application '{application_id}' recovered; "
                         f"auto-redeploy backoff cleared."
                     )
+                # RUNNING is not proof the new code is live: a reused replica
+                # can serve stale code after a version bump. If the entry
+                # replica loaded the wrong version, delete so the next tick
+                # sees it missing and redeploys fresh replicas.
+                rv = await self._get_running_version(application_id)
+                if rv is not None and rv.get("version") != application_info["version"]:
+                    self.logger.warning(
+                        f"Application '{application_id}' reports RUNNING but its "
+                        f"entry replica loaded version {rv.get('version')!r} != "
+                        f"requested {application_info['version']!r}; deleting to "
+                        f"force fresh replicas."
+                    )
+                    try:
+                        await self.ray_cluster.call_with_reconnect(
+                            serve.delete, application_id
+                        )
+                    except Exception as del_err:
+                        self.logger.error(
+                            f"Error deleting stale '{application_id}': {del_err}"
+                        )
                 continue
 
             unhealthy = application is None or state in (
@@ -2134,6 +2191,35 @@ class AppsManager:
                     f"version '{version}'; kwargs: {kwargs_str}; env_vars: {env_vars_str}"
                 )
                 await self._cancel_deployment_process(application_id=application_id)
+
+                # A content change (new version, or a different artifact under
+                # this application_id) must reach every replica. serve.run's
+                # in-place update can silently reuse replicas — at
+                # num_replicas=1 with no surge headroom (e.g. a single GPU)
+                # the old replica keeps serving stale in-memory code. Delete
+                # first so the slot frees and fresh replicas load the new
+                # source. Clear is_deployed so the monitor loop doesn't fire a
+                # redundant redeploy during the delete→rebuild window.
+                content_changed = (
+                    version != existing_app["version"]
+                    or artifact_id != existing_app["artifact_id"]
+                )
+                if content_changed:
+                    existing_app["is_deployed"].clear()
+                    try:
+                        await self.ray_cluster.call_with_reconnect(
+                            serve.delete, application_id
+                        )
+                        self.logger.info(
+                            f"Deleted Ray Serve application '{application_id}' "
+                            f"before redeploy so replicas are recreated with "
+                            f"the new source."
+                        )
+                    except Exception as delete_err:
+                        self.logger.error(
+                            f"Error deleting Ray Serve application "
+                            f"'{application_id}' before redeploy: {delete_err}"
+                        )
             else:
                 # Create a new application
                 self.logger.info(

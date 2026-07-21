@@ -25,7 +25,7 @@ from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
 
 from bioengine._app.errors import ReservedMethodNameError
-from bioengine._app.mixin import _make_check_health, wrap_init
+from bioengine._app.mixin import _make_check_health, _make_runtime_version, wrap_init
 
 # Top-level imports of hypha_rpc and ray.serve were moved inside the
 # decorator function bodies. The introspection task in
@@ -38,7 +38,12 @@ from bioengine._app.mixin import _make_check_health, wrap_init
 # Method names the framework owns. User code cannot define them as plain
 # methods — the new contract is to mark a method with @bioengine.<hook>
 # and let the name be whatever the user wants.
-_RESERVED_NAMES = ("check_health", "async_init", "test_deployment")
+_RESERVED_NAMES = (
+    "check_health",
+    "async_init",
+    "test_deployment",
+    "bioengine_runtime_version",
+)
 
 # Tag attached to functions by the marker decorators below.
 _KIND_ATTR = "_bioengine_kind"
@@ -234,6 +239,7 @@ def app(
         orig_init = cls.__init__
         cls.__init__ = wrap_init(cls, orig_init)
         cls.check_health = _make_check_health(cls, lifecycle)
+        cls.bioengine_runtime_version = _make_runtime_version(cls)
 
         opts = _build_ray_actor_options(
             num_cpus=num_cpus,
