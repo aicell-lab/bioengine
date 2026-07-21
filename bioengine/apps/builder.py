@@ -197,6 +197,13 @@ class AppBuilder:
                 f"{self.server_url.rstrip('/')}/{artifact_workspace}"
                 f"/artifacts/{alias}/create-zip-file?version={version}"
             )
+            # Files-listing endpoint (metadata only) — the introspect uses it
+            # to compute a content signature and skip the full re-download when
+            # the artifact is unchanged.
+            env_vars["BIOENGINE_ARTIFACT_FILES_URL"] = (
+                f"{self.server_url.rstrip('/')}/{artifact_workspace}"
+                f"/artifacts/{alias}/files"
+            )
             if download_token:
                 env_vars["BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN"] = download_token
 

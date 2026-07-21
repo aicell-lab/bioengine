@@ -532,8 +532,17 @@ def build_and_run_application(
 
     handles: Dict[str, Any] = {}
 
-    def _with_pkg(cls: Any) -> Any:
+    def _with_pkg(cls: Any, spec_ray_opts: Dict[str, Any]) -> Any:
         opts = dict(cls.ray_actor_options or {})
+        # Deploy-time resource overrides (notably disable_gpu → num_gpus=0)
+        # are applied by the worker onto the spec, not the class. Bind reads
+        # cls.ray_actor_options, so re-apply the spec's resource fields here or
+        # the override is silently lost — e.g. disable_gpu on a type-hint-
+        # composed GPU deployment would keep requesting a GPU and never
+        # schedule on a CPU-only target.
+        for _rk in ("num_cpus", "num_gpus", "memory"):
+            if _rk in (spec_ray_opts or {}):
+                opts[_rk] = spec_ray_opts[_rk]
         runtime_env = dict(opts.get("runtime_env") or {})
         # Ray Serve replicas do NOT inherit job-level py_modules (observed
         # empirically on KTH). The bioengine package has to ride in the
@@ -597,7 +606,7 @@ def build_and_run_application(
         if cid in handles:
             return handles[cid]
         meta = spec["classes"][cid]
-        cls = _with_pkg(_load_app_class(cid))
+        cls = _with_pkg(_load_app_class(cid), meta.get("ray_actor_options") or {})
         # Per-deployment scaling: the user keys the dict by class name
         # (matching what get_app_status reports). Multi-class apps can
         # mix fixed and autoscaling configs across deployments.
