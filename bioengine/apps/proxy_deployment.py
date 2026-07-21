@@ -294,6 +294,15 @@ class ProxyDeployment:
         """Return non-secret application metadata used for worker recovery."""
         return self.app_data
 
+    async def get_running_version(self) -> Dict[str, Any]:
+        """Return the artifact identity the entry replica actually booted with.
+
+        Internal method — called via Ray actor handle from the manager only.
+        The worker compares this against the requested version to detect a
+        reused replica still running stale in-memory code.
+        """
+        return await self.entry_deployment_handle.bioengine_runtime_version.remote()
+
     async def update_authorized_users(
         self, authorized_users: Dict[str, List[str]]
     ) -> None:

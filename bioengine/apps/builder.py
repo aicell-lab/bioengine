@@ -188,6 +188,7 @@ class AppBuilder:
             env_vars["HYPHA_SERVER_URL"] = self.server_url
             env_vars["HYPHA_WORKSPACE"] = worker_workspace
         env_vars["HYPHA_ARTIFACT_ID"] = artifact_id
+        env_vars["BIOENGINE_ARTIFACT_ID"] = artifact_id
         if version is not None:
             env_vars["HYPHA_ARTIFACT_VERSION"] = version
             env_vars["BIOENGINE_ARTIFACT_VERSION"] = version

@@ -220,6 +220,26 @@ def _make_check_health(
     return check_health
 
 
+def _make_runtime_version(user_cls: type) -> Callable[..., Any]:
+    """Build the ``bioengine_runtime_version`` method installed on the class.
+
+    Returns the artifact identity this replica *actually booted with*, read
+    from the process env the worker set in the replica's runtime_env. The
+    worker queries it (through the ProxyDeployment) to verify that a running
+    replica loaded the requested version rather than stale in-memory code
+    left over from a reused replica.
+    """
+
+    async def bioengine_runtime_version(self: Any) -> Dict[str, Optional[str]]:
+        return {
+            "artifact_id": os.environ.get("BIOENGINE_ARTIFACT_ID"),
+            "version": os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
+            "app_source_uri": os.environ.get("BIOENGINE_APP_SOURCE_URI"),
+        }
+
+    return bioengine_runtime_version
+
+
 async def _invoke_lifecycle(
     instance: Any, method_name: str, label: str, logger: logging.Logger
 ) -> None:

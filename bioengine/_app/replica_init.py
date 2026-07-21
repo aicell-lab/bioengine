@@ -196,6 +196,12 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     # holding ``<artifact_alias>/`` subdirs with the raw app sources.
     local_root_env = os.environ.get("BIOENGINE_LOCAL_ARTIFACT_PATH")
     artifact_id = os.environ.get("BIOENGINE_ARTIFACT_ID", "")
+    # Cache identity keys on the artifact too, not just the version string:
+    # two different artifacts (or a reused application_id) can share a version
+    # string, and a bare-version marker would serve the first one's stale
+    # source. Same content ⇒ same identity in both the introspect and replica
+    # branches, so the flock skip still short-circuits correctly.
+    identity = f"{artifact_id}@{version}"
     if local_root_env and artifact_id:
         alias = artifact_id.split("/")[-1]
         candidate = Path(local_root_env) / alias
@@ -205,7 +211,7 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
             shutil.copytree(
                 candidate, source, ignore=shutil.ignore_patterns("__pycache__", ".git")
             )
-            version_marker.write_text(version)
+            version_marker.write_text(identity)
             logger.info(f"BioEngine: source mirrored from local path {candidate}")
             return source
 
@@ -216,16 +222,16 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
             current = version_marker.read_text().strip() if version_marker.exists() else None
-            if current == version and source.is_dir():
+            if current == identity and source.is_dir():
                 logger.info(
-                    f"BioEngine: source already at version {version} — skip download"
+                    f"BioEngine: source already at {identity} — skip download"
                 )
                 return source
 
             gcs_uri = os.environ.get("BIOENGINE_APP_SOURCE_URI")
             if gcs_uri:
                 _download_from_ray_gcs(gcs_uri, source, logger)
-                version_marker.write_text(version)
+                version_marker.write_text(identity)
                 return source
 
             url = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_URL")
@@ -239,7 +245,7 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
                 )
             token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
             _download_and_extract(url, token, source, logger)
-            version_marker.write_text(version)
+            version_marker.write_text(identity)
             return source
         finally:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
