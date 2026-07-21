@@ -77,6 +77,8 @@ For deployment-side PRs (changes under `bioengine/**`, `bioengine/cluster/**`, `
 ## App version bumps
 
 - Always bump `version` in `apps/<name>/manifest.yaml` when app code changes.
+- A committed artifact version is **immutable** and its content is exactly what a deploy runs — so a version string must map to one bundle forever. Never delete-and-recreate a version to change its code, and never deploy a *staged* (uncommitted) version; deploy pinned, committed versions only. `upload_app` already rejects any version that isn't strictly greater than every existing one (PEP 440).
+- To iterate without inflating the release history, use pre-releases: upload `X.Y.Z-devN`, test, then publish the verified bundle once as `X.Y.Z` and drop the `-dev*` pre-releases. See the user-facing skill's dev-iteration workflow + `scripts/upload_app.py` (`../bioimage.io/public/skills/bioengine/`).
 - `deploy-applications.yml` is manual-dispatch only (push trigger disabled). Agents deploy directly via the worker API.
 
 ## Testing apps on the live worker
