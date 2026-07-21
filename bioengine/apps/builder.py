@@ -301,7 +301,14 @@ class AppBuilder:
         try:
             return await asyncio.to_thread(
                 ray.get,
-                ray.remote(num_cpus=0, runtime_env=submit_runtime_env)(
+                # max_calls=1 forces a fresh worker process per introspect:
+                # Ray pools task workers, and _load_app_class imports the user
+                # modules into that process's sys.modules. A reused worker
+                # would return a stale cached module (Python resolves imports
+                # from sys.modules before sys.path), so the spec — and the
+                # by-value-pickled deployment class — would capture old code
+                # even after the on-disk source is refreshed.
+                ray.remote(num_cpus=0, max_calls=1, runtime_env=submit_runtime_env)(
                     introspect_app_in_ray_task
                 ).remote(entry_id, task_env_vars),
             )
@@ -734,7 +741,12 @@ class AppBuilder:
         try:
             await asyncio.to_thread(
                 ray.get,
-                ray.remote(num_cpus=0, runtime_env=built_app.runtime_env)(
+                # max_calls=1: same reason as the introspect task — a fresh
+                # process guarantees the deployment class is imported from the
+                # refreshed source, not a stale sys.modules entry cached on a
+                # reused worker (the class is cloudpickled by value to the
+                # replicas, so the build worker's import is what they run).
+                ray.remote(num_cpus=0, max_calls=1, runtime_env=built_app.runtime_env)(
                     build_and_run_application
                 ).remote(
                     _ensure_jsonable(built_app.spec),
