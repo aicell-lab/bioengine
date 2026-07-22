@@ -329,11 +329,13 @@ class EntryApp:
 
     def _get_bioimageio_versions(self) -> Dict[str, str]:
         """
-        Return identities the test cache invalidates on.
+        Return the identities the test cache invalidates on: the installed
+        ``bioimageio.core`` and ``bioimageio.spec`` versions.
 
-        Includes installed versions of the bioimageio packages and the
-        model-runner artifact's own version — so the existing env-mismatch
-        check in ``test()`` re-runs when the runner itself is upgraded.
+        The bioengine version and the model-runner artifact version are
+        deliberately NOT invalidation keys — a framework or runner upgrade
+        should reuse an otherwise-current report. Both are still recorded in
+        ``test_report['env']`` (see ``_stamp_runtime_versions_in_test_env``).
         """
         from importlib.metadata import PackageNotFoundError, version
 
@@ -345,10 +347,6 @@ class EntryApp:
                 versions[package_name] = version(package_name)
             except PackageNotFoundError:
                 versions[package_name] = "not-installed"
-
-        versions["bioimage-io/model-runner"] = os.environ.get(
-            "HYPHA_ARTIFACT_VERSION", "unknown"
-        )
 
         logger.debug(f"📦 Bioimage.io package versions: {versions}")
         return versions
@@ -379,10 +377,11 @@ class EntryApp:
     def _stamp_runtime_versions_in_test_env(self, test_report: dict) -> dict:
         """Upsert runtime-identity rows in ``test_report['env']``.
 
-        The test cache invalidation in ``test()`` reuses this env list to
-        detect when a stored report was produced under different runtime
-        versions; downstream consumers (e.g. bioimage.io CI) also read it
-        from the published report to drive their own cache keys.
+        Records the bioengine and model-runner versions the report was
+        produced under. These are NOT cache-invalidation keys (only
+        ``bioimageio.core``/``.spec`` are); they are stamped for downstream
+        consumers (e.g. bioimage.io CI) that read them from the published
+        report to drive their own cache keys.
         """
         rows = [
             ("bioengine", __version__),
