@@ -57,6 +57,34 @@ def test_purge_drops_app_source_modules_and_reimports_fresh(tmp_path, monkeypatc
         sys.modules.pop("probemod", None)
 
 
+def test_purge_drops_stale_module_imported_from_a_different_path(tmp_path, monkeypatch):
+    """A stale module cached under a DIFFERENT path (0.11.29-era py_modules /
+    a prior app_dir) is still purged — matched by the top-level name the
+    current source defines. A path-only match would miss it and Python would
+    keep serving the cached copy."""
+    old = tmp_path / "old_pkg"
+    old.mkdir()
+    (old / "probemod.py").write_text("VALUE = 'stale'\n")
+    app_dir = tmp_path / "app"
+    source = app_dir / "source"
+    source.mkdir(parents=True)
+    (source / "probemod.py").write_text("VALUE = 'fresh'\n")
+
+    monkeypatch.setenv("BIOENGINE_APP_DIR", str(app_dir))
+    monkeypatch.syspath_prepend(str(old))
+    try:
+        stale = importlib.import_module("probemod")
+        assert stale.VALUE == "stale"  # __file__ under old/, not app_dir/source
+
+        mixin._purge_stale_app_modules(logging.getLogger("test"))
+
+        assert "probemod" not in sys.modules
+        # The purge prepended source_root to sys.path, so re-import reads fresh.
+        assert importlib.import_module("probemod").VALUE == "fresh"
+    finally:
+        sys.modules.pop("probemod", None)
+
+
 def test_purge_noop_without_app_dir(monkeypatch):
     monkeypatch.delenv("BIOENGINE_APP_DIR", raising=False)
     # Must not raise and must not touch sys.modules.

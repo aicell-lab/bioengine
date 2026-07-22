@@ -111,10 +111,16 @@ def _purge_stale_app_modules(logger: logging.Logger) -> None:
     one-GPU node), or when the runtime_env is unchanged. The per-file Hypha
     sync already refreshed ``<app_dir>/source`` on disk, but the reused
     interpreter still has the *previous* deploy's app modules in
-    ``sys.modules``, so ``import entry`` returns stale code. Purging every
-    module whose file lives under ``<app_dir>/source`` (framework and
-    site-packages untouched) forces a fresh import of the new source. Runs
-    per replica instance via :func:`_setup_replica`, before user ``__init__``.
+    ``sys.modules``, so a lazy ``import entry`` returns stale code. Purging the
+    app's modules (framework and site-packages untouched) forces a fresh
+    import. Runs per replica instance via :func:`_setup_replica`, before user
+    ``__init__``.
+
+    Purge by module *name* — the top-level names the app defines at its source
+    root — not just by ``__file__`` under the current source: a stale module
+    may have been imported earlier under a different path (a 0.11.29-era Ray
+    ``py_modules`` ``_ray_pkg`` dir, or a prior ``app_dir``), so a path-only
+    match misses it and Python keeps serving the cached copy.
     """
     import sys
 
@@ -123,10 +129,22 @@ def _purge_stale_app_modules(logger: logging.Logger) -> None:
         return
     source_root = str(Path(app_dir).resolve() / "source")
     prefix = source_root + os.sep
+    app_names = set()
+    try:
+        for item in os.listdir(source_root):
+            item_path = os.path.join(source_root, item)
+            if item.endswith(".py") and item != "__init__.py":
+                app_names.add(item[:-3])
+            elif os.path.isdir(item_path) and os.path.exists(
+                os.path.join(item_path, "__init__.py")
+            ):
+                app_names.add(item)
+    except OSError:
+        pass
     purged = []
     for name, module in list(sys.modules.items()):
         path = getattr(module, "__file__", None)
-        if path and path.startswith(prefix):
+        if name.split(".", 1)[0] in app_names or (path and path.startswith(prefix)):
             del sys.modules[name]
             purged.append(name)
     if source_root not in sys.path:
