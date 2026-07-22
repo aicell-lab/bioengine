@@ -45,6 +45,7 @@ def _setup_replica(instance: Any) -> None:
 
     _register_with_proxy_actor(logger)
     _ensure_working_directory(logger)
+    _purge_stale_app_modules(logger)
     _unmask_secret_env_vars()
 
     instance._bioengine_replica_initialized = False
@@ -98,6 +99,45 @@ def _register_with_proxy_actor(logger: logging.Logger) -> None:
         logger.error(
             f"❌ Unable to register replica with BioEngineProxyActor: {e}",
             exc_info=True,
+        )
+
+
+def _purge_stale_app_modules(logger: logging.Logger) -> None:
+    """Drop cached app-source modules from ``sys.modules`` so a redeploy that
+    reuses this Ray worker process re-imports the freshly-synced source.
+
+    A redeploy can land a fresh replica on a *reused* worker process — forced
+    when the deployment holds a single-slot resource (``num_gpus=1`` on a
+    one-GPU node), or when the runtime_env is unchanged. The per-file Hypha
+    sync already refreshed ``<app_dir>/source`` on disk, but the reused
+    interpreter still has the *previous* deploy's app modules in
+    ``sys.modules``, so ``import entry`` returns stale code. Purging every
+    module whose file lives under ``<app_dir>/source`` (framework and
+    site-packages untouched) forces a fresh import of the new source. Runs
+    per replica instance via :func:`_setup_replica`, before user ``__init__``.
+    """
+    import sys
+
+    app_dir = os.environ.get("BIOENGINE_APP_DIR")
+    if not app_dir:
+        return
+    source_root = str(Path(app_dir).resolve() / "source")
+    prefix = source_root + os.sep
+    purged = []
+    for name, module in list(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if path and path.startswith(prefix):
+            del sys.modules[name]
+            purged.append(name)
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
+    if purged:
+        import importlib
+
+        importlib.invalidate_caches()
+        logger.info(
+            f"BioEngine: purged {len(purged)} stale app module(s) from "
+            f"sys.modules for a fresh import: {sorted(purged)}"
         )
 
 

@@ -433,6 +433,7 @@ def build_and_run_application(
     import os
     from pathlib import Path
 
+    from ray import cloudpickle as ray_cloudpickle
     from ray import serve
 
     from bioengine._app.replica_init import _ensure_source
@@ -544,6 +545,25 @@ def build_and_run_application(
         return handles[cid]
 
     entry_handle = bind(spec["entry_id"])
+
+    # Ray Serve pickles each deployment's class with ``ray.cloudpickle`` on this
+    # head. A @bioengine.app class that touches module-level symbols of its own
+    # source module (helper funcs/classes — any monolith like cellpose has many)
+    # otherwise pickles those references BY NAME, so a cold replica has to
+    # ``import main``/``import entry`` inside ``cloudpickle.loads`` — before any
+    # bioengine code runs, hence before the meta_path finder is installed →
+    # ``ModuleNotFoundError``. (worker_process_setup_hook is NOT honoured before
+    # a Serve replica's unpickle, so it can't bridge this.) Registering every
+    # materialised app-source module for pickle-by-value makes the deployment
+    # carry the code, so the replica reconstructs it without importing user
+    # modules. Lazy in-method imports still resolve via the finder, which is
+    # installed when the reconstructed class's @bioengine wrappers import
+    # bioengine on load.
+    src_prefix = os.path.realpath(src_str) + os.sep
+    for module in list(sys.modules.values()):
+        module_file = getattr(module, "__file__", None)
+        if module_file and os.path.realpath(module_file).startswith(src_prefix):
+            ray_cloudpickle.register_pickle_by_value(module)
 
     # Override the proxy's ray_actor_options.memory at deployment time.
     # ``num_cpus=0`` is set on the decorator (see proxy_deployment.py); a
