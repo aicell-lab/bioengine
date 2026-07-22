@@ -1,47 +1,45 @@
 """Replica-side (and build-task-side) artifact materialisation.
 
-Materialises the user's app source into ``<app_dir>/source/`` before any
-user code is imported. Two backends:
-
-1. **Ray-internal GCS** (``BIOENGINE_APP_SOURCE_URI`` set) — preferred on
-   replicas. The :mod:`bioengine._app.bootstrap` introspect task uploaded
-   the source bytes to Ray's content-addressed package store; replicas
-   re-materialise them by URI via
-   :func:`ray._private.runtime_env.packaging.download_and_unpack_package`.
-   No Hypha auth involved — the short-TTL token has typically expired by
-   replica launch time.
-
-2. **Hypha** (``BIOENGINE_ARTIFACT_DOWNLOAD_URL`` + ``_TOKEN`` set) — used
-   by the introspect Ray task which has a fresh short-TTL token. Single
-   ``fcntl`` lock per node serialises concurrent same-node starts; the
-   second caller sees the up-to-date ``.version`` marker and skips.
+Materialises the user's app source into ``<app_dir>/source/`` before any user
+code is imported, by downloading it **per file directly from Hypha** (the
+durable artifact store) with an incremental sync keyed on each file's remote
+``last_modified``. A snapshot at ``<app_dir>/.source_snapshot.json`` records
+``{relpath: last_modified}`` so a redeploy re-downloads only changed/new files
+and deletes files removed from the artifact — big unchanged files (e.g. model
+weights) are never re-fetched. There is no Ray-GCS intermediary: the Ray head's
+in-memory package store is neither an OOM sink (a package per app×version) nor a
+single point of failure across a head restart.
 
 Reads its configuration from env_vars set by the BioEngine worker:
 
-* ``BIOENGINE_APP_DIR``                — ``<apps_workdir>/<worker-ws>-<app-id>``
-* ``BIOENGINE_ARTIFACT_VERSION``       — cache-invalidation marker
-* ``BIOENGINE_APP_SOURCE_URI``         — ``gcs://_ray_pkg_<hash>.zip`` (replicas)
-* ``BIOENGINE_ARTIFACT_DOWNLOAD_URL``  — Hypha ``create-zip-file`` URL (introspect)
-* ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN``— short-TTL read-only Hypha token
+* ``BIOENGINE_APP_DIR``                 — ``<apps_workdir>/<worker-ws>-<app-id>``
+* ``BIOENGINE_ARTIFACT_ID``             — artifact id (cache identity)
+* ``BIOENGINE_ARTIFACT_VERSION``        — committed version to materialise
+* ``BIOENGINE_ARTIFACT_FILES_URL``      — Hypha ``/files`` listing endpoint
+* ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` — read token (absent ⇒ anonymous/public)
+
+Hypha is already a hard dependency (an app cannot register its service without
+it), so pulling source from Hypha at replica start adds no new availability
+surface: if Hypha is unreachable the replica fails to materialise, the
+deployment fails, and ``auto_redeploy`` retries.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import os
 import shutil
 import sys
 import urllib.parse
 import urllib.request
-import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 #: Excludes mirror v0.11.3's ``AppBuilder._PY_MODULES_EXCLUDES`` with one
-#: addition (``.dotfiles`` per user request) — the artifact zip carries
-#: everything in the artifact, but only Python/config content should be
-#: extracted to ``source/``.
+#: addition (``.dotfiles`` per user request) — the artifact carries everything,
+#: but only Python/config content should be materialised into ``source/``.
 _SOURCE_EXCLUDES = [
     "manifest.yaml",
     "manifest.yml",
@@ -75,131 +73,41 @@ def _is_excluded(rel_path: str) -> bool:
     return False
 
 
-def _authed_url(url: str, token: Optional[str]) -> str:
-    if not token:
-        return url
-    sep = "&" if urllib.parse.urlparse(url).query else "?"
-    return f"{url}{sep}token={urllib.parse.quote(token, safe='')}"
+def _artifact_url(
+    files_url: str, subpath: str, version: str, token: Optional[str]
+) -> str:
+    """Build a Hypha ``/files`` URL for a listing subpath or a single file."""
+    url = f"{files_url}/{subpath}"
+    query = []
+    if version:
+        query.append(f"version={urllib.parse.quote(version)}")
+    if token:
+        query.append(f"token={urllib.parse.quote(token, safe='')}")
+    if query:
+        url = f"{url}?{'&'.join(query)}"
+    return url
 
 
-def _download_and_extract(
-    url: str, token: Optional[str], dest: Path, logger: logging.Logger
-) -> None:
-    """Download the artifact zip to a temp file, extract filtered entries, atomic rename into dest."""
-    url = _authed_url(url, token)
-
-    app_root = dest.parent
-    tmp_zip = app_root / f".source.tmp.{os.getpid()}.zip"
-    tmp_dir = app_root / f".source.new.{os.getpid()}"
-    try:
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        tmp_dir.mkdir(parents=True)
-
-        logger.info(f"BioEngine: downloading artifact zip → {tmp_zip}")
-        with urllib.request.urlopen(url, timeout=120) as r:
-            with open(tmp_zip, "wb") as out:
-                shutil.copyfileobj(r, out, length=1024 * 1024)
-
-        kept = 0
-        with zipfile.ZipFile(tmp_zip, "r") as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                if _is_excluded(info.filename):
-                    continue
-                zf.extract(info, tmp_dir)
-                kept += 1
-
-        if dest.exists():
-            shutil.rmtree(dest)
-        os.replace(tmp_dir, dest)
-        logger.info(
-            f"BioEngine: extracted {kept} source files → {dest}"
-        )
-    finally:
-        try:
-            tmp_zip.unlink(missing_ok=True)
-        except OSError:
-            pass
-        if tmp_dir.exists():
-            try:
-                shutil.rmtree(tmp_dir)
-            except OSError:
-                pass
-
-
-def _download_from_ray_gcs(uri: str, dest: Path, logger: logging.Logger) -> None:
-    """Materialise ``dest`` from a ``gcs://_ray_pkg_<hash>.zip`` URI.
-
-    Wraps :func:`ray._private.runtime_env.packaging.download_and_unpack_package`
-    (which is async) in a synchronous facade since both the replica
-    bootstrap and the build Ray task are sync callers. The unpack target
-    Ray picks is its own scratch dir; we copy the result into ``dest``
-    with the same filter logic ``_download_and_extract`` uses for Hypha
-    zips so the on-disk layout is identical across backends.
-    """
-    import asyncio
-    import tempfile
-
-    from ray._private.runtime_env.packaging import download_and_unpack_package
-
-    logger.info(f"BioEngine: downloading source from Ray-GCS {uri} → {dest}")
-    with tempfile.TemporaryDirectory(prefix="bioengine-rayfetch-") as scratch:
-        unpacked = asyncio.run(download_and_unpack_package(uri, scratch))
-        unpacked_path = Path(unpacked)
-
-        app_root = dest.parent
-        tmp_dir = app_root / f".source.new.{os.getpid()}"
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        tmp_dir.mkdir(parents=True)
-        kept = 0
-        for root, _dirs, files in os.walk(unpacked_path):
-            root_p = Path(root)
-            rel_root = root_p.relative_to(unpacked_path)
-            for fname in files:
-                rel = (rel_root / fname).as_posix()
-                if _is_excluded(rel):
-                    continue
-                out = tmp_dir / rel
-                out.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(root_p / fname, out)
-                kept += 1
-        if dest.exists():
-            shutil.rmtree(dest)
-        os.replace(tmp_dir, dest)
-        logger.info(f"BioEngine: extracted {kept} source files → {dest}")
-
-
-def _artifact_source_signature(
+def _list_source_files(
     files_url: str, version: str, token: Optional[str], logger: logging.Logger
-) -> Optional[str]:
-    """Content signature over the artifact's non-excluded (source) files.
+) -> Dict[str, str]:
+    """Recursively list the artifact's non-excluded source files.
 
-    Walks the artifact file listing (cheap metadata, not the content) and
-    hashes each kept file's ``(path, size, last_modified)``. Only files that
-    would actually be extracted into ``source/`` are included, so a change to
-    an excluded file (README, notebook, cover image, manifest) does not force
-    a re-download. Returns ``None`` if the listing can't be fetched — the
-    caller then falls back to an unconditional download.
+    The Hypha ``/files`` endpoint is not recursive — it returns, per item,
+    ``name`` / ``type`` (``"directory"`` vs file) / ``size`` / ``last_modified``
+    — so we walk directories ourselves by re-requesting each subpath. Returns
+    ``{relpath: last_modified}`` for exactly the files that would land in
+    ``source/`` (excluded files are never listed or fetched). Raises on any
+    fetch/parse failure so the caller fails the deployment and ``auto_redeploy``
+    retries rather than silently serving a partial sync.
     """
-    import hashlib
-    import json as _json
 
-    def _list(subpath: str) -> Optional[List[Dict[str, Any]]]:
-        url = f"{files_url}/{subpath}"
-        query = []
-        if version:
-            query.append(f"version={urllib.parse.quote(version)}")
-        if token:
-            query.append(f"token={urllib.parse.quote(token, safe='')}")
-        if query:
-            url = f"{url}?{'&'.join(query)}"
+    def _list(subpath: str) -> Optional[List[dict]]:
+        url = _artifact_url(files_url, subpath, version, token)
         with urllib.request.urlopen(url, timeout=30) as resp:
-            return _json.loads(resp.read().decode())
+            return json.loads(resp.read().decode())
 
-    entries: List[tuple] = []
+    files: Dict[str, str] = {}
 
     def _walk(subpath: str) -> None:
         for item in _list(subpath) or []:
@@ -211,53 +119,122 @@ def _artifact_source_signature(
                 if _is_excluded(f"{rel}/_"):
                     continue
                 _walk(f"{rel}/")
-            else:
-                if _is_excluded(rel):
-                    continue
-                entries.append((rel, item.get("size"), item.get("last_modified")))
+            elif not _is_excluded(rel):
+                files[rel] = str(item.get("last_modified"))
 
+    _walk("")
+    return files
+
+
+def _download_file(
+    files_url: str,
+    relpath: str,
+    version: str,
+    token: Optional[str],
+    dest: Path,
+    logger: logging.Logger,
+) -> None:
+    """Stream one artifact file to ``dest`` (temp file + atomic rename)."""
+    url = _artifact_url(files_url, relpath, version, token)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.parent / f".{dest.name}.tmp.{os.getpid()}"
     try:
-        _walk("")
-    except Exception as exc:
-        logger.info(f"BioEngine: artifact file listing failed ({exc}); will re-download")
-        return None
+        with urllib.request.urlopen(url, timeout=120) as r:
+            with open(tmp, "wb") as out:
+                shutil.copyfileobj(r, out, length=1024 * 1024)
+        os.replace(tmp, dest)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
-    entries.sort()
-    digest = hashlib.sha256()
-    for rel, size, last_modified in entries:
-        digest.update(f"{rel}\t{size}\t{last_modified}\n".encode())
-    return digest.hexdigest()
+
+def _prune_empty_dirs(start: Path, stop_at: Path) -> None:
+    """Remove now-empty directories from ``start`` up to (not incl.) ``stop_at``."""
+    d = start
+    while d != stop_at and stop_at in d.parents:
+        try:
+            d.rmdir()
+        except OSError:
+            break
+        d = d.parent
+
+
+def _sync_source_from_hypha(
+    files_url: str,
+    version: str,
+    token: Optional[str],
+    source: Path,
+    snapshot_path: Path,
+    logger: logging.Logger,
+) -> None:
+    """Incrementally sync ``source/`` to the artifact's committed ``version``.
+
+    Downloads files whose remote ``last_modified`` differs from the local
+    snapshot (or that are missing on disk), deletes files that vanished from the
+    artifact, and rewrites the snapshot only after every download succeeds so a
+    partial failure re-syncs cleanly on the next attempt.
+    """
+    remote = _list_source_files(files_url, version, token, logger)
+
+    snapshot: Dict[str, str] = {}
+    if snapshot_path.exists():
+        try:
+            snapshot = json.loads(snapshot_path.read_text())
+        except (OSError, ValueError):
+            snapshot = {}
+
+    source.mkdir(parents=True, exist_ok=True)
+
+    downloaded = 0
+    for relpath, last_modified in remote.items():
+        if snapshot.get(relpath) != last_modified or not (source / relpath).is_file():
+            _download_file(files_url, relpath, version, token, source / relpath, logger)
+            downloaded += 1
+
+    # Reconcile against the whole source tree, not just the snapshot: delete any
+    # file no longer in the artifact — covers files removed between versions AND
+    # leftovers from a prior transport scheme on a migrated app_dir.
+    removed = 0
+    for path in list(source.rglob("*")):
+        if path.is_file():
+            relpath = path.relative_to(source).as_posix()
+            if relpath not in remote:
+                path.unlink()
+                _prune_empty_dirs(path.parent, source)
+                removed += 1
+
+    snapshot_path.write_text(json.dumps(remote))
+    logger.info(
+        f"BioEngine: synced source from Hypha "
+        f"({downloaded} downloaded, {removed} removed, {len(remote)} total) → {source}"
+    )
 
 
 def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
-    """Atomically populate ``app_dir/source`` so it matches ``version``.
+    """Populate ``app_dir/source`` so it matches the artifact's ``version``.
 
-    Three backends, picked in order:
+    Backends, picked in order:
 
     1. ``BIOENGINE_LOCAL_ARTIFACT_PATH`` — dev override, short-circuits to a
        locally-mounted artifact root.
-    2. ``BIOENGINE_APP_SOURCE_URI`` — Ray-internal GCS download via
-       :func:`_download_from_ray_gcs`. Preferred on replicas because the
-       Hypha short-TTL token has typically expired by replica launch.
-    3. ``BIOENGINE_ARTIFACT_DOWNLOAD_URL`` (+ optional ``_TOKEN``) — direct
-       Hypha pull, used by the introspect Ray task.
+    2. ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional ``_DOWNLOAD_TOKEN``) —
+       per-file incremental Hypha sync (:func:`_sync_source_from_hypha`).
 
-    Single ``fcntl`` lock per node serialises concurrent same-node starts;
-    the second caller sees the up-to-date ``.version`` marker and skips.
+    A single ``fcntl`` lock per node serialises concurrent same-node starts.
     """
     source = app_dir / "source"
     version_marker = app_dir / ".version"
+    snapshot_path = app_dir / ".source_snapshot.json"
     app_dir.mkdir(parents=True, exist_ok=True)
 
     # Dev override: ``BIOENGINE_LOCAL_ARTIFACT_PATH`` points at a directory
     # holding ``<artifact_alias>/`` subdirs with the raw app sources.
     local_root_env = os.environ.get("BIOENGINE_LOCAL_ARTIFACT_PATH")
     artifact_id = os.environ.get("BIOENGINE_ARTIFACT_ID", "")
-    # Cache identity keys on the artifact too, not just the version string:
-    # two different artifacts (or a reused application_id) can share a version
-    # string, and a bare-version marker would serve the first one's stale
-    # source. Same content ⇒ same identity in both the introspect and replica
-    # branches, so the flock skip still short-circuits correctly.
+    # Identity keys on the artifact too, not just the version string, so a
+    # reused application_id across artifacts can't serve stale source.
     identity = f"{artifact_id}@{version}"
     if local_root_env and artifact_id:
         alias = artifact_id.split("/")[-1]
@@ -278,69 +255,18 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     with open(lock_path, "w") as lock_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
-            current = (
-                version_marker.read_text().strip()
-                if version_marker.exists()
-                else None
-            )
-
-            gcs_uri = os.environ.get("BIOENGINE_APP_SOURCE_URI")
-            if gcs_uri:
-                # Replica/build path. The introspect for this deploy always
-                # re-materialises the source (below), so a matching identity
-                # marker means the current content is already on disk — on a
-                # shared FS the build/replicas reuse it (and the flock
-                # serialises concurrent same-node replicas). Only pull from the
-                # content-addressed GCS package when the source is absent.
-                if current == identity and source.is_dir():
-                    logger.info(
-                        f"BioEngine: source already at {identity} — skip download"
-                    )
-                    return source
-                _download_from_ray_gcs(gcs_uri, source, logger)
-                version_marker.write_text(identity)
-                return source
-
-            url = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_URL")
-            if not url:
-                raise RuntimeError(
-                    "Neither BIOENGINE_APP_SOURCE_URI nor "
-                    "BIOENGINE_ARTIFACT_DOWNLOAD_URL is set; cannot "
-                    "materialise the app source. The worker is expected to "
-                    "populate one of these env_vars when constructing the "
-                    "runtime_env for the task or deployment."
-                )
-            # Introspect path: the authoritative per-deploy fetch from Hypha.
-            # A version string is NOT a content identity (a version can be
-            # re-staged / re-uploaded with new code, an artifact_id recreated),
-            # so we cannot skip on it. Instead gate the (potentially heavy)
-            # re-download on a content signature over the artifact's file
-            # listing — path + size + last_modified of the files that land in
-            # source/. Unchanged ⇒ skip the download and keep the cached
-            # source; changed / unavailable ⇒ re-download and re-extract (which
-            # also drops files deleted from the artifact).
-            token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
             files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
-            signature = (
-                _artifact_source_signature(files_url, version, token, logger)
-                if files_url
-                else None
-            )
-            sig_marker = app_dir / ".source_signature"
-            if signature is not None and source.is_dir():
-                prev = (
-                    sig_marker.read_text().strip() if sig_marker.exists() else None
+            if not files_url:
+                raise RuntimeError(
+                    "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
+                    "the app source. The worker is expected to populate it (and "
+                    "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
+                    "constructing the runtime_env for the task or deployment."
                 )
-                if prev == signature:
-                    logger.info(
-                        "BioEngine: artifact source signature unchanged — "
-                        "skip download"
-                    )
-                    version_marker.write_text(identity)
-                    return source
-            _download_and_extract(url, token, source, logger)
-            if signature is not None:
-                sig_marker.write_text(signature)
+            token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
+            _sync_source_from_hypha(
+                files_url, version, token, source, snapshot_path, logger
+            )
             version_marker.write_text(identity)
             return source
         finally:

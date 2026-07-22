@@ -933,6 +933,20 @@ class RayCluster:
             # callers racing against the reconnect could hold and use it.
             self.proxy_actor_handle = None
             await self._connect_to_cluster()
+            # Ray Serve caches a module-global client bound to the previous
+            # session's controller actor; ray.shutdown()/reconnect does not
+            # reset it, so the next serve.* call keeps hitting the dead
+            # controller ("doesn't have a handle for"). Drop it so serve.*
+            # re-resolves the live controller, or cleanly reports that no
+            # instance is running (which triggers in-place app recovery).
+            try:
+                from ray import serve as _serve
+
+                _serve.context._set_global_client(None)
+            except Exception as e:
+                self.logger.debug(
+                    f"Could not reset Ray Serve global client during reconnect: {e}"
+                )
             self.logger.info("Ray Client reconnected; handles refreshed.")
 
     async def call_with_reconnect(self, fn, *args, **kwargs):

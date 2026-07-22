@@ -1,18 +1,19 @@
 """Unit tests for :mod:`bioengine._app.replica_init` — the replica-side
-artifact materialisation that v0.11.4 substitutes for the worker's old
-zip-and-ship-via-file:// path.
+artifact materialisation (per-file incremental sync from Hypha).
 
-These tests exercise the pure-Python branches (exclude filtering, version
-marker reuse, atomic source/ rename, HOME/TMPDIR/sys.path setup) without
-needing a live Hypha server. The HTTP download path is monkey-patched so
-the tests don't reach the network.
+These tests exercise the pure-Python branches (exclude filtering, snapshot
+diffing, deletion of removed files, HOME/TMPDIR/sys.path setup) without a live
+Hypha server. The network-facing helpers are either monkey-patched at the
+``_list_source_files`` / ``_download_file`` seam (sync-logic tests) or driven
+through a fake ``urlopen`` (listing/download tests).
 """
 from __future__ import annotations
 
 import io
+import json
+import logging
 import os
 import sys
-import zipfile
 from pathlib import Path
 from typing import Tuple
 
@@ -20,64 +21,37 @@ import pytest
 
 from bioengine._app import replica_init
 
-
-def _make_artifact_zip(files: dict[str, bytes]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, content in files.items():
-            zf.writestr(name, content)
-    return buf.getvalue()
-
-
-@pytest.fixture
-def fake_artifact_files() -> dict[str, bytes]:
-    return {
-        "entry.py": b"def main(): return 42\n",
-        "subpkg/__init__.py": b"",
-        "subpkg/util.py": b"X = 1\n",
-        "config/settings.yaml": b"key: value\n",
-        "manifest.yaml": b"name: My App\n",  # excluded
-        "README.md": b"# excluded\n",  # excluded
-        "tutorial.ipynb": b"{}",  # excluded
-        "frontend/index.html": b"<html/>",  # excluded
-        ".env": b"SECRET=1",  # excluded (hidden)
-        "__pycache__/x.pyc": b"\x00",  # excluded
-    }
+#: Canned artifact: ``{relpath: (content, last_modified)}``.
+_ARTIFACT = {
+    "entry.py": (b"def main(): return 42\n", "2026-01-01T00:00:00"),
+    "subpkg/__init__.py": (b"", "2026-01-01T00:00:00"),
+    "subpkg/util.py": (b"X = 1\n", "2026-01-01T00:00:00"),
+    "config/settings.yaml": (b"key: value\n", "2026-01-01T00:00:00"),
+}
 
 
 @pytest.fixture
-def patched_download(monkeypatch, fake_artifact_files):
-    """Replace ``_download_and_extract`` so the test never touches the network.
+def fake_hypha(monkeypatch):
+    """Fake ``_list_source_files`` + ``_download_file``.
 
-    The fake writes a zip with the canned artifact bytes into the dest dir
-    using the real extract+filter logic, so exclude semantics still get
-    exercised.
+    Returns a controller with a mutable ``remote`` map (``{rel: (content, lm)}``)
+    and a ``downloads`` list recording every relpath fetched, so tests can
+    mutate the remote between syncs and assert exactly what got re-downloaded.
     """
-    captured: dict = {}
+    remote = dict(_ARTIFACT)
+    downloads: list = []
 
-    def fake(url, token, dest, logger):
-        captured["url"] = url
-        captured["token"] = token
-        zip_bytes = _make_artifact_zip(fake_artifact_files)
-        tmp = dest.parent / f".source.new.{os.getpid()}"
-        if tmp.exists():
-            import shutil
-            shutil.rmtree(tmp)
-        tmp.mkdir(parents=True)
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                if replica_init._is_excluded(info.filename):
-                    continue
-                zf.extract(info, tmp)
-        if dest.exists():
-            import shutil
-            shutil.rmtree(dest)
-        os.replace(tmp, dest)
+    def fake_list(files_url, version, token, logger):
+        return {rel: lm for rel, (_content, lm) in remote.items()}
 
-    monkeypatch.setattr(replica_init, "_download_and_extract", fake)
-    return captured
+    def fake_download(files_url, relpath, version, token, dest, logger):
+        downloads.append(relpath)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(remote[relpath][0])
+
+    monkeypatch.setattr(replica_init, "_list_source_files", fake_list)
+    monkeypatch.setattr(replica_init, "_download_file", fake_download)
+    return {"remote": remote, "downloads": downloads}
 
 
 @pytest.fixture
@@ -87,9 +61,8 @@ def replica_env(monkeypatch, tmp_path) -> Tuple[Path, dict]:
         "BIOENGINE_APP_DIR": str(app_dir),
         "BIOENGINE_ARTIFACT_ID": "bioimage-io/model-runner",
         "BIOENGINE_ARTIFACT_VERSION": "1.2.0",
-        "BIOENGINE_ARTIFACT_DOWNLOAD_URL": (
-            "https://hypha.aicell.io/bioimage-io/artifacts/model-runner"
-            "/create-zip-file?version=1.2.0"
+        "BIOENGINE_ARTIFACT_FILES_URL": (
+            "https://hypha.aicell.io/bioimage-io/artifacts/model-runner/files"
         ),
     }
     for k, v in env.items():
@@ -97,6 +70,9 @@ def replica_env(monkeypatch, tmp_path) -> Tuple[Path, dict]:
     monkeypatch.delenv("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN", raising=False)
     monkeypatch.delenv("BIOENGINE_LOCAL_ARTIFACT_PATH", raising=False)
     return app_dir, env
+
+
+# ───────────────────────────── exclude filter ─────────────────────────────
 
 
 def test_is_excluded_drops_docs_frontend_and_dotfiles() -> None:
@@ -116,20 +92,18 @@ def test_is_excluded_keeps_python_and_config() -> None:
     assert not replica_init._is_excluded("model.json")
 
 
-def test_setup_creates_dirs_and_extends_sys_path(replica_env, patched_download) -> None:
-    app_dir, env = replica_env
+# ───────────────────────────── setup + sync ───────────────────────────────
+
+
+def test_setup_creates_dirs_and_extends_sys_path(replica_env, fake_hypha) -> None:
+    app_dir, _env = replica_env
 
     replica_init.setup_replica_environment()
 
     source = app_dir / "source"
-    assert source.is_dir()
     assert (source / "entry.py").is_file()
     assert (source / "subpkg" / "util.py").is_file()
     assert (source / "config" / "settings.yaml").is_file()
-    assert not (source / "manifest.yaml").exists()
-    assert not (source / "README.md").exists()
-    assert not (source / "frontend").exists()
-    assert not (source / "__pycache__").exists()
 
     assert (app_dir / "home").is_dir()
     assert (app_dir / "tmp").is_dir()
@@ -137,55 +111,66 @@ def test_setup_creates_dirs_and_extends_sys_path(replica_env, patched_download) 
     assert os.environ["TMPDIR"] == str(app_dir / "tmp")
     assert str(source) in sys.path
 
-    marker = (app_dir / ".version").read_text().strip()
-    assert marker == "1.2.0"
+    snapshot = json.loads((app_dir / ".source_snapshot.json").read_text())
+    assert set(snapshot) == set(_ARTIFACT)
+    assert (
+        app_dir / ".version"
+    ).read_text().strip() == "bioimage-io/model-runner@1.2.0"
 
 
-def test_second_setup_at_same_version_skips_download(
-    replica_env, patched_download, monkeypatch
+def test_initial_sync_downloads_all(replica_env, fake_hypha) -> None:
+    replica_init.setup_replica_environment()
+    assert sorted(fake_hypha["downloads"]) == sorted(_ARTIFACT)
+
+
+def test_unchanged_timestamps_skip_download(replica_env, fake_hypha) -> None:
+    replica_init.setup_replica_environment()
+    fake_hypha["downloads"].clear()
+
+    replica_init.setup_replica_environment()  # nothing changed remotely
+    assert fake_hypha["downloads"] == []
+
+
+def test_changed_timestamp_redownloads_only_that_file(
+    replica_env, fake_hypha
 ) -> None:
-    app_dir, env = replica_env
+    app_dir, _env = replica_env
     replica_init.setup_replica_environment()
-    patched_download.clear()
+    fake_hypha["downloads"].clear()
 
-    sentinel = app_dir / "source" / "marker.txt"
-    sentinel.write_text("preserve me")
-
-    download_calls = {"count": 0}
-    original = replica_init._download_and_extract
-
-    def counting(url, token, dest, logger):
-        download_calls["count"] += 1
-        return original(url, token, dest, logger)
-
-    monkeypatch.setattr(replica_init, "_download_and_extract", counting)
-    replica_init.setup_replica_environment()
-
-    assert download_calls["count"] == 0
-    assert sentinel.read_text() == "preserve me"
-
-
-def test_version_change_triggers_redownload(
-    replica_env, patched_download, monkeypatch
-) -> None:
-    app_dir, env = replica_env
-    replica_init.setup_replica_environment()
-
-    sentinel = app_dir / "source" / "sentinel.txt"
-    sentinel.write_text("v1")
-
-    monkeypatch.setenv("BIOENGINE_ARTIFACT_VERSION", "1.3.0")
-    monkeypatch.setenv(
-        "BIOENGINE_ARTIFACT_DOWNLOAD_URL",
-        "https://hypha.aicell.io/bioimage-io/artifacts/model-runner"
-        "/create-zip-file?version=1.3.0",
+    fake_hypha["remote"]["entry.py"] = (
+        b"def main(): return 99\n",
+        "2026-02-02T00:00:00",
     )
-
     replica_init.setup_replica_environment()
 
-    assert not sentinel.exists()
+    assert fake_hypha["downloads"] == ["entry.py"]
+    assert (app_dir / "source" / "entry.py").read_bytes() == b"def main(): return 99\n"
+
+
+def test_removed_file_deleted_locally(replica_env, fake_hypha) -> None:
+    app_dir, _env = replica_env
+    replica_init.setup_replica_environment()
+    assert (app_dir / "source" / "subpkg" / "util.py").is_file()
+
+    del fake_hypha["remote"]["subpkg/util.py"]
+    replica_init.setup_replica_environment()
+
+    assert not (app_dir / "source" / "subpkg" / "util.py").exists()
     assert (app_dir / "source" / "entry.py").is_file()
-    assert (app_dir / ".version").read_text().strip() == "1.3.0"
+
+
+def test_missing_local_file_redownloaded(replica_env, fake_hypha) -> None:
+    """A file the snapshot claims is current is re-fetched if gone from disk."""
+    app_dir, _env = replica_env
+    replica_init.setup_replica_environment()
+    fake_hypha["downloads"].clear()
+
+    (app_dir / "source" / "entry.py").unlink()
+    replica_init.setup_replica_environment()
+
+    assert "entry.py" in fake_hypha["downloads"]
+    assert (app_dir / "source" / "entry.py").is_file()
 
 
 def test_setup_is_noop_without_app_dir(monkeypatch) -> None:
@@ -200,14 +185,25 @@ def test_setup_raises_when_version_missing(monkeypatch, tmp_path) -> None:
         replica_init.setup_replica_environment()
 
 
-def test_local_artifact_path_shortcircuits_download(
-    replica_env, monkeypatch, tmp_path, fake_artifact_files
+def test_missing_files_url_raises(monkeypatch, tmp_path) -> None:
+    app_dir = tmp_path / "app"
+    monkeypatch.setenv("BIOENGINE_APP_DIR", str(app_dir))
+    monkeypatch.setenv("BIOENGINE_ARTIFACT_VERSION", "1.2.0")
+    monkeypatch.delenv("BIOENGINE_ARTIFACT_FILES_URL", raising=False)
+    monkeypatch.delenv("BIOENGINE_LOCAL_ARTIFACT_PATH", raising=False)
+    monkeypatch.delenv("BIOENGINE_ARTIFACT_ID", raising=False)
+    with pytest.raises(RuntimeError, match="BIOENGINE_ARTIFACT_FILES_URL"):
+        replica_init.setup_replica_environment()
+
+
+def test_local_artifact_path_shortcircuits_sync(
+    replica_env, monkeypatch, tmp_path
 ) -> None:
-    app_dir, env = replica_env
+    app_dir, _env = replica_env
     local_root = tmp_path / "local-dev"
     artifact_subdir = local_root / "model-runner"
     artifact_subdir.mkdir(parents=True)
-    for rel, content in fake_artifact_files.items():
+    for rel, (content, _lm) in _ARTIFACT.items():
         out = artifact_subdir / rel
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(content)
@@ -215,82 +211,91 @@ def test_local_artifact_path_shortcircuits_download(
     monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(local_root))
 
     def boom(*a, **kw):
-        raise AssertionError("download must not be called when local path exists")
+        raise AssertionError("Hypha sync must not run when local path exists")
 
-    monkeypatch.setattr(replica_init, "_download_and_extract", boom)
-
-    replica_init.setup_replica_environment()
-    assert (app_dir / "source" / "entry.py").is_file()
-    assert (app_dir / ".version").read_text().strip() == "1.2.0"
-
-
-def test_authed_url_appends_token_via_query_string() -> None:
-    base = "https://hypha.aicell.io/ws/artifacts/x/create-zip-file?version=1"
-    assert replica_init._authed_url(base, "abc 123").endswith(
-        "&token=abc%20123"
-    )
-    no_query = "https://hypha.aicell.io/ws/artifacts/x/create-zip-file"
-    assert replica_init._authed_url(no_query, "abc").endswith("?token=abc")
-
-
-def test_authed_url_returns_base_when_no_token() -> None:
-    base = "https://hypha.aicell.io/ws/artifacts/x/create-zip-file?version=1"
-    assert replica_init._authed_url(base, None) == base
-    assert replica_init._authed_url(base, "") == base
-
-
-def test_ray_gcs_uri_branch_skips_hypha(
-    replica_env, monkeypatch, tmp_path, fake_artifact_files
-) -> None:
-    """When BIOENGINE_APP_SOURCE_URI is set, _ensure_source pulls from
-    Ray-internal GCS and never touches Hypha — even if a Hypha URL is
-    also in the env."""
-    app_dir, env = replica_env
-
-    monkeypatch.setenv(
-        "BIOENGINE_APP_SOURCE_URI",
-        "gcs://_ray_pkg_deadbeefdeadbeef.zip",
-    )
-
-    def fake_ray_gcs(uri, dest, logger):
-        # Materialise the artifact bytes the same way Hypha would, so the
-        # downstream version-marker write / sys.path lookup paths still
-        # work identically.
-        assert uri == "gcs://_ray_pkg_deadbeefdeadbeef.zip"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            import shutil
-            shutil.rmtree(dest)
-        dest.mkdir(parents=True)
-        for rel, content in fake_artifact_files.items():
-            if replica_init._is_excluded(rel):
-                continue
-            out = dest / rel
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(content)
-
-    def boom(*a, **kw):
-        raise AssertionError(
-            "Hypha _download_and_extract must not be called when "
-            "BIOENGINE_APP_SOURCE_URI is set"
-        )
-
-    monkeypatch.setattr(replica_init, "_download_from_ray_gcs", fake_ray_gcs)
-    monkeypatch.setattr(replica_init, "_download_and_extract", boom)
+    monkeypatch.setattr(replica_init, "_sync_source_from_hypha", boom)
 
     replica_init.setup_replica_environment()
     assert (app_dir / "source" / "entry.py").is_file()
-    assert (app_dir / ".version").read_text().strip() == "1.2.0"
+    assert (
+        app_dir / ".version"
+    ).read_text().strip() == "bioimage-io/model-runner@1.2.0"
 
 
-def test_neither_uri_set_raises_clear_error(monkeypatch, tmp_path) -> None:
-    app_dir = tmp_path / "app"
-    monkeypatch.setenv("BIOENGINE_APP_DIR", str(app_dir))
-    monkeypatch.setenv("BIOENGINE_ARTIFACT_VERSION", "1.2.0")
-    monkeypatch.delenv("BIOENGINE_APP_SOURCE_URI", raising=False)
-    monkeypatch.delenv("BIOENGINE_ARTIFACT_DOWNLOAD_URL", raising=False)
-    monkeypatch.delenv("BIOENGINE_LOCAL_ARTIFACT_PATH", raising=False)
-    monkeypatch.delenv("BIOENGINE_ARTIFACT_ID", raising=False)
+# ───────────────────────── network-facing helpers ─────────────────────────
 
-    with pytest.raises(RuntimeError, match="BIOENGINE_APP_SOURCE_URI"):
-        replica_init.setup_replica_environment()
+
+class _FakeResp:
+    def __init__(self, data: bytes) -> None:
+        self._buf = io.BytesIO(data)
+
+    def read(self, n: int = -1) -> bytes:
+        return self._buf.read(n)
+
+    def __enter__(self) -> "_FakeResp":
+        return self
+
+    def __exit__(self, *a) -> bool:
+        return False
+
+
+def test_list_source_files_walks_and_excludes(monkeypatch) -> None:
+    tree = {
+        "": [
+            {"name": "entry.py", "type": "file", "size": 10, "last_modified": "t1"},
+            {"name": "manifest.yaml", "type": "file", "size": 5, "last_modified": "t1"},
+            {"name": "subpkg", "type": "directory"},
+            {"name": "frontend", "type": "directory"},
+        ],
+        "subpkg/": [
+            {"name": "util.py", "type": "file", "size": 3, "last_modified": "t2"},
+        ],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        after = url.split("?")[0].split("/files", 1)[1].lstrip("/")
+        return _FakeResp(json.dumps(tree.get(after, [])).encode())
+
+    monkeypatch.setattr(replica_init.urllib.request, "urlopen", fake_urlopen)
+    files = replica_init._list_source_files(
+        "https://h/ws/artifacts/x/files", "1.0", None, logging.getLogger("t")
+    )
+    # manifest.yaml + frontend/ excluded; subpkg walked recursively.
+    assert files == {"entry.py": "t1", "subpkg/util.py": "t2"}
+
+
+def test_download_file_writes_content_and_builds_url(monkeypatch, tmp_path) -> None:
+    seen = {}
+
+    def fake_urlopen(url, timeout=None):
+        seen["url"] = url
+        return _FakeResp(b"hello world")
+
+    monkeypatch.setattr(replica_init.urllib.request, "urlopen", fake_urlopen)
+    dest = tmp_path / "a" / "b" / "f.py"
+    replica_init._download_file(
+        "https://h/ws/artifacts/x/files",
+        "a/b/f.py",
+        "1.0",
+        "tok",
+        dest,
+        logging.getLogger("t"),
+    )
+    assert dest.read_bytes() == b"hello world"
+    assert seen["url"].startswith("https://h/ws/artifacts/x/files/a/b/f.py?")
+    assert "version=1.0" in seen["url"] and "token=tok" in seen["url"]
+
+
+def test_artifact_url_appends_version_and_token() -> None:
+    files = "https://h/ws/artifacts/x/files"
+    url = replica_init._artifact_url(files, "entry.py", "1.2.0", "abc 123")
+    assert url.startswith("https://h/ws/artifacts/x/files/entry.py?")
+    assert "version=1.2.0" in url
+    assert "token=abc%20123" in url
+
+
+def test_artifact_url_public_no_token() -> None:
+    files = "https://h/ws/artifacts/x/files"
+    url = replica_init._artifact_url(files, "entry.py", "1.2.0", None)
+    assert url == "https://h/ws/artifacts/x/files/entry.py?version=1.2.0"
+    assert "token" not in url

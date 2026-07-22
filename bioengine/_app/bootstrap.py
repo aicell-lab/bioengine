@@ -3,20 +3,17 @@
 The BioEngine worker never imports user app code directly. The flow is:
 
 1. Worker submits :func:`introspect_app_in_ray_task` as a short Ray task. The
-   task materialises the user package into ``<app_dir>/source/`` (Hypha
-   download, short-TTL token), walks the type-hint composition graph via
-   :func:`introspect_app`, packages the source dir into Ray's internal
-   GCS package store, and returns ``{spec, app_source_uri}``.
+   task materialises the user package into ``<app_dir>/source/`` (per-file
+   Hypha sync), walks the type-hint composition graph via
+   :func:`introspect_app`, and returns ``{spec}``.
 2. Worker checks resources against the spec.
 3. Worker submits :func:`build_and_run_application` as a second Ray task. The
-   task re-materialises source (no-op on shared-FS clusters; a Ray-GCS pull
-   via ``BIOENGINE_APP_SOURCE_URI`` on non-shared ones — no Hypha auth at
-   this point) and calls ``cls.bind`` + ``serve.run(blocking=False)``.
+   task re-materialises source (per-file Hypha sync; incremental — a no-op
+   when unchanged) and calls ``cls.bind`` + ``serve.run(blocking=False)``.
 
-Replicas don't run any function in this module directly; they boot with
-``BIOENGINE_APP_SOURCE_URI`` in their env_vars and call the same
-``_ensure_source`` to materialise their copy of the source, bypassing
-Hypha entirely.
+Replicas don't run any function in this module directly; they boot with the
+Hypha ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional token) in their env_vars and
+call the same ``_ensure_source`` to sync their copy of the source per file.
 """
 
 from __future__ import annotations
@@ -95,16 +92,14 @@ def introspect_app_in_ray_task(
     entry_id: str,
     env_vars: Dict[str, str],
 ) -> Dict[str, Any]:
-    """Phase-1 Ray task: download user source, introspect, package to Ray-GCS.
+    """Phase-1 Ray task: download user source and introspect it.
 
-    Returns ``{"spec": …, "app_source_uri": "gcs://_ray_pkg_<hash>.zip"}``.
+    Returns ``{"spec": …}``.
 
-    The download uses the Hypha ``BIOENGINE_ARTIFACT_DOWNLOAD_URL`` +
-    ``_TOKEN`` env vars (short-TTL). Once source is on disk, we hash and
-    upload it to Ray's internal package store; the resulting URI is what
-    every replica's ``runtime_env`` ships so they can re-materialise the
-    same bytes without going back through Hypha (token expires before
-    most replicas finish their pip install).
+    The download uses the Hypha ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional
+    ``_DOWNLOAD_TOKEN``) env vars via ``_ensure_source``. Replicas materialise
+    their own copy the same way (per-file Hypha sync) — no Ray-GCS package is
+    produced or shipped.
     """
     import logging
     import os
@@ -136,71 +131,7 @@ def introspect_app_in_ray_task(
         sys.path.insert(0, src_str)
 
     spec = introspect_app(entry_id)
-    app_source_uri = _package_source_to_ray_gcs(source)
-    return {"spec": spec, "app_source_uri": app_source_uri}
-
-
-def _package_source_to_ray_gcs(source_dir: "Path") -> str:  # type: ignore[name-defined]
-    """Hash + upload ``source_dir`` to Ray's internal package store.
-
-    Returns the ``gcs://_ray_pkg_<hash>.zip`` URI replicas pass to
-    :func:`ray._private.runtime_env.packaging.download_and_unpack_package`
-    to re-materialise the same bytes.
-
-    Why not use ``runtime_env.py_modules=[<local_path>]`` and let Ray
-    Serve upload for us? Because the bootstrap puts source at a stable
-    ``<app_dir>/source/`` (so cellpose's ``home/`` checkpoints survive
-    version bumps), not Ray's per-process ``runtime_resources/`` dir.
-    Explicit upload here decouples the GCS URI from runtime_env handling.
-
-    Ray patch versions disagree on whether ``include_gitignore`` is a
-    required argument on these packaging APIs; the inspect gates keep us
-    cross-compatible.
-    """
-    from ray._private.runtime_env.packaging import (
-        get_uri_for_directory,
-        upload_package_if_needed,
-    )
-
-    src = str(source_dir.resolve())
-
-    get_kwargs: Dict[str, Any] = {}
-    if "include_gitignore" in inspect.signature(get_uri_for_directory).parameters:
-        get_kwargs["include_gitignore"] = False
-    uri = get_uri_for_directory(src, **get_kwargs)
-
-    upload_kwargs: Dict[str, Any] = {}
-    upload_sig = inspect.signature(upload_package_if_needed)
-    if "include_gitignore" in upload_sig.parameters:
-        upload_kwargs["include_gitignore"] = False
-    # Belt-and-braces: exclude any leftover Ray package zip from the
-    # source tree. Earlier dev iterations of v0.11.4 wrote temp zips
-    # into ``src`` itself (when ``base_directory == src``), Ray's walker
-    # then included its own output back into the package and looped to
-    # 360 GiB on shared NFS before the task was killed. The fix below
-    # uses a scratch ``base_directory``, but if any artifact / pod still
-    # has a stale ``_ray_pkg_*.zip`` sitting in ``source/`` from history,
-    # this exclude keeps it out of the new package.
-    upload_kwargs["excludes"] = ["*.zip", "_ray_pkg_*.zip"]
-    # ``base_directory`` is a scratch dir where Ray writes the temporary
-    # zip file before pushing to GCS. Must not point at the source dir
-    # itself.
-    import tempfile
-    base_dir = tempfile.mkdtemp(prefix="bioengine-pkg-")
-    try:
-        # Ray patches disagree on the third positional name:
-        # Ray 2.5x ships ``(pkg_uri, base_directory, module_path, ...)``;
-        # earlier patches expose ``(pkg_uri, base_directory, ...)`` only.
-        if "module_path" in upload_sig.parameters:
-            upload_package_if_needed(uri, base_dir, src, **upload_kwargs)
-        elif "package_path" in upload_sig.parameters:
-            upload_package_if_needed(uri, base_dir, src, **upload_kwargs)
-        else:
-            upload_package_if_needed(uri, base_dir, **upload_kwargs)
-    finally:
-        import shutil as _shutil
-        _shutil.rmtree(base_dir, ignore_errors=True)
-    return uri
+    return {"spec": spec}
 
 
 def _walk(
@@ -466,7 +397,6 @@ def build_and_run_application(
     application_id: str,
     route_prefix: str,
     bioengine_uri: str,
-    app_source_uri: str,
     proxy_pip: List[str],
     user_replica_framework_pip: List[str],
     replica_env_vars: Dict[str, str],
@@ -483,18 +413,16 @@ def build_and_run_application(
     Runs in a Ray task on whatever node Ray schedules — no head-node pin.
     ``bioengine`` is available via the task's ``runtime_env.py_modules =
     [bioengine_uri]``. The user's app source is materialised here by
-    :func:`bioengine._app.replica_init._ensure_source` using the Ray-GCS
-    branch (``BIOENGINE_APP_SOURCE_URI``) which was just uploaded by the
-    introspect Ray task — the Hypha short-TTL token is not needed and
-    isn't in ``replica_env_vars``.
+    :func:`bioengine._app.replica_init._ensure_source`, which syncs it per
+    file from Hypha using ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional token)
+    from ``replica_env_vars`` — no Ray-GCS package.
 
     Each deployment's ``runtime_env`` is augmented with
-    ``py_modules=[bioengine_uri]`` and ``env_vars`` carrying
-    ``BIOENGINE_APP_SOURCE_URI`` + ``BIOENGINE_APP_DIR`` + secrets. The
-    actual source download on each replica runs via the
-    ``sys.meta_path`` finder installed in :mod:`bioengine.__init__`,
-    which triggers the same ``_ensure_source`` call before the user
-    module's import is retried.
+    ``py_modules=[bioengine_uri]`` (bioengine only — the app source is NOT a
+    py_module) and ``env_vars`` carrying the Hypha coords + ``BIOENGINE_APP_DIR``
+    + secrets. The source download on each replica runs via the ``sys.meta_path``
+    finder installed in :mod:`bioengine.__init__`, which triggers the same
+    ``_ensure_source`` call before the user module's import is retried.
 
     ``proxy_memory_in_gb`` overrides ``ProxyDeployment.ray_actor_options
     .memory`` so the scheduler is biased toward a node with at least
@@ -515,9 +443,6 @@ def build_and_run_application(
     # Overwrite (not setdefault) so this build's values win.
     for key, value in replica_env_vars.items():
         os.environ[key] = value
-    # The Ray-GCS source URI lives on the task env explicitly; replicas
-    # get it via per-deployment env_vars injected in `_with_pkg`.
-    os.environ["BIOENGINE_APP_SOURCE_URI"] = app_source_uri
 
     head_app_dir = Path(replica_env_vars["BIOENGINE_APP_DIR"])
     head_version = replica_env_vars.get("BIOENGINE_ARTIFACT_VERSION") or spec.get(
@@ -556,16 +481,10 @@ def build_and_run_application(
         py_modules = list(runtime_env.get("py_modules") or [])
         if bioengine_uri not in py_modules:
             py_modules.append(bioengine_uri)
-        # Ship the user source via py_modules too. Ray extracts py_modules
-        # to ``/tmp/ray/.../runtime_resources/py_modules_files/<hash>/``
-        # and adds that dir to PYTHONPATH BEFORE the replica's Python
-        # interpreter runs cloudpickle.loads — so ``import main``
-        # (cellpose) or ``import entry`` (model-runner) resolves natively
-        # without any hook / finder / pickle-by-value trick. The source
-        # is content-hashed in Ray's GCS package store by the introspect
-        # task; replicas pull from there.
-        if app_source_uri not in py_modules:
-            py_modules.append(app_source_uri)
+        # The user app source is NOT shipped via py_modules — it's synced per
+        # file from Hypha into ``<app_dir>/source/`` by ``_ensure_source``,
+        # triggered by the ``sys.meta_path`` finder (installed on
+        # ``import bioengine``) before ``import main``/``import entry`` resolves.
         runtime_env["py_modules"] = py_modules
         # Ray's default_worker.py honours ``worker_process_setup_hook``
         # *before* Ray Serve's ServeReplica.__init__ runs cloudpickle.loads.
@@ -587,13 +506,12 @@ def build_and_run_application(
             list(runtime_env.get("pip") or []),
             user_replica_framework_pip,
         )
-        # Merge the worker-side env_vars + the app-source URI into
+        # Merge the worker-side env_vars (incl. the Hypha source coords) into
         # whatever static ``env_vars`` the author declared via
         # ``@bioengine.app(env_vars=…)``. The author's entries take
         # precedence on key collision.
         deploy_env_vars = {
             **replica_env_vars,
-            "BIOENGINE_APP_SOURCE_URI": app_source_uri,
             **(runtime_env.get("env_vars") or {}),
         }
         runtime_env["env_vars"] = deploy_env_vars
@@ -644,13 +562,10 @@ def build_and_run_application(
     proxy_py_modules = list(proxy_runtime_env.get("py_modules") or [])
     if bioengine_uri not in proxy_py_modules:
         proxy_py_modules.append(bioengine_uri)
-    if app_source_uri not in proxy_py_modules:
-        proxy_py_modules.append(app_source_uri)
     proxy_runtime_env["py_modules"] = proxy_py_modules
     proxy_runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
     proxy_runtime_env["env_vars"] = {
         **replica_env_vars,
-        "BIOENGINE_APP_SOURCE_URI": app_source_uri,
         **(proxy_runtime_env.get("env_vars") or {}),
     }
     proxy_actor_options["runtime_env"] = proxy_runtime_env
