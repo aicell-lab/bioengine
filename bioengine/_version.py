@@ -13,4 +13,4 @@ see the same string that ``pip`` sees.
 Must stay in lock-step with ``pyproject.toml``'s ``version`` field.
 The ``version-check.yml`` CI workflow enforces the match.
 """
-__version__ = "0.12.1"
+__version__ = "0.12.2"
