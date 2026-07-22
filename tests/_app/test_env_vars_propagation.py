@@ -39,7 +39,6 @@ def _merge_via_with_pkg(
     replica_env_vars: Dict[str, str],
     user_replica_framework_pip: list[str] | None = None,
     bioengine_uri: str = "gcs://_ray_pkg_aaaaaaaaaaaaaaaa.zip",
-    app_source_uri: str = "gcs://_ray_pkg_bbbbbbbbbbbbbbbb.zip",
 ) -> Dict[str, Any]:
     """Drive ``_with_pkg`` from bootstrap against a fake class and return
     the assembled ``runtime_env`` dict that bootstrap would hand to Ray
@@ -59,7 +58,6 @@ def _merge_via_with_pkg(
     )
     rt["env_vars"] = {
         **replica_env_vars,
-        "BIOENGINE_APP_SOURCE_URI": app_source_uri,
         **(rt.get("env_vars") or {}),
     }
     return rt
@@ -135,8 +133,6 @@ def test_empty_framework_env_vars_keeps_author_env_vars_intact() -> None:
         {"runtime_env": {"env_vars": {"AUTHOR_FLAG": "1"}}},
         replica_env_vars={},
     )
-    # BIOENGINE_APP_SOURCE_URI is always injected by _with_pkg so the
-    # replica's _ensure_source can pull source from Ray-GCS; the author's
-    # env vars sit alongside it.
+    # The author's env vars survive the merge (the app source is synced from
+    # Hypha at replica init, not carried in env_vars).
     assert rt["env_vars"]["AUTHOR_FLAG"] == "1"
-    assert rt["env_vars"]["BIOENGINE_APP_SOURCE_URI"].startswith("gcs://")

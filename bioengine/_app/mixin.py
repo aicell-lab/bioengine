@@ -234,7 +234,6 @@ def _make_runtime_version(user_cls: type) -> Callable[..., Any]:
         return {
             "artifact_id": os.environ.get("BIOENGINE_ARTIFACT_ID"),
             "version": os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
-            "app_source_uri": os.environ.get("BIOENGINE_APP_SOURCE_URI"),
         }
 
     return bioengine_runtime_version

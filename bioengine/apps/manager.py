@@ -28,6 +28,23 @@ from bioengine.utils import (
 )
 
 
+def _is_serve_controller_gone(exc: BaseException) -> bool:
+    """Whether a ``serve.*`` call failed because the Serve controller is gone.
+
+    A Ray head restart wipes the Serve controller actor: ``serve.status``
+    then reports "There is no Serve instance running on this Ray cluster",
+    or — when a cached client handle outlives the controller — "doesn't have
+    a handle for <actor>". Both mean the controller must be re-bootstrapped
+    by a fresh ``serve.run`` rather than merely reconnected.
+    """
+    msg = str(exc).lower()
+    return (
+        "no serve instance running" in msg
+        or "there is no serve instance" in msg
+        or "doesn't have a handle for" in msg
+    )
+
+
 def _belongs_to_worker_workspace(
     application_id: str,
     app_data: Dict[str, Any],
@@ -91,6 +108,12 @@ from bioengine.apps._cache_fs_tasks import (
 # Schedule: 10, 20, 40, 80, 160, 320, 600, 600 … s.
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
+
+# Minimum gap between in-place Serve-controller-loss recovery sweeps. Long
+# enough for a redeploy's serve.run to bootstrap the controller before we'd
+# consider re-firing, short enough for a couple of attempts before the
+# monitor's degraded backstop cycles the pod (~62 s to 5 consecutive errors).
+_CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
 
 class AppsManager:
@@ -223,6 +246,11 @@ class AppsManager:
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
         # moment an app is observed healthy again. See monitor_applications.
         self._redeploy_backoff: Dict[str, Dict[str, Any]] = {}
+
+        # Timestamp of the last in-place Serve-controller-loss recovery sweep,
+        # used to rate-limit re-firing while a redeploy's serve.run is still
+        # bootstrapping the controller. See _recover_from_controller_loss.
+        self._last_controller_recovery = 0.0
 
         # Cache the result of the one-time FS-topology probe across Ray
         # nodes. None until the first list/clear-cache call from the
@@ -602,6 +630,14 @@ class AppsManager:
             f"User '{user_id}' is starting undeployment of application '{application_id}'..."
         )
         await self._cancel_deployment_process(application_id=application_id)
+
+        # Drop the tracking entry BEFORE serve.delete. The monitor loop iterates
+        # _deployed_applications and fires auto-redeploy for anything unhealthy;
+        # if the entry survived the serve.delete window, a monitor tick could
+        # re-adopt the app mid-stop and re-deploy it, racing the stop. Popping
+        # first makes the app invisible to the monitor for the rest of teardown.
+        self._deployed_applications.pop(application_id, None)
+        self._redeploy_backoff.pop(application_id, None)
 
         try:
             await self.ray_cluster.call_with_reconnect(
@@ -1255,7 +1291,20 @@ class AppsManager:
 
         # Get status of actively running deployments
         await self.ray_cluster.check_connection()
-        serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
+        try:
+            serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
+        except Exception as exc:
+            if _is_serve_controller_gone(exc):
+                # A Ray head restart wiped the Serve controller. The client
+                # reconnects (handles refreshed, cached Serve client dropped)
+                # but there is no controller until an app is (re)deployed, so
+                # redeploy the tracked apps in-place: serve.run bootstraps a
+                # fresh controller and recreates the replicas without cycling
+                # the pod. Re-raise so, if recovery can't take within a few
+                # ticks, the monitor's degraded counter still trips the
+                # liveness backstop.
+                await self._recover_from_controller_loss(apps_to_redeploy)
+            raise
 
         now = time.time()
 
@@ -1332,6 +1381,35 @@ class AppsManager:
             )
             backoff_state["consecutive_failures"] = attempt
             backoff_state["next_attempt_at"] = now + delay
+
+    async def _recover_from_controller_loss(
+        self, application_ids: List[str]
+    ) -> None:
+        """Re-establish Ray Serve in-place after the controller was lost.
+
+        A Ray head restart destroys the Serve controller; ``reconnect`` has
+        already dropped the cached Serve client, so re-firing each tracked
+        app's deploy task lets ``serve.run`` bootstrap a fresh controller and
+        recreate the replicas without cycling the worker pod. A deployed app's
+        deploy task blocks alive on an event, so we can't gate on it being
+        idle; instead a cooldown rate-limits sweeps so an in-flight serve.run
+        isn't stomped every tick. Apps recovered from a previous worker carry
+        no cached ``built_app``; they can't be rebuilt from here and are left
+        for the liveness backstop to recover via a pod cycle.
+        """
+        now = time.time()
+        if now - self._last_controller_recovery < _CONTROLLER_RECOVERY_COOLDOWN_SECONDS:
+            return
+        self._last_controller_recovery = now
+        for application_id in application_ids:
+            info = self._deployed_applications.get(application_id)
+            if not info or info.get("built_app") is None:
+                continue
+            self.logger.error(
+                f"Ray Serve controller lost (Ray head restart?); "
+                f"re-establishing application '{application_id}' in-place."
+            )
+            self._fire_redeploy(application_id, info, attempt=1)
 
     def _fire_redeploy(
         self,

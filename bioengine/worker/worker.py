@@ -276,6 +276,17 @@ class BioEngineWorker:
         self.start_time = None
         self._last_monitoring = 0
 
+        # Backstop for the in-place Serve recovery in
+        # ``AppsManager.monitor_applications``: after this many consecutive
+        # monitoring-loop failures the worker reports not-ready (get_status)
+        # so the k8s liveness probe cycles the pod. In-place recovery handles
+        # the common Ray-head-restart case (redeploy bootstraps a fresh Serve
+        # controller); this covers the residue it can't — e.g. an app with no
+        # cached built_app, or a redeploy that keeps failing — where a fresh
+        # pod is the only way out.
+        self._monitor_consecutive_errors = 0
+        self._monitor_degraded_threshold = 5
+
         self.is_ready = asyncio.Event()
         self._shutdown_event = asyncio.Event()
         self._shutdown_event.set()
@@ -830,7 +841,7 @@ class BioEngineWorker:
                 "Starting monitoring task with interval "
                 f"{self.monitoring_interval_seconds} seconds..."
             )
-            consecutive_errors = 0
+            self._monitor_consecutive_errors = 0
             while self.is_ready.is_set():
                 try:
                     # Sleep for 1 second before next iteration
@@ -860,7 +871,8 @@ class BioEngineWorker:
                         except Exception as step_exc:
                             step_errors.append((name, step_exc))
                             self.logger.warning(
-                                f"Monitoring step '{name}' failed: {step_exc}"
+                                f"Monitoring step '{name}' failed: {step_exc}",
+                                exc_info=True,
                             )
 
                     # ===== 0. Geo location =====
@@ -900,31 +912,47 @@ class BioEngineWorker:
                     # await self.dataset_manager.monitor_datasets()
 
                     # Log recovery after a streak of failures
-                    if consecutive_errors > 0:
+                    if self._monitor_consecutive_errors > 0:
                         self.logger.info(
                             f"Monitoring loop recovered after "
-                            f"{consecutive_errors} consecutive error(s)"
+                            f"{self._monitor_consecutive_errors} consecutive error(s)"
                         )
-                    consecutive_errors = 0
+                    self._monitor_consecutive_errors = 0
 
                 except asyncio.CancelledError:
                     # Propagate so the outer handler performs clean shutdown.
                     raise
                 except Exception as e:
-                    consecutive_errors += 1
+                    self._monitor_consecutive_errors += 1
                     # Exponential backoff capped at backoff_max_seconds.
                     backoff = min(
                         backoff_max_seconds,
-                        backoff_initial_seconds * (2 ** (consecutive_errors - 1)),
+                        backoff_initial_seconds
+                        * (2 ** (self._monitor_consecutive_errors - 1)),
                     )
-                    # Escalate severity once the streak indicates a sustained
-                    # outage so dashboards / alerts still notice, without
-                    # ever killing the worker.
-                    log = self.logger.warning if consecutive_errors <= 5 else self.logger.error
+                    log = (
+                        self.logger.warning
+                        if self._monitor_consecutive_errors <= 5
+                        else self.logger.error
+                    )
                     log(
-                        f"Error in monitoring task (#{consecutive_errors} consecutive, "
+                        f"Error in monitoring task "
+                        f"(#{self._monitor_consecutive_errors} consecutive, "
                         f"sleeping {backoff:.0f}s before retry): {e}"
                     )
+                    # At the degraded threshold, get_status flips to not-ready
+                    # so the k8s liveness probe cycles the pod — the backstop
+                    # for when in-place Serve recovery can't clear the wedge.
+                    if (
+                        self._monitor_consecutive_errors
+                        == self._monitor_degraded_threshold
+                    ):
+                        self.logger.error(
+                            f"Monitoring wedged for "
+                            f"{self._monitor_consecutive_errors} consecutive ticks — "
+                            f"reporting worker not-ready so the liveness probe "
+                            f"restarts the pod."
+                        )
                     await asyncio.sleep(backoff)
 
         except asyncio.CancelledError:
@@ -1207,7 +1235,11 @@ class BioEngineWorker:
             "ray_cluster": self.ray_cluster.status,
             "admin_users": self.admin_users,
             "geo_location": self.geo_location,
-            "is_ready": self.is_ready.is_set(),
+            "is_ready": (
+                self.is_ready.is_set()
+                and self._monitor_consecutive_errors
+                < self._monitor_degraded_threshold
+            ),
         }
 
         # SLURM jobs — refresh from squeue at read time so the dashboard

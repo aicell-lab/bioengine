@@ -5,19 +5,19 @@ the filesystem. The worker only handles:
 
 * manifest loading + ``format_version`` / ``authorized_users`` gate
 * runtime_env composition (base pip + env_vars for the introspect task)
-* mint short-TTL Hypha download token
+* mint a read-only Hypha download token (30-day; public artifacts need none)
 * submit :func:`bioengine._app.bootstrap.introspect_app_in_ray_task` —
-  that Ray task downloads source, walks the type-hint composition graph,
-  packages source to Ray's internal GCS, returns ``{spec, app_source_uri}``
+  that Ray task syncs source from Hypha and walks the type-hint composition
+  graph, returning ``{spec}``
 * kwargs validation against the returned spec
 * resource accounting + ``_check_resources`` (the SLURM-aware gate)
 * authorisation-rule resolution + ``ProxyDeployment`` argument assembly
 * submit :func:`bioengine._app.bootstrap.build_and_run_application` — that
   Ray task does ``cls.bind(...)`` + ``serve.run(blocking=False)``
 
-Every replica receives ``BIOENGINE_APP_SOURCE_URI`` in its ``env_vars``
-and uses Ray-internal GCS to materialise source — no Hypha auth on the
-replica side, so the short-TTL token never matters after step 4.
+Every replica syncs its own source **per file from Hypha** (durable) using
+the ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional token) in its ``env_vars`` —
+no Ray-GCS package for the app source.
 """
 
 from __future__ import annotations
@@ -56,11 +56,14 @@ from bioengine.utils import (
     validate_manifest,
 )
 
-#: TTL of the short-lived read-only token the worker mints per deploy and
-#: hands the replica setup hook for its create-zip-file download. Bounded
-#: well above the time it takes a typical Ray Serve replica to pull the
-#: ~MB-scale artifact and well under any plausible session-reuse window.
-_DOWNLOAD_TOKEN_TTL_SECONDS = 600
+#: TTL of the read-only token the worker mints per deploy and hands replicas
+#: for their per-file Hypha source sync. Unlike the old ~10 min introspect-only
+#: token, replicas now pull source at *every* start (autoscale, crash-restart,
+#: head-restart re-submit), so it must span the deployment lifetime; 30 days
+#: matches the proxy service token. Refreshed on every redeploy, with
+#: auto_redeploy as the backstop for the 30-day edge. Public artifacts need no
+#: token (anonymous read).
+_DOWNLOAD_TOKEN_TTL_SECONDS = 3600 * 24 * 30
 
 
 class AppBuilder:
@@ -159,7 +162,7 @@ class AppBuilder:
         """Compose the env_vars dict the replica's runtime_env will receive.
 
         The replica setup hook (``bioengine._app.replica_init``) reads
-        ``BIOENGINE_APP_DIR`` + ``BIOENGINE_ARTIFACT_DOWNLOAD_URL`` +
+        ``BIOENGINE_APP_DIR`` + ``BIOENGINE_ARTIFACT_FILES_URL`` +
         ``BIOENGINE_ARTIFACT_VERSION`` + ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN``
         from this dict to materialise the user source. HOME and TMPDIR are
         deliberately *not* set here — the setup hook computes them under
@@ -193,13 +196,9 @@ class AppBuilder:
             env_vars["HYPHA_ARTIFACT_VERSION"] = version
             env_vars["BIOENGINE_ARTIFACT_VERSION"] = version
             artifact_workspace, alias = artifact_id.split("/", 1)
-            env_vars["BIOENGINE_ARTIFACT_DOWNLOAD_URL"] = (
-                f"{self.server_url.rstrip('/')}/{artifact_workspace}"
-                f"/artifacts/{alias}/create-zip-file?version={version}"
-            )
-            # Files-listing endpoint (metadata only) — the introspect uses it
-            # to compute a content signature and skip the full re-download when
-            # the artifact is unchanged.
+            # Files endpoint: lists files (name/type/size/last_modified) for the
+            # per-file incremental sync, and serves each file at
+            # ``{files_url}/{relpath}?version=&token=``. See replica_init.py.
             env_vars["BIOENGINE_ARTIFACT_FILES_URL"] = (
                 f"{self.server_url.rstrip('/')}/{artifact_workspace}"
                 f"/artifacts/{alias}/files"
@@ -291,11 +290,9 @@ class AppBuilder:
     ) -> Dict[str, Any]:
         """Submit :func:`introspect_app_in_ray_task` as a Ray task.
 
-        The task downloads the user package (Hypha, short-TTL token in
-        ``env_vars``), walks the type-hint composition graph, packages
-        the source to Ray's internal GCS, and returns the
-        ``{spec, app_source_uri}`` payload. We never touch the worker's
-        filesystem.
+        The task syncs the user package from Hypha (token in ``env_vars``),
+        walks the type-hint composition graph, and returns the ``{spec}``
+        payload. We never touch the worker's filesystem.
 
         Strips the ``_BIOENGINE_SECRET_*`` keys from ``env_vars`` before
         passing into the task to keep secrets out of Ray's logs; the
@@ -487,11 +484,11 @@ class AppBuilder:
         application_kwargs = dict(application_kwargs or {})
         application_env_vars = dict(application_env_vars or {})
 
-        # 1. Mint a short-TTL read-only token the introspect Ray task will
-        # attach to its single Hypha create-zip-file download. The token
-        # never crosses to Ray Serve replicas — they pull source from Ray's
-        # internal GCS via ``BIOENGINE_APP_SOURCE_URI`` (uploaded inside the
-        # introspect task), so its TTL only matters for the next ~10 s.
+        # 1. Mint a read-only token for the introspect task AND every replica's
+        # per-file Hypha source sync (it rides in replica_env_vars). 30-day TTL
+        # so replicas starting later (autoscale, crash-restart) can still pull;
+        # refreshed on each redeploy. On a public artifact the mint raises a
+        # permission error and we fall through to anonymous read (below).
         download_token: Optional[str] = None
         artifact_workspace = artifact_id.split("/", 1)[0]
         try:
@@ -540,18 +537,14 @@ class AppBuilder:
         )
         runtime_env = self._build_submit_runtime_env(env_vars)
 
-        # 3. Introspect the user package via a Ray task — the task
-        # downloads from Hypha, walks @bioengine.app composition, and
-        # packages the source to Ray-internal GCS. Returns spec + URI.
+        # 3. Introspect the user package via a Ray task — the task syncs the
+        # source from Hypha and walks the @bioengine.app composition. Returns
+        # spec only; replicas sync their own source per file from Hypha.
         introspect_result = await self._introspect_via_ray_task(
             entry_id, env_vars, runtime_env
         )
         spec = introspect_result["spec"]
-        app_source_uri = introspect_result["app_source_uri"]
-        self.logger.info(
-            f"Introspect task returned for '{application_id}' — "
-            f"app_source_uri={app_source_uri}"
-        )
+        self.logger.info(f"Introspect task returned for '{application_id}'")
 
         # Sanity check: format_version round-trip.
         if spec.get("format_version") != SPEC_FORMAT_VERSION:
@@ -718,7 +711,6 @@ class AppBuilder:
             proxy_args=proxy_args,
             runtime_env=runtime_env,
             bioengine_uri=self._bioengine_gcs_uri(),
-            app_source_uri=app_source_uri,
             proxy_pip=proxy_pip,
             user_replica_framework_pip=user_replica_framework_pip,
             replica_env_vars=replica_env_vars,
@@ -736,8 +728,7 @@ class AppBuilder:
         not after — and preserves the SLURM-scaling fallback.
 
         No worker-side cleanup needed: the worker never wrote anything to
-        its own filesystem. Source bytes live in Ray's GCS package store
-        (uploaded by the introspect task); replicas fetch from there.
+        its own filesystem. Replicas sync source per file from Hypha.
         """
         # The Ray Client server unpickles ``.remote(...)`` args in a
         # per-client runtime_env that ships bioengine via ``py_modules``
@@ -762,7 +753,6 @@ class AppBuilder:
                     application_id,
                     f"/{application_id}",
                     built_app.bioengine_uri,
-                    built_app.app_source_uri,
                     built_app.proxy_pip,
                     built_app.user_replica_framework_pip,
                     _ensure_jsonable(built_app.replica_env_vars),
@@ -789,10 +779,10 @@ class BuiltApp:
     the manager can do ``build → check_resources → submit`` and keep the
     resource check on the right side of the actual claim.
 
-    ``app_source_uri`` is the ``gcs://_ray_pkg_<hash>.zip`` URI returned
-    by the introspect Ray task — the build task plus every replica use
-    it to materialise source via Ray's internal package store, no Hypha
-    auth needed.
+    ``bioengine_uri`` is the content-hashed ``gcs://_ray_pkg_<hash>.zip`` URI
+    for the framework package (re-derived from the worker's ``ray.init``
+    upload). The user app source is NOT carried here — replicas sync it per
+    file from Hypha via the coords in ``replica_env_vars``.
     """
 
     __slots__ = (
@@ -802,7 +792,6 @@ class BuiltApp:
         "proxy_args",
         "runtime_env",
         "bioengine_uri",
-        "app_source_uri",
         "proxy_pip",
         "user_replica_framework_pip",
         "replica_env_vars",
@@ -818,7 +807,6 @@ class BuiltApp:
         proxy_args: Dict[str, Any],
         runtime_env: Dict[str, Any],
         bioengine_uri: str,
-        app_source_uri: str,
         proxy_pip: List[str],
         user_replica_framework_pip: List[str],
         replica_env_vars: Dict[str, str],
@@ -831,7 +819,6 @@ class BuiltApp:
         self.proxy_args = proxy_args
         self.runtime_env = runtime_env
         self.bioengine_uri = bioengine_uri
-        self.app_source_uri = app_source_uri
         self.proxy_pip = proxy_pip
         self.user_replica_framework_pip = user_replica_framework_pip
         self.replica_env_vars = replica_env_vars

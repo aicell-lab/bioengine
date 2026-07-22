@@ -70,8 +70,10 @@ def _install_replica_bootstrap_finder() -> None:
       1. Sets a sentinel so the bootstrap can't recurse if any of its
          own imports also miss.
       2. Runs ``setup_replica_environment()`` which calls
-         ``_ensure_source`` (Ray-GCS download via
-         ``BIOENGINE_APP_SOURCE_URI``) and ``sys.path.insert(0, source/)``.
+         ``_ensure_source`` (per-file Hypha sync via
+         ``BIOENGINE_ARTIFACT_FILES_URL``) and ``sys.path.insert(0, source/)``.
+         The app source is no longer shipped as a Ray py_module, so this
+         finder is the *sole* mechanism that puts user modules on sys.path.
       3. Delegates back to ``importlib.machinery.PathFinder`` to resolve
          the name against the now-populated ``sys.path`` — so the import
          that triggered us succeeds without the caller knowing.
