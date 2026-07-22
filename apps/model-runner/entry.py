@@ -2310,12 +2310,22 @@ class EntryApp:
                         pass
 
                 # Mirror the model's identifying metadata from the bioimage.io
-                # collection so the test-reports collection is self-describing.
+                # collection so the test-reports collection is self-describing,
+                # and record whether the model has a committed/published
+                # version — a non-empty ``versions`` list. That, not the test
+                # ``stage`` param, gates the published-model type and score: a
+                # model can be tested ``stage=False`` yet never have been
+                # committed (draft / in-review, ``versions == []``), and must
+                # not leak onto the public grid (which filters strictly on
+                # ``type == published-model``). Fail closed to staged on a read
+                # error. Matches the website's ``isPublished = versions.length > 0``.
                 model_meta = {}
+                model_is_published = False
                 try:
                     model_artifact = await self.artifact_manager.read(
                         f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}", silent=True
                     )
+                    model_is_published = bool(model_artifact.get("versions"))
                     model_manifest = model_artifact.get("manifest") or {}
                     for key in (
                         "name",
@@ -2339,22 +2349,24 @@ class EntryApp:
                 else:
                     manifest.update(model_meta)
 
-                # Only the published slot scores an artifact — a staged-only
-                # model has no committed version to rank. The score is an
-                # additive ladder whose tiers can't tie: valid format (+1)
+                # Score only a published model's committed-version report — a
+                # staged-only model has no committed version to rank. The score
+                # is an additive ladder whose tiers can't tie: valid format (+1)
                 # < passed default-env inference (+2) < passed
                 # reproducibility (+4), with metadata completeness (0..1) as
                 # a sub-tier tiebreaker. Each tier presupposes the one below
                 # (inference needs a valid format, reproducibility needs a
                 # runnable model), so the gaps guarantee a strict ordering.
-                if not stage:
+                if not stage and model_is_published:
                     manifest["score"] = self._compute_report_score(test_report)
 
-                # Publishing a committed model upgrades the report artifact
-                # type to ``published-model`` (sticky — a later staged
-                # upload omits ``type`` so it never downgrades).
+                # A model with a committed/published version types its report
+                # artifact ``published-model`` (sticky — a staged-only model
+                # never passes ``type`` so it stays ``staged-model`` and is
+                # kept off the type-filtered public grid). Keyed on the model's
+                # ``versions``, NOT the test ``stage`` slot.
                 edit_kwargs = {"manifest": manifest, "stage": True}
-                if not stage:
+                if model_is_published:
                     edit_kwargs["type"] = "published-model"
                 await self.artifact_manager.edit(
                     report_artifact_id, **edit_kwargs
