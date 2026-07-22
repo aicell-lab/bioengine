@@ -33,6 +33,27 @@ from bioengine._app.errors import (
 SPEC_FORMAT_VERSION = "0.6.0"
 
 
+def _purge_stale_source_modules(source_root: str) -> None:
+    """Drop cached app-source modules so the next import reads fresh on-disk source.
+
+    Introspect and build run as Ray tasks that may reuse a warm worker process.
+    A prior version's build can leave the app's own modules in ``sys.modules``;
+    ``importlib.import_module`` then returns the stale module instead of the
+    freshly synced source, and pickle-by-value would bake the old code into the
+    deployment (this served stale model-runner tagging on a KTH worker cycle).
+    Purge every module whose file lives under ``<app_dir>/source``.
+    """
+    import os
+
+    prefix = os.path.realpath(source_root) + os.sep
+    for name in list(sys.modules):
+        module = sys.modules.get(name)
+        module_file = getattr(module, "__file__", None)
+        if module_file and os.path.realpath(module_file).startswith(prefix):
+            del sys.modules[name]
+    importlib.invalidate_caches()
+
+
 # ───────────────────────────── introspection ─────────────────────────────
 
 
@@ -129,6 +150,7 @@ def introspect_app_in_ray_task(
     src_str = str(source)
     if src_str not in sys.path:
         sys.path.insert(0, src_str)
+    _purge_stale_source_modules(src_str)
 
     spec = introspect_app(entry_id)
     return {"spec": spec}
@@ -455,6 +477,7 @@ def build_and_run_application(
     src_str = str(head_source)
     if src_str not in sys.path:
         sys.path.insert(0, src_str)
+    _purge_stale_source_modules(src_str)
 
     handles: Dict[str, Any] = {}
 
