@@ -41,15 +41,37 @@ def _purge_stale_source_modules(source_root: str) -> None:
     ``importlib.import_module`` then returns the stale module instead of the
     freshly synced source, and pickle-by-value would bake the old code into the
     deployment (this served stale model-runner tagging on a KTH worker cycle).
-    Purge every module whose file lives under ``<app_dir>/source``.
+
+    Purge by module *name* — the top-level module/package names the app defines
+    at its source root — not just by ``__file__`` under the current source. The
+    stale module may have been imported earlier under a different path (a
+    0.11.29-era Ray ``py_modules`` ``_ray_pkg`` dir, or a prior ``app_dir``), so
+    a path-only match misses it and Python keeps serving the cached copy. We
+    also drop anything whose file *is* under the current source, as a backstop.
     """
     import os
 
-    prefix = os.path.realpath(source_root) + os.sep
+    source = os.path.realpath(source_root)
+    app_names = set()
+    try:
+        for name in os.listdir(source):
+            path = os.path.join(source, name)
+            if name.endswith(".py") and name != "__init__.py":
+                app_names.add(name[:-3])
+            elif os.path.isdir(path) and os.path.exists(
+                os.path.join(path, "__init__.py")
+            ):
+                app_names.add(name)
+    except OSError:
+        pass
+
+    prefix = source + os.sep
     for name in list(sys.modules):
         module = sys.modules.get(name)
         module_file = getattr(module, "__file__", None)
-        if module_file and os.path.realpath(module_file).startswith(prefix):
+        if name.split(".", 1)[0] in app_names or (
+            module_file and os.path.realpath(module_file).startswith(prefix)
+        ):
             del sys.modules[name]
     importlib.invalidate_caches()
 
