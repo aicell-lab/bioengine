@@ -111,10 +111,16 @@ def _purge_stale_app_modules(logger: logging.Logger) -> None:
     one-GPU node), or when the runtime_env is unchanged. The per-file Hypha
     sync already refreshed ``<app_dir>/source`` on disk, but the reused
     interpreter still has the *previous* deploy's app modules in
-    ``sys.modules``, so ``import entry`` returns stale code. Purging every
-    module whose file lives under ``<app_dir>/source`` (framework and
-    site-packages untouched) forces a fresh import of the new source. Runs
-    per replica instance via :func:`_setup_replica`, before user ``__init__``.
+    ``sys.modules``, so a lazy ``import entry`` returns stale code. Purging the
+    app's modules (framework and site-packages untouched) forces a fresh
+    import. Runs per replica instance via :func:`_setup_replica`, before user
+    ``__init__``.
+
+    Purge by module *name* — the top-level names the app defines at its source
+    root — not just by ``__file__`` under the current source: a stale module
+    may have been imported earlier under a different path (a 0.11.29-era Ray
+    ``py_modules`` ``_ray_pkg`` dir, or a prior ``app_dir``), so a path-only
+    match misses it and Python keeps serving the cached copy.
     """
     import sys
 
@@ -123,10 +129,22 @@ def _purge_stale_app_modules(logger: logging.Logger) -> None:
         return
     source_root = str(Path(app_dir).resolve() / "source")
     prefix = source_root + os.sep
+    app_names = set()
+    try:
+        for item in os.listdir(source_root):
+            item_path = os.path.join(source_root, item)
+            if item.endswith(".py") and item != "__init__.py":
+                app_names.add(item[:-3])
+            elif os.path.isdir(item_path) and os.path.exists(
+                os.path.join(item_path, "__init__.py")
+            ):
+                app_names.add(item)
+    except OSError:
+        pass
     purged = []
     for name, module in list(sys.modules.items()):
         path = getattr(module, "__file__", None)
-        if path and path.startswith(prefix):
+        if name.split(".", 1)[0] in app_names or (path and path.startswith(prefix)):
             del sys.modules[name]
             purged.append(name)
     if source_root not in sys.path:
@@ -264,16 +282,25 @@ def _make_runtime_version(user_cls: type) -> Callable[..., Any]:
     """Build the ``bioengine_runtime_version`` method installed on the class.
 
     Returns the artifact identity this replica *actually booted with*, read
-    from the process env the worker set in the replica's runtime_env. The
-    worker queries it (through the ProxyDeployment) to verify that a running
-    replica loaded the requested version rather than stale in-memory code
-    left over from a reused replica.
+    from attributes **baked into the class at build time** (captured by
+    pickle-by-value), not from the runtime_env env var. This is the crucial
+    difference: a REUSED replica running stale in-memory code still has the
+    fresh env var (the worker set it in the new runtime_env), so an env-var
+    read reports the new version while the code is old — the exact blind spot
+    that let a reused entry replica serve stale code undetected. The baked
+    value travels *with the code*, so a stale replica reports the stale
+    identity and the worker's monitor can detect + force a real restart.
+    Falls back to the env var only if the build didn't bake the identity.
     """
 
     async def bioengine_runtime_version(self: Any) -> Dict[str, Optional[str]]:
+        cls = type(self)
         return {
-            "artifact_id": os.environ.get("BIOENGINE_ARTIFACT_ID"),
-            "version": os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
+            "artifact_id": getattr(cls, "_bioengine_baked_artifact_id", None)
+            or os.environ.get("BIOENGINE_ARTIFACT_ID"),
+            "version": getattr(cls, "_bioengine_baked_version", None)
+            or os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
+            "code_hash": getattr(cls, "_bioengine_baked_code_hash", None),
         }
 
     return bioengine_runtime_version

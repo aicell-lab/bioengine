@@ -859,6 +859,49 @@ class AppsManager:
             )
             return None
 
+    async def _get_stale_deployments(
+        self, application_id: str, expected_version: str
+    ) -> Optional[List[str]]:
+        """Names of user deployments whose replica loaded a version other than
+        ``expected_version`` — i.e. reused replicas serving stale code.
+
+        A reused replica can happen on ANY user deployment, not just the entry,
+        so this queries every deployment class in the app's spec (each carries
+        ``bioengine_runtime_version`` returning its *baked* identity). Returns
+        an empty list when all deployments match, or ``None`` when the check
+        can't be run (so the caller doesn't act on incomplete information).
+        """
+        info = self._deployed_applications.get(application_id)
+        built_app = info.get("built_app") if info else None
+        spec = getattr(built_app, "spec", None)
+        if not spec:
+            return None
+        names = {
+            meta["qualname"].split(".")[-1]
+            for meta in (spec.get("classes") or {}).values()
+        }
+        if not names:
+            return None
+        stale: List[str] = []
+        checked = 0
+        for name in names:
+            try:
+                handle = await self.ray_cluster.call_with_reconnect(
+                    serve.get_deployment_handle, name, application_id
+                )
+                rv = await asyncio.wait_for(
+                    handle.bioengine_runtime_version.remote(), timeout=10.0
+                )
+                checked += 1
+                if rv is not None and rv.get("version") != expected_version:
+                    stale.append(name)
+            except Exception as exc:
+                self.logger.debug(
+                    f"Could not read running version for deployment "
+                    f"'{name}' of '{application_id}': {exc}"
+                )
+        return stale if checked else None
+
     async def _get_app_status(
         self,
         application_id: str,
@@ -914,16 +957,23 @@ class AppsManager:
 
         service_ids = await self._get_application_service_ids(application_id)
 
-        # Report what the entry replica actually loaded, not just the
-        # requested version — a stale reused replica reads as "healthy"
-        # otherwise. version_verified is None when it can't be determined.
+        # Report what the replicas actually loaded, not just the requested
+        # version — a stale reused replica reads as "healthy" otherwise.
+        # ``running_version`` shows the entry replica's baked version;
+        # ``version_verified`` reflects EVERY user deployment (a reused replica
+        # of any deployment, not just the entry, counts as unverified). Both are
+        # None when they can't be determined.
         running_version = None
         version_verified = None
         if status == "RUNNING":
             rv = await self._get_running_version(application_id)
             if rv is not None:
                 running_version = rv.get("version")
-                version_verified = running_version == application_info["version"]
+            stale = await self._get_stale_deployments(
+                application_id, application_info["version"]
+            )
+            if stale is not None:
+                version_verified = len(stale) == 0
 
         # Build static site URL with runtime config params so the frontend
         # knows which Hypha server and service to connect to.
@@ -1328,17 +1378,20 @@ class AppsManager:
                         f"Application '{application_id}' recovered; "
                         f"auto-redeploy backoff cleared."
                     )
-                # RUNNING is not proof the new code is live: a reused replica
-                # can serve stale code after a version bump. If the entry
-                # replica loaded the wrong version, delete so the next tick
-                # sees it missing and redeploys fresh replicas.
-                rv = await self._get_running_version(application_id)
-                if rv is not None and rv.get("version") != application_info["version"]:
+                # RUNNING is not proof the new code is live: Ray Serve can reuse
+                # a replica of ANY deployment (not just the entry) after a
+                # version bump, serving stale in-memory code. If any deployment's
+                # replica loaded the wrong version, delete so the next tick sees
+                # it missing and redeploys fresh replicas.
+                stale = await self._get_stale_deployments(
+                    application_id, application_info["version"]
+                )
+                if stale:
                     self.logger.warning(
-                        f"Application '{application_id}' reports RUNNING but its "
-                        f"entry replica loaded version {rv.get('version')!r} != "
-                        f"requested {application_info['version']!r}; deleting to "
-                        f"force fresh replicas."
+                        f"Application '{application_id}' reports RUNNING but "
+                        f"deployment(s) {sorted(stale)} loaded a version != "
+                        f"requested {application_info['version']!r} (reused "
+                        f"replica); deleting to force fresh replicas."
                     )
                     try:
                         await self.ray_cluster.call_with_reconnect(
