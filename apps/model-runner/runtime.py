@@ -1,8 +1,8 @@
 """GPU runtime for bioimage.io model inference.
 
-The runtime is the GPU half of the model-runner app. ``EntryApp`` keeps a
+The runtime is the GPU half of the model-runner app. ``EntryDeployment`` keeps a
 type-hint reference to ``RuntimeApp`` so the v0.6 composition graph wires
-them together; ``EntryApp`` then calls ``await self.runtime.ping()`` /
+them together; ``EntryDeployment`` then calls ``await self.runtime.ping()`` /
 ``await self.runtime.predict_from_disk(...)`` /
 ``await self.runtime.test(...)`` to delegate the heavy work. Inputs and
 outputs for ``predict_from_disk`` stream through the shared PVC-backed
@@ -32,7 +32,7 @@ import bioengine
 logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
 
-# Filename key under which EntryApp.infer stages a bare (single, unnamed)
+# Filename key under which EntryDeployment.infer stages a bare (single, unnamed)
 # input array. On read-back the runtime unwraps it to a bare array so
 # bioimageio.core maps it to the model's sole input member id itself,
 # rather than us guessing a member id that differs across spec versions.
@@ -95,11 +95,11 @@ def _read_pip(name: str) -> List[str]:
 class RuntimeApp:
     """GPU-resident bioimage.io model executor."""
 
-    # Per-request scratch on the app's shared PVC-backed HOME. EntryApp
+    # Per-request scratch on the app's shared PVC-backed HOME. EntryDeployment
     # writes ``input/<key>.npy`` here on ``infer()`` receipt; this app
     # reads inputs from disk, deletes the input dir, writes outputs to
     # ``output/<key>.npy``, and records step timestamps in
-    # ``state.json``. Kept in sync with ``EntryApp._INFERENCE_DIR_NAME``.
+    # ``state.json``. Kept in sync with ``EntryDeployment._INFERENCE_DIR_NAME``.
     _INFERENCE_DIR_NAME = ".model-runner-inference"
 
     def __init__(self) -> None:
@@ -139,7 +139,7 @@ class RuntimeApp:
 
     @bioengine.method
     async def ping(self) -> str:
-        """Fast liveness probe used by EntryApp before every GPU-bound method."""
+        """Fast liveness probe used by EntryDeployment before every GPU-bound method."""
         return "pong"
 
     # === Memory accounting (used by test/predict log lines) ===
@@ -198,7 +198,7 @@ class RuntimeApp:
         set by ``bioengine._app.replica_init`` to
         ``<app_dir>/home/`` on the app's PVC, which is
         cross-replica RWX under the bioengine layout, so envs built
-        by EntryApp are visible to this RuntimeApp on the same
+        by EntryDeployment are visible to this RuntimeApp on the same
         path.
         """
         env_vars = self._safe_subprocess_env()
@@ -241,7 +241,7 @@ class RuntimeApp:
             ``conda`` → ``mamba`` on the first arg for the faster
             libmamba solver (both binaries ship in the replica image
             at ``/home/ray/anaconda3/bin/``). Envs are pre-built and
-            cached on the shared PVC by the EntryApp (LRU eviction under
+            cached on the shared PVC by the EntryDeployment (LRU eviction under
             a size ceiling), so this side normally finds them present
             and does not create or remove them.
 
@@ -261,7 +261,7 @@ class RuntimeApp:
 
             # custom_environment=True: run inside the model's declared
             # conda env via mamba. Env creation is now owned by the
-            # EntryApp (``_prebuild_conda_envs``) so this replica's
+            # EntryDeployment (``_prebuild_conda_envs``) so this replica's
             # GPU isn't held during a multi-minute mamba solve.
             # ``bioimageio.core.test_description(runtime_env="as-described")``
             # still does its own existence probe
@@ -403,7 +403,7 @@ class RuntimeApp:
         conda environment declared by the model's weights description
         (``bioimageio.core`` ``runtime_env="as-described"``). Env
         creation uses ``mamba`` (via a swapping ``run_command``); envs
-        are pre-built and cached on the shared PVC by the EntryApp
+        are pre-built and cached on the shared PVC by the EntryDeployment
         (LRU-evicted under a size ceiling), not removed per call.
         """
         # GPU serialisation: ``max_ongoing_requests=10`` allows requests
@@ -649,7 +649,7 @@ for key, member in result.members.items():
         """Read inputs from disk, run inference in a subprocess, write
         outputs to disk.
 
-        Called by ``EntryApp._execute_infer`` after it has staged
+        Called by ``EntryDeployment._execute_infer`` after it has staged
         ``<inference_dir>/<request_id>/input/<key>.npy`` on the shared
         PVC. This method:
 

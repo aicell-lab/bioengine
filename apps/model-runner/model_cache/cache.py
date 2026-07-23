@@ -6,7 +6,7 @@ coordinates across replicas with on-disk markers so two replicas don't
 download the same model twice. It also implements LRU eviction so the
 cache stays under a configured size budget.
 
-Public surface used by ``EntryApp``:
+Public surface used by ``EntryDeployment``:
 
 * ``ModelCache(cache_size_in_gb, replica_id)`` — constructor
 * ``await cache.get_model_package(model_id, stage, allow_unpublished, skip_cache)``

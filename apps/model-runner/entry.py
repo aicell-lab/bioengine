@@ -1,4 +1,4 @@
-"""@bioengine.app EntryApp — the public RPC surface of the model-runner.
+"""@bioengine.app EntryDeployment — the public RPC surface of the model-runner.
 
 The app provides bioimage.io model search, RDF/documentation retrieval,
 RDF validation, end-to-end model testing, and inference. It delegates the
@@ -80,7 +80,7 @@ def _read_pip(name: str) -> List[str]:
     graceful_shutdown_timeout_s=300.0,
     graceful_shutdown_wait_loop_s=2.0,
 )
-class EntryApp:
+class EntryDeployment:
     """
     Ray Serve deployment for bioimage.io model operations.
 
@@ -135,7 +135,7 @@ class EntryApp:
     # caller never polls after the runtime completes.
     _INFER_JOBS_TTL_SEC = 3600
 
-    # Per-request scratch on the app's shared PVC-backed HOME. EntryApp
+    # Per-request scratch on the app's shared PVC-backed HOME. EntryDeployment
     # writes ``input/<key>.npy`` here on ``infer()`` receipt so large
     # images don't sit in RAM through the queue+download wait; RuntimeApp
     # reads inputs from the same directory, deletes them, writes outputs
@@ -458,7 +458,7 @@ class EntryApp:
         set by ``bioengine._app.replica_init`` to
         ``<app_dir>/home/`` on the app's PVC, which is
         cross-replica RWX under the bioengine layout, so envs built
-        by EntryApp are visible to RuntimeApp on the same path.
+        by EntryDeployment are visible to RuntimeApp on the same path.
         """
         env_vars = self._safe_subprocess_env()
         mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
@@ -1116,7 +1116,7 @@ class EntryApp:
             env_name = hashlib.sha256(encoded_env).hexdigest()
 
         Bit-identical hashes are load-bearing: the whole point of
-        pre-building envs on EntryApp is that ``test_description``
+        pre-building envs on EntryDeployment is that ``test_description``
         on RuntimeApp finds an env with the SAME name and skips its
         own ``mamba env create`` step. If any of the four upstream
         primitives changes (a new pydantic dump mode, a different YAML
@@ -1188,7 +1188,7 @@ class EntryApp:
         eviction/sweep won't reap them. The caller MUST pass the returned
         list to ``_release_inuse_envs`` once ``runtime.test`` returns.
 
-        Runs entirely on this EntryApp replica (no GPU held). Loads
+        Runs entirely on this EntryDeployment replica (no GPU held). Loads
         the model description, walks the present weight formats,
         computes each weight format's ``BioimageioCondaEnv`` spec
         via ``bioimageio.spec.get_conda_env``, and hashes the dumped
@@ -1386,10 +1386,10 @@ class EntryApp:
     # (e.g. ``facebook/sam3``) returns 401 in the test/infer subprocess —
     # which is also where ``_safe_subprocess_env`` strips every ``*TOKEN*``
     # var. So we fetch such weights here instead, during package
-    # preparation in the trusted EntryApp process, with the read-only HF
+    # preparation in the trusted EntryDeployment process, with the read-only HF
     # token, and repoint the local RDF ``source`` at the downloaded file.
     # The subprocess then loads a local file with no HF access and never
-    # sees the token. Same shape as ``_prebuild_conda_envs``: EntryApp
+    # sees the token. Same shape as ``_prebuild_conda_envs``: EntryDeployment
     # prepares artifacts on the shared PVC-backed HOME, the RuntimeApp
     # subprocess consumes them.
     _HF_WEIGHTS_DIRNAME = ".hf_weights"
@@ -2128,7 +2128,7 @@ class EntryApp:
                 needed_envs: List[str] = []
                 try:
                     # For ``custom_environment=True``: build every conda
-                    # env the model needs on THIS EntryApp replica
+                    # env the model needs on THIS EntryDeployment replica
                     # first — Entry is CPU-only, so a ~10-min mamba
                     # solve doesn't hold the GPU-bound RuntimeApp
                     # replica. Multiple envs (one per weight format)
