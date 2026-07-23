@@ -501,6 +501,20 @@ def build_and_run_application(
         sys.path.insert(0, src_str)
     _purge_stale_source_modules(src_str)
 
+    # Content hash of the materialised source — the code identity we bake into
+    # each user class below so a running replica reports what it *actually*
+    # loaded (a version string can't distinguish same-version-different-content;
+    # a content hash can). Excludes bytecode caches.
+    import hashlib as _hashlib
+
+    _src_hasher = _hashlib.md5()
+    for _p in sorted(Path(src_str).rglob("*")):
+        if _p.is_file() and "__pycache__" not in _p.parts:
+            _src_hasher.update(_p.relative_to(src_str).as_posix().encode())
+            _src_hasher.update(_p.read_bytes())
+    source_hash = _src_hasher.hexdigest()[:16]
+    head_artifact_id = replica_env_vars.get("BIOENGINE_ARTIFACT_ID")
+
     handles: Dict[str, Any] = {}
 
     def _with_pkg(cls: Any, spec_ray_opts: Dict[str, Any]) -> Any:
@@ -591,6 +605,19 @@ def build_and_run_application(
 
     entry_handle = bind(spec["entry_id"])
 
+    # Bake the artifact identity + source content hash onto each user class
+    # BEFORE serialization, so pickle-by-value carries it into the replica. A
+    # reused replica running stale code then reports the STALE baked identity
+    # via ``bioengine_runtime_version`` — the reliable signal the worker's
+    # monitor uses to detect a reused replica and force a real restart. (The
+    # runtime_env env var can't do this: a reused replica has the fresh env var
+    # but old code.)
+    for cid in spec["classes"]:
+        user_cls = _user_class_of(_load_app_class(cid))
+        user_cls._bioengine_baked_version = head_version
+        user_cls._bioengine_baked_artifact_id = head_artifact_id
+        user_cls._bioengine_baked_code_hash = source_hash
+
     # Ray Serve pickles each deployment's class with ``ray.cloudpickle`` on this
     # head. A @bioengine.app class that touches module-level symbols of its own
     # source module (helper funcs/classes — any monolith like cellpose has many)
@@ -609,6 +636,44 @@ def build_and_run_application(
         module_file = getattr(module, "__file__", None)
         if module_file and os.path.realpath(module_file).startswith(src_prefix):
             ray_cloudpickle.register_pickle_by_value(module)
+
+    # BIODIAG (temporary import-trace instrumentation) — log, per app-source
+    # module actually loaded, its __file__ + on-disk md5 + LOADED-source md5,
+    # plus sys.path head and whether the entry module was pre-cached. Reveals
+    # whether the 'model-runner' build imports the fresh disk source or a stale
+    # cached/alternate module. Remove before merge.
+    import hashlib as _hashlib
+    import inspect as _inspect
+
+    _diag = logging.getLogger("ray.serve")
+    _aid = os.environ.get("BIOENGINE_APPLICATION_ID", "?")
+    _entry_name = spec.get("entry_id", "?").split(":", 1)[0]
+    _diag.info(
+        f"BIODIAG[{_aid}] src_str={src_str} src_prefix={src_prefix} "
+        f"entry_module={_entry_name} sys.path[:6]={sys.path[:6]}"
+    )
+    for module in list(sys.modules.values()):
+        module_file = getattr(module, "__file__", None)
+        name = getattr(module, "__name__", "?")
+        if not module_file:
+            continue
+        rp = os.path.realpath(module_file)
+        if rp.startswith(src_prefix) or name.split(".", 1)[0] == _entry_name:
+            try:
+                disk_md5 = _hashlib.md5(open(module_file, "rb").read()).hexdigest()[:12]
+            except Exception as exc:
+                disk_md5 = f"err:{exc}"
+            try:
+                loaded_md5 = _hashlib.md5(
+                    _inspect.getsource(module).encode()
+                ).hexdigest()[:12]
+            except Exception as exc:
+                loaded_md5 = f"err:{exc}"
+            _diag.info(
+                f"BIODIAG[{_aid}] module={name} file={module_file} "
+                f"disk_md5={disk_md5} loaded_md5={loaded_md5} "
+                f"under_src={rp.startswith(src_prefix)}"
+            )
 
     # Override the proxy's ray_actor_options.memory at deployment time.
     # ``num_cpus=0`` is set on the decorator (see proxy_deployment.py); a

@@ -282,16 +282,25 @@ def _make_runtime_version(user_cls: type) -> Callable[..., Any]:
     """Build the ``bioengine_runtime_version`` method installed on the class.
 
     Returns the artifact identity this replica *actually booted with*, read
-    from the process env the worker set in the replica's runtime_env. The
-    worker queries it (through the ProxyDeployment) to verify that a running
-    replica loaded the requested version rather than stale in-memory code
-    left over from a reused replica.
+    from attributes **baked into the class at build time** (captured by
+    pickle-by-value), not from the runtime_env env var. This is the crucial
+    difference: a REUSED replica running stale in-memory code still has the
+    fresh env var (the worker set it in the new runtime_env), so an env-var
+    read reports the new version while the code is old — the exact blind spot
+    that let a reused entry replica serve stale code undetected. The baked
+    value travels *with the code*, so a stale replica reports the stale
+    identity and the worker's monitor can detect + force a real restart.
+    Falls back to the env var only if the build didn't bake the identity.
     """
 
     async def bioengine_runtime_version(self: Any) -> Dict[str, Optional[str]]:
+        cls = type(self)
         return {
-            "artifact_id": os.environ.get("BIOENGINE_ARTIFACT_ID"),
-            "version": os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
+            "artifact_id": getattr(cls, "_bioengine_baked_artifact_id", None)
+            or os.environ.get("BIOENGINE_ARTIFACT_ID"),
+            "version": getattr(cls, "_bioengine_baked_version", None)
+            or os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
+            "code_hash": getattr(cls, "_bioengine_baked_code_hash", None),
         }
 
     return bioengine_runtime_version
