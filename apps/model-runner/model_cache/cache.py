@@ -301,6 +301,11 @@ class ModelCache:
 
                             return False
 
+                    except FileNotFoundError:
+                        # Marker removed by the owning replica between exists() and
+                        # open() — the download just finished. Re-check package state
+                        # on the next loop instead of mis-reading success as failure.
+                        pass
                     except (json.JSONDecodeError, KeyError, OSError, IOError):
                         # Corrupted or unreadable lock file, treat as timed out
                         logger.warning(
@@ -804,8 +809,8 @@ class ModelCache:
             else:
                 # Download failed or timed out, try to claim it ourselves
 
-                # Remove stale marker
-                downloading_marker.unlink()
+                # Remove stale marker (a concurrent waiter may have already removed it)
+                downloading_marker.unlink(missing_ok=True)
 
                 logger.info(
                     f"🧹 Cleaned up stale download marker for model '{model_id}'."
