@@ -745,44 +745,71 @@ class EntryApp:
 
         The single ``_env_build_lock`` serializes conda-env prebuild across
         test runs, so this is a real FIFO queue: 0 = building now, N = N
-        env-setup jobs entered the stage ahead of this one. Ordered by
-        ``env_setup_ts`` (stage-entry time) so the number only decreases.
+        env-setup jobs ahead of this one. Rank by the BUILD signal
+        (``env_started_ts``, stamped when the lock is acquired), NOT raw
+        entry order (``env_setup_ts``): the asyncio lock isn't always
+        granted in entry order, so the job actually building must be the
+        one reported at position 0 — keeping the position consistent with
+        the ``env_setup`` start timestamp (start set iff position 0).
         Infer never enters ``env_setup``, so this is test-only.
         """
         if job["state"] != "env_setup":
             return None
+        # The job holding the build lock (env_started_ts set) is building
+        # now → position 0. A still-waiting job counts the current builder
+        # plus any earlier-queued waiter ahead of it.
+        if job["env_started_ts"] is not None:
+            return 0
         ts = job["env_setup_ts"]
-        return sum(
-            1
-            for other in self._test_jobs.values()
-            if other["state"] == "env_setup"
-            and other["env_setup_ts"] is not None
-            and other["env_setup_ts"] < ts
-        )
+        ahead = 0
+        for other in self._test_jobs.values():
+            if other["state"] != "env_setup":
+                continue
+            if other["env_started_ts"] is not None:
+                ahead += 1  # the current builder
+            elif (
+                other["env_setup_ts"] is not None
+                and ts is not None
+                and other["env_setup_ts"] < ts
+            ):
+                ahead += 1  # an earlier-queued waiter
+        return ahead
 
     def _run_queue_position(self, job: dict) -> Optional[int]:
         """0-based position in the combined test+infer GPU queue, or None
         when the job is not currently in the ``running`` stage.
 
-        Test and infer share one ``_gpu_lock`` per runtime replica, so the
-        queue counts jobs of BOTH kinds. Ordered by ``running_ts``
-        (stage-entry time): 0 = on the GPU, N = N run-stage jobs ahead. The
-        runtime autoscales to 2 replicas, so up to 2 jobs legitimately run
-        at once — a job can drop 2→0 when both free together.
+        Position 0 means the job is actually executing on a GPU replica,
+        identified by a live execution start (``run_started_ts`` — infer
+        reads ``runtime_started_at`` from state.json, test lazy-stamps at
+        the front of the queue). Test and infer share one ``_gpu_lock``
+        per replica and the runtime autoscales to 2 replicas, so up to 2
+        jobs execute at once and BOTH report 0 — that's why position is
+        keyed on "is it running", not on dispatch rank. A job still waiting
+        for a lock counts every executing job plus every earlier-dispatched
+        waiter ahead of it (ordered by ``running_ts``), so the first waiter
+        behind two busy replicas is #2. This keeps the invariant that a
+        start timestamp exists iff position == 0.
         """
         if job["state"] != "running":
             return None
-        ts = job["running_ts"]
-        if ts is None:
+        if job["run_started_ts"] is not None:
             return 0
-        return sum(
-            1
-            for registry in (self._test_jobs, self._infer_jobs)
-            for other in registry.values()
-            if other["state"] == "running"
-            and other["running_ts"] is not None
-            and other["running_ts"] < ts
-        )
+        ts = job["running_ts"]
+        ahead = 0
+        for registry in (self._test_jobs, self._infer_jobs):
+            for other in registry.values():
+                if other["state"] != "running":
+                    continue
+                if other["run_started_ts"] is not None:
+                    ahead += 1  # actively executing on a replica, ahead of us
+                elif (
+                    other["running_ts"] is not None
+                    and ts is not None
+                    and other["running_ts"] < ts
+                ):
+                    ahead += 1  # dispatched before us, also waiting for a lock
+        return ahead
 
     def _queue_position(self, job: dict) -> int:
         """Flat 0-based position in the queue of the job's CURRENT stage.
@@ -854,11 +881,12 @@ class EntryApp:
           always set. The step checks the remote file list and updates
           only outdated files, so its duration is near-zero on a fully
           cached model and grows with how much needs downloading.
-        * ``env_setup`` — unix ts when conda-env prebuild joined the queue,
-          or None on non-custom-env runs. See ``stages.env_setup.start``
-          for the execution start.
+        * ``env_setup`` — unix ts when the conda-env build actually started
+          (env-build lock acquired, queue position #0); None while still
+          queued behind another build, or on non-custom-env runs.
         * ``running`` — unix ts when the GPU run actually started (position
-          #0), or the dispatch ts while still queued for the GPU.
+          #0); None while still queued for the GPU. Start timestamps are
+          only ever set at queue position 0.
         * ``completed_at`` — unix ts when the run finished (result ready
           or failed), recorded server-side at completion so the elapsed
           time is accurate regardless of poll cadence; None until then.
@@ -870,23 +898,31 @@ class EntryApp:
         # Lazy-stamp the run execution-start the first time this job is
         # observed at GPU-queue position #0. The test path has no runtime
         # state.json (infer reads ``runtime_started_at`` instead), so the
-        # entry records the moment it sees the run reach the front.
+        # entry records the moment it sees the run reach the front. With 2
+        # replicas this can only see the front runner: a second test running
+        # concurrently on the other replica stays at #1 (no start) until the
+        # first frees — invariant-preserving (no start above #0) but it
+        # under-reports the rare co-running second test. Infer has a real
+        # per-replica signal (state.json) and reports both at #0.
         if (
             job["run_started_ts"] is None
             and job["state"] == "running"
             and self._run_queue_position(job) == 0
         ):
             job["run_started_ts"] = time.time()
-        run_start = (
-            job["run_started_ts"]
-            if job["run_started_ts"] is not None
-            else job["running_ts"]
-        )
+        # Flat ``running`` mirrors ``stages.run.start``: the execution start,
+        # None while still queued for the GPU (position > 0), with a terminal
+        # fallback for a run that finished before any poll caught it at #0.
+        run_start = job["run_started_ts"]
+        if run_start is None and job["state"] in ("completed", "failed"):
+            run_start = job["running_ts"]
         return {
             "queue_position": self._queue_position(job),
             "submitted_at": job["started_at"],
             "model_download": job["model_download_ts"],
-            "env_setup": job["env_setup_ts"],
+            # execution start of the env build (position #0); None while the
+            # build is still queued behind another, per "start only at pos 0".
+            "env_setup": job["env_started_ts"],
             "running": run_start,
             "completed_at": job["completed_at"],
             "result": job["result"],
@@ -1033,11 +1069,24 @@ class EntryApp:
             if state_file and "runtime_started_at" in state_file:
                 job["run_started_ts"] = float(state_file["runtime_started_at"])
 
-        run_start = (
-            job["run_started_ts"]
-            if job["run_started_ts"] is not None
-            else job["running_ts"]
-        )
+        # Fallback: a fast infer can finish (and have its request dir swept)
+        # before a poll catches ``runtime_started_at`` in state.json, leaving
+        # a position-0 (executing) job with no start. Lazy-stamp it the first
+        # time it's observed at the front of the GPU queue — mirrors the test
+        # path (``_job_progress``) so a running job always carries a start and
+        # a queued one (position > 0) never does.
+        if (
+            job["run_started_ts"] is None
+            and job["state"] == "running"
+            and self._run_queue_position(job) == 0
+        ):
+            job["run_started_ts"] = time.time()
+
+        # Flat ``running`` mirrors ``stages.run.start``: None while queued
+        # for the GPU (position > 0), with a terminal fallback.
+        run_start = job["run_started_ts"]
+        if run_start is None and job["state"] in ("completed", "failed"):
+            run_start = job["running_ts"]
         return {
             "queue_position": self._queue_position(job),
             "submitted_at": job["started_at"],
