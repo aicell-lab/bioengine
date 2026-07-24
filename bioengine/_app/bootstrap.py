@@ -90,12 +90,12 @@ def introspect_app(entry_id: str) -> Dict[str, Any]:
 
         {
           "format_version": "0.6.0",
-          "entry_id": "entry:EntryApp",
+          "entry_id": "entry:EntryDeployment",
           "classes": {                         // one entry per deployment in the graph
-            "entry:EntryApp": {                // key is "module:ClassName"; the
+            "entry:EntryDeployment": {         // key is "module:ClassName"; the
               "module": "entry",               // class IS the Ray Serve deployment,
-              "qualname": "EntryApp",          // so deployment_name == the class name
-              "deployment_name": "EntryApp",
+              "qualname": "EntryDeployment",   // so deployment_name == the class name
+              "deployment_name": "EntryDeployment",
               "ray_actor_options": {...},
               "max_ongoing_requests": 20,
               "method_schemas": [...],
