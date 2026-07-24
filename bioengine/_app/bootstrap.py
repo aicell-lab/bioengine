@@ -90,23 +90,24 @@ def introspect_app(entry_id: str) -> Dict[str, Any]:
 
         {
           "format_version": "0.6.0",
-          "entry_id": "demo_app.deployment:DemoApp",
-          "classes": {
-            "demo_app.deployment:DemoApp": {
-              "module": "demo_app.deployment",
-              "qualname": "DemoApp",
-              "deployment_name": "DemoApp",
+          "entry_id": "entry:EntryApp",
+          "classes": {                         // one entry per deployment in the graph
+            "entry:EntryApp": {                // key is "module:ClassName"; the
+              "module": "entry",               // class IS the Ray Serve deployment,
+              "qualname": "EntryApp",          // so deployment_name == the class name
+              "deployment_name": "EntryApp",
               "ray_actor_options": {...},
               "max_ongoing_requests": 20,
               "method_schemas": [...],
               "lifecycle_methods": {...},
               "init_params": [
                 {"name": "runtime_a", "kind": "deployment_handle",
-                 "target": "demo_app.runtime:RuntimeA", "required": true},
+                 "target": "runtimes.a:RuntimeA", "required": true},
                 {"name": "batch_size", "kind": "value",
                  "annotation": "int", "default": 32, "required": false},
               ]
-            }
+            },
+            "runtimes.a:RuntimeA": {...}        // the composed dependency, same shape
           }
         }
 
