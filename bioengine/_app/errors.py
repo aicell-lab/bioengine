@@ -27,6 +27,11 @@ class CompositionCycleError(BioEngineUserError):
     """The type-hint composition graph contains a cycle."""
 
 
+class UnknownDependencyError(BioEngineUserError):
+    """``@bioengine.health_check(depends_on=[...])`` names a deployment that
+    isn't part of this app's composition graph."""
+
+
 class MissingDataServerError(BioEngineUserError):
     """``bioengine.datasets`` accessed before BIOENGINE_DATA_SERVER_URL was set.
 

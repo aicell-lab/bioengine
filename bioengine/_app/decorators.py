@@ -53,6 +53,10 @@ _KIND_ATTR = "_bioengine_kind"
 # forward the Hypha caller's context as a kwarg.
 _WANTS_CONTEXT_ATTR = "_bioengine_wants_context"
 
+# Sibling-deployment names attached by ``@bioengine.health_check(depends_on=...)``;
+# read into the lifecycle dict by ``_scan_class`` and gated in ``_make_check_health``.
+_DEPENDS_ON_ATTR = "_bioengine_health_depends_on"
+
 
 # ─────────────────────────── method markers ──────────────────────────────
 
@@ -173,14 +177,42 @@ def smoke_test(fn: Callable[..., Any]) -> Callable[..., Any]:
     return fn
 
 
-def health_check(fn: Callable[..., Any]) -> Callable[..., Any]:
+def health_check(
+    fn: Optional[Callable[..., Any]] = None,
+    *,
+    depends_on: Optional[List[str]] = None,
+) -> Callable[..., Any]:
     """Mark a method as the periodic health check.
 
     Invoked on every ``check_health`` call after one-shot init has
     completed. Raise to signal unhealthy.
+
+    ``depends_on`` names sibling deployments in the same app. After the marked
+    method runs, the framework additionally fails the check once a named
+    deployment — having first been seen RUNNING — later drops to zero running
+    replicas, so the service is deregistered rather than advertised while a
+    core dependency is dead. Readiness is read out-of-band from the Serve
+    controller (never an in-band request), so a merely-busy dependency is not
+    misread as down. Each name must exactly match a deployment (the
+    ``@bioengine.app`` class name) in this app's composition graph — a name
+    that matches none raises at deploy time.
+
+    Usable bare (``@bioengine.health_check``) or parameterised
+    (``@bioengine.health_check(depends_on=["RuntimeDeployment"])``).
     """
-    setattr(fn, _KIND_ATTR, "health_check")
-    return fn
+    deps = list(depends_on) if depends_on is not None else []
+    if not all(isinstance(d, str) for d in deps):
+        raise TypeError(
+            "@bioengine.health_check(depends_on=...) must be a list of "
+            "deployment-name strings."
+        )
+
+    def _apply(f: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(f, _KIND_ATTR, "health_check")
+        setattr(f, _DEPENDS_ON_ATTR, deps)
+        return f
+
+    return _apply(fn) if fn is not None else _apply
 
 
 # ───────────────────────────── @bioengine.app ────────────────────────────
@@ -310,6 +342,10 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
                     f"'{lifecycle[kind]}' and '{attr_name}'. Only one is allowed."
                 )
             lifecycle[kind] = attr_name
+            if kind == "health_check":
+                lifecycle["health_check_depends_on"] = list(
+                    getattr(member, _DEPENDS_ON_ATTR, [])
+                )
 
     return lifecycle, method_schemas
 
