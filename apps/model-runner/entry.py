@@ -216,12 +216,21 @@ class EntryDeployment:
         # Set in ``_async_init`` once the workspace of the app token is known.
         self._test_reports_writable: bool = False
 
-        # Get replica identifier for logging
+        # Replica identifier for logging + our Serve application name, used by
+        # the health check to read RuntimeDeployment's replica state.
         try:
             from ray import serve as _serve
-            self.replica_id = _serve.get_replica_context().replica_tag
+            _ctx = _serve.get_replica_context()
+            self.replica_id = _ctx.replica_tag
+            self.app_name = _ctx.app_name
         except Exception:
             self.replica_id = "unknown"
+            self.app_name = None
+
+        # Latched once RuntimeDeployment is first seen RUNNING, so a slow initial
+        # GPU start doesn't fail the deploy — only a runtime that goes down *after*
+        # coming up trips the health check.
+        self._runtime_seen_ready = False
 
         # Set up model cache
         self.model_cache = ModelCache(
@@ -301,29 +310,69 @@ class EntryDeployment:
 
     # === Ray Serve Health Check Method - will be called periodically to check the health of the deployment ===
 
-    async def _check_runtime_available(self) -> None:
-        """Ping the runtime deployment and raise immediately if it is not responding.
+    async def _runtime_running_replicas(self) -> Optional[int]:
+        """RUNNING replica count of RuntimeDeployment, read out-of-band from the
+        Serve controller.
 
-        Called at the top of every GPU method so callers get a fast, clear error
-        instead of a 30 s+ Ray timeout when the GPU runtime is not running.
+        The controller already health-checks every replica; this reads that
+        collected state and never issues an in-band request to the runtime, so
+        runtime load can't affect it. Returns ``None`` when the count can't be
+        determined (controller mid-restart, app not yet in the status view) —
+        callers treat ``None`` as "unknown" and must not deregister on it; only a
+        definite ``0`` means the GPU runtime is down.
         """
-        try:
-            await asyncio.wait_for(
-                self.runtime.ping(),
-                timeout=2.0,
+        from ray import serve as _serve
+
+        def _query() -> Optional[int]:
+            application = _serve.status().applications.get(self.app_name)
+            if application is None:
+                return None
+            deployment = application.deployments.get("RuntimeDeployment")
+            if deployment is None:
+                return None
+            return sum(
+                count
+                for state, count in deployment.replica_states.items()
+                if str(getattr(state, "value", state)) == "RUNNING"
             )
+
+        def _read() -> Optional[int]:
+            try:
+                return _query()
+            except Exception:
+                # A restarted Serve controller leaves serve.status() wedged on a
+                # dead cached client handle (status() never re-checks controller
+                # liveness); drop it so the retry reconnects to the live one.
+                _serve.context._set_global_client(None)
+                return _query()
+
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, _read)
         except Exception as e:
-            raise RuntimeError(
-                "GPU runtime deployment is not available. "
-                "Inference, test, and validate are unavailable until the runtime starts."
-            ) from e
+            logger.debug(f"Could not read RuntimeDeployment status: {e}")
+            return None
 
     @bioengine.health_check
     async def _health_check(self) -> None:
-        # Test connection to the Hypha server only — runtime availability is
-        # checked per-call in GPU methods so partial registration is preserved
-        # (service stays registered for CPU-only methods when GPU is down).
+        # Hypha connectivity: a failure here means we cannot serve at all.
         await self.hypha_client.echo("ping")
+
+        # Whole-app readiness follows the GPU runtime: once it has come up, a
+        # later loss of every RUNNING RuntimeDeployment replica fails this check
+        # so the framework deregisters the service rather than advertise a healthy
+        # service id whose core function is dead. Latched on first readiness so a
+        # slow initial GPU start (env build, model load) doesn't fail the deploy;
+        # an "unknown" read (None) is non-fatal so a controller blip can't tear
+        # down a working service. The read is out-of-band and never load-sensitive.
+        running = await self._runtime_running_replicas()
+        if running and running > 0:
+            self._runtime_seen_ready = True
+        elif running == 0 and self._runtime_seen_ready:
+            raise RuntimeError(
+                "GPU runtime deployment has no running replica — "
+                "model running is unavailable."
+            )
 
     # === Internal Helper Methods ===
 
@@ -1668,20 +1717,6 @@ class EntryDeployment:
     # Note: Parameter type hints and docstrings will be used to generate the API documentation.
 
     @bioengine.method
-    async def get_version(self) -> Dict[str, str]:
-        """Return the artifact identity this replica was deployed from.
-
-        Callers (e.g. bioimage.io CI cache invalidation) use this to detect
-        when a stored test report was produced under a different runner
-        version and should be re-tested.
-        """
-        return {
-            "artifact_id": os.environ.get("HYPHA_ARTIFACT_ID", "unknown"),
-            "version": os.environ.get("HYPHA_ARTIFACT_VERSION", "unknown"),
-            "bioengine_version": __version__,
-        }
-
-    @bioengine.method
     async def search_models(
         self,
         keywords: Optional[List[str]] = Field(
@@ -1972,8 +2007,6 @@ class EntryDeployment:
             publishing is skipped — the report is still cached locally and
             returned via ``get_test_status``.
         """
-        await self._check_runtime_available()
-
         job = self._new_test_job(model_id, custom_environment)
 
         async def _bg_execute():
@@ -2634,9 +2667,7 @@ class EntryDeployment:
                 inputs are empty / not decodeable.
             FileNotFoundError: if a URL / temporary file path is
                 provided but the resource does not exist or has expired.
-            RuntimeError: if the runtime deployment is not available.
         """
-        await self._check_runtime_available()
         logger.info(f"🤖 Queuing inference for model '{model_id}'...")
 
         # Resolve any URL or temporary file path strings to numpy
