@@ -1133,8 +1133,14 @@ class ProxyDeployment:
         """
         # Check entry deployment health.
         # First call: wait without timeout (entry may be slow to initialise).
-        # Subsequent calls: short timeout so a stuck entry is detected quickly,
-        # the service is deregistered, and the health check fails fast.
+        # Subsequent calls: short timeout so a genuinely unhealthy entry is
+        # detected quickly, the service is deregistered, and the health check
+        # fails fast. A timeout is NOT a health failure: the probe is routed
+        # through the entry's router and counts against its
+        # ``max_ongoing_requests``, so a saturated-but-healthy entry
+        # head-of-line-blocks it. Treat a timeout as "busy, still registered";
+        # only a raised health error (entry crashed, or a depends_on
+        # dependency is down and its health_check raised) deregisters.
         if not self.entry_deployment_ready:
             logger.info(
                 f"⏳ Waiting for entry deployment (app '{self.application_id}') to complete initial health check."
@@ -1149,6 +1155,11 @@ class ProxyDeployment:
                 await asyncio.wait_for(
                     self.entry_deployment_handle.check_health.remote(),
                     timeout=3.0,
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    f"⏳ Entry deployment health probe for '{self.application_id}' "
+                    f"timed out (entry saturated). Leaving Hypha service registered."
                 )
             except Exception as e:
                 logger.error(
