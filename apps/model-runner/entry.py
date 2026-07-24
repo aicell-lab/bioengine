@@ -2056,6 +2056,28 @@ class EntryDeployment:
             f"skip_cache={skip_cache}, custom_environment={custom_environment})."
         )
 
+        # Publish-report invariant, enforced at the boundary: a stage=False
+        # (published) test requires a committed version and a public status —
+        # draft/in-review/in-revision never yield a published report even if a
+        # committed version somehow exists.
+        if not stage:
+            model_alias = model_id.rsplit("/", 1)[-1]
+            model_artifact = await self.artifact_manager.read(
+                f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}", silent=True
+            )
+            status = (model_artifact.get("manifest") or {}).get("status")
+            if not model_artifact.get("versions") or status in (
+                "draft",
+                "in-review",
+                "in-revision",
+            ):
+                raise RuntimeError(
+                    f"Cannot test '{model_id}' as published (stage=False): the "
+                    f"model must have a committed version and a public status "
+                    f"(got versions={bool(model_artifact.get('versions'))}, "
+                    f"status={status!r}). Use stage=True to test staged edits."
+                )
+
         self._update_test_job(job, state="model_download")
         # Get model package with access tracking
         package = await self.model_cache.get_model_package(
@@ -2392,22 +2414,12 @@ class EntryDeployment:
                         pass
 
                 # Mirror the model's identifying metadata from the bioimage.io
-                # collection so the test-reports collection is self-describing,
-                # and record whether the model has a committed/published
-                # version — a non-empty ``versions`` list. That, not the test
-                # ``stage`` param, gates the published-model type and score: a
-                # model can be tested ``stage=False`` yet never have been
-                # committed (draft / in-review, ``versions == []``), and must
-                # not leak onto the public grid (which filters strictly on
-                # ``type == published-model``). Fail closed to staged on a read
-                # error. Matches the website's ``isPublished = versions.length > 0``.
+                # collection so the test-reports collection is self-describing.
                 model_meta = {}
-                model_is_published = False
                 try:
                     model_artifact = await self.artifact_manager.read(
                         f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}", silent=True
                     )
-                    model_is_published = bool(model_artifact.get("versions"))
                     model_manifest = model_artifact.get("manifest") or {}
                     for key in (
                         "name",
@@ -2431,25 +2443,36 @@ class EntryDeployment:
                 else:
                     manifest.update(model_meta)
 
-                # Score only a published model's committed-version report — a
-                # staged-only model has no committed version to rank. The score
-                # is an additive ladder whose tiers can't tie: valid format (+1)
-                # < passed default-env inference (+2) < passed
-                # reproducibility (+4), with metadata completeness (0..1) as
-                # a sub-tier tiebreaker. Each tier presupposes the one below
-                # (inference needs a valid format, reproducibility needs a
-                # runnable model), so the gaps guarantee a strict ordering.
-                if not stage and model_is_published:
+                if not stage:
                     manifest["score"] = self._compute_report_score(test_report)
 
-                # A model with a committed/published version types its report
-                # artifact ``published-model`` (sticky — a staged-only model
-                # never passes ``type`` so it stays ``staged-model`` and is
-                # kept off the type-filtered public grid). Keyed on the model's
-                # ``versions``, NOT the test ``stage`` slot.
-                edit_kwargs = {"manifest": manifest, "stage": True}
-                if model_is_published:
-                    edit_kwargs["type"] = "published-model"
+                # Type the report from published-report presence, not the raw
+                # stage flag: a stage=False upload writes the published report;
+                # a model that already has one keeps ``published-model`` so a
+                # later staged upload can't drop it off the type-filtered public
+                # grid. Written on every edit, so it self-heals rather than
+                # sticking. (stage=False is guarded upstream to require a
+                # committed public version.)
+                published_report_present = not stage
+                if stage:
+                    try:
+                        await self.artifact_manager.get_file(
+                            report_artifact_id,
+                            file_path="published/test_report.json",
+                        )
+                        published_report_present = True
+                    except Exception:
+                        published_report_present = False
+
+                edit_kwargs = {
+                    "manifest": manifest,
+                    "stage": True,
+                    "type": (
+                        "published-model"
+                        if published_report_present
+                        else "staged-model"
+                    ),
+                }
                 await self.artifact_manager.edit(
                     report_artifact_id, **edit_kwargs
                 )
