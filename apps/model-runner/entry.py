@@ -216,21 +216,13 @@ class EntryDeployment:
         # Set in ``_async_init`` once the workspace of the app token is known.
         self._test_reports_writable: bool = False
 
-        # Replica identifier for logging + our Serve application name, used by
-        # the health check to read RuntimeDeployment's replica state.
+        # Replica identifier for logging.
         try:
             from ray import serve as _serve
             _ctx = _serve.get_replica_context()
             self.replica_id = _ctx.replica_tag
-            self.app_name = _ctx.app_name
         except Exception:
             self.replica_id = "unknown"
-            self.app_name = None
-
-        # Latched once RuntimeDeployment is first seen RUNNING, so a slow initial
-        # GPU start doesn't fail the deploy — only a runtime that goes down *after*
-        # coming up trips the health check.
-        self._runtime_seen_ready = False
 
         # Set up model cache
         self.model_cache = ModelCache(
@@ -310,69 +302,12 @@ class EntryDeployment:
 
     # === Ray Serve Health Check Method - will be called periodically to check the health of the deployment ===
 
-    async def _runtime_running_replicas(self) -> Optional[int]:
-        """RUNNING replica count of RuntimeDeployment, read out-of-band from the
-        Serve controller.
-
-        The controller already health-checks every replica; this reads that
-        collected state and never issues an in-band request to the runtime, so
-        runtime load can't affect it. Returns ``None`` when the count can't be
-        determined (controller mid-restart, app not yet in the status view) —
-        callers treat ``None`` as "unknown" and must not deregister on it; only a
-        definite ``0`` means the GPU runtime is down.
-        """
-        from ray import serve as _serve
-
-        def _query() -> Optional[int]:
-            application = _serve.status().applications.get(self.app_name)
-            if application is None:
-                return None
-            deployment = application.deployments.get("RuntimeDeployment")
-            if deployment is None:
-                return None
-            return sum(
-                count
-                for state, count in deployment.replica_states.items()
-                if str(getattr(state, "value", state)) == "RUNNING"
-            )
-
-        def _read() -> Optional[int]:
-            try:
-                return _query()
-            except Exception:
-                # A restarted Serve controller leaves serve.status() wedged on a
-                # dead cached client handle (status() never re-checks controller
-                # liveness); drop it so the retry reconnects to the live one.
-                _serve.context._set_global_client(None)
-                return _query()
-
-        try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, _read)
-        except Exception as e:
-            logger.debug(f"Could not read RuntimeDeployment status: {e}")
-            return None
-
-    @bioengine.health_check
+    @bioengine.health_check(depends_on=["RuntimeDeployment"])
     async def _health_check(self) -> None:
         # Hypha connectivity: a failure here means we cannot serve at all.
+        # depends_on additionally deregisters the app once RuntimeDeployment,
+        # having come up, later loses every RUNNING replica.
         await self.hypha_client.echo("ping")
-
-        # Whole-app readiness follows the GPU runtime: once it has come up, a
-        # later loss of every RUNNING RuntimeDeployment replica fails this check
-        # so the framework deregisters the service rather than advertise a healthy
-        # service id whose core function is dead. Latched on first readiness so a
-        # slow initial GPU start (env build, model load) doesn't fail the deploy;
-        # an "unknown" read (None) is non-fatal so a controller blip can't tear
-        # down a working service. The read is out-of-band and never load-sensitive.
-        running = await self._runtime_running_replicas()
-        if running and running > 0:
-            self._runtime_seen_ready = True
-        elif running == 0 and self._runtime_seen_ready:
-            raise RuntimeError(
-                "GPU runtime deployment has no running replica — "
-                "model running is unavailable."
-            )
 
     # === Internal Helper Methods ===
 
@@ -759,6 +694,10 @@ class EntryDeployment:
             # success, ``{"error": str}`` on failure, or None while
             # still running.
             "result": None,
+            # Background asyncio.Task handle, set right after the job is
+            # created so ``cancel_request`` can cancel it. Never surfaced
+            # in the progress dict.
+            "_task": None,
         }
         self._test_jobs[job_id] = job
         return job
@@ -783,7 +722,7 @@ class EntryDeployment:
                 job["env_setup_ts"] = now
             elif state == "running" and job["running_ts"] is None:
                 job["running_ts"] = now
-            if state in ("completed", "failed"):
+            if state in ("completed", "failed", "cancelled"):
                 job["completed_at"] = now
         if result is not None:
             job["result"] = result
@@ -860,20 +799,6 @@ class EntryDeployment:
                     ahead += 1  # dispatched before us, also waiting for a lock
         return ahead
 
-    def _queue_position(self, job: dict) -> int:
-        """Flat 0-based position in the queue of the job's CURRENT stage.
-
-        Bridges the pre-``stages`` schema: 0 while executing (or
-        downloading, queued, or terminal — model download is never
-        queued), N while N jobs are ahead in the active env-build or GPU
-        queue. See ``_env_queue_position`` / ``_run_queue_position``.
-        """
-        if job["state"] == "env_setup":
-            return self._env_queue_position(job)
-        if job["state"] == "running":
-            return self._run_queue_position(job)
-        return 0
-
     def _stage_timeline(self, job: dict) -> dict:
         """Per-stage ``{start, end[, queue_position]}`` timeline, shared by
         the test and infer progress dicts.
@@ -892,7 +817,7 @@ class EntryDeployment:
         run_entry_ts = job["running_ts"]
         done_ts = job["completed_at"]
         run_start = job["run_started_ts"]
-        if run_start is None and job["state"] in ("completed", "failed"):
+        if run_start is None and job["state"] in ("completed", "failed", "cancelled"):
             # A run that finished before any poll caught it at position #0
             # never got a live execution stamp; fall back to its GPU-queue
             # entry mark so a terminal stage still reports a start.
@@ -921,21 +846,10 @@ class EntryDeployment:
         speak the same shape — a monotonic timeline bracketed by
         ``submitted_at`` / ``completed_at``:
 
-        * ``queue_position`` — flat 0-based position in the job's current
-          stage: 0 while executing/downloading/terminal, N while N jobs are
-          ahead in the active env-build or GPU queue. See ``stages`` for
-          the per-stage breakdown; model download is never queued.
+        * ``state`` — current job state (``queued``, ``model_download``,
+          ``env_setup``, ``running``, ``completed``, ``failed``,
+          ``cancelled``).
         * ``submitted_at`` — unix ts when the run was accepted (queued).
-        * ``model_download`` — unix ts when the download step started;
-          always set. The step checks the remote file list and updates
-          only outdated files, so its duration is near-zero on a fully
-          cached model and grows with how much needs downloading.
-        * ``env_setup`` — unix ts when the conda-env build actually started
-          (env-build lock acquired, queue position #0); None while still
-          queued behind another build, or on non-custom-env runs.
-        * ``running`` — unix ts when the GPU run actually started (position
-          #0); None while still queued for the GPU. Start timestamps are
-          only ever set at queue position 0.
         * ``completed_at`` — unix ts when the run finished (result ready
           or failed), recorded server-side at completion so the elapsed
           time is accurate regardless of poll cadence; None until then.
@@ -959,20 +873,9 @@ class EntryDeployment:
             and self._run_queue_position(job) == 0
         ):
             job["run_started_ts"] = time.time()
-        # Flat ``running`` mirrors ``stages.run.start``: the execution start,
-        # None while still queued for the GPU (position > 0), with a terminal
-        # fallback for a run that finished before any poll caught it at #0.
-        run_start = job["run_started_ts"]
-        if run_start is None and job["state"] in ("completed", "failed"):
-            run_start = job["running_ts"]
         return {
-            "queue_position": self._queue_position(job),
+            "state": job["state"],
             "submitted_at": job["started_at"],
-            "model_download": job["model_download_ts"],
-            # execution start of the env build (position #0); None while the
-            # build is still queued behind another, per "start only at pos 0".
-            "env_setup": job["env_started_ts"],
-            "running": run_start,
             "completed_at": job["completed_at"],
             "result": job["result"],
             "stages": self._stage_timeline(job),
@@ -1039,6 +942,9 @@ class EntryDeployment:
             # the first poll has read the outputs off disk and deleted
             # the request dir. Guards against re-reading a deleted dir.
             "_result_materialized": False,
+            # Background asyncio.Task handle for ``cancel_request``. Never
+            # surfaced in the progress dict.
+            "_task": None,
         }
         self._infer_jobs[request_id] = job
         return job
@@ -1061,7 +967,7 @@ class EntryDeployment:
                 job["model_download_ts"] = now
             elif state == "running" and job["running_ts"] is None:
                 job["running_ts"] = now
-            if state in ("completed", "failed"):
+            if state in ("completed", "failed", "cancelled"):
                 job["completed_at"] = now
         if result is not None:
             job["result"] = result
@@ -1097,11 +1003,11 @@ class EntryDeployment:
     def _infer_job_progress(self, job: dict) -> dict:
         """Return the progress dict for an infer request.
 
-        Same schema as ``_job_progress`` (test): a monotonic timeline
-        bracketed by ``submitted_at`` / ``completed_at`` plus the flat
-        ``queue_position`` and the per-stage ``stages`` map. ``env_setup``
-        is always None on the infer path since there's no per-model
-        environment prebuild, so its ``stages`` entry never queues.
+        Same schema as ``_job_progress`` (test): ``state`` plus a monotonic
+        timeline bracketed by ``submitted_at`` / ``completed_at`` and the
+        per-stage ``stages`` map. ``env_setup`` is always None on the infer
+        path since there's no per-model environment prebuild, so its
+        ``stages`` entry never queues.
         """
         # Fill the run execution-start from ``state.json`` on the shared
         # PVC. Once the runtime has acquired ``_gpu_lock`` for this request
@@ -1113,6 +1019,7 @@ class EntryDeployment:
             "model_download",
             "completed",
             "failed",
+            "cancelled",
         ):
             state_file = self._read_runtime_state_file(job["job_id"])
             if state_file and "runtime_started_at" in state_file:
@@ -1131,17 +1038,9 @@ class EntryDeployment:
         ):
             job["run_started_ts"] = time.time()
 
-        # Flat ``running`` mirrors ``stages.run.start``: None while queued
-        # for the GPU (position > 0), with a terminal fallback.
-        run_start = job["run_started_ts"]
-        if run_start is None and job["state"] in ("completed", "failed"):
-            run_start = job["running_ts"]
         return {
-            "queue_position": self._queue_position(job),
+            "state": job["state"],
             "submitted_at": job["started_at"],
-            "model_download": job["model_download_ts"],
-            "env_setup": job["env_setup_ts"],  # always None on the infer path
-            "running": run_start,
             "completed_at": job["completed_at"],
             "result": job["result"],
             "stages": self._stage_timeline(job),
@@ -1964,10 +1863,9 @@ class EntryDeployment:
 
             "tj-…"  # the returned test_run_id
             # then poll get_test_status(test_run_id) →
-            # {"queue_position": 0, "submitted_at": 1735689590.0,
-            #  "model_download": 1735689600.0, "env_setup": None,
-            #  "running": 1735689630.0, "completed_at": 1735689645.0,
-            #  "result": {...test_report...}}
+            # {"state": "running", "submitted_at": 1735689590.0,
+            #  "completed_at": 1735689645.0, "result": {...test_report...},
+            #  "stages": {...}}
 
         Caching behavior:
         - Cached test reports are locally stored at ``<model_package>/.test_cache.json``.
@@ -2030,7 +1928,7 @@ class EntryDeployment:
                     job, state="failed", result={"error": str(exc)}
                 )
 
-        asyncio.create_task(_bg_execute())
+        job["_task"] = asyncio.create_task(_bg_execute())
         return job["job_id"]
 
     async def _execute_test(
@@ -2355,6 +2253,48 @@ class EntryDeployment:
             pass
         return score
 
+    async def _thumbnail_covers(
+        self, model_alias: str, covers: list, stage: bool
+    ) -> list:
+        """Swap each cover for its thumbnail sibling when the model artifact
+        ships one: ``<cover-stem>.thumbnail.<ext>`` (jpg/jpeg preferred over
+        png), e.g. ``cover.png`` → ``cover.thumbnail.jpg``. Non-string covers
+        and covers without a thumbnail are kept as-is. Returns the covers
+        unchanged on any error — a report upload must never fail over cover
+        cosmetics.
+        """
+        try:
+            files = await self.artifact_manager.list_files(
+                f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}",
+                version=("stage" if stage else None),
+            )
+            names = {(f.get("name") if isinstance(f, dict) else f) for f in files}
+            resolved = []
+            for cover in covers:
+                if not isinstance(cover, str):
+                    resolved.append(cover)
+                    continue
+                stem = cover.rsplit(".", 1)[0] if "." in cover else cover
+                thumb = next(
+                    (
+                        c
+                        for c in (
+                            f"{stem}.thumbnail.jpg",
+                            f"{stem}.thumbnail.jpeg",
+                            f"{stem}.thumbnail.png",
+                        )
+                        if c in names
+                    ),
+                    cover,
+                )
+                resolved.append(thumb)
+            return resolved
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Thumbnail cover resolution failed for '{model_alias}': {e}"
+            )
+            return covers
+
     async def _upload_test_report(
         self, model_id: str, stage: bool, test_report: dict
     ) -> None:
@@ -2434,6 +2374,11 @@ class EntryDeployment:
                 except Exception as e:
                     logger.warning(
                         f"⚠️ Could not copy model metadata for '{model_alias}': {e}"
+                    )
+
+                if "covers" in model_meta:
+                    model_meta["covers"] = await self._thumbnail_covers(
+                        model_alias, model_meta["covers"], stage
                     )
 
                 if manifest is None:
@@ -2528,19 +2473,15 @@ class EntryDeployment:
             ...,
             description="Run id returned by ``test()``.",
         ),
-    ) -> Dict[str, Union[int, float, dict, None]]:
+    ) -> Dict[str, Union[str, float, dict, None]]:
         """Return the shared progress dict for a test run.
 
         Response shape (same schema as ``get_infer_status``)::
 
             {
-              "queue_position": int,          # 0-based position in the current stage's
-                                              # queue: 0 = running/downloading/done,
-                                              # N = N jobs ahead. Download is never queued.
+              "state":          str,          # queued / model_download / env_setup /
+                                              # running / completed / failed / cancelled
               "submitted_at":   float,        # ts when the run was queued
-              "model_download": float | None, # ts when download step started (always set once reached)
-              "env_setup":      float | None, # ts (custom-env runs only)
-              "running":        float | None, # ts when runtime.test was called
               "completed_at":   float | None, # ts when finished, None until then
               "result":         dict | None,  # test report on success,
                                               # {"error": str} on failure
@@ -2570,6 +2511,71 @@ class EntryDeployment:
                 f"fresh run via test()."
             )
         return self._job_progress(job)
+
+    @bioengine.method
+    async def cancel_request(
+        self,
+        request_id: str = Field(
+            ...,
+            description="Id returned by ``test()`` (``tj-…``) or ``infer()`` (``ij-…``).",
+        ),
+    ) -> Dict[str, Union[str, bool]]:
+        """Cancel a pending or in-flight ``test()`` / ``infer()`` request.
+
+        Best-effort: cancels the background orchestration task and marks the
+        request ``cancelled`` (a terminal state, ``result={"error":
+        "cancelled"}``). A GPU call already dispatched to RuntimeDeployment is
+        not force-killed — it runs to completion on the replica and its result
+        is discarded; the test path's conda-env hold is released by its
+        ``finally`` and the infer path's staged inputs are deleted here.
+
+        Routing is by id prefix (``tj-`` test, ``ij-`` infer). An already
+        finished request is a no-op (``cancelled: False``). Unknown ids raise
+        ``KeyError`` — runs live in-memory per Entry replica and expire after
+        their TTL.
+
+        Returns ``{"request_id", "state", "cancelled"}``.
+        """
+        if request_id.startswith("tj-"):
+            registry = self._test_jobs
+        elif request_id.startswith("ij-"):
+            registry = self._infer_jobs
+        else:
+            registry = (
+                self._test_jobs
+                if request_id in self._test_jobs
+                else self._infer_jobs
+            )
+        job = registry.get(request_id)
+        if job is None:
+            raise KeyError(
+                f"Unknown request_id {request_id!r}. Requests live in-memory per "
+                f"Entry replica and expire after completion. Start a fresh run."
+            )
+
+        if job["state"] in ("completed", "failed", "cancelled"):
+            return {
+                "request_id": request_id,
+                "state": job["state"],
+                "cancelled": False,
+            }
+
+        task = job.get("_task")
+        if task is not None and not task.done():
+            task.cancel()
+
+        is_infer = registry is self._infer_jobs
+        update = self._update_infer_job if is_infer else self._update_test_job
+        update(job, state="cancelled", result={"error": "cancelled"})
+        if is_infer and self._inference_dir is not None:
+            await asyncio.to_thread(
+                shutil.rmtree,
+                str(self._inference_dir / request_id),
+                ignore_errors=True,
+            )
+
+        logger.info(f"🛑 Cancelled request {request_id!r}.")
+        return {"request_id": request_id, "state": "cancelled", "cancelled": True}
 
     @bioengine.method
     async def get_upload_url(
@@ -2672,9 +2678,8 @@ class EntryDeployment:
         Poll ``get_infer_status(request_id)`` for the shared
         progress dict::
 
-            {"queue_position": 3, "submitted_at": 1735689590.0,
-             "model_download": None, "env_setup": None, "running": None,
-             "completed_at": None, "result": None}
+            {"state": "queued", "submitted_at": 1735689590.0,
+             "completed_at": None, "result": None, "stages": {...}}
 
         Once ``result`` is populated, the outputs are read off disk on
         that first poll and the request dir is deleted; subsequent
@@ -2755,7 +2760,7 @@ class EntryDeployment:
         # Kick off the background task. Any exception it raises is
         # captured onto the job record — never propagates up through
         # the asyncio task's default exception handler.
-        asyncio.create_task(
+        job["_task"] = asyncio.create_task(
             self._execute_infer(
                 job=job,
                 model_id=model_id,
@@ -2912,19 +2917,15 @@ class EntryDeployment:
             ...,
             description="Request id returned by ``infer()``.",
         ),
-    ) -> Dict[str, Union[int, float, dict, None]]:
+    ) -> Dict[str, Union[str, float, dict, None]]:
         """Return the shared progress dict for an infer request.
 
         Response shape (same schema as ``get_test_status``)::
 
             {
-              "queue_position": int,          # 0-based position in the current stage's
-                                              # queue: 0 = running/downloading/done,
-                                              # N = N jobs ahead. Download is never queued.
+              "state":          str,          # queued / model_download /
+                                              # running / completed / failed / cancelled
               "submitted_at":   float,        # ts when the request was queued
-              "model_download": float | None, # ts when download step started (always set once reached)
-              "env_setup":      float | None, # always None on the infer path
-              "running":        float | None, # ts when runtime acquired the GPU lock
               "completed_at":   float | None, # ts when finished, None until then
               "result":         dict | None,  # inference dict on success,
                                               # {"error": str} on failure
