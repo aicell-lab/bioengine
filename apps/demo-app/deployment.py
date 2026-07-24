@@ -44,7 +44,7 @@ def _read_pip(name: str) -> List[str]:
     pip=_read_pip("requirements-deployment.txt"),
     env_vars={"EXAMPLE_ENV_VAR": "example_value"},
 )
-class DemoApp:
+class DemoDeployment:
     """A small reference app exercising every BioEngine authoring decorator."""
 
     def __init__(self, test_param: str = "default_value") -> None:

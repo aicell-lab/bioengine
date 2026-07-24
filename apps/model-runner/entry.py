@@ -3,7 +3,7 @@
 The app provides bioimage.io model search, RDF/documentation retrieval,
 RDF validation, end-to-end model testing, and inference. It delegates the
 GPU-bound work (``predict`` and the heavy ``bioimageio.core.test_model``
-call) to :class:`runtime.RuntimeApp` via the v0.6 type-hint composition.
+call) to :class:`runtime.RuntimeDeployment` via the v0.6 type-hint composition.
 
 Heavier helper modules:
 
@@ -38,7 +38,7 @@ from pydantic import Field
 from bioengine import __version__
 
 from model_cache import BioimageioPackage, ModelCache
-from runtime import SINGLE_INPUT_KEY, RuntimeApp
+from runtime import SINGLE_INPUT_KEY, RuntimeDeployment
 
 
 logger = logging.getLogger("ray.serve")
@@ -137,15 +137,15 @@ class EntryDeployment:
 
     # Per-request scratch on the app's shared PVC-backed HOME. EntryDeployment
     # writes ``input/<key>.npy`` here on ``infer()`` receipt so large
-    # images don't sit in RAM through the queue+download wait; RuntimeApp
+    # images don't sit in RAM through the queue+download wait; RuntimeDeployment
     # reads inputs from the same directory, deletes them, writes outputs
     # to ``output/<key>.npy``, and records state timestamps in
-    # ``state.json``. Kept in sync with ``RuntimeApp._INFERENCE_DIR_NAME``.
+    # ``state.json``. Kept in sync with ``RuntimeDeployment._INFERENCE_DIR_NAME``.
     _INFERENCE_DIR_NAME = ".model-runner-inference"
 
     def __init__(
         self,
-        runtime: RuntimeApp,
+        runtime: RuntimeDeployment,
         cache_size_in_gb: float = 50.0,
     ) -> None:
         self.runtime = runtime
@@ -183,7 +183,7 @@ class EntryDeployment:
 
         # Refcount of conda envs currently needed by a live test (env name →
         # number of in-flight tests using it). Env-build (this replica,
-        # ``_env_build_lock``) is decoupled from the GPU run (RuntimeApp
+        # ``_env_build_lock``) is decoupled from the GPU run (RuntimeDeployment
         # ``_gpu_lock``), so a second test's prebuild could otherwise evict an
         # env the first test is still running against. Eviction + the weekly
         # sweep read this under ``_env_build_lock`` and never remove an env
@@ -431,7 +431,7 @@ class EntryDeployment:
         """Return ``os.environ`` minus obviously-sensitive entries.
 
         Test subprocesses (bioimageio CLI, mamba, the standard-env
-        ``sys.executable -c`` wrapper) don't need the RuntimeApp's
+        ``sys.executable -c`` wrapper) don't need the RuntimeDeployment's
         Hypha credentials. Denylist any env-var name containing
         ``TOKEN`` / ``SECRET`` / ``PASSWORD`` / ``CREDENTIAL`` /
         ``API_KEY`` — covers ``HYPHA_TOKEN``,
@@ -458,7 +458,7 @@ class EntryDeployment:
         set by ``bioengine._app.replica_init`` to
         ``<app_dir>/home/`` on the app's PVC, which is
         cross-replica RWX under the bioengine layout, so envs built
-        by EntryDeployment are visible to RuntimeApp on the same path.
+        by EntryDeployment are visible to RuntimeDeployment on the same path.
         """
         env_vars = self._safe_subprocess_env()
         mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
@@ -1117,7 +1117,7 @@ class EntryDeployment:
 
         Bit-identical hashes are load-bearing: the whole point of
         pre-building envs on EntryDeployment is that ``test_description``
-        on RuntimeApp finds an env with the SAME name and skips its
+        on RuntimeDeployment finds an env with the SAME name and skips its
         own ``mamba env create`` step. If any of the four upstream
         primitives changes (a new pydantic dump mode, a different YAML
         flow style, added metadata fields), the two silently diverge
@@ -1194,7 +1194,7 @@ class EntryDeployment:
         via ``bioimageio.spec.get_conda_env``, and hashes the dumped
         YAML with SHA256 — matching ``bioimageio.core 0.10.4``'s
         env-name algorithm exactly so the pre-created envs are the
-        same names ``test_description`` looks for on the RuntimeApp
+        same names ``test_description`` looks for on the RuntimeDeployment
         side.
 
         Each ``mamba env create`` is spawned via
@@ -1390,7 +1390,7 @@ class EntryDeployment:
     # token, and repoint the local RDF ``source`` at the downloaded file.
     # The subprocess then loads a local file with no HF access and never
     # sees the token. Same shape as ``_prebuild_conda_envs``: EntryDeployment
-    # prepares artifacts on the shared PVC-backed HOME, the RuntimeApp
+    # prepares artifacts on the shared PVC-backed HOME, the RuntimeDeployment
     # subprocess consumes them.
     _HF_WEIGHTS_DIRNAME = ".hf_weights"
 
@@ -1911,7 +1911,7 @@ class EntryDeployment:
         ),
         custom_environment: Optional[bool] = Field(
             False,
-            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False (default), run in the model-runner RuntimeApp's own venv — the same interpreter that serves inference.",
+            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False (default), run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference.",
         ),
         skip_cache: Optional[bool] = Field(
             False,
@@ -1950,7 +1950,7 @@ class EntryDeployment:
 
         Environment mode:
         - ``custom_environment=False`` (default): the test runs in the
-            RuntimeApp's own venv — the same interpreter that will serve
+            RuntimeDeployment's own venv — the same interpreter that will serve
             ``infer()``.
         - ``custom_environment=True``: the test runs inside the conda
             environment declared by the model's own weights description
@@ -2130,17 +2130,17 @@ class EntryDeployment:
                     # For ``custom_environment=True``: build every conda
                     # env the model needs on THIS EntryDeployment replica
                     # first — Entry is CPU-only, so a ~10-min mamba
-                    # solve doesn't hold the GPU-bound RuntimeApp
+                    # solve doesn't hold the GPU-bound RuntimeDeployment
                     # replica. Multiple envs (one per weight format)
-                    # are built concurrently. RuntimeApp then invokes
+                    # are built concurrently. RuntimeDeployment then invokes
                     # ``bioimageio.core.test_description`` which does
                     # its own env-existence check (``mamba run -n
                     # <hash> python --version``) and finds the envs
                     # already present on the shared PVC-backed HOME,
                     # so ``mamba env create`` is a no-op there and the
-                    # RuntimeApp only spends time on the actual test
+                    # RuntimeDeployment only spends time on the actual test
                     # inference. If HOME is NOT shared cross-replica
-                    # for some reason, RuntimeApp falls through to
+                    # for some reason, RuntimeDeployment falls through to
                     # its normal env-create flow — graceful degrade
                     # to pre-1.10.0 behavior with no correctness gap.
                     if custom_environment:

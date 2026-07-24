@@ -20,7 +20,7 @@ logger = bioengine.logger
     memory_mb=256,
     max_ongoing_requests=20,
 )
-class EntryApp:
+class EntryDeployment:
     def __init__(
         self,
         runtime_a: RuntimeA,
@@ -38,7 +38,7 @@ class EntryApp:
         assert_pong(await self.runtime_a.ping())
         assert_pong(await self.runtime_b.ping())
         assert_pong(await self.runtime_c.ping())
-        logger.info("EntryApp smoke test passed")
+        logger.info("EntryDeployment smoke test passed")
 
     @bioengine.method
     async def status(self) -> dict:

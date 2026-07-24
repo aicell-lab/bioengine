@@ -1,7 +1,7 @@
 """GPU runtime for bioimage.io model inference.
 
 The runtime is the GPU half of the model-runner app. ``EntryDeployment`` keeps a
-type-hint reference to ``RuntimeApp`` so the v0.6 composition graph wires
+type-hint reference to ``RuntimeDeployment`` so the v0.6 composition graph wires
 them together; ``EntryDeployment`` then calls ``await self.runtime.ping()`` /
 ``await self.runtime.predict_from_disk(...)`` /
 ``await self.runtime.test(...)`` to delegate the heavy work. Inputs and
@@ -92,7 +92,7 @@ def _read_pip(name: str) -> List[str]:
     graceful_shutdown_timeout_s=300.0,
     graceful_shutdown_wait_loop_s=2.0,
 )
-class RuntimeApp:
+class RuntimeDeployment:
     """GPU-resident bioimage.io model executor."""
 
     # Per-request scratch on the app's shared PVC-backed HOME. EntryDeployment
@@ -174,7 +174,7 @@ class RuntimeApp:
         """Return ``os.environ`` minus obviously-sensitive entries.
 
         Test subprocesses (bioimageio CLI, mamba) don't need the
-        RuntimeApp's Hypha credentials. Denylist any env-var name
+        RuntimeDeployment's Hypha credentials. Denylist any env-var name
         containing ``TOKEN`` / ``SECRET`` / ``PASSWORD`` /
         ``CREDENTIAL`` / ``API_KEY`` — covers ``HYPHA_TOKEN``,
         ``BIOENGINE_ARTIFACT_TOKEN``, ``BIOIMAGE_IO_TOKEN``, and any
@@ -198,7 +198,7 @@ class RuntimeApp:
         set by ``bioengine._app.replica_init`` to
         ``<app_dir>/home/`` on the app's PVC, which is
         cross-replica RWX under the bioengine layout, so envs built
-        by EntryDeployment are visible to this RuntimeApp on the same
+        by EntryDeployment are visible to this RuntimeDeployment on the same
         path.
         """
         env_vars = self._safe_subprocess_env()
@@ -218,7 +218,7 @@ class RuntimeApp:
         context isolation: PyTorch caches allocator arenas inside
         its Python process's CUDA context and does not release them
         across calls even after ``torch.cuda.empty_cache()``. Running
-        the model in the RuntimeApp's own process therefore leaves
+        the model in the RuntimeDeployment's own process therefore leaves
         multi-GB of VRAM pinned across tests. Testing in a child
         process side-steps this — the OS reclaims the entire context
         (and all its VRAM) when the subprocess exits, no matter what
@@ -395,7 +395,7 @@ class RuntimeApp:
         """Test model inference.
 
         When ``custom_environment=False`` (default), the test runs in
-        the currently-active RuntimeApp venv — same interpreter that
+        the currently-active RuntimeDeployment venv — same interpreter that
         serves inference. Fast, and validates what the caller will
         actually use.
 
