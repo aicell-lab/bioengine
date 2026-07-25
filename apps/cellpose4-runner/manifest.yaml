@@ -1,0 +1,16 @@
+name: Cellpose4 Runner
+id: cellpose4-runner
+id_emoji: "🔬"
+description: Runs Cellpose-4 bioimage.io models (Cellpose-SAM, Cellpose-DINO) for instance segmentation via bioimageio.core; switch models by bioimage.io model id.
+documentation: README.md
+authors:
+  - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
+maintainers: []
+license: MIT
+format_version: 0.6.0
+git_repo: https://github.com/aicell-lab/bioengine
+links: []
+tags: []
+type: ray-serve
+version: 0.1.0
+entry: deployment:Cellpose4Runner
