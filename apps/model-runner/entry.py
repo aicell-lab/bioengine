@@ -2354,12 +2354,19 @@ class EntryDeployment:
                         pass
 
                 # Mirror the model's identifying metadata from the bioimage.io
-                # collection so the test-reports collection is self-describing.
+                # collection so the test-reports collection is self-describing,
+                # and record whether the model currently has a committed public
+                # version (a non-empty ``versions`` list). Fail closed to
+                # unpublished on a read error.
                 model_meta = {}
+                model_is_published = False
+                model_confirmed_unpublished = False
                 try:
                     model_artifact = await self.artifact_manager.read(
                         f"{self._TEST_REPORTS_WORKSPACE}/{model_alias}", silent=True
                     )
+                    model_is_published = bool(model_artifact.get("versions"))
+                    model_confirmed_unpublished = not model_is_published
                     model_manifest = model_artifact.get("manifest") or {}
                     for key in (
                         "name",
@@ -2391,36 +2398,41 @@ class EntryDeployment:
                 if not stage:
                     manifest["score"] = self._compute_report_score(test_report)
 
-                # Type the report from published-report presence, not the raw
-                # stage flag: a stage=False upload writes the published report;
-                # a model that already has one keeps ``published-model`` so a
-                # later staged upload can't drop it off the type-filtered public
-                # grid. Written on every edit, so it self-heals rather than
-                # sticking. (stage=False is guarded upstream to require a
-                # committed public version.)
-                published_report_present = not stage
-                if stage:
-                    try:
-                        await self.artifact_manager.get_file(
-                            report_artifact_id,
-                            file_path="published/test_report.json",
-                        )
-                        published_report_present = True
-                    except Exception:
-                        published_report_present = False
-
-                edit_kwargs = {
-                    "manifest": manifest,
-                    "stage": True,
-                    "type": (
-                        "published-model"
-                        if published_report_present
-                        else "staged-model"
-                    ),
-                }
+                # Type the report from the model's CURRENT published state — a
+                # non-empty ``versions`` list, matching the website's
+                # ``isPublished = versions.length > 0`` and the public grid's
+                # ``type == published-model`` filter. Written whenever the model
+                # read succeeds so it self-heals both ways: it stays
+                # ``published-model`` across a staged re-test of a still-published
+                # model (``versions`` keeps its committed entries while staging),
+                # and drops back to ``staged-model`` once the model is
+                # unpublished. Keying on the presence of a published report file
+                # instead would strand the report at ``published-model`` after an
+                # unpublish, since that file is never removed — leaking a phantom
+                # card onto the grid. On a read error the type is left untouched
+                # (neither state is confirmed); the next successful upload heals.
+                edit_kwargs = {"manifest": manifest, "stage": True}
+                if model_is_published:
+                    edit_kwargs["type"] = "published-model"
+                elif model_confirmed_unpublished:
+                    edit_kwargs["type"] = "staged-model"
                 await self.artifact_manager.edit(
                     report_artifact_id, **edit_kwargs
                 )
+                # A model with no committed version keeps no published report:
+                # published uploads are blocked upstream, so a leftover published
+                # file is never overwritten and would strand the report on the
+                # public grid. Drop it (idempotent) only when the model read
+                # positively confirmed an empty ``versions`` — never on a read
+                # error, which must not destroy a real published report.
+                if model_confirmed_unpublished:
+                    try:
+                        await self.artifact_manager.remove_file(
+                            report_artifact_id,
+                            file_path="published/test_report.json",
+                        )
+                    except Exception:
+                        pass
                 upload_url = await self.artifact_manager.put_file(
                     report_artifact_id, file_path=file_path
                 )
