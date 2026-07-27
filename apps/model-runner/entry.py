@@ -1844,8 +1844,8 @@ class EntryDeployment:
             description="Whether to test the staged version of the model (True) or the committed version (False). The report is published to the matching slot: staged/ or published/.",
         ),
         custom_environment: Optional[bool] = Field(
-            False,
-            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False (default), run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference.",
+            None,
+            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False, run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference. If left None (default), inherit the environment of the model's prior report for the matching slot (staged report for stage=True, published for stage=False) — so a model last tested in its custom env is re-tested in the custom env automatically — falling back to False when no prior report exists.",
         ),
         skip_cache: Optional[bool] = Field(
             False,
@@ -1882,7 +1882,7 @@ class EntryDeployment:
             bypasses cached test results, and runs a fresh test.
 
         Environment mode:
-        - ``custom_environment=False`` (default): the test runs in the
+        - ``custom_environment=False``: the test runs in the
             RuntimeDeployment's own venv — the same interpreter that will serve
             ``infer()``.
         - ``custom_environment=True``: the test runs inside the conda
@@ -1890,6 +1890,11 @@ class EntryDeployment:
             (``bioimageio.core`` ``runtime_env="as-described"``). The env is
             cached on the shared PVC (LRU-evicted under a size ceiling, not
             removed per call) and protected from eviction while in use.
+        - ``custom_environment=None`` (default): inherit the environment of the
+            model's prior report for the matching slot (the staged report when
+            ``stage=True``, the published report when ``stage=False``) — a model
+            last tested ``custom`` re-tests ``custom``, otherwise ``standard``.
+            Falls back to False when no prior report exists for that slot.
 
         Report publishing:
         - The report is published to the dedicated
@@ -1905,6 +1910,17 @@ class EntryDeployment:
             publishing is skipped — the report is still cached locally and
             returned via ``get_test_status``.
         """
+        # Resolve the default (None) env from the model's prior report for the
+        # matching slot: a model last tested in its custom env re-tests custom,
+        # else standard. Staged reads never influence a published run and vice
+        # versa. No prior report → standard (False).
+        if custom_environment is None:
+            model_alias = model_id.rsplit("/", 1)[-1]
+            prior_report = await self._read_published_report(model_alias, stage)
+            custom_environment = (
+                (prior_report or {}).get("test_environment") == "custom"
+            )
+
         job = self._new_test_job(model_id, custom_environment)
 
         async def _bg_execute():
