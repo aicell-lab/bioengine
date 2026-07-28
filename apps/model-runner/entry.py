@@ -38,7 +38,7 @@ from pydantic import Field
 from bioengine import __version__
 
 from model_cache import BioimageioPackage, ModelCache
-from runtime import SINGLE_INPUT_KEY, RuntimeDeployment
+from runtime import SINGLE_INPUT_KEY, RuntimeDeployment, pin_bioimageio_conda_env
 
 
 logger = logging.getLogger("ray.serve")
@@ -358,16 +358,31 @@ class EntryDeployment:
             for name, installed in current_versions.items()
         )
 
-    def _stamp_runtime_versions_in_test_env(self, test_report: dict) -> dict:
+    def _stamp_runtime_versions_in_test_env(
+        self, test_report: dict, current_versions: Dict[str, str]
+    ) -> dict:
         """Upsert runtime-identity rows in ``test_report['env']``.
 
-        Records the bioengine and model-runner versions the report was
-        produced under. These are NOT cache-invalidation keys (only
-        ``bioimageio.core``/``.spec`` are); they are stamped for downstream
-        consumers (e.g. bioimage.io CI) that read them from the published
-        report to drive their own cache keys.
+        Records the ``bioimageio.core``/``.spec`` the RuntimeApp
+        orchestrated the test under (``current_versions``), plus the
+        bioengine and model-runner versions the report was produced under.
+
+        ``bioimageio.core``/``.spec`` are the cache-invalidation keys and
+        the versions the frontend renders. Upstream stamps ``env`` from the
+        orchestrating interpreter, so a standard-env run already carries
+        both; but an ``as-described`` custom-env run drops the
+        ``bioimageio.core`` row (the outer summary is built by
+        ``build_description`` and only merges ``details`` back from the
+        in-env subprocess) and reports only the orchestrator's
+        ``bioimageio.spec``. Backfill both here from the installed versions
+        so every report — standard or custom — is keyed and displayed
+        identically. bioengine and model-runner are NOT cache-invalidation
+        keys; they are stamped for downstream consumers (e.g. bioimage.io
+        CI) that read them from the published report.
         """
         rows = [
+            ("bioimageio.core", current_versions.get("bioimageio.core", "unknown")),
+            ("bioimageio.spec", current_versions.get("bioimageio.spec", "unknown")),
             ("bioengine", __version__),
             (
                 "bioimage-io/model-runner",
@@ -1077,6 +1092,11 @@ class EntryDeployment:
         ``get_conda_env``, ``write_yaml``, ``BioimageioCondaEnv``. The
         hash calculation itself has no upstream export — it is inline
         in ``_test_in_env`` — hence this local helper.
+
+        ``pin_bioimageio_conda_env`` pins ``bioimageio.core``/``.spec`` to
+        the installed versions; the RuntimeApp applies the identical pin
+        (by wrapping ``get_conda_env``) before the same hash, so both sides
+        still agree and the pre-built env is reused.
         """
         from io import StringIO
         import hashlib
@@ -1084,7 +1104,12 @@ class EntryDeployment:
         from bioimageio.spec import get_conda_env
         from bioimageio.spec._internal.io_utils import write_yaml
 
-        conda_env = get_conda_env(entry=wf)
+        versions = self._get_bioimageio_versions()
+        conda_env = pin_bioimageio_conda_env(
+            get_conda_env(entry=wf),
+            versions["bioimageio.core"],
+            versions["bioimageio.spec"],
+        )
         conda_env.name = None
         dumped_env = conda_env.model_dump(mode="json", exclude_none=True)
         buf = StringIO()
@@ -2182,7 +2207,9 @@ class EntryDeployment:
                     # failure) so eviction can reclaim them again.
                     self._release_inuse_envs(needed_envs)
 
-                test_report = self._stamp_runtime_versions_in_test_env(test_report)
+                test_report = self._stamp_runtime_versions_in_test_env(
+                    test_report, current_versions
+                )
 
                 # Add tested_at timestamp to the test report so the report is self-contained.
                 test_report["tested_at"] = tested_at

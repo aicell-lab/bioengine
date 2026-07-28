@@ -54,6 +54,53 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
+def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
+    """Return ``conda_env`` with ``bioimageio.core``/``.spec`` pinned to the
+    given versions in its pip section; the model's own deps are untouched.
+
+    An ``as-described`` custom env otherwise solves ``bioimageio.core>=0.9.4``
+    fresh from conda-forge, so the harness the test actually runs under drifts
+    from the RuntimeApp's own core/spec. Pinning makes a custom-env test run
+    against the same core/spec a standard-env run uses. Applied identically by
+    the RuntimeApp (wrapping ``get_conda_env`` while ``test_description`` builds
+    each weight format's env) and the EntryApp pre-build
+    (``_compute_conda_env_name``) so both derive the SAME env-name hash and the
+    pre-built env is reused instead of cold-rebuilt. ``==`` on core also
+    suppresses the upstream ``>=0.9.4`` floor; ``.spec`` is never touched by
+    normalization.
+
+    The env ``name`` is dropped so the hash depends only on channels +
+    dependencies: two models declaring the same deps (even under different
+    ``environment.yaml`` names) resolve to the same env and share it.
+    """
+    from bioimageio.spec.conda_env import BioimageioCondaEnv
+
+    data = conda_env.model_dump(mode="python")
+    data["name"] = None
+    kept: List = []
+    pip: List[str] = []
+    for dep in data.get("dependencies", []):
+        if isinstance(dep, dict) and "pip" in dep:
+            pip = list(dep["pip"])
+            continue
+        bare = dep.split("::", 1)[-1] if isinstance(dep, str) else dep
+        if isinstance(bare, str) and (
+            bare.startswith("bioimageio.core") or bare.startswith("bioimageio.spec")
+        ):
+            continue
+        kept.append(dep)
+
+    pip = [
+        p
+        for p in pip
+        if not (p.startswith("bioimageio.core") or p.startswith("bioimageio.spec"))
+    ]
+    pip += [f"bioimageio.core=={core_version}", f"bioimageio.spec=={spec_version}"]
+    kept.append({"pip": pip})
+    data["dependencies"] = kept
+    return BioimageioCondaEnv.model_validate(data)
+
+
 @bioengine.app(
     num_cpus=1,
     num_gpus=1,
@@ -304,20 +351,47 @@ class RuntimeDeployment:
                         stderr=proc.stderr,
                     )
 
-            # Deliberately omit ``expected_type`` here — the model's
-            # declared conda env often pins an older ``bioimageio.core``
-            # whose ``bioimageio test`` CLI does not recognise
-            # ``--expected-type=<type>``. ``test_description`` would
-            # otherwise pass that flag into the subprocess and fail
-            # with ``unrecognized arguments: --expected-type=model``.
-            # We know ``model_id`` resolves to a model artifact (the
+            # Deliberately omit ``expected_type`` here — the ``bioimageio
+            # test`` CLI in some model envs does not recognise
+            # ``--expected-type=<type>``, and ``test_description`` would
+            # otherwise pass it into the subprocess and fail with
+            # ``unrecognized arguments: --expected-type=model``. We know
+            # ``model_id`` resolves to a model artifact (the
             # ``bioimage-io/model-runner`` service is scoped to models),
             # so losing the type assertion is not a real gap.
-            validation_summary = test_description(
-                rdf_path,
-                runtime_env="as-described",
-                run_command=mamba_run_command,
-            )
+            #
+            # Pin ``bioimageio.core``/``.spec`` in every weight-format env to
+            # this replica's installed versions so the custom-env test runs
+            # against the same harness a standard-env test does — rather than
+            # whatever conda-forge resolves ``>=0.9.4`` to. ``test_description``
+            # loops weight formats internally and calls the module-level
+            # ``get_conda_env`` per format; wrap that name so each env is
+            # pinned while the model's own deps stay as declared. The
+            # EntryApp pre-build applies the identical pin, so the env-name
+            # hash still matches and the pre-built env is reused. Safe to
+            # patch the module global here: ``_test`` is the process's only
+            # ``get_conda_env`` caller and runs serialized under ``_gpu_lock``.
+            from importlib.metadata import version
+            import bioimageio.core._resource_tests as _rt
+
+            core_version = version("bioimageio.core")
+            spec_version = version("bioimageio.spec")
+            _orig_get_conda_env = _rt.get_conda_env
+
+            def _pinned_get_conda_env(*, entry):
+                return pin_bioimageio_conda_env(
+                    _orig_get_conda_env(entry=entry), core_version, spec_version
+                )
+
+            _rt.get_conda_env = _pinned_get_conda_env
+            try:
+                validation_summary = test_description(
+                    rdf_path,
+                    runtime_env="as-described",
+                    run_command=mamba_run_command,
+                )
+            finally:
+                _rt.get_conda_env = _orig_get_conda_env
             return validation_summary.model_dump(mode="json")
         except Exception as e:
             logger.error(f"❌ Model test failed: {str(e)}")
