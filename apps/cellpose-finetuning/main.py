@@ -273,7 +273,7 @@ class TrainingParams(TypedDict):
     learning_rate: float
     weight_decay: float
     server_url: str
-    n_samples: int | None
+    n_samples: int | float | None
     session_id: str
     min_train_masks: int
     validation_interval: int | None
@@ -929,7 +929,7 @@ class SessionStatus(TypedDict, total=False):
     exported_artifact_id: str  # Artifact ID if model has been exported
     model_modified: bool  # Flag indicating if model was modified since last export
     model: str
-    n_samples: int | None
+    n_samples: int | float | None
     n_epochs: int
     learning_rate: float
     weight_decay: float
@@ -967,7 +967,7 @@ class SessionStatusWithId(TypedDict, total=False):
     exported_artifact_id: str
     model_modified: bool
     model: str
-    n_samples: int | None
+    n_samples: int | float | None
     n_epochs: int
     learning_rate: float
     weight_decay: float
@@ -1150,7 +1150,7 @@ def update_status(
     current_batch: int | None = None,
     total_batches: int | None = None,
     model: str | None = None,
-    n_samples: int | None = None,
+    n_samples: int | float | None = None,
     n_epochs: int | None = None,
     learning_rate: float | None = None,
     weight_decay: float | None = None,
@@ -2931,9 +2931,10 @@ async def make_training_pairs_from_metadata(
             "Expected keys like image_path/mask_path (also supports camelCase variants)."
         )
 
-    if n_samples is not None and n_samples < len(train_pairs_raw):
+    n_take = resolve_n_samples(n_samples, len(train_pairs_raw))
+    if n_take is not None and n_take < len(train_pairs_raw):
         subset_idx = np.random.default_rng().permutation(len(train_pairs_raw))[
-            :n_samples
+            :n_take
         ]
         train_pairs_raw = [train_pairs_raw[i] for i in subset_idx]
 
@@ -3060,6 +3061,22 @@ def create_dataset_split(
 
         return bool(np.any(mask > 0))
 
+    def _image_is_readable(image_path: Path) -> bool:
+        """Return True when the image header can be decoded (cheap; no full load)."""
+        from PIL import Image
+
+        try:
+            with Image.open(image_path) as img:
+                _ = img.size
+        except Exception as exc:
+            logger.warning(
+                "Skipping sample with unreadable image '%s': %s",
+                str(image_path),
+                str(exc),
+            )
+            return False
+        return True
+
     def _filter_pairs_with_foreground(
         pairs: list[TrainingPair],
         split_name: str,
@@ -3067,8 +3084,11 @@ def create_dataset_split(
         kept: list[TrainingPair] = []
         skipped: list[Path] = []
         for pair in pairs:
+            img_path = pair["image"]
             ann_path = pair["annotation"]
-            if _mask_has_foreground_label(ann_path):
+            if not _image_is_readable(img_path):
+                skipped.append(img_path)
+            elif _mask_has_foreground_label(ann_path):
                 kept.append(pair)
             else:
                 skipped.append(ann_path)
@@ -3092,8 +3112,13 @@ def create_dataset_split(
         "test",
     )
 
-    if not train_pairs_filtered or len(train_pairs_filtered) < 1:
-        error_msg = "No training pairs found. At least one training sample is required."
+    if not train_pairs_filtered:
+        error_msg = (
+            "No training samples remain after filtering unreadable images and "
+            "empty/invalid masks. Check that image and mask files decode correctly "
+            "and that masks contain labeled objects; try increasing n_samples or "
+            "lowering min_train_masks."
+        )
         raise ValueError(error_msg)
 
     dataset_split = DatasetSplit(
@@ -3117,6 +3142,20 @@ def create_dataset_split(
     )
 
     return dataset_split
+
+
+def resolve_n_samples(n_samples: int | float | None, total: int) -> int | None:
+    """Resolve n_samples to an absolute sample count against the dataset size.
+
+    A value in (0, 1) is treated as a fraction of ``total`` (e.g. 0.05 = 5%);
+    any value >= 1 is an absolute count. Returns None when n_samples is None
+    (use all available samples).
+    """
+    if n_samples is None:
+        return None
+    if isinstance(n_samples, float) and 0 < n_samples < 1:
+        return max(1, round(n_samples * total))
+    return int(n_samples)
 
 
 def get_training_subset(
@@ -3193,12 +3232,13 @@ async def make_training_pairs(
     train_image_paths = [Path(img) for img, anns in train_matched for _ in anns]
     train_annotation_paths = [Path(ann) for _, anns in train_matched for ann in anns]
 
-    # Apply n_samples if specified
-    if config["n_samples"] is not None and config["n_samples"] < len(train_image_paths):
+    # Apply n_samples if specified (absolute count or fraction of the dataset)
+    n_take = resolve_n_samples(config["n_samples"], len(train_image_paths))
+    if n_take is not None and n_take < len(train_image_paths):
         train_image_paths, train_annotation_paths = get_training_subset(
             train_image_paths,
             train_annotation_paths,
-            config["n_samples"],
+            n_take,
         )
 
     # Download training pairs
@@ -3241,6 +3281,100 @@ async def make_training_pairs(
         )
 
     return train_pairs, test_pairs
+
+
+async def count_training_pairs(
+    config: TrainingParams,
+    save_path: Path,
+) -> tuple[int, int]:
+    """Resolve dataset paths and count matched (image, mask) pairs.
+
+    Mirrors ``make_training_pairs`` resolution but downloads nothing except the
+    (small) metadata JSONs needed to count records — image/mask files are only
+    listed. Returns ``(train_pair_count, test_pair_count)``.
+    """
+    artifact = await make_artifact_client(
+        config["artifact_id"],
+        config["server_url"],
+    )
+
+    metadata_dir = config["metadata_dir"]
+    if metadata_dir:
+        metadata_root = _normalize_artifact_relpath(metadata_dir)
+        if metadata_root and not metadata_root.endswith("/"):
+            metadata_root += "/"
+        metadata_files = [
+            p
+            for p in await list_artifact_files_recursive(artifact, metadata_root)
+            if p.lower().endswith(".json")
+        ]
+        if not metadata_files:
+            raise ValueError(f"No metadata JSON files found under '{metadata_dir}'")
+
+        missing_rpaths, missing_lpaths = get_missing_paths(
+            [Path(p) for p in metadata_files],
+            save_path,
+        )
+        if missing_rpaths:
+            await artifact.get(missing_rpaths, missing_lpaths, on_error="ignore")
+
+        train_count = 0
+        test_count = 0
+        for metadata_rel in metadata_files:
+            metadata_local = to_local_path(save_path, Path(metadata_rel))
+            if not metadata_local.exists():
+                continue
+            payload = json.loads(metadata_local.read_text(encoding="utf-8"))
+            metadata_parent = Path(metadata_rel).parent
+            for record in _iter_metadata_records(payload):
+                if _extract_metadata_pair(record, metadata_parent) is None:
+                    continue
+                if _metadata_is_test_record(record):
+                    test_count += 1
+                else:
+                    train_count += 1
+        return train_count, test_count
+
+    train_images = config["train_images"]
+    train_annotations = config["train_annotations"]
+    if not train_images or not train_annotations:
+        raise ValueError(
+            "Either metadata_dir must be provided, or both train_images and "
+            "train_annotations must be provided."
+        )
+
+    train_image_files = await list_matching_artifact_paths(artifact, train_images)
+    train_annotation_files = await list_matching_artifact_paths(
+        artifact,
+        train_annotations,
+    )
+    train_matched = match_image_annotation_pairs(
+        train_image_files,
+        train_annotation_files,
+        train_images,
+        train_annotations,
+    )
+    train_count = sum(len(anns) for _img, anns in train_matched)
+
+    test_count = 0
+    if config["test_images"] and config["test_annotations"]:
+        test_image_files = await list_matching_artifact_paths(
+            artifact,
+            config["test_images"],
+        )
+        test_annotation_files = await list_matching_artifact_paths(
+            artifact,
+            config["test_annotations"],
+        )
+        test_matched = match_image_annotation_pairs(
+            test_image_files,
+            test_annotation_files,
+            config["test_images"],
+            config["test_annotations"],
+        )
+        test_count = sum(len(anns) for _img, anns in test_matched)
+
+    return train_count, test_count
 
 
 # ---------------------------------------------------------------------------
@@ -3887,11 +4021,13 @@ class CellposeFinetune:
                 *PretrainedModel.values(),
             ],
         ),
-        n_samples: int | None = Field(
+        n_samples: int | float | None = Field(
             None,
             description=(
-                "Optional number of samples to use from the dataset. If None, "
-                "all available samples are used."
+                "Optional number of samples to use from the dataset. A value >= 1 "
+                "is an absolute sample count; a value in (0, 1) is a fraction of the "
+                "resolved dataset (e.g. 0.05 = 5%). If None, all available samples "
+                "are used."
             ),
         ),
         n_epochs: int = Field(10, description="Number of training epochs"),
@@ -4026,7 +4162,8 @@ class CellposeFinetune:
         if min_train_masks is None:
             min_train_masks = 5
         if n_samples is not None:
-            n_samples = int(n_samples)
+            n_samples = float(n_samples)
+            n_samples = n_samples if 0 < n_samples < 1 else int(n_samples)
         if validation_interval is not None:
             validation_interval = int(validation_interval)
         label = normalize_optional_param(label)
@@ -4103,6 +4240,131 @@ class CellposeFinetune:
 
         status = get_status(session_id)
         return SessionStatusWithId(**status, session_id=session_id)
+
+    @bioengine.method
+    async def preflight_training_dataset(
+        self,
+        artifact: str = Field(
+            description=(
+                "Artifact identifier 'workspace/alias' containing images and "
+                "annotations."
+            ),
+            examples=["ri-scale/zarr-demo"],
+        ),
+        train_images: str | None = Field(
+            None,
+            description="Path/pattern to training images (see start_training).",
+            examples=["images/*/*.tif"],
+        ),
+        train_annotations: str | None = Field(
+            None,
+            description="Path/pattern to training annotations (see start_training).",
+            examples=["annotations/*/*_mask.ome.tif"],
+        ),
+        metadata_dir: str | None = Field(
+            None,
+            description="Directory of metadata JSON files (alternative to patterns).",
+        ),
+        test_images: str | None = Field(
+            None, description="Optional path/pattern to test images."
+        ),
+        test_annotations: str | None = Field(
+            None, description="Optional path/pattern to test annotations."
+        ),
+        n_samples: int | float | None = Field(
+            None,
+            description=(
+                "Same semantics as start_training: >= 1 absolute count, (0, 1) "
+                "fraction. Only affects the reported n_samples_resolved."
+            ),
+        ),
+        context: dict[str, Any] | None = Field(
+            None,
+            description="Authentication context, automatically provided by Hypha.",
+        ),
+    ) -> dict[str, Any]:
+        """Dry-run dataset resolution without downloading images or training.
+
+        Resolves the given patterns (or metadata_dir) and counts matched
+        (image, mask) pairs so a dataset can be validated before committing to a
+        long training run. Returns ``{ok, train_pair_count, test_pair_count,
+        n_samples_resolved, message}``.
+        """
+        if isinstance(artifact, dict):
+            wrapped = artifact
+            artifact = wrapped.get(
+                "artifact", wrapped.get("artifact_id", wrapped.get("id", artifact))
+            )
+            train_images = wrapped.get("train_images", train_images)
+            train_annotations = wrapped.get("train_annotations", train_annotations)
+            metadata_dir = wrapped.get("metadata_dir", metadata_dir)
+            test_images = wrapped.get("test_images", test_images)
+            test_annotations = wrapped.get("test_annotations", test_annotations)
+            n_samples = wrapped.get("n_samples", n_samples)
+
+        artifact = normalize_optional_param(artifact)
+        train_images = normalize_optional_param(train_images)
+        train_annotations = normalize_optional_param(train_annotations)
+        metadata_dir = normalize_optional_param(metadata_dir)
+        test_images = normalize_optional_param(test_images)
+        test_annotations = normalize_optional_param(test_annotations)
+        n_samples = normalize_optional_param(n_samples)
+        if n_samples is not None:
+            n_samples = float(n_samples)
+            n_samples = n_samples if 0 < n_samples < 1 else int(n_samples)
+
+        if (test_images is None) ^ (test_annotations is None):
+            raise ValueError(
+                "test_images and test_annotations must be provided together"
+            )
+
+        server_url, artifact_id = get_url_and_artifact_id(artifact)
+        config = TrainingParams(
+            artifact_id=artifact_id,
+            train_images=train_images,
+            train_annotations=train_annotations,
+            metadata_dir=metadata_dir,
+            test_images=test_images,
+            test_annotations=test_annotations,
+            server_url=server_url,
+            n_samples=n_samples,
+        )
+        save_path = artifact_cache_dir(artifact_id)
+
+        try:
+            train_count, test_count = await count_training_pairs(config, save_path)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "train_pair_count": 0,
+                "test_pair_count": 0,
+                "n_samples_resolved": None,
+                "message": str(exc),
+            }
+
+        n_resolved = resolve_n_samples(n_samples, train_count) if train_count else None
+        ok = train_count > 0
+        if ok:
+            message = f"Resolved {train_count} training pair(s)"
+            if n_resolved is not None and n_resolved < train_count:
+                message += f"; {n_resolved} will be used (n_samples={n_samples})"
+            if test_count:
+                message += f"; {test_count} test pair(s)"
+            message += "."
+        else:
+            message = (
+                "No training pairs resolved. Check that train_images/"
+                "train_annotations patterns (or metadata_dir) match files in the "
+                "artifact."
+            )
+
+        return {
+            "ok": ok,
+            "train_pair_count": train_count,
+            "test_pair_count": test_count,
+            "n_samples_resolved": n_resolved,
+            "message": message,
+        }
 
     @bioengine.method
     async def stop_training(
