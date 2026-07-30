@@ -24,7 +24,7 @@ import inspect
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
 
-from bioengine._app.errors import ReservedMethodNameError
+from bioengine._app.errors import BioEngineUserError, ReservedMethodNameError
 from bioengine._app.mixin import _make_check_health, _make_runtime_version, wrap_init
 
 # Top-level imports of hypha_rpc and ray.serve were moved inside the
@@ -196,7 +196,7 @@ def health_check(fn: Optional[Callable[..., Any]] = None) -> Callable[..., Any]:
 def app(
     *,
     num_cpus: float = 1,
-    num_gpus: float = 0,
+    gpu_memory_mb: Optional[int] = None,
     memory_mb: Optional[int] = None,
     pip: Optional[List[str]] = None,
     container_image: Optional[str] = None,
@@ -209,8 +209,14 @@ def app(
 
     Args:
         num_cpus: CPU cores per replica.
-        num_gpus: GPU devices per replica (the worker may force this to 0
-            when ``disable_gpu`` is set at deploy time).
+        gpu_memory_mb: VRAM the replica needs, in megabytes. This is
+            cluster-independent: the worker translates it into a Ray GPU
+            reservation at deploy time against the actual GPUs it lands on
+            (a fraction of a GPU, so several replicas can share one card).
+            Omit for CPU-only apps. Replaces the old ``num_gpus`` knob,
+            which was non-portable (a fraction meant different amounts of
+            VRAM on different GPUs). ``disable_gpu`` at deploy time still
+            forces the reservation to zero.
         memory_mb: Soft memory cap in megabytes. Converted to Ray's bytes
             convention internally.
         pip: Additional pip requirements for the replica's runtime_env on
@@ -233,6 +239,15 @@ def app(
         **serve_deployment_kwargs: Forwarded to ``serve.deployment(...)``
             (e.g. ``num_replicas``, ``autoscaling_config``).
     """
+
+    if "num_gpus" in serve_deployment_kwargs or (
+        ray_actor_options is not None and "num_gpus" in ray_actor_options
+    ):
+        raise BioEngineUserError(
+            "@bioengine.app no longer accepts 'num_gpus' — GPUs are now sized "
+            "by VRAM. Declare 'gpu_memory_mb=<MB>' instead (e.g. "
+            "gpu_memory_mb=8192 for an 8 GB model)."
+        )
 
     def decorator(cls: type) -> Any:
         from ray import serve
@@ -258,6 +273,7 @@ def app(
         cls._bioengine_method_schemas = method_schemas
         cls._bioengine_lifecycle = lifecycle
         cls._bioengine_composition_params = composition_params
+        cls._bioengine_gpu_memory_mb = gpu_memory_mb
 
         orig_init = cls.__init__
         cls.__init__ = wrap_init(cls, orig_init)
@@ -266,7 +282,6 @@ def app(
 
         opts = _build_ray_actor_options(
             num_cpus=num_cpus,
-            num_gpus=num_gpus,
             memory_mb=memory_mb,
             pip=pip,
             container_image=container_image,
@@ -395,15 +410,19 @@ def _resolve_app_user_class(annotation: Any) -> Optional[type]:
 def _build_ray_actor_options(
     *,
     num_cpus: float,
-    num_gpus: float,
     memory_mb: Optional[int],
     pip: Optional[List[str]],
     container_image: Optional[str],
     env_vars: Optional[Dict[str, str]],
     extra: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Translate the flat decorator args into Ray Serve's nested options shape."""
-    opts: Dict[str, Any] = {"num_cpus": num_cpus, "num_gpus": num_gpus}
+    """Translate the flat decorator args into Ray Serve's nested options shape.
+
+    ``num_gpus`` is deliberately absent: GPU sizing is derived from
+    ``gpu_memory_mb`` by the worker at deploy time, once the target cluster's
+    GPUs are known. See ``bioengine/apps/builder.py``.
+    """
+    opts: Dict[str, Any] = {"num_cpus": num_cpus}
     if memory_mb is not None:
         opts["memory"] = int(memory_mb) * 1024 * 1024
 

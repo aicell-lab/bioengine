@@ -209,6 +209,7 @@ def _walk(
             "lifecycle_methods": dict(
                 getattr(user_cls, "_bioengine_lifecycle", {})
             ),
+            "gpu_memory_mb": getattr(user_cls, "_bioengine_gpu_memory_mb", None),
             "init_params": init_params,
         }
         for child_id, child_user_cls, child_deployment in child_ids:
@@ -528,7 +529,7 @@ def build_and_run_application(
         # the override is silently lost — e.g. disable_gpu on a type-hint-
         # composed GPU deployment would keep requesting a GPU and never
         # schedule on a CPU-only target.
-        for _rk in ("num_cpus", "num_gpus", "memory"):
+        for _rk in ("num_cpus", "num_gpus", "memory", "resources"):
             if _rk in (spec_ray_opts or {}):
                 opts[_rk] = spec_ray_opts[_rk]
         runtime_env = dict(opts.get("runtime_env") or {})

@@ -416,6 +416,43 @@ class BioEngineProxyActor:
 
         return per_node_gpu_memory, True
 
+    def get_gpu_memory_sizing(self) -> Dict[str, Any]:
+        """GPU sizing hints for VRAM-based deployment (used by AppBuilder).
+
+        Returns:
+            {
+                "vram_resource_advertised": bool,   # any node exposes VRAM_MB
+                "min_gpu_total_mb": Optional[int],  # smallest per-GPU VRAM (MB)
+            }
+
+        ``min_gpu_total_mb`` is the divisor for the fraction fallback, so it is
+        the smallest single-GPU capacity in the cluster — a replica sized for it
+        fits on any node. ``None`` when no GPU has reported memory yet.
+        """
+        vram_advertised = float(ray.cluster_resources().get("VRAM_MB", 0) or 0) > 0
+
+        per_node, dashboard_available = self._get_per_node_gpu_memory_usage()
+        min_gpu_total_mb: Optional[int] = None
+        if dashboard_available:
+            totals = self.global_state.total_resources_per_node()
+            for node_id, info in per_node.items():
+                gpu_count = int(totals.get(node_id, {}).get("GPU", 0) or 0)
+                total_bytes = info.get("total_gpu_memory", 0) or 0
+                if gpu_count <= 0 or total_bytes <= 0:
+                    continue
+                per_gpu_mb = int((total_bytes / (1024 * 1024)) / gpu_count)
+                if per_gpu_mb > 0:
+                    min_gpu_total_mb = (
+                        per_gpu_mb
+                        if min_gpu_total_mb is None
+                        else min(min_gpu_total_mb, per_gpu_mb)
+                    )
+
+        return {
+            "vram_resource_advertised": vram_advertised,
+            "min_gpu_total_mb": min_gpu_total_mb,
+        }
+
     @_touch_on_call
     def get_cluster_state(self) -> Dict[str, Any]:
         """
