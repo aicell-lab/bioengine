@@ -200,6 +200,24 @@ class MicroSAM:
             array = (array / denom * 255).astype("uint8")
         return array
 
+    @staticmethod
+    def _nd(arr: np.ndarray) -> Dict[str, Any]:
+        """Encode an array as hypha-rpc's ndarray wire-dict.
+
+        The worker's ProxyDeployment (numpy 1.x base env) cannot unpickle
+        numpy-2.x arrays over the Ray hop, and this app must run numpy 2.x
+        (python-elf). Returning the wire-dict crosses that hop as bytes and the
+        hypha client still decodes it to a real ndarray — same format the
+        frontend already sends inbound.
+        """
+        arr = np.ascontiguousarray(arr)
+        return {
+            "_rtype": "ndarray",
+            "_rvalue": arr.tobytes(),
+            "_rshape": list(arr.shape),
+            "_rdtype": arr.dtype.name,
+        }
+
     def _ensure_model(self, model_type: str, device: str):
         """Load (predictor, AIS segmenter), reusing the resident pair when the
         model_type is unchanged; a switch frees the previous model's VRAM.
@@ -304,7 +322,7 @@ class MicroSAM:
         enable_clahe: Optional[bool] = Field(
             None, description="Ignored; accepted for Cellpose-API compatibility."
         ),
-    ) -> List[Dict[str, np.ndarray]]:
+    ) -> List[Dict[str, Any]]:
         """Automatic μSAM instance segmentation (propose-and-prune pre-seg).
 
         A true drop-in for the frontend's Cellpose ``infer`` reader: returns a
@@ -321,13 +339,13 @@ class MicroSAM:
 
         images = [await self._resolve_image(src) for src in input_arrays]
         logger.info(f"🤖 μSAM AIS on {len(images)} image(s) with '{model_type}'...")
-        results: List[Dict[str, np.ndarray]] = []
+        results: List[Dict[str, Any]] = []
         async with self._gpu_lock:
             for image in images:
                 labels = await asyncio.to_thread(
                     self._auto_segment, model_type, device, image, generate_kwargs
                 )
-                results.append({"output": labels})
+                results.append({"output": self._nd(labels)})
         return results
 
     @bioengine.method
@@ -339,7 +357,7 @@ class MicroSAM:
         ),
         model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
         device: Literal["cuda", "cpu"] = Field("cuda", description="Compute device."),
-    ) -> List[Dict[str, np.ndarray]]:
+    ) -> List[Dict[str, Any]]:
         """Single-image alias of ``infer`` — same ``[{"output": int32 [H,W]}]`` shape."""
         return await self.infer(input_arrays=[inputs], model_type=model_type, device=device)
 
@@ -397,16 +415,21 @@ class MicroSAM:
         """
         image = await self._resolve_image(inputs)
         logger.info(f"🧠 μSAM embedding ({output_mode}) with '{model_type}'...")
+        labels = None
         async with self._gpu_lock:
             payload = await asyncio.to_thread(self._encode, model_type, device, image)
             if output_mode == "embedding+masks":
                 labels = await asyncio.to_thread(
                     self._auto_segment, model_type, device, image, {}
                 )
-                payload["masks"] = labels
 
+        features = payload.pop("features")
         if return_features_url:
-            payload["features_url"] = await self._save_npy_to_temp(payload.pop("features"))
+            payload["features_url"] = await self._save_npy_to_temp(features)
+        else:
+            payload["features"] = self._nd(features)
+        if labels is not None:
+            payload["masks"] = self._nd(labels)
         return payload
 
     # === Consumer 3: interactive prompt decoder → ONNX (browser decode) ===
