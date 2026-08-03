@@ -9,3 +9,8 @@ torchvision==0.22.1
 onnx==1.17.0
 onnxruntime==1.21.0
 imageio>=2.37.0
+# Pin numpy to the 1.x the worker/proxy ships: the app's returned arrays are
+# pickled by Ray and unpickled in the ProxyDeployment, and numpy 2.x pickles
+# reference numpy._core which numpy 1.x cannot import (ModuleNotFoundError:
+# numpy._core.numeric). Must match across the replica↔proxy boundary.
+numpy==1.26.4

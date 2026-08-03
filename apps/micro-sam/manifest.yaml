@@ -12,5 +12,5 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [cell-segmentation, segment-anything, interactive-annotation, deep-learning, biomedical-imaging]
 type: ray-serve
-version: 0.1.0
+version: 0.1.1
 entry: deployment:MicroSAM
