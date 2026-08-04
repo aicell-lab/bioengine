@@ -9,10 +9,20 @@ status. Runs in the runtime's pip env (micro-sam / torch-em installed).
 """
 
 import sys
+import threading
 import time
 import traceback
 
 import training
+
+
+def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -> None:
+    """Refresh status.json's ``updated_at`` while train_sam runs, so a long epoch
+    doesn't trip the stale-window check (get_status marks TRAINING → STOPPED after
+    STATUS_STALE_SECONDS of no update). train_sam has no per-step callback here.
+    """
+    while not stop.wait(interval):
+        training.write_status(session_id, status="TRAINING", message="training in progress")
 
 
 def main(session_id: str) -> None:
@@ -24,6 +34,11 @@ def main(session_id: str) -> None:
     sdir = training.session_dir(session_id)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     patch = tuple(p["patch_shape"])
+
+    training.write_status(session_id, status="TRAINING", message="training started")
+    stop = threading.Event()
+    heartbeat = threading.Thread(target=_heartbeat, args=(session_id, stop), daemon=True)
+    heartbeat.start()
 
     common = dict(
         raw_key=None, label_key=None, patch_shape=patch,
@@ -47,6 +62,7 @@ def main(session_id: str) -> None:
             with_segmentation_decoder=True, save_root=str(sdir),
             device=device, lr=p["learning_rate"],
         )
+        stop.set()
         ok = training.checkpoint_path(session_id).exists()
         training.write_status(
             session_id,
@@ -55,6 +71,7 @@ def main(session_id: str) -> None:
             end_time=time.time(),
         )
     except Exception as e:
+        stop.set()
         training.write_status(
             session_id, status="FAILED", message=str(e)[:800],
             traceback=traceback.format_exc()[-2500:], end_time=time.time(),

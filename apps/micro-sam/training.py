@@ -153,6 +153,17 @@ def _to_hwc_or_hw(image: np.ndarray) -> np.ndarray:
         image = np.transpose(image, (1, 2, 0))
     if image.ndim == 3 and image.shape[-1] == 1:
         image = image[..., 0]
+    # micro_sam's training loader requires inputs in [0, 255]; normalize the same
+    # way inference does (runtime._to_image_format) so train and serve preprocess
+    # identically for non-uint8 substrates (e.g. uint16 brightfield).
+    if image.dtype != np.uint8:
+        image = image.astype("float32")
+        axis = (0, 1) if image.ndim == 3 else None
+        keepdims = image.ndim == 3
+        image = image - image.min(axis=axis, keepdims=keepdims)
+        denom = image.max(axis=axis, keepdims=keepdims)
+        denom = np.where(denom == 0, 1.0, denom)
+        image = (image / denom * 255).astype("uint8")
     return image
 
 
