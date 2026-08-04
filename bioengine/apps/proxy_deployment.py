@@ -261,8 +261,16 @@ class ProxyDeployment:
         app_hash = hashlib.sha1(application_id.encode("utf-8")).hexdigest()[:8]
         self.client_id = f"{worker_client_id}-{app_hash}"
 
-        # Store entry deployment readiness
+        # App-serviceable gate: the proxy registers its Hypha service only once
+        # every sibling deployment (all deployments in this app but the proxy
+        # itself) has a RUNNING replica, read out-of-band from the Serve
+        # controller so a saturated app never blocks or fails the check.
         self.entry_deployment_ready = False
+        self._own_deployment_name: Optional[str] = None
+        # Per-sibling "seen RUNNING at least once" latch: a deployment only
+        # fails the gate after first coming up, so a slow initial start doesn't
+        # deregister a not-yet-ready app.
+        self._dep_seen_ready: Dict[str, bool] = {}
 
         # Custom ICE servers for WebRTC (None means fetch from default URL)
         self.ice_servers = ice_servers
@@ -293,15 +301,6 @@ class ProxyDeployment:
     async def get_app_data(self) -> Dict[str, Any]:
         """Return non-secret application metadata used for worker recovery."""
         return self.app_data
-
-    async def get_running_version(self) -> Dict[str, Any]:
-        """Return the artifact identity the entry replica actually booted with.
-
-        Internal method — called via Ray actor handle from the manager only.
-        The worker compares this against the requested version to detect a
-        reused replica still running stale in-memory code.
-        """
-        return await self.entry_deployment_handle.bioengine_runtime_version.remote()
 
     async def update_authorized_users(
         self, authorized_users: Dict[str, List[str]]
@@ -1114,6 +1113,59 @@ class ProxyDeployment:
     # ===== Ray Serve Health Check =====
     # Implements periodic health checks for Ray Serve.
 
+    async def _sibling_running_counts(self) -> Optional[Dict[str, int]]:
+        """RUNNING replica count of every sibling deployment (all deployments in
+        this app but the proxy itself), read out-of-band from the Serve
+        controller.
+
+        The controller already health-checks every replica; this reads that
+        collected state and never issues an in-band request, so a saturated app
+        can't affect the reading or count against ``max_ongoing_requests``.
+        Returns ``None`` when the status can't be determined (controller
+        mid-restart, app not yet in the view) — the caller treats ``None`` as
+        "unknown" and never deregisters on it.
+        """
+        from ray import serve as _serve
+
+        if self._own_deployment_name is None:
+            try:
+                self._own_deployment_name = _serve.get_replica_context().deployment
+            except Exception:
+                self._own_deployment_name = None
+
+        def _query() -> Optional[Dict[str, int]]:
+            app = _serve.status().applications.get(self.application_id)
+            if app is None:
+                return None
+            counts: Dict[str, int] = {}
+            for name, deployment in app.deployments.items():
+                if name == self._own_deployment_name:
+                    continue
+                counts[name] = sum(
+                    count
+                    for state, count in deployment.replica_states.items()
+                    if str(getattr(state, "value", state)) == "RUNNING"
+                )
+            return counts
+
+        def _read() -> Optional[Dict[str, int]]:
+            try:
+                return _query()
+            except Exception:
+                # A restarted Serve controller leaves serve.status() wedged on a
+                # dead cached client handle; drop it so the retry reconnects.
+                _serve.context._set_global_client(None)
+                return _query()
+
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, _read)
+        except Exception as e:
+            logger.debug(
+                f"Could not read sibling status for '{self.application_id}': {e}"
+            )
+            return None
+
     async def check_health(self):
         """
         Perform Ray Serve health check for this deployment.
@@ -1131,43 +1183,50 @@ class ProxyDeployment:
         Raises:
             RuntimeError: If any health check fails, indicating the deployment is unhealthy
         """
-        # Check entry deployment health.
-        # First call: wait without timeout (entry may be slow to initialise).
-        # Subsequent calls: short timeout so a genuinely unhealthy entry is
-        # detected quickly, the service is deregistered, and the health check
-        # fails fast. A timeout is NOT a health failure: the probe is routed
-        # through the entry's router and counts against its
-        # ``max_ongoing_requests``, so a saturated-but-healthy entry
-        # head-of-line-blocks it. Treat a timeout as "busy, still registered";
-        # only a raised health error (entry crashed, or a depends_on
-        # dependency is down and its health_check raised) deregisters.
+        # Gate the Hypha service on the app being serviceable: register only
+        # while every sibling deployment (entry + any runtimes) has a RUNNING
+        # replica. Read out-of-band from the Serve controller — a saturated app
+        # neither blocks nor fails this check, and the probe never counts
+        # against any deployment's ``max_ongoing_requests``. Ray's own controller
+        # already health-checks each replica; a sibling that crashes or whose
+        # ``health_check`` raises drops out of the RUNNING count here.
+        counts = await self._sibling_running_counts()
+
         if not self.entry_deployment_ready:
-            logger.info(
-                f"⏳ Waiting for entry deployment (app '{self.application_id}') to complete initial health check."
-            )
-            await self.entry_deployment_handle.check_health.remote()
-            self.entry_deployment_ready = True
-            logger.info(
-                f"✅ Entry deployment (app '{self.application_id}') passed health check."
-            )
-        else:
-            try:
-                await asyncio.wait_for(
-                    self.entry_deployment_handle.check_health.remote(),
-                    timeout=3.0,
+            if counts and all(running > 0 for running in counts.values()):
+                self.entry_deployment_ready = True
+                for dep in counts:
+                    self._dep_seen_ready[dep] = True
+                logger.info(
+                    f"✅ All deployments of app '{self.application_id}' are RUNNING."
                 )
-            except asyncio.TimeoutError:
-                logger.debug(
-                    f"⏳ Entry deployment health probe for '{self.application_id}' "
-                    f"timed out (entry saturated). Leaving Hypha service registered."
+            else:
+                pending = (
+                    [dep for dep, running in counts.items() if running == 0]
+                    if counts
+                    else "unknown"
                 )
-            except Exception as e:
-                logger.error(
-                    f"❌ Entry deployment unhealthy for '{self.application_id}': {e}. "
-                    f"Deregistering Hypha service."
+                logger.info(
+                    f"⏳ Waiting for app '{self.application_id}' deployments to run "
+                    f"(pending: {pending})."
                 )
-                await self._deregister_services()
-                raise RuntimeError(f"Entry deployment is unhealthy: {e}") from e
+                return
+        elif counts is not None:
+            # A sibling that came up and then dropped to zero means the app can
+            # no longer serve: deregister so the service disappears from Hypha,
+            # and re-gate. The outage stays visible in the app status via the
+            # down deployment itself, so the proxy need not fail its own health.
+            for dep, running in counts.items():
+                if running > 0:
+                    self._dep_seen_ready[dep] = True
+                elif running == 0 and self._dep_seen_ready.get(dep):
+                    logger.error(
+                        f"❌ Deployment '{dep}' of app '{self.application_id}' has "
+                        f"no RUNNING replica. Deregistering Hypha service until it "
+                        f"recovers."
+                    )
+                    await self._deregister_services()
+                    return
 
         # Register services if not already done (with lock to prevent concurrent registration)
         if not self.server or not self.websocket_service_id:

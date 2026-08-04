@@ -137,6 +137,14 @@ class BioEngineProxyActor:
             str, Dict[str, Dict[str, Tuple[str, float, str]]]
         ] = {}
 
+        # Baked artifact identity each replica booted with, pushed once at
+        # replica init. Read out-of-band by the worker's status poll so the
+        # stale-replica check never round-trips the data plane.
+        # Structure: {app_id: {deployment_name: {replica_id: identity_dict}}}
+        self.replica_identities: Dict[
+            str, Dict[str, Dict[str, Dict[str, Optional[str]]]]
+        ] = {}
+
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
         # Idle self-eviction state. Counts construction as "activity" so
@@ -639,6 +647,7 @@ class BioEngineProxyActor:
         deployment_name: str,
         replica_id: str,
         timezone: str,
+        identity: Optional[Dict[str, Optional[str]]] = None,
     ) -> None:
         """
         Register a Ray Serve replica for tracking and log retrieval.
@@ -652,6 +661,9 @@ class BioEngineProxyActor:
             deployment_name: Name of the deployment within the application.
             replica_id: Unique identifier for the replica (e.g., "replica_1").
             timezone: Timezone string for the replica (e.g., "Europe/Stockholm").
+            identity: Optional baked artifact identity this replica booted with
+                (``{artifact_id, version, code_hash}``), cached for the worker's
+                out-of-band stale-replica check.
 
         Raises:
             ValueError: If the replica is already registered, not found in the
@@ -703,6 +715,10 @@ class BioEngineProxyActor:
             registration_time,
             timezone,
         )
+        if identity is not None:
+            self.replica_identities.setdefault(application_id, {}).setdefault(
+                deployment_name, {}
+            )[replica_id] = identity
         logger.info(
             f"Registered replica '{replica_id}' for application '{application_id}', "
             f"deployment '{deployment_name}' with actor ID '{actor_id}' (replica timezone: {timezone})."
@@ -720,9 +736,23 @@ class BioEngineProxyActor:
             application_id: Name of the Ray Serve application to clear.
         """
         self.application_replicas.pop(application_id, None)
+        self.replica_identities.pop(application_id, None)
         logger.info(
             f"Cleared all registered replicas for application '{application_id}'."
         )
+
+    @_touch_on_call
+    def get_replica_identities(
+        self, application_id: str
+    ) -> Dict[str, Dict[str, Dict[str, Optional[str]]]]:
+        """Baked artifact identities of an application's replicas.
+
+        Returns ``{deployment_name: {replica_id: identity}}`` pushed by each
+        replica at init. Entries for replicas that have since died linger until
+        the app is cleared; the caller cross-references live replica IDs from
+        the Serve controller and ignores the rest.
+        """
+        return self.replica_identities.get(application_id, {})
 
     @_touch_on_call
     def get_actor_logs(

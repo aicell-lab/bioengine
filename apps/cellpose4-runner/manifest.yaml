@@ -1,7 +1,7 @@
 name: Cellpose4 Runner
 id: cellpose4-runner
 id_emoji: "🔬"
-description: Runs Cellpose-4 bioimage.io models (Cellpose-SAM, Cellpose-DINO) for instance segmentation via bioimageio.core; switch models by bioimage.io model id.
+description: Inference-only service for supported Cellpose-4 bioimage.io models (Cellpose-SAM) via bioimageio.core; async submit/poll infer API, optional flow-field output.
 documentation: README.md
 authors:
   - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
@@ -12,5 +12,5 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: []
 type: ray-serve
-version: 0.1.0
+version: 0.4.0
 entry: deployment:Cellpose4Runner
