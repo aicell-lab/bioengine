@@ -95,9 +95,18 @@ in each training image.
   Export a completed session as a **standard BioImage.IO model package** and
   register it on Hypha (`type="model"` artifact: rdf.yaml + weights). Built in a
   CPU subprocess on the runtime via `micro_sam.bioimageio.export_sam_model`, then
-  uploaded by the entry. Returns `{artifact_id, n_files, model_name}` — the model
-  is then re-servable anywhere by that identifier (e.g. via `model-runner` or
-  `bioimageio.core`).
+  uploaded by the entry. Returns `{artifact_id, n_files, model_name}`.
+
+  > **Known limitation (env-gated).** `export_sam_model` (micro_sam 1.8.5) is not
+  > yet compatible with `bioimageio.core 0.11` / `spec 0.5.12` (what this runtime
+  > resolves to). `export_worker.py` patches the spec-validation mismatches
+  > (`FileDescr` for documentation/covers, the over-strict "too-small" test-tensor
+  > check), but the export's self-test then fails inside **core 0.11's**
+  > `create_model_adapter` (a core-internal incompatibility with the exported
+  > PredictorAdaptor). The same export works end-to-end on `core 0.9.4` /
+  > `spec 0.5.5.6`, but that stack can't be pinned here without regressing
+  > training's `torch-em`. **Revisit when micro_sam supports bioimageio.core 0.11**
+  > (or export offline in a core-0.9.4 env). Serving/training are unaffected.
 
 **Serve the just-trained model:** once `checkpoint_available` is true, pass
 `session_id` to any serving method — the fine-tuned checkpoint flows through the
@@ -110,9 +119,9 @@ out = await svc.infer(input_arrays=[img], session_id=sid)          # AIS masks f
 emb = await svc.compute_image_embedding(inputs=img, session_id=sid) # embedding from the fine-tuned encoder
 ```
 
-Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`. Call
-`export_model(session_id, ...)` to publish the fine-tuned model as a standard
-BioImage.IO artifact and re-serve it anywhere by identifier.
+Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`.
+`export_model(session_id, ...)` publishes the fine-tuned model as a standard
+BioImage.IO artifact (currently env-gated — see the method note above).
 
 ## Interactive annotation loop (Option A — in-browser decode)
 
