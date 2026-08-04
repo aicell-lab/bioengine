@@ -26,7 +26,6 @@ from typing import Any, Dict, List, Optional
 from bioengine._app.errors import (
     BioEngineUserError,
     CompositionCycleError,
-    UnknownDependencyError,
 )
 
 #: Manifest format the worker and bootstrap agree on. Bumped together
@@ -126,28 +125,12 @@ def introspect_app(entry_id: str) -> Dict[str, Any]:
     classes: Dict[str, Dict[str, Any]] = {}
     # DFS with a visiting set so cycles surface as a clear error.
     _walk(entry_id, user_cls, entry_cls, classes, visiting=[])
-    _validate_dependencies(classes)
 
     return {
         "format_version": SPEC_FORMAT_VERSION,
         "entry_id": entry_id,
         "classes": classes,
     }
-
-
-def _validate_dependencies(classes: Dict[str, Dict[str, Any]]) -> None:
-    """Every ``@bioengine.health_check(depends_on=[...])`` name must be a
-    deployment in this app's composition graph — a typo would otherwise read as
-    permanently "unknown" and silently never gate, so we reject it at deploy."""
-    deployment_names = {c["deployment_name"] for c in classes.values()}
-    for cid, c in classes.items():
-        for dep in c["lifecycle_methods"].get("health_check_depends_on") or []:
-            if dep not in deployment_names:
-                raise UnknownDependencyError(
-                    f"{cid}: @bioengine.health_check(depends_on=...) names "
-                    f"'{dep}', which is not a deployment in this app. Known "
-                    f"deployments: {sorted(deployment_names)}."
-                )
 
 
 def introspect_app_in_ray_task(

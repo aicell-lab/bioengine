@@ -53,19 +53,6 @@ def _setup_replica(instance: Any) -> None:
     instance._bioengine_test_task: Optional[asyncio.Task] = None
     instance._bioengine_health_check_lock = asyncio.Lock()
 
-    # Per-dependency "seen RUNNING at least once" latch for
-    # @bioengine.health_check(depends_on=...); a dependency only fails the
-    # check after first coming up, so a slow initial start doesn't fail deploy.
-    instance._bioengine_dep_seen_ready: Dict[str, bool] = {}
-    # This replica's own Serve application name, used to read sibling
-    # deployment status out-of-band. None outside a Serve replica (unit tests).
-    try:
-        from ray import serve as _serve
-
-        instance._bioengine_app_name = _serve.get_replica_context().app_name
-    except Exception:
-        instance._bioengine_app_name = None
-
 
 def _baked_identity(cls: type) -> Dict[str, Optional[str]]:
     """Artifact identity baked into the class at build time.
@@ -277,7 +264,6 @@ def _make_check_health(
     async_init_name: Optional[str] = lifecycle.get("async_init")
     smoke_test_name: Optional[str] = lifecycle.get("smoke_test")
     health_check_name: Optional[str] = lifecycle.get("health_check")
-    depends_on: list = list(lifecycle.get("health_check_depends_on") or [])
 
     async def check_health(self: Any) -> None:
         logger = logging.getLogger("ray.serve")
@@ -312,68 +298,7 @@ def _make_check_health(
                 else:
                     await asyncio.to_thread(hook)
 
-            for dep in depends_on:
-                running = await _read_running_replicas(
-                    self._bioengine_app_name, dep, logger
-                )
-                if running and running > 0:
-                    self._bioengine_dep_seen_ready[dep] = True
-                elif running == 0 and self._bioengine_dep_seen_ready.get(dep):
-                    raise RuntimeError(
-                        f"Dependency deployment '{dep}' has no running replica "
-                        f"— this app cannot serve."
-                    )
-
     return check_health
-
-
-async def _read_running_replicas(
-    app_name: Optional[str], deployment_name: str, logger: logging.Logger
-) -> Optional[int]:
-    """RUNNING replica count of a sibling deployment, read out-of-band from the
-    Serve controller.
-
-    The controller already health-checks every replica; this reads that
-    collected state and never issues an in-band request to the dependency, so
-    its load can't affect the reading. Returns ``None`` when the count can't be
-    determined (no app name, controller mid-restart, app/deployment not yet in
-    the status view) — callers treat ``None`` as "unknown" and must not
-    deregister on it; only a definite ``0`` means the dependency is down.
-    """
-    if not app_name:
-        return None
-
-    from ray import serve as _serve
-
-    def _query() -> Optional[int]:
-        application = _serve.status().applications.get(app_name)
-        if application is None:
-            return None
-        deployment = application.deployments.get(deployment_name)
-        if deployment is None:
-            return None
-        return sum(
-            count
-            for state, count in deployment.replica_states.items()
-            if str(getattr(state, "value", state)) == "RUNNING"
-        )
-
-    def _read() -> Optional[int]:
-        try:
-            return _query()
-        except Exception:
-            # A restarted Serve controller leaves serve.status() wedged on a
-            # dead cached client handle (status() never re-checks controller
-            # liveness); drop it so the retry reconnects to the live one.
-            _serve.context._set_global_client(None)
-            return _query()
-
-    try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _read)
-    except Exception as e:
-        logger.debug(f"Could not read '{deployment_name}' status: {e}")
-        return None
 
 
 def _make_runtime_version(user_cls: type) -> Callable[..., Any]:
