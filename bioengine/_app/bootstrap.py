@@ -532,6 +532,42 @@ def build_and_run_application(
             if _rk in (spec_ray_opts or {}):
                 opts[_rk] = spec_ray_opts[_rk]
         runtime_env = dict(opts.get("runtime_env") or {})
+
+        container = runtime_env.get("container")
+        if container:
+            # Container-as-runtime (opt-in via @bioengine.app(container_image=…)).
+            # The image is the sole source of code: it bakes bioengine + the
+            # app source (on PYTHONPATH) + deps, so ``import bioengine`` and
+            # ``import <entry>`` resolve natively at cloudpickle.loads and the
+            # replica finder never needs to fetch source. Ray REJECTS any
+            # runtime_env that pairs ``container`` with py_modules/pip/
+            # worker_process_setup_hook (only env_vars/config are allowed),
+            # so this branch deliberately builds a minimal runtime_env and
+            # returns before the normal injection below.
+            #
+            # GPU + host wiring rides in podman ``run_options`` because Ray's
+            # plugin hardcodes its base flags and only appends run_options;
+            # ``--device nvidia.com/gpu=all`` is the CDI GPU injector and
+            # ``LD_LIBRARY_PATH`` points at the driver libs the disabled
+            # ``update-ldcache`` CDI hook would otherwise have wired up.
+            run_options = list(container.get("run_options") or [])
+            if opts.get("num_gpus"):
+                run_options += ["--device", "nvidia.com/gpu=all"]
+            ld_library_path = os.environ.get(
+                "BIOENGINE_CONTAINER_LD_LIBRARY_PATH", "/usr/lib64"
+            )
+            run_options += ["-e", f"LD_LIBRARY_PATH={ld_library_path}"]
+            opts["runtime_env"] = {
+                "container": {
+                    "image": container["image"],
+                    "run_options": run_options,
+                },
+                "env_vars": {
+                    **replica_env_vars,
+                    **(runtime_env.get("env_vars") or {}),
+                },
+            }
+            return cls.options(ray_actor_options=opts)
         # Ray Serve replicas do NOT inherit job-level py_modules (observed
         # empirically on KTH). The bioengine package has to ride in the
         # deployment's runtime_env to be on sys.path at

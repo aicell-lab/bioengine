@@ -199,6 +199,7 @@ def app(
     num_gpus: float = 0,
     memory_mb: Optional[int] = None,
     pip: Optional[List[str]] = None,
+    container_image: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
     max_ongoing_requests: int = 10,
     ray_actor_options: Optional[Dict[str, Any]] = None,
@@ -214,7 +215,15 @@ def app(
             convention internally.
         pip: Additional pip requirements for the replica's runtime_env on
             top of BioEngine's baseline (``hypha-rpc``, ``pydantic``,
-            ``httpx``, and the ``bioengine[worker]`` package).
+            ``httpx``, and the ``bioengine[worker]`` package). Mutually
+            exclusive with ``container_image``.
+        container_image: Opt-in alternative to pip: run the replica inside
+            this prebuilt container image instead of installing deps
+            per-actor. The image must be self-contained — Ray forbids
+            combining ``container`` with ``py_modules``/``pip``, so the
+            image has to bake ``bioengine`` plus the app source on
+            ``PYTHONPATH``. Requires the worker to run with
+            ``--enable-container-runtime`` (single-machine mode only).
         env_vars: Static env vars baked into the replica's runtime_env.
             Secrets passed at deploy time are layered on top.
         max_ongoing_requests: Concurrent request cap per replica.
@@ -232,6 +241,13 @@ def app(
             raise TypeError(
                 "@bioengine.app must be applied to a class, not "
                 f"{type(cls).__name__}"
+            )
+
+        if container_image and pip:
+            raise ValueError(
+                "@bioengine.app cannot combine 'container_image' with 'pip': "
+                "Ray forbids mixing a container runtime_env with pip. Bake "
+                "your dependencies into the image instead."
             )
 
         _reject_reserved_names(cls)
@@ -253,6 +269,7 @@ def app(
             num_gpus=num_gpus,
             memory_mb=memory_mb,
             pip=pip,
+            container_image=container_image,
             env_vars=env_vars,
             extra=ray_actor_options,
         )
@@ -381,6 +398,7 @@ def _build_ray_actor_options(
     num_gpus: float,
     memory_mb: Optional[int],
     pip: Optional[List[str]],
+    container_image: Optional[str],
     env_vars: Optional[Dict[str, str]],
     extra: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -390,6 +408,13 @@ def _build_ray_actor_options(
         opts["memory"] = int(memory_mb) * 1024 * 1024
 
     runtime_env: Dict[str, Any] = {}
+    if container_image:
+        # Marker only; the worker's bootstrap fills in the GPU/host
+        # ``run_options`` at deploy time (it knows whether the container
+        # runtime is enabled). Ray forbids ``container`` alongside pip/
+        # py_modules, so the container branch in bootstrap._with_pkg
+        # deliberately skips those.
+        runtime_env["container"] = {"image": container_image}
     if pip:
         runtime_env["pip"] = list(pip)
     if env_vars:
