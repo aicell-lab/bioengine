@@ -16,7 +16,6 @@ import asyncio
 import os
 import time
 import uuid
-from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -199,63 +198,38 @@ class EntryApp:
             description="μSAM model. LM generalists (vit_b_lm / vit_l_lm / "
             "vit_t_lm) carry the AIS decoder and suit brightfield/fluorescence cells.",
         ),
-        device: Literal["cuda", "cpu"] = Field("cuda", description="Compute device."),
-        pred_iou_thresh: Optional[float] = Field(None, description="Post-processing IoU threshold."),
-        stability_score_thresh: Optional[float] = Field(None, description="Post-processing stability-score threshold."),
-        min_size: Optional[int] = Field(None, description="Minimum object size in pixels."),
-        model: Optional[str] = Field(None, description="Ignored; Cellpose-API compatibility."),
-        diameter: Optional[float] = Field(None, description="Ignored; Cellpose-API compatibility."),
-        flow_threshold: Optional[float] = Field(None, description="Ignored; Cellpose-API compatibility."),
-        cellprob_threshold: Optional[float] = Field(None, description="Ignored; Cellpose-API compatibility."),
-        niter: Optional[int] = Field(None, description="Ignored; Cellpose-API compatibility."),
-        enable_clahe: Optional[bool] = Field(None, description="Ignored; Cellpose-API compatibility."),
+        min_size: Optional[int] = Field(
+            None, description="Minimum object size in pixels (smaller objects dropped)."
+        ),
         session_id: Optional[str] = Field(
             None, description="Serve the fine-tuned model from this training session's checkpoint."
         ),
     ) -> List[Dict[str, Any]]:
-        """Automatic μSAM instance segmentation. Cellpose ``infer`` drop-in:
-        returns a bare list, one item per input, each ``{"output": <int32 [H,W]
-        instance label mask>}``.
+        """Automatic μSAM instance segmentation. Returns a bare list, one item per
+        input, each ``{"output": <int32 [H,W] instance label mask>}`` (background
+        0, one positive integer per object).
         """
         await self._check_runtime_available()
         generate_kwargs: Dict[str, Any] = {}
-        if pred_iou_thresh is not None:
-            generate_kwargs["pred_iou_thresh"] = pred_iou_thresh
-        if stability_score_thresh is not None:
-            generate_kwargs["stability_score_thresh"] = stability_score_thresh
         if min_size is not None:
             generate_kwargs["min_size"] = min_size
         checkpoint = self._session_checkpoint(session_id) if session_id else None
         images = [await self._resolve_image(src) for src in input_arrays]
         return await self.runtime.auto_segment(
-            images=images, model_type=model_type, device=device,
+            images=images, model_type=model_type,
             generate_kwargs=generate_kwargs, checkpoint=checkpoint,
         )
 
     @bioengine.method
-    async def segment_image(
+    async def compute_embedding(
         self,
         inputs: Union[np.ndarray, str] = Field(..., description="A single input image."),
         model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
-        device: Literal["cuda", "cpu"] = Field("cuda", description="Compute device."),
-        session_id: Optional[str] = Field(None, description="Serve a fine-tuned session checkpoint."),
-    ) -> List[Dict[str, Any]]:
-        """Single-image alias of ``infer`` — same ``[{"output": int32 [H,W]}]`` shape."""
-        return await self.infer(
-            input_arrays=[inputs], model_type=model_type, device=device, session_id=session_id
-        )
-
-    @bioengine.method
-    async def compute_image_embedding(
-        self,
-        inputs: Union[np.ndarray, str] = Field(..., description="A single input image."),
-        model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
-        output_mode: Literal["embedding", "embedding+masks"] = Field(
-            "embedding",
-            description="'embedding' returns only the encoder embedding; "
-            "'embedding+masks' also returns the automatic AIS instance mask.",
+        return_masks: bool = Field(
+            False,
+            description="If True, also run the AIS decoder and return the automatic "
+            "instance ``masks`` alongside the embedding.",
         ),
-        device: Literal["cuda", "cpu"] = Field("cuda", description="Compute device."),
         return_features_url: bool = Field(
             False,
             description="If True, the 4MB features are saved to a temporary .npy in S3 "
@@ -263,13 +237,17 @@ class EntryApp:
         ),
         session_id: Optional[str] = Field(None, description="Serve a fine-tuned session checkpoint."),
     ) -> Dict[str, Any]:
-        """Encoder embedding (+ optional AIS masks) for the in-browser prompt decoder."""
+        """Run the encoder once and return its embedding (for the in-browser ONNX
+        prompt decoder): ``{features | features_url, original_image_shape,
+        sam_scale, mask_threshold}``, plus the automatic AIS ``masks`` when
+        ``return_masks``.
+        """
         await self._check_runtime_available()
         checkpoint = self._session_checkpoint(session_id) if session_id else None
         image = await self._resolve_image(inputs)
         payload = await self.runtime.encode(
-            image=image, model_type=model_type, device=device,
-            checkpoint=checkpoint, output_mode=output_mode,
+            image=image, model_type=model_type,
+            checkpoint=checkpoint, return_masks=return_masks,
         )
         if return_features_url:
             feat = payload.pop("features")
@@ -282,11 +260,10 @@ class EntryApp:
         self,
         model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
         quantize: bool = Field(True, description="Quantize for faster browser runtime."),
-        device: Literal["cuda", "cpu"] = Field("cuda", description="Compute device."),
     ) -> bytes:
         """The interactive prompt decoder as ONNX bytes for onnxruntime-web."""
         await self._check_runtime_available()
-        return await self.runtime.export_onnx(model_type=model_type, device=device, quantize=quantize)
+        return await self.runtime.export_onnx(model_type=model_type, quantize=quantize)
 
     # === fine-tuning orchestration (async-job model) ===
 
@@ -419,22 +396,23 @@ class EntryApp:
         training.write_status(session_id, status="STOPPED", message="stop requested by user")
         return training.get_status(session_id)
 
-    @bioengine.method
     async def export_model(
         self,
-        session_id: str = Field(..., description="Completed training session to export."),
-        model_name: str = Field(..., description="Artifact alias / model name (lowercase, hyphens)."),
-        description: str = Field("", description="Optional model description for the RDF."),
-        authors: Optional[List[Dict[str, Any]]] = Field(
-            None, description="Optional list of author dicts (e.g. [{name, affiliation}])."),
-        collection: Optional[str] = Field(
-            None, description="Optional parent collection artifact id; omitted → top-level model."),
+        session_id: str,
+        model_name: str,
+        description: str = "",
+        authors: Optional[List[Dict[str, Any]]] = None,
+        collection: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Export a fine-tuned session as a **standard BioImage.IO model package**
         and register it on Hypha. Builds the package in a CPU subprocess on the
         runtime, then uploads the file collection (rdf.yaml + weights) as a
         ``type="model"`` artifact. Returns the ``artifact_id`` — re-servable by
         identifier (e.g. via model-runner or ``bioimageio.core``).
+
+        Not currently exposed as a ``@bioengine.method`` — env-gated on a
+        micro_sam/bioimageio.core 0.11 incompatibility (see README). Re-expose
+        once that's resolved.
         """
         import yaml
         from bioengine.utils import create_file_list_from_directory
@@ -480,19 +458,3 @@ class EntryApp:
         await am.commit(artifact_id)
         logger.info(f"Exported BioImage.IO model artifact: {artifact_id}")
         return {"artifact_id": artifact_id, "n_files": len(files), "model_name": model_name}
-
-    @bioengine.method
-    async def ping(self) -> Dict[str, Any]:
-        """Entry status + GPU runtime availability."""
-        runtime_available = False
-        try:
-            await asyncio.wait_for(self.runtime.ping(), timeout=2.0)
-            runtime_available = True
-        except Exception:
-            pass
-        return {
-            "status": "ok",
-            "entry_uptime": time.time() - self.start_time,
-            "runtime_available": runtime_available,
-            "timestamp": datetime.now().isoformat(),
-        }

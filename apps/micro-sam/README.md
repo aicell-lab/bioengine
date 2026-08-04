@@ -52,29 +52,26 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
 
 ## Methods
 
-- **`infer(input_arrays, model_type="vit_b_lm", device="cuda", ...)`**
-  Automatic μSAM instance segmentation (propose-and-prune). Cellpose `infer`
-  drop-in: returns a **bare list**, one item per input, each
-  `{"output": <int32 [H,W] instance label mask>}` (bg 0, one positive int per
-  object). `input_arrays` items are numpy arrays (HxW, HxWx3, or 3xHxW), http(s)
-  URLs, or `get_upload_url` file paths. Optional `pred_iou_thresh`,
-  `stability_score_thresh`, `min_size` tune post-processing; Cellpose-only
-  params (`diameter`, `flow_threshold`, …) are accepted and ignored.
-- **`segment_image(inputs, model_type="vit_b_lm", device="cuda")`**
-  Single-image alias of `infer` (same `[{"output": …}]` shape).
-- **`compute_image_embedding(inputs, model_type="vit_b_lm", output_mode="embedding", return_features_url=False)`**
+- **`infer(input_arrays, model_type="vit_b_lm", min_size=None, session_id=None)`**
+  Automatic μSAM instance segmentation (propose-and-prune). Returns a **bare
+  list**, one item per input, each `{"output": <int32 [H,W] instance label
+  mask>}` (bg 0, one positive int per object). `input_arrays` items are numpy
+  arrays (HxW, HxWx3, or 3xHxW), http(s) URLs, or `get_upload_url` file paths.
+  `min_size` drops smaller objects. `session_id` serves a fine-tuned checkpoint.
+- **`compute_embedding(inputs, model_type="vit_b_lm", return_masks=False, return_features_url=False, session_id=None)`**
   Run the resident encoder once. Returns `{features (1,256,64,64) f32,
   original_image_shape [H,W], sam_scale, mask_threshold}`. With
-  `output_mode="embedding+masks"` also returns `masks` (int32 [H,W]). With
+  `return_masks=True` also returns `masks` (int32 [H,W]). With
   `return_features_url=True` the 4MB `features` come back as a presigned `.npy`
   URL (`features_url`) instead of raw — for large batches / slow links.
 - **`get_onnx_model(model_type="vit_b_lm", quantize=True)`**
   The interactive prompt decoder as ONNX bytes (cached per model). Fetch once
   per session, run with `onnxruntime-web`, decode each box locally using the
-  `compute_image_embedding` features.
+  `compute_embedding` features.
 - **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
   an input image.
-- **`ping()`** Status + the currently resident `model_type`.
+
+> `device` is chosen internally (CUDA, CPU fallback) — not an API parameter.
 
 ### Fine-tuning (train → serve)
 
@@ -91,7 +88,7 @@ in each training image.
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
-- **`export_model(session_id, model_name, description="", authors=None, collection=None)`**
+- **`export_model(...)`** _(present in code but **not currently exposed** as an API method — env-gated, see below)_
   Export a completed session as a **standard BioImage.IO model package** and
   register it on Hypha (`type="model"` artifact: rdf.yaml + weights). Built in a
   CPU subprocess on the runtime via `micro_sam.bioimageio.export_sam_model`, then
@@ -116,7 +113,7 @@ exact same path as the pretrained model:
 sid = (await svc.start_training(train_images=imgs, train_labels=lbls, n_epochs=10))["session_id"]
 # poll get_training_status(sid) until status == "COMPLETED"
 out = await svc.infer(input_arrays=[img], session_id=sid)          # AIS masks from the fine-tuned model
-emb = await svc.compute_image_embedding(inputs=img, session_id=sid) # embedding from the fine-tuned encoder
+emb = await svc.compute_embedding(inputs=img, session_id=sid) # embedding from the fine-tuned encoder
 ```
 
 Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`.
@@ -127,7 +124,7 @@ BioImage.IO artifact (currently env-gated — see the method note above).
 
 ```
 once per session:  onnx = get_onnx_model("vit_b_lm", quantize=True)
-once per image:    emb  = compute_image_embedding(img, output_mode="embedding")
+once per image:    emb  = compute_embedding(img)
 per user box:      decode locally via onnxruntime-web using onnx + emb.features   # no GPU
 auto pre-seg:      infer([img], "vit_b_lm") -> [{"output": int32 [H,W]}]          # propose-and-prune
 ```

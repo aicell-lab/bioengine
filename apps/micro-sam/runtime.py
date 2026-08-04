@@ -86,17 +86,30 @@ class RuntimeApp:
         self._loaded_model_type: Optional[str] = None
         self._loaded_key: Optional[tuple] = None
         self._onnx_cache: Dict[str, bytes] = {}
+        self._device_cached: Optional[str] = None
 
-    @bioengine.method
     async def ping(self) -> Dict[str, Any]:
-        """Liveness — deliberately unlocked so it answers during GPU work."""
+        """Internal liveness for the entry's readiness check — not a Hypha method,
+        but reachable via the composition handle. Unlocked so it answers during
+        GPU work.
+        """
         return {
             "status": "ok",
             "loaded_model_type": self._loaded_model_type,
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
-            "timestamp": datetime.now().isoformat(),
         }
+
+    def _device(self) -> str:
+        """Pick the compute device internally (device is not a public API param)."""
+        if self._device_cached is None:
+            try:
+                import torch
+
+                self._device_cached = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                self._device_cached = "cpu"
+        return self._device_cached
 
     # === resident model (one encoder + AIS segmenter at a time) ===
 
@@ -136,13 +149,14 @@ class RuntimeApp:
             "_rdtype": arr.dtype.name,
         }
 
-    def _ensure_model(self, model_type: str, device: str, checkpoint: Optional[str] = None):
+    def _ensure_model(self, model_type: str, checkpoint: Optional[str] = None):
         """Load (predictor, AIS segmenter), reusing the resident pair when the
         (model_type, checkpoint) is unchanged. ``checkpoint`` serves a fine-tuned
         ``best.pt``. Blocking — call via ``asyncio.to_thread`` under the GPU lock.
         """
         from micro_sam.automatic_segmentation import get_predictor_and_segmenter
 
+        device = self._device()
         key = (model_type, checkpoint)
         if key != self._loaded_key:
             self._release_model()
@@ -176,11 +190,11 @@ class RuntimeApp:
         except Exception:
             pass
 
-    def _auto_segment(self, model_type, device, image, generate_kwargs, checkpoint):
+    def _auto_segment(self, model_type, image, generate_kwargs, checkpoint):
         """μSAM automatic instance segmentation → int32 [H,W] mask. Blocking."""
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
 
-        predictor, segmenter = self._ensure_model(model_type, device, checkpoint)
+        predictor, segmenter = self._ensure_model(model_type, checkpoint)
         image = self._to_image_format(image)
         labels = automatic_instance_segmentation(
             predictor=predictor, segmenter=segmenter, input_path=image,
@@ -188,9 +202,9 @@ class RuntimeApp:
         )
         return np.asarray(labels).astype(np.int32)
 
-    def _encode(self, model_type, device, image, checkpoint):
+    def _encode(self, model_type, image, checkpoint):
         """SAM image encoder → embedding payload for onnxruntime-web. Blocking."""
-        predictor, _ = self._ensure_model(model_type, device, checkpoint)
+        predictor, _ = self._ensure_model(model_type, checkpoint)
         image = self._to_image_format(image)
         original_image_shape = image.shape[:2]
         sam = predictor.model
@@ -206,7 +220,7 @@ class RuntimeApp:
             "mask_threshold": float(sam.mask_threshold),
         }
 
-    def _export_onnx(self, model_type: str, device: str, quantize: bool) -> bytes:
+    def _export_onnx(self, model_type: str, quantize: bool) -> bytes:
         """Export the lightweight SAM prompt decoder to ONNX bytes. Blocking."""
         import tempfile
         import warnings
@@ -217,7 +231,8 @@ class RuntimeApp:
         from onnxruntime.quantization.quantize import quantize_dynamic
         from segment_anything.utils.onnx import SamOnnxModel
 
-        predictor, _ = self._ensure_model(model_type, device)
+        device = self._device()
+        predictor, _ = self._ensure_model(model_type)
         sam = predictor.model
         with tempfile.TemporaryDirectory() as tmp:
             onnx_path = Path(tmp) / f"{model_type}.onnx"
@@ -269,7 +284,7 @@ class RuntimeApp:
 
     async def auto_segment(
         self, images: List[np.ndarray], model_type: str = "vit_b_lm",
-        device: str = "cuda", generate_kwargs: Optional[Dict[str, Any]] = None,
+        generate_kwargs: Optional[Dict[str, Any]] = None,
         checkpoint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """AIS masks for a batch of (already-resolved) images → wire-dict list."""
@@ -278,37 +293,37 @@ class RuntimeApp:
         async with self._gpu_lock:
             for image in images:
                 labels = await asyncio.to_thread(
-                    self._auto_segment, model_type, device, image, generate_kwargs, checkpoint
+                    self._auto_segment, model_type, image, generate_kwargs, checkpoint
                 )
                 results.append({"output": self._nd(labels)})
         return results
 
     async def encode(
-        self, image: np.ndarray, model_type: str = "vit_b_lm", device: str = "cuda",
-        checkpoint: Optional[str] = None, output_mode: str = "embedding",
+        self, image: np.ndarray, model_type: str = "vit_b_lm",
+        checkpoint: Optional[str] = None, return_masks: bool = False,
     ) -> Dict[str, Any]:
         """Encoder embedding (+ optional AIS masks). ``features`` and ``masks``
         come back as wire-dicts; the entry reconstructs/forwards them.
         """
         async with self._gpu_lock:
-            payload = await asyncio.to_thread(self._encode, model_type, device, image, checkpoint)
-            if output_mode == "embedding+masks":
+            payload = await asyncio.to_thread(self._encode, model_type, image, checkpoint)
+            if return_masks:
                 labels = await asyncio.to_thread(
-                    self._auto_segment, model_type, device, image, {}, checkpoint
+                    self._auto_segment, model_type, image, {}, checkpoint
                 )
                 payload["masks"] = self._nd(labels)
         payload["features"] = self._nd(payload["features"])
         return payload
 
     async def export_onnx(
-        self, model_type: str = "vit_b_lm", device: str = "cuda", quantize: bool = True,
+        self, model_type: str = "vit_b_lm", quantize: bool = True,
     ) -> bytes:
         cache_key = f"{model_type}:{quantize}"
         if cache_key in self._onnx_cache:
             return self._onnx_cache[cache_key]
         logger.info(f"📦 Exporting ONNX prompt decoder for '{model_type}'...")
         async with self._gpu_lock:
-            onnx_bytes = await asyncio.to_thread(self._export_onnx, model_type, device, quantize)
+            onnx_bytes = await asyncio.to_thread(self._export_onnx, model_type, quantize)
         self._onnx_cache[cache_key] = onnx_bytes
         return onnx_bytes
 
@@ -367,7 +382,7 @@ class RuntimeApp:
             await asyncio.to_thread(self._release_model)
             training.write_status(
                 session_id, status="TRAINING", start_time=time.time(),
-                n_epochs=params.get("n_epochs"), device="cuda",
+                n_epochs=params.get("n_epochs"), device=self._device(),
             )
             proc = await asyncio.to_thread(self._run_train_subprocess, session_id)
 
