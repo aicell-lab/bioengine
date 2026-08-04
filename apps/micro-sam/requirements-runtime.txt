@@ -3,12 +3,6 @@
 # conda-only nifty/vigra/z5py blocker is gone. onnx(runtime) is only for the
 # in-browser prompt-decoder export (get_onnx_model).
 micro-sam==1.8.5
-# Pin bioimageio.core to 0.9.4 (→ bioimageio.spec 0.5.5.6). micro-sam 1.8.5's
-# export_sam_model passes plain str/Path for cover/documentation, which newer
-# bioimageio.spec (0.5.12, pulled by the default core 0.11) rejects — it now
-# requires FileDescr. 0.5.5.6 still accepts str, so the BioImage.IO export works.
-# Serving/training don't import bioimageio.core, so this only affects export.
-bioimageio.core==0.9.4
 segment-anything==1.0
 torch==2.7.1
 torchvision==0.22.1
