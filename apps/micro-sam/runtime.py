@@ -48,7 +48,7 @@ def _read_pip(name: str) -> List[str]:
 @bioengine.app(
     num_cpus=2,
     num_gpus=1,
-    memory_mb=24 * 1024,
+    memory_mb=12 * 1024,
     pip=_read_pip("requirements-runtime.txt"),
     # Let up to 10 RPCs reach a replica so backlog behind ``_gpu_lock`` is
     # observable to the autoscaler; the lock serialises the actual GPU work.
