@@ -319,6 +319,15 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         help="Skip cleanup of previous Ray cluster processes and data. "
         "Use with caution as it may cause port conflicts or resource issues.",
     )
+    ray_cluster_group.add_argument(
+        "--enable-container-runtime",
+        action="store_true",
+        help="Opt-in: allow apps declared with @bioengine.app(container_image=…) "
+        "to run inside a prebuilt container image as their Ray Serve runtime "
+        "(single-machine mode only). Requires a rootful worker with podman + "
+        "nvidia-container-toolkit; the worker generates a podman-compatible CDI "
+        "spec at startup for GPU passthrough. Pip remains the default runtime.",
+    )
 
     # SLURM job configuration options (for HPC environments)
     slurm_job_group = parser.add_argument_group(

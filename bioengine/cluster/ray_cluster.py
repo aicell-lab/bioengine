@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -93,6 +94,7 @@ class RayCluster:
         head_memory_in_gb: Optional[int] = None,
         runtime_env_pip_cache_size_gb: int = 30,  # Ray default is 10 GB
         force_clean_up: bool = True,
+        enable_container_runtime: bool = False,
         # SLURM Worker Configuration parameters
         image: str = f"ghcr.io/aicell-lab/bioengine-worker:{bioengine.__version__}",
         worker_workspace_dir: Optional[str] = None,
@@ -135,6 +137,10 @@ class RayCluster:
             head_memory_in_gb: Memory limit for head node in GB. If not set, Ray will auto-detect available memory.
             runtime_env_pip_cache_size_gb: Size of pip cache for runtime environments in GB. Default 30.
             force_clean_up: Force cleanup of previous Ray cluster on start. Default True.
+            enable_container_runtime: Opt-in container-as-runtime for apps
+                using ``@bioengine.app(container_image=…)`` (single-machine
+                mode). Generates a podman-compatible CDI spec at startup for
+                nested-GPU passthrough. Default False.
             image: Container image for workers (SLURM mode). Default bioengine-worker.
             worker_workspace_dir: Workspace directory mounted to worker containers (SLURM mode).
             default_num_gpus: Default GPU count per worker. Default 1.
@@ -174,6 +180,7 @@ class RayCluster:
                 "Supported modes are 'slurm', 'single-machine' and 'external-cluster'."
             )
         self.mode = mode
+        self.enable_container_runtime = bool(enable_container_runtime)
 
         # Initialize cluster state and monitoring attributes
         self.address = None
@@ -582,6 +589,105 @@ class RayCluster:
             self.logger.error(f"Symlink '{symlink_path}' does not exist")
             raise FileNotFoundError(f"Symlink '{symlink_path}' does not exist")
 
+    async def _generate_cdi_spec(self) -> None:
+        """Emit a podman-4.9.3-compatible CDI spec for nested-GPU passthrough.
+
+        Container-as-runtime replicas run in a nested podman container; the
+        only GPU injector that works there is native podman CDI
+        (``--device nvidia.com/gpu=all``). Two host-specific fixups are baked
+        in because the recipe was validated on a double-nested cgroup-v1 host:
+
+        * ``--disable-hook update-ldcache`` — the ldcache hook runs ``ldconfig``
+          via a mount op that fails in the nested container; the driver libs
+          are reached via ``LD_LIBRARY_PATH`` instead (exported below and read
+          by ``bootstrap._with_pkg`` as a podman ``-e`` run option).
+        * down-version to ``cdiVersion: 0.6.0`` and strip the 0.7.0-only
+          ``additionalGids`` field — podman 4.9.3's CDI parser predates 0.7.0.
+
+        No-op with a warning if ``nvidia-ctk`` is absent or the process is not
+        root (a rootless worker can't write ``/etc/cdi`` nor create a usable
+        CUDA context anyway).
+        """
+        if os.geteuid() != 0:
+            self.logger.warning(
+                "enable_container_runtime is set but the worker is not running "
+                "as root; skipping CDI generation. GPU container apps will fail."
+            )
+            return
+
+        nvidia_ctk = shutil.which("nvidia-ctk")
+        if not nvidia_ctk:
+            self.logger.warning(
+                "enable_container_runtime is set but 'nvidia-ctk' was not found; "
+                "skipping CDI generation. GPU container apps will fail."
+            )
+            return
+
+        cdi_path = "/etc/cdi/nvidia.yaml"
+        await asyncio.to_thread(
+            lambda: Path(cdi_path).parent.mkdir(parents=True, exist_ok=True)
+        )
+
+        proc = await asyncio.create_subprocess_exec(
+            nvidia_ctk,
+            "cdi",
+            "generate",
+            f"--output={cdi_path}",
+            "--disable-hook",
+            "update-ldcache",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode,
+                "nvidia-ctk cdi generate",
+                stderr=stderr.decode() if stderr else "Unknown error",
+            )
+
+        def _downversion_spec() -> None:
+            lines = Path(cdi_path).read_text().splitlines()
+            out = []
+            for line in lines:
+                if "additionalgids" in line.lower():
+                    continue
+                # additionalGids' numeric list items (e.g. `- 44`) would otherwise
+                # orphan into the preceding deviceNodes list once the key is gone,
+                # producing a bare number where podman expects a DeviceNode. No
+                # other list entry in the spec is a bare integer, so drop them.
+                if re.fullmatch(r"\s*-\s*\d+\s*", line):
+                    continue
+                if line.startswith("cdiVersion:"):
+                    line = "cdiVersion: 0.6.0"
+                out.append(line)
+            Path(cdi_path).write_text("\n".join(out) + "\n")
+
+        await asyncio.to_thread(_downversion_spec)
+
+        # Point replicas' LD_LIBRARY_PATH at the host dir holding libcuda.so.1
+        # (CDI mounts driver libs at their host paths inside the container).
+        ld_dir = "/usr/lib64"
+        ldconfig = shutil.which("ldconfig")
+        if ldconfig:
+            proc = await asyncio.create_subprocess_exec(
+                ldconfig,
+                "-p",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            for line in stdout.decode().splitlines():
+                if "libcuda.so.1" in line and "=>" in line:
+                    ld_dir = str(Path(line.split("=>")[-1].strip()).parent)
+                    break
+        os.environ["BIOENGINE_CONTAINER_LD_LIBRARY_PATH"] = ld_dir
+
+        self.logger.info(
+            f"Generated CDI spec at {cdi_path} (cdiVersion 0.6.0); "
+            f"container GPU LD_LIBRARY_PATH={ld_dir}"
+        )
+
     async def _start_cluster(self) -> None:
         """Start Ray cluster head node with configured ports and resources.
 
@@ -613,6 +719,11 @@ class RayCluster:
 
             # Check and set cluster ports
             await asyncio.to_thread(self._set_cluster_ports)
+
+            # Opt-in container-as-runtime: emit a podman-compatible CDI spec so
+            # GPU apps can run inside their image (single-machine mode only).
+            if self.enable_container_runtime:
+                await self._generate_cdi_spec()
 
             # Start ray as the head node with the specified parameters
             args = [
