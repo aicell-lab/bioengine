@@ -349,7 +349,7 @@ class RuntimeApp:
         res_path = training.session_dir(session_id) / "export" / "export_result.json"
         if proc.returncode != 0 or not res_path.exists():
             raise RuntimeError(
-                f"BioImage.IO export failed (rc={proc.returncode}): {(proc.stderr or '')[-800:]}"
+                f"BioImage.IO export failed (rc={proc.returncode}): {(proc.stderr or '')[-3000:]}"
             )
         return json.loads(res_path.read_text())
 

@@ -27,7 +27,9 @@ def main(session_id: str, model_name: str) -> None:
     if not ckpt.exists():
         raise FileNotFoundError(f"No checkpoint for session '{session_id}'.")
 
-    image = tifffile.imread(p["train_images"][0])
+    # float32 image: export runs the model on this test image, and SAM's
+    # apply_image_torch interpolation is not implemented for uint8 ('Byte').
+    image = tifffile.imread(p["train_images"][0]).astype("float32")
     label = tifffile.imread(p["train_labels"][0])
 
     export_dir = training.session_dir(session_id) / "export"
