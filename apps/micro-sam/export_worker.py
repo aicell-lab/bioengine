@@ -18,36 +18,53 @@ from pathlib import Path
 import training
 
 
-def _relax_spec_output_check() -> None:
-    """Tolerate the latest bioimageio.spec's over-strict all-near-zero output
-    check so export works with bioimageio.core 0.11 / spec 0.5.12.
+def _patch_spec_for_export() -> None:
+    """Adapt micro-sam 1.8.5's export_sam_model to the latest bioimageio.spec
+    (0.5.12, via bioimageio.core 0.11). export_sam_model builds
+    ``bioimageio.spec.model.v0_5.ModelDescr`` and calls the module-level
+    ``validate_tensors`` — both of which we patch in-place (same module the
+    exporter imports as ``spec``):
 
-    spec 0.5.12 rejects any test tensor whose values are all within (-1e-4, 1e-4)
-    ("Output values are too small for reliable testing" — the message even
-    mis-states the bound as 1e5). That wrongly rejects legitimate sparse SAM
-    outputs (e.g. an empty predicted mask from an under-trained model). We wrap
-    the module-level ``validate_tensors`` (its only caller is same-module, by
-    global name) to swallow just that one error and keep every other validation.
+    1. ``documentation`` / ``covers`` — the exporter passes plain str/Path, but
+       0.5.12 now requires ``FileDescr``; coerce them.
+    2. ``validate_tensors`` rejects any test tensor whose values are all within
+       (-1e-4, 1e-4) ("too small for reliable testing" — the message even
+       mis-states the bound as 1e5), which wrongly rejects legitimate sparse SAM
+       outputs (an empty predicted mask); swallow only that one error.
     """
     import bioimageio.spec.model.v0_5 as v05
 
-    _orig = v05.validate_tensors
+    _OrigModelDescr = v05.ModelDescr
 
-    def _tolerant(*args, **kwargs):
+    def _fd(v):
+        return v if isinstance(v, v05.FileDescr) else v05.FileDescr(source=v)
+
+    def _PatchedModelDescr(*args, **kwargs):
+        if kwargs.get("documentation") is not None:
+            kwargs["documentation"] = _fd(kwargs["documentation"])
+        if kwargs.get("covers"):
+            kwargs["covers"] = [_fd(c) for c in kwargs["covers"]]
+        return _OrigModelDescr(*args, **kwargs)
+
+    v05.ModelDescr = _PatchedModelDescr
+
+    _orig_validate = v05.validate_tensors
+
+    def _tolerant_validate(*args, **kwargs):
         try:
-            return _orig(*args, **kwargs)
+            return _orig_validate(*args, **kwargs)
         except ValueError as e:
             if "too small for reliable testing" in str(e):
                 return None
             raise
 
-    v05.validate_tensors = _tolerant
+    v05.validate_tensors = _tolerant_validate
 
 
 def main(session_id: str, model_name: str) -> None:
     import tifffile
 
-    _relax_spec_output_check()
+    _patch_spec_for_export()
     from micro_sam.bioimageio import export_sam_model
 
     p = training.read_training_params(session_id)
