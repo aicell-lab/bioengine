@@ -420,6 +420,68 @@ class EntryApp:
         return training.get_status(session_id)
 
     @bioengine.method
+    async def export_model(
+        self,
+        session_id: str = Field(..., description="Completed training session to export."),
+        model_name: str = Field(..., description="Artifact alias / model name (lowercase, hyphens)."),
+        description: str = Field("", description="Optional model description for the RDF."),
+        authors: Optional[List[Dict[str, Any]]] = Field(
+            None, description="Optional list of author dicts (e.g. [{name, affiliation}])."),
+        collection: Optional[str] = Field(
+            None, description="Optional parent collection artifact id; omitted → top-level model."),
+    ) -> Dict[str, Any]:
+        """Export a fine-tuned session as a **standard BioImage.IO model package**
+        and register it on Hypha. Builds the package in a CPU subprocess on the
+        runtime, then uploads the file collection (rdf.yaml + weights) as a
+        ``type="model"`` artifact. Returns the ``artifact_id`` — re-servable by
+        identifier (e.g. via model-runner or ``bioimageio.core``).
+        """
+        import yaml
+        from bioengine.utils import create_file_list_from_directory
+
+        self._session_checkpoint(session_id)  # raises if no trained checkpoint
+        await self._check_runtime_available()
+        res = await self.runtime.export_bioimageio(session_id=session_id, model_name=model_name)
+
+        pkg_dir = Path(res["package_dir"])
+        rdf_path = pkg_dir / "rdf.yaml"
+        if not rdf_path.exists():
+            cands = sorted(pkg_dir.glob("*.yaml")) + sorted(pkg_dir.glob("*.yml"))
+            if not cands:
+                raise FileNotFoundError(f"No rdf.yaml in exported package {pkg_dir}")
+            rdf_path = cands[0]
+        rdf = yaml.safe_load(rdf_path.read_text())
+        if description:
+            rdf["description"] = description
+        if authors:
+            rdf["authors"] = authors
+
+        am = await self._hypha.get_service("public/artifact-manager")
+        create_kwargs: Dict[str, Any] = dict(
+            type="model", alias=model_name, manifest=rdf, stage=True
+        )
+        if collection:
+            col = await am.read(collection)
+            create_kwargs["parent_id"] = col["id"] if isinstance(col, dict) else col
+        art = await am.create(**create_kwargs)
+        artifact_id = str(art["id"] if isinstance(art, dict) else art)
+
+        files = create_file_list_from_directory(directory_path=str(pkg_dir))
+        async with httpx.AsyncClient(timeout=600) as client:
+            for f in files:
+                url = await am.put_file(artifact_id, file_path=f["name"])
+                content = f["content"]
+                if f.get("type") == "base64":
+                    import base64
+
+                    content = base64.b64decode(content)
+                resp = await client.put(url, content=content)
+                resp.raise_for_status()
+        await am.commit(artifact_id)
+        logger.info(f"Exported BioImage.IO model artifact: {artifact_id}")
+        return {"artifact_id": artifact_id, "n_files": len(files), "model_name": model_name}
+
+    @bioengine.method
     async def ping(self) -> Dict[str, Any]:
         """Entry status + GPU runtime availability."""
         runtime_available = False

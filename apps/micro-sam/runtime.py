@@ -327,6 +327,32 @@ class RuntimeApp:
             capture_output=True, text=True, env=self._subprocess_env(),
         )
 
+    def _run_export_subprocess(self, session_id: str, model_name: str):
+        worker = str(Path(__file__).parent / "export_worker.py")
+        env = self._subprocess_env()
+        env["CUDA_VISIBLE_DEVICES"] = ""  # CPU-only export → no GPU contention
+        return subprocess.run(
+            [sys.executable, worker, session_id, model_name],
+            cwd=str(Path(__file__).parent),
+            capture_output=True, text=True, env=env,
+        )
+
+    async def export_bioimageio(self, session_id: str, model_name: str) -> Dict[str, Any]:
+        """Build a BioImage.IO package from a trained session in a CPU subprocess
+        (no GPU lock). Returns the on-disk package dir for the entry to upload.
+        """
+        import json
+
+        import training
+
+        proc = await asyncio.to_thread(self._run_export_subprocess, session_id, model_name)
+        res_path = training.session_dir(session_id) / "export" / "export_result.json"
+        if proc.returncode != 0 or not res_path.exists():
+            raise RuntimeError(
+                f"BioImage.IO export failed (rc={proc.returncode}): {(proc.stderr or '')[-800:]}"
+            )
+        return json.loads(res_path.read_text())
+
     async def train(self, session_id: str, model_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Fine-tune in a subprocess under the shared GPU lock (long-running).
 

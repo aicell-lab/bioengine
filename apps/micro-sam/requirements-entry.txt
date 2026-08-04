@@ -6,3 +6,4 @@ imageio>=2.37.0
 tifffile
 Pillow
 httpx
+pyyaml

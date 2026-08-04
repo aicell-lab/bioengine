@@ -91,6 +91,13 @@ in each training image.
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
+- **`export_model(session_id, model_name, description="", authors=None, collection=None)`**
+  Export a completed session as a **standard BioImage.IO model package** and
+  register it on Hypha (`type="model"` artifact: rdf.yaml + weights). Built in a
+  CPU subprocess on the runtime via `micro_sam.bioimageio.export_sam_model`, then
+  uploaded by the entry. Returns `{artifact_id, n_files, model_name}` — the model
+  is then re-servable anywhere by that identifier (e.g. via `model-runner` or
+  `bioimageio.core`).
 
 **Serve the just-trained model:** once `checkpoint_available` is true, pass
 `session_id` to any serving method — the fine-tuned checkpoint flows through the
@@ -103,8 +110,9 @@ out = await svc.infer(input_arrays=[img], session_id=sid)          # AIS masks f
 emb = await svc.compute_image_embedding(inputs=img, session_id=sid) # embedding from the fine-tuned encoder
 ```
 
-Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`. BioImage.IO
-export of a trained session is a planned follow-up.
+Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`. Call
+`export_model(session_id, ...)` to publish the fine-tuned model as a standard
+BioImage.IO artifact and re-serve it anywhere by identifier.
 
 ## Interactive annotation loop (Option A — in-browser decode)
 
