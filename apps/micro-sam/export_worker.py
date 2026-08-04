@@ -34,8 +34,13 @@ def main(session_id: str, model_name: str) -> None:
     export_dir.mkdir(parents=True, exist_ok=True)
     zip_path = export_dir / f"{model_name}.zip"
 
+    # export_sam_model builds the base SAM via segment_anything's
+    # sam_model_registry, which only knows base architectures — strip the
+    # micro-sam suffix (vit_b_lm -> vit_b); the fine-tuned weights come from the
+    # checkpoint.
+    base_arch = "_".join(p["model_type"].split("_")[:2])
     export_sam_model(
-        image=image, label_image=label, model_type=p["model_type"],
+        image=image, label_image=label, model_type=base_arch,
         name=model_name, output_path=str(zip_path), checkpoint_path=str(ckpt),
     )
 
