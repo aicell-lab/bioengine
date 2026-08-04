@@ -33,7 +33,7 @@ import numpy as np
 
 logger = bioengine.logger
 
-ModelType = ("vit_b_lm", "vit_l_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h")
+ModelType = ("vit_l_lm", "vit_b_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h")
 
 
 def _read_pip(name: str) -> List[str]:
@@ -303,7 +303,7 @@ class RuntimeApp:
     # === composition endpoints (called by EntryApp via the runtime handle) ===
 
     async def auto_segment(
-        self, images: List[np.ndarray], model_type: str = "vit_b_lm",
+        self, images: List[np.ndarray], model_type: str = "vit_l_lm",
         generate_kwargs: Optional[Dict[str, Any]] = None,
         checkpoint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
@@ -319,7 +319,7 @@ class RuntimeApp:
         return results
 
     async def auto_segment_from_embedding(
-        self, embeddings: List[Dict[str, Any]], model_type: str = "vit_b_lm",
+        self, embeddings: List[Dict[str, Any]], model_type: str = "vit_l_lm",
         generate_kwargs: Optional[Dict[str, Any]] = None, checkpoint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """AIS masks for a batch of precomputed embeddings (each a dict with
@@ -338,7 +338,7 @@ class RuntimeApp:
         return results
 
     async def encode(
-        self, image: np.ndarray, model_type: str = "vit_b_lm",
+        self, image: np.ndarray, model_type: str = "vit_l_lm",
         checkpoint: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Encoder embedding. ``features`` comes back as a wire-dict (the entry
@@ -352,7 +352,7 @@ class RuntimeApp:
         return payload
 
     async def export_onnx(
-        self, model_type: str = "vit_b_lm", quantize: bool = True,
+        self, model_type: str = "vit_l_lm", quantize: bool = True,
     ) -> bytes:
         cache_key = f"{model_type}:{quantize}"
         if cache_key in self._onnx_cache:

@@ -33,7 +33,7 @@ logger = bioengine.logger
 SERVER_URL = "https://hypha.aicell.io"
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
-ModelType = Literal["vit_b_lm", "vit_l_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h"]
+ModelType = Literal["vit_l_lm", "vit_b_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h"]
 
 
 def _read_pip(name: str) -> List[str]:
@@ -250,7 +250,7 @@ class EntryApp:
             "Provide this OR input_arrays.",
         ),
         model_type: ModelType = Field(
-            "vit_b_lm",
+            "vit_l_lm",
             description="μSAM model. LM generalists (vit_b_lm / vit_l_lm / vit_t_lm) "
             "carry the AIS decoder. For embeddings, the model must match the one that "
             "produced them (inferred from the embedding when available).",
@@ -291,7 +291,7 @@ class EntryApp:
     async def compute_embedding(
         self,
         inputs: Union[np.ndarray, str] = Field(..., description="A single input image."),
-        model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
+        model_type: ModelType = Field("vit_l_lm", description="μSAM model."),
         return_url: bool = Field(
             False,
             description="If True, save the embedding as a self-contained .npz in a "
@@ -335,7 +335,7 @@ class EntryApp:
     @bioengine.method
     async def get_onnx_model(
         self,
-        model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
+        model_type: ModelType = Field("vit_l_lm", description="μSAM model."),
         quantize: bool = Field(True, description="Quantize for faster browser runtime."),
     ) -> bytes:
         """The interactive prompt decoder as ONNX bytes for onnxruntime-web."""
@@ -405,7 +405,7 @@ class EntryApp:
             "needs DENSE labels — annotate all objects per image."),
         val_images: Optional[List[Union[np.ndarray, str]]] = Field(None, description="Optional validation images."),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(None, description="Validation labels."),
-        model_type: ModelType = Field("vit_b_lm", description="Base μSAM model to fine-tune."),
+        model_type: ModelType = Field("vit_l_lm", description="Base μSAM model to fine-tune."),
         n_epochs: int = Field(5, description="Number of training epochs."),
         n_objects_per_batch: int = Field(
             8, description="Objects per batch — main GPU-memory knob; 8 fits vit_b on 24GB."),

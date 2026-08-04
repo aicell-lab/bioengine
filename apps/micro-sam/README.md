@@ -43,8 +43,8 @@ box.
 
 | `model_type` | Notes |
 |---|---|
-| `vit_b_lm` (default) | Speed/quality balance for cells & nuclei in LM |
-| `vit_l_lm` | Higher quality, slower |
+| `vit_l_lm` (default) | Best quality for cells & nuclei in LM (~5 GB resident) |
+| `vit_b_lm` | Lighter/faster fallback, lower quality |
 | `vit_t_lm`, `vit_b`, `vit_l`, `vit_h` | Also selectable (base SAM has no AIS decoder → AMG fallback) |
 
 Switching `model_type` frees the previous model's VRAM and loads the new one
@@ -52,7 +52,7 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
 
 ## Methods
 
-- **`infer(input_arrays=None, embeddings=None, model_type="vit_b_lm", min_size=None, session_id=None)`**
+- **`infer(input_arrays=None, embeddings=None, model_type="vit_l_lm", min_size=None, session_id=None)`**
   Automatic μSAM instance segmentation (propose-and-prune). Returns a **bare
   list**, one item per input, each `{"output": <int32 [H,W] instance label
   mask>}` (bg 0, one positive int per object). Pass **`input_arrays`** (numpy
@@ -62,7 +62,7 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
   With `embeddings` the AIS decoder runs on the stored embedding **without
   re-encoding** (the model is inferred from the embedding). `min_size` drops
   smaller objects. `session_id` serves a fine-tuned checkpoint.
-- **`compute_embedding(inputs, model_type="vit_b_lm", return_url=False, embedding_upload_url=None, session_id=None)`**
+- **`compute_embedding(inputs, model_type="vit_l_lm", return_url=False, embedding_upload_url=None, session_id=None)`**
   Run the resident encoder once. Returns `{features (1,256,64,64) f32,
   original_image_shape [H,W], input_size [h,w], sam_scale, mask_threshold,
   model_type}`. With `return_url=True` the embedding is saved as a
@@ -70,7 +70,7 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
   (feed straight to `infer(embeddings=[…])`). With `embedding_upload_url` (a
   presigned PUT URL from `get_upload_url('.npz')`) the `.npz` is stored at your
   own URL instead — you keep the matching download URL for `infer`.
-- **`get_onnx_model(model_type="vit_b_lm", quantize=True)`**
+- **`get_onnx_model(model_type="vit_l_lm", quantize=True)`**
   The interactive prompt decoder as ONNX bytes (cached per model). Fetch once
   per session, run with `onnxruntime-web`, decode each box locally using the
   `compute_embedding` features.
@@ -92,7 +92,7 @@ just-trained model — no export step needed. Fine-tuning **with the AIS decoder
 (`with_segmentation_decoder=True`) needs **dense** labels: annotate *all* objects
 in each training image.
 
-- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_b_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, label="")`**
+- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, label="")`**
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
@@ -135,10 +135,10 @@ BioImage.IO artifact (currently env-gated — see the method note above).
 ## Interactive annotation loop (Option A — in-browser decode)
 
 ```
-once per session:  onnx = get_onnx_model("vit_b_lm", quantize=True)
+once per session:  onnx = get_onnx_model("vit_l_lm", quantize=True)
 once per image:    emb  = compute_embedding(img)
 per user box:      decode locally via onnxruntime-web using onnx + emb.features   # no GPU
-auto pre-seg:      infer([img], "vit_b_lm") -> [{"output": int32 [H,W]}]          # propose-and-prune
+auto pre-seg:      infer([img], "vit_l_lm") -> [{"output": int32 [H,W]}]          # propose-and-prune
 ```
 
 ## Deployment
@@ -158,7 +158,7 @@ await worker.deploy_app(
 Notes:
 - First deploy is slow — the runtime env pip-installs `micro-sam` (+ `torch-em`,
   `segment-anything`, `bioimage-cpp`) and `onnxruntime`.
-- Requires a GPU replica; SAM ViT encoders are large. `vit_b_lm` fits comfortably
+- Requires a GPU replica; SAM ViT encoders are large. `vit_l_lm` (default) needs ~5 GB; `vit_b_lm` is lighter
   in a few GB of VRAM.
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the
   C++ pieces `python-elf` used to need from conda-forge.
