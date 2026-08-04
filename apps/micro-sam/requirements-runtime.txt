@@ -13,4 +13,4 @@ imageio>=2.37.0
 # numpy>=2, and no numpy<2 python-elf exists on PyPI. The bioengine worker's
 # ProxyDeployment runs numpy 1.x and cannot unpickle numpy-2.x arrays over the Ray
 # hop, so this app returns arrays as hypha ndarray wire-dicts (bytes) instead of raw
-# ndarrays — see MicroSAM._nd. Leave numpy unpinned so elf resolves it.
+# ndarrays — see RuntimeApp._nd. Leave numpy unpinned so elf resolves it.

@@ -1,0 +1,8 @@
+# CPU entry: Hypha/S3 transport + training data materialization only.
+# numpy stays 2.x (matches the runtime for entry->runtime array passing);
+# no torch / micro-sam here.
+numpy
+imageio>=2.37.0
+tifffile
+Pillow
+httpx

@@ -17,6 +17,24 @@ SAM image encoder stays resident on the GPU and backs three cheap consumers**
 Motivated by annotation ergonomics and low-contrast brightfield (where drawing
 masks from scratch is slow); **not** an accuracy claim over Cellpose-SAM.
 
+## Architecture (two deployments)
+
+Like `model-runner`, the app is split into a **CPU `EntryApp`** (`entry.py`) and
+a **GPU `RuntimeApp`** (`runtime.py`); only the entry is named in the manifest and
+it composes the runtime by type hint. The client always talks to the entry.
+
+- **EntryApp** (CPU, 1 replica) — Hypha/S3 transport, training data
+  materialization, session orchestration, and request routing to the runtime.
+- **RuntimeApp** (GPU, autoscaling `min=1 / max=2`) — the resident SAM encoder,
+  a single `asyncio` **GPU lock over every GPU op** (serving *and* training), and
+  fine-tuning that runs in a **subprocess** (VRAM fully reclaimed on exit; the
+  resident inference model is evicted first so the subprocess owns the GPU).
+
+Because the GPU runtime autoscales, a long training run holds one GPU replica's
+lock while a concurrent inference request spins up and runs on the **second GPU
+replica** — training and inference at the same time. Returned arrays are
+hypha-rpc ndarray wire-dicts, which decode to real ndarrays on the client.
+
 ## Models
 
 Use a light-microscopy (LM) generalist for brightfield/fluorescence cells — the
@@ -105,7 +123,7 @@ so it must be deployed with the token injected:
 ```python
 await worker.deploy_app(
     artifact_id="bioimage-io/micro-sam",
-    version="0.1.0",
+    version="0.3.0",
     application_id="micro-sam",
     hypha_token=HYPHA_TOKEN,
 )

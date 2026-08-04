@@ -216,63 +216,17 @@ def materialize_pairs(
         "patch_shape": ph, "n_train": len(train_imgs), "n_val": len(val_imgs),
     }
 
+# === training params (written by the entry, read by train_worker.py) ===
 
-# === training driver (runs in a ThreadPoolExecutor thread) ===
+def _params_path(session_id: str) -> Path:
+    return session_dir(session_id) / "training_params.json"
 
-def run_training_blocking(session_id: str, model_type: str, data: Dict[str, Any], params: Dict[str, Any]) -> None:
-    """Blocking μSAM fine-tuning. Updates status.json at start and on
-    completion/failure. Call under ``loop.run_in_executor``.
-    """
-    import torch
-    from micro_sam.training import default_sam_loader, train_sam
-    from torch_em.data import MinInstanceSampler
 
-    sdir = session_dir(session_id)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    patch = tuple(data["patch_shape"])
-    write_status(session_id, status="TRAINING", start_time=time.time(),
-                 n_epochs=params["n_epochs"], device=device,
-                 n_train=data["n_train"], n_val=data["n_val"], patch_shape=list(patch))
+def write_training_params(session_id: str, params: Dict[str, Any]) -> None:
+    p = _params_path(session_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(params))
 
-    if stop_requested(session_id):
-        write_status(session_id, status="STOPPED", message="stopped before training", end_time=time.time())
-        return
 
-    common = dict(
-        raw_key=None, label_key=None, patch_shape=patch,
-        with_segmentation_decoder=True, batch_size=params["batch_size"],
-        sampler=MinInstanceSampler(min_num_instances=1), num_workers=params.get("num_workers", 0),
-    )
-    try:
-        train_loader = default_sam_loader(
-            raw_paths=data["train_images"], label_paths=data["train_labels"],
-            is_train=True, shuffle=True, n_samples=params.get("n_samples"), **common,
-        )
-        val_loader = default_sam_loader(
-            raw_paths=data["val_images"], label_paths=data["val_labels"],
-            is_train=False, shuffle=False, **common,
-        )
-        train_sam(
-            name=session_id, model_type=model_type,
-            train_loader=train_loader, val_loader=val_loader,
-            n_epochs=params["n_epochs"], n_objects_per_batch=params.get("n_objects_per_batch", 25),
-            with_segmentation_decoder=True, save_root=str(sdir),
-            device=device, lr=params["learning_rate"],
-        )
-        ok = checkpoint_path(session_id).exists()
-        write_status(session_id,
-                     status="COMPLETED" if ok else "FAILED",
-                     message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
-                     end_time=time.time())
-    except Exception as e:
-        write_status(session_id, status="FAILED", message=str(e)[:800],
-                     traceback=traceback.format_exc()[-2500:], end_time=time.time())
-        raise
-    finally:
-        # Release the training VRAM so an OOM (or completion) doesn't leave the
-        # shared GPU wedged for inference / the next session.
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+def read_training_params(session_id: str) -> Dict[str, Any]:
+    return json.loads(_params_path(session_id).read_text())
