@@ -19,7 +19,7 @@ Query the live set with `list_supported_models()`:
 
 - **`list_supported_models()`** Returns the bioimage.io ids this service accepts
   (currently `["idealistic-eagle"]`). Any other id passed to `infer` is rejected.
-- **`infer(model_id, inputs, sample_id="sample", flow_threshold=None, cellprob_threshold=None, min_size=None, return_flows=False, return_download_url=False)`**
+- **`infer(model_id, inputs, sample_id="sample", flow_threshold=None, cellprob_threshold=None, min_size=None, return_flows=False, two_pass=False, return_download_url=False)`**
   Submits an inference request and returns a `request_id` **immediately**. Poll
   `get_infer_status(request_id)` for progress and the result (same submit/poll
   contract as `model-runner`). `inputs` is a numpy array, a direct http(s) URL,
@@ -33,6 +33,11 @@ Query the live set with `list_supported_models()`:
     flow field (`{"flows": array}`, 3 channels = 2 flow components + cell
     probability) instead of instance masks. The overrides above do not apply in
     this mode.
+  - `two_pass=True` runs the model twice: the first pass maps the image to a raw
+    flow field (postprocessing skipped), and the second pass feeds that flow
+    field back through the model as input. The flow-dynamics postprocessing (with
+    any overrides) is applied on the second pass — unless `return_flows=True`, in
+    which case the raw second-pass flow field is returned instead.
   - `return_download_url=True` returns each output as a presigned S3 `.npy` URL
     (1-hour TTL) instead of the raw array.
 - **`get_infer_status(request_id)`** Poll an infer request: returns a progress dict

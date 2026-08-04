@@ -222,6 +222,7 @@ class Cellpose4Runner:
         sample_id: str,
         overrides: Dict[str, float],
         return_flows: bool,
+        two_pass: bool,
     ) -> Dict[str, np.ndarray]:
         """Load the model (reusing the resident pipeline when unchanged) and
         run the forward pass. Blocking — call via ``asyncio.to_thread`` while
@@ -287,6 +288,21 @@ class Cellpose4Runner:
         # op (which turns the stitched 3-channel flow+cellprob tensor into
         # instance labels), returning the raw flow field instead. It runs after
         # tile stitching, so skipping it yields a correctly stitched flow field.
+        if two_pass:
+            # First pass: image -> raw flow field, postprocessing skipped. Feed
+            # that 3-channel flow field back through the model as the input of
+            # the second pass, which carries the postprocessing (unless the
+            # caller wants the raw second-pass flow field via return_flows).
+            first = self._pipeline.predict_sample_with_blocking(
+                sample, skip_postprocessing=True
+            )
+            flow = next(iter(first.members.values())).data.data
+            sample = create_sample_for_model(
+                self._pipeline.model_description,
+                inputs=flow,
+                sample_id=sample_id,
+            )
+
         result = self._pipeline.predict_sample_with_blocking(
             sample, skip_postprocessing=return_flows
         )
@@ -384,6 +400,7 @@ class Cellpose4Runner:
         sample_id: str,
         overrides: Dict[str, float],
         return_flows: bool,
+        two_pass: bool,
         return_download_url: bool,
     ) -> None:
         """Background driver: wait for the GPU, run the forward pass, store the
@@ -402,6 +419,7 @@ class Cellpose4Runner:
                     sample_id,
                     overrides,
                     return_flows,
+                    two_pass,
                 )
             if return_download_url:
                 outputs = {
@@ -490,6 +508,15 @@ class Cellpose4Runner:
             "probability). The flow-dynamics overrides above do not apply in this "
             "mode.",
         ),
+        two_pass: bool = Field(
+            False,
+            description="If True, run the model twice: the first pass maps the "
+            "image to a raw flow field (postprocessing skipped) and the second "
+            "pass feeds that flow field back through the model as input. The "
+            "flow-dynamics postprocessing (with any overrides above) is applied "
+            "on the second pass — unless ``return_flows`` is True, in which case "
+            "the raw second-pass flow field is returned instead.",
+        ),
         return_download_url: bool = Field(
             False,
             description="If True, each output array is saved to a temporary .npy "
@@ -546,6 +573,7 @@ class Cellpose4Runner:
                 sample_id,
                 overrides,
                 return_flows,
+                two_pass,
                 return_download_url,
             )
         )
