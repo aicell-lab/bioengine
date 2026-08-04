@@ -268,3 +268,11 @@ def run_training_blocking(session_id: str, model_type: str, data: Dict[str, Any]
         write_status(session_id, status="FAILED", message=str(e)[:800],
                      traceback=traceback.format_exc()[-2500:], end_time=time.time())
         raise
+    finally:
+        # Release the training VRAM so an OOM (or completion) doesn't leave the
+        # shared GPU wedged for inference / the next session.
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

@@ -65,7 +65,7 @@ just-trained model — no export step needed. Fine-tuning **with the AIS decoder
 (`with_segmentation_decoder=True`) needs **dense** labels: annotate *all* objects
 in each training image.
 
-- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_b_lm", n_epochs=5, n_objects_per_batch=25, patch_size=512, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, label="")`**
+- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_b_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, label="")`**
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a

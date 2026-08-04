@@ -267,6 +267,20 @@ class MicroSAM:
             logger.info(f"✅ μSAM model '{label}' loaded.")
         return self._predictor, self._segmenter
 
+    def _release_model(self) -> None:
+        """Drop the resident model and free its VRAM (blocking; under gpu lock)."""
+        self._predictor = None
+        self._segmenter = None
+        self._loaded_key = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def _session_checkpoint(self, session_id: str) -> str:
         """Resolve a training session's ``best.pt``; raise if not yet available."""
         import training
@@ -635,6 +649,9 @@ class MicroSAM:
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
             )
+            # Free the resident inference model so training gets the whole shared GPU.
+            async with self._gpu_lock:
+                await asyncio.to_thread(self._release_model)
             loop = asyncio.get_running_loop()
             executor = ThreadPoolExecutor(max_workers=1)
             self._executors[session_id] = executor
@@ -677,7 +694,10 @@ class MicroSAM:
             "vit_b_lm", description="Base μSAM model to fine-tune (LM generalist for cells)."
         ),
         n_epochs: int = Field(5, description="Number of training epochs."),
-        n_objects_per_batch: int = Field(25, description="Objects sampled per batch."),
+        n_objects_per_batch: int = Field(
+            8, description="Objects sampled per batch — the main GPU-memory knob. "
+            "8 fits vit_b on a 24GB card; raise on larger GPUs.",
+        ),
         patch_size: int = Field(
             512, description="Square training patch side (clamped to the smallest image)."
         ),
