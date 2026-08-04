@@ -1,7 +1,7 @@
 name: micro-sam
 id: micro-sam
 id_emoji: "🔬"
-description: Serves micro-sam (μSAM) with one resident SAM encoder backing three consumers — image-embedding export, automatic instance segmentation (AIS decoder), and an ONNX interactive prompt decoder for in-browser box→mask annotation.
+description: Serves micro-sam (μSAM) with one resident SAM encoder backing image-embedding export, automatic instance segmentation (AIS decoder), and an ONNX interactive prompt decoder for in-browser box→mask annotation — plus in-app fine-tuning (train a μSAM model on annotated pairs and serve the just-trained checkpoint).
 documentation: README.md
 authors:
   - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
@@ -10,7 +10,7 @@ license: MIT
 format_version: 0.6.0
 git_repo: https://github.com/aicell-lab/bioengine
 links: []
-tags: [cell-segmentation, segment-anything, interactive-annotation, deep-learning, biomedical-imaging]
+tags: [cell-segmentation, segment-anything, interactive-annotation, fine-tuning, deep-learning, biomedical-imaging]
 type: ray-serve
-version: 0.1.2
+version: 0.2.0
 entry: deployment:MicroSAM

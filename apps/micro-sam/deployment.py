@@ -28,6 +28,7 @@ import gc
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -61,15 +62,18 @@ def _read_pip(name: str) -> List[str]:
 
 
 @bioengine.app(
-    num_cpus=1,
+    num_cpus=4,
     num_gpus=1,
-    memory_mb=16 * 1024,
+    memory_mb=24 * 1024,
     pip=_read_pip("requirements-deployment.txt"),
     max_ongoing_requests=10,
     autoscaling_config={
+        # Single replica: this app both serves and runs a long fine-tuning job
+        # (in a background thread on the same GPU), so a second replica would
+        # only duplicate the resident encoder without owning the training state.
         "min_replicas": 1,
         "initial_replicas": 1,
-        "max_replicas": 2,
+        "max_replicas": 1,
         "target_num_ongoing_requests_per_replica": 3.0,
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
@@ -96,7 +100,12 @@ class MicroSAM:
         self._predictor = None
         self._segmenter = None
         self._loaded_model_type: Optional[str] = None
+        self._loaded_key: Optional[tuple] = None
         self._onnx_cache: Dict[str, bytes] = {}
+
+        # Fine-tuning sessions: one background asyncio task + executor each.
+        self._training_tasks: Dict[str, asyncio.Task] = {}
+        self._executors: Dict[str, ThreadPoolExecutor] = {}
 
         self._hypha = None
         self._s3 = None
@@ -218,17 +227,20 @@ class MicroSAM:
             "_rdtype": arr.dtype.name,
         }
 
-    def _ensure_model(self, model_type: str, device: str):
+    def _ensure_model(self, model_type: str, device: str, checkpoint: Optional[str] = None):
         """Load (predictor, AIS segmenter), reusing the resident pair when the
-        model_type is unchanged; a switch frees the previous model's VRAM.
-        Blocking — call via ``asyncio.to_thread`` under ``self._gpu_lock``.
+        (model_type, checkpoint) is unchanged; a switch frees the previous
+        model's VRAM. ``checkpoint`` points at a fine-tuned ``best.pt`` to serve
+        a just-trained model. Blocking — call via ``asyncio.to_thread`` under
+        ``self._gpu_lock``.
         """
         from micro_sam.automatic_segmentation import get_predictor_and_segmenter
 
-        if model_type != self._loaded_model_type:
+        key = (model_type, checkpoint)
+        if key != self._loaded_key:
             self._predictor = None
             self._segmenter = None
-            self._loaded_model_type = None
+            self._loaded_key = None
             gc.collect()
             try:
                 import torch
@@ -238,9 +250,11 @@ class MicroSAM:
             except Exception:
                 pass
 
-            logger.info(f"🔄 Loading μSAM model '{model_type}' on {device}...")
+            label = f"{model_type}" + (f" (finetuned: {checkpoint})" if checkpoint else "")
+            logger.info(f"🔄 Loading μSAM model '{label}' on {device}...")
             predictor, segmenter = get_predictor_and_segmenter(
                 model_type=model_type,
+                checkpoint=checkpoint,
                 device=device,
                 # None → μSAM auto-selects AIS when the model ships a decoder
                 # (all *_lm models do), else AMG.
@@ -248,9 +262,22 @@ class MicroSAM:
             )
             self._predictor = predictor
             self._segmenter = segmenter
+            self._loaded_key = key
             self._loaded_model_type = model_type
-            logger.info(f"✅ μSAM model '{model_type}' loaded.")
+            logger.info(f"✅ μSAM model '{label}' loaded.")
         return self._predictor, self._segmenter
+
+    def _session_checkpoint(self, session_id: str) -> str:
+        """Resolve a training session's ``best.pt``; raise if not yet available."""
+        import training
+
+        ckpt = training.checkpoint_path(session_id)
+        if not ckpt.exists():
+            raise FileNotFoundError(
+                f"No trained checkpoint for session '{session_id}' "
+                "(best.pt not found — training may be unfinished or failed)."
+            )
+        return str(ckpt)
 
     # === Consumer 2: automatic instance segmentation (AIS decoder) ===
 
@@ -260,13 +287,14 @@ class MicroSAM:
         device: str,
         image: np.ndarray,
         generate_kwargs: Dict[str, Any],
+        checkpoint: Optional[str] = None,
     ) -> np.ndarray:
         """Run μSAM automatic instance segmentation → int32 [H,W] label mask.
         Blocking — call under the GPU lock.
         """
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
 
-        predictor, segmenter = self._ensure_model(model_type, device)
+        predictor, segmenter = self._ensure_model(model_type, device, checkpoint)
         image = self._to_image_format(image)
         labels = automatic_instance_segmentation(
             predictor=predictor,
@@ -322,6 +350,11 @@ class MicroSAM:
         enable_clahe: Optional[bool] = Field(
             None, description="Ignored; accepted for Cellpose-API compatibility."
         ),
+        session_id: Optional[str] = Field(
+            None,
+            description="If set, serve the fine-tuned model from this training "
+            "session's checkpoint instead of the pretrained model_type.",
+        ),
     ) -> List[Dict[str, Any]]:
         """Automatic μSAM instance segmentation (propose-and-prune pre-seg).
 
@@ -337,13 +370,15 @@ class MicroSAM:
         if min_size is not None:
             generate_kwargs["min_size"] = min_size
 
+        checkpoint = self._session_checkpoint(session_id) if session_id else None
         images = [await self._resolve_image(src) for src in input_arrays]
-        logger.info(f"🤖 μSAM AIS on {len(images)} image(s) with '{model_type}'...")
+        tag = f"session {session_id}" if session_id else model_type
+        logger.info(f"🤖 μSAM AIS on {len(images)} image(s) with '{tag}'...")
         results: List[Dict[str, Any]] = []
         async with self._gpu_lock:
             for image in images:
                 labels = await asyncio.to_thread(
-                    self._auto_segment, model_type, device, image, generate_kwargs
+                    self._auto_segment, model_type, device, image, generate_kwargs, checkpoint
                 )
                 results.append({"output": self._nd(labels)})
         return results
@@ -357,17 +392,23 @@ class MicroSAM:
         ),
         model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
         device: Literal["cuda", "cpu"] = Field("cuda", description="Compute device."),
+        session_id: Optional[str] = Field(
+            None, description="Serve a fine-tuned session checkpoint instead of model_type."
+        ),
     ) -> List[Dict[str, Any]]:
         """Single-image alias of ``infer`` — same ``[{"output": int32 [H,W]}]`` shape."""
-        return await self.infer(input_arrays=[inputs], model_type=model_type, device=device)
+        return await self.infer(
+            input_arrays=[inputs], model_type=model_type, device=device, session_id=session_id
+        )
 
     # === Consumer 1: image embedding (feeds the in-browser prompt decoder) ===
 
-    def _encode(self, model_type: str, device: str, image: np.ndarray) -> Dict[str, Any]:
+    def _encode(self, model_type: str, device: str, image: np.ndarray,
+                checkpoint: Optional[str] = None) -> Dict[str, Any]:
         """Run the SAM image encoder → embedding payload for onnxruntime-web.
         Blocking — call under the GPU lock.
         """
-        predictor, _ = self._ensure_model(model_type, device)
+        predictor, _ = self._ensure_model(model_type, device, checkpoint)
         image = self._to_image_format(image)
         original_image_shape = image.shape[:2]
         sam = predictor.model
@@ -405,6 +446,9 @@ class MicroSAM:
             ".npy in S3 and returned as 'features_url' (presigned, 1h) instead of the "
             "raw 'features' ndarray — for large batches / slow links.",
         ),
+        session_id: Optional[str] = Field(
+            None, description="Serve a fine-tuned session checkpoint instead of model_type."
+        ),
     ) -> Dict[str, Any]:
         """Run the resident encoder once and return its embedding.
 
@@ -413,14 +457,16 @@ class MicroSAM:
         sam_scale, mask_threshold}`` and, when ``output_mode='embedding+masks'``,
         an additional ``masks`` (int32 [H,W] instance label mask).
         """
+        checkpoint = self._session_checkpoint(session_id) if session_id else None
         image = await self._resolve_image(inputs)
-        logger.info(f"🧠 μSAM embedding ({output_mode}) with '{model_type}'...")
+        logger.info(f"🧠 μSAM embedding ({output_mode}) with "
+                    f"'{session_id or model_type}'...")
         labels = None
         async with self._gpu_lock:
-            payload = await asyncio.to_thread(self._encode, model_type, device, image)
+            payload = await asyncio.to_thread(self._encode, model_type, device, image, checkpoint)
             if output_mode == "embedding+masks":
                 labels = await asyncio.to_thread(
-                    self._auto_segment, model_type, device, image, {}
+                    self._auto_segment, model_type, device, image, {}, checkpoint
                 )
 
         features = payload.pop("features")
@@ -531,6 +577,175 @@ class MicroSAM:
             )
         self._onnx_cache[cache_key] = onnx_bytes
         return onnx_bytes
+
+    # === Fine-tuning (train + serve the just-trained model) ===
+
+    async def _resolve_label_array(
+        self, source: Union[np.ndarray, str], ref_shape: tuple
+    ) -> np.ndarray:
+        """Resolve a label source to a 2D instance-label array. GeoJSON polygon
+        annotations are rasterized against the paired image's shape.
+        """
+        import training
+
+        if isinstance(source, np.ndarray):
+            return source
+        if not isinstance(source, str):
+            return np.asarray(source)
+        ext = Path(source.split("?")[0]).suffix.lower()
+        if ext in (".geojson", ".json"):
+            url = source if source.startswith(("http://", "https://")) else (
+                await self._get_download_url(source)
+            )
+            resp = await self._http.get(url)
+            resp.raise_for_status()
+            h, w = int(ref_shape[0]), int(ref_shape[1])
+            return training.rasterize_geojson(resp.json(), width=w, height=h)
+        return await self._load_image_from_source(source)
+
+    async def _prepare_training_data(
+        self, session_id, train_images, train_labels, val_images, val_labels, params
+    ) -> Dict[str, Any]:
+        import training
+
+        if len(train_images) != len(train_labels):
+            raise ValueError("train_images and train_labels must have equal length.")
+
+        async def pairs(images, labels):
+            out = []
+            for img_src, lbl_src in zip(images, labels):
+                img = await self._resolve_image(img_src)
+                lbl = await self._resolve_label_array(lbl_src, np.asarray(img).shape[:2])
+                out.append((img, lbl))
+            return out
+
+        train = await pairs(train_images, train_labels)
+        val = await pairs(val_images, val_labels) if val_images and val_labels else None
+        return await asyncio.to_thread(
+            training.materialize_pairs, session_id, train, val,
+            params["val_fraction"], params["patch_shape"],
+        )
+
+    async def _run_training_session(
+        self, session_id, model_type, train_images, train_labels, val_images, val_labels, params
+    ) -> None:
+        import training
+
+        try:
+            data = await self._prepare_training_data(
+                session_id, train_images, train_labels, val_images, val_labels, params
+            )
+            loop = asyncio.get_running_loop()
+            executor = ThreadPoolExecutor(max_workers=1)
+            self._executors[session_id] = executor
+            await loop.run_in_executor(
+                executor, training.run_training_blocking, session_id, model_type, data, params
+            )
+        except asyncio.CancelledError:
+            training.write_status(session_id, status="STOPPED", message="training task cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Training session {session_id} failed: {e}")
+            training.write_status(session_id, status="FAILED", message=str(e)[:800])
+        finally:
+            ex = self._executors.pop(session_id, None)
+            if ex is not None:
+                ex.shutdown(wait=False)
+            self._training_tasks.pop(session_id, None)
+
+    @bioengine.method
+    async def start_training(
+        self,
+        train_images: List[Union[np.ndarray, str]] = Field(
+            ..., description="Training images: numpy arrays, http(s) URLs, or "
+            "get_upload_url file paths. Paired 1:1 with train_labels.",
+        ),
+        train_labels: List[Union[np.ndarray, str]] = Field(
+            ..., description="Dense instance-label masks paired with train_images. "
+            "Each is a numpy int mask, a .tif/.png/.npy label file, or a .geojson "
+            "FeatureCollection of polygons (rasterized to instances). AIS "
+            "fine-tuning needs DENSE labels — annotate all objects per image.",
+        ),
+        val_images: Optional[List[Union[np.ndarray, str]]] = Field(
+            None, description="Optional validation images; if omitted a val split "
+            "is taken from the training set (val_fraction).",
+        ),
+        val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
+            None, description="Validation labels paired with val_images."
+        ),
+        model_type: ModelType = Field(
+            "vit_b_lm", description="Base μSAM model to fine-tune (LM generalist for cells)."
+        ),
+        n_epochs: int = Field(5, description="Number of training epochs."),
+        n_objects_per_batch: int = Field(25, description="Objects sampled per batch."),
+        patch_size: int = Field(
+            512, description="Square training patch side (clamped to the smallest image)."
+        ),
+        batch_size: int = Field(1, description="Training batch size."),
+        learning_rate: float = Field(1e-5, description="AdamW learning rate."),
+        val_fraction: float = Field(
+            0.2, description="Fraction of train pairs used for validation when val is omitted."
+        ),
+        n_samples: Optional[int] = Field(
+            None, description="Patches sampled per epoch (auto if omitted)."
+        ),
+        label: str = Field("", description="Optional human-readable tag for this session."),
+    ) -> Dict[str, Any]:
+        """Start a μSAM fine-tuning session (with the AIS decoder) in the
+        background and return immediately with the session status (incl.
+        ``session_id``). Poll ``get_training_status`` and, once
+        ``checkpoint_available`` is true, serve it via ``infer(session_id=...)``.
+        """
+        import training
+
+        session_id = training.new_session_id()
+        training.write_status(
+            session_id, status="PREPARING", created_at=time.time(),
+            model_type=model_type, label=label, n_train_inputs=len(train_images),
+        )
+        params = dict(
+            n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,
+            batch_size=batch_size, learning_rate=learning_rate,
+            val_fraction=val_fraction, n_samples=n_samples,
+            patch_shape=(patch_size, patch_size), num_workers=0,
+        )
+        task = asyncio.create_task(self._run_training_session(
+            session_id, model_type, train_images, train_labels, val_images, val_labels, params
+        ))
+        self._training_tasks[session_id] = task
+        return training.get_status(session_id)
+
+    @bioengine.method
+    async def get_training_status(
+        self, session_id: str = Field(..., description="Session id from start_training.")
+    ) -> Dict[str, Any]:
+        """Return a fine-tuning session's status (PREPARING/TRAINING/COMPLETED/
+        FAILED/STOPPED), elapsed time, and whether its checkpoint is servable."""
+        import training
+
+        return training.get_status(session_id)
+
+    @bioengine.method
+    async def list_training_sessions(self) -> Dict[str, Any]:
+        """Return all fine-tuning sessions on this worker, keyed by session_id."""
+        import training
+
+        return training.list_sessions()
+
+    @bioengine.method
+    async def stop_training(
+        self, session_id: str = Field(..., description="Session id to stop.")
+    ) -> Dict[str, Any]:
+        """Request cancellation of a fine-tuning session. Note: an in-flight
+        training epoch may run to completion before the task unwinds."""
+        import training
+
+        training.request_stop(session_id)
+        task = self._training_tasks.get(session_id)
+        if task is not None and not task.done():
+            task.cancel()
+        training.write_status(session_id, status="STOPPED", message="stop requested by user")
+        return training.get_status(session_id)
 
     @bioengine.method
     async def ping(self) -> Dict[str, Union[str, float, None]]:

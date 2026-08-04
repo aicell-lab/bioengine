@@ -58,6 +58,36 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
   an input image.
 - **`ping()`** Status + the currently resident `model_type`.
 
+### Fine-tuning (train → serve)
+
+Retrain μSAM on your own annotated pairs (propose-and-prune labels) and serve the
+just-trained model — no export step needed. Fine-tuning **with the AIS decoder**
+(`with_segmentation_decoder=True`) needs **dense** labels: annotate *all* objects
+in each training image.
+
+- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_b_lm", n_epochs=5, n_objects_per_batch=25, patch_size=512, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, label="")`**
+  Starts a background fine-tuning session and returns immediately with the
+  status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
+  paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
+  `.geojson` FeatureCollection of polygons (rasterized to instances).
+- **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
+- **`list_training_sessions()`** → all sessions on this worker.
+- **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
+
+**Serve the just-trained model:** once `checkpoint_available` is true, pass
+`session_id` to any serving method — the fine-tuned checkpoint flows through the
+exact same path as the pretrained model:
+
+```python
+sid = (await svc.start_training(train_images=imgs, train_labels=lbls, n_epochs=10))["session_id"]
+# poll get_training_status(sid) until status == "COMPLETED"
+out = await svc.infer(input_arrays=[img], session_id=sid)          # AIS masks from the fine-tuned model
+emb = await svc.compute_image_embedding(inputs=img, session_id=sid) # embedding from the fine-tuned encoder
+```
+
+Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`. BioImage.IO
+export of a trained session is a planned follow-up.
+
 ## Interactive annotation loop (Option A — in-browser decode)
 
 ```
