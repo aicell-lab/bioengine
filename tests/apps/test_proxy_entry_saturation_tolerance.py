@@ -1,59 +1,155 @@
-"""Pin that ProxyDeployment's entry health check tolerates saturation.
+"""Pin that ProxyDeployment gates its Hypha service off the data plane.
 
-The proxy probes the entry in-band via ``check_health.remote()``. That call
-is routed through the entry's router and counts against its
-``max_ongoing_requests`` (default 10), so a saturated-but-healthy entry
-head-of-line-blocks the probe and the 3s ``wait_for`` fires. Treating that
-timeout as a health failure spuriously deregisters the Hypha service while
-the entry is merely busy.
+The proxy no longer probes the entry in-band via ``check_health.remote()`` —
+that call was routed through the entry's router and counted against its
+``max_ongoing_requests``, so a saturated-but-healthy entry head-of-line-blocked
+the probe. Instead the proxy reads every sibling deployment's RUNNING replica
+count out-of-band from the Serve controller (``serve.status()``), which a
+saturated app can neither block nor fail.
 
-The fix classifies the two outcomes distinctly: an ``asyncio.TimeoutError``
-is tolerated (entry busy, service stays registered), while any other raised
-exception — the entry crashed, or a ``depends_on`` dependency is down and
-its ``health_check`` raised — deregisters. Reading the entry's RUNNING
-count from ``serve.status()`` instead does NOT work here: Ray Serve keeps a
-health-check-failing replica at ``RUNNING`` (it is not evicted on a raised
-check_health within the health window), so an out-of-band count is blind to
-a ``depends_on`` outage. These tests pin the shape (check_health is
-Ray-Serve glue that is impractical to exercise standalone).
+The gate:
+
+* registers only once every sibling deployment has a RUNNING replica;
+* tolerates an "unknown" reading (``None``) — a controller mid-restart never
+  deregisters a healthy app;
+* deregisters when a sibling that was seen RUNNING drops to zero (the outage
+  stays visible in the app status via the down deployment itself, so the proxy
+  does not fail its own health);
+* saturation is a non-event: a busy replica is still ``RUNNING`` in
+  ``serve.status()``, so the count is unaffected.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
+
+import pytest
 
 from bioengine.apps import proxy_deployment as pd_module
 
-
-def _check_health_src() -> str:
-    return inspect.getsource(pd_module.ProxyDeployment.func_or_class.check_health)
+_ProxyCls = pd_module.ProxyDeployment.func_or_class
 
 
-def test_timeout_is_tolerated_not_deregistered() -> None:
-    """A saturation timeout must be caught separately and NOT deregister."""
-    src = _check_health_src()
-    assert "except asyncio.TimeoutError" in src, (
-        "check_health must catch asyncio.TimeoutError separately so a "
-        "saturated entry is not mistaken for an unhealthy one."
+class _WsService:
+    async def get_load(self):
+        return 0
+
+    async def get_num_pcs(self):
+        return 0
+
+
+class _Server:
+    async def echo(self, msg):
+        return msg
+
+    async def get_service(self, service_id):
+        return _WsService()
+
+
+class _Recorder:
+    def __init__(self):
+        self.called = False
+
+    async def __call__(self, *args, **kwargs):
+        self.called = True
+
+
+def _bare_proxy(**attrs):
+    inst = object.__new__(_ProxyCls)
+    inst.application_id = "app"
+    inst._own_deployment_name = "ProxyDeployment"
+    inst.entry_deployment_ready = False
+    inst._dep_seen_ready = {}
+    inst.server = None
+    inst.websocket_service_id = None
+    inst._registration_lock = asyncio.Lock()
+    inst._consecutive_ping_failures = 0
+    inst._deregister_services = _Recorder()
+    for key, value in attrs.items():
+        setattr(inst, key, value)
+    return inst
+
+
+def _stub_counts(value):
+    async def _counts(self=None):
+        return value
+
+    return _counts
+
+
+async def _run(inst):
+    await inst.check_health()
+
+
+@pytest.mark.asyncio
+async def test_saturation_does_not_deregister() -> None:
+    """A busy-but-RUNNING sibling keeps the service registered."""
+    inst = _bare_proxy(
+        entry_deployment_ready=True,
+        _dep_seen_ready={"EntryDeployment": True},
+        server=_Server(),
+        websocket_service_id="ws",
     )
-    timeout_block = src.split("except asyncio.TimeoutError", 1)[1].split(
-        "except Exception", 1
-    )[0]
-    assert "_deregister_services" not in timeout_block, (
-        "a saturation timeout must leave the Hypha service registered."
+    inst._sibling_running_counts = _stub_counts({"EntryDeployment": 1})
+    await _run(inst)
+    assert inst._deregister_services.called is False
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_does_not_deregister() -> None:
+    """A ``None`` reading (controller mid-restart) never deregisters."""
+    inst = _bare_proxy(
+        entry_deployment_ready=True,
+        _dep_seen_ready={"EntryDeployment": True},
+        server=_Server(),
+        websocket_service_id="ws",
     )
+    inst._sibling_running_counts = _stub_counts(None)
+    await _run(inst)
+    assert inst._deregister_services.called is False
 
 
-def test_raised_health_error_deregisters() -> None:
-    """A genuine health failure (crash / depends_on down) deregisters."""
-    src = _check_health_src()
-    error_block = src.split("except Exception", 1)[1]
-    assert "_deregister_services" in error_block
-    assert "raise RuntimeError" in error_block
+@pytest.mark.asyncio
+async def test_sibling_drop_deregisters() -> None:
+    """A sibling seen RUNNING that drops to zero deregisters the service."""
+    inst = _bare_proxy(
+        entry_deployment_ready=True,
+        _dep_seen_ready={"RuntimeDeployment": True},
+        server=_Server(),
+        websocket_service_id="ws",
+    )
+    inst._sibling_running_counts = _stub_counts({"RuntimeDeployment": 0})
+    await _run(inst)
+    assert inst._deregister_services.called is True
 
 
-def test_probe_stays_in_band() -> None:
-    """The in-band probe is what propagates the entry's raised health error
-    (incl. the depends_on gate) — an out-of-band serve.status() RUNNING count
-    is blind to it, so the probe must stay in-band."""
-    src = _check_health_src()
-    assert "entry_deployment_handle.check_health.remote" in src
+@pytest.mark.asyncio
+async def test_initial_gate_waits_for_all_running() -> None:
+    """The service registers only once every sibling is RUNNING."""
+    registered = _Recorder()
+    inst = _bare_proxy()
+    inst._register_services = registered
+
+    inst._sibling_running_counts = _stub_counts(
+        {"EntryDeployment": 1, "RuntimeDeployment": 0}
+    )
+    await _run(inst)
+    assert inst.entry_deployment_ready is False
+    assert registered.called is False
+
+    inst._sibling_running_counts = _stub_counts(
+        {"EntryDeployment": 1, "RuntimeDeployment": 1}
+    )
+    await _run(inst)
+    assert inst.entry_deployment_ready is True
+    assert registered.called is True
+
+
+def test_probe_is_off_the_data_plane() -> None:
+    """check_health must read sibling status out-of-band, never in-band."""
+    src = inspect.getsource(_ProxyCls.check_health)
+    assert "entry_deployment_handle.check_health.remote" not in src, (
+        "the entry health probe must not be issued in-band — it counts against "
+        "the entry's max_ongoing_requests and blocks under load."
+    )
+    assert "_sibling_running_counts" in src

@@ -43,7 +43,7 @@ def _setup_replica(instance: Any) -> None:
     if os.environ.get("BIOENGINE_DEBUG") == "1":
         logger.setLevel(logging.DEBUG)
 
-    _register_with_proxy_actor(logger)
+    _register_with_proxy_actor(instance, logger)
     _ensure_working_directory(logger)
     _purge_stale_app_modules(logger)
     _unmask_secret_env_vars()
@@ -67,8 +67,30 @@ def _setup_replica(instance: Any) -> None:
         instance._bioengine_app_name = None
 
 
-def _register_with_proxy_actor(logger: logging.Logger) -> None:
+def _baked_identity(cls: type) -> Dict[str, Optional[str]]:
+    """Artifact identity baked into the class at build time.
+
+    The baked value travels *with the code* (captured by pickle-by-value), so a
+    reused replica running stale in-memory code reports the stale identity even
+    though its runtime_env env var was refreshed — the signal the worker uses to
+    detect and force a real restart. Falls back to the env var only if the build
+    didn't bake the identity.
+    """
+    return {
+        "artifact_id": getattr(cls, "_bioengine_baked_artifact_id", None)
+        or os.environ.get("BIOENGINE_ARTIFACT_ID"),
+        "version": getattr(cls, "_bioengine_baked_version", None)
+        or os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
+        "code_hash": getattr(cls, "_bioengine_baked_code_hash", None),
+    }
+
+
+def _register_with_proxy_actor(instance: Any, logger: logging.Logger) -> None:
     """Register this replica with the worker's ``BioEngineProxyActor``.
+
+    Pushes the replica's baked artifact identity alongside its actor tracking
+    so the worker's status poll reads identity out-of-band instead of issuing an
+    in-band ``bioengine_runtime_version`` request per app.
 
     A best-effort call: if the actor isn't reachable (e.g. local unit test
     without a Ray cluster) we log and move on.
@@ -103,6 +125,7 @@ def _register_with_proxy_actor(logger: logging.Logger) -> None:
             deployment_name=replica_context.deployment,
             replica_id=replica_context.replica_tag,
             timezone=time.strftime("%Z"),
+            identity=_baked_identity(type(instance)),
         )
         logger.info(
             f"✅ Registered replica '{replica_context.replica_tag}' "
@@ -369,14 +392,7 @@ def _make_runtime_version(user_cls: type) -> Callable[..., Any]:
     """
 
     async def bioengine_runtime_version(self: Any) -> Dict[str, Optional[str]]:
-        cls = type(self)
-        return {
-            "artifact_id": getattr(cls, "_bioengine_baked_artifact_id", None)
-            or os.environ.get("BIOENGINE_ARTIFACT_ID"),
-            "version": getattr(cls, "_bioengine_baked_version", None)
-            or os.environ.get("BIOENGINE_ARTIFACT_VERSION"),
-            "code_hash": getattr(cls, "_bioengine_baked_code_hash", None),
-        }
+        return _baked_identity(type(self))
 
     return bioengine_runtime_version
 
