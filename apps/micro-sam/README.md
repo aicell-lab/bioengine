@@ -52,24 +52,36 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
 
 ## Methods
 
-- **`infer(input_arrays, model_type="vit_b_lm", min_size=None, session_id=None)`**
+- **`infer(input_arrays=None, embeddings=None, model_type="vit_b_lm", min_size=None, session_id=None)`**
   Automatic μSAM instance segmentation (propose-and-prune). Returns a **bare
   list**, one item per input, each `{"output": <int32 [H,W] instance label
-  mask>}` (bg 0, one positive int per object). `input_arrays` items are numpy
-  arrays (HxW, HxWx3, or 3xHxW), http(s) URLs, or `get_upload_url` file paths.
-  `min_size` drops smaller objects. `session_id` serves a fine-tuned checkpoint.
-- **`compute_embedding(inputs, model_type="vit_b_lm", return_masks=False, return_features_url=False, session_id=None)`**
+  mask>}` (bg 0, one positive int per object). Pass **`input_arrays`** (numpy
+  arrays HxW/HxWx3/3xHxW, http(s) URLs, or `get_upload_url` file paths) **or**
+  **`embeddings`** — a list of precomputed embeddings (an `embedding_url` from
+  `compute_embedding(return_url=True)`, or a `compute_embedding` result dict).
+  With `embeddings` the AIS decoder runs on the stored embedding **without
+  re-encoding** (the model is inferred from the embedding). `min_size` drops
+  smaller objects. `session_id` serves a fine-tuned checkpoint.
+- **`compute_embedding(inputs, model_type="vit_b_lm", return_url=False, embedding_upload_url=None, session_id=None)`**
   Run the resident encoder once. Returns `{features (1,256,64,64) f32,
-  original_image_shape [H,W], sam_scale, mask_threshold}`. With
-  `return_masks=True` also returns `masks` (int32 [H,W]). With
-  `return_features_url=True` the 4MB `features` come back as a presigned `.npy`
-  URL (`features_url`) instead of raw — for large batches / slow links.
+  original_image_shape [H,W], input_size [h,w], sam_scale, mask_threshold,
+  model_type}`. With `return_url=True` the embedding is saved as a
+  self-contained `.npz` in a temporary S3 file and returned as `embedding_url`
+  (feed straight to `infer(embeddings=[…])`). With `embedding_upload_url` (a
+  presigned PUT URL from `get_upload_url('.npz')`) the `.npz` is stored at your
+  own URL instead — you keep the matching download URL for `infer`.
 - **`get_onnx_model(model_type="vit_b_lm", quantize=True)`**
   The interactive prompt decoder as ONNX bytes (cached per model). Fetch once
   per session, run with `onnxruntime-web`, decode each box locally using the
   `compute_embedding` features.
 - **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
-  an input image.
+  an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
+
+**Embedding reuse (Leg B).** Encode once, reuse the embedding for both the
+in-browser interactive decoder and automatic segmentation without a second
+encoder pass:
+`image → get_upload_url → compute_embedding(return_url=True) → embedding_url →
+infer(embeddings=[embedding_url]) → mask`.
 
 > `device` is chosen internally (CUDA, CPU fallback) — not an API parameter.
 

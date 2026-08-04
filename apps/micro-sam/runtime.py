@@ -212,13 +212,33 @@ class RuntimeApp:
         predictor.reset_image()
         predictor.set_image(image)
         features = predictor.get_image_embedding().cpu().numpy()
+        input_size = [int(x) for x in predictor.input_size]
         predictor.reset_image()
         return {
             "features": features.astype(np.float32),
             "original_image_shape": [int(x) for x in original_image_shape],
+            "input_size": input_size,
             "sam_scale": float(sam_scale),
             "mask_threshold": float(sam.mask_threshold),
         }
+
+    def _auto_segment_from_embedding(self, model_type, features, input_size, original_size,
+                                     generate_kwargs, checkpoint):
+        """Run the AIS decoder on a **precomputed** SAM embedding (no encoder pass).
+        Blocking — call under the GPU lock. For the AIS (``*_lm``) models; matches
+        the image path, where ``generate`` returns the instance-label array directly.
+        """
+        _, segmenter = self._ensure_model(model_type, checkpoint)
+        image_embeddings = {
+            "features": np.asarray(features).astype(np.float32),
+            "input_size": tuple(int(x) for x in input_size),
+            "original_size": tuple(int(x) for x in original_size),
+        }
+        # image is unused when image_embeddings is provided (initialize only
+        # encodes when embeddings are None).
+        segmenter.initialize(image=None, image_embeddings=image_embeddings)
+        instances = segmenter.generate(**generate_kwargs)
+        return np.asarray(instances).astype(np.int32)
 
     def _export_onnx(self, model_type: str, quantize: bool) -> bytes:
         """Export the lightweight SAM prompt decoder to ONNX bytes. Blocking."""
@@ -298,20 +318,36 @@ class RuntimeApp:
                 results.append({"output": self._nd(labels)})
         return results
 
+    async def auto_segment_from_embedding(
+        self, embeddings: List[Dict[str, Any]], model_type: str = "vit_b_lm",
+        generate_kwargs: Optional[Dict[str, Any]] = None, checkpoint: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """AIS masks for a batch of precomputed embeddings (each a dict with
+        ``features``/``input_size``/``original_size``) → wire-dict list.
+        """
+        generate_kwargs = generate_kwargs or {}
+        results: List[Dict[str, Any]] = []
+        async with self._gpu_lock:
+            for emb in embeddings:
+                labels = await asyncio.to_thread(
+                    self._auto_segment_from_embedding, model_type,
+                    emb["features"], emb["input_size"], emb["original_size"],
+                    generate_kwargs, checkpoint,
+                )
+                results.append({"output": self._nd(labels)})
+        return results
+
     async def encode(
         self, image: np.ndarray, model_type: str = "vit_b_lm",
-        checkpoint: Optional[str] = None, return_masks: bool = False,
+        checkpoint: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Encoder embedding (+ optional AIS masks). ``features`` and ``masks``
-        come back as wire-dicts; the entry reconstructs/forwards them.
+        """Encoder embedding. ``features`` comes back as a wire-dict (the entry
+        reconstructs/forwards it); ``input_size``/``original_image_shape``/
+        ``sam_scale``/``mask_threshold`` describe it for the ONNX decoder and for
+        running AIS on it later via ``infer(embeddings=...)``.
         """
         async with self._gpu_lock:
             payload = await asyncio.to_thread(self._encode, model_type, image, checkpoint)
-            if return_masks:
-                labels = await asyncio.to_thread(
-                    self._auto_segment, model_type, image, {}, checkpoint
-                )
-                payload["masks"] = self._nd(labels)
         payload["features"] = self._nd(payload["features"])
         return payload
 

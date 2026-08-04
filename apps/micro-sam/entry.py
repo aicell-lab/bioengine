@@ -32,6 +32,7 @@ logger = bioengine.logger
 
 SERVER_URL = "https://hypha.aicell.io"
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
+UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal["vit_b_lm", "vit_l_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h"]
 
 
@@ -104,13 +105,14 @@ class EntryApp:
     @bioengine.method
     async def get_upload_url(
         self,
-        file_type: SUPPORTED_FILE_TYPES = Field(
+        file_type: UPLOAD_FILE_TYPES = Field(
             ...,
             description='File type for the upload: ".npy" (NumPy array), ".png", '
-            '".tiff"/".tif", or ".jpeg"/".jpg".',
+            '".tiff"/".tif", ".jpeg"/".jpg", or ".npz" (a compute_embedding bundle '
+            "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL (1-hour TTL) for staging an input image."""
+        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -171,6 +173,54 @@ class EntryApp:
         await self._http.put(info["upload_url"], content=buffer.getvalue())
         return await self._get_download_url(info["file_path"])
 
+    @staticmethod
+    def _embedding_npz_bytes(features, input_size, original_size, model_type) -> bytes:
+        buffer = BytesIO()
+        np.savez(
+            buffer, features=np.asarray(features),
+            input_size=np.asarray(input_size), original_size=np.asarray(original_size),
+            model_type=str(model_type),
+        )
+        return buffer.getvalue()
+
+    async def _put_temp_embedding(self, content: bytes) -> str:
+        file_path = f"temp/{uuid.uuid4()}.npz"
+        upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
+        await self._http.put(upload_url, content=content)
+        return await self._get_download_url(file_path)
+
+    async def _resolve_embedding(self, e: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """Resolve an infer ``embeddings`` item to ``{features, input_size,
+        original_size, model_type}``. Accepts an embedding_url (.npz from
+        compute_embedding) or an inline compute_embedding result dict.
+        """
+        if isinstance(e, str):
+            url = e if e.startswith(("http://", "https://")) else await self._get_download_url(e)
+            resp = await self._http.get(url)
+            resp.raise_for_status()
+            data = await asyncio.to_thread(np.load, BytesIO(resp.content), allow_pickle=False)
+            return {
+                "features": np.asarray(data["features"]),
+                "input_size": [int(x) for x in np.asarray(data["input_size"]).tolist()],
+                "original_size": [int(x) for x in np.asarray(data["original_size"]).tolist()],
+                "model_type": str(data["model_type"]),
+            }
+        if isinstance(e, dict):
+            original_size = e.get("original_image_shape") or e.get("original_size")
+            input_size = e.get("input_size")
+            if input_size is None:
+                scale = float(e["sam_scale"])
+                input_size = [round(original_size[0] * scale), round(original_size[1] * scale)]
+            return {
+                "features": np.asarray(e["features"]),
+                "input_size": [int(x) for x in input_size],
+                "original_size": [int(x) for x in original_size],
+                "model_type": e.get("model_type"),
+            }
+        raise ValueError(
+            "embeddings items must be an embedding_url (str) or a compute_embedding dict."
+        )
+
     def _session_checkpoint(self, session_id: str) -> str:
         import training
 
@@ -187,16 +237,23 @@ class EntryApp:
     @bioengine.method
     async def infer(
         self,
-        input_arrays: List[Union[np.ndarray, str]] = Field(
-            ...,
-            description="List of input images. Each is a numpy array (HxW, HxWx3, "
-            "or 3xHxW), an http(s) URL, or a get_upload_url file path. Cellpose "
-            "drop-in shape: a list of [3,H,W] uint8 RGB ndarrays.",
+        input_arrays: Optional[List[Union[np.ndarray, str]]] = Field(
+            None,
+            description="List of input images (numpy HxW/HxWx3/3xHxW, an http(s) URL, "
+            "or a get_upload_url file path). Provide this OR embeddings.",
+        ),
+        embeddings: Optional[List[Union[str, Dict[str, Any]]]] = Field(
+            None,
+            description="Run AIS on precomputed embeddings instead of images (skips "
+            "the encoder). Each item is an embedding_url from "
+            "compute_embedding(return_url=True), or a compute_embedding result dict. "
+            "Provide this OR input_arrays.",
         ),
         model_type: ModelType = Field(
             "vit_b_lm",
-            description="μSAM model. LM generalists (vit_b_lm / vit_l_lm / "
-            "vit_t_lm) carry the AIS decoder and suit brightfield/fluorescence cells.",
+            description="μSAM model. LM generalists (vit_b_lm / vit_l_lm / vit_t_lm) "
+            "carry the AIS decoder. For embeddings, the model must match the one that "
+            "produced them (inferred from the embedding when available).",
         ),
         min_size: Optional[int] = Field(
             None, description="Minimum object size in pixels (smaller objects dropped)."
@@ -206,14 +263,24 @@ class EntryApp:
         ),
     ) -> List[Dict[str, Any]]:
         """Automatic μSAM instance segmentation. Returns a bare list, one item per
-        input, each ``{"output": <int32 [H,W] instance label mask>}`` (background
-        0, one positive integer per object).
+        input, each ``{"output": <int32 [H,W] instance label mask>}``. Pass
+        ``input_arrays`` (images) OR ``embeddings`` (precomputed — runs the AIS
+        decoder on the embedding without re-encoding).
         """
         await self._check_runtime_available()
+        if (input_arrays is None) == (embeddings is None):
+            raise ValueError("Provide exactly one of 'input_arrays' or 'embeddings'.")
         generate_kwargs: Dict[str, Any] = {}
         if min_size is not None:
             generate_kwargs["min_size"] = min_size
         checkpoint = self._session_checkpoint(session_id) if session_id else None
+        if embeddings is not None:
+            embs = [await self._resolve_embedding(e) for e in embeddings]
+            emb_model = next((e["model_type"] for e in embs if e.get("model_type")), None)
+            return await self.runtime.auto_segment_from_embedding(
+                embeddings=embs, model_type=emb_model or model_type,
+                generate_kwargs=generate_kwargs, checkpoint=checkpoint,
+            )
         images = [await self._resolve_image(src) for src in input_arrays]
         return await self.runtime.auto_segment(
             images=images, model_type=model_type,
@@ -225,34 +292,44 @@ class EntryApp:
         self,
         inputs: Union[np.ndarray, str] = Field(..., description="A single input image."),
         model_type: ModelType = Field("vit_b_lm", description="μSAM model."),
-        return_masks: bool = Field(
+        return_url: bool = Field(
             False,
-            description="If True, also run the AIS decoder and return the automatic "
-            "instance ``masks`` alongside the embedding.",
+            description="If True, save the embedding as a self-contained .npz in a "
+            "temporary S3 file and return its download URL as 'embedding_url' (feed it "
+            "to infer(embeddings=[...])) instead of the inline 'features' ndarray.",
         ),
-        return_features_url: bool = Field(
-            False,
-            description="If True, the 4MB features are saved to a temporary .npy in S3 "
-            "and returned as 'features_url' instead of the raw 'features' ndarray.",
+        embedding_upload_url: Optional[str] = Field(
+            None,
+            description="Presigned PUT URL (from get_upload_url('.npz')) to store the "
+            "embedding .npz at, instead of a temporary S3 file. You keep the matching "
+            "download URL to pass to infer(embeddings=[...]).",
         ),
         session_id: Optional[str] = Field(None, description="Serve a fine-tuned session checkpoint."),
     ) -> Dict[str, Any]:
-        """Run the encoder once and return its embedding (for the in-browser ONNX
-        prompt decoder): ``{features | features_url, original_image_shape,
-        sam_scale, mask_threshold}``, plus the automatic AIS ``masks`` when
-        ``return_masks``.
+        """Run the encoder once and return its embedding: ``{features |
+        embedding_url, original_image_shape, input_size, sam_scale, mask_threshold,
+        model_type}``. The embedding feeds the in-browser ONNX prompt decoder and can
+        be passed to ``infer(embeddings=[...])`` to run AIS without re-encoding. With
+        ``embedding_upload_url`` the .npz is PUT to your URL and ``features`` is
+        dropped from the return.
         """
         await self._check_runtime_available()
         checkpoint = self._session_checkpoint(session_id) if session_id else None
         image = await self._resolve_image(inputs)
         payload = await self.runtime.encode(
-            image=image, model_type=model_type,
-            checkpoint=checkpoint, return_masks=return_masks,
+            image=image, model_type=model_type, checkpoint=checkpoint,
         )
-        if return_features_url:
+        payload["model_type"] = model_type
+        if embedding_upload_url or return_url:
             feat = payload.pop("features")
             arr = np.frombuffer(feat["_rvalue"], dtype=feat["_rdtype"]).reshape(feat["_rshape"])
-            payload["features_url"] = await self._save_npy_to_temp(arr)
+            bundle = self._embedding_npz_bytes(
+                arr, payload["input_size"], payload["original_image_shape"], model_type
+            )
+            if embedding_upload_url:
+                await self._http.put(embedding_upload_url, content=bundle)
+            else:
+                payload["embedding_url"] = await self._put_temp_embedding(bundle)
         return payload
 
     @bioengine.method
