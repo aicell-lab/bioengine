@@ -5,6 +5,11 @@ RDF validation, end-to-end model testing, and inference. It delegates the
 GPU-bound work (``predict`` and the heavy ``bioimageio.core.test_model``
 call) to :class:`runtime.RuntimeDeployment` via the v0.6 type-hint composition.
 
+The GPU runtime ships Cellpose-3 and cannot run Cellpose-4 models
+(Cellpose-SAM / Cellpose-DINO). Deploy the ``bioimage-io/cellpose4-runner``
+app for those and call its ``list_supported_models()`` for the currently
+accepted model ids.
+
 Heavier helper modules:
 
 * :mod:`model_cache.cache` — LRU cache of downloaded bioimage.io model
@@ -1659,6 +1664,10 @@ class EntryDeployment:
         Search for models in the bioimage.io collection.
 
         Returns a list of model identifiers with their descriptions that match the search query.
+
+        Cellpose-4 models (Cellpose-SAM / Cellpose-DINO) are served by the
+        ``bioimage-io/cellpose4-runner`` app, not this runner; query that
+        app's ``list_supported_models()`` for its current accepted ids.
         """
         logger.info(f"🔍 Searching models with keywords={keywords}, limit={limit}")
         collection_id = "bioimage-io/bioimage.io"
@@ -2721,6 +2730,11 @@ class EntryDeployment:
     ) -> str:
         """
         Submit an inference request and return a ``request_id`` immediately.
+
+        Cellpose-4 models (Cellpose-SAM / Cellpose-DINO) are not supported
+        here — this runner's runtime ships Cellpose-3. Run them via the
+        ``bioimage-io/cellpose4-runner`` app instead and call its
+        ``list_supported_models()`` for the currently accepted model ids.
 
         The call resolves URL / S3-path inputs to numpy arrays, spills
         them to disk under ``$HOME/.model-runner-inference/<request_id>/input/``
