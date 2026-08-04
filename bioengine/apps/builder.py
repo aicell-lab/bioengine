@@ -71,6 +71,14 @@ _DOWNLOAD_TOKEN_TTL_SECONDS = 3600 * 24 * 30
 #: replicas share one GPU on a cluster that advertises real per-node VRAM.
 _GPU_HANDLE_EPSILON = 0.01
 
+#: Fraction-fallback sizing (no ``VRAM_MB`` advertised): round the derived
+#: ``num_gpus`` to this many decimals for clean, predictable packing, and clamp
+#: a request up to ``_GPU_FRACTION_GRACE`` over a whole GPU to 1.0 rather than
+#: rejecting it — a "16 GB" card typically reports ~15360 MB, so a literal
+#: ``gpu_memory_mb=16384`` would otherwise fail to deploy.
+_GPU_FRACTION_DECIMALS = 2
+_GPU_FRACTION_GRACE = 0.1
+
 
 class AppBuilder:
     """Build BioEngine apps from artifact storage for Ray Serve.
@@ -461,7 +469,14 @@ class AppBuilder:
                 opts["num_gpus"] = _GPU_HANDLE_EPSILON
                 opts.setdefault("resources", {})["VRAM_MB"] = int(gmb)
             elif min_gpu_mb:
-                opts["num_gpus"] = min(1.0, int(gmb) / min_gpu_mb)
+                fraction = round(int(gmb) / min_gpu_mb, _GPU_FRACTION_DECIMALS)
+                if fraction > 1.0 + _GPU_FRACTION_GRACE:
+                    raise BioEngineUserError(
+                        f"gpu_memory_mb={gmb} does not fit the smallest GPU on "
+                        f"the cluster ({min_gpu_mb} MB). Reduce gpu_memory_mb or "
+                        f"deploy on a cluster with a larger GPU."
+                    )
+                opts["num_gpus"] = min(1.0, fraction)
             else:
                 opts["num_gpus"] = 1.0
                 logger.warning(
