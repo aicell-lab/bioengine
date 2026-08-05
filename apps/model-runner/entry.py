@@ -306,11 +306,9 @@ class EntryDeployment:
 
     # === Ray Serve Health Check Method - will be called periodically to check the health of the deployment ===
 
-    @bioengine.health_check(depends_on=["RuntimeDeployment"])
+    @bioengine.health_check
     async def _health_check(self) -> None:
         # Hypha connectivity: a failure here means we cannot serve at all.
-        # depends_on additionally deregisters the app once RuntimeDeployment,
-        # having come up, later loses every RUNNING replica.
         await self.hypha_client.echo("ping")
 
     # === Internal Helper Methods ===
