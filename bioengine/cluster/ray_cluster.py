@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -688,6 +689,38 @@ class RayCluster:
             f"container GPU LD_LIBRARY_PATH={ld_dir}"
         )
 
+    def _detect_gpu_vram_mb(self) -> Optional[int]:
+        """Return the managed GPU's VRAM in MB via nvidia-smi, or None.
+
+        Only meaningful for a single-GPU head, where node-level ``VRAM_MB``
+        equals the device's VRAM (the caller gates on that). Honours
+        ``CUDA_VISIBLE_DEVICES`` so a worker pinned to a subset sees only the
+        GPUs Ray manages. Returns None — deferring to the deploy-time fraction
+        path, which reads the real managed GPU from the Ray dashboard — when
+        nvidia-smi is unavailable or the visible GPUs differ in size (we can't
+        tell which one Ray picked, so advertising either is unsafe).
+        """
+        query = [
+            "nvidia-smi",
+            "--query-gpu=memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible:
+            query.append(f"--id={visible}")
+        try:
+            result = subprocess.run(
+                query, capture_output=True, text=True, timeout=15
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        mems = [int(float(l)) for l in result.stdout.splitlines() if l.strip()]
+        if not mems or len(set(mems)) != 1:
+            return None
+        return mems[0]
+
     async def _start_cluster(self) -> None:
         """Start Ray cluster head node with configured ports and resources.
 
@@ -749,6 +782,16 @@ class RayCluster:
             if self.ray_cluster_config["head_memory_in_gb"] is not None:
                 memory_limit = self.ray_cluster_config["head_memory_in_gb"] * 1024**3
                 args.append(f"--memory={memory_limit}")
+
+            # Advertise real VRAM as a custom resource so apps declaring
+            # gpu_memory_mb pack by memory. Only for a single-GPU head, where
+            # the node-level VRAM_MB equals the device's VRAM; multi-GPU heads
+            # fall through to the deploy-time fraction path, which Ray's
+            # fractional GPU scheduler spreads across devices correctly.
+            if self.ray_cluster_config["head_num_gpus"] == 1:
+                vram_mb = await asyncio.to_thread(self._detect_gpu_vram_mb)
+                if vram_mb:
+                    args.append(f"--resources={json.dumps({'VRAM_MB': vram_mb})}")
 
             # Prevent logging of Redis password in debug logs
             censored_args = [

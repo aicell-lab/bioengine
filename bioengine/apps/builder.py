@@ -65,6 +65,20 @@ from bioengine.utils import (
 #: token (anonymous read).
 _DOWNLOAD_TOKEN_TTL_SECONDS = 3600 * 24 * 30
 
+#: Tiny GPU reservation used only to bind a physical device (and populate
+#: ``CUDA_VISIBLE_DEVICES``) when packing is driven by the ``VRAM_MB`` custom
+#: resource. The ``VRAM_MB`` reservation — not this fraction — bounds how many
+#: replicas share one GPU on a cluster that advertises real per-node VRAM.
+_GPU_HANDLE_EPSILON = 0.01
+
+#: Fraction-fallback sizing (no ``VRAM_MB`` advertised): round the derived
+#: ``num_gpus`` to this many decimals for clean, predictable packing, and clamp
+#: a request up to ``_GPU_FRACTION_GRACE`` over a whole GPU to 1.0 rather than
+#: rejecting it — a "16 GB" card typically reports ~15360 MB, so a literal
+#: ``gpu_memory_mb=16384`` would otherwise fail to deploy.
+_GPU_FRACTION_DECIMALS = 2
+_GPU_FRACTION_GRACE = 0.1
+
 
 class AppBuilder:
     """Build BioEngine apps from artifact storage for Ray Serve.
@@ -369,12 +383,20 @@ class AppBuilder:
     def _sum_resources(
         spec: Dict[str, Any], proxy_memory_in_gb: float
     ) -> Dict[str, int]:
-        totals: Dict[str, Union[int, float]] = {"num_cpus": 0, "num_gpus": 0, "memory": 0}
+        totals: Dict[str, Union[int, float]] = {
+            "num_cpus": 0,
+            "num_gpus": 0,
+            "memory": 0,
+            "VRAM_MB": 0,
+        }
         for meta in spec["classes"].values():
             opts = meta.get("ray_actor_options", {})
             totals["num_cpus"] += opts.get("num_cpus", 0)
             totals["num_gpus"] += opts.get("num_gpus", 0)
             totals["memory"] += opts.get("memory", 0)
+            # VRAM-based packing carries GPU demand as a custom resource with a
+            # near-zero num_gpus, so sum it separately for the SLURM autoscaler.
+            totals["VRAM_MB"] += (opts.get("resources") or {}).get("VRAM_MB", 0)
         # ProxyDeployment overhead — CPU/GPU come from the decorator;
         # memory reservation is the deploy-time ``proxy_memory_in_gb``.
         proxy_opts = getattr(ProxyDeployment, "ray_actor_options", {}) or {}
@@ -382,6 +404,92 @@ class AppBuilder:
         totals["num_gpus"] += proxy_opts.get("num_gpus", 0)
         totals["memory"] += int(proxy_memory_in_gb * (1024**3))
         return {k: int(v) if isinstance(v, (int, float)) else v for k, v in totals.items()}
+
+    async def _get_cluster_gpu_sizing(self) -> Dict[str, Any]:
+        """Ask the proxy actor how to size GPU reservations on this cluster.
+
+        Returns ``{"vram_resource_advertised": bool, "min_gpu_total_mb":
+        Optional[int]}``. Falls back to a "nothing known" answer (whole-GPU
+        reservation downstream) if the proxy is unreachable or has no GPU view
+        yet — safer than guessing a fraction from stale data.
+        """
+        default = {"vram_resource_advertised": False, "min_gpu_total_mb": None}
+        if not self.proxy_actor_name:
+            return default
+        try:
+            proxy = ray.get_actor(name=self.proxy_actor_name, namespace="bioengine")
+            return await asyncio.to_thread(
+                ray.get, proxy.get_gpu_memory_sizing.remote()
+            )
+        except Exception:
+            self.logger.warning(
+                "Could not query cluster GPU sizing from the proxy actor; "
+                "GPU apps will reserve a whole GPU each.",
+                exc_info=True,
+            )
+            return default
+
+    @staticmethod
+    def _apply_gpu_memory(
+        spec: Dict[str, Any],
+        disable_gpu: bool,
+        gpu_sizing: Dict[str, Any],
+        logger: logging.Logger,
+    ) -> None:
+        """Translate each class's ``gpu_memory_mb`` into a Ray GPU reservation.
+
+        The decorator records the VRAM requirement but leaves the reservation
+        to deploy time, where the target cluster's GPUs are known. Hybrid:
+        when the cluster advertises a ``VRAM_MB`` custom resource, request it
+        and let Ray pack by real memory (a tiny ``num_gpus`` only binds a
+        device); otherwise derive a safe fraction from the smallest GPU so the
+        replica fits on any node.
+        """
+        vram_advertised = bool(gpu_sizing.get("vram_resource_advertised"))
+        min_gpu_mb = gpu_sizing.get("min_gpu_total_mb")
+
+        for meta in spec["classes"].values():
+            opts = meta.setdefault("ray_actor_options", {})
+            gmb = meta.get("gpu_memory_mb")
+
+            # The worker is the sole authority on the GPU reservation; clear any
+            # residual so re-derivation is idempotent.
+            opts.pop("num_gpus", None)
+            resources = opts.get("resources")
+            if isinstance(resources, dict):
+                resources.pop("VRAM_MB", None)
+                if not resources:
+                    opts.pop("resources", None)
+
+            if disable_gpu or not gmb:
+                opts["num_gpus"] = 0
+                continue
+
+            # -1 is the portable "whole GPU": book the entire device on any
+            # node regardless of its VRAM, so it never joins VRAM_MB packing.
+            if gmb == -1:
+                opts["num_gpus"] = 1.0
+                continue
+
+            if vram_advertised:
+                opts["num_gpus"] = _GPU_HANDLE_EPSILON
+                opts.setdefault("resources", {})["VRAM_MB"] = int(gmb)
+            elif min_gpu_mb:
+                fraction = round(int(gmb) / min_gpu_mb, _GPU_FRACTION_DECIMALS)
+                if fraction > 1.0 + _GPU_FRACTION_GRACE:
+                    raise BioEngineUserError(
+                        f"gpu_memory_mb={gmb} does not fit the smallest GPU on "
+                        f"the cluster ({min_gpu_mb} MB). Reduce gpu_memory_mb or "
+                        f"deploy on a cluster with a larger GPU."
+                    )
+                opts["num_gpus"] = min(1.0, fraction)
+            else:
+                opts["num_gpus"] = 1.0
+                logger.warning(
+                    "No GPU VRAM visible on the cluster yet; app requesting "
+                    "%s MB will reserve a whole GPU until a GPU node reports in.",
+                    gmb,
+                )
 
     # ────────────────────────── auth resolution ──────────────────────────
 
@@ -558,12 +666,10 @@ class AppBuilder:
         translated_kwargs = self._translate_kwargs_keys(spec, application_kwargs)
         validate_kwargs_against_spec(spec, translated_kwargs)
 
-        # 5. Resource totals and disable_gpu override.
-        if disable_gpu:
-            for meta in spec["classes"].values():
-                opts = meta.get("ray_actor_options", {})
-                if opts.get("num_gpus"):
-                    opts["num_gpus"] = 0
+        # 5. Derive GPU reservations from each class's gpu_memory_mb (honouring
+        # disable_gpu), then sum resource totals.
+        gpu_sizing = await self._get_cluster_gpu_sizing()
+        self._apply_gpu_memory(spec, disable_gpu, gpu_sizing, self.logger)
         required_resources = self._sum_resources(spec, proxy_memory_in_gb)
 
         # 6. Generate the proxy service token.

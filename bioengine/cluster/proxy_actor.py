@@ -147,6 +147,14 @@ class BioEngineProxyActor:
 
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
+        # Last successful per-node GPU memory read from the Ray dashboard. The
+        # dashboard sits behind a KubeRay auth proxy where a cold one-shot fetch
+        # can time out; a single miss must not erase the cluster's (static) GPU
+        # capacity, which get_gpu_memory_sizing() needs at deploy time. The
+        # frequently-polled status path keeps this warm, so a deploy-time sizing
+        # read reuses the last good snapshot instead of a fresh cold fetch.
+        self._last_per_node_gpu_memory: Dict[str, Dict[str, int]] = {}
+
         # Idle self-eviction state. Counts construction as "activity" so
         # the actor is not killed before any worker has a chance to call it.
         self._last_called_at: float = time.time()
@@ -369,7 +377,7 @@ class BioEngineProxyActor:
         """
         webui_url = self._get_dashboard_webui_url()
         if not webui_url:
-            return {}, False
+            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
 
         url = f"{webui_url}/nodes?view=summary"
         # KubeRay (and some other managed Ray distributions) put the dashboard
@@ -391,10 +399,10 @@ class BioEngineProxyActor:
                 url,
                 exc_info=True,
             )
-            return {}, False
+            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
 
         if not payload.get("result"):
-            return {}, False
+            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
 
         summary = payload.get("data", {}).get("summary", [])
         per_node_gpu_memory: Dict[str, Dict[str, int]] = {}
@@ -414,7 +422,45 @@ class BioEngineProxyActor:
                 "used_gpu_memory": used_gpu_memory_mb * 1024 * 1024,
             }
 
+        self._last_per_node_gpu_memory = per_node_gpu_memory
         return per_node_gpu_memory, True
+
+    def get_gpu_memory_sizing(self) -> Dict[str, Any]:
+        """GPU sizing hints for VRAM-based deployment (used by AppBuilder).
+
+        Returns:
+            {
+                "vram_resource_advertised": bool,   # any node exposes VRAM_MB
+                "min_gpu_total_mb": Optional[int],  # smallest per-GPU VRAM (MB)
+            }
+
+        ``min_gpu_total_mb`` is the divisor for the fraction fallback, so it is
+        the smallest single-GPU capacity in the cluster — a replica sized for it
+        fits on any node. ``None`` when no GPU has reported memory yet.
+        """
+        vram_advertised = float(ray.cluster_resources().get("VRAM_MB", 0) or 0) > 0
+
+        per_node, dashboard_available = self._get_per_node_gpu_memory_usage()
+        min_gpu_total_mb: Optional[int] = None
+        if dashboard_available:
+            totals = self.global_state.total_resources_per_node()
+            for node_id, info in per_node.items():
+                gpu_count = int(totals.get(node_id, {}).get("GPU", 0) or 0)
+                total_bytes = info.get("total_gpu_memory", 0) or 0
+                if gpu_count <= 0 or total_bytes <= 0:
+                    continue
+                per_gpu_mb = int((total_bytes / (1024 * 1024)) / gpu_count)
+                if per_gpu_mb > 0:
+                    min_gpu_total_mb = (
+                        per_gpu_mb
+                        if min_gpu_total_mb is None
+                        else min(min_gpu_total_mb, per_gpu_mb)
+                    )
+
+        return {
+            "vram_resource_advertised": vram_advertised,
+            "min_gpu_total_mb": min_gpu_total_mb,
+        }
 
     @_touch_on_call
     def get_cluster_state(self) -> Dict[str, Any]:
