@@ -213,10 +213,12 @@ def app(
             cluster-independent: the worker translates it into a Ray GPU
             reservation at deploy time against the actual GPUs it lands on
             (a fraction of a GPU, so several replicas can share one card).
-            Omit for CPU-only apps. Replaces the old ``num_gpus`` knob,
-            which was non-portable (a fraction meant different amounts of
-            VRAM on different GPUs). ``disable_gpu`` at deploy time still
-            forces the reservation to zero.
+            Pass ``-1`` to reserve a whole GPU on whatever node it lands on,
+            regardless of that GPU's size. Omit for CPU-only apps. Replaces
+            the old ``num_gpus`` knob, which was non-portable (a fraction
+            meant different amounts of VRAM on different GPUs).
+            ``disable_gpu`` at deploy time still forces the reservation to
+            zero.
         memory_mb: Soft memory cap in megabytes. Converted to Ray's bytes
             convention internally.
         pip: Additional pip requirements for the replica's runtime_env on
@@ -247,6 +249,17 @@ def app(
             "@bioengine.app no longer accepts 'num_gpus' — GPUs are now sized "
             "by VRAM. Declare 'gpu_memory_mb=<MB>' instead (e.g. "
             "gpu_memory_mb=8192 for an 8 GB model)."
+        )
+
+    if gpu_memory_mb is not None and (
+        not isinstance(gpu_memory_mb, int)
+        or isinstance(gpu_memory_mb, bool)
+        or (gpu_memory_mb <= 0 and gpu_memory_mb != -1)
+    ):
+        raise BioEngineUserError(
+            "gpu_memory_mb must be a positive integer (VRAM in MB), -1 to "
+            "reserve a whole GPU regardless of its size, or None for a "
+            f"CPU-only app; got {gpu_memory_mb!r}."
         )
 
     def decorator(cls: type) -> Any:

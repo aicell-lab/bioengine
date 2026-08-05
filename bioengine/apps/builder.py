@@ -465,6 +465,12 @@ class AppBuilder:
                 opts["num_gpus"] = 0
                 continue
 
+            # -1 is the portable "whole GPU": book the entire device on any
+            # node regardless of its VRAM, so it never joins VRAM_MB packing.
+            if gmb == -1:
+                opts["num_gpus"] = 1.0
+                continue
+
             if vram_advertised:
                 opts["num_gpus"] = _GPU_HANDLE_EPSILON
                 opts.setdefault("resources", {})["VRAM_MB"] = int(gmb)
