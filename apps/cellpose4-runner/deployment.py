@@ -49,7 +49,7 @@ def _read_pip(name: str) -> List[str]:
 
 @bioengine.app(
     num_cpus=1,
-    num_gpus=1,
+    gpu_memory_mb=-1,
     memory_mb=12 * 1024,
     pip=_read_pip("requirements-deployment.txt"),
     # Requests queue at the replica behind ``_gpu_lock`` so the Ray Serve

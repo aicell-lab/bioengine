@@ -47,7 +47,6 @@ def _read_pip(name: str) -> List[str]:
 
 @bioengine.app(
     num_cpus=1,
-    num_gpus=0,
     memory_mb=4 * 1024,
     pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=10,

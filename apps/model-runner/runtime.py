@@ -103,7 +103,7 @@ def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
 
 @bioengine.app(
     num_cpus=1,
-    num_gpus=1,
+    gpu_memory_mb=-1,
     memory_mb=12 * 1024,
     pip=_read_pip("requirements-runtime.txt"),
     # ``max_ongoing_requests=10`` intentionally lets requests queue at
