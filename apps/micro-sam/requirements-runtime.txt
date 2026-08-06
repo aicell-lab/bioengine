@@ -9,6 +9,10 @@ torchvision==0.22.1
 onnx==1.17.0
 onnxruntime==1.21.0
 imageio>=2.37.0
+# onnx pulls protobuf transitively; protobuf 6.x's upb FieldDescriptor drops
+# `.label`, which Ray 2.55.1's serve config _proto_to_dict still reads → the GPU
+# replica dies with AttributeError at construction. Cap below 6 to match Ray's base.
+protobuf<6
 # numpy stays at 2.x: micro-sam → python-elf (>=0.9, the AIS decoder) hard-requires
 # numpy>=2, and no numpy<2 python-elf exists on PyPI. The bioengine worker's
 # ProxyDeployment runs numpy 1.x and cannot unpickle numpy-2.x arrays over the Ray
