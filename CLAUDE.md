@@ -38,6 +38,8 @@ before opening a PR — sync first:
 - **Simplicity First.** Make every change as minimal as possible.
 - **No Regressions.** Only change what's necessary; read before modifying.
 - **Prove It Works.** Test and verify before marking done.
+- **Grep before you write.** Before adding a helper, util, type, or pattern, search for one that already exists. Re-implementing what lives a few files over is the most common form of slop here.
+- **Fix the root cause, not the symptom.** A bug report names one broken path; before editing it, grep every caller of the function you are about to touch. One guard in the shared function is a smaller diff than a guard in every caller — and patching only the path the report names leaves every sibling caller still broken.
 - **Don't add features, refactors, abstractions, or error handling beyond what the task requires.** No designing for hypothetical futures. Three similar lines is better than a premature abstraction. No half-finished implementations.
 - **Trust internal code and framework guarantees.** Only validate at system boundaries (user input, external APIs). Don't add backwards-compat shims when you can just change the code.
 - **Don't bake in machine-specific paths/identifiers** (`/proj/aicell/users/x_nilme/...`, `/home/<user>/...`, SLURM allocation ids, private cluster names). The repo ships to other clusters; those strings leak local layout and rot. Use a generic placeholder or drop the path entirely if the surrounding code already explains the shape.
