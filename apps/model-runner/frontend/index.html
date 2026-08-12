@@ -441,24 +441,8 @@ import { connectToServer, getRTCService } from "https://cdn.jsdelivr.net/npm/hyp
 /* ── Config from URL ──────────────────────────────────────── */
 const params = new URLSearchParams(window.location.search);
 const SERVER_URL = params.get("server") || "https://hypha.aicell.io";
-const WS_SERVICE_ID = params.get("ws_service_id") || "";
-
-// The UI's own service id looks like {ws}/{pod-client}-{apphash}:{app-id}.
-// The model-runner on the SAME worker shares the pod-client prefix, so a
-// glob on that prefix pins us to this worker's runner. Override with
-// ?runner=<full service id>.
-function deriveRunnerId() {
-  const override = params.get("runner");
-  if (override) return override;
-  if (WS_SERVICE_ID.includes("/") && WS_SERVICE_ID.includes(":")) {
-    const [wsClient] = WS_SERVICE_ID.split(":");
-    const [workspace, client] = wsClient.split("/");
-    const m = client.match(/^(bioengine-worker-[a-z0-9]+)-/);
-    if (m) return `${workspace}/${m[1]}-*:model-runner`;
-  }
-  return "bioimage-io/bioengine-worker-kth-*:model-runner";
-}
-const RUNNER_ID = deriveRunnerId();
+const RUNNER_ID = params.get("ws_service_id") || "";
+const RTC_ID = params.get("webrtc_service_id") || (RUNNER_ID ? RUNNER_ID + "-rtc" : "");
 
 /* ── State ────────────────────────────────────────────────── */
 const S = {
@@ -484,6 +468,11 @@ function setConn(state, text) {
 }
 
 async function connect() {
+  if (!RUNNER_ID) {
+    setConn("err", "Not connected");
+    showRunError("Missing ws_service_id in the URL — open this app from the BioEngine worker dashboard.", null);
+    return;
+  }
   setConn("busy", "Connecting…");
   try {
     const cfg = { server_url: SERVER_URL };
@@ -507,8 +496,7 @@ async function connectPrivate() {
     const coturn = await S.server.getService("turn-server/coturn", { _rkwargs: true });
     iceServers = await coturn.get_rtc_ice_servers();
   } catch { /* built-in STUN fallback */ }
-  const rtcId = S.svcStd.id.split(":")[0] + ":model-runner-rtc";
-  S.rtcPeer = await getRTCService(S.server, rtcId, iceServers ? { ice_servers: iceServers } : {});
+  S.rtcPeer = await getRTCService(S.server, RTC_ID, iceServers ? { ice_servers: iceServers } : {});
   S.svcPriv = await S.rtcPeer.getService(S.svcStd.id.split(":")[1], { _rkwargs: true });
   return S.svcPriv;
 }
