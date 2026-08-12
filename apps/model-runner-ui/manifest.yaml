@@ -1,0 +1,16 @@
+name: Model Runner UI
+id: model-runner-ui
+id_emoji: "🖼️"
+description: "Browser frontend for the BioEngine model-runner: upload a microscopy image, pick a BioImage Model Zoo model, map channels, run inference on the worker, and view the segmentation overlay."
+authors:
+  - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
+maintainers: [nilsmechtel]
+license: MIT
+format_version: 0.6.0
+git_repo: https://github.com/aicell-lab/bioengine
+links: []
+tags: [frontend, bioimage-model-zoo, inference, demo]
+type: ray-serve
+version: 0.1.4
+entry: entry:ModelRunnerUI
+frontend_entry: "frontend/index.html"

@@ -1,0 +1,1524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BioEngine · Model Runner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #F6F6F2;
+    --card: #FFFFFF;
+    --ink: #182028;
+    --muted: #66717E;
+    --faint: #98A1AB;
+    --line: #E3E4DC;
+    --stage: #0B0F14;
+    --stage-line: #1E2630;
+    --accent: #0E7C86;
+    --accent-dark: #0A5F67;
+    --accent-soft: #E3F0F1;
+    --amber: #9A6B15;
+    --amber-soft: #FBF3E0;
+    --red: #B3402E;
+    --red-soft: #FBEAE6;
+    --ok: #2E7D4F;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+    --sans: "IBM Plex Sans", system-ui, sans-serif;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--sans);
+    background: var(--paper);
+    color: var(--ink);
+    font-size: 14px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Header ─────────────────────────────────────────────── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.7rem 1.25rem;
+    border-bottom: 1px solid var(--line);
+    background: var(--card);
+    flex-shrink: 0;
+  }
+  .brand { display: flex; align-items: baseline; gap: 0.65rem; }
+  .brand .eyebrow {
+    font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.22em;
+    color: var(--accent); font-weight: 500;
+  }
+  .brand h1 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; }
+  .conn { display: flex; align-items: center; gap: 0.9rem; font-size: 0.78rem; color: var(--muted); }
+  .conn .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--faint); display: inline-block; margin-right: 0.4rem;
+    vertical-align: 1px;
+  }
+  .conn .dot.ok { background: var(--ok); }
+  .conn .dot.err { background: var(--red); }
+  .conn .dot.busy { background: var(--amber); }
+  .conn code { font-family: var(--mono); font-size: 0.72rem; color: var(--faint); }
+
+  /* segmented control */
+  .seg {
+    display: inline-flex; border: 1px solid var(--line); border-radius: 7px;
+    overflow: hidden; background: var(--paper);
+  }
+  .seg button {
+    border: none; background: transparent; cursor: pointer;
+    font-family: var(--sans); font-size: 0.75rem; font-weight: 500;
+    color: var(--muted); padding: 0.32rem 0.7rem;
+  }
+  .seg button.active { background: var(--ink); color: #fff; }
+  .seg button:not(.active):hover { color: var(--ink); }
+  .seg button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* ── Main split ─────────────────────────────────────────── */
+  main { flex: 1; display: flex; min-height: 0; }
+  .rail {
+    width: 372px; flex-shrink: 0;
+    overflow-y: auto;
+    border-right: 1px solid var(--line);
+    padding: 1.1rem 1.25rem 2rem;
+    background: var(--paper);
+  }
+  .viewer { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--card); }
+
+  /* ── Steps ──────────────────────────────────────────────── */
+  .step { padding: 0.7rem 0 0.75rem; border-bottom: 1px solid var(--line); }
+  .step:first-child { padding-top: 0.2rem; }
+  .step:last-child { border-bottom: none; }
+  .step-head { display: flex; align-items: baseline; gap: 0.55rem; margin-bottom: 0.75rem; }
+  .step-num {
+    font-family: var(--mono); font-size: 0.7rem; color: var(--faint);
+    font-weight: 500;
+  }
+  .step-head h2 { font-size: 0.82rem; font-weight: 600; letter-spacing: 0.01em; }
+  .step-head .tag {
+    margin-left: auto; font-family: var(--mono); font-size: 0.65rem;
+    color: var(--accent); background: var(--accent-soft);
+    padding: 0.1rem 0.45rem; border-radius: 4px;
+  }
+
+  /* drop zone */
+  #dropZone {
+    border: 1.5px dashed #C9CCC2; border-radius: 9px;
+    padding: 1.35rem 1rem; text-align: center; cursor: pointer;
+    background: var(--card);
+    transition: border-color 0.15s, background 0.15s;
+  }
+  #dropZone:hover, #dropZone.drag { border-color: var(--accent); background: var(--accent-soft); }
+  #dropZone .big { font-size: 0.85rem; font-weight: 500; }
+  #dropZone .sub { font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; }
+  #dropZone.slim { padding: 0.45rem 0.75rem; }
+  #dropZone.slim .big { display: none; }
+  #dropZone.slim .sub { margin-top: 0; }
+  #fileInput { display: none; }
+
+  .file-meta {
+    display: none; align-items: center; gap: 0.65rem; margin-top: 0.65rem;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.5rem 0.65rem;
+  }
+  .file-meta.on { display: flex; }
+  .file-meta canvas { width: 44px; height: 44px; border-radius: 5px; background: var(--stage); }
+  .file-meta .name { font-size: 0.78rem; font-weight: 500; word-break: break-all; }
+  .file-meta .dims { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); margin-top: 0.15rem; }
+
+  /* stack controls */
+  #stackCtl { display: none; margin-top: 0.6rem; gap: 0.6rem; align-items: center; font-size: 0.75rem; color: var(--muted); }
+  #stackCtl.on { display: flex; }
+  #stackCtl input[type="range"] { flex: 1; }
+
+  /* search */
+  .search-row { display: flex; gap: 0.5rem; }
+  .search-row input {
+    flex: 1; border: 1px solid var(--line); border-radius: 7px;
+    padding: 0.45rem 0.65rem; font-family: var(--sans); font-size: 0.82rem;
+    background: var(--card); color: var(--ink); outline: none;
+  }
+  .search-row input:focus { border-color: var(--accent); }
+  .btn-sm {
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+    border-radius: 7px; padding: 0.45rem 0.8rem; font-size: 0.78rem;
+    font-weight: 500; cursor: pointer; font-family: var(--sans);
+  }
+  .btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  #modelList { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.35rem; max-height: 220px; overflow-y: auto; transition: max-height 0.2s; }
+  #modelList.compact { max-height: 68px; }
+  .model-item {
+    border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.65rem;
+    cursor: pointer; background: var(--card); transition: border-color 0.12s;
+  }
+  .model-item:hover { border-color: var(--accent); }
+  .model-item.sel { border-color: var(--accent); background: var(--accent-soft); }
+  .model-item .mid { font-family: var(--mono); font-size: 0.75rem; font-weight: 500; color: var(--accent-dark); }
+  .model-item .mdesc { font-size: 0.72rem; color: var(--muted); margin-top: 0.15rem; line-height: 1.35; }
+
+  #modelSpec { display: none; margin-top: 0.65rem; }
+  #modelSpec.on { display: block; }
+  .spec-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .chip {
+    font-family: var(--mono); font-size: 0.66rem; color: var(--muted);
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 5px; padding: 0.14rem 0.45rem;
+  }
+  .chip b { color: var(--ink); font-weight: 500; }
+
+  /* ── Patchboard (channel mapping) ───────────────────────── */
+  #chanThumbs { display: flex; gap: 0.45rem; flex-wrap: wrap; margin-bottom: 0.6rem; }
+  .cthumb { text-align: center; }
+  .cthumb canvas {
+    width: 46px; height: 46px; border-radius: 6px; background: var(--stage);
+    border: 2px solid var(--line); display: block;
+  }
+  .cthumb .clabel {
+    font-family: var(--mono); font-size: 0.64rem; margin-top: 0.25rem; color: var(--muted);
+  }
+  .map-row { display: flex; align-items: center; gap: 0.55rem; margin-bottom: 0.4rem; }
+  .map-row .socket {
+    font-family: var(--mono); font-size: 0.7rem; color: var(--ink);
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 6px; padding: 0.3rem 0.5rem; min-width: 108px;
+  }
+  .map-row .wire { color: var(--faint); font-size: 0.8rem; }
+  .map-row select {
+    flex: 1; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card); color: var(--ink); font-family: var(--mono);
+    font-size: 0.74rem; padding: 0.3rem 0.4rem; outline: none; cursor: pointer;
+  }
+  .map-row select:focus { border-color: var(--accent); }
+  .placeholder { font-size: 0.76rem; color: var(--faint); font-style: italic; }
+
+  /* banners */
+  .banner {
+    display: none; border-radius: 7px; padding: 0.5rem 0.7rem;
+    font-size: 0.75rem; line-height: 1.45; margin-top: 0.6rem;
+  }
+  .banner.on { display: block; }
+  .banner.warn { background: var(--amber-soft); color: var(--amber); border: 1px solid #EAD9B0; }
+  .banner.err  { background: var(--red-soft); color: var(--red); border: 1px solid #EFC4BB; }
+  .banner details { margin-top: 0.4rem; }
+  .banner summary { cursor: pointer; font-weight: 500; }
+  .banner pre {
+    font-family: var(--mono); font-size: 0.65rem; white-space: pre-wrap;
+    word-break: break-all; margin-top: 0.35rem; max-height: 180px; overflow-y: auto;
+    color: #7A3527;
+  }
+
+  /* preflight */
+  #preflight { display: none; flex-direction: column; gap: 0.3rem; margin-bottom: 0.75rem; }
+  #preflight.on { display: flex; }
+  .pf-line { display: flex; gap: 0.5rem; font-size: 0.75rem; color: var(--muted); align-items: baseline; }
+  .pf-line .pf-ico { width: 14px; text-align: center; flex-shrink: 0; }
+  .pf-line.ok .pf-ico { color: var(--ok); }
+  .pf-line.warn .pf-ico { color: var(--amber); }
+  .pf-line.err .pf-ico { color: var(--red); }
+  .pf-line code { font-family: var(--mono); font-size: 0.7rem; color: var(--ink); }
+
+  /* radios */
+  .radio-group { display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 0.7rem; }
+  .radio-group label {
+    display: flex; align-items: baseline; gap: 0.5rem; font-size: 0.76rem; line-height: 1.3;
+    cursor: pointer; color: var(--ink);
+  }
+  .radio-group input { accent-color: var(--accent); }
+  .radio-group .rsub { font-size: 0.68rem; color: var(--faint); }
+
+  .btn-run {
+    width: 100%; border: none; border-radius: 8px;
+    background: var(--accent); color: #fff;
+    font-family: var(--sans); font-size: 0.9rem; font-weight: 600;
+    padding: 0.7rem; cursor: pointer; transition: background 0.15s;
+  }
+  .btn-run:hover { background: var(--accent-dark); }
+  .btn-run:disabled { background: #C7CBC4; cursor: not-allowed; }
+
+  /* progress */
+  #progress { display: none; margin-top: 0.8rem; }
+  #progress.on { display: block; }
+  .prog-stages { display: flex; flex-direction: column; gap: 0.3rem; }
+  .pstage { display: flex; align-items: baseline; gap: 0.5rem; font-size: 0.75rem; color: var(--faint); }
+  .pstage .pdot { width: 14px; text-align: center; }
+  .pstage.active { color: var(--ink); font-weight: 500; }
+  .pstage.active .pdot { color: var(--accent); }
+  .pstage.done { color: var(--muted); }
+  .pstage.done .pdot { color: var(--ok); }
+  .pstage .ptime { margin-left: auto; font-family: var(--mono); font-size: 0.68rem; color: var(--faint); }
+
+  /* ── Viewer / stage ─────────────────────────────────────── */
+  .meta-bar {
+    display: flex; align-items: center; gap: 0.9rem;
+    padding: 0.55rem 1.1rem; border-bottom: 1px solid var(--line);
+    font-size: 0.75rem; color: var(--muted); flex-shrink: 0; flex-wrap: wrap;
+  }
+  .meta-bar .mchip { font-family: var(--mono); font-size: 0.7rem; color: var(--ink); }
+  .meta-bar .mchip .lbl { color: var(--faint); margin-right: 0.3rem; font-family: var(--sans); }
+  .meta-bar .spacer { flex: 1; }
+
+  .stage-wrap {
+    flex: 1; min-height: 0; background: var(--stage);
+    display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden;
+  }
+  #stageCanvas { max-width: 96%; max-height: 94%; display: block; }
+  #stageEmpty {
+    color: #3A4552; font-size: 0.85rem; text-align: center; line-height: 1.6;
+    font-family: var(--mono);
+  }
+  .scanline {
+    display: none; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    animation: scan 2.4s ease-in-out infinite;
+  }
+  .scanline.on { display: block; }
+  @keyframes scan { 0% { top: 0; } 50% { top: calc(100% - 2px); } 100% { top: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .scanline { animation: none; top: 50%; }
+  }
+
+  .stage-ctl {
+    display: flex; align-items: center; gap: 1rem;
+    padding: 0.6rem 1.1rem; border-top: 1px solid var(--line);
+    flex-shrink: 0; font-size: 0.75rem; color: var(--muted); flex-wrap: wrap;
+  }
+  .stage-ctl .ctl { display: flex; align-items: center; gap: 0.45rem; }
+  .stage-ctl input[type="range"] { width: 110px; accent-color: var(--accent); }
+  .stage-ctl select {
+    border: 1px solid var(--line); border-radius: 6px; background: var(--card);
+    font-family: var(--mono); font-size: 0.7rem; padding: 0.2rem 0.35rem;
+    color: var(--ink); outline: none;
+  }
+  .stage-ctl .mono-val { font-family: var(--mono); font-size: 0.68rem; color: var(--ink); min-width: 2.4em; }
+
+  button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+
+  @media (max-width: 900px) {
+    main { flex-direction: column; }
+    .rail { width: 100%; border-right: none; border-bottom: 1px solid var(--line); }
+    .viewer { min-height: 60vh; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="eyebrow">BIOENGINE</span>
+    <h1>Model Runner</h1>
+  </div>
+  <div class="conn">
+    <div class="seg" role="radiogroup" aria-label="Connection mode">
+      <button id="connStd" class="active" title="Traffic is routed through the Hypha server (WebSocket)">Standard connection</button>
+      <button id="connPriv" title="Direct encrypted peer-to-peer channel to the worker (WebRTC)">Private connection</button>
+    </div>
+    <span><span class="dot" id="connDot"></span><span id="connText">Connecting…</span></span>
+  </div>
+</header>
+
+<main>
+  <!-- ── Left rail: the pipeline ─────────────────────────── -->
+  <div class="rail">
+
+    <div class="step">
+      <div class="step-head"><span class="step-num">01</span><h2>Image</h2><span class="tag" id="imgTag" style="display:none">loaded</span></div>
+      <div id="dropZone" tabindex="0" role="button" aria-label="Upload an image">
+        <div class="big">Drop a microscopy image</div>
+        <div class="sub">TIFF · PNG · JPEG · NPY — or click to browse</div>
+      </div>
+      <input type="file" id="fileInput" accept=".tif,.tiff,.png,.jpg,.jpeg,.npy" />
+      <div class="file-meta" id="fileMeta">
+        <canvas id="fileThumb" width="88" height="88"></canvas>
+        <div>
+          <div class="name" id="fileName">—</div>
+          <div class="dims" id="fileDims">—</div>
+        </div>
+      </div>
+      <div id="stackCtl">
+        <label><input type="checkbox" id="maxProject" /> max&nbsp;project</label>
+        <input type="range" id="sliceSlider" min="0" max="0" value="0" aria-label="Stack slice" />
+        <span class="mono-val" id="sliceLabel">z 0</span>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><span class="step-num">02</span><h2>Model</h2><span class="tag" id="modelTag" style="display:none">selected</span></div>
+      <div class="search-row">
+        <input id="searchBox" type="search" placeholder="Search the Model Zoo — e.g. nuclei" aria-label="Search models" />
+        <button class="btn-sm" id="searchBtn">Search</button>
+      </div>
+      <div id="modelList"></div>
+      <div id="modelSpec">
+        <div class="spec-chips" id="specChips"></div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><span class="step-num">03</span><h2>Channels</h2><span class="tag" id="mapTag" style="display:none">auto-mapped</span></div>
+      <div id="chanThumbs"></div>
+      <div id="mapRows"><div class="placeholder">Load an image and select a model to map channels.</div></div>
+      <div class="banner warn" id="mapWarn"></div>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><span class="step-num">04</span><h2>Run</h2></div>
+      <div id="preflight"></div>
+      <div class="radio-group" role="radiogroup" aria-label="Intensity normalization">
+        <label><input type="radio" name="norm" value="percentile" checked />
+          <span>Percentile 1–99.8 → [0, 1] <span class="rsub">· robust, per channel</span></span></label>
+        <label><input type="radio" name="norm" value="dtypemax" />
+          <span>Divide by dtype max <span class="rsub">· e.g. uint16 / 65535</span></span></label>
+        <label><input type="radio" name="norm" value="asis" />
+          <span>As-is <span class="rsub">· raw intensities unchanged</span></span></label>
+      </div>
+      <button class="btn-run" id="runBtn" disabled>Run model</button>
+      <div id="progress">
+        <div class="prog-stages">
+          <div class="pstage" data-stage="queue"><span class="pdot">○</span><span class="plbl">Queued</span><span class="ptime"></span></div>
+          <div class="pstage" data-stage="download"><span class="pdot">○</span><span class="plbl">Fetching model package</span><span class="ptime"></span></div>
+          <div class="pstage" data-stage="run"><span class="pdot">○</span><span class="plbl">Running inference</span><span class="ptime"></span></div>
+          <div class="pstage" data-stage="render"><span class="pdot">○</span><span class="plbl">Rendering result</span><span class="ptime"></span></div>
+        </div>
+      </div>
+      <div class="banner err" id="runErr"></div>
+    </div>
+
+  </div>
+
+  <!-- ── Right: the stage ────────────────────────────────── -->
+  <div class="viewer">
+    <div class="meta-bar">
+      <span class="mchip" id="metaModel" style="display:none"></span>
+      <span class="mchip" id="metaAxes" style="display:none"></span>
+      <span class="mchip" id="metaIn" style="display:none"></span>
+      <span class="mchip" id="metaOut" style="display:none"></span>
+      <span class="spacer"></span>
+      <span class="mchip" id="metaTime" style="display:none"></span>
+    </div>
+    <div class="stage-wrap">
+      <div class="scanline" id="scanline"></div>
+      <canvas id="stageCanvas" style="display:none"></canvas>
+      <div id="stageEmpty">— specimen stage —<br />load an image to begin</div>
+    </div>
+    <div class="stage-ctl">
+      <div class="seg" role="radiogroup" aria-label="View">
+        <button id="viewInput" class="active">Input</button>
+        <button id="viewOverlay" disabled>Overlay</button>
+      </div>
+      <div class="ctl" id="opacityCtl" style="display:none">
+        <span>overlay</span>
+        <input type="range" id="opacity" min="0" max="100" value="60" aria-label="Overlay opacity" />
+        <span class="mono-val" id="opacityVal">0.60</span>
+      </div>
+      <div class="ctl" id="threshCtl" style="display:none">
+        <span>threshold</span>
+        <input type="range" id="thresh" min="1" max="99" value="50" aria-label="Threshold" />
+        <span class="mono-val" id="threshVal">0.50</span>
+      </div>
+      <div class="ctl" id="outChanCtl" style="display:none">
+        <span>output ch</span>
+        <select id="outChan"></select>
+      </div>
+      <div class="ctl" id="countCtl" style="display:none">
+        <span id="objCount" class="mono-val" style="min-width:auto"></span>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script type="module">
+import { connectToServer, getRTCService } from "https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.54/dist/hypha-rpc-websocket.mjs";
+
+/* ── Config from URL ──────────────────────────────────────── */
+const params = new URLSearchParams(window.location.search);
+const SERVER_URL = params.get("server") || "https://hypha.aicell.io";
+const WS_SERVICE_ID = params.get("ws_service_id") || "";
+
+// The UI's own service id looks like {ws}/{pod-client}-{apphash}:{app-id}.
+// The model-runner on the SAME worker shares the pod-client prefix, so a
+// glob on that prefix pins us to this worker's runner. Override with
+// ?runner=<full service id>.
+function deriveRunnerId() {
+  const override = params.get("runner");
+  if (override) return override;
+  if (WS_SERVICE_ID.includes("/") && WS_SERVICE_ID.includes(":")) {
+    const [wsClient] = WS_SERVICE_ID.split(":");
+    const [workspace, client] = wsClient.split("/");
+    const m = client.match(/^(bioengine-worker-[a-z0-9]+)-/);
+    if (m) return `${workspace}/${m[1]}-*:model-runner`;
+  }
+  return "bioimage-io/bioengine-worker-kth-*:model-runner";
+}
+const RUNNER_ID = deriveRunnerId();
+
+/* ── State ────────────────────────────────────────────────── */
+const S = {
+  server: null,
+  svcStd: null,        // websocket service
+  svcPriv: null,       // webrtc service
+  rtcPeer: null,
+  mode: "std",
+  image: null,         // {channels:[Float32Array], W, H, names, fileName, dtypeMax, stack}
+  model: null,         // {id, rdf, spec}
+  mapping: [],         // model channel -> image channel index | -1 (zeros)
+  result: null,        // {outputs:{name:{data,shape,dtype}}, key, seconds, inW,inH, kind}
+  running: false,
+  view: "input",
+};
+
+const $ = (id) => document.getElementById(id);
+
+/* ── Connection ───────────────────────────────────────────── */
+function setConn(state, text) {
+  $("connDot").className = "dot " + state;
+  $("connText").textContent = text;
+}
+
+async function connect() {
+  setConn("busy", "Connecting…");
+  try {
+    const cfg = { server_url: SERVER_URL };
+    const token = params.get("token");
+    if (token) cfg.token = token;
+    S.server = await connectToServer(cfg);
+    S.svcStd = await S.server.getService(RUNNER_ID, { _rkwargs: true });
+    setConn("ok", "Connected · standard");
+    updateRunBtn();
+  } catch (err) {
+    setConn("err", "Connection failed");
+    showRunError("Could not reach the model-runner service.", err);
+  }
+}
+
+async function connectPrivate() {
+  if (S.svcPriv) return S.svcPriv;
+  setConn("busy", "Negotiating peer-to-peer…");
+  let iceServers = null;
+  try {
+    const coturn = await S.server.getService("turn-server/coturn", { _rkwargs: true });
+    iceServers = await coturn.get_rtc_ice_servers();
+  } catch { /* built-in STUN fallback */ }
+  const rtcId = S.svcStd.id.split(":")[0] + ":model-runner-rtc";
+  S.rtcPeer = await getRTCService(S.server, rtcId, iceServers ? { ice_servers: iceServers } : {});
+  S.svcPriv = await S.rtcPeer.getService(S.svcStd.id.split(":")[1], { _rkwargs: true });
+  return S.svcPriv;
+}
+
+function svc() { return S.mode === "priv" && S.svcPriv ? S.svcPriv : S.svcStd; }
+
+$("connStd").addEventListener("click", () => {
+  S.mode = "std";
+  $("connStd").classList.add("active");
+  $("connPriv").classList.remove("active");
+  if (S.svcStd) setConn("ok", "Connected · standard");
+});
+$("connPriv").addEventListener("click", async () => {
+  try {
+    await connectPrivate();
+    S.mode = "priv";
+    $("connPriv").classList.add("active");
+    $("connStd").classList.remove("active");
+    setConn("ok", "Connected · private (peer-to-peer)");
+  } catch (err) {
+    console.warn("WebRTC failed:", err);
+    setConn("ok", "Connected · standard (private unavailable)");
+    showMapWarn(null);
+    showRunError("Private connection could not be established — staying on the standard connection.", err);
+  }
+});
+
+/* ── File loading ─────────────────────────────────────────── */
+const FLUOR = [[91,141,239],[70,167,88],[229,72,77],[193,139,242],[240,180,60],[80,200,210]];
+
+$("dropZone").addEventListener("click", () => $("fileInput").click());
+$("dropZone").addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") $("fileInput").click(); });
+$("dropZone").addEventListener("dragover", (e) => { e.preventDefault(); $("dropZone").classList.add("drag"); });
+$("dropZone").addEventListener("dragleave", () => $("dropZone").classList.remove("drag"));
+$("dropZone").addEventListener("drop", (e) => {
+  e.preventDefault(); $("dropZone").classList.remove("drag");
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+$("fileInput").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+async function loadFile(file) {
+  clearRunError();
+  try {
+    const buf = await file.arrayBuffer();
+    const ext = file.name.split(".").pop().toLowerCase();
+    let img;
+    if (ext === "tif" || ext === "tiff") img = await loadTiff(buf);
+    else if (ext === "npy") img = loadNpy(buf);
+    else img = await loadBrowserImage(buf);
+    img.fileName = file.name;
+    S.image = img;
+    S.result = null;
+    $("imgTag").style.display = "";
+    $("dropZone").classList.add("slim");
+    $("dropZone").querySelector(".sub").textContent = "drop a new image to replace";
+    $("fileName").textContent = file.name;
+    const stackInfo = img.stack ? ` · ${img.stack.n} slices` : "";
+    $("fileDims").textContent = `${img.W} × ${img.H} px · ${img.names.length} channel${img.names.length > 1 ? "s" : ""} · ${img.srcDtype}${stackInfo}`;
+    $("fileMeta").classList.add("on");
+    drawComposite($("fileThumb"), img, 88);
+    $("stackCtl").classList.toggle("on", !!img.stack);
+    if (img.stack) {
+      $("sliceSlider").max = img.stack.n - 1;
+      $("sliceSlider").value = img.stack.current;
+      $("sliceLabel").textContent = `z ${img.stack.current}`;
+    }
+    rebuildChannelThumbs();
+    rebuildMapping();
+    setView("input");
+    renderStage();
+    updateRunBtn();
+  } catch (err) {
+    showRunError(`Could not read ${file.name}.`, err);
+  }
+}
+
+/* TIFF — 8/16/32-bit grayscale, RGB, multi-page (pages → channels or z-stack) */
+async function loadTiff(buf) {
+  const mod = await import("https://cdn.jsdelivr.net/npm/utif2@4.1.0/+esm");
+  const UTIF = mod.UTIF || mod.default || mod;
+  const ifds = UTIF.decode(buf);
+  if (!ifds.length) throw new Error("No image data in TIFF");
+  const littleEndian = new Uint8Array(buf, 0, 2)[0] === 0x49; // 'II'
+  const pages = [];
+  for (const ifd of ifds) {
+    UTIF.decodeImage(buf, ifd);
+    const W = ifd.width, H = ifd.height;
+    const bps = (ifd.t258 && ifd.t258[0]) || 8;
+    const spp = (ifd.t277 && ifd.t277[0]) || 1;
+    const fmt = (ifd.t339 && ifd.t339[0]) || 1; // 3 = float
+    const raw = ifd.data;
+    const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const n = W * H;
+    const chans = [];
+    for (let s = 0; s < spp; s++) chans.push(new Float32Array(n));
+    for (let i = 0; i < n; i++) {
+      for (let s = 0; s < spp; s++) {
+        const idx = i * spp + s;
+        let v;
+        if (fmt === 3 && bps === 32) v = view.getFloat32(idx * 4, littleEndian);
+        else if (bps === 16) v = view.getUint16(idx * 2, littleEndian);
+        else if (bps === 32) v = view.getUint32(idx * 4, littleEndian);
+        else v = raw[idx];
+        chans[s][i] = v;
+      }
+    }
+    pages.push({ W, H, chans, bps, fmt });
+  }
+  const p0 = pages[0];
+  const dtypeMax = p0.fmt === 3 ? 1 : (p0.bps === 16 ? 65535 : p0.bps === 32 ? 4294967295 : 255);
+  const srcDtype = p0.fmt === 3 ? "float32" : `uint${p0.bps}`;
+  if (pages.length === 1) {
+    const names = p0.chans.length === 3 ? ["R", "G", "B"] : p0.chans.map((_, i) => `C${i}`);
+    return { channels: p0.chans.slice(0, 4), W: p0.W, H: p0.H, names: names.slice(0, 4), dtypeMax, srcDtype, stack: null };
+  }
+  const sameSize = pages.every((p) => p.W === p0.W && p.H === p0.H);
+  if (!sameSize) {
+    const names = p0.chans.map((_, i) => `C${i}`);
+    return { channels: p0.chans, W: p0.W, H: p0.H, names, dtypeMax, srcDtype, stack: null };
+  }
+  if (pages.length <= 6) {
+    // few same-size pages → treat as channels
+    const channels = pages.map((p) => p.chans[0]);
+    return { channels, W: p0.W, H: p0.H, names: channels.map((_, i) => `C${i}`), dtypeMax, srcDtype, stack: null };
+  }
+  // many pages → z-stack with slice slider + max-project
+  const slices = pages.map((p) => p.chans[0]);
+  const mid = Math.floor(slices.length / 2);
+  return {
+    channels: [slices[mid]], W: p0.W, H: p0.H, names: ["C0"], dtypeMax, srcDtype,
+    stack: { slices, n: slices.length, current: mid, maxProject: false },
+  };
+}
+
+/* PNG / JPEG via browser decoder */
+async function loadBrowserImage(buf) {
+  const blob = new Blob([buf]);
+  const bmp = await createImageBitmap(blob);
+  const W = bmp.width, H = bmp.height;
+  const off = new OffscreenCanvas(W, H);
+  const ctx = off.getContext("2d");
+  ctx.drawImage(bmp, 0, 0);
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const n = W * H;
+  let gray = true;
+  for (let i = 0; i < n; i += 997) {
+    if (d[i * 4] !== d[i * 4 + 1] || d[i * 4 + 1] !== d[i * 4 + 2]) { gray = false; break; }
+  }
+  if (gray) {
+    const c = new Float32Array(n);
+    for (let i = 0; i < n; i++) c[i] = d[i * 4];
+    return { channels: [c], W, H, names: ["C0"], dtypeMax: 255, srcDtype: "uint8", stack: null };
+  }
+  const chans = [new Float32Array(n), new Float32Array(n), new Float32Array(n)];
+  for (let i = 0; i < n; i++) {
+    chans[0][i] = d[i * 4]; chans[1][i] = d[i * 4 + 1]; chans[2][i] = d[i * 4 + 2];
+  }
+  return { channels: chans, W, H, names: ["R", "G", "B"], dtypeMax: 255, srcDtype: "uint8", stack: null };
+}
+
+/* Minimal NPY parser — C-order, 2D/3D */
+function loadNpy(buf) {
+  const u8 = new Uint8Array(buf);
+  if (u8[0] !== 0x93 || String.fromCharCode(...u8.slice(1, 6)) !== "NUMPY") throw new Error("Not an NPY file");
+  const major = u8[6];
+  const headerLen = major >= 2 ? new DataView(buf).getUint32(8, true) : new DataView(buf).getUint16(8, true);
+  const headerStart = major >= 2 ? 12 : 10;
+  const header = new TextDecoder().decode(u8.slice(headerStart, headerStart + headerLen));
+  const descr = header.match(/'descr':\s*'([^']+)'/)[1];
+  const fortran = /'fortran_order':\s*True/.test(header);
+  if (fortran) throw new Error("Fortran-order NPY not supported");
+  const shape = (header.match(/'shape':\s*\(([^)]*)\)/)[1].match(/\d+/g) || []).map(Number);
+  const dataStart = headerStart + headerLen;
+  const le = descr[0] !== ">";
+  const code = descr.slice(1);
+  const view = new DataView(buf, dataStart);
+  const total = shape.reduce((a, b) => a * b, 1);
+  const out = new Float32Array(total);
+  const readers = {
+    u1: (i) => u8[dataStart + i], i1: (i) => (u8[dataStart + i] << 24) >> 24,
+    u2: (i) => view.getUint16(i * 2, le), i2: (i) => view.getInt16(i * 2, le),
+    u4: (i) => view.getUint32(i * 4, le), i4: (i) => view.getInt32(i * 4, le),
+    f4: (i) => view.getFloat32(i * 4, le), f8: (i) => view.getFloat64(i * 8, le),
+  };
+  const rd = readers[code];
+  if (!rd) throw new Error(`NPY dtype ${descr} not supported`);
+  for (let i = 0; i < total; i++) out[i] = rd(i);
+  const dtypeMax = { u1: 255, u2: 65535, u4: 4294967295 }[code] || 1;
+  const srcDtype = { u1: "uint8", u2: "uint16", u4: "uint32", i1: "int8", i2: "int16", i4: "int32", f4: "float32", f8: "float64" }[code];
+
+  const squeezed = shape.filter((s) => s > 1);
+  if (squeezed.length === 2) {
+    const [H, W] = squeezed;
+    return { channels: [out], W, H, names: ["C0"], dtypeMax, srcDtype, stack: null };
+  }
+  if (squeezed.length === 3) {
+    let [A, H, W] = squeezed;
+    let arr = out;
+    if (squeezed[2] <= 6 && squeezed[0] > 6) { // (H,W,C) → transpose
+      [H, W, A] = squeezed;
+      arr = new Float32Array(total);
+      for (let c = 0; c < A; c++) for (let i = 0; i < H * W; i++) arr[c * H * W + i] = out[i * A + c];
+    }
+    const planes = [];
+    for (let a = 0; a < A; a++) planes.push(arr.subarray(a * H * W, (a + 1) * H * W));
+    if (A <= 6) {
+      return { channels: planes, W, H, names: planes.map((_, i) => `C${i}`), dtypeMax, srcDtype, stack: null };
+    }
+    const mid = Math.floor(A / 2);
+    return { channels: [planes[mid]], W, H, names: ["C0"], dtypeMax, srcDtype, stack: { slices: planes, n: A, current: mid, maxProject: false } };
+  }
+  throw new Error(`NPY shape [${shape}] not supported — need 2D or 3D`);
+}
+
+/* stack controls */
+$("sliceSlider").addEventListener("input", () => {
+  const img = S.image;
+  if (!img || !img.stack) return;
+  img.stack.current = +$("sliceSlider").value;
+  $("sliceLabel").textContent = `z ${img.stack.current}`;
+  if (!img.stack.maxProject) {
+    img.channels = [img.stack.slices[img.stack.current]];
+    afterChannelChange();
+  }
+});
+$("maxProject").addEventListener("change", () => {
+  const img = S.image;
+  if (!img || !img.stack) return;
+  img.stack.maxProject = $("maxProject").checked;
+  $("sliceSlider").disabled = img.stack.maxProject;
+  if (img.stack.maxProject) {
+    const n = img.W * img.H;
+    const mp = new Float32Array(n);
+    for (const sl of img.stack.slices) for (let i = 0; i < n; i++) if (sl[i] > mp[i]) mp[i] = sl[i];
+    img.channels = [mp];
+  } else {
+    img.channels = [img.stack.slices[img.stack.current]];
+  }
+  afterChannelChange();
+});
+function afterChannelChange() {
+  drawComposite($("fileThumb"), S.image, 88);
+  rebuildChannelThumbs();
+  if (S.view === "input") renderStage();
+}
+
+/* ── Model search & RDF ───────────────────────────────────── */
+$("searchBtn").addEventListener("click", searchModels);
+$("searchBox").addEventListener("keydown", (e) => { if (e.key === "Enter") searchModels(); });
+
+async function searchModels() {
+  if (!S.svcStd) return;
+  const q = $("searchBox").value.trim();
+  $("modelList").classList.remove("compact");
+  $("modelList").innerHTML = `<div class="placeholder">Searching…</div>`;
+  try {
+    const models = await S.svcStd.search_models({
+      keywords: q ? q.split(/\s+/) : null, limit: 12, _rkwargs: true,
+    });
+    if (!models.length) {
+      $("modelList").innerHTML = `<div class="placeholder">No runnable models match — try another keyword.</div>`;
+      return;
+    }
+    $("modelList").innerHTML = "";
+    for (const m of models) {
+      const el = document.createElement("div");
+      el.className = "model-item";
+      el.tabIndex = 0;
+      el.innerHTML = `<div class="mid">${m.model_id}</div><div class="mdesc">${escapeHtml(m.description || "")}</div>`;
+      const pick = () => selectModel(m.model_id, el);
+      el.addEventListener("click", pick);
+      el.addEventListener("keydown", (e) => { if (e.key === "Enter") pick(); });
+      $("modelList").appendChild(el);
+    }
+  } catch (err) {
+    $("modelList").innerHTML = "";
+    showRunError("Model search failed.", err);
+  }
+}
+
+async function selectModel(modelId, el) {
+  document.querySelectorAll(".model-item").forEach((n) => n.classList.remove("sel"));
+  el.classList.add("sel");
+  $("modelList").classList.add("compact");
+  setTimeout(() => el.scrollIntoView({ block: "nearest" }), 250);
+  $("modelTag").style.display = "none";
+  $("modelSpec").classList.remove("on");
+  try {
+    const rdf = await S.svcStd.get_model_rdf({ model_id: modelId, _rkwargs: true });
+    const spec = parseInputSpec(rdf);
+    if (spec.error) {
+      showRunError(`${modelId}: ${spec.error}`, null);
+      S.model = null;
+      updateRunBtn();
+      return;
+    }
+    clearRunError();
+    S.model = { id: modelId, rdf, spec };
+    $("modelTag").style.display = "";
+    $("metaModel").style.display = "";
+    $("metaModel").innerHTML = `<span class="lbl">model</span>${modelId}`;
+    $("metaAxes").style.display = "";
+    $("metaAxes").innerHTML = `<span class="lbl">axes</span>${spec.axes.map((a) => a.id).join("·")}`;
+    renderSpecChips(rdf, spec);
+    rebuildMapping();
+    updateRunBtn();
+  } catch (err) {
+    showRunError(`Could not load the model card for ${modelId}.`, err);
+  }
+}
+
+/* Parse an axes declaration (v0.4 string + shape, or v0.5 axis dicts). */
+function parseAxes(axesField, shapeField) {
+  const axes = [];
+  if (typeof axesField === "string") {
+    for (let i = 0; i < axesField.length; i++) {
+      const id = axesField[i];
+      let size = null;
+      if (Array.isArray(shapeField)) size = shapeField[i];
+      else if (shapeField && shapeField.min) size = { min: shapeField.min[i], step: (shapeField.step && shapeField.step[i]) || 0 };
+      axes.push({ id, size });
+    }
+    return axes;
+  }
+  if (Array.isArray(axesField)) {
+    for (const ax of axesField) {
+      const type = ax.type || ax.id;
+      let id = ax.id || (type === "batch" ? "b" : type === "channel" ? "c" : type === "time" ? "t" : "?");
+      if (type === "batch") id = "b";
+      if (type === "channel") id = "c";
+      let size = ax.size ?? null;
+      if (type === "channel" && Array.isArray(ax.channel_names)) size = ax.channel_names.length;
+      if (size && typeof size === "object" && !("min" in size)) size = null; // axis reference → unconstrained
+      axes.push({ id, size, channelNames: ax.channel_names });
+    }
+    return axes;
+  }
+  return null;
+}
+
+/* Parse inputs[0] of a v0.4 or v0.5 RDF into a uniform axis list. */
+function parseInputSpec(rdf) {
+  const inputs = rdf.inputs || [];
+  if (inputs.length !== 1) {
+    return { error: `this model needs ${inputs.length} inputs — this demo supports single-input models only.` };
+  }
+  const inp = inputs[0];
+  const axes = parseAxes(inp.axes, inp.shape);
+  if (!axes) {
+    return { error: "could not parse the model's input axes." };
+  }
+  const cAx = axes.find((a) => a.id === "c");
+  const channelCount = cAx ? (typeof cAx.size === "number" ? cAx.size : (cAx.size && cAx.size.min) || 1) : 1;
+  const channelNames = (cAx && cAx.channelNames) || Array.from({ length: channelCount }, (_, i) => `input ch ${i}`);
+  if (axes.some((a) => a.id === "t")) return { error: "time-axis models are not supported in this demo." };
+  const preproc = (inp.preprocessing || []).map((p) => p.id || p.name).filter(Boolean);
+  return {
+    axes, channelCount, channelNames,
+    hasZ: axes.some((a) => a.id === "z"),
+    inputId: inp.id || inp.name || "input",
+    formatVersion: String(rdf.format_version || ""),
+    preproc,
+  };
+}
+
+function renderSpecChips(rdf, spec) {
+  const chips = [];
+  chips.push(`<span class="chip">format <b>${spec.formatVersion}</b></span>`);
+  chips.push(`<span class="chip">axes <b>${spec.axes.map((a) => a.id).join("·")}</b></span>`);
+  chips.push(`<span class="chip">channels <b>${spec.channelCount}</b></span>`);
+  for (const a of spec.axes) {
+    if ((a.id === "y" || a.id === "x") && a.size) {
+      if (typeof a.size === "number") chips.push(`<span class="chip">${a.id} <b>= ${a.size}</b></span>`);
+      else chips.push(`<span class="chip">${a.id} <b>≥ ${a.size.min}${a.size.step ? ` step ${a.size.step}` : ""}</b></span>`);
+    }
+  }
+  if (spec.preproc.length) chips.push(`<span class="chip">preprocessing <b>${spec.preproc.join(", ")}</b></span>`);
+  $("specChips").innerHTML = chips.join("");
+  $("modelSpec").classList.add("on");
+}
+
+/* ── Channel patchboard ───────────────────────────────────── */
+function rebuildChannelThumbs() {
+  const box = $("chanThumbs");
+  box.innerHTML = "";
+  if (!S.image) return;
+  S.image.channels.forEach((ch, i) => {
+    const d = document.createElement("div");
+    d.className = "cthumb";
+    const cv = document.createElement("canvas");
+    cv.width = 104; cv.height = 104;
+    const col = S.image.channels.length > 1 ? FLUOR[i % FLUOR.length] : [235, 235, 235];
+    drawChannel(cv, ch, S.image.W, S.image.H, col);
+    cv.style.borderColor = S.image.channels.length > 1 ? `rgb(${col.join(",")})` : "var(--line)";
+    const lb = document.createElement("div");
+    lb.className = "clabel";
+    lb.textContent = S.image.names[i];
+    d.appendChild(cv); d.appendChild(lb);
+    box.appendChild(d);
+  });
+}
+
+function rebuildMapping() {
+  const box = $("mapRows");
+  $("mapTag").style.display = "none";
+  showMapWarn(null);
+  if (!S.image || !S.model) {
+    box.innerHTML = `<div class="placeholder">Load an image and select a model to map channels.</div>`;
+    S.mapping = [];
+    updateRunBtn();
+    return;
+  }
+  const nModel = S.model.spec.channelCount;
+  const nImg = S.image.channels.length;
+  S.mapping = Array.from({ length: nModel }, (_, i) => (i < nImg ? i : -1));
+  box.innerHTML = "";
+  for (let mi = 0; mi < nModel; mi++) {
+    const row = document.createElement("div");
+    row.className = "map-row";
+    const sock = document.createElement("span");
+    sock.className = "socket";
+    sock.textContent = S.model.spec.channelNames[mi] || `input ch ${mi}`;
+    const wire = document.createElement("span");
+    wire.className = "wire";
+    wire.textContent = "←";
+    const sel = document.createElement("select");
+    sel.setAttribute("aria-label", `Source for model channel ${mi}`);
+    S.image.channels.forEach((_, ii) => {
+      const o = document.createElement("option");
+      o.value = ii;
+      o.textContent = `${S.image.names[ii]} — image channel ${ii}`;
+      sel.appendChild(o);
+    });
+    const oz = document.createElement("option");
+    oz.value = -1;
+    oz.textContent = "zeros (leave empty)";
+    sel.appendChild(oz);
+    sel.value = S.mapping[mi];
+    sel.addEventListener("change", () => {
+      S.mapping[mi] = +sel.value;
+      $("mapTag").style.display = "none";
+      updateMapWarn();
+    });
+    row.appendChild(sock); row.appendChild(wire); row.appendChild(sel);
+    box.appendChild(row);
+  }
+  if (nModel === nImg) $("mapTag").style.display = "";
+  updateMapWarn();
+  updateRunBtn();
+}
+
+function updateMapWarn() {
+  if (!S.image || !S.model) return showMapWarn(null);
+  const nModel = S.model.spec.channelCount, nImg = S.image.channels.length;
+  if (nModel !== nImg) {
+    showMapWarn(`Model expects <b>${nModel}</b> channel${nModel > 1 ? "s" : ""} — image has <b>${nImg}</b>. Check the mapping.`);
+  } else showMapWarn(null);
+  refreshPreflight();
+}
+
+function showMapWarn(html) {
+  const el = $("mapWarn");
+  if (!html) { el.classList.remove("on"); el.innerHTML = ""; }
+  else { el.classList.add("on"); el.innerHTML = html; }
+}
+
+/* ── Preflight ────────────────────────────────────────────── */
+function computeCrop() {
+  // returns {W, H, ok, msg} target spatial size satisfying the model's y/x constraints
+  const img = S.image, spec = S.model.spec;
+  let W = img.W, H = img.H;
+  for (const a of spec.axes) {
+    if (a.id !== "y" && a.id !== "x") continue;
+    const cur = a.id === "y" ? H : W;
+    let target = cur;
+    if (typeof a.size === "number") {
+      if (cur < a.size) return { ok: false, msg: `model needs ${a.id} = ${a.size}, image has ${cur}` };
+      target = a.size;
+    } else if (a.size && a.size.min != null) {
+      if (cur < a.size.min) return { ok: false, msg: `model needs ${a.id} ≥ ${a.size.min}, image has ${cur}` };
+      const step = a.size.step || 0;
+      target = step > 0 ? a.size.min + Math.floor((cur - a.size.min) / step) * step : cur;
+    }
+    if (a.id === "y") H = target; else W = target;
+  }
+  return { ok: true, W, H };
+}
+
+function refreshPreflight() {
+  const box = $("preflight");
+  if (!S.image || !S.model) { box.classList.remove("on"); box.innerHTML = ""; return; }
+  const lines = [];
+  const spec = S.model.spec;
+  const nModel = spec.channelCount, nImg = S.image.channels.length;
+  lines.push(pfLine(nModel === nImg ? "ok" : "warn", nModel === nImg ? "✓" : "!",
+    `model wants <code>${nModel}</code> channel${nModel > 1 ? "s" : ""}, image has <code>${nImg}</code>`));
+  const crop = computeCrop();
+  if (!crop.ok) {
+    lines.push(pfLine("err", "✕", `image too small — ${crop.msg}`));
+  } else if (crop.W !== S.image.W || crop.H !== S.image.H) {
+    lines.push(pfLine("ok", "✓", `center-crop to size grid: <code>${S.image.W}×${S.image.H}</code> → <code>${crop.W}×${crop.H}</code>`));
+  } else {
+    lines.push(pfLine("ok", "✓", `size <code>${S.image.W}×${S.image.H}</code> fits the model's grid`));
+  }
+  lines.push(pfLine("ok", "✓", `sent as <code>${spec.axes.map((a) => a.id).join("·")}</code> float32`));
+  if (spec.hasZ) lines.push(pfLine("warn", "!", `model declares a z axis — a singleton z plane will be sent`));
+  box.innerHTML = lines.join("");
+  box.classList.add("on");
+}
+function pfLine(cls, ico, html) {
+  return `<div class="pf-line ${cls}"><span class="pf-ico">${ico}</span><span>${html}</span></div>`;
+}
+
+/* ── Run ──────────────────────────────────────────────────── */
+function updateRunBtn() {
+  const crop = S.image && S.model ? computeCrop() : { ok: false };
+  $("runBtn").disabled = !(S.svcStd && S.image && S.model && !S.running && crop.ok);
+}
+
+function normalizeChannel(src, n, mode, dtypeMax) {
+  const out = new Float32Array(n);
+  if (mode === "asis") { out.set(src.subarray ? src.subarray(0, n) : src); return out; }
+  if (mode === "dtypemax") {
+    for (let i = 0; i < n; i++) out[i] = src[i] / dtypeMax;
+    return out;
+  }
+  // percentile 1–99.8 → [0,1]
+  const sorted = Float32Array.from(src).sort();
+  const lo = sorted[Math.floor(sorted.length * 0.01)];
+  const hi = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.998))];
+  const range = hi - lo;
+  if (range <= 0) return out;
+  for (let i = 0; i < n; i++) {
+    const v = (src[i] - lo) / range;
+    out[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+  }
+  return out;
+}
+
+function buildInputTensor() {
+  const img = S.image, spec = S.model.spec;
+  const crop = computeCrop();
+  const norm = document.querySelector('input[name="norm"]:checked').value;
+  const nC = spec.channelCount;
+  const { W: tW, H: tH } = crop;
+  // normalize each mapped channel over the FULL image, then center-crop
+  const ox = Math.floor((img.W - tW) / 2), oy = Math.floor((img.H - tH) / 2);
+  const planes = [];
+  for (let mi = 0; mi < nC; mi++) {
+    const srcIdx = S.mapping[mi];
+    const plane = new Float32Array(tW * tH);
+    if (srcIdx >= 0) {
+      const normed = normalizeChannel(img.channels[srcIdx], img.W * img.H, norm, img.dtypeMax);
+      for (let y = 0; y < tH; y++) {
+        const srcRow = (y + oy) * img.W + ox;
+        plane.set(normed.subarray(srcRow, srcRow + tW), y * tW);
+      }
+    }
+    planes.push(plane);
+  }
+  // assemble in the declared axis order; b/z singleton
+  const dims = spec.axes.map((a) => (a.id === "c" ? nC : a.id === "y" ? tH : a.id === "x" ? tW : 1));
+  const total = dims.reduce((a, b) => a * b, 1);
+  const data = new Float32Array(total);
+  // strides for the target layout
+  const strides = new Array(dims.length);
+  let acc = 1;
+  for (let i = dims.length - 1; i >= 0; i--) { strides[i] = acc; acc *= dims[i]; }
+  const iC = spec.axes.findIndex((a) => a.id === "c");
+  const iY = spec.axes.findIndex((a) => a.id === "y");
+  const iX = spec.axes.findIndex((a) => a.id === "x");
+  for (let c = 0; c < nC; c++) {
+    const base = iC >= 0 ? c * strides[iC] : 0;
+    const plane = planes[c];
+    for (let y = 0; y < tH; y++) {
+      const rowBase = base + y * strides[iY];
+      for (let x = 0; x < tW; x++) data[rowBase + x * strides[iX]] = plane[y * tW + x];
+    }
+  }
+  lastSentSize = { W: tW, H: tH, ox, oy };
+  return { data, shape: dims, W: tW, H: tH };
+}
+let lastSentSize = { W: 0, H: 0, ox: 0, oy: 0 };
+
+$("runBtn").addEventListener("click", runModel);
+
+async function runModel() {
+  if (S.running) return;
+  clearRunError();
+  S.running = true;
+  updateRunBtn();
+  $("progress").classList.add("on");
+  $("scanline").classList.add("on");
+  resetStages();
+  const t0 = performance.now();
+  try {
+    const tensor = buildInputTensor();
+    $("metaIn").style.display = "";
+    $("metaIn").innerHTML = `<span class="lbl">in</span>${tensor.shape.join("×")}`;
+    setStage("queue", "active");
+    const service = svc();
+    const requestId = await service.infer({
+      model_id: S.model.id,
+      inputs: { _rtype: "ndarray", _rvalue: new Uint8Array(tensor.data.buffer), _rshape: tensor.shape, _rdtype: "float32" },
+      _rkwargs: true,
+    });
+    let status = null;
+    while (true) {
+      await sleep(1200);
+      status = await service.get_infer_status({ request_id: requestId, _rkwargs: true });
+      applyStatus(status, t0);
+      if (status.result) break;
+    }
+    if (status.result.error && Object.keys(status.result).length === 1) {
+      throw new Error(status.result.error);
+    }
+    setStage("queue", "done");
+    setStage("download", "done");
+    setStage("run", "done");
+    setStage("render", "active");
+    const outputs = {};
+    for (const [k, v] of Object.entries(status.result)) {
+      const arr = decodeNdarray(v);
+      if (arr) outputs[k] = arr;
+    }
+    const key = Object.keys(outputs)[0];
+    if (!key) throw new Error("The model returned no decodable output tensors.");
+    const seconds = (performance.now() - t0) / 1000;
+    S.result = { outputs, key, seconds, inW: lastSentSize.W, inH: lastSentSize.H, ox: lastSentSize.ox, oy: lastSentSize.oy };
+    prepareResultView();
+    setStage("render", "done");
+    $("metaTime").style.display = "";
+    $("metaTime").innerHTML = `<span class="lbl">wall time</span>${seconds.toFixed(1)} s`;
+    $("metaOut").style.display = "";
+    $("metaOut").innerHTML = `<span class="lbl">out</span>${key} ${outputs[key].shape.join("×")}`;
+    setView("overlay");
+  } catch (err) {
+    showRunError("Inference failed.", err);
+  } finally {
+    S.running = false;
+    $("scanline").classList.remove("on");
+    updateRunBtn();
+  }
+}
+
+function applyStatus(st, t0) {
+  const qp = st.queue_position;
+  const stages = st.stages || {};
+  if (st.model_download) {
+    setStage("queue", "done");
+    setStage("download", stages.model_download && stages.model_download.end ? "done" : "active");
+  } else if (qp > 0) {
+    setStageLabel("queue", `Queued · ${qp} ahead`);
+    setStage("queue", "active");
+  }
+  if (st.running) {
+    setStage("download", "done");
+    const runQ = stages.run && stages.run.queue_position;
+    setStageLabel("run", runQ > 0 ? `Waiting for GPU · ${runQ} ahead` : "Running inference");
+    setStage("run", "active");
+  }
+  const el = document.querySelector('.pstage.active .ptime');
+  if (el) el.textContent = `${((performance.now() - t0) / 1000).toFixed(0)} s`;
+}
+
+function resetStages() {
+  document.querySelectorAll(".pstage").forEach((n) => {
+    n.classList.remove("active", "done");
+    n.querySelector(".pdot").textContent = "○";
+    n.querySelector(".ptime").textContent = "";
+  });
+  setStageLabel("queue", "Queued");
+  setStageLabel("run", "Running inference");
+}
+function setStage(name, cls) {
+  const n = document.querySelector(`.pstage[data-stage="${name}"]`);
+  if (!n) return;
+  n.classList.remove("active", "done");
+  n.classList.add(cls);
+  n.querySelector(".pdot").textContent = cls === "done" ? "●" : "◐";
+}
+function setStageLabel(name, text) {
+  const n = document.querySelector(`.pstage[data-stage="${name}"] .plbl`);
+  if (n) n.textContent = text;
+}
+
+function decodeNdarray(v) {
+  if (!v || v._rtype !== "ndarray") return null;
+  let raw = v._rvalue;
+  if (Array.isArray(raw)) { // chunked transfer
+    const total = raw.reduce((a, b) => a + b.byteLength, 0);
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const part of raw) { merged.set(new Uint8Array(part.buffer || part, part.byteOffset || 0, part.byteLength), off); off += part.byteLength; }
+    raw = merged;
+  }
+  const u8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+  const buf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+  const ctors = {
+    float32: Float32Array, float64: Float64Array,
+    uint8: Uint8Array, int8: Int8Array, uint16: Uint16Array, int16: Int16Array,
+    uint32: Uint32Array, int32: Int32Array, int64: BigInt64Array, uint64: BigUint64Array,
+  };
+  const C = ctors[v._rdtype];
+  if (!C) return null;
+  let data = new C(buf);
+  if (v._rdtype === "int64" || v._rdtype === "uint64") data = Float32Array.from(data, Number);
+  return { data, shape: v._rshape, dtype: v._rdtype };
+}
+
+/* ── Result interpretation & rendering ────────────────────── */
+function prepareResultView() {
+  const out = S.result.outputs[S.result.key];
+  const shape = out.shape;
+  // locate y/x/c dims from the model's declared output axes; fall back to
+  // "last two dims are spatial" when the declaration doesn't match
+  let iY = shape.length - 2, iX = shape.length - 1, iC = -1;
+  const outSpecs = S.model.rdf.outputs || [];
+  const outSpec = outSpecs.find((o) => (o.id || o.name) === S.result.key) || outSpecs[0];
+  if (outSpec) {
+    const axes = parseAxes(outSpec.axes, outSpec.shape);
+    if (axes && axes.length === shape.length) {
+      const y = axes.findIndex((a) => a.id === "y");
+      const x = axes.findIndex((a) => a.id === "x");
+      if (y >= 0 && x >= 0) {
+        iY = y; iX = x;
+        iC = axes.findIndex((a) => a.id === "c");
+      }
+    }
+  }
+  const H = shape[iY], W = shape[iX];
+  const planeSize = W * H;
+  const nPlanes = iC >= 0 ? shape[iC] : 1;
+  const strides = new Array(shape.length);
+  let acc = 1;
+  for (let i = shape.length - 1; i >= 0; i--) { strides[i] = acc; acc *= shape[i]; }
+  S.result.strideY = strides[iY];
+  S.result.strideX = strides[iX];
+  S.result.strideC = iC >= 0 ? strides[iC] : 0;
+  // integer-valued & >1 distinct positive → label map
+  let isLabels = /int/.test(out.dtype) && !/8$/.test(out.dtype);
+  if (!isLabels && nPlanes === 1) {
+    let integral = true, mx = 0;
+    const step = Math.max(1, Math.floor(out.data.length / 20000));
+    for (let i = 0; i < out.data.length; i += step) {
+      const v = Number(out.data[i]);
+      if (v !== Math.round(v)) { integral = false; break; }
+      if (v > mx) mx = v;
+    }
+    isLabels = integral && mx > 1;
+  }
+  S.result.kind = isLabels ? "labels" : "prob";
+  S.result.W = W; S.result.H = H; S.result.nPlanes = nPlanes;
+  $("viewOverlay").disabled = false;
+  $("opacityCtl").style.display = "";
+  $("threshCtl").style.display = isLabels ? "none" : "";
+  $("outChanCtl").style.display = nPlanes > 1 ? "" : "none";
+  if (nPlanes > 1) {
+    const sel = $("outChan");
+    sel.innerHTML = "";
+    for (let i = 0; i < nPlanes; i++) {
+      const o = document.createElement("option");
+      o.value = i; o.textContent = `ch ${i}`;
+      sel.appendChild(o);
+    }
+    sel.value = 0;
+  }
+}
+
+function getOverlayLabels() {
+  // returns Int32Array of instance labels at result resolution
+  const r = S.result;
+  const out = r.outputs[r.key];
+  const planeSize = r.W * r.H;
+  const chan = r.nPlanes > 1 ? +$("outChan").value : 0;
+  // stride-aware plane extraction (handles channel-first AND channel-last)
+  const plane = new Float32Array(planeSize);
+  const cOff = chan * r.strideC;
+  for (let y = 0; y < r.H; y++) {
+    const rowOff = cOff + y * r.strideY;
+    for (let x = 0; x < r.W; x++) plane[y * r.W + x] = Number(out.data[rowOff + x * r.strideX]);
+  }
+  if (r.kind === "labels") {
+    const labels = new Int32Array(planeSize);
+    const seen = new Set();
+    for (let i = 0; i < planeSize; i++) {
+      const v = Number(plane[i]) | 0;
+      labels[i] = v;
+      if (v > 0 && seen.size < 3) seen.add(v);
+    }
+    // a single positive value is a binary mask, not instances — split it
+    if (seen.size !== 1) return labels;
+    const bin = new Uint8Array(planeSize);
+    for (let i = 0; i < planeSize; i++) bin[i] = labels[i] > 0 ? 1 : 0;
+    return connectedComponents(bin, r.W, r.H);
+  }
+  // probability → threshold → connected components (4-connectivity)
+  const thr = +$("thresh").value / 100;
+  const mask = new Uint8Array(planeSize);
+  for (let i = 0; i < planeSize; i++) mask[i] = plane[i] >= thr ? 1 : 0;
+  return connectedComponents(mask, r.W, r.H);
+}
+
+function connectedComponents(mask, W, H) {
+  const planeSize = W * H;
+  const labels = new Int32Array(planeSize);
+  let next = 0;
+  const qx = new Int32Array(planeSize);
+  for (let i = 0; i < planeSize; i++) {
+    if (!mask[i] || labels[i]) continue;
+    next++;
+    labels[i] = next;
+    let head = 0, tail = 0;
+    qx[tail++] = i;
+    while (head < tail) {
+      const p = qx[head++];
+      const y = (p / W) | 0, x = p % W;
+      if (x > 0 && mask[p - 1] && !labels[p - 1]) { labels[p - 1] = next; qx[tail++] = p - 1; }
+      if (x < W - 1 && mask[p + 1] && !labels[p + 1]) { labels[p + 1] = next; qx[tail++] = p + 1; }
+      if (y > 0 && mask[p - W] && !labels[p - W]) { labels[p - W] = next; qx[tail++] = p - W; }
+      if (y < H - 1 && mask[p + W] && !labels[p + W]) { labels[p + W] = next; qx[tail++] = p + W; }
+    }
+  }
+  return labels;
+}
+
+function labelColor(id) {
+  const h = (id * 137.508) % 360;
+  return hslToRgb(h / 360, 0.72, 0.6);
+}
+function hslToRgb(h, s, l) {
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const f = (t) => {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return [Math.round(f(h + 1 / 3) * 255), Math.round(f(h) * 255), Math.round(f(h - 1 / 3) * 255)];
+}
+
+/* percentile stretch helper for display */
+function stretchLUT(data) {
+  const sample = [];
+  const step = Math.max(1, Math.floor(data.length / 50000));
+  for (let i = 0; i < data.length; i += step) sample.push(data[i]);
+  sample.sort((a, b) => a - b);
+  const lo = sample[Math.floor(sample.length * 0.01)];
+  const hi = sample[Math.min(sample.length - 1, Math.floor(sample.length * 0.998))];
+  const range = hi - lo || 1;
+  return (v) => {
+    const t = (v - lo) / range;
+    return t < 0 ? 0 : t > 1 ? 255 : Math.round(t * 255);
+  };
+}
+
+/* composite of image channels into RGB Uint8ClampedArray (W*H*4) */
+function compositeImage(img) {
+  const n = img.W * img.H;
+  const px = new Uint8ClampedArray(n * 4);
+  if (img.channels.length === 1) {
+    const lut = stretchLUT(img.channels[0]);
+    const ch = img.channels[0];
+    for (let i = 0; i < n; i++) {
+      const v = lut(ch[i]);
+      px[i * 4] = v; px[i * 4 + 1] = v; px[i * 4 + 2] = v; px[i * 4 + 3] = 255;
+    }
+    return px;
+  }
+  const isRGB = img.names[0] === "R";
+  for (let c = 0; c < img.channels.length; c++) {
+    const lut = stretchLUT(img.channels[c]);
+    const col = isRGB ? [[255,0,0],[0,255,0],[0,0,255]][c] : FLUOR[c % FLUOR.length];
+    const ch = img.channels[c];
+    for (let i = 0; i < n; i++) {
+      const v = lut(ch[i]) / 255;
+      px[i * 4]     = Math.min(255, px[i * 4]     + v * col[0]);
+      px[i * 4 + 1] = Math.min(255, px[i * 4 + 1] + v * col[1]);
+      px[i * 4 + 2] = Math.min(255, px[i * 4 + 2] + v * col[2]);
+    }
+  }
+  for (let i = 0; i < n; i++) px[i * 4 + 3] = 255;
+  return px;
+}
+
+function drawChannel(canvas, data, W, H, tint) {
+  const ctx = canvas.getContext("2d");
+  const size = Math.min(W, H);
+  const off = new OffscreenCanvas(W, H);
+  const octx = off.getContext("2d");
+  const id = octx.createImageData(W, H);
+  const lut = stretchLUT(data);
+  for (let i = 0; i < W * H; i++) {
+    const v = lut(data[i]) / 255;
+    id.data[i * 4] = v * tint[0]; id.data[i * 4 + 1] = v * tint[1]; id.data[i * 4 + 2] = v * tint[2];
+    id.data[i * 4 + 3] = 255;
+  }
+  octx.putImageData(id, 0, 0);
+  // center-crop square thumb
+  const sx = (W - size) / 2, sy = (H - size) / 2;
+  ctx.drawImage(off, sx, sy, size, size, 0, 0, canvas.width, canvas.height);
+}
+
+function drawComposite(canvas, img, cssSize) {
+  const px = compositeImage(img);
+  const off = new OffscreenCanvas(img.W, img.H);
+  const octx = off.getContext("2d");
+  octx.putImageData(new ImageData(px, img.W, img.H), 0, 0);
+  const size = Math.min(img.W, img.H);
+  const sx = (img.W - size) / 2, sy = (img.H - size) / 2;
+  canvas.getContext("2d").drawImage(off, sx, sy, size, size, 0, 0, canvas.width, canvas.height);
+}
+
+/* ── Stage rendering ──────────────────────────────────────── */
+function setView(v) {
+  S.view = v;
+  $("viewInput").classList.toggle("active", v === "input");
+  $("viewOverlay").classList.toggle("active", v === "overlay");
+  renderStage();
+}
+$("viewInput").addEventListener("click", () => setView("input"));
+$("viewOverlay").addEventListener("click", () => { if (!$("viewOverlay").disabled) setView("overlay"); });
+$("opacity").addEventListener("input", () => {
+  $("opacityVal").textContent = (+$("opacity").value / 100).toFixed(2);
+  if (S.view === "overlay") renderStage();
+});
+$("thresh").addEventListener("input", () => {
+  $("threshVal").textContent = (+$("thresh").value / 100).toFixed(2);
+  if (S.view === "overlay") renderStage();
+});
+$("outChan").addEventListener("change", () => { if (S.view === "overlay") renderStage(); });
+
+function renderStage() {
+  const canvas = $("stageCanvas");
+  if (!S.image) return;
+  $("stageEmpty").style.display = "none";
+  canvas.style.display = "";
+  const img = S.image;
+  const base = compositeImage(img);
+
+  if (S.view === "overlay" && S.result) {
+    const labels = getOverlayLabels();
+    const alpha = +$("opacity").value / 100;
+    const r = S.result;
+    // result may be smaller than the displayed image (center-crop happened
+    // before send, halo may shrink it further — halo is centered by core)
+    const offX = r.ox + Math.max(0, Math.round((r.inW - r.W) / 2));
+    const offY = r.oy + Math.max(0, Math.round((r.inH - r.H) / 2));
+    let count = 0;
+    for (let y = 0; y < r.H; y++) {
+      const iy = y + offY;
+      if (iy >= img.H) break;
+      for (let x = 0; x < r.W; x++) {
+        const ix = x + offX;
+        if (ix >= img.W) break;
+        const id = labels[y * r.W + x];
+        if (id > 0) {
+          if (id > count) count = id;
+          const c = labelColor(id);
+          const p = (iy * img.W + ix) * 4;
+          base[p]     = Math.round(base[p]     * (1 - alpha) + c[0] * alpha);
+          base[p + 1] = Math.round(base[p + 1] * (1 - alpha) + c[1] * alpha);
+          base[p + 2] = Math.round(base[p + 2] * (1 - alpha) + c[2] * alpha);
+        }
+      }
+    }
+    $("countCtl").style.display = "";
+    $("objCount").textContent = `${count} object${count === 1 ? "" : "s"}`;
+  }
+
+  // hi-DPI draw
+  const dpr = window.devicePixelRatio || 1;
+  const wrap = canvas.parentElement;
+  const maxW = wrap.clientWidth * 0.96, maxH = wrap.clientHeight * 0.94;
+  const scale = Math.min(maxW / img.W, maxH / img.H, 3);
+  const cssW = Math.round(img.W * scale), cssH = Math.round(img.H * scale);
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  const off = new OffscreenCanvas(img.W, img.H);
+  off.getContext("2d").putImageData(new ImageData(base, img.W, img.H), 0, 0);
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = scale < 1;
+  ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+}
+
+window.addEventListener("resize", () => renderStage());
+
+/* ── Errors ───────────────────────────────────────────────── */
+function showRunError(friendly, err) {
+  const el = $("runErr");
+  const detail = err ? (err.message || String(err)) : "";
+  el.innerHTML = `${escapeHtml(friendly)}${detail ? `<details><summary>Raw server response</summary><pre>${escapeHtml(detail)}</pre></details>` : ""}`;
+  el.classList.add("on");
+  document.querySelectorAll(".pstage.active").forEach((n) => n.classList.remove("active"));
+}
+function clearRunError() {
+  $("runErr").classList.remove("on");
+  $("runErr").innerHTML = "";
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/* ── Boot ─────────────────────────────────────────────────── */
+connect();
+</script>
+</body>
+</html>
