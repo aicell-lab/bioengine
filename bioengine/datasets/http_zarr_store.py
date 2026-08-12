@@ -53,7 +53,8 @@ class HttpZarrStore(Store):
     each chunk request. ``base_url`` may point to a BioEngine local data server
     path (``{service_url}/data/{dataset_id}/{zarr_path}``) or to any
     HTTPS-served Zarr root (e.g. an OME-Zarr URI from the BioImage Archive).
-    An optional ``token`` is appended as ``?token=`` for the local-server case.
+    An optional ``token`` is sent as an ``Authorization: Bearer`` header — it
+    cannot go in the query string, because keys are appended after it.
     """
 
     dataset_id: Optional[str] = None
@@ -88,9 +89,9 @@ class HttpZarrStore(Store):
                 the form ``{service_url}/data/{dataset_id}/{zarr_path}`` or an
                 arbitrary HTTPS Zarr root (e.g. an OME-Zarr URI from a public
                 repository). The store appends ``/{key}`` for each chunk.
-            token: Authentication token for access control. When set, appended
-                as ``?token=`` to each chunk URL. Public Zarr roots (e.g. BIA)
-                don't need it.
+            token: Authentication token for access control. When set, sent as an
+                ``Authorization: Bearer`` header on each chunk request. Public
+                Zarr roots (e.g. BIA) don't need it.
             chunk_cache: Shared LRU cache for chunk data. Defaults to the
                 process-wide ``default_cache`` so all stores share one budget.
                 Pass ``ChunkCache(max_size_gb=0)`` to disable caching.
@@ -107,6 +108,7 @@ class HttpZarrStore(Store):
         super().__init__(read_only=True)
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self._auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
         self.logger = logger
         self._chunk_cache = chunk_cache
         self.dataset_id = dataset_id
@@ -128,11 +130,8 @@ class HttpZarrStore(Store):
         )
 
     def _build_url(self, key: str) -> str:
-        """Build the chunk URL for a key, appending the token if present."""
-        url = f"{self.base_url}/{key.lstrip('/')}"
-        if self.token:
-            url += f"?token={self.token}"
-        return url
+        """Build the chunk URL for a key."""
+        return f"{self.base_url}/{key.lstrip('/')}"
 
     def _cache_key(self, key: str, byte_range: ByteRequest | None) -> str:
         """Generate a cache key scoped to this store's base_url."""
@@ -177,7 +176,7 @@ class HttpZarrStore(Store):
 
         async with self._request_semaphore:
             url = self._build_url(key)
-            headers = {}
+            headers = dict(self._auth_headers)
             if isinstance(byte_range, RangeByteRequest):
                 headers["Range"] = f"bytes={byte_range.start}-{byte_range.end - 1}"
             elif isinstance(byte_range, OffsetByteRequest):
@@ -223,7 +222,9 @@ class HttpZarrStore(Store):
     async def exists(self, key: str) -> bool:
         """Check if a key exists in the store without fetching its content."""
         url = self._build_url(key)
-        response = await self.http_client.get(url, headers={"Range": "bytes=0-0"})
+        response = await self.http_client.get(
+            url, headers={**self._auth_headers, "Range": "bytes=0-0"}
+        )
         return response.status_code in (200, 206)
 
     async def set(self, key: str, value: Buffer) -> None:

@@ -9,7 +9,7 @@ The datasets server exposes a simple HTTP API for:
 - Listing files within a dataset
 - Streaming file bytes directly, including zarr chunks with HTTP Range request support
 
-Clients connect directly to the datasets server using the `BioEngineDatasets` Python client. Authentication tokens are validated against `https://hypha.aicell.io` on demand and cached locally.
+Clients connect directly to the datasets server using the `BioEngineDatasets` Python client. Authentication tokens are sent in an `Authorization: Bearer` header, validated against `https://hypha.aicell.io` on demand, and cached locally.
 
 ---
 
@@ -188,6 +188,20 @@ Returns metadata for all datasets. No authentication required.
 curl http://localhost:39527/datasets
 ```
 
+### Authentication
+
+Authenticated endpoints take the Hypha token in an `Authorization: Bearer` header:
+
+```bash
+curl -H "Authorization: Bearer $HYPHA_TOKEN" http://localhost:39527/datasets/blood-atlas/files
+```
+
+> **Deprecated:** a `?token=` query parameter is still accepted so an older
+> client can talk to a newer server, but it will be removed. Prefer the header:
+> a query token is written to the access log on every request (once per zarr
+> chunk), and it cannot be used with a zarr store at all, because zarr appends
+> the key path *after* the query string.
+
 ```json
 {
   "blood-atlas": {
@@ -205,11 +219,12 @@ Lists all files in a dataset. Requires a valid token for non-public datasets.
 
 | Parameter | In | Description |
 |-----------|----|-------------|
-| `token` | query | Hypha authentication token (required if not public) |
+| `Authorization` | header | `Bearer <hypha_token>` (required if not public) |
 | `dir_path` | query | Subdirectory to list (e.g. `data.zarr`) |
 
 ```bash
-curl "http://localhost:39527/datasets/blood-atlas/files?token=your_token"
+curl -H "Authorization: Bearer $HYPHA_TOKEN" \
+  "http://localhost:39527/datasets/blood-atlas/files"
 ```
 
 Returns paths relative to the dataset root:
@@ -226,18 +241,18 @@ Upload a file to the server. Requires a Hypha authentication token (GitHub-backe
 |-----------|----|-------------|
 | `filename` | query | Name of the file — no path separators allowed |
 | `public` | query | `true` → world-readable, **no overwrite**. `false` (default) → owner-only, overwrite allowed |
-| `token` | query | Hypha authentication token (required) |
+| `Authorization` | header | `Bearer <hypha_token>` (required) |
 | Body | — | Raw file bytes (text or binary) |
 
 ```bash
 # Save a public text file (cannot be overwritten once created)
-curl -X POST \
-  "http://localhost:39527/save?filename=notes.txt&public=true&token=your_token" \
+curl -X POST -H "Authorization: Bearer $HYPHA_TOKEN" \
+  "http://localhost:39527/save?filename=notes.txt&public=true" \
   --data-binary "Hello from BioEngine"
 
 # Save or overwrite a private binary file
-curl -X POST \
-  "http://localhost:39527/save?filename=result.npy&public=false&token=your_token" \
+curl -X POST -H "Authorization: Bearer $HYPHA_TOKEN" \
+  "http://localhost:39527/save?filename=result.npy&public=false" \
   --data-binary @result.npy
 ```
 
@@ -260,14 +275,15 @@ Retrieve a previously saved file. Routes to the public or private directory base
 |-----------|----|-------------|
 | `filename` | path | Name of the file to retrieve |
 | `public` | query | `true` to fetch from the public directory. Default: `false` |
-| `token` | query | Hypha authentication token (required when `public=false`) |
+| `Authorization` | header | `Bearer <hypha_token>` (required when `public=false`) |
 
 ```bash
 # Fetch a public file (no token needed)
 curl "http://localhost:39527/saved/notes.txt?public=true"
 
 # Fetch your own private file
-curl "http://localhost:39527/saved/result.npy?public=false&token=your_token"
+curl -H "Authorization: Bearer $HYPHA_TOKEN" \
+  "http://localhost:39527/saved/result.npy?public=false"
 ```
 
 **Storage layout:**
@@ -293,13 +309,16 @@ Serves raw file bytes. Supports HTTP Range requests for partial content, which z
 
 ```bash
 # Full file
-curl "http://localhost:39527/data/blood-atlas/data.zarr/cells/c/0/0?token=your_token"
+curl -H "Authorization: Bearer $HYPHA_TOKEN" \
+  "http://localhost:39527/data/blood-atlas/data.zarr/cells/c/0/0"
 
 # Partial content
-curl -H "Range: bytes=0-1023" \
-  "http://localhost:39527/data/blood-atlas/data.zarr/cells/c/0/0?token=your_token"
+curl -H "Authorization: Bearer $HYPHA_TOKEN" -H "Range: bytes=0-1023" \
+  "http://localhost:39527/data/blood-atlas/data.zarr/cells/c/0/0"
 # → HTTP 206 Partial Content
 ```
+
+Paths are resolved strictly inside the dataset directory — any `..` component is rejected with `400`.
 
 ---
 
@@ -361,6 +380,46 @@ store = await client.get_file("blood-atlas", file_name="data.zarr")
 group = zarr.open_group(store=store, mode="r")
 print(list(group.array_keys()))
 ```
+
+### Read OME-Zarr
+
+`get_file` returns a standard `zarr` store, so an OME-Zarr image from a
+BioEngine dataset is consumed exactly like one from any other storage — the
+only line that differs is how the store is obtained:
+
+```python
+# Local, access-controlled — served in place by the data server
+store = await client.get_file("blood-atlas", file_name="image.ome.zarr")
+
+# Remote and public — plain zarr/fsspec, no BioEngine involved
+store = "https://uk1s3.embassy.ebi.ac.uk/idr/zarr/v0.4/idr0062A/6001240.zarr"
+
+# ... identical from here down
+import zarr
+group = zarr.open_group(store, mode="r")
+multiscales = group.attrs["ome"]["multiscales"]   # v0.5; top-level in v0.4
+level0 = group[multiscales[0]["datasets"][0]["path"]]
+patch = level0[0, 0, 0, 512:1024, 512:1024]       # only these chunks transfer
+```
+
+For anything beyond reading pixels at a known level — physical scale (µm/px),
+picking a level by resolution, HCS plates, or **writing** OME-Zarr — add
+[`ngff-zarr`](https://pypi.org/project/ngff-zarr/) to your app's dependencies.
+It takes any zarr store, handles NGFF v0.1–v0.6 uniformly, and returns dask
+arrays:
+
+```python
+import ngff_zarr
+
+multiscales = ngff_zarr.from_ngff_zarr(store)
+image = multiscales.images[0]
+print(image.dims, image.scale)        # ('t','c','z','y','x'), {'x': 0.325, ...}
+patch = image.data[0, 0, 0].compute()  # dask → streams the chunks it needs
+```
+
+`BioEngineDatasets` deliberately has no remote-storage support of its own: it
+serves local, authorised files, and hands back the standard store type that the
+wider zarr ecosystem already consumes.
 
 ### Get a non-zarr file
 

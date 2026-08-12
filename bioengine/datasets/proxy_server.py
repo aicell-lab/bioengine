@@ -6,7 +6,9 @@ all client-facing endpoints (dataset listing, file listing, and zarr chunk
 serving) with no Hypha service registration needed.
 
 Token authentication is delegated to the remote Hypha server on demand and
-cached locally — the server itself requires no credentials at startup.
+cached locally — the server itself requires no credentials at startup. Clients
+authenticate with an ``Authorization: Bearer`` header; the legacy ``?token=``
+query parameter is still accepted but deprecated.
 
 Architecture:
 - Dataset directories are scanned for manifest.yaml at startup
@@ -31,9 +33,11 @@ from typing import Any, Dict, List, Optional, Union
 
 import uvicorn
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from hypha_rpc import connect_to_server
+from uvicorn.logging import AccessFormatter
 
 from bioengine import __version__
 from bioengine.utils import (
@@ -53,6 +57,21 @@ logger = logging.getLogger("ProxyServer")
 # ---------------------------------------------------------------------------
 
 
+_TOKEN_QUERY_RE = re.compile(r"([?&]token=)[^&\s]*")
+
+
+class RedactingAccessFormatter(AccessFormatter):
+    """Access formatter that scrubs ``?token=`` values from the request line.
+
+    The query-param form is deprecated but still accepted, and the value is a
+    full-power Hypha credential rather than a scoped, expiring URL signature —
+    a zarr read would otherwise write it to the log once per chunk.
+    """
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        return _TOKEN_QUERY_RE.sub(r"\1<redacted>", super().formatMessage(record))
+
+
 def get_log_config(log_file: Optional[Path] = None) -> Dict[str, Any]:
     log_config = {
         "version": 1,
@@ -64,7 +83,7 @@ def get_log_config(log_file: Optional[Path] = None) -> Dict[str, Any]:
                 "use_colors": None,
             },
             "access": {
-                "()": "uvicorn.logging.AccessFormatter",
+                "()": "bioengine.datasets.proxy_server.RedactingAccessFormatter",
                 "fmt": '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
             },
         },
@@ -191,6 +210,19 @@ async def _watch_data_dir(
 # ---------------------------------------------------------------------------
 
 
+def resolve_token(authorization: Optional[str], token: Optional[str]) -> Optional[str]:
+    """Take the token from the Authorization header, else the ?token= query param.
+
+    The query param is deprecated — it leaks the credential into access logs and
+    breaks zarr store URLs, which append the key path after the query string.
+    """
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value.strip():
+            return value.strip()
+    return token
+
+
 async def parse_token(
     token: Optional[str],
     cached_user_info: Dict[str, dict],
@@ -203,10 +235,13 @@ async def parse_token(
         if cached is not None and cached.get("expires_at", 0) > time.time():
             return cached
 
-        async with connect_to_server(
-            {"server_url": AUTHENTICATION_SERVER_URL, "token": token}
-        ) as user_client:
-            user_info = user_client.config.user
+        try:
+            async with connect_to_server(
+                {"server_url": AUTHENTICATION_SERVER_URL, "token": token}
+            ) as user_client:
+                user_info = user_client.config.user
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
         cached_user_info[token] = user_info
         # Evict oldest entry when cache exceeds 1000 tokens
@@ -242,6 +277,21 @@ async def _authenticate_user(
         raise HTTPException(status_code=401, detail="Could not determine user identity from token")
     safe_uid = re.sub(r"[^a-zA-Z0-9_-]", "_", user_id)
     return user_id, safe_uid
+
+
+def safe_join(path: str, base_dir: Path) -> Path:
+    """Join a client-supplied relative path onto base_dir, rejecting traversal.
+
+    Unlike ``_validate_path`` this deliberately does not resolve symlinks:
+    dataset directories are curated by the data owner and legitimately symlink
+    out to other mounts, which is the whole point of serving data in place.
+    """
+    if not path:
+        raise HTTPException(status_code=400, detail="path must not be empty")
+    parts = Path(path).parts
+    if Path(path).is_absolute() or any(part == ".." for part in parts):
+        raise HTTPException(status_code=400, detail="path traversal is not allowed")
+    return base_dir / path
 
 
 async def _serve_file_response(full_path: Path, request: Optional[Request]) -> Response:
@@ -307,6 +357,16 @@ def _build_app(
         lifespan=lifespan,
     )
 
+    # Browser-based Zarr viewers fetch chunks cross-origin. Access control is
+    # enforced per request from the token, so the origin itself grants nothing.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "HEAD", "OPTIONS"],
+        allow_headers=["Authorization", "Range"],
+        expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
+    )
+
     @app.get("/health/liveness")
     async def liveness():
         return {"status": "ok"}
@@ -327,6 +387,7 @@ def _build_app(
         dataset_id: str,
         dir_path: Optional[str] = None,
         token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
     ):
         if dataset_id not in datasets:
             raise HTTPException(
@@ -335,7 +396,9 @@ def _build_app(
             )
 
         try:
-            user_info = await parse_token(token, cached_user_info)
+            user_info = await parse_token(
+                resolve_token(authorization, token), cached_user_info
+            )
             check_permissions(
                 context={"user": user_info},
                 authorized_users=datasets[dataset_id]["authorized_users"],
@@ -345,7 +408,7 @@ def _build_app(
             raise HTTPException(status_code=403, detail=str(e))
 
         base_path = datasets[dataset_id]["path"]
-        scan_path = base_path / dir_path if dir_path else base_path
+        scan_path = safe_join(dir_path, base_path) if dir_path else base_path
 
         if not scan_path.exists():
             raise HTTPException(
@@ -367,12 +430,15 @@ def _build_app(
         path: str,
         token: Optional[str] = None,
         request: Request = None,
+        authorization: Optional[str] = Header(None),
     ):
         if dataset_id not in datasets:
             raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
 
         try:
-            user_info = await parse_token(token, cached_user_info)
+            user_info = await parse_token(
+                resolve_token(authorization, token), cached_user_info
+            )
             check_permissions(
                 context={"user": user_info},
                 authorized_users=datasets[dataset_id]["authorized_users"],
@@ -381,7 +447,7 @@ def _build_app(
         except PermissionError as e:
             raise HTTPException(status_code=403, detail=str(e))
 
-        full_path = datasets[dataset_id]["path"] / path
+        full_path = safe_join(path, datasets[dataset_id]["path"])
         if not full_path.exists() or not full_path.is_file():
             raise HTTPException(status_code=404, detail=f"'{path}' not found")
 
@@ -439,6 +505,7 @@ def _build_app(
         filename: str,
         public: bool = False,
         token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
     ):
         """Save a file to the server.
 
@@ -452,7 +519,9 @@ def _build_app(
             token: Hypha authentication token (required).
         """
         _validate_filename(filename)
-        user_id, safe_uid = await _authenticate_user(token, cached_user_info)
+        user_id, safe_uid = await _authenticate_user(
+            resolve_token(authorization, token), cached_user_info
+        )
 
         if public:
             dataset_id = "saved-public"
@@ -490,6 +559,7 @@ def _build_app(
         public: bool = False,
         dir_path: Optional[str] = None,
         token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
     ):
         """List files in the public or private saved directory.
 
@@ -501,7 +571,9 @@ def _build_app(
         if public:
             save_dir = data_dir / "saved" / "public"
         else:
-            _, safe_uid = await _authenticate_user(token, cached_user_info)
+            _, safe_uid = await _authenticate_user(
+                resolve_token(authorization, token), cached_user_info
+            )
             save_dir = data_dir / "saved" / safe_uid
 
         if not save_dir.exists():
@@ -527,6 +599,7 @@ def _build_app(
         public: bool = False,
         token: Optional[str] = None,
         request: Request = None,
+        authorization: Optional[str] = Header(None),
     ):
         """Retrieve a previously saved file or file inside a subdirectory.
 
@@ -543,7 +616,9 @@ def _build_app(
         if public:
             save_dir = data_dir / "saved" / "public"
         else:
-            _, safe_uid = await _authenticate_user(token, cached_user_info)
+            _, safe_uid = await _authenticate_user(
+                resolve_token(authorization, token), cached_user_info
+            )
             save_dir = data_dir / "saved" / safe_uid
 
         full_path = _validate_path(filename, save_dir)
