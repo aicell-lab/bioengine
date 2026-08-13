@@ -386,6 +386,7 @@ def _build_app(
     async def list_files_route(
         dataset_id: str,
         dir_path: Optional[str] = None,
+        recursive: bool = True,
         token: Optional[str] = None,
         authorization: Optional[str] = Header(None),
     ):
@@ -415,6 +416,16 @@ def _build_app(
                 status_code=400,
                 detail=f"ValueError: Path '{dir_path}' does not exist in dataset '{dataset_id}'",
             )
+
+        if not recursive:
+            # Directories carry a trailing slash so a caller can tell them from
+            # files without a second request. Zarr's list_dir needs exactly this
+            # one level; walking instead would touch every chunk in a pyramid.
+            entries = []
+            for child in sorted(scan_path.iterdir()):
+                rel = str(child.relative_to(base_path))
+                entries.append(f"{rel}/" if child.is_dir() else rel)
+            return entries
 
         files = []
         for root, dirs, filenames in os.walk(scan_path):

@@ -326,6 +326,7 @@ class BioEngineDatasets:
         self,
         dataset_id: str,
         dir_path: Optional[str] = None,
+        recursive: bool = True,
         token: Optional[str] = None,
     ) -> List[str]:
         """
@@ -338,10 +339,14 @@ class BioEngineDatasets:
 
         Args:
             dataset_id: Name of the dataset to list files from
+            dir_path: Optional subdirectory to list, relative to the dataset root
+            recursive: When True (default) walk the whole tree and return files
+                only. When False list one level, with a trailing slash marking
+                directories.
             token: Optional authentication token for accessing protected datasets
 
         Returns:
-            List of file paths available within the specified dataset
+            List of paths relative to the dataset root
 
         Raises:
             ValueError: If the service_url is None or dataset does not exist
@@ -358,7 +363,7 @@ class BioEngineDatasets:
         start_time = asyncio.get_event_loop().time()
         token = token or self.default_token
 
-        params = {}
+        params = {"recursive": str(recursive).lower()}
         if dir_path is not None:
             params["dir_path"] = dir_path
 
@@ -448,6 +453,7 @@ class BioEngineDatasets:
             zarr_path = _file_path.as_posix().lstrip("/")
             file_output = HttpZarrStore(
                 base_url=f"{self.service_url}/data/{dataset_id}/{zarr_path}",
+                service_url=self.service_url,
                 token=token,
                 chunk_cache=self.chunk_cache,
                 logger=self.logger,

@@ -55,6 +55,12 @@ class HttpZarrStore(Store):
     HTTPS-served Zarr root (e.g. an OME-Zarr URI from the BioImage Archive).
     An optional ``token`` is sent as an ``Authorization: Bearer`` header — it
     cannot go in the query string, because keys are appended after it.
+
+    Listing is supported only against a BioEngine data server, which has a
+    catalog route to answer it; ``supports_listing`` is therefore per-instance
+    and stays False for an external root, since plain HTTP cannot enumerate
+    keys. Reading OME-Zarr never needs listing (child paths are declared in the
+    metadata), but a plain Zarr hierarchy is only discoverable through it.
     """
 
     dataset_id: Optional[str] = None
@@ -69,6 +75,7 @@ class HttpZarrStore(Store):
     def __init__(
         self,
         base_url: str,
+        service_url: Optional[str] = None,
         token: Optional[str] = None,
         chunk_cache: ChunkCache = default_cache,
         max_concurrent_requests: int = int(
@@ -89,6 +96,9 @@ class HttpZarrStore(Store):
                 the form ``{service_url}/data/{dataset_id}/{zarr_path}`` or an
                 arbitrary HTTPS Zarr root (e.g. an OME-Zarr URI from a public
                 repository). The store appends ``/{key}`` for each chunk.
+            service_url: Base URL of the BioEngine data server, used for the
+                listing route. Leave as ``None`` for an external Zarr root,
+                which disables listing.
             token: Authentication token for access control. When set, sent as an
                 ``Authorization: Bearer`` header on each chunk request. Public
                 Zarr roots (e.g. BIA) don't need it.
@@ -107,12 +117,17 @@ class HttpZarrStore(Store):
         """
         super().__init__(read_only=True)
         self.base_url = base_url.rstrip("/")
+        self.service_url = service_url.rstrip("/") if service_url else None
         self.token = token
         self._auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
         self.logger = logger
         self._chunk_cache = chunk_cache
         self.dataset_id = dataset_id
         self.zarr_path = zarr_path
+
+        # Listing needs the data server's catalog route, which a plain HTTPS Zarr
+        # root doesn't have — HTTP alone offers no way to enumerate keys.
+        self.supports_listing = bool(self.service_url and dataset_id and zarr_path)
 
         # Concurrency control
         self._request_semaphore = Semaphore(max_concurrent_requests)
@@ -238,14 +253,45 @@ class HttpZarrStore(Store):
     ) -> None:
         raise NotImplementedError("Partial write not supported")
 
-    def list(self) -> AsyncIterator[str]:
-        raise NotImplementedError("Listing not supported")
+    async def _list_keys(self, prefix: str, recursive: bool) -> list[str]:
+        """List store keys under prefix, as paths relative to the store root.
 
-    def list_prefix(self, prefix: str) -> AsyncIterator[str]:
-        raise NotImplementedError("Prefix listing not supported")
+        Returns an empty list for a prefix that doesn't exist, which is what
+        Zarr expects from a store when it probes for optional members.
+        """
+        if not self.supports_listing:
+            raise NotImplementedError(
+                "Listing requires a BioEngine data server; this store points at "
+                f"an external Zarr root ({self.base_url})"
+            )
+        root = self.zarr_path.strip("/")
+        prefix = prefix.strip("/")
+        response = await get_url_with_retry(
+            url=f"{self.service_url}/datasets/{self.dataset_id}/files",
+            params={
+                "dir_path": f"{root}/{prefix}" if prefix else root,
+                "recursive": str(recursive).lower(),
+            },
+            headers=self._auth_headers,
+            raise_for_status=False,
+            http_client=self.http_client,
+            logger=self.logger,
+        )
+        if response.status_code != 200:
+            return []
+        return [entry[len(root) + 1 :] for entry in response.json()]
 
-    def list_dir(self, prefix: str) -> AsyncIterator[str]:
-        raise NotImplementedError("Dir listing not supported")
+    async def list(self) -> AsyncIterator[str]:
+        for key in await self._list_keys("", recursive=True):
+            yield key
+
+    async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
+        for key in await self._list_keys(prefix, recursive=True):
+            yield key
+
+    async def list_dir(self, prefix: str) -> AsyncIterator[str]:
+        for entry in await self._list_keys(prefix, recursive=False):
+            yield entry.rstrip("/").rsplit("/", 1)[-1]
 
     def close(self):
         # The shared cache is intentionally not cleared here — other stores

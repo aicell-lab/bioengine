@@ -221,6 +221,7 @@ Lists all files in a dataset. Requires a valid token for non-public datasets.
 |-----------|----|-------------|
 | `Authorization` | header | `Bearer <hypha_token>` (required if not public) |
 | `dir_path` | query | Subdirectory to list (e.g. `data.zarr`) |
+| `recursive` | query | `true` (default) walks the whole tree; `false` lists one level |
 
 ```bash
 curl -H "Authorization: Bearer $HYPHA_TOKEN" \
@@ -232,6 +233,17 @@ Returns paths relative to the dataset root:
 ```json
 ["README.md", "manifest.yaml", "data.zarr/zarr.json", "data.zarr/cells/c/0/0"]
 ```
+
+With `recursive=false` only the immediate children are returned, and
+directories carry a trailing slash so you can tell them apart without a second
+request:
+
+```json
+["README.md", "manifest.yaml", "data.zarr/"]
+```
+
+Prefer `recursive=false` when walking a Zarr store — a multiscale pyramid can
+hold millions of chunk files, and the recursive form visits every one.
 
 ### `POST /save`
 
@@ -367,6 +379,9 @@ files = await client.list_files("blood-atlas")
 
 # Only files inside data.zarr/
 files = await client.list_files("blood-atlas", dir_path="data.zarr")
+
+# One level only — directories come back with a trailing slash
+entries = await client.list_files("blood-atlas", recursive=False)
 ```
 
 ### Get a zarr store
@@ -401,6 +416,26 @@ multiscales = group.attrs["ome"]["multiscales"]   # v0.5; top-level in v0.4
 level0 = group[multiscales[0]["datasets"][0]["path"]]
 patch = level0[0, 0, 0, 512:1024, 512:1024]       # only these chunks transfer
 ```
+
+### Explore a plain Zarr hierarchy
+
+OME-Zarr declares every child path in its metadata, so reading one never needs
+to enumerate the store. A plain Zarr group declares nothing — the only way to
+find out what is in it is to list it. A store from `get_file` supports that:
+
+```python
+store = await client.get_file("blood-atlas", file_name="unknown.zarr")
+group = zarr.open_group(store, mode="r")
+
+print(sorted(group.array_keys()))   # ['alpha', 'beta']
+print(sorted(group.group_keys()))   # ['nested']
+```
+
+Listing is backed by the data server's file catalog, so it works only for
+stores obtained from `get_file`. A store built directly on an external HTTPS
+Zarr root reports `supports_listing = False` and raises on the listing methods,
+because plain HTTP has no way to enumerate keys — reach such a root through
+`fsspec`/`s3fs` if you need to explore it.
 
 For anything beyond reading pixels at a known level — physical scale (µm/px),
 picking a level by resolution, HCS plates, or **writing** OME-Zarr — add
