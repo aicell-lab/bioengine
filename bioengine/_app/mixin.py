@@ -43,15 +43,21 @@ def _setup_replica(instance: Any) -> None:
     if os.environ.get("BIOENGINE_DEBUG") == "1":
         logger.setLevel(logging.DEBUG)
 
-    _register_with_proxy_actor(instance, logger)
-    _ensure_working_directory(logger)
-    _purge_stale_app_modules(logger)
-    _unmask_secret_env_vars()
-
     instance._bioengine_replica_initialized = False
     instance._bioengine_replica_test_failed = False
     instance._bioengine_test_task: Optional[asyncio.Task] = None
     instance._bioengine_health_check_lock = asyncio.Lock()
+
+    instance._bioengine_has_gpu = False
+    instance._bioengine_node_id = None
+    instance._bioengine_proxy_handle = None
+    instance._bioengine_gpu_sampler = None
+    instance._bioengine_gpu_init_failed = False
+
+    _register_with_proxy_actor(instance, logger)
+    _ensure_working_directory(logger)
+    _purge_stale_app_modules(logger)
+    _unmask_secret_env_vars()
 
 
 def _baked_identity(cls: type) -> Dict[str, Optional[str]]:
@@ -104,6 +110,10 @@ def _register_with_proxy_actor(instance: Any, logger: logging.Logger) -> None:
             exc_info=True,
         )
         return
+
+    instance._bioengine_has_gpu = len(ray.get_gpu_ids()) > 0
+    instance._bioengine_node_id = ray.get_runtime_context().get_node_id()
+    instance._bioengine_proxy_handle = proxy_actor_handle
 
     try:
         replica_context = serve.get_replica_context()
@@ -274,6 +284,24 @@ def _make_check_health(
             elif not self._bioengine_replica_initialized:
                 self._bioengine_replica_initialized = True
 
+            if (
+                self._bioengine_has_gpu
+                and self._bioengine_gpu_sampler is None
+                and not self._bioengine_gpu_init_failed
+            ):
+                from bioengine._app.gpu_memory import CudaMemorySampler
+
+                try:
+                    self._bioengine_gpu_sampler = await asyncio.to_thread(
+                        CudaMemorySampler
+                    )
+                except Exception as e:
+                    self._bioengine_gpu_init_failed = True
+                    raise RuntimeError(
+                        "GPU deployment was assigned a GPU but could not "
+                        "initialize a CUDA context"
+                    ) from e
+
             if self._bioengine_test_task is None and smoke_test_name:
                 logger.info("🚀 Launching smoke test in the background...")
                 self._bioengine_test_task = asyncio.create_task(
@@ -297,6 +325,15 @@ def _make_check_health(
                     await hook()
                 else:
                     await asyncio.to_thread(hook)
+
+            sampler = self._bioengine_gpu_sampler
+            handle = self._bioengine_proxy_handle
+            if sampler is not None and handle is not None:
+                used, _total = await asyncio.to_thread(sampler.sample)
+                handle.report_gpu_memory.remote(
+                    node_id=self._bioengine_node_id,
+                    used_gpu_memory=used,
+                )
 
     return check_health
 

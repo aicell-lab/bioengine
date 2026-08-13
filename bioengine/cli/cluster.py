@@ -45,6 +45,19 @@ def add_worker_options(f):
     return f
 
 
+def _format_vram(used, total):
+    """Render used/total VRAM in GiB, tolerating the ``"NA"`` sentinel.
+
+    A GPU node with no live reporter (idle, or no bioengine GPU app) reports
+    ``used_gpu_memory == "NA"``; dividing that by ``1024**3`` would crash.
+    """
+
+    def _gib(value):
+        return f"{value / 1024**3:.1f}" if isinstance(value, (int, float)) else "NA"
+
+    return f"{_gib(used)}/{_gib(total)} GiB"
+
+
 @click.group("cluster")
 def cluster_group():
     """Inspect BioEngine Ray cluster resources (GPUs, CPUs, memory)."""
@@ -108,14 +121,15 @@ def cluster_status(as_json, worker_service_id, token, server_url):
         if gpu_nodes:
             click.echo("GPU nodes:")
             for nid, info in gpu_nodes:
-                vram_used_gb = info.get("used_gpu_memory", 0) / 1024**3
-                vram_total_gb = info.get("total_gpu_memory", 0) / 1024**3
+                vram = _format_vram(
+                    info.get("used_gpu_memory", 0), info.get("total_gpu_memory", 0)
+                )
                 role = "HEAD" if info.get("head") else "worker"
                 click.echo(
                     f"  {info.get('node_ip')} [{role}] "
                     f"{info.get('accelerator_type', '?')} "
                     f"GPU: {info.get('used_gpu', 0):.1f}/{info.get('total_gpu', 0):.0f} "
-                    f"VRAM: {vram_used_gb:.1f}/{vram_total_gb:.1f} GiB  "
+                    f"VRAM: {vram}  "
                     f"CPU: {info.get('used_cpu', 0):.0f}/{info.get('total_cpu', 0):.0f}"
                 )
 
