@@ -39,6 +39,89 @@ logger.setLevel("INFO")
 SINGLE_INPUT_KEY = "__single_input__"
 
 
+# Resident inference child: loads the model once from its argv identity,
+# then loops handling predict requests (input_dir/output_dir/sample_id on
+# stdin) until stdin closes. Responses (ready / ok / error) go on a private
+# ``pass_fds`` pipe so chatty framework stdout can never be mis-parsed as a
+# protocol message. Large arrays stay on disk — never over the pipe.
+_WARM_CHILD_SCRIPT = r"""
+import ctypes, json, os, signal, sys
+from pathlib import Path
+import numpy as np
+
+# Kernel SIGKILLs this child the instant the parent replica dies — even
+# mid-predict — so a VRAM-holding process can never be orphaned.
+try:
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+except Exception:
+    pass
+
+from bioimageio.core import create_prediction_pipeline, load_model_description
+from bioimageio.core.digest_spec import create_sample_for_model
+
+rdf_path, load_params_path, resp_fd = sys.argv[1:4]
+resp = os.fdopen(int(resp_fd), "w")
+
+
+def _respond(obj):
+    resp.write(json.dumps(obj) + "\n")
+    resp.flush()
+
+
+with open(load_params_path) as f:
+    lp = json.load(f)
+single_input_key = lp["single_input_key"]
+default_blocksize_parameter = lp["default_blocksize_parameter"]
+
+model_description = load_model_description(rdf_path)
+pipeline = create_prediction_pipeline(
+    model_description,
+    weights_format=lp["weights_format"],
+    device=lp["device"],
+    default_blocksize_parameter=default_blocksize_parameter,
+)
+pipeline.load()
+_respond({"status": "ready"})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    try:
+        inputs = {}
+        for entry in sorted(Path(req["input_dir"]).iterdir()):
+            if entry.is_file() and entry.suffix == ".npy":
+                inputs[entry.stem] = np.load(str(entry))
+        if not inputs:
+            raise ValueError("No .npy input files found under " + req["input_dir"])
+        # A bare single input arrives under the sentinel key; hand it to core
+        # as a bare array so it maps to the model's sole input member id.
+        # Explicit multi/named inputs pass through as-is.
+        sample_inputs = (
+            inputs[single_input_key]
+            if list(inputs) == [single_input_key]
+            else inputs
+        )
+        sample = create_sample_for_model(
+            pipeline.model_description,
+            inputs=sample_inputs,
+            sample_id=req["sample_id"],
+        )
+        if default_blocksize_parameter:
+            result = pipeline.predict_sample_with_blocking(sample)
+        else:
+            result = pipeline.predict_sample_without_blocking(sample)
+        out = Path(req["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        for key, member in result.members.items():
+            np.save(str(out / (str(key) + ".npy")), member.data.data)
+        _respond({"status": "ok"})
+    except Exception as e:
+        _respond({"status": "error", "message": repr(e)})
+"""
+
+
 def _read_pip(name: str) -> List[str]:
     """Load a ``requirements-*.txt`` file next to this module.
 
@@ -156,6 +239,11 @@ class RuntimeDeployment:
         # replica. That extra queue is intentional: Ray Serve's
         # autoscaler needs to see it to scale up.
         self._gpu_lock = asyncio.Lock()
+        # One resident inference child, reused for consecutive predicts of
+        # the SAME model and evicted (killed → VRAM reclaimed) only on a
+        # model switch / test / error / teardown. ``None`` when no child is
+        # resident. Guarded entirely by ``_gpu_lock``. See ``_spawn_warm``.
+        self._warm = None
         # Route bioimageio.spec + bioimageio.core log messages through
         # loguru. Their loggers are ``logger.disable()``-d by default
         # (standard convention for libraries), so per-weight-format
@@ -490,11 +578,14 @@ class RuntimeDeployment:
                 f"GPU: {gpu_before / (1024 * 1024):.2f} MB"
             )
 
-            # Both the test and the infer path run the model in a child
-            # process (CUDA-context isolation), so no GPU-resident model
-            # from a prior call survives in this replica to contend for
-            # VRAM — the tested model has the whole GPU to itself once we
-            # hold ``_gpu_lock``. Nothing to evict here.
+            # The test child assumes a clean CUDA context. Evict any
+            # resident warm inference child first so its VRAM is reclaimed
+            # before the test subprocess loads the model — otherwise a
+            # warm model would contend for VRAM with the tested one on a
+            # time-sliced GPU (no per-replica VRAM isolation).
+            if self._warm is not None:
+                logger.info("🔄 [test] Evicting warm inference child before test")
+            await asyncio.to_thread(self._evict_warm)
 
             # Run the sync ``_test`` in a thread so it doesn't block
             # this replica's asyncio loop. ``_test`` blocks on
@@ -592,124 +683,151 @@ class RuntimeDeployment:
 
     # === Prediction ===
 
-    def _run_prediction_subprocess(
-        self,
-        rdf_path: str,
-        input_dir: str,
-        output_dir: str,
-        params: Dict[str, object],
+    def _spawn_warm(
+        self, key: tuple, rdf_path: str, load_params: Dict[str, object]
     ) -> None:
-        """Load the model, run inference, and write outputs — all in a
-        child Python process for CUDA-context isolation.
+        """Spawn a resident inference child that loads the model once and
+        then serves predict requests until stdin closes.
 
-        Mirrors ``_run_bioimageio_test_subprocess``. A subprocess is the
-        only framework-agnostic way to guarantee the model's VRAM is
-        fully reclaimed: the OS tears down the entire CUDA context on
-        exit, so torch's caching allocator, TensorFlow's greedy
-        whole-GPU grab, and onnxruntime's CUDA arena are all released no
-        matter what state the model left behind. An in-process pipeline
-        cache plus ``torch.cuda.empty_cache()`` only ever freed torch
-        memory and left TF / ONNX VRAM pinned until replica restart —
-        the cause of OOM piling up across repeated infer calls.
+        A child process is the only framework-agnostic way to guarantee
+        the model's VRAM is fully reclaimed on eviction: the OS tears
+        down the entire CUDA context on exit, releasing torch's caching
+        allocator, TensorFlow's greedy whole-GPU grab, and onnxruntime's
+        CUDA arena no matter what state the model left behind. Reusing
+        the child across consecutive predicts of the *same* model keeps
+        the loaded weights resident (no per-call ``pipeline.load()``);
+        eviction on a model switch reclaims that VRAM before the next
+        model loads.
 
-        The child reads ``input_dir/<key>.npy`` and writes
-        ``output_dir/<key>.npy`` itself so large arrays never cross the
-        process boundary; ``params`` travels as a small JSON file.
+        Blocks until the child signals the model finished loading, so the
+        first predict never races the load and the cold-start cost is
+        paid here (under ``_gpu_lock``). Stores the live child on
+        ``self._warm``.
         """
+        import collections
         import subprocess
         import sys
         import tempfile
+        import threading
 
-        script = """
-import json, sys
-from pathlib import Path
-import numpy as np
-from bioimageio.core import create_prediction_pipeline, load_model_description
-from bioimageio.core.digest_spec import create_sample_for_model
+        r_fd, w_fd = os.pipe()
+        tail = collections.deque(maxlen=40)
+        lp_dir = tempfile.mkdtemp(prefix="mr-warm-")
+        lp_path = os.path.join(lp_dir, "load_params.json")
+        with open(lp_path, "w") as f:
+            json.dump(load_params, f)
 
-rdf_path, input_dir, output_dir, params_path = sys.argv[1:5]
-with open(params_path) as f:
-    params = json.load(f)
-single_input_key = params["single_input_key"]
+        logger.info(
+            f"🐍 [predict] Spawning resident inference child for {rdf_path}"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _WARM_CHILD_SCRIPT, rdf_path, lp_path, str(w_fd)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            pass_fds=(w_fd,),
+            env=self._safe_subprocess_env(),
+            text=True,
+        )
+        os.close(w_fd)
+        resp = os.fdopen(r_fd, "r")
 
-inputs = {}
-for entry in sorted(Path(input_dir).iterdir()):
-    if entry.is_file() and entry.suffix == ".npy":
-        inputs[entry.stem] = np.load(str(entry))
-if not inputs:
-    raise ValueError("No .npy input files found under " + input_dir)
+        def _drain() -> None:
+            for line in proc.stdout:
+                line = line.rstrip()
+                tail.append(line)
+                logger.info(f"[predict:child] {line}")
 
-model_description = load_model_description(rdf_path)
-pipeline = create_prediction_pipeline(
-    model_description,
-    weights_format=params["weights_format"],
-    device=params["device"],
-    default_blocksize_parameter=params["default_blocksize_parameter"],
-)
-pipeline.load()
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
 
-# A bare single input arrives under the sentinel key; hand it to core as
-# a bare array so it maps to the model's sole input member id. Explicit
-# multi/named inputs pass through as-is.
-sample_inputs = (
-    inputs[single_input_key]
-    if list(inputs) == [single_input_key]
-    else inputs
-)
-sample = create_sample_for_model(
-    pipeline.model_description,
-    inputs=sample_inputs,
-    sample_id=params["sample_id"],
-)
-if params["default_blocksize_parameter"]:
-    result = pipeline.predict_sample_with_blocking(sample)
-else:
-    result = pipeline.predict_sample_without_blocking(sample)
+        self._warm = {
+            "proc": proc,
+            "key": key,
+            "stdin": proc.stdin,
+            "resp": resp,
+            "reader": reader,
+            "tail": tail,
+        }
 
-out = Path(output_dir)
-out.mkdir(parents=True, exist_ok=True)
-for key, member in result.members.items():
-    np.save(str(out / (str(key) + ".npy")), member.data.data)
-"""
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            params_path = str(Path(tmpdir) / "params.json")
-            with open(params_path, "w") as f:
-                json.dump(params, f)
-            logger.info(
-                f"🐍 [predict] Spawning bioimageio subprocess for CUDA "
-                f"context isolation: {sys.executable} -c <inline> {rdf_path}"
-            )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    script,
-                    rdf_path,
-                    input_dir,
-                    output_dir,
-                    params_path,
-                ],
-                capture_output=True,
-                text=True,
-                env=self._safe_subprocess_env(),
-            )
-            if result.stdout:
-                for line in result.stdout.rstrip().splitlines()[-40:]:
-                    logger.info(f"[predict:stdout] {line}")
-            if result.stderr:
-                for line in result.stderr.rstrip().splitlines()[-40:]:
-                    logger.info(f"[predict:stderr] {line}")
-            if result.returncode != 0:
-                stderr_tail = (result.stderr or "")[-800:]
-                if "out of memory" in stderr_tail.lower():
-                    raise RuntimeError(
-                        f"CUDA out of memory during inference: {stderr_tail}"
-                    )
+        ready = resp.readline()
+        if not ready or json.loads(ready).get("status") != "ready":
+            tail_str = "\n".join(tail)[-800:]
+            self._evict_warm()
+            shutil.rmtree(lp_dir, ignore_errors=True)
+            if "out of memory" in tail_str.lower():
                 raise RuntimeError(
-                    f"Inference subprocess exited with code "
-                    f"{result.returncode} (stderr tail: {stderr_tail!r})"
+                    f"CUDA out of memory during inference: {tail_str}"
                 )
+            raise RuntimeError(
+                f"Inference child failed to load model (stderr tail: {tail_str!r})"
+            )
+        shutil.rmtree(lp_dir, ignore_errors=True)
+
+    def _send_predict(
+        self, input_dir: str, output_dir: str, sample_id: str
+    ) -> None:
+        """Send one predict request to the resident child and wait for its
+        result. On child crash or error the child is evicted (a poisoned
+        CUDA context is never reused) and the same ``RuntimeError`` the
+        one-shot path used to raise is surfaced for the entry to handle.
+        """
+        warm = self._warm
+        req = {"input_dir": input_dir, "output_dir": output_dir, "sample_id": sample_id}
+        try:
+            warm["stdin"].write(json.dumps(req) + "\n")
+            warm["stdin"].flush()
+        except (BrokenPipeError, OSError):
+            line = ""
+        else:
+            line = warm["resp"].readline()
+
+        if not line:
+            tail_str = "\n".join(warm["tail"])[-800:]
+            self._evict_warm()
+            if "out of memory" in tail_str.lower():
+                raise RuntimeError(
+                    f"CUDA out of memory during inference: {tail_str}"
+                )
+            raise RuntimeError(
+                f"Inference child exited during prediction (stderr tail: {tail_str!r})"
+            )
+
+        resp = json.loads(line)
+        if resp.get("status") != "ok":
+            message = resp.get("message", "")
+            self._evict_warm()
+            if "out of memory" in message.lower():
+                raise RuntimeError(
+                    f"CUDA out of memory during inference: {message}"
+                )
+            raise RuntimeError(f"Inference failed: {message}")
+
+    def _evict_warm(self) -> None:
+        """Kill the resident inference child and reap it — reclaiming its
+        VRAM. Safe to call when no child is resident.
+        """
+        warm = self._warm
+        if warm is None:
+            return
+        self._warm = None
+        proc = warm["proc"]
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            pass
+        for stream in ("stdin", "resp"):
+            try:
+                warm[stream].close()
+            except Exception:
+                pass
+        reader = warm.get("reader")
+        if reader is not None:
+            reader.join(timeout=5)
 
     async def predict_from_disk(
         self,
@@ -719,6 +837,7 @@ for key, member in result.members.items():
         device: Literal["cuda", "cpu"] = None,
         default_blocksize_parameter: Optional[int] = None,
         sample_id: str = "sample",
+        remote_modified: Optional[str] = None,
     ) -> None:
         """Read inputs from disk, run inference in a subprocess, write
         outputs to disk.
@@ -733,10 +852,12 @@ for key, member in result.members.items():
         2. Writes ``state.json`` with ``runtime_started_at`` so the
            entry can distinguish "still queued at runtime" from
            "actively running" when computing ``queue_position``.
-        3. Runs the model in a child process
-           (``_run_prediction_subprocess``) which reads the inputs,
-           predicts, and writes ``output/<key>.npy``. The subprocess exit
-           reclaims all of the model's VRAM regardless of framework.
+        3. Runs the model in a resident child process (``_spawn_warm`` /
+           ``_send_predict``) which reads the inputs, predicts, and
+           writes ``output/<key>.npy``. The child is reused for
+           consecutive predicts of the same model (identity ``key``
+           below) and evicted — reclaiming all of the model's VRAM
+           regardless of framework — on a model switch.
         4. Deletes the input dir and records ``runtime_completed_at``.
 
         The entry's poll (``get_infer_status``) reads the outputs off
@@ -773,19 +894,50 @@ for key, member in result.members.items():
                 f"🚀 Starting prediction for model at {rdf_path} with "
                 f"device={device} and weights_format={weights_format}"
             )
-            params: Dict[str, object] = {
-                "weights_format": weights_format,
-                "device": device,
-                "default_blocksize_parameter": default_blocksize_parameter,
-                "sample_id": sample_id,
-                "single_input_key": SINGLE_INPUT_KEY,
-            }
-            await asyncio.to_thread(
-                self._run_prediction_subprocess,
+            # Identity of the resident child. ``remote_modified`` is the
+            # cache's own staleness token (entry passes
+            # ``package.latest_remote_modified``): a genuine model update
+            # changes it → key mismatch → evict + reload, so the warm
+            # pipeline can never outlive a cache refresh.
+            key = (
                 rdf_path,
+                remote_modified,
+                weights_format,
+                device,
+                default_blocksize_parameter,
+            )
+            warm = self._warm
+            reuse = (
+                warm is not None
+                and warm["proc"].poll() is None
+                and warm["key"] == key
+            )
+            if reuse:
+                logger.info(f"♻️ [predict] Reusing warm inference child for {rdf_path}")
+            else:
+                if warm is not None:
+                    reason = (
+                        "model switch" if warm["key"] != key else "warm child exited"
+                    )
+                    logger.info(
+                        f"🔄 [predict] Evicting warm child ({reason}) before "
+                        f"loading {rdf_path}"
+                    )
+                await asyncio.to_thread(self._evict_warm)
+                load_params: Dict[str, object] = {
+                    "weights_format": weights_format,
+                    "device": device,
+                    "default_blocksize_parameter": default_blocksize_parameter,
+                    "single_input_key": SINGLE_INPUT_KEY,
+                }
+                await asyncio.to_thread(
+                    self._spawn_warm, key, rdf_path, load_params
+                )
+            await asyncio.to_thread(
+                self._send_predict,
                 str(input_dir),
                 str(output_dir),
-                params,
+                sample_id,
             )
 
             # Free the input images now the child has consumed them.

@@ -2934,6 +2934,7 @@ class EntryDeployment:
                     device=device,
                     default_blocksize_parameter=default_blocksize_parameter,
                     sample_id=sample_id,
+                    remote_modified=package.latest_remote_modified,
                 )
 
             self._update_infer_job(job, state="completed")
