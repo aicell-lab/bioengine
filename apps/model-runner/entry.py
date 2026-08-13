@@ -156,9 +156,12 @@ class EntryDeployment:
 
         # Set Hypha server and workspace
         self.server_url = "https://hypha.aicell.io"
-        self._hypha_token = os.getenv("HYPHA_TOKEN")
-        if not self._hypha_token:
-            raise RuntimeError("HYPHA_TOKEN environment variable is not set")
+        # No token is allowed: the client then connects anonymously and the
+        # app runs in public read-only mode (search / RDF / validate / test /
+        # infer on public models via inline ndarray or public-URL inputs). The
+        # anonymous workspace is read-only, so ``get_upload_url`` and test-report
+        # publishing are unavailable — see ``_async_init`` and ``get_upload_url``.
+        self._hypha_token = os.getenv("HYPHA_TOKEN") or None
 
         # Conda env cache soft ceiling
         raw = os.getenv("CONDA_ENV_CACHE_MAX_GB", str(self._CONDA_ENV_CACHE_MIN_GB))
@@ -217,8 +220,9 @@ class EntryDeployment:
         # same ``test-report-<model>`` artifact (a published and a staged
         # test of one model would otherwise race on its single staging area).
         self._report_locks: Dict[str, asyncio.Lock] = {}
-        # Set in ``_async_init`` once the workspace of the app token is known.
+        # Both set in ``_async_init`` once the connected identity is known.
         self._test_reports_writable: bool = False
+        self._is_anonymous: bool = False
 
         # Replica identifier for logging.
         try:
@@ -247,12 +251,10 @@ class EntryDeployment:
 
     @bioengine.async_init
     async def _async_init(self) -> None:
-        self.hypha_client = await connect_to_server(
-            {
-                "server_url": self.server_url,
-                "token": self._hypha_token,
-            }
-        )
+        connect_config = {"server_url": self.server_url}
+        if self._hypha_token:
+            connect_config["token"] = self._hypha_token
+        self.hypha_client = await connect_to_server(connect_config)
         self.artifact_manager = await self.hypha_client.get_service(
             "public/artifact-manager"
         )
@@ -288,11 +290,20 @@ class EntryDeployment:
         # injected; manual deploys must pass it via ``--hypha-token``.
         # Otherwise reports are cached + returned only.
         user = dict(self.hypha_client.config.user or {})
+        self._is_anonymous = bool(user.get("is_anonymous"))
         scope = dict(user.get("scope") or {})
         workspace_perms = dict(scope.get("workspaces") or {})
         token_permission = workspace_perms.get(self._TEST_REPORTS_WORKSPACE)
         self._test_reports_writable = token_permission in ("rw", "a")
-        if self._test_reports_writable:
+        if self._is_anonymous:
+            logger.warning(
+                "⚠️ No HYPHA_TOKEN — connected anonymously in PUBLIC READ-ONLY "
+                "mode. Search / RDF / validate / test / infer on public models "
+                "work with inline ndarray or public-URL inputs, but get_upload_url "
+                "(S3 upload) and test-report publishing are unavailable. Redeploy "
+                "with --hypha-token for full functionality."
+            )
+        elif self._test_reports_writable:
             logger.info(
                 f"📤 Test reports will be published to '{self._TEST_REPORTS_COLLECTION}'."
             )
@@ -1643,6 +1654,25 @@ class EntryDeployment:
     # Note: Parameter type hints and docstrings will be used to generate the API documentation.
 
     @bioengine.method
+    async def get_status(self) -> Dict[str, Union[str, bool]]:
+        """Report which capabilities this deployment actually has.
+
+        The runner degrades gracefully by connected identity: a tokenless
+        (anonymous) deploy can only read public models and run inference on
+        inline/URL inputs, while full functionality (S3 upload, test-report
+        publishing) needs a token with read-write scope on the bioimage-io
+        workspace. Deployers verify a runner is fully functional by asserting
+        ``test_reports_writable`` here. Artifact/version identity is NOT
+        returned — read that from the worker's ``get_app_status`` instead.
+        """
+        return {
+            "workspace": self.hypha_client.config.workspace,
+            "is_anonymous": self._is_anonymous,
+            "s3_upload_available": not self._is_anonymous,
+            "test_reports_writable": self._test_reports_writable,
+        }
+
+    @bioengine.method
     async def search_models(
         self,
         keywords: Optional[List[str]] = Field(
@@ -2668,6 +2698,14 @@ class EntryDeployment:
                 await client.put(result["upload_url"], content=buf.getvalue())
             output = await model_runner_service.infer(model_id="...", inputs=result["file_path"])
         """
+        if self._is_anonymous:
+            raise RuntimeError(
+                "Upload is unavailable: this model-runner was deployed without a "
+                "HYPHA_TOKEN and runs in public read-only mode. Pass an ndarray or "
+                "a public image URL to infer() directly, or redeploy the runner "
+                "with --hypha-token to enable S3 uploads."
+            )
+
         unique_id = str(uuid.uuid4())
         file_path = f"temp/{unique_id}{file_type}"
 

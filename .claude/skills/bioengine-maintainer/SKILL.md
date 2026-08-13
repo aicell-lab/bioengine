@@ -184,6 +184,21 @@ Different maintainers may run production on entirely different clusters — the 
 
 **Coordinated framework + app upgrades.** A bioengine version bump that changes app-facing API (0.11.22's rename `@bioengine.multiplexed → @bioengine.cached` was one) requires a matching app version bump landing at the same helm upgrade. On a single-commit helm upgrade the worker pod cycles → boots the new worker image → deploys the new app version → all in one atomic hop. Bumping the worker image alone would boot on 0.11.22 and immediately `AttributeError` while trying to deploy an app that still uses the removed API. The clean-break style used in 0.11.22 (no deprecation shim) makes this coordination mandatory rather than merely advisable.
 
+### Verify the official model-runner has full functionality after deploy
+
+From **1.19.0** the model-runner no longer hard-fails when `HYPHA_TOKEN` is absent — it connects anonymously and runs in **public read-only mode** (search / RDF / validate / test / infer on public models, but `get_upload_url` and test-report publishing disabled). This is deliberate, so users can self-deploy a runner without minting a token, but it means a misconfigured **official** deployment (missing / expired / wrong-scoped token — see the worker-token-expiry failure mode) now degrades *silently* instead of crash-looping. After deploying or upgrading the production `model-runner` that the bioimage.io UI pins, assert it is fully functional and fail loudly if not:
+
+```python
+status = await (await server.get_service("bioimage-io/model-runner")).get_status()
+assert status["test_reports_writable"], (
+    f"model-runner is NOT fully functional: {status}. The injected token lacks "
+    f"read-write scope on the bioimage-io workspace — test reports will not be "
+    f"published. Fix the token (k8s secret / startup-app hypha_token) and redeploy."
+)
+```
+
+`get_status()` returns `{workspace, is_anonymous, s3_upload_available, test_reports_writable}` — capability flags only; artifact/version identity comes from the worker's `get_app_status`, not here. A tokenless self-deploy is fine to leave anonymous; the assertion is only mandatory for the website-driving production instance.
+
 ## Other deployment modes — dev and HPC examples
 
 Beyond the production external-cluster deployments, the other two supported modes each have their own workflow. Concrete targets vary per maintainer — the examples below happen to be the current maintainer's setup.
