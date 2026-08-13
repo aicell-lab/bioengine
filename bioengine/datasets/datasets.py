@@ -294,10 +294,39 @@ class BioEngineDatasets:
 
         return datasets
 
+    def _auth_headers(self, token: Optional[str]) -> Dict[str, str]:
+        """Bearer header for the data server, or empty when unauthenticated."""
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    async def _zarr_store_exists(
+        self, dataset_id: str, zarr_path: str, token: Optional[str]
+    ) -> bool:
+        """Probe for a Zarr root's metadata key.
+
+        Cheaper than listing the store: a large OME-Zarr pyramid holds millions
+        of chunk files, and the server walks the directory tree to enumerate
+        them. The metadata key is one small ranged GET.
+        """
+        from bioengine.datasets.utils import get_url_with_retry
+
+        base = f"{self.service_url}/data/{dataset_id}/{zarr_path.lstrip('/')}"
+        for meta_key in ("zarr.json", ".zgroup", ".zarray"):
+            response = await get_url_with_retry(
+                url=f"{base}/{meta_key}",
+                headers={**self._auth_headers(token), "Range": "bytes=0-0"},
+                raise_for_status=False,
+                http_client=self.http_client,
+                logger=self.logger,
+            )
+            if response.status_code in (200, 206):
+                return True
+        return False
+
     async def list_files(
         self,
         dataset_id: str,
         dir_path: Optional[str] = None,
+        recursive: bool = True,
         token: Optional[str] = None,
     ) -> List[str]:
         """
@@ -310,10 +339,14 @@ class BioEngineDatasets:
 
         Args:
             dataset_id: Name of the dataset to list files from
+            dir_path: Optional subdirectory to list, relative to the dataset root
+            recursive: When True (default) walk the whole tree and return files
+                only. When False list one level, with a trailing slash marking
+                directories.
             token: Optional authentication token for accessing protected datasets
 
         Returns:
-            List of file paths available within the specified dataset
+            List of paths relative to the dataset root
 
         Raises:
             ValueError: If the service_url is None or dataset does not exist
@@ -330,16 +363,15 @@ class BioEngineDatasets:
         start_time = asyncio.get_event_loop().time()
         token = token or self.default_token
 
-        params = {}
+        params = {"recursive": str(recursive).lower()}
         if dir_path is not None:
             params["dir_path"] = dir_path
-        if token is not None:
-            params["token"] = token
 
         async def _list_files():
             return await get_url_with_retry(
                 url=f"{self.service_url}/datasets/{dataset_id}/files",
                 params=params,
+                headers=self._auth_headers(token),
                 raise_for_status=True,
                 http_client=self.http_client,
                 logger=self.logger,
@@ -396,12 +428,7 @@ class BioEngineDatasets:
         _file_path = Path(file_path)
 
         if _file_path.suffix == ".zarr":
-            # zarr stores are directories — check that at least one file exists under them
-            lookup_dir = _file_path.as_posix()
-            available_files = await self.list_files(
-                dataset_id=dataset_id, dir_path=lookup_dir, token=token
-            )
-            if not available_files:
+            if not await self._zarr_store_exists(dataset_id, _file_path.as_posix(), token):
                 raise ValueError(
                     f"Zarr store '{_file_path.as_posix()}' not found in dataset '{dataset_id}'"
                 )
@@ -426,6 +453,7 @@ class BioEngineDatasets:
             zarr_path = _file_path.as_posix().lstrip("/")
             file_output = HttpZarrStore(
                 base_url=f"{self.service_url}/data/{dataset_id}/{zarr_path}",
+                service_url=self.service_url,
                 token=token,
                 chunk_cache=self.chunk_cache,
                 logger=self.logger,
@@ -435,12 +463,10 @@ class BioEngineDatasets:
         else:
             from bioengine.datasets.utils import get_url_with_retry
 
-            params = {"token": token} if token else {}
-
             async def _get():
                 return await get_url_with_retry(
                     url=f"{self.service_url}/data/{dataset_id}/{_file_path.as_posix()}",
-                    params=params,
+                    headers=self._auth_headers(token),
                     raise_for_status=True,
                     http_client=self.http_client,
                     logger=self.logger,
@@ -456,63 +482,6 @@ class BioEngineDatasets:
         )
 
         return file_output
-
-    def open_remote_zarr(
-        self,
-        uri: str,
-        token: Optional[str] = None,
-    ) -> "HttpZarrStore":
-        """
-        Stream an OME-Zarr (or any Zarr) from an arbitrary HTTPS URI.
-
-        Bypasses the local data server entirely — callers pass a URI obtained
-        elsewhere (e.g. from the BioImage Archive search API) and get back a
-        Zarr store that streams chunks on demand via HTTP byte-range requests.
-        The store reuses this client's shared chunk cache.
-
-        Args:
-            uri: HTTPS URL of the Zarr root (the directory containing
-                ``.zarray`` for a Zarr v2 array, ``.zattrs`` for a Zarr v2
-                group, or ``zarr.json`` for a Zarr v3 store).
-            token: Optional auth token, appended as ``?token=`` to chunk
-                URLs. Public Zarr roots (e.g. BioImage Archive) don't need it.
-
-        Returns:
-            HttpZarrStore that can be opened with ``zarr.open(store, ...)``.
-
-        Example:
-            ```python
-            # Search the BioImage Archive for an OME-Zarr image
-            import httpx
-            r = httpx.get(
-                "https://beta.bioimagearchive.org/search/v1/search/fts/image",
-                params={"q": "cellpose", "pageSize": 1},
-            ).json()
-            hit = r["hits"]["hits"][0]["_source"]
-            uri = next(
-                rep["file_uri"][0]
-                for rep in hit["representation"]
-                if rep["image_format"] == ".ome.zarr"
-            )
-
-            # Stream the OME-Zarr
-            import zarr
-            store = datasets.open_remote_zarr(uri)
-            root = zarr.open(store, mode="r")
-            ```
-        """
-        try:
-            from bioengine.datasets.http_zarr_store import HttpZarrStore
-        except ImportError as e:
-            raise ImportError("Unable to load HttpZarrStore") from e
-
-        self.logger.debug(f"Opening remote Zarr at {uri}")
-        return HttpZarrStore(
-            base_url=uri,
-            token=token,
-            chunk_cache=self.chunk_cache,
-            logger=self.logger,
-        )
 
     async def save_file(
         self,
@@ -546,12 +515,11 @@ class BioEngineDatasets:
             content = content.encode("utf-8")
 
         params = {"filename": filename, "public": str(public).lower()}
-        if token:
-            params["token"] = token
 
         response = await self.http_client.post(
             url=f"{self.service_url}/save",
             params=params,
+            headers=self._auth_headers(token),
             content=content,
         )
         response.raise_for_status()
@@ -590,12 +558,11 @@ class BioEngineDatasets:
         params: dict = {"public": str(public).lower()}
         if dir_path is not None:
             params["dir_path"] = dir_path
-        if token:
-            params["token"] = token
 
         response = await get_url_with_retry(
             url=f"{self.service_url}/saved",
             params=params,
+            headers=self._auth_headers(token),
             raise_for_status=True,
             http_client=self.http_client,
             logger=self.logger,
@@ -632,12 +599,11 @@ class BioEngineDatasets:
 
         token = token or self.default_token
         params: dict = {"public": str(public).lower()}
-        if token:
-            params["token"] = token
 
         response = await get_url_with_retry(
             url=f"{self.service_url}/saved/{filename}",
             params=params,
+            headers=self._auth_headers(token),
             raise_for_status=True,
             http_client=self.http_client,
             logger=self.logger,
@@ -694,19 +660,16 @@ if __name__ == "__main__":
         adata.layers["X_binned"][1, :].compute()
         # loaded chunks: 0.0, 0.1, 0.2, 0.4
 
-        # Test presigned URL caching
+        # Same slice again — served from the chunk cache
         adata.layers["X_binned"][1, :].compute()
-        # -> does not need to request new presigned URL
-        # -> still needs to fetch same data chunks again
 
         # Load next slice of data
         adata.layers["X_binned"][2, :].compute()
-        # -> does not need to request new presigned URL - slice in in same chunks
-        # -> needs to fetch new data chunks
+        # -> same chunks, still cached
 
         adata.layers["X_binned"][:, 1].compute()
         # loaded chunks: 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0
-        # -> needs to request new presigned URL - different chunks, one overlap
+        # -> different chunks, one overlap
 
         # Cleanup
         store.close()
