@@ -43,11 +43,6 @@ def _setup_replica(instance: Any) -> None:
     if os.environ.get("BIOENGINE_DEBUG") == "1":
         logger.setLevel(logging.DEBUG)
 
-    _register_with_proxy_actor(instance, logger)
-    _ensure_working_directory(logger)
-    _purge_stale_app_modules(logger)
-    _unmask_secret_env_vars()
-
     instance._bioengine_replica_initialized = False
     instance._bioengine_replica_test_failed = False
     instance._bioengine_test_task: Optional[asyncio.Task] = None
@@ -58,6 +53,11 @@ def _setup_replica(instance: Any) -> None:
     instance._bioengine_proxy_handle = None
     instance._bioengine_gpu_sampler = None
     instance._bioengine_gpu_init_failed = False
+
+    _register_with_proxy_actor(instance, logger)
+    _ensure_working_directory(logger)
+    _purge_stale_app_modules(logger)
+    _unmask_secret_env_vars()
 
 
 def _baked_identity(cls: type) -> Dict[str, Optional[str]]:
