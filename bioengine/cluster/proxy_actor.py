@@ -80,6 +80,11 @@ class BioEngineProxyActor:
     IDLE_EVICTION_SECONDS: float = 24 * 60 * 60  # 24 hours
     IDLE_CHECK_INTERVAL_SECONDS: float = 10 * 60  # 10 minutes
 
+    # Freshness window for a GPU replica's pushed cuMemGetInfo sample. Beyond
+    # it a GPU node's used-VRAM reports "NA" (idle / no live reporter). Sized
+    # for ~3 missed Serve health cadences (~10s each).
+    GPU_SAMPLE_STALE_SECONDS: float = 30
+
     def __init__(
         self,
         bioengine_version: str,
@@ -154,6 +159,12 @@ class BioEngineProxyActor:
         # frequently-polled status path keeps this warm, so a deploy-time sizing
         # read reuses the last good snapshot instead of a fresh cold fetch.
         self._last_per_node_gpu_memory: Dict[str, Dict[str, int]] = {}
+
+        # Real device-wide VRAM usage pushed by GPU app replicas via
+        # report_gpu_memory (cuMemGetInfo, truthful on vGPU where NVML is
+        # blind). Keyed by node_id, last-write-wins across co-located replicas.
+        # Structure: {node_id: {"used_gpu_memory": int, "timestamp": float}}
+        self.node_gpu_memory: Dict[str, Dict[str, float]] = {}
 
         # Idle self-eviction state. Counts construction as "activity" so
         # the actor is not killed before any worker has a chance to call it.
@@ -462,6 +473,22 @@ class BioEngineProxyActor:
             "min_gpu_total_mb": min_gpu_total_mb,
         }
 
+    def report_gpu_memory(self, node_id: str, used_gpu_memory: int) -> None:
+        """Record a GPU replica's real device-wide VRAM usage.
+
+        Pushed from each GPU replica's ``check_health`` via ``cuMemGetInfo``
+        (device-wide, truthful on vGPU where NVML ``memoryUsed`` is blind and
+        latches stale values). Last-write-wins per node: co-located replicas
+        on the same GPU read the same device-wide value, and a surviving
+        replica keeps the node fresh when another dies. Deliberately *not*
+        ``@_touch_on_call`` — a background telemetry push must not keep an
+        otherwise-idle proxy alive past its eviction window.
+        """
+        self.node_gpu_memory[node_id] = {
+            "used_gpu_memory": used_gpu_memory,
+            "timestamp": time.time(),
+        }
+
     @_touch_on_call
     def get_cluster_state(self) -> Dict[str, Any]:
         """
@@ -526,6 +553,7 @@ class BioEngineProxyActor:
             )
             available_resources_per_node = {}
         gpu_memory_per_node, dashboard_available = self._get_per_node_gpu_memory_usage()
+        now = time.time()
 
         cluster_state = {
             "cluster": {
@@ -567,15 +595,29 @@ class BioEngineProxyActor:
             available_object_store_memory = available_resources.get(
                 "object_store_memory", 0
             )
-            if total_gpu > 0 and not dashboard_available:
-                total_gpu_memory: Union[int, str] = "NA"
-                used_gpu_memory: Union[int, str] = "NA"
+            if total_gpu == 0:
+                total_gpu_memory: Union[int, str] = 0
+                used_gpu_memory: Union[int, str] = 0
             else:
-                gpu_memory = gpu_memory_per_node.get(
-                    node_id, {"total_gpu_memory": 0, "used_gpu_memory": 0}
-                )
-                total_gpu_memory = gpu_memory["total_gpu_memory"]
-                used_gpu_memory = gpu_memory["used_gpu_memory"]
+                # NVML's memoryTotal is correct even on vGPU, so it is kept as
+                # the capacity. NVML's memoryUsed is blind there (stuck/phantom
+                # values) and is never served: the only numeric "used" is a
+                # fresh cuMemGetInfo sample pushed by a live GPU replica, else
+                # "NA" (idle node / no live reporter).
+                if dashboard_available:
+                    total_gpu_memory = gpu_memory_per_node.get(
+                        node_id, {"total_gpu_memory": 0}
+                    )["total_gpu_memory"]
+                else:
+                    total_gpu_memory = "NA"
+                sample = self.node_gpu_memory.get(node_id)
+                if (
+                    sample is not None
+                    and now - sample["timestamp"] <= self.GPU_SAMPLE_STALE_SECONDS
+                ):
+                    used_gpu_memory = sample["used_gpu_memory"]
+                else:
+                    used_gpu_memory = "NA"
 
             cluster_state["nodes"][node_id] = {
                 "node_ip": self._get_node_ip(total_resources),
