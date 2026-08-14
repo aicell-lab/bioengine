@@ -119,6 +119,34 @@ class EntryApp:
     async def _get_download_url(self, file_path: str) -> str:
         return await self._s3.get_file(file_path=file_path, use_proxy=True)
 
+    # Exponential backoff (~30s total) covers a full broker commit + re-stage
+    # cycle, during which a presigned URL can transiently 403/404/5xx. micro-sam
+    # stays artifact-agnostic: it retries the raw HTTP transfer, never inspects
+    # stage state, and never retries indefinitely.
+    _HTTP_RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0)
+
+    async def _http_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Issue a request on a presigned URL, retrying transient failures.
+
+        Retries on 403/404/408/429/5xx and httpx transport errors with the
+        backoff above, then returns the final response WITHOUT raising for
+        status — callers keep their own handling (e.g. 404 -> FileNotFoundError,
+        raise_for_status on a PUT). An exhausted retry loop must surface loudly.
+        """
+        retry_status = {403, 404, 408, 429}
+        for delay in (*self._HTTP_RETRY_BACKOFF, None):
+            try:
+                resp = await self._http.request(method, url, **kwargs)
+            except httpx.TransportError:
+                if delay is None:
+                    raise
+                await asyncio.sleep(delay)
+                continue
+            if delay is not None and (resp.status_code in retry_status or resp.status_code >= 500):
+                await asyncio.sleep(delay)
+                continue
+            return resp
+
     async def _load_image_from_source(self, source: str) -> np.ndarray:
         ext = Path(source.split("?")[0]).suffix.lower()
         if ext not in SUPPORTED_FILE_TYPES.__args__:
@@ -129,7 +157,7 @@ class EntryApp:
         url = source if source.startswith(("http://", "https://")) else (
             await self._get_download_url(source)
         )
-        resp = await self._http.get(url)
+        resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
             raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
         resp.raise_for_status()
@@ -185,7 +213,8 @@ class EntryApp:
     async def _put_temp_embedding(self, content: bytes) -> str:
         file_path = f"temp/{uuid.uuid4()}.npz"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
-        await self._http.put(upload_url, content=content)
+        resp = await self._http_retry("PUT", upload_url, content=content)
+        resp.raise_for_status()
         return await self._get_download_url(file_path)
 
     async def _resolve_embedding(self, e: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -195,7 +224,7 @@ class EntryApp:
         """
         if isinstance(e, str):
             url = e if e.startswith(("http://", "https://")) else await self._get_download_url(e)
-            resp = await self._http.get(url)
+            resp = await self._http_retry("GET", url)
             resp.raise_for_status()
             data = await asyncio.to_thread(np.load, BytesIO(resp.content), allow_pickle=False)
             return {
@@ -326,7 +355,8 @@ class EntryApp:
                 arr, payload["input_size"], payload["original_image_shape"], model_type
             )
             if embedding_upload_url:
-                await self._http.put(embedding_upload_url, content=bundle)
+                resp = await self._http_retry("PUT", embedding_upload_url, content=bundle)
+                resp.raise_for_status()
             else:
                 payload["embedding_url"] = await self._put_temp_embedding(bundle)
         return payload
