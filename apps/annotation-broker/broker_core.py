@@ -47,7 +47,7 @@ ROLE_LIST_KEYS: Dict[str, str] = {
     "annotator": "annotators",
 }
 
-_ANONYMOUS_IDS = {"", "anonymous"}
+_ANONYMOUS_IDS = {"", "anonymous", "http-anonymous"}
 
 
 def role_at_least(role: str, minimum: str) -> bool:

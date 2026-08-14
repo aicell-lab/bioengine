@@ -96,6 +96,11 @@ class AnnotationBroker:
     @staticmethod
     def _ctx_user(context: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
         user = (context or {}).get("user") or {}
+        # Hypha marks anonymous connections with is_anonymous and gives them
+        # ids like "http-anonymous"; treat them as identity-less so they can
+        # never hold a role or a user folder.
+        if user.get("is_anonymous"):
+            return {"id": None, "email": None}
         return {"id": user.get("id"), "email": user.get("email")}
 
     def _metadata_or_raise(self, artifact_id: str) -> Dict[str, Any]:
