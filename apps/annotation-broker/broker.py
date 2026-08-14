@@ -15,6 +15,7 @@ wrapper) lives in ``broker_core.py``, which is plain Python and unit-tested
 without Ray or a live Hypha connection.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -145,11 +146,13 @@ class AnnotationBroker:
             return []
 
     async def _file_exists(self, artifact_id: str, file_path: str) -> bool:
-        try:
-            await self._am.get_file(artifact_id=artifact_id, file_path=file_path, stage=True)
-            return True
-        except Exception:
-            return False
+        # Presigning does not check object existence, so a get_file probe can
+        # succeed for a key that was never written. List the parent dir instead.
+        dir_path, _, name = file_path.rpartition("/")
+        entries = await self._list_files_safe(artifact_id, dir_path)
+        return any(
+            (e.get("name") if isinstance(e, dict) else str(e)) == name for e in entries
+        )
 
     async def _read_json_file(self, artifact_id: str, file_path: str, default: Any) -> Any:
         try:
@@ -241,6 +244,9 @@ class AnnotationBroker:
         else:
             manifest = dict(getattr(artifact, "manifest", {}) or {})
             created_by = getattr(artifact, "created_by", None)
+        # colab_service.py historically wrote created_by into the manifest,
+        # not the artifact top level.
+        created_by = created_by or manifest.get("created_by")
 
         if not core.caller_matches_artifact_owner(manifest, created_by, caller["id"], caller["email"]):
             who = caller["id"] or caller["email"] or "anonymous"
@@ -283,10 +289,14 @@ class AnnotationBroker:
         context=None,
     ) -> Dict[str, Any]:
         """Broker metadata + the caller's resolved role, for gating the
-        dataset-overview route."""
+        dataset-overview route. Annotators get labels and their role but not
+        the member lists (those are for the manager-side sharing panel)."""
         meta, _caller, role = self._require_role(context, artifact_id, "annotator")
         result = dict(meta)
         result["role"] = role
+        if not core.role_at_least(role, "manager"):
+            result.pop("managers", None)
+            result.pop("annotators", None)
         return result
 
     @bioengine.method(context=True)
@@ -385,60 +395,81 @@ class AnnotationBroker:
         """One-shot payload for the annotate page: images, embeddings, labels,
         and the caller's own latest annotation per (label, stem). Callers
         should never have to reason about stage/permission edge cases
-        themselves."""
-        meta, caller, _role = self._require_role(context, artifact_id, "annotator")
+        themselves.
+
+        Role ``public`` (anonymous visitor on a public dataset) gets the
+        read-only payload with ``my_annotations`` omitted — annotating always
+        requires a login.
+        """
+        meta, caller, role = self._require_role(context, artifact_id, "public")
+
+        # Presigned-URL minting is one RPC round trip per file; run them with
+        # bounded concurrency so large datasets don't take N sequential trips.
+        sem = asyncio.Semaphore(16)
+
+        async def _mint(file_path: str) -> str:
+            async with sem:
+                return await self._am.get_file(
+                    artifact_id=artifact_id, file_path=file_path, stage=True
+                )
 
         image_entries = await self._list_files_safe(artifact_id, "images")
-        images: List[Dict[str, str]] = []
+        image_names = []
         for entry in image_entries:
             name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
             if not name or (isinstance(entry, dict) and (entry.get("type") == "directory" or entry.get("is_dir"))):
                 continue
-            stem = Path(name).stem
-            read_url = await self._am.get_file(
-                artifact_id=artifact_id, file_path=f"images/{name}", stage=True
-            )
-            images.append({"stem": stem, "read_url": read_url})
+            image_names.append(name)
+        image_urls = await asyncio.gather(*[_mint(f"images/{n}") for n in image_names])
+        images = [
+            {"stem": Path(n).stem, "read_url": url}
+            for n, url in zip(image_names, image_urls)
+        ]
 
         embedding_entries = await self._list_files_safe(artifact_id, "embeddings")
-        embeddings: Dict[str, Any] = {}
+        parsed_embeddings = []
         for entry in embedding_entries:
             name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
             parsed = core.parse_embedding_filename(name)
-            if not parsed:
-                continue
-            read_url = await self._am.get_file(
-                artifact_id=artifact_id, file_path=f"embeddings/{name}", stage=True
-            )
-            embeddings[parsed["stem"]] = {"model_type": parsed["model_type"], "read_url": read_url}
+            if parsed:
+                parsed_embeddings.append((name, parsed))
+        embedding_urls = await asyncio.gather(
+            *[_mint(f"embeddings/{n}") for n, _ in parsed_embeddings]
+        )
+        embeddings: Dict[str, Any] = {
+            parsed["stem"]: {"model_type": parsed["model_type"], "read_url": url}
+            for (_, parsed), url in zip(parsed_embeddings, embedding_urls)
+        }
 
         my_annotations: Dict[str, Any] = {}
-        for label in meta.get("labels", []):
-            label_name = label.get("name")
-            if not label_name:
-                continue
-            dir_path = core.user_label_dir(label_name, caller["id"])
-            entries = await self._list_files_safe(artifact_id, dir_path)
-            filenames = [e.get("name", "") if isinstance(e, dict) else str(e) for e in entries]
-            pairs = core.latest_pairs_by_stem(filenames)
-            if not pairs:
-                continue
-            stem_map: Dict[str, Any] = {}
-            for stem, pair in pairs.items():
-                geojson_url = await self._am.get_file(
-                    artifact_id=artifact_id,
-                    file_path=f"{dir_path}/{pair['geojson']}",
-                    stage=True,
+        if role != "public":
+            for label in meta.get("labels", []):
+                label_name = label.get("name")
+                if not label_name:
+                    continue
+                dir_path = core.user_label_dir(label_name, caller["id"])
+                entries = await self._list_files_safe(artifact_id, dir_path)
+                filenames = [e.get("name", "") if isinstance(e, dict) else str(e) for e in entries]
+                pairs = core.latest_pairs_by_stem(filenames)
+                if not pairs:
+                    continue
+                stems = list(pairs.keys())
+                geojson_urls = await asyncio.gather(
+                    *[_mint(f"{dir_path}/{pairs[s]['geojson']}") for s in stems]
                 )
-                stem_map[stem] = {"latest_ts": pair["timestamp"], "geojson_read_url": geojson_url}
-            my_annotations[label_name] = stem_map
+                my_annotations[label_name] = {
+                    stem: {"latest_ts": pairs[stem]["timestamp"], "geojson_read_url": url}
+                    for stem, url in zip(stems, geojson_urls)
+                }
 
-        return {
+        result = {
             "images": images,
             "embeddings": embeddings,
             "labels": meta.get("labels", []),
             "my_annotations": my_annotations,
         }
+        result["role"] = role
+        return result
 
     @bioengine.method(context=True)
     async def get_embedding_urls(
