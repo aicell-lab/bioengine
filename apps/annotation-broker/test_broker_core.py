@@ -177,8 +177,8 @@ class TestLabelName:
     def test_label_users_path(self):
         assert bc.label_users_path("cells") == "label_cells/users.json"
 
-    def test_label_keep_path(self):
-        assert bc.label_keep_path("cells") == "label_cells/.keep"
+    def test_label_metadata_path(self):
+        assert bc.label_metadata_path("cells") == "label_cells/metadata.json"
 
     def test_user_label_dir(self):
         assert bc.user_label_dir("cells", "alice") == "label_cells/user-alice"

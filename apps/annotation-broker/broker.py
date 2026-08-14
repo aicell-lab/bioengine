@@ -103,6 +103,13 @@ class AnnotationBroker:
             return {"id": None, "email": None}
         return {"id": user.get("id"), "email": user.get("email")}
 
+    @staticmethod
+    def _canonical_id(artifact_id: str) -> str:
+        """Frontend URLs carry the bare alias (no 'bioimage-io/' prefix);
+        canonicalize to the full artifact id for all broker state and
+        artifact-manager calls."""
+        return artifact_id if "/" in artifact_id else f"bioimage-io/{artifact_id}"
+
     def _metadata_or_raise(self, artifact_id: str) -> Dict[str, Any]:
         meta = core.read_metadata(artifact_id, root=STATE_ROOT)
         if meta is None:
@@ -275,6 +282,7 @@ class AnnotationBroker:
         may register it. Idempotent: calling it again on an already
         registered dataset just returns the existing record.
         """
+        artifact_id = self._canonical_id(artifact_id)
         caller = self._ctx_user(context)
         existing = core.read_metadata(artifact_id, root=STATE_ROOT)
         if existing is not None:
@@ -334,6 +342,7 @@ class AnnotationBroker:
         """Broker metadata + the caller's resolved role, for gating the
         dataset-overview route. Annotators get labels and their role but not
         the member lists (those are for the manager-side sharing panel)."""
+        artifact_id = self._canonical_id(artifact_id)
         meta, _caller, role = self._require_role(context, artifact_id, "annotator")
         result = dict(meta)
         result["role"] = role
@@ -352,6 +361,7 @@ class AnnotationBroker:
     ) -> Dict[str, Any]:
         """Grant *user* the given role. Only the dataset owner may add or
         remove the manager role (either direction)."""
+        artifact_id = self._canonical_id(artifact_id)
         meta, _caller, caller_role = self._require_role(context, artifact_id, "manager")
         if role not in core.ROLE_LIST_KEYS:
             raise ValueError(f"Invalid role '{role}'; expected 'manager' or 'annotator'.")
@@ -374,6 +384,7 @@ class AnnotationBroker:
     ) -> Dict[str, Any]:
         """Remove *user* from the dataset's managers/annotators. Only the
         owner may remove a manager."""
+        artifact_id = self._canonical_id(artifact_id)
         meta, _caller, caller_role = self._require_role(context, artifact_id, "manager")
         target_role = core.resolve_role(meta, user.get("id"), user.get("email"))
         if caller_role != "owner" and target_role == "manager":
@@ -391,6 +402,7 @@ class AnnotationBroker:
         is_public: bool = Field(..., description="Whether anyone can read (and, if logged in, annotate) this dataset."),
         context=None,
     ) -> Dict[str, Any]:
+        artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         meta["public"] = bool(is_public)
         meta = core.write_metadata(meta, root=STATE_ROOT)
@@ -405,28 +417,23 @@ class AnnotationBroker:
         description: str = Field("", description="Human-readable label description."),
         context=None,
     ) -> Dict[str, Any]:
-        """Create a new annotation label: broker metadata + artifact
-        manifest + a visible ``label_<name>/.keep`` placeholder file."""
+        """Create a new annotation label: broker metadata + a
+        ``label_<name>/metadata.json`` file carrying the description (and any
+        future per-label info). The artifact manifest is NOT touched, and no
+        empty placeholder files are written."""
+        artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         core.add_label(meta, name, description)  # raises ValueError on a bad name
         meta = core.write_metadata(meta, root=STATE_ROOT)
 
-        async def _update_manifest():
-            manifest = await self._read_artifact_manifest(artifact_id)
-            labels = list(manifest.get("labels") or [])
-            if not any(l.get("name") == name for l in labels):
-                labels.append({"name": name, "description": description})
-            manifest["labels"] = labels
-            await self._am.edit(artifact_id=artifact_id, manifest=manifest, stage=True)
+        async def _put_label_metadata():
+            await self._write_json_file(
+                artifact_id,
+                core.label_metadata_path(name),
+                {"name": name, "description": description, "created_at": core.now_iso()},
+            )
 
-        await self._ensure_staged(artifact_id, _update_manifest)
-
-        async def _put_keep():
-            await self._put_bytes(artifact_id, core.label_keep_path(name), b"")
-
-        await self._ensure_staged(artifact_id, _put_keep)
-
-        self._manifest_name_cache.pop(artifact_id, None)
+        await self._ensure_staged(artifact_id, _put_label_metadata)
         return meta
 
     @bioengine.method(context=True)
@@ -444,6 +451,7 @@ class AnnotationBroker:
         read-only payload with ``my_annotations`` omitted — annotating always
         requires a login.
         """
+        artifact_id = self._canonical_id(artifact_id)
         meta, caller, role = self._require_role(context, artifact_id, "public")
 
         # Presigned-URL minting is one RPC round trip per file; run them with
@@ -522,6 +530,7 @@ class AnnotationBroker:
         model_type: str = Field(..., description="μSAM model type, e.g. 'vit_l_lm'."),
         context=None,
     ) -> Dict[str, Any]:
+        artifact_id = self._canonical_id(artifact_id)
         """Existing embedding read URL, or URLs for the micro-sam app to
         compute and upload a new one."""
         self._require_role(context, artifact_id, "annotator")
@@ -548,6 +557,7 @@ class AnnotationBroker:
         image_stem: str = Field(..., description="Image stem (filename without extension)."),
         context=None,
     ) -> Dict[str, Any]:
+        artifact_id = self._canonical_id(artifact_id)
         """Presigned PUT URLs for a new (png, geojson) annotation pair,
         sharing one server-generated UTC timestamp. Also upserts
         ``label_<label>/users.json`` with the caller's identity."""
@@ -582,6 +592,7 @@ class AnnotationBroker:
         artifact_id: str = Field(..., description="Dataset artifact id."),
         context=None,
     ) -> Dict[str, Any]:
+        artifact_id = self._canonical_id(artifact_id)
         """Broker-side cleanup after the frontend deletes the underlying
         artifact."""
         self._require_role(context, artifact_id, "owner")
