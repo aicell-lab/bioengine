@@ -177,8 +177,8 @@ def label_users_path(label: str) -> str:
     return f"{label_folder(label)}/users.json"
 
 
-def label_keep_path(label: str) -> str:
-    return f"{label_folder(label)}/.keep"
+def label_metadata_path(label: str) -> str:
+    return f"{label_folder(label)}/metadata.json"
 
 
 def user_label_dir(label: str, user_id: Optional[str]) -> str:
