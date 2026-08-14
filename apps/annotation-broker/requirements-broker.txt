@@ -1,0 +1,4 @@
+# Standing CPU app: Hypha/S3 transport only, no ML deps. Pins match the
+# bioengine root pyproject.toml's own dependency floors for consistency.
+httpx>=0.28.1
+hypha-rpc>=0.21.40
