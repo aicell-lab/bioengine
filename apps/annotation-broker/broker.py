@@ -18,6 +18,7 @@ without Ray or a live Hypha connection.
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -195,6 +196,43 @@ class AnnotationBroker:
         self._manifest_name_cache[artifact_id] = (now, name)
         return name
 
+    _MISSING_FILE_RE = re.compile(r"File '([^']+)' does not exist")
+
+    async def _commit_tolerating_pending_uploads(self, artifact_id: str) -> None:
+        """Commit, tolerating staged files that were minted via put_file but
+        not (yet) uploaded to S3.
+
+        put_file registers the file in the staged manifest immediately, and
+        Hypha's commit validates every staged file against S3 — so a single
+        in-flight or abandoned annotation/embedding upload would make every
+        set_role/set_public fail. Strategy: retry with short waits so
+        in-flight uploads can land, then prune entries that never arrived
+        (an annotator whose upload lands after the prune sees the pair
+        missing on the next index refresh and can simply re-save).
+        """
+        delays = [5.0, 10.0]
+        prunes = 0
+        while True:
+            try:
+                await self._am.commit(artifact_id)
+                return
+            except Exception as exc:
+                match = self._MISSING_FILE_RE.search(str(exc))
+                if not match:
+                    raise
+                if delays:
+                    await asyncio.sleep(delays.pop(0))
+                    continue
+                if prunes >= 20:
+                    raise
+                missing = match.group(1)
+                logger.warning(
+                    f"annotation-broker: pruning never-uploaded staged file "
+                    f"'{missing}' from '{artifact_id}' to unblock commit"
+                )
+                await self._am.remove_file(artifact_id=artifact_id, file_path=missing)
+                prunes += 1
+
     async def _apply_permissions(self, artifact_id: str, meta: Dict[str, Any]) -> None:
         """Mirror broker-metadata roles into the Hypha ACL.
 
@@ -213,7 +251,7 @@ class AnnotationBroker:
             )
             current_config["permissions"] = perms
             await self._am.edit(artifact_id=artifact_id, config=current_config, stage=True)
-            await self._am.commit(artifact_id)
+            await self._commit_tolerating_pending_uploads(artifact_id)
             await self._am.edit(artifact_id=artifact_id, stage=True)
 
         await self._ensure_staged(artifact_id, _do_edit)
