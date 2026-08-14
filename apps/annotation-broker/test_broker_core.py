@@ -671,3 +671,13 @@ class TestCallerMatchesArtifactOwner:
 
     def test_empty_manifest_and_no_created_by(self):
         assert not bc.caller_matches_artifact_owner({}, None, "u1", None)
+
+
+def test_resolve_role_http_anonymous_is_public_on_public_dataset():
+    import broker_core as core
+    meta = core.new_metadata("bioimage-io/x", owner={"id": "u1"})
+    meta["public"] = True
+    assert core.resolve_role(meta, "http-anonymous", None) == "public"
+    assert core.resolve_role(meta, "anonymous", None) == "public"
+    assert core.resolve_role(meta, None, None) == "public"
+    assert core.resolve_role(meta, "real-user", None) == "annotator"
