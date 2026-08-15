@@ -681,3 +681,41 @@ def test_resolve_role_http_anonymous_is_public_on_public_dataset():
     assert core.resolve_role(meta, "anonymous", None) == "public"
     assert core.resolve_role(meta, None, None) == "public"
     assert core.resolve_role(meta, "real-user", None) == "annotator"
+
+
+class TestAccessRequests:
+    def _meta(self):
+        import broker_core as core
+        return core.new_metadata("bioimage-io/x", owner={"id": "owner1"})
+
+    def test_add_and_remove_request(self):
+        import broker_core as core
+        m = self._meta()
+        core.add_access_request(m, {"id": "u2", "email": "u2@x.org"}, "annotator", "t1")
+        assert len(m["access_requests"]) == 1
+        assert m["access_requests"][0]["requested_role"] == "annotator"
+        core.remove_access_request(m, {"id": "u2"})
+        assert m["access_requests"] == []
+
+    def test_repeat_request_updates_role(self):
+        import broker_core as core
+        m = self._meta()
+        core.add_access_request(m, {"id": "u2"}, "annotator", "t1")
+        core.add_access_request(m, {"id": "u2"}, "manager", "t2")
+        assert len(m["access_requests"]) == 1
+        assert m["access_requests"][0]["requested_role"] == "manager"
+        assert m["access_requests"][0]["requested_at"] == "t2"
+
+    def test_invalid_role_rejected(self):
+        import broker_core as core, pytest
+        m = self._meta()
+        with pytest.raises(ValueError):
+            core.add_access_request(m, {"id": "u2"}, "owner", "t1")
+
+    def test_legacy_metadata_without_key(self):
+        import broker_core as core
+        m = self._meta(); m.pop("access_requests")
+        core.add_access_request(m, {"email": "a@b.c"}, "annotator", "t1")
+        assert len(m["access_requests"]) == 1
+        core.remove_access_request(m, {"email": "A@B.C"})
+        assert m["access_requests"] == []

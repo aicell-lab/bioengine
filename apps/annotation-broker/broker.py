@@ -349,7 +349,45 @@ class AnnotationBroker:
         if not core.role_at_least(role, "manager"):
             result.pop("managers", None)
             result.pop("annotators", None)
+            result.pop("access_requests", None)
         return result
+
+    @bioengine.method(context=True)
+    async def request_access(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        role: str = Field("annotator", description="Requested role: 'annotator' or 'manager'."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Register an access request from a logged-in user without a role
+        (the annotate page offers this when the broker denies access). The
+        dataset owner sees pending requests in the Share dialog and grants
+        them via set_role, which clears the request."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta = self._metadata_or_raise(artifact_id)
+        caller = self._ctx_user(context)
+        if not caller["id"] and not caller["email"]:
+            raise PermissionError("Log in to request access to this dataset.")
+        current = core.resolve_role(meta, caller["id"], caller["email"])
+        if core.role_at_least(current, "annotator"):
+            return {"status": "already_has_access", "role": current}
+        core.add_access_request(meta, caller, role, core.now_iso())
+        core.write_metadata(meta, root=STATE_ROOT)
+        return {"status": "requested", "requested_role": role}
+
+    @bioengine.method(context=True)
+    async def dismiss_access_request(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        user: Dict[str, Any] = Field(..., description="{'id': ...} or {'email': ...}."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Reject a pending access request without granting a role."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+        core.remove_access_request(meta, user)
+        meta = core.write_metadata(meta, root=STATE_ROOT)
+        return meta
 
     @bioengine.method(context=True)
     async def set_role(
@@ -371,6 +409,7 @@ class AnnotationBroker:
             raise PermissionError("Only the dataset owner may add or remove managers.")
 
         core.set_user_role(meta, user, role)
+        core.remove_access_request(meta, user)
         meta = core.write_metadata(meta, root=STATE_ROOT)
         await self._apply_permissions(artifact_id, meta)
         return meta

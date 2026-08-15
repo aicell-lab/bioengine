@@ -143,6 +143,51 @@ def remove_user_role(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str
 
 
 # ---------------------------------------------------------------------------
+# Access requests (annotators knocking on the door via the QR link)
+# ---------------------------------------------------------------------------
+
+
+def add_access_request(
+    metadata: Dict[str, Any], user: Dict[str, Any], requested_role: str, requested_at: str
+) -> Dict[str, Any]:
+    """Record that *user* asked for *requested_role* on this dataset.
+
+    Idempotent per user (matched by id or email): a repeat request just
+    updates the requested role and timestamp. Mutates and returns *metadata*.
+    Older metadata files without the ``access_requests`` key are upgraded in
+    place.
+    """
+    if requested_role not in ROLE_LIST_KEYS:
+        raise ValueError(
+            f"Invalid requested_role {requested_role!r}; expected one of {sorted(ROLE_LIST_KEYS)}"
+        )
+    requests = metadata.setdefault("access_requests", [])
+    remove_access_request(metadata, user)
+    metadata["access_requests"].append(
+        {
+            "id": user.get("id"),
+            "email": user.get("email"),
+            "requested_role": requested_role,
+            "requested_at": requested_at,
+        }
+    )
+    return metadata
+
+
+def remove_access_request(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop *user*'s pending access request, if any. Mutates and returns
+    *metadata*."""
+    user_id = user.get("id")
+    user_email = user.get("email")
+    metadata["access_requests"] = [
+        r
+        for r in metadata.get("access_requests", []) or []
+        if not _user_matches(r, user_id, user_email)
+    ]
+    return metadata
+
+
+# ---------------------------------------------------------------------------
 # Path building
 # ---------------------------------------------------------------------------
 
@@ -353,6 +398,7 @@ def new_metadata(artifact_id: str, owner: Dict[str, Any]) -> Dict[str, Any]:
         "owner": dict(owner),
         "managers": [],
         "annotators": [],
+        "access_requests": [],
         "public": False,
         "labels": [],
         "created_at": ts,
