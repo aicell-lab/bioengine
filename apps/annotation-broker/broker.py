@@ -353,6 +353,56 @@ class AnnotationBroker:
         return result
 
     @bioengine.method(context=True)
+    async def delete_label(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        name: str = Field(..., description="Label name to delete."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Delete a label: remove it from the broker metadata AND delete the
+        whole ``label_<name>/`` folder (metadata.json, users.json, every
+        user's annotation files) via the workspace token. Frontend deletion
+        with the user token was unreliable and left the broker's label list
+        stale, which made deleted labels reappear."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+        folder = core.label_folder(name)
+
+        failed: List[str] = []
+
+        async def _rm_dir(dir_path: str) -> None:
+            entries = await self._list_files_safe(artifact_id, dir_path)
+            for entry in entries:
+                n = entry.get("name") if isinstance(entry, dict) else str(entry)
+                if not n:
+                    continue
+                is_dir = isinstance(entry, dict) and (
+                    entry.get("type") == "directory" or entry.get("is_dir")
+                )
+                path = f"{dir_path}/{n}"
+                if is_dir:
+                    await _rm_dir(path)
+                else:
+                    try:
+                        await self._am.remove_file(artifact_id=artifact_id, file_path=path)
+                    except Exception as exc:
+                        failed.append(path)
+                        logger.warning(
+                            f"annotation-broker: failed to remove '{path}' from "
+                            f"'{artifact_id}': {exc}"
+                        )
+
+        async def _do():
+            await _rm_dir(folder)
+
+        await self._ensure_staged(artifact_id, _do)
+        meta["labels"] = [l for l in meta.get("labels", []) or [] if l.get("name") != name]
+        meta = core.write_metadata(meta, root=STATE_ROOT)
+        result = dict(meta)
+        result["failed_files"] = failed
+        return result
+
+    @bioengine.method(context=True)
     async def update_sharing(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
