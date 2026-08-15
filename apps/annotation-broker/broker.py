@@ -353,6 +353,65 @@ class AnnotationBroker:
         return result
 
     @bioengine.method(context=True)
+    async def update_sharing(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        add: Optional[List[Dict[str, Any]]] = Field(
+            None,
+            description="Users to add/move: [{'user': {'id'|'email': ...}, 'role': 'annotator'|'manager'}].",
+        ),
+        remove: Optional[List[Dict[str, Any]]] = Field(
+            None, description="Users to remove: [{'id'|'email': ...}]."
+        ),
+        set_public: Optional[bool] = Field(
+            None, description="New public flag, or omit to leave unchanged."
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Apply a batch of sharing changes with a SINGLE ACL commit +
+        re-stage cycle (the Share dialog's Apply button). Same rules as
+        set_role/remove_user: only the owner may add or remove managers.
+        Granted users' pending access requests are cleared. A call with no
+        changes returns the metadata without touching the artifact."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta, _caller, caller_role = self._require_role(context, artifact_id, "manager")
+        add = add or []
+        remove = remove or []
+
+        # Validate everything before mutating anything.
+        for entry in add:
+            role = entry.get("role")
+            user = entry.get("user") or {}
+            if role not in core.ROLE_LIST_KEYS:
+                raise ValueError(f"Invalid role '{role}'; expected 'manager' or 'annotator'.")
+            if not user.get("id") and not user.get("email"):
+                raise ValueError("Each add entry needs a user with an id or email.")
+            target_role = core.resolve_role(meta, user.get("id"), user.get("email"))
+            if caller_role != "owner" and (role == "manager" or target_role == "manager"):
+                raise PermissionError("Only the dataset owner may add or remove managers.")
+        for user in remove:
+            target_role = core.resolve_role(meta, user.get("id"), user.get("email"))
+            if caller_role != "owner" and target_role == "manager":
+                raise PermissionError("Only the dataset owner may remove a manager.")
+
+        changed = bool(add or remove) or (
+            set_public is not None and bool(set_public) != bool(meta.get("public"))
+        )
+        for entry in add:
+            core.set_user_role(meta, entry["user"], entry["role"])
+            core.remove_access_request(meta, entry["user"])
+        for user in remove:
+            core.remove_user_role(meta, user)
+        if set_public is not None:
+            meta["public"] = bool(set_public)
+
+        if not changed:
+            return meta
+        meta = core.write_metadata(meta, root=STATE_ROOT)
+        await self._apply_permissions(artifact_id, meta)
+        return meta
+
+    @bioengine.method(context=True)
     async def request_access(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
