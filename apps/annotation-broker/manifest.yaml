@@ -11,7 +11,7 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [annotation, collaboration, artifact-manager, access-control, image-segmentation]
 type: ray-serve
-version: 0.5.0
+version: 0.5.1
 entry: broker:AnnotationBroker
 authorized_users:
   - "*"

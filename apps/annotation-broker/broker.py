@@ -398,6 +398,11 @@ class AnnotationBroker:
         await self._ensure_staged(artifact_id, _do)
         meta["labels"] = [l for l in meta.get("labels", []) or [] if l.get("name") != name]
         meta = core.write_metadata(meta, root=STATE_ROOT)
+        # Persist the deletion into the committed version as well: staged
+        # removals alone leave the last committed snapshot holding the label
+        # files. Reuses the ACL mirror cycle (commit + re-stage, tolerant of
+        # pending uploads); permissions are rebuilt unchanged.
+        await self._apply_permissions(artifact_id, meta)
         result = dict(meta)
         result["failed_files"] = failed
         return result
