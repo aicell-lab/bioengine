@@ -604,47 +604,31 @@ class AnnotationBroker:
         Role ``public`` (anonymous visitor on a public dataset) gets the
         read-only payload with ``my_annotations`` omitted — annotating always
         requires a login.
+
+        Contract since 0.5.0: NO presigned URLs in the index. Minting one URL
+        per file made an 86-image index take ~30 s; the index now returns
+        stems and presence only (a few list_files calls), and callers fetch
+        URLs on demand via get_image_url / get_embedding_urls /
+        get_my_annotation_url.
         """
         artifact_id = self._canonical_id(artifact_id)
         meta, caller, role = self._require_role(context, artifact_id, "public")
 
-        # Presigned-URL minting is one RPC round trip per file; run them with
-        # bounded concurrency so large datasets don't take N sequential trips.
-        sem = asyncio.Semaphore(16)
-
-        async def _mint(file_path: str) -> str:
-            async with sem:
-                return await self._am.get_file(
-                    artifact_id=artifact_id, file_path=file_path, stage=True
-                )
-
         image_entries = await self._list_files_safe(artifact_id, "images")
-        image_names = []
+        images = []
         for entry in image_entries:
             name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
             if not name or (isinstance(entry, dict) and (entry.get("type") == "directory" or entry.get("is_dir"))):
                 continue
-            image_names.append(name)
-        image_urls = await asyncio.gather(*[_mint(f"images/{n}") for n in image_names])
-        images = [
-            {"stem": Path(n).stem, "read_url": url}
-            for n, url in zip(image_names, image_urls)
-        ]
+            images.append({"stem": Path(name).stem})
 
         embedding_entries = await self._list_files_safe(artifact_id, "embeddings")
-        parsed_embeddings = []
+        embeddings: Dict[str, Any] = {}
         for entry in embedding_entries:
             name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
             parsed = core.parse_embedding_filename(name)
             if parsed:
-                parsed_embeddings.append((name, parsed))
-        embedding_urls = await asyncio.gather(
-            *[_mint(f"embeddings/{n}") for n, _ in parsed_embeddings]
-        )
-        embeddings: Dict[str, Any] = {
-            parsed["stem"]: {"model_type": parsed["model_type"], "read_url": url}
-            for (_, parsed), url in zip(parsed_embeddings, embedding_urls)
-        }
+                embeddings[parsed["stem"]] = {"model_type": parsed["model_type"]}
 
         my_annotations: Dict[str, Any] = {}
         if role != "public":
@@ -656,25 +640,42 @@ class AnnotationBroker:
                 entries = await self._list_files_safe(artifact_id, dir_path)
                 filenames = [e.get("name", "") if isinstance(e, dict) else str(e) for e in entries]
                 pairs = core.latest_pairs_by_stem(filenames)
-                if not pairs:
-                    continue
-                stems = list(pairs.keys())
-                geojson_urls = await asyncio.gather(
-                    *[_mint(f"{dir_path}/{pairs[s]['geojson']}") for s in stems]
-                )
-                my_annotations[label_name] = {
-                    stem: {"latest_ts": pairs[stem]["timestamp"], "geojson_read_url": url}
-                    for stem, url in zip(stems, geojson_urls)
-                }
+                if pairs:
+                    my_annotations[label_name] = {
+                        stem: {"latest_ts": pairs[stem]["timestamp"]} for stem in pairs
+                    }
 
-        result = {
+        return {
             "images": images,
             "embeddings": embeddings,
             "labels": meta.get("labels", []),
             "my_annotations": my_annotations,
+            "role": role,
         }
-        result["role"] = role
-        return result
+
+    @bioengine.method(context=True)
+    async def get_my_annotation_url(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: str = Field(..., description="Label name."),
+        image_stem: str = Field(..., description="Image stem."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Presigned GET URL for the caller's LATEST geojson annotation of
+        one image under one label (the refine flow), minted on demand."""
+        artifact_id = self._canonical_id(artifact_id)
+        _meta, caller, _role = self._require_role(context, artifact_id, "annotator")
+        dir_path = core.user_label_dir(label, caller["id"])
+        entries = await self._list_files_safe(artifact_id, dir_path)
+        filenames = [e.get("name", "") if isinstance(e, dict) else str(e) for e in entries]
+        pairs = core.latest_pairs_by_stem(filenames)
+        pair = pairs.get(image_stem)
+        if not pair:
+            return {"exists": False}
+        url = await self._am.get_file(
+            artifact_id=artifact_id, file_path=f"{dir_path}/{pair['geojson']}", stage=True
+        )
+        return {"exists": True, "latest_ts": pair["timestamp"], "geojson_read_url": url}
 
     @bioengine.method(context=True)
     async def get_image_url(
