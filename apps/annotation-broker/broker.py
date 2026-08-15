@@ -677,6 +677,23 @@ class AnnotationBroker:
         return result
 
     @bioengine.method(context=True)
+    async def get_image_url(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        image_stem: str = Field(..., description="Image stem (filename without extension)."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Single presigned GET URL for one image. Featherweight first call
+        for the annotate page so the image renders before the full dataset
+        index (which mints URLs for every file) has been assembled."""
+        artifact_id = self._canonical_id(artifact_id)
+        self._require_role(context, artifact_id, "public")
+        read_url = await self._am.get_file(
+            artifact_id=artifact_id, file_path=core.image_path(image_stem), stage=True
+        )
+        return {"stem": image_stem, "read_url": read_url}
+
+    @bioengine.method(context=True)
     async def get_embedding_urls(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
