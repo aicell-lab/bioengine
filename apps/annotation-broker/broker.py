@@ -375,8 +375,12 @@ class AnnotationBroker:
         changes returns the metadata without touching the artifact."""
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, caller_role = self._require_role(context, artifact_id, "manager")
-        add = add or []
-        remove = remove or []
+        # Omitted optional params arrive as pydantic FieldInfo (truthy!), not
+        # None — the classic bioengine decorator trap. Normalize by type.
+        add = add if isinstance(add, list) else []
+        remove = remove if isinstance(remove, list) else []
+        if not isinstance(set_public, bool):
+            set_public = None
 
         # Validate everything before mutating anything.
         for entry in add:
@@ -430,6 +434,8 @@ class AnnotationBroker:
         current = core.resolve_role(meta, caller["id"], caller["email"])
         if core.role_at_least(current, "annotator"):
             return {"status": "already_has_access", "role": current}
+        if not isinstance(role, str):
+            role = "annotator"
         core.add_access_request(meta, caller, role, core.now_iso())
         core.write_metadata(meta, root=STATE_ROOT)
         return {"status": "requested", "requested_role": role}
