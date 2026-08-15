@@ -12,5 +12,5 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: []
 type: ray-serve
-version: 0.5.0
+version: 0.6.0
 entry: deployment:Cellpose4Runner

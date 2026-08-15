@@ -9,7 +9,7 @@ cache stays under a configured size budget.
 Public surface used by ``EntryDeployment``:
 
 * ``ModelCache(cache_size_in_gb, replica_id)`` — constructor
-* ``await cache.get_model_package(model_id, stage, allow_unpublished, skip_cache)``
+* ``await cache.get_model_package(model_id, stage, allow_unpublished, cache)``
   — returns a :class:`BioimageioPackage` ready to use in an ``async with``
 * ``cache.client`` — the shared ``httpx.AsyncClient`` for downloads
 * ``cache._get_url_with_retry(url, params)`` — exposed because the entry
@@ -960,21 +960,34 @@ class ModelCache:
         model_id: str,
         stage: bool,
         allow_unpublished: bool,
-        skip_cache: bool,
+        cache: str = "check",
     ) -> "BioimageioPackage":
-        """Get a cached model package or download it if not available."""
+        """Get a cached model package, honoring the ``cache`` policy.
+
+        ``cache`` is one of ``"skip"`` (force a complete re-download),
+        ``"check"`` (verify the cached files against upstream and update the
+        stale ones — the default), or ``"reuse"`` (trust an existing local
+        package as-is, with no freshness round-trip; download only if absent).
+        """
 
         # Check if model is published
         if not allow_unpublished:
             await self._check_model_published_status(model_id, stage=stage)
 
-        # Force a complete re-download if skip_cache is True
         package_path = self.cache_dir / model_id
-        if await asyncio.to_thread(package_path.exists) and skip_cache:
+        if cache == "skip" and await asyncio.to_thread(package_path.exists):
             await self._remove_package(package_path)
 
-        # Create or update the local package
-        await self._create_package(model_id, stage=stage)
+        # "reuse" skips the remote file-list fetch when a local copy exists;
+        # "skip"/"check" both go through _create_package (which fetches the
+        # remote listing and updates stale files).
+        if cache == "reuse" and await asyncio.to_thread(package_path.exists):
+            logger.info(
+                f"♻️ Reusing cached package for '{model_id}' without a "
+                f"freshness check (cache='reuse')"
+            )
+        else:
+            await self._create_package(model_id, stage=stage)
 
         # Get latest tracked remote last-modified time from .file_metadata.json
         latest_remote_modified = await self._get_latest_remote_modified_time(

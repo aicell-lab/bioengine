@@ -838,6 +838,7 @@ class RuntimeDeployment:
         default_blocksize_parameter: Optional[int] = None,
         sample_id: str = "sample",
         remote_modified: Optional[str] = None,
+        force_reload: bool = False,
     ) -> None:
         """Read inputs from disk, run inference in a subprocess, write
         outputs to disk.
@@ -906,18 +907,26 @@ class RuntimeDeployment:
                 device,
                 default_blocksize_parameter,
             )
+            # ``force_reload`` (entry passes it for cache="skip") bypasses reuse
+            # so a byte-identical re-download — which leaves ``remote_modified``
+            # unchanged, hence the key unchanged — still reloads the model.
             warm = self._warm
             reuse = (
                 warm is not None
                 and warm["proc"].poll() is None
                 and warm["key"] == key
+                and not force_reload
             )
             if reuse:
                 logger.info(f"♻️ [predict] Reusing warm inference child for {rdf_path}")
             else:
                 if warm is not None:
                     reason = (
-                        "model switch" if warm["key"] != key else "warm child exited"
+                        "forced reload (cache=skip)"
+                        if force_reload
+                        else "model switch"
+                        if warm["key"] != key
+                        else "warm child exited"
                     )
                     logger.info(
                         f"🔄 [predict] Evicting warm child ({reason}) before "

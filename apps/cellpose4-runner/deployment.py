@@ -91,6 +91,9 @@ class Cellpose4Runner:
         self._pipeline = None
         self._loaded_model_id: Optional[str] = None
         self._loaded_overrides: Optional[tuple] = None
+        # Freshness token (max file ``last_modified``) of the resident model,
+        # so a cache="check" round-trip can tell whether the artifact changed.
+        self._loaded_remote_modified: Optional[float] = None
 
         # Async infer-job registry (mirrors model-runner's submit/poll API).
         # infer() returns a request_id and runs the work as a background task;
@@ -151,6 +154,27 @@ class Cellpose4Runner:
 
     async def _get_download_url(self, file_path: str) -> str:
         return await self._s3.get_file(file_path=file_path, use_proxy=True)
+
+    async def _fetch_remote_modified(self, model_id: str) -> Optional[float]:
+        """Max file ``last_modified`` for the model artifact — a freshness
+        token for the cache="check" round-trip. Returns None if the listing
+        can't be fetched, which is treated as "no change" so a transient blip
+        never forces a needless reload.
+        """
+        url = f"{SERVER_URL}/bioimage-io/artifacts/{model_id}/files/"
+        try:
+            resp = await self._http.get(url, params={"stage": "false"})
+            resp.raise_for_status()
+            files = resp.json()
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not fetch remote freshness for '{model_id}': {e}"
+            )
+            return None
+        stamps = [
+            f["last_modified"] for f in files if f.get("last_modified") is not None
+        ]
+        return max(stamps) if stamps else None
 
     async def _load_image_from_source(self, source: str) -> np.ndarray:
         """Load an image from an http(s) URL or a ``get_upload_url`` file path."""
@@ -217,16 +241,25 @@ class Cellpose4Runner:
 
     def _run_inference(
         self,
+        job: dict,
         model_id: str,
         inputs: np.ndarray,
         sample_id: str,
         overrides: Dict[str, float],
         return_flows: bool,
         two_pass: bool,
+        force_reload: bool,
+        remote_modified: Optional[float],
     ) -> Dict[str, np.ndarray]:
         """Load the model (reusing the resident pipeline when unchanged) and
         run the forward pass. Blocking — call via ``asyncio.to_thread`` while
         holding ``self._gpu_lock``.
+
+        Reloads when the identity changed (new ``model_id`` / override set) or
+        ``force_reload`` is set (cache="skip", or a cache="check" round-trip
+        that saw the artifact change). A reload stamps the ``model_download``
+        stage on ``job`` so ``get_infer_status`` reports honest timing; a warm
+        reuse leaves it untouched (reported as "Skipped").
         """
         device = "cuda"
         from bioimageio.core import (
@@ -241,13 +274,21 @@ class Cellpose4Runner:
         override_key = tuple(
             sorted((k, v) for k, v in overrides.items() if v is not None)
         )
-        if model_id != self._loaded_model_id or override_key != self._loaded_overrides:
+        reload = (
+            model_id != self._loaded_model_id
+            or override_key != self._loaded_overrides
+            or force_reload
+        )
+        if reload:
+            if job.get("md_start") is None:
+                job["md_start"] = time.time()
             # Free the previous model's VRAM before loading the next. A single
             # framework (torch) means empty_cache after dropping the refs is
             # enough — no subprocess isolation needed.
             self._pipeline = None
             self._loaded_model_id = None
             self._loaded_overrides = None
+            self._loaded_remote_modified = None
             gc.collect()
             try:
                 import torch
@@ -272,6 +313,8 @@ class Cellpose4Runner:
             self._pipeline = pipeline
             self._loaded_model_id = model_id
             self._loaded_overrides = override_key
+            self._loaded_remote_modified = remote_modified
+            job["md_end"] = time.time()
             logger.info(f"✅ Model '{model_id}' loaded.")
 
         sample = create_sample_for_model(
@@ -343,6 +386,11 @@ class Cellpose4Runner:
             "running_ts": None,
             "completed_at": None,
             "result": None,
+            # model_download stage timing, stamped only when this request does
+            # real cache work (freshness check and/or a pipeline reload). Left
+            # None on a warm reuse so the stage reports as "Skipped".
+            "md_start": None,
+            "md_end": None,
             # asyncio.Task handle, filled in by infer(); used by cancel_request
             # to drop a still-queued job before it acquires the GPU. Never
             # serialised out — _job_progress builds its own dict.
@@ -368,21 +416,21 @@ class Cellpose4Runner:
     def _job_progress(self, job: dict) -> dict:
         """Progress dict for an infer request. Same top-level shape as
         model-runner's ``get_infer_status`` so a single poller works against
-        both services. ``model_download`` / ``env_setup`` are always None here
-        (no separate download or per-model env-build stage) and kept for schema
-        parity; the GPU forward is the only stage.
+        both services. ``model_download`` reflects the real cache work done for
+        this request (freshness check and/or pipeline reload) and is None on a
+        warm reuse; ``env_setup`` is always None (no per-model env build here).
         """
         pos = self._queue_position(job)
         return {
             "queue_position": pos,
             "submitted_at": job["submitted_at"],
-            "model_download": None,
+            "model_download": job["md_start"],
             "env_setup": None,
             "running": job["running_ts"],
             "completed_at": job["completed_at"],
             "result": job["result"],
             "stages": {
-                "model_download": {"start": None, "end": None},
+                "model_download": {"start": job["md_start"], "end": job["md_end"]},
                 "env_setup": {"start": None, "end": None, "queue_position": None},
                 "run": {
                     "start": job["running_ts"],
@@ -402,6 +450,7 @@ class Cellpose4Runner:
         return_flows: bool,
         two_pass: bool,
         return_download_url: bool,
+        cache: str,
     ) -> None:
         """Background driver: wait for the GPU, run the forward pass, store the
         result on the job. Any exception is captured onto the job as an error
@@ -411,15 +460,37 @@ class Cellpose4Runner:
         try:
             async with self._gpu_lock:
                 job["state"] = "running"
+
+                # Cache policy. "skip" always reloads; "check" does a real,
+                # timed freshness round-trip every time and reloads only if the
+                # artifact changed; "reuse" trusts the resident model with no
+                # round-trip. The round-trip is stamped as the model_download
+                # stage so it shows honest timing, matching model-runner.
+                force_reload = cache == "skip"
+                remote_modified: Optional[float] = None
+                if cache == "check":
+                    job["md_start"] = time.time()
+                    remote_modified = await self._fetch_remote_modified(model_id)
+                    job["md_end"] = time.time()
+                    if (
+                        model_id == self._loaded_model_id
+                        and remote_modified is not None
+                        and remote_modified != self._loaded_remote_modified
+                    ):
+                        force_reload = True
+
                 job["running_ts"] = time.time()
                 outputs = await asyncio.to_thread(
                     self._run_inference,
+                    job,
                     model_id,
                     inputs,
                     sample_id,
                     overrides,
                     return_flows,
                     two_pass,
+                    force_reload,
+                    remote_modified,
                 )
             if return_download_url:
                 outputs = {
@@ -523,6 +594,16 @@ class Cellpose4Runner:
             "in S3 and returned as a presigned download URL (valid 1 hour) instead "
             "of the raw array.",
         ),
+        cache: Literal["skip", "check", "reuse"] = Field(
+            "check",
+            description="Model-cache policy (same meaning as model-runner's "
+            "``infer``): 'check' (default) does a real freshness round-trip to "
+            "the model artifact and reloads the resident pipeline only if it "
+            "changed; 'skip' forces a full pipeline reload even if the model is "
+            "resident; 'reuse' trusts the resident pipeline as-is with no "
+            "round-trip. A reload's timing surfaces in the ``model_download`` "
+            "stage of ``get_infer_status``.",
+        ),
     ) -> str:
         """Submit an inference request and return a ``request_id`` immediately.
 
@@ -575,6 +656,7 @@ class Cellpose4Runner:
                 return_flows,
                 two_pass,
                 return_download_url,
+                cache,
             )
         )
         return job["job_id"]
@@ -593,14 +675,14 @@ class Cellpose4Runner:
             {
               "queue_position": int,          # 0 = running/done, N = N jobs ahead
               "submitted_at":   float,        # ts when queued
-              "model_download": None,         # no separate stage here
+              "model_download": float | None, # cache-check/reload start, None on warm reuse
               "env_setup":      None,         # no per-model env build here
               "running":        float | None, # ts when GPU work started
               "completed_at":   float | None, # ts when finished, None until then
               "result":         dict | None,  # output dict on success,
                                               # {"error": str} on failure
               "stages": {                     # per-stage timeline, schema parity
-                "model_download": {"start": None, "end": None},
+                "model_download": {"start": float|None, "end": float|None},
                 "env_setup": {"start": None, "end": None, "queue_position": None},
                 "run": {"start": float|None, "end": float|None,
                         "queue_position": int|None},

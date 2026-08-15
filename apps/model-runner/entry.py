@@ -1894,6 +1894,17 @@ class EntryDeployment:
         logger.info(f"✅ RDF validation {'passed' if result['success'] else 'failed'}.")
         return result
 
+    @staticmethod
+    def _resolve_cache(cache: str, skip_cache: Optional[bool]) -> str:
+        """Resolve the effective cache policy from ``cache`` and the deprecated
+        ``skip_cache`` alias. ``skip_cache`` (kept so existing callers keep
+        working while ``cache`` rolls out) wins only when explicitly set:
+        True→"skip", False→"check".
+        """
+        if skip_cache is not None:
+            return "skip" if skip_cache else "check"
+        return cache
+
     @bioengine.method
     async def test(
         self,
@@ -1908,9 +1919,19 @@ class EntryDeployment:
             None,
             description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False, run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference. If left None (default), inherit the environment of the model's prior report for the matching slot (staged report for stage=True, published for stage=False) — so a model last tested in its custom env is re-tested in the custom env automatically — falling back to False when no prior report exists.",
         ),
+        cache: Literal["skip", "check", "reuse"] = Field(
+            "check",
+            description="Model-cache policy (same meaning on ``infer`` and on "
+            "cellpose4-runner): 'check' (default) verifies the cached package "
+            "against upstream and re-downloads if stale, also re-checking "
+            "cached test-report currency; 'skip' forces a complete re-download "
+            "and bypasses cached test results; 'reuse' trusts the local cache "
+            "as-is with no freshness round-trip.",
+        ),
         skip_cache: Optional[bool] = Field(
-            False,
-            description="Force a complete model package re-download and bypass cached test results before testing",
+            None,
+            description="Deprecated alias for ``cache``; prefer ``cache``. When "
+            "set it overrides ``cache``: True→'skip', False→'check'.",
         ),
     ) -> str:
         """
@@ -1930,7 +1951,7 @@ class EntryDeployment:
 
         Caching behavior:
         - Cached test reports are locally stored at ``<model_package>/.test_cache.json``.
-        - Cached results are reused only when ``skip_cache=False`` AND the model
+        - Cached results are reused only when ``cache != "skip"`` AND the model
             package has not changed (same ``latest_remote_modified``) AND the cached
             ``test_report['env']`` versions for ``bioimageio.core`` and
             ``bioimageio.spec`` match the currently installed versions.
@@ -1939,7 +1960,7 @@ class EntryDeployment:
             is reused instead — subject to the same currency check — and the
             local cache is warmed from it. This survives package eviction and
             replica restarts without re-running the test.
-        - ``skip_cache=True`` forces a complete model package re-download,
+        - ``cache="skip"`` forces a complete model package re-download,
             bypasses cached test results, and runs a fresh test.
 
         Environment mode:
@@ -1975,6 +1996,8 @@ class EntryDeployment:
         # matching slot: a model last tested in its custom env re-tests custom,
         # else standard. Staged reads never influence a published run and vice
         # versa. No prior report → standard (False).
+        cache = self._resolve_cache(cache, skip_cache)
+
         if custom_environment is None:
             model_alias = model_id.rsplit("/", 1)[-1]
             prior_report = await self._read_published_report(model_alias, stage)
@@ -1991,7 +2014,7 @@ class EntryDeployment:
                     model_id=model_id,
                     stage=stage,
                     custom_environment=custom_environment,
-                    skip_cache=skip_cache,
+                    cache=cache,
                 )
                 self._update_test_job(job, state="completed", result=report)
             except Exception as exc:
@@ -2014,7 +2037,7 @@ class EntryDeployment:
         model_id: str,
         stage: bool,
         custom_environment: bool,
-        skip_cache: bool,
+        cache: str,
     ) -> dict:
         """Run the full test pipeline for a scheduled run and return the report.
 
@@ -2028,7 +2051,7 @@ class EntryDeployment:
 
         logger.info(
             f"🧪 Testing model '{model_id}' (run {job['job_id']}, stage={stage}, "
-            f"skip_cache={skip_cache}, custom_environment={custom_environment})."
+            f"cache={cache}, custom_environment={custom_environment})."
         )
 
         # Publish-report invariant, enforced at the boundary: a stage=False
@@ -2059,7 +2082,7 @@ class EntryDeployment:
             model_id=model_id,
             stage=stage,
             allow_unpublished=True,
-            skip_cache=skip_cache,
+            cache=cache,
         )
 
         # Silent fallback: models that declare no custom env yaml (no
@@ -2101,7 +2124,7 @@ class EntryDeployment:
             test_report_path = package.package_path / ".test_cache.json"
             current_versions = self._get_bioimageio_versions()
 
-            if not skip_cache and await asyncio.to_thread(test_report_path.exists):
+            if cache != "skip" and await asyncio.to_thread(test_report_path.exists):
                 try:
                     async with aiofiles.open(test_report_path, "r") as f:
                         content = await f.read()
@@ -2137,7 +2160,7 @@ class EntryDeployment:
 
             # Fall back to the published report in the collection when the
             # local cache is absent (evicted / fresh package download).
-            if should_run_test and not skip_cache and not local_report_stale:
+            if should_run_test and cache != "skip" and not local_report_stale:
                 model_alias = model_id.rsplit("/", 1)[-1]
                 published = await self._read_published_report(model_alias, stage)
                 if published and self._report_is_current(
@@ -2755,8 +2778,19 @@ class EntryDeployment:
             "sample",
             description="Identifier for this inference request, used for logging and debugging",
         ),
+        cache: Literal["skip", "check", "reuse"] = Field(
+            "check",
+            description="Model-cache policy (same meaning on ``test`` and on "
+            "cellpose4-runner): 'check' (default) verifies the cached package "
+            "against upstream and re-downloads if stale, re-checking a warm "
+            "model too; 'skip' forces a complete re-download and reload even if "
+            "the model is warm; 'reuse' trusts the local cache and any warm "
+            "model as-is with no freshness round-trip.",
+        ),
         skip_cache: Optional[bool] = Field(
-            False, description="Force re-download of model package before inference"
+            None,
+            description="Deprecated alias for ``cache``; prefer ``cache``. When "
+            "set it overrides ``cache``: True→'skip', False→'check'.",
         ),
         return_download_url: Optional[bool] = Field(
             False,
@@ -2839,6 +2873,8 @@ class EntryDeployment:
                     f"{type(value).__name__})."
                 )
 
+        cache = self._resolve_cache(cache, skip_cache)
+
         job = self._new_infer_job(
             model_id=model_id, return_download_url=bool(return_download_url)
         )
@@ -2872,7 +2908,7 @@ class EntryDeployment:
                 device=device,
                 default_blocksize_parameter=default_blocksize_parameter,
                 sample_id=sample_id,
-                skip_cache=skip_cache,
+                cache=cache,
             )
         )
         return request_id
@@ -2885,7 +2921,7 @@ class EntryDeployment:
         device: Optional[Literal["cuda", "cpu"]],
         default_blocksize_parameter: Optional[int],
         sample_id: Optional[str],
-        skip_cache: Optional[bool],
+        cache: str,
     ) -> None:
         """Background inference driver — model download → runtime dispatch.
 
@@ -2908,7 +2944,7 @@ class EntryDeployment:
                 model_id=model_id,
                 stage=False,
                 allow_unpublished=False,
-                skip_cache=skip_cache,
+                cache=cache,
             )
             async with package:
                 logger.info(
@@ -2935,6 +2971,7 @@ class EntryDeployment:
                     default_blocksize_parameter=default_blocksize_parameter,
                     sample_id=sample_id,
                     remote_modified=package.latest_remote_modified,
+                    force_reload=(cache == "skip"),
                 )
 
             self._update_infer_job(job, state="completed")
