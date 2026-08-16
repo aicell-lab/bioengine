@@ -719,3 +719,139 @@ class TestAccessRequests:
         assert len(m["access_requests"]) == 1
         core.remove_access_request(m, {"email": "A@B.C"})
         assert m["access_requests"] == []
+
+
+# ---------------------------------------------------------------------------
+# count_pairs_by_stem
+# ---------------------------------------------------------------------------
+
+
+def test_count_pairs_counts_complete_saves_only():
+    files = [
+        "a-20260101-000001.png", "a-20260101-000001.geojson",
+        "a-20260102-000002.png", "a-20260102-000002.geojson",
+        "a-20260103-000003.png",  # incomplete save
+        "b-20260101-000001.geojson",  # incomplete
+        "junk.txt",
+    ]
+    assert bc.count_pairs_by_stem(files) == {"a": 2}
+
+
+def test_count_pairs_empty():
+    assert bc.count_pairs_by_stem([]) == {}
+    assert bc.count_pairs_by_stem(["x.png", "y.geojson"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# Split paths + names
+# ---------------------------------------------------------------------------
+
+
+def test_split_paths():
+    assert bc.splits_dir_path("cells") == "label_cells/splits"
+    assert bc.split_path("cells", "fold-1") == "label_cells/splits/fold-1.json"
+
+
+def test_split_name_validation():
+    assert bc.is_valid_split_name("default")
+    assert bc.is_valid_split_name("fold-1.a_b")
+    assert not bc.is_valid_split_name("")
+    assert not bc.is_valid_split_name("With Space")
+    assert not bc.is_valid_split_name("UPPER")
+
+
+# ---------------------------------------------------------------------------
+# new_split
+# ---------------------------------------------------------------------------
+
+COUNTS = {"a": 3, "b": 1, "c": 2, "d": 1}
+
+
+def test_new_split_happy_path():
+    doc = bc.new_split("cells", "default", ["a", "b"], ["c"], COUNTS, "user-1")
+    assert doc["train"] == ["a", "b"]
+    assert doc["test"] == ["c"]
+    assert doc["ratio"] == pytest.approx(2 / 3)
+    assert doc["annotation_counts"] == {"a": 3, "b": 1, "c": 2}
+    assert doc["checkpoint"] is None
+    assert doc["history"] == []
+    assert doc["label"] == "cells"
+
+
+def test_new_split_explicit_ratio_and_dedup():
+    doc = bc.new_split("cells", "default", ["a", "a", "b"], [], COUNTS, None, ratio=0.8)
+    assert doc["train"] == ["a", "b"]
+    assert doc["ratio"] == 0.8
+
+
+def test_new_split_rejects_unannotated():
+    with pytest.raises(ValueError, match="unannotated"):
+        bc.new_split("cells", "default", ["a", "zz"], [], COUNTS, None)
+    with pytest.raises(ValueError, match="unannotated"):
+        bc.new_split("cells", "default", ["a"], ["zz"], COUNTS, None)
+
+
+def test_new_split_rejects_overlap_empty_train_bad_name_bad_ratio():
+    with pytest.raises(ValueError, match="both train and test"):
+        bc.new_split("cells", "default", ["a"], ["a"], COUNTS, None)
+    with pytest.raises(ValueError, match="at least one training image"):
+        bc.new_split("cells", "default", [], ["a"], COUNTS, None)
+    with pytest.raises(ValueError, match="Invalid split name"):
+        bc.new_split("cells", "Bad Name", ["a"], [], COUNTS, None)
+    with pytest.raises(ValueError, match="ratio"):
+        bc.new_split("cells", "default", ["a"], [], COUNTS, None, ratio=1.5)
+
+
+# ---------------------------------------------------------------------------
+# extend_split
+# ---------------------------------------------------------------------------
+
+
+def _base_split():
+    return bc.new_split("cells", "default", ["a"], ["c"], COUNTS, "user-1")
+
+
+def test_extend_split_adds_and_refreshes_counts():
+    doc = _base_split()
+    counts_now = {"a": 5, "b": 1, "c": 2, "d": 1}
+    doc = bc.extend_split(doc, ["b"], ["d"], counts_now, "user-2")
+    assert doc["train"] == ["a", "b"]
+    assert doc["test"] == ["c", "d"]
+    assert doc["annotation_counts"] == {"a": 5, "b": 1, "c": 2, "d": 1}
+    assert len(doc["history"]) == 1
+    assert doc["history"][0]["added_train"] == ["b"]
+    assert doc["history"][0]["added_test"] == ["d"]
+    assert doc["updated_by"] == "user-2"
+
+
+def test_extend_split_train_to_test_guard():
+    doc = _base_split()
+    with pytest.raises(ValueError, match="ever-trained"):
+        bc.extend_split(doc, [], ["a"], COUNTS, None)
+
+
+def test_extend_split_rejects_existing_members_and_unannotated():
+    doc = _base_split()
+    with pytest.raises(ValueError, match="never move"):
+        bc.extend_split(doc, ["c"], [], COUNTS, None)
+    with pytest.raises(ValueError, match="unannotated"):
+        bc.extend_split(doc, ["zz"], [], COUNTS, None)
+    with pytest.raises(ValueError, match="Nothing to add"):
+        bc.extend_split(doc, [], [], COUNTS, None)
+    with pytest.raises(ValueError, match="both train and test"):
+        bc.extend_split(doc, ["b"], ["b"], COUNTS, None)
+
+
+def test_extend_split_member_losing_files_keeps_zero_count():
+    doc = _base_split()
+    doc = bc.extend_split(doc, ["b"], [], {"b": 1}, None)
+    assert doc["annotation_counts"]["a"] == 0
+    assert doc["annotation_counts"]["b"] == 1
+
+
+def test_split_summary():
+    doc = _base_split()
+    s = bc.split_summary(doc)
+    assert s["n_train"] == 1 and s["n_test"] == 1
+    assert s["name"] == "default" and s["label"] == "cells"
+    assert s["checkpoint"] is None

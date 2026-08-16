@@ -336,6 +336,187 @@ def is_annotated(filenames: List[str]) -> bool:
     return bool(latest_pairs_by_stem(filenames))
 
 
+def count_pairs_by_stem(filenames: List[str]) -> Dict[str, int]:
+    """Given a flat filename listing from one user's label folder, return
+    ``{stem: n}`` where *n* is the number of timestamps with BOTH a png and
+    a geojson — i.e. how many complete annotation saves that user made for
+    the stem. Stems with zero complete pairs are omitted.
+    """
+    by_stem_ts: Dict[str, Dict[str, set]] = {}
+    for filename in filenames:
+        parsed = parse_annotation_filename(filename)
+        if not parsed:
+            continue
+        stem, ts, ext = parsed["stem"], parsed["timestamp"], parsed["ext"]
+        by_stem_ts.setdefault(stem, {}).setdefault(ts, set()).add(ext)
+
+    result: Dict[str, int] = {}
+    for stem, ts_map in by_stem_ts.items():
+        n = sum(1 for exts in ts_map.values() if {"png", "geojson"} <= exts)
+        if n:
+            result[stem] = n
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Per-label train/test splits (add-only snapshots of annotation progress)
+# ---------------------------------------------------------------------------
+
+# A split is a per-label, named, ADD-ONLY snapshot: only annotated images may
+# enter, images never move between sets, and an image that was ever in train
+# can never later be in test (fine-tuning lineage integrity). Multiple named
+# splits per label support k-fold-style reuse of one dataset.
+
+SPLIT_NAME_RE = LABEL_NAME_RE  # same charset rules as label names
+
+
+def is_valid_split_name(name: str) -> bool:
+    return bool(name) and bool(SPLIT_NAME_RE.match(name))
+
+
+def splits_dir_path(label: str) -> str:
+    return f"{label_folder(label)}/splits"
+
+
+def split_path(label: str, name: str) -> str:
+    return f"{splits_dir_path(label)}/{name}.json"
+
+
+def _clean_stems(stems: Any) -> List[str]:
+    if not isinstance(stems, list):
+        return []
+    seen, out = set(), []
+    for s in stems:
+        s = str(s)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _require_annotated(stems: List[str], annotation_counts: Dict[str, int], what: str) -> None:
+    missing = [s for s in stems if annotation_counts.get(s, 0) < 1]
+    if missing:
+        raise ValueError(
+            f"Cannot put unannotated images into the {what} set: {', '.join(sorted(missing))}. "
+            "A split is a snapshot of annotation progress; annotate these images first."
+        )
+
+
+def new_split(
+    label: str,
+    name: str,
+    train: List[str],
+    test: List[str],
+    annotation_counts: Dict[str, int],
+    created_by: Optional[str],
+    ratio: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build a fresh split document. *annotation_counts* maps every currently
+    annotated stem of the label to its number of complete annotation saves;
+    membership is validated against it (snapshot semantics)."""
+    if not is_valid_split_name(name):
+        raise ValueError(f"Invalid split name {name!r}: must match ^[a-z0-9._-]+$")
+    train = _clean_stems(train)
+    test = _clean_stems(test)
+    if not train:
+        raise ValueError("A split needs at least one training image.")
+    overlap = set(train) & set(test)
+    if overlap:
+        raise ValueError(f"Stems cannot be in both train and test: {', '.join(sorted(overlap))}")
+    _require_annotated(train, annotation_counts, "train")
+    _require_annotated(test, annotation_counts, "test")
+    members = set(train) | set(test)
+    if ratio is None:
+        ratio = len(train) / (len(train) + len(test))
+    ratio = float(ratio)
+    if not (0.0 < ratio <= 1.0):
+        raise ValueError(f"ratio must be in (0, 1], got {ratio}")
+    ts = now_iso()
+    return {
+        "name": name,
+        "label": label,
+        "created_at": ts,
+        "created_by": created_by,
+        "updated_at": ts,
+        "updated_by": created_by,
+        "ratio": ratio,
+        "train": train,
+        "test": test,
+        "annotation_counts": {s: int(annotation_counts[s]) for s in sorted(members)},
+        "history": [],
+        "checkpoint": None,
+    }
+
+
+def extend_split(
+    split: Dict[str, Any],
+    add_train: List[str],
+    add_test: List[str],
+    annotation_counts: Dict[str, int],
+    updated_by: Optional[str],
+) -> Dict[str, Any]:
+    """Add-only extension of an existing split document.
+
+    Guards: added stems must be annotated and new to BOTH sets, and nothing
+    that was ever in train may enter test (leakage guard; add-only sets mean
+    the current train list IS the full train history). Refreshes the
+    annotation-count snapshot for every member and appends a history entry.
+    Mutates and returns *split*.
+    """
+    add_train = _clean_stems(add_train)
+    add_test = _clean_stems(add_test)
+    if not add_train and not add_test:
+        raise ValueError("Nothing to add: both add_train and add_test are empty.")
+    cur_train = list(split.get("train") or [])
+    cur_test = list(split.get("test") or [])
+    leaked = set(add_test) & set(cur_train)
+    if leaked:
+        raise ValueError(
+            f"Refusing to move ever-trained images into test: {', '.join(sorted(leaked))}. "
+            "Images that were part of a training set would leak into the evaluation."
+        )
+    already = (set(add_train) | set(add_test)) & (set(cur_train) | set(cur_test))
+    if already:
+        raise ValueError(
+            f"Already in the split (images never move between sets): {', '.join(sorted(already))}"
+        )
+    both = set(add_train) & set(add_test)
+    if both:
+        raise ValueError(f"Stems cannot be in both train and test: {', '.join(sorted(both))}")
+    _require_annotated(add_train, annotation_counts, "train")
+    _require_annotated(add_test, annotation_counts, "test")
+
+    split["train"] = cur_train + add_train
+    split["test"] = cur_test + add_test
+    members = set(split["train"]) | set(split["test"])
+    # Refresh the snapshot for every member so the frontend's "+N new
+    # annotations" indicator resets after each extension. A member that lost
+    # its files entirely keeps count 0 rather than erroring.
+    split["annotation_counts"] = {s: int(annotation_counts.get(s, 0)) for s in sorted(members)}
+    ts = now_iso()
+    split["updated_at"] = ts
+    split["updated_by"] = updated_by
+    split.setdefault("history", []).append(
+        {"at": ts, "by": updated_by, "added_train": add_train, "added_test": add_test}
+    )
+    return split
+
+
+def split_summary(split: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact listing row for list_splits."""
+    return {
+        "name": split.get("name"),
+        "label": split.get("label"),
+        "n_train": len(split.get("train") or []),
+        "n_test": len(split.get("test") or []),
+        "ratio": split.get("ratio"),
+        "created_at": split.get("created_at"),
+        "updated_at": split.get("updated_at"),
+        "checkpoint": split.get("checkpoint"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Embedding filename parsing
 # ---------------------------------------------------------------------------
