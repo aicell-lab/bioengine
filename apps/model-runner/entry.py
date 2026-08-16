@@ -349,15 +349,29 @@ class EntryDeployment:
         return versions
 
     def _report_is_current(
-        self, report: dict, package, current_versions: Dict[str, str]
+        self,
+        report: dict,
+        package,
+        current_versions: Dict[str, str],
+        custom_environment: bool,
     ) -> bool:
         """Whether ``report`` can be reused instead of re-running the test.
 
-        A report is current when the model files have not changed since it
-        was produced (same ``latest_remote_modified``) and every tracked
-        runtime package matches the installed version. Same criteria used
-        for the on-disk ``.test_cache.json`` and the collection fallback.
+        A report is current when it ran in the requested environment mode,
+        the model files have not changed since it was produced (same
+        ``latest_remote_modified``) and every tracked runtime package matches
+        the installed version. Same criteria used for the on-disk
+        ``.test_cache.json`` and the collection fallback.
+
+        ``custom_environment`` must be the *effective* mode (after the
+        no-``environment.yaml`` downgrade in ``_execute_test``), not the raw
+        request — otherwise a downgraded custom request would never match its
+        own standard report. Reports written before ``test_environment``
+        existed are treated as standard.
         """
+        requested = "custom" if custom_environment else "standard"
+        if report.get("test_environment", "standard") != requested:
+            return False
         if report.get("latest_remote_modified") != package.latest_remote_modified:
             return False
         report_versions = {
@@ -1954,7 +1968,10 @@ class EntryDeployment:
         - Cached results are reused only when ``cache != "skip"`` AND the model
             package has not changed (same ``latest_remote_modified``) AND the cached
             ``test_report['env']`` versions for ``bioimageio.core`` and
-            ``bioimageio.spec`` match the currently installed versions.
+            ``bioimageio.spec`` match the currently installed versions AND the
+            report's ``test_environment`` matches the environment requested for
+            this run — a standard run never reuses a custom-env report, or
+            vice versa.
         - When the local cache is absent (evicted / fresh package download),
             the published report in the ``bioimage-io/test-reports`` collection
             is reused instead — subject to the same currency check — and the
@@ -2132,7 +2149,7 @@ class EntryDeployment:
 
                     cached_report = cached_data["test_report"]
                     if self._report_is_current(
-                        cached_report, package, current_versions
+                        cached_report, package, current_versions, custom_environment
                     ):
                         logger.info(
                             f"💾 Model '{model_id}' unchanged since last test, using cached results."
@@ -2164,7 +2181,7 @@ class EntryDeployment:
                 model_alias = model_id.rsplit("/", 1)[-1]
                 published = await self._read_published_report(model_alias, stage)
                 if published and self._report_is_current(
-                    published, package, current_versions
+                    published, package, current_versions, custom_environment
                 ):
                     logger.info(
                         f"💾 Reusing published test report for '{model_id}' from "
