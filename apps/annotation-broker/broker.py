@@ -352,59 +352,271 @@ class AnnotationBroker:
             result.pop("access_requests", None)
         return result
 
+    # ------------------------------------------------------------------
+    # Per-label train/test splits (add-only snapshots, see broker_core)
+    # ------------------------------------------------------------------
+
+    async def _image_stems(self, artifact_id: str) -> set:
+        """Stems of every file under images/."""
+        entries = await self._list_files_safe(artifact_id, "images")
+        stems = set()
+        for e in entries:
+            name = e.get("name", "") if isinstance(e, dict) else str(e)
+            if not name or (isinstance(e, dict) and (e.get("type") == "directory" or e.get("is_dir"))):
+                continue
+            stems.add(Path(name).stem)
+        return stems
+
+    async def _annotation_counts(self, artifact_id: str, label: str) -> Dict[str, int]:
+        """Complete (png+geojson) annotation saves per stem, summed across
+        every user folder of *label*."""
+        label_dir = core.label_folder(label)
+        entries = await self._list_files_safe(artifact_id, label_dir)
+        user_dirs = [
+            e.get("name") for e in entries
+            if isinstance(e, dict)
+            and (e.get("type") == "directory" or e.get("is_dir"))
+            and str(e.get("name", "")).startswith("user-")
+        ]
+        totals: Dict[str, int] = {}
+        for user_dir in user_dirs:
+            files = await self._list_files_safe(artifact_id, f"{label_dir}/{user_dir}")
+            filenames = [f.get("name", "") if isinstance(f, dict) else str(f) for f in files]
+            for stem, n in core.count_pairs_by_stem(filenames).items():
+                totals[stem] = totals.get(stem, 0) + n
+        return totals
+
+    def _require_label(self, meta: Dict[str, Any], label: str) -> None:
+        if not any(l.get("name") == label for l in meta.get("labels", []) or []):
+            raise ValueError(f"Unknown label '{label}' on this dataset.")
+
+    async def _read_split_or_raise(
+        self, artifact_id: str, label: str, name: str
+    ) -> Dict[str, Any]:
+        doc = await self._read_json_file(
+            artifact_id, core.split_path(label, name), default=None
+        )
+        if not isinstance(doc, dict):
+            raise ValueError(f"No split named '{name}' for label '{label}'.")
+        return doc
+
+    async def _validate_split_stems_are_images(
+        self, artifact_id: str, stems: List[str]
+    ) -> None:
+        image_stems = await self._image_stems(artifact_id)
+        unknown = [s for s in stems if s not in image_stems]
+        if unknown:
+            raise ValueError(
+                "Not images of this dataset: " + ", ".join(sorted(unknown))
+            )
+
     @bioengine.method(context=True)
-    async def set_split(
+    async def create_split(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
-        train: List[str] = Field(..., description="Image stems in the training set."),
-        test: List[str] = Field(..., description="Image stems in the test set."),
+        label: str = Field(..., description="Label the split belongs to."),
+        name: str = Field(..., description="Split name (^[a-z0-9._-]+$)."),
+        train: List[str] = Field(..., description="Annotated image stems for training."),
+        test: Optional[List[str]] = Field(None, description="Annotated image stems for testing."),
+        ratio: Optional[float] = Field(
+            None,
+            description="Target train fraction (0..1] used for later auto-distribution; defaults to the actual fraction at creation.",
+        ),
         context=None,
     ) -> Dict[str, Any]:
-        """Write the train/test split metadata file (train/split.json)."""
+        """Create a per-label split: an add-only snapshot of annotation
+        progress. Only images with at least one complete annotation save for
+        *label* may enter. Fails if the split name already exists."""
         artifact_id = self._canonical_id(artifact_id)
-        _meta, caller, _role = self._require_role(context, artifact_id, "manager")
-        split = {
-            "train": [str(s) for s in (train if isinstance(train, list) else [])],
-            "test": [str(s) for s in (test if isinstance(test, list) else [])],
-            "updated_at": core.now_iso(),
-            "updated_by": caller.get("id") or caller.get("email"),
-        }
+        meta, caller, _role = self._require_role(context, artifact_id, "manager")
+        self._require_label(meta, label)
+        train = train if isinstance(train, list) else []
+        test = test if isinstance(test, list) else []
+        ratio = ratio if isinstance(ratio, (int, float)) else None
+        if not core.is_valid_split_name(name if isinstance(name, str) else ""):
+            raise ValueError(f"Invalid split name {name!r}: must match ^[a-z0-9._-]+$")
+        existing = await self._read_json_file(
+            artifact_id, core.split_path(label, name), default=None
+        )
+        if isinstance(existing, dict):
+            raise ValueError(
+                f"Split '{name}' already exists for label '{label}'. "
+                "Extend it with update_split or pick another name."
+            )
+        stems = [str(s) for s in train] + [str(s) for s in test]
+        await self._validate_split_stems_are_images(artifact_id, stems)
+        counts = await self._annotation_counts(artifact_id, label)
+        doc = core.new_split(
+            label, name, train, test, counts,
+            caller.get("id") or caller.get("email"), ratio,
+        )
 
         async def _write():
-            await self._write_json_file(artifact_id, "train/split.json", split)
+            await self._write_json_file(artifact_id, core.split_path(label, name), doc)
 
         await self._ensure_staged(artifact_id, _write)
-        return split
+        return doc
+
+    @bioengine.method(context=True)
+    async def update_split(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: str = Field(..., description="Label the split belongs to."),
+        name: str = Field(..., description="Split name."),
+        add_train: Optional[List[str]] = Field(None, description="Annotated stems to add to train."),
+        add_test: Optional[List[str]] = Field(None, description="Annotated stems to add to test."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Add-only extension of an existing split. Added stems must be
+        annotated and new to both sets; an image that was ever in train can
+        never enter test. Refreshes the annotation-count snapshot for every
+        member."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta, caller, _role = self._require_role(context, artifact_id, "manager")
+        self._require_label(meta, label)
+        add_train = add_train if isinstance(add_train, list) else []
+        add_test = add_test if isinstance(add_test, list) else []
+        doc = await self._read_split_or_raise(artifact_id, label, name)
+        added = [str(s) for s in add_train] + [str(s) for s in add_test]
+        await self._validate_split_stems_are_images(artifact_id, added)
+        counts = await self._annotation_counts(artifact_id, label)
+        doc = core.extend_split(
+            doc, add_train, add_test, counts,
+            caller.get("id") or caller.get("email"),
+        )
+
+        async def _write():
+            await self._write_json_file(artifact_id, core.split_path(label, name), doc)
+
+        await self._ensure_staged(artifact_id, _write)
+        return doc
+
+    @bioengine.method(context=True)
+    async def set_split_checkpoint(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: str = Field(..., description="Label the split belongs to."),
+        name: str = Field(..., description="Split name."),
+        checkpoint: Dict[str, Any] = Field(
+            ...,
+            description="Training lineage record, e.g. {'session_id': ..., 'model_type': ...}.",
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Record the fine-tuning checkpoint a split's training produced.
+        A non-null checkpoint locks the split's lineage: the frontend shows
+        continued fine-tuning from this checkpoint instead of a base-model
+        selector, and the split can no longer be deleted."""
+        artifact_id = self._canonical_id(artifact_id)
+        _meta, caller, _role = self._require_role(context, artifact_id, "manager")
+        if not isinstance(checkpoint, dict) or not checkpoint:
+            raise ValueError("checkpoint must be a non-empty object.")
+        doc = await self._read_split_or_raise(artifact_id, label, name)
+        doc["checkpoint"] = dict(checkpoint)
+        doc["checkpoint"]["recorded_at"] = core.now_iso()
+        doc["checkpoint"]["recorded_by"] = caller.get("id") or caller.get("email")
+        doc["updated_at"] = core.now_iso()
+        doc["updated_by"] = caller.get("id") or caller.get("email")
+
+        async def _write():
+            await self._write_json_file(artifact_id, core.split_path(label, name), doc)
+
+        await self._ensure_staged(artifact_id, _write)
+        return doc
 
     @bioengine.method(context=True)
     async def get_split(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: str = Field(..., description="Label the split belongs to."),
+        name: str = Field(..., description="Split name."),
         context=None,
     ) -> Dict[str, Any]:
-        """Read train/split.json; a missing file returns empty lists (the
-        frontend treats an absent split as everything-trains)."""
+        """Read one split document (full: members, counts, history,
+        checkpoint)."""
         artifact_id = self._canonical_id(artifact_id)
         self._require_role(context, artifact_id, "annotator")
-        split = await self._read_json_file(artifact_id, "train/split.json", default=None)
-        if not isinstance(split, dict):
-            return {"train": [], "test": []}
-        return split
+        return await self._read_split_or_raise(artifact_id, label, name)
+
+    @bioengine.method(context=True)
+    async def list_splits(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: Optional[str] = Field(
+            None, description="Label to list splits for; omit for ALL labels."
+        ),
+        context=None,
+    ) -> List[Dict[str, Any]]:
+        """Compact summaries of the splits of one label, or of every label
+        when *label* is omitted (the image-delete guard wants all of them)."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta, _caller, _role = self._require_role(context, artifact_id, "annotator")
+        label = label if isinstance(label, str) else None
+        labels = (
+            [label]
+            if label
+            else [l.get("name") for l in meta.get("labels", []) or [] if l.get("name")]
+        )
+        summaries: List[Dict[str, Any]] = []
+        for lbl in labels:
+            entries = await self._list_files_safe(artifact_id, core.splits_dir_path(lbl))
+            for e in entries:
+                fname = e.get("name", "") if isinstance(e, dict) else str(e)
+                if not fname.endswith(".json"):
+                    continue
+                doc = await self._read_json_file(
+                    artifact_id, f"{core.splits_dir_path(lbl)}/{fname}", default=None
+                )
+                if isinstance(doc, dict):
+                    summaries.append(core.split_summary(doc))
+        return summaries
+
+    @bioengine.method(context=True)
+    async def delete_split(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: str = Field(..., description="Label the split belongs to."),
+        name: str = Field(..., description="Split name."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Delete a split that never produced a checkpoint. A trained
+        split's lineage is permanent and cannot be deleted."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+        doc = await self._read_split_or_raise(artifact_id, label, name)
+        if doc.get("checkpoint"):
+            raise ValueError(
+                f"Split '{name}' has a trained checkpoint and cannot be deleted."
+            )
+
+        async def _rm():
+            await self._am.remove_file(
+                artifact_id=artifact_id, file_path=core.split_path(label, name)
+            )
+
+        await self._ensure_staged(artifact_id, _rm)
+        # Persist the deletion into the committed version (same staleness
+        # trap as delete_label: a staged-only removal reappears on restage).
+        await self._apply_permissions(artifact_id, meta)
+        return {"deleted": True, "label": label, "name": name}
 
     @bioengine.method(context=True)
     async def get_training_urls(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
         label: str = Field(..., description="Label whose annotations feed the training."),
+        split_name: str = Field(..., description="Split that defines the train/test membership."),
         context=None,
     ) -> Dict[str, Any]:
         """Training inputs for micro-sam fine-tuning: for the LATEST pair per
-        (user, stem) under the label, presigned image + geojson URLs,
-        partitioned by the train/test split (unsplit stems fall into train)."""
+        (user, stem) under the label, presigned image + geojson URLs. ONLY
+        stems that are members of the split are included, partitioned by its
+        train/test lists."""
         artifact_id = self._canonical_id(artifact_id)
         self._require_role(context, artifact_id, "manager")
-        split = await self._read_json_file(artifact_id, "train/split.json", default=None)
-        test_stems = set((split or {}).get("test") or [])
+        split = await self._read_split_or_raise(artifact_id, label, split_name)
+        train_stems = set(split.get("train") or [])
+        test_stems = set(split.get("test") or [])
 
         label_dir = core.label_folder(label)
         entries = await self._list_files_safe(artifact_id, label_dir)
@@ -421,6 +633,8 @@ class AnnotationBroker:
             files = await self._list_files_safe(artifact_id, dir_path)
             filenames = [f.get("name", "") if isinstance(f, dict) else str(f) for f in files]
             for stem, pair in core.latest_pairs_by_stem(filenames).items():
+                if stem not in train_stems and stem not in test_stems:
+                    continue
                 pairs.append({
                     "stem": stem,
                     "user": user_dir,
@@ -449,7 +663,7 @@ class AnnotationBroker:
                 "geojson_url": geo_url,
             }
             (test_out if p["stem"] in test_stems else train_out).append(row)
-        return {"train": train_out, "test": test_out}
+        return {"train": train_out, "test": test_out, "split": core.split_summary(split)}
 
     @bioengine.method(context=True)
     async def delete_label(
