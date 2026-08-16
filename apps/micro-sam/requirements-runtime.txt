@@ -4,6 +4,10 @@
 # in-browser prompt-decoder export (get_onnx_model).
 micro-sam==1.8.5
 segment-anything==1.0
+# micro-sam routes the vit_t_lm base model through MobileSAM's tiny image
+# encoder; without it train_sam / get_predictor raise "'mobile_sam' is required
+# for the vit-tiny". Pure-Python (+ timm from PyPI), no PyPI release exists.
+mobile_sam @ git+https://github.com/ChaoningZhang/MobileSAM.git
 torch==2.7.1
 torchvision==0.22.1
 onnx==1.17.0
