@@ -353,6 +353,105 @@ class AnnotationBroker:
         return result
 
     @bioengine.method(context=True)
+    async def set_split(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        train: List[str] = Field(..., description="Image stems in the training set."),
+        test: List[str] = Field(..., description="Image stems in the test set."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Write the train/test split metadata file (train/split.json)."""
+        artifact_id = self._canonical_id(artifact_id)
+        _meta, caller, _role = self._require_role(context, artifact_id, "manager")
+        split = {
+            "train": [str(s) for s in (train if isinstance(train, list) else [])],
+            "test": [str(s) for s in (test if isinstance(test, list) else [])],
+            "updated_at": core.now_iso(),
+            "updated_by": caller.get("id") or caller.get("email"),
+        }
+
+        async def _write():
+            await self._write_json_file(artifact_id, "train/split.json", split)
+
+        await self._ensure_staged(artifact_id, _write)
+        return split
+
+    @bioengine.method(context=True)
+    async def get_split(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Read train/split.json; a missing file returns empty lists (the
+        frontend treats an absent split as everything-trains)."""
+        artifact_id = self._canonical_id(artifact_id)
+        self._require_role(context, artifact_id, "annotator")
+        split = await self._read_json_file(artifact_id, "train/split.json", default=None)
+        if not isinstance(split, dict):
+            return {"train": [], "test": []}
+        return split
+
+    @bioengine.method(context=True)
+    async def get_training_urls(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: str = Field(..., description="Label whose annotations feed the training."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Training inputs for micro-sam fine-tuning: for the LATEST pair per
+        (user, stem) under the label, presigned image + geojson URLs,
+        partitioned by the train/test split (unsplit stems fall into train)."""
+        artifact_id = self._canonical_id(artifact_id)
+        self._require_role(context, artifact_id, "manager")
+        split = await self._read_json_file(artifact_id, "train/split.json", default=None)
+        test_stems = set((split or {}).get("test") or [])
+
+        label_dir = core.label_folder(label)
+        entries = await self._list_files_safe(artifact_id, label_dir)
+        user_dirs = [
+            e.get("name") for e in entries
+            if isinstance(e, dict)
+            and (e.get("type") == "directory" or e.get("is_dir"))
+            and str(e.get("name", "")).startswith("user-")
+        ]
+
+        pairs: List[Dict[str, str]] = []
+        for user_dir in user_dirs:
+            dir_path = f"{label_dir}/{user_dir}"
+            files = await self._list_files_safe(artifact_id, dir_path)
+            filenames = [f.get("name", "") if isinstance(f, dict) else str(f) for f in files]
+            for stem, pair in core.latest_pairs_by_stem(filenames).items():
+                pairs.append({
+                    "stem": stem,
+                    "user": user_dir,
+                    "geojson_path": f"{dir_path}/{pair['geojson']}",
+                })
+
+        sem = asyncio.Semaphore(16)
+
+        async def _mint(file_path: str) -> str:
+            async with sem:
+                return await self._am.get_file(
+                    artifact_id=artifact_id, file_path=file_path, stage=True
+                )
+
+        image_urls, geojson_urls = await asyncio.gather(
+            asyncio.gather(*[_mint(core.image_path(p["stem"])) for p in pairs]),
+            asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs]),
+        )
+        train_out: List[Dict[str, str]] = []
+        test_out: List[Dict[str, str]] = []
+        for p, img_url, geo_url in zip(pairs, image_urls, geojson_urls):
+            row = {
+                "stem": p["stem"],
+                "user": p["user"],
+                "image_url": img_url,
+                "geojson_url": geo_url,
+            }
+            (test_out if p["stem"] in test_stems else train_out).append(row)
+        return {"train": train_out, "test": test_out}
+
+    @bioengine.method(context=True)
     async def delete_label(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
