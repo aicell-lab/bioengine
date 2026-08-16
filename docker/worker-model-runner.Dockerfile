@@ -21,6 +21,10 @@
 # Rolling tag — each build picks up current Debian-slim security patches.
 FROM python:3.11-slim
 
+# Links the GHCR package to this repo (CI injects this for the published
+# worker image; this image is built manually, so it's baked in here).
+LABEL org.opencontainers.image.source=https://github.com/aicell-lab/bioengine
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
