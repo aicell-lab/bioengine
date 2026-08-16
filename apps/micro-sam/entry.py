@@ -73,6 +73,10 @@ class EntryApp:
         self._s3 = None
         self._http: Optional[httpx.AsyncClient] = None
         self._training_tasks: Dict[str, asyncio.Task] = {}
+        # Serialize GPU fine-tuning across all runtime replicas: at most one
+        # training runs at a time, so autoscaled replicas stay free to serve
+        # inference during a long run. Mirrors model-runner's _env_build_lock.
+        self._training_lock = asyncio.Lock()
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -426,7 +430,17 @@ class EntryApp:
             })
             # Long-running: this await holds one GPU runtime replica for the whole
             # training run, so a concurrent infer is routed to a second replica.
-            await self.runtime.train(session_id=session_id, model_type=model_type, params=params)
+            # The entry lock caps concurrency at one training regardless of how
+            # many replicas exist, leaving the rest free for inference. QUEUED is
+            # exempt from the PREPARING/TRAINING stale-window sweep, so a session
+            # waiting here is not false-flagged STOPPED.
+            if self._training_lock.locked():
+                training.write_status(
+                    session_id, status="QUEUED",
+                    message="waiting for GPU — another fine-tuning is in progress",
+                )
+            async with self._training_lock:
+                await self.runtime.train(session_id=session_id, model_type=model_type, params=params)
         except asyncio.CancelledError:
             training.write_status(session_id, status="STOPPED", message="training task cancelled")
             raise
@@ -491,8 +505,9 @@ class EntryApp:
     async def get_training_status(
         self, session_id: str = Field(..., description="Session id from start_training.")
     ) -> Dict[str, Any]:
-        """Fine-tuning session status (PREPARING/TRAINING/COMPLETED/FAILED/STOPPED),
-        elapsed time, and whether the checkpoint is servable."""
+        """Fine-tuning session status (PREPARING/QUEUED/TRAINING/COMPLETED/FAILED/
+        STOPPED), elapsed time, and whether the checkpoint is servable. QUEUED
+        means another fine-tuning holds the single training slot."""
         import training
 
         return training.get_status(session_id)
