@@ -189,13 +189,15 @@ def materialize_pairs(
     val = keep(val) if val else []
     if not train:
         raise ValueError("No training pairs with foreground labels after ingestion.")
+    val_reused_train = False
     if not val:
         n_val = max(1, int(round(len(train) * val_fraction))) if len(train) > 1 else 0
         if n_val:
             val = train[:n_val]
             train = train[n_val:]
-        if not train:  # tiny dataset: reuse the same pair for train and val
-            train, val = val, val
+        if not val:  # single-image (or otherwise empty) split: reuse train as val
+            val = list(train)
+            val_reused_train = True
 
     def dump(split, pairs):
         img_dir = sdir / "data" / split / "images"
@@ -225,6 +227,7 @@ def materialize_pairs(
         "train_images": train_imgs, "train_labels": train_lbls,
         "val_images": val_imgs, "val_labels": val_lbls,
         "patch_shape": ph, "n_train": len(train_imgs), "n_val": len(val_imgs),
+        "val_reused_train": val_reused_train,
     }
 
 # === training params (written by the entry, read by train_worker.py) ===

@@ -9,9 +9,9 @@ predict+test. Fine-tuning runs in a **subprocess** so the OS reclaims all
 training VRAM on exit; the resident inference model is evicted first so the
 subprocess gets the whole GPU.
 
-Autoscaling (``max_replicas=2``, ``target=1``) lets a long training run hold one
-GPU replica's lock while a concurrent inference request spins up and runs on the
-second GPU replica — training and inference at the same time.
+Autoscaling (``max_replicas=3``, ``target=1``) lets a long training run hold one
+GPU replica's lock while concurrent inference requests spin up and run on the
+other GPU replicas — training and inference at the same time.
 
 Import rule: heavy deps (``torch``, ``micro_sam``, ``segment_anything``) are
 imported inside method bodies so the ``@bioengine.app`` decorator module stays
@@ -56,7 +56,7 @@ def _read_pip(name: str) -> List[str]:
     autoscaling_config={
         "min_replicas": 1,
         "initial_replicas": 1,
-        "max_replicas": 2,
+        "max_replicas": 3,
         # target=1: a single concurrent op (a long train + one infer) is enough
         # to spin the 2nd GPU replica, so training and inference run at the same
         # time on the two GPUs instead of queueing on one lock.

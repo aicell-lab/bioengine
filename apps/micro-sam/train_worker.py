@@ -61,6 +61,7 @@ def main(session_id: str) -> None:
             n_epochs=p["n_epochs"], n_objects_per_batch=p.get("n_objects_per_batch", 8),
             with_segmentation_decoder=True, save_root=str(sdir),
             device=device, lr=p["learning_rate"],
+            checkpoint_path=p.get("checkpoint_path"),
         )
         stop.set()
         ok = training.checkpoint_path(session_id).exists()

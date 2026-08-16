@@ -405,11 +405,24 @@ class EntryApp:
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
             )
+            if data.get("val_reused_train"):
+                training.write_status(session_id, val_reused_train=True)
+            resolved = {}
+            resume_id = params.get("resume_session_id")
+            if resume_id:
+                prior_model = training.read_training_params(resume_id).get("model_type")
+                if prior_model and prior_model != model_type:
+                    raise ValueError(
+                        f"resume_session_id '{resume_id}' was trained as {prior_model}, "
+                        f"not {model_type}; model_type must match to resume."
+                    )
+                resolved["checkpoint_path"] = self._session_checkpoint(resume_id)
             training.write_training_params(session_id, {
                 **params, "model_type": model_type,
                 "patch_shape": list(data["patch_shape"]),
                 "train_images": data["train_images"], "train_labels": data["train_labels"],
                 "val_images": data["val_images"], "val_labels": data["val_labels"],
+                **resolved,
             })
             # Long-running: this await holds one GPU runtime replica for the whole
             # training run, so a concurrent infer is routed to a second replica.
@@ -443,6 +456,8 @@ class EntryApp:
         learning_rate: float = Field(1e-5, description="AdamW learning rate."),
         val_fraction: float = Field(0.2, description="Val split fraction when val is omitted."),
         n_samples: Optional[int] = Field(None, description="Patches sampled per epoch (auto if omitted)."),
+        resume_session_id: Optional[str] = Field(
+            None, description="Continue fine-tuning from a prior session's checkpoint (same model_type)."),
         label: str = Field("", description="Optional human-readable tag for this session."),
     ) -> Dict[str, Any]:
         """Start a μSAM fine-tuning session (AIS decoder) and return immediately
@@ -463,6 +478,7 @@ class EntryApp:
             n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,
             batch_size=batch_size, learning_rate=learning_rate,
             val_fraction=val_fraction, n_samples=n_samples,
+            resume_session_id=resume_session_id,
             patch_shape=(patch_size, patch_size), num_workers=0,
         )
         task = asyncio.create_task(self._run_training(
