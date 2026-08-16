@@ -194,19 +194,25 @@ class AnnotationBroker:
             return dict(artifact.get("manifest") or {})
         return dict(getattr(artifact, "manifest", {}) or {})
 
-    async def _cached_manifest_name(self, artifact_id: str) -> str:
+    async def _cached_manifest_info(self, artifact_id: str) -> Dict[str, str]:
         cached = self._manifest_name_cache.get(artifact_id)
         now = time.time()
         if cached is not None and core.is_cache_fresh(cached[0], ttl_s=MANIFEST_CACHE_TTL_S, now=now):
             return cached[1]
         try:
             manifest = await self._read_artifact_manifest(artifact_id)
-            name = manifest.get("name") or artifact_id
+            info = {
+                "name": manifest.get("name") or artifact_id,
+                "description": str(manifest.get("description") or ""),
+            }
         except Exception as exc:
             logger.warning(f"annotation-broker: failed to read manifest for '{artifact_id}': {exc}")
-            name = artifact_id
-        self._manifest_name_cache[artifact_id] = (now, name)
-        return name
+            info = {"name": artifact_id, "description": ""}
+        self._manifest_name_cache[artifact_id] = (now, info)
+        return info
+
+    async def _cached_manifest_name(self, artifact_id: str) -> str:
+        return (await self._cached_manifest_info(artifact_id))["name"]
 
     _MISSING_FILE_RE = re.compile(r"File '([^']+)' does not exist")
 
@@ -322,11 +328,12 @@ class AnnotationBroker:
             role = core.resolve_role(meta, caller["id"], caller["email"])
             if role not in ("manager", "annotator"):
                 continue
-            name = await self._cached_manifest_name(artifact_id)
+            info = await self._cached_manifest_info(artifact_id)
             shared.append(
                 {
                     "artifact_id": artifact_id,
-                    "name": name,
+                    "name": info["name"],
+                    "description": info["description"],
                     "role": role,
                     "labels": meta.get("labels", []),
                 }
@@ -664,6 +671,49 @@ class AnnotationBroker:
             }
             (test_out if p["stem"] in test_stems else train_out).append(row)
         return {"train": train_out, "test": test_out, "split": core.split_summary(split)}
+
+    @bioengine.method(context=True)
+    async def delete_annotation(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        label: str = Field(..., description="Label the annotation belongs to."),
+        user_folder: str = Field(..., description="Sanitized annotator folder, e.g. 'user-github-12345'."),
+        stem: str = Field(..., description="Image stem the annotation belongs to."),
+        timestamp: str = Field(..., description="Timestamp of the save pair (YYYYMMDD-HHMMSS)."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Delete one annotation save (its png + geojson pair). Allowed for
+        managers/owners, and for the annotation's own author. The removal is
+        persisted through a commit cycle (a staged-only removal would
+        resurface on the next re-stage)."""
+        artifact_id = self._canonical_id(artifact_id)
+        meta, caller, role = self._require_role(context, artifact_id, "annotator")
+        if not core.is_valid_timestamp(timestamp):
+            raise ValueError(f"Invalid timestamp {timestamp!r}; expected YYYYMMDD-HHMMSS.")
+        is_own = core.sanitize_user_id(caller.get("id")) == user_folder
+        if not core.role_at_least(role, "manager") and not is_own:
+            raise PermissionError(
+                "Only managers or the annotation's author may delete an annotation."
+            )
+        base = f"{core.label_folder(label)}/{user_folder}/{stem}-{timestamp}"
+        removed = []
+        for ext in ("png", "geojson"):
+            path = f"{base}.{ext}"
+
+            async def _rm(p=path):
+                await self._am.remove_file(artifact_id=artifact_id, file_path=p)
+
+            try:
+                await self._ensure_staged(artifact_id, _rm)
+                removed.append(path)
+            except Exception as exc:
+                logger.warning(
+                    f"annotation-broker: could not remove '{path}' from '{artifact_id}': {exc}"
+                )
+        if not removed:
+            raise ValueError(f"No annotation files found for {base}.*")
+        await self._apply_permissions(artifact_id, meta)
+        return {"deleted": removed}
 
     @bioengine.method(context=True)
     async def delete_label(
