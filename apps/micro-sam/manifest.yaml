@@ -12,5 +12,5 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [cell-segmentation, segment-anything, interactive-annotation, fine-tuning, deep-learning, biomedical-imaging]
 type: ray-serve
-version: 0.8.5
+version: 0.9.0
 entry: entry:EntryApp

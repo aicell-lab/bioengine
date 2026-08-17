@@ -85,6 +85,8 @@ class RuntimeApp:
         self._segmenter = None
         self._loaded_model_type: Optional[str] = None
         self._loaded_key: Optional[tuple] = None
+        self._pkg_model = None
+        self._pkg_key: Optional[str] = None
         self._onnx_cache: Dict[str, bytes] = {}
         self._device_cached: Optional[str] = None
 
@@ -181,6 +183,8 @@ class RuntimeApp:
         self._predictor = None
         self._segmenter = None
         self._loaded_key = None
+        self._pkg_model = None
+        self._pkg_key = None
         gc.collect()
         try:
             import torch
@@ -239,6 +243,59 @@ class RuntimeApp:
         segmenter.initialize(image=None, image_embeddings=image_embeddings)
         instances = segmenter.generate(**generate_kwargs)
         return np.asarray(instances).astype(np.int32)
+
+    def _load_package_model(self, weights_path: str, model_type: str, use_conv_transpose: bool):
+        """Load an exported AIS package's ``MicroSAMAIS`` weights as the resident
+        model, reusing it when ``weights_path`` is unchanged. Blocking — under lock."""
+        import torch
+
+        sys.path.insert(0, str(Path(__file__).parent))
+        from ais_adapter import MicroSAMAIS
+
+        key = f"pkg:{weights_path}"
+        if key != self._pkg_key:
+            self._release_model()
+            mod = MicroSAMAIS(model_type=model_type, use_conv_transpose=use_conv_transpose)
+            mod.load_state_dict(torch.load(weights_path, map_location="cpu"))
+            mod.eval().to(self._device())
+            self._pkg_model = mod
+            self._pkg_key = key
+            self._loaded_model_type = f"package:{model_type}"
+            logger.info(f"✅ Loaded exported AIS package model ({model_type}).")
+        return self._pkg_model
+
+    def _watershed_from_maps(self, maps: np.ndarray, generate_kwargs: Dict[str, Any]) -> np.ndarray:
+        """micro-SAM native post-processing on the three AIS maps → int32 instance
+        labels (channel 0 foreground, 1 center distance, 2 boundary distance).
+        Injects the maps into micro_sam's own ``InstanceSegmentationWithDecoder``
+        and calls ``generate`` so the smoothing + watershed exactly match the
+        built-in AIS path (and track whatever smoothing backend the installed
+        micro_sam ships — it no longer hard-depends on vigra)."""
+        from micro_sam.instance_segmentation import InstanceSegmentationWithDecoder
+
+        allowed = (
+            "center_distance_threshold", "boundary_distance_threshold",
+            "foreground_threshold", "foreground_smoothing", "distance_smoothing", "min_size",
+        )
+        kw = {k: v for k, v in (generate_kwargs or {}).items() if k in allowed}
+        seg = InstanceSegmentationWithDecoder.__new__(InstanceSegmentationWithDecoder)
+        seg._foreground = maps[0]
+        seg._center_distances = maps[1]
+        seg._boundary_distances = maps[2]
+        seg._is_initialized = True
+        instances = seg.generate(output_mode="instance_segmentation", **kw)
+        return np.asarray(instances).astype(np.int32)
+
+    def _auto_segment_package(self, weights_path, model_type, use_conv_transpose, image, generate_kwargs):
+        """Run an exported AIS package on one image → int32 instance mask. Blocking."""
+        import torch
+
+        mod = self._load_package_model(weights_path, model_type, use_conv_transpose)
+        img = self._to_image_format(image)
+        inp = torch.from_numpy(img.astype("float32")).permute(2, 0, 1)[None].contiguous().to(self._device())
+        with torch.no_grad():
+            maps = mod(inp)[0].cpu().numpy()
+        return self._watershed_from_maps(maps, generate_kwargs)
 
     def _export_onnx(self, model_type: str, quantize: bool) -> bytes:
         """Export the lightweight SAM prompt decoder to ONNX bytes. Blocking."""
@@ -337,6 +394,23 @@ class RuntimeApp:
                 results.append({"output": self._nd(labels)})
         return results
 
+    async def auto_segment_package(
+        self, images: List[np.ndarray], weights_path: str, model_type: str,
+        use_conv_transpose: bool, generate_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """AIS masks from an exported BioImage.IO package (``MicroSAMAIS`` weights +
+        micro-SAM native watershed) for a batch of images → wire-dict list."""
+        generate_kwargs = generate_kwargs or {}
+        results: List[Dict[str, Any]] = []
+        async with self._gpu_lock:
+            for image in images:
+                labels = await asyncio.to_thread(
+                    self._auto_segment_package, weights_path, model_type,
+                    use_conv_transpose, image, generate_kwargs,
+                )
+                results.append({"output": self._nd(labels)})
+        return results
+
     async def encode(
         self, image: np.ndarray, model_type: str = "vit_l_lm",
         checkpoint: Optional[str] = None,
@@ -378,26 +452,32 @@ class RuntimeApp:
             capture_output=True, text=True, env=self._subprocess_env(),
         )
 
-    def _run_export_subprocess(self, session_id: str, model_name: str):
+    def _run_export_subprocess(self, session_id: str, export_dir: str):
         worker = str(Path(__file__).parent / "export_worker.py")
         env = self._subprocess_env()
         env["CUDA_VISIBLE_DEVICES"] = ""  # CPU-only export → no GPU contention
         return subprocess.run(
-            [sys.executable, worker, session_id, model_name],
+            [sys.executable, worker, session_id, export_dir],
             cwd=str(Path(__file__).parent),
             capture_output=True, text=True, env=env,
         )
 
-    async def export_bioimageio(self, session_id: str, model_name: str) -> Dict[str, Any]:
-        """Build a BioImage.IO package from a trained session in a CPU subprocess
-        (no GPU lock). Returns the on-disk package dir for the entry to upload.
+    async def export_bioimageio(self, session_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a prompt-free AIS BioImage.IO package from a trained session in a
+        CPU subprocess (no GPU lock). ``request`` carries the RDF metadata
+        (name/description/authors/license/provenance). Returns the export result
+        (package dir, zip path, file listing) for the entry to serve/upload.
         """
         import json
 
         import training
 
-        proc = await asyncio.to_thread(self._run_export_subprocess, session_id, model_name)
-        res_path = training.session_dir(session_id) / "export" / "export_result.json"
+        export_dir = training.session_dir(session_id) / "export"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        (export_dir / "request.json").write_text(json.dumps(request))
+
+        proc = await asyncio.to_thread(self._run_export_subprocess, session_id, str(export_dir))
+        res_path = export_dir / "export_result.json"
         if proc.returncode != 0 or not res_path.exists():
             raise RuntimeError(
                 f"BioImage.IO export failed (rc={proc.returncode}): {(proc.stderr or '')[-3000:]}"

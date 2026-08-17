@@ -13,7 +13,9 @@ ndarrays.
 """
 
 import asyncio
+import json
 import os
+import re
 import time
 import uuid
 from io import BytesIO
@@ -23,6 +25,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import bioengine
 import httpx
 import numpy as np
+import yaml
 from hypha_rpc import connect_to_server
 from pydantic import Field
 
@@ -73,6 +76,10 @@ class EntryApp:
         self._s3 = None
         self._http: Optional[httpx.AsyncClient] = None
         self._training_tasks: Dict[str, asyncio.Task] = {}
+        # In-memory export registry (v1): export_id -> status record. Lost on
+        # replica restart — the frontend re-exports if a handle goes missing.
+        self._exports: Dict[str, Dict[str, Any]] = {}
+        self._export_tasks: Dict[str, asyncio.Task] = {}
         # Serialize GPU fine-tuning across all runtime replicas: at most one
         # training runs at a time, so autoscaled replicas stay free to serve
         # inference during a long run. Mirrors model-runner's _env_build_lock.
@@ -264,6 +271,42 @@ class EntryApp:
             )
         return str(ckpt)
 
+    async def _fetch_model_package(
+        self, model_id: str, model_token: Optional[str]
+    ) -> Dict[str, Any]:
+        """Download an exported bioimage.io AIS package (published or the caller's
+        draft/staged) into a shared HOME cache and return
+        ``{weights_path, model_type, use_conv_transpose}``. Reads the RDF for the
+        ``MicroSAMAIS`` architecture kwargs. ``model_token`` (the caller's own token)
+        grants read access to a draft in their workspace; without it the app token is
+        used, which only reaches published models.
+        """
+        cache_dir = Path.home() / ".bioengine" / "micro_sam_zoo_cache" / re.sub(r"[^\w.-]", "_", model_id)
+        weights_path = cache_dir / "weights.pt"
+        meta_path = cache_dir / "kwargs.json"
+        if weights_path.exists() and meta_path.exists():
+            return {"weights_path": str(weights_path), **json.loads(meta_path.read_text())}
+
+        server = self._hypha
+        if model_token:
+            server = await connect_to_server({"server_url": SERVER_URL, "token": model_token})
+        am = await server.get_service("public/artifact-manager")
+
+        rdf_url = await am.get_file(model_id, file_path="rdf.yaml")
+        rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
+        ps = rdf["weights"]["pytorch_state_dict"]
+        kwargs = ps["architecture"]["kwargs"]
+        model_type = kwargs["model_type"]
+        use_conv_transpose = bool(kwargs["use_conv_transpose"])
+
+        w_url = await am.get_file(model_id, file_path=ps["source"])
+        content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(weights_path.write_bytes, content)
+        meta = {"model_type": model_type, "use_conv_transpose": use_conv_transpose}
+        meta_path.write_text(json.dumps(meta))
+        return {"weights_path": str(weights_path), **meta}
+
     # === serving (forwarded to the GPU runtime) ===
 
     @bioengine.method
@@ -293,18 +336,41 @@ class EntryApp:
         session_id: Optional[str] = Field(
             None, description="Serve the fine-tuned model from this training session's checkpoint."
         ),
+        model_id: Optional[str] = Field(
+            None,
+            description="Run an exported BioImage.IO AIS model by artifact id (e.g. "
+            "'bioimage-io/<alias>') — published, or your own draft/staged. Downloads "
+            "the package and runs micro-SAM native watershed → instances. Requires "
+            "input_arrays (not embeddings).",
+        ),
+        model_token: Optional[str] = Field(
+            None,
+            description="Hypha token with read access to model_id — needed for a "
+            "draft/staged model in your workspace; omit for published models.",
+        ),
     ) -> List[Dict[str, Any]]:
         """Automatic μSAM instance segmentation. Returns a bare list, one item per
         input, each ``{"output": <int32 [H,W] instance label mask>}``. Pass
         ``input_arrays`` (images) OR ``embeddings`` (precomputed — runs the AIS
-        decoder on the embedding without re-encoding).
+        decoder on the embedding without re-encoding). Pass ``model_id`` to run an
+        exported BioImage.IO AIS package instead of a built-in/finetuned model.
         """
         await self._check_runtime_available()
-        if (input_arrays is None) == (embeddings is None):
-            raise ValueError("Provide exactly one of 'input_arrays' or 'embeddings'.")
         generate_kwargs: Dict[str, Any] = {}
         if min_size is not None:
             generate_kwargs["min_size"] = min_size
+        if model_id is not None:
+            if input_arrays is None:
+                raise ValueError("model_id requires input_arrays (images), not embeddings.")
+            pkg = await self._fetch_model_package(model_id, model_token)
+            images = [await self._resolve_image(src) for src in input_arrays]
+            return await self.runtime.auto_segment_package(
+                images=images, weights_path=pkg["weights_path"],
+                model_type=pkg["model_type"], use_conv_transpose=pkg["use_conv_transpose"],
+                generate_kwargs=generate_kwargs,
+            )
+        if (input_arrays is None) == (embeddings is None):
+            raise ValueError("Provide exactly one of 'input_arrays' or 'embeddings'.")
         checkpoint = self._session_checkpoint(session_id) if session_id else None
         if embeddings is not None:
             embs = [await self._resolve_embedding(e) for e in embeddings]
@@ -533,65 +599,115 @@ class EntryApp:
         training.write_status(session_id, status="STOPPED", message="stop requested by user")
         return training.get_status(session_id)
 
+    @bioengine.method
     async def export_model(
         self,
-        session_id: str,
-        model_name: str,
-        description: str = "",
-        authors: Optional[List[Dict[str, Any]]] = None,
-        collection: Optional[str] = None,
+        session_id: str = Field(..., description="COMPLETED fine-tuning session to export."),
+        name: str = Field(..., description="Model name for the BioImage.IO package."),
+        description: str = Field("", description="Model description for the RDF."),
+        authors: Optional[List[Dict[str, Any]]] = Field(
+            None,
+            description="Authors, each {name, affiliation?, email?, github_user?, orcid?}.",
+        ),
+        license: str = Field("CC-BY-4.0", description="SPDX license id for the model."),
+        provenance: Optional[Dict[str, Any]] = Field(
+            None,
+            description="Baked server-side into RDF config.microsam_provenance, e.g. "
+            "{dataset_artifact_id, label, split_name, session_lineage}.",
+        ),
     ) -> Dict[str, Any]:
-        """Export a fine-tuned session as a **standard BioImage.IO model package**
-        and register it on Hypha. Builds the package in a CPU subprocess on the
-        runtime, then uploads the file collection (rdf.yaml + weights) as a
-        ``type="model"`` artifact. Returns the ``artifact_id`` — re-servable by
-        identifier (e.g. via model-runner or ``bioimageio.core``).
-
-        Not currently exposed as a ``@bioengine.method`` — env-gated on a
-        micro_sam/bioimageio.core 0.11 incompatibility (see README). Re-expose
-        once that's resolved.
+        """Start building a **prompt-free** BioImage.IO model package (RGB image ->
+        the 3 AIS maps) from a COMPLETED fine-tuning session. Async, like
+        start_training: returns immediately with an ``export_id`` — poll
+        ``get_export_status``. The package is built server-side and staged on
+        temporary storage; this method **publishes nothing**. The frontend creates
+        the draft artifact with the user's own token and either downloads the zip
+        from ``download_url`` or calls ``push_export`` to stream the package files
+        straight into the draft.
         """
-        import yaml
-        from bioengine.utils import create_file_list_from_directory
-
         self._session_checkpoint(session_id)  # raises if no trained checkpoint
         await self._check_runtime_available()
-        res = await self.runtime.export_bioimageio(session_id=session_id, model_name=model_name)
-
-        pkg_dir = Path(res["package_dir"])
-        rdf_path = pkg_dir / "rdf.yaml"
-        if not rdf_path.exists():
-            cands = sorted(pkg_dir.glob("*.yaml")) + sorted(pkg_dir.glob("*.yml"))
-            if not cands:
-                raise FileNotFoundError(f"No rdf.yaml in exported package {pkg_dir}")
-            rdf_path = cands[0]
-        rdf = yaml.safe_load(rdf_path.read_text())
-        if description:
-            rdf["description"] = description
-        if authors:
-            rdf["authors"] = authors
-
-        am = await self._hypha.get_service("public/artifact-manager")
-        create_kwargs: Dict[str, Any] = dict(
-            type="model", alias=model_name, manifest=rdf, stage=True
+        export_id = uuid.uuid4().hex
+        request = {
+            "name": name,
+            "description": description,
+            "authors": authors,
+            "license": license,
+            "provenance": provenance,
+        }
+        self._exports[export_id] = {
+            "export_id": export_id, "status": "PENDING", "progress": 0.0,
+            "message": "queued", "download_url": None, "size_bytes": None, "error": None,
+        }
+        self._export_tasks[export_id] = asyncio.create_task(
+            self._run_export(export_id, session_id, request)
         )
-        if collection:
-            col = await am.read(collection)
-            create_kwargs["parent_id"] = col["id"] if isinstance(col, dict) else col
-        art = await am.create(**create_kwargs)
-        artifact_id = str(art["id"] if isinstance(art, dict) else art)
+        return {"export_id": export_id, "status": "PENDING"}
 
-        files = create_file_list_from_directory(directory_path=str(pkg_dir))
-        async with httpx.AsyncClient(timeout=600) as client:
-            for f in files:
-                url = await am.put_file(artifact_id, file_path=f["name"])
-                content = f["content"]
-                if f.get("type") == "base64":
-                    import base64
+    async def _run_export(self, export_id: str, session_id: str, request: Dict[str, Any]) -> None:
+        rec = self._exports[export_id]
+        try:
+            rec.update(status="BUILDING", progress=0.1, message="building package")
+            res = await self.runtime.export_bioimageio(session_id=session_id, request=request)
+            rec["_package_dir"] = res["package_dir"]
+            rec.update(progress=0.8, message="staging package")
+            zip_path = Path(res["zip"])
+            file_path = f"temp/{export_id}/{zip_path.name}"
+            upload_url = await self._s3.put_file(file_path=file_path, ttl=6 * 3600)
+            data = await asyncio.to_thread(zip_path.read_bytes)
+            resp = await self._http_retry("PUT", upload_url, content=data, timeout=600.0)
+            resp.raise_for_status()
+            download_url = await self._get_download_url(file_path)
+            rec.update(
+                status="READY", progress=1.0, message="ready",
+                download_url=download_url, size_bytes=res["zip_size"], files=res["files"],
+            )
+        except Exception as e:
+            logger.exception(f"Export {export_id} failed")
+            rec.update(status="FAILED", progress=1.0, message="failed", error=str(e))
 
-                    content = base64.b64decode(content)
-                resp = await client.put(url, content=content)
-                resp.raise_for_status()
-        await am.commit(artifact_id)
-        logger.info(f"Exported BioImage.IO model artifact: {artifact_id}")
-        return {"artifact_id": artifact_id, "n_files": len(files), "model_name": model_name}
+    @bioengine.method
+    async def get_export_status(
+        self, export_id: str = Field(..., description="export_id from export_model.")
+    ) -> Dict[str, Any]:
+        """Export progress. ``status`` ∈ {PENDING, BUILDING, READY, FAILED}.
+        ``download_url`` (6h TTL) + ``size_bytes`` are set on READY; ``error`` on
+        FAILED. ``files`` lists the package members (name + size) so the frontend
+        can mirror them when creating the draft artifact and calling push_export."""
+        rec = self._exports.get(export_id)
+        if rec is None:
+            raise KeyError(f"Unknown export_id '{export_id}'.")
+        return {k: v for k, v in rec.items() if not k.startswith("_")}
+
+    @bioengine.method
+    async def push_export(
+        self,
+        export_id: str = Field(..., description="A READY export_id from export_model."),
+        files: Dict[str, str] = Field(
+            ...,
+            description="Map of package file name -> presigned PUT URL. Keys must "
+            "match the 'files' from get_export_status; mint the URLs via the draft "
+            "artifact's put_file with the user's token.",
+        ),
+    ) -> Dict[str, Any]:
+        """Stream the built package files straight into a draft artifact so the
+        browser never moves the ~350 MB twice. The frontend creates the staged
+        draft with the user's token, mints a presigned put_file URL per package
+        file, then calls this. Draft-only: this app never creates, commits, or
+        reads the artifact."""
+        rec = self._exports.get(export_id)
+        if rec is None:
+            raise KeyError(f"Unknown export_id '{export_id}'.")
+        if rec.get("status") != "READY":
+            raise RuntimeError(f"Export '{export_id}' is not READY (status={rec.get('status')}).")
+        pkg_dir = Path(rec["_package_dir"])
+        pushed = []
+        for rel, url in files.items():
+            fpath = pkg_dir / rel
+            if not fpath.is_file():
+                raise FileNotFoundError(f"Package file '{rel}' not found for export '{export_id}'.")
+            data = await asyncio.to_thread(fpath.read_bytes)
+            resp = await self._http_retry("PUT", url, content=data, timeout=600.0)
+            resp.raise_for_status()
+            pushed.append(rel)
+        return {"pushed": pushed, "n_files": len(pushed)}
