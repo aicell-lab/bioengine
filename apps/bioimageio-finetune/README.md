@@ -1,4 +1,4 @@
-# micro-sam (μSAM) 🔬
+# BioImageIO Fine-tune (μSAM) 🔬
 
 Serves [micro-sam](https://github.com/computational-cell-analytics/micro-sam)
 (μSAM) for microscopy segmentation and interactive annotation. **One fine-tuned
@@ -9,7 +9,7 @@ SAM image encoder stays resident on the GPU and backs three cheap consumers**
    in-browser ONNX prompt decoder, so "draw a bounding box → get a cell mask"
    needs no GPU round-trip per prompt.
 2. **Automatic instance segmentation (AIS decoder)** — the UNETR instance
-   decoder on the `*_lm` models produces a full instance label mask without
+   decoder on the generalist models produces a full instance label mask without
    prompts. This is the propose-and-prune pre-segmentation.
 3. **ONNX prompt decoder** — the lightweight interactive decoder exported to
    ONNX bytes for `onnxruntime-web`.
@@ -37,15 +37,19 @@ hypha-rpc ndarray wire-dicts, which decode to real ndarrays on the client.
 
 ## Models
 
-Use a light-microscopy (LM) generalist for brightfield/fluorescence cells — the
-`*_lm` models carry the AIS decoder so automatic segmentation works out of the
-box.
+Pick a generalist for your modality — all six carry the AIS decoder, so automatic
+segmentation works out of the box. Light-microscopy (`*_lm`) for
+brightfield/fluorescence cells; EM-organelles (`*_em_organelles`) for organelles
+in electron microscopy. Their weights load from **version-pinned bioimage.io
+records** (`runtime.py` `ZOO_MODELS`), so a zoo-side update never changes what is
+served without an app release.
 
 | `model_type` | Notes |
 |---|---|
 | `vit_l_lm` (default) | Best quality for cells & nuclei in LM (~5 GB resident) |
-| `vit_b_lm` | Lighter/faster fallback, lower quality |
-| `vit_t_lm`, `vit_b`, `vit_l`, `vit_h` | Also selectable (base SAM has no AIS decoder → AMG fallback) |
+| `vit_b_lm`, `vit_t_lm` | Lighter/faster LM, lower quality |
+| `vit_l_em_organelles`, `vit_b_em_organelles`, `vit_t_em_organelles` | Organelles in EM (AIS decoder) |
+| `vit_b`, `vit_l`, `vit_h` | Base SAM — no AIS decoder → AMG fallback |
 
 Switching `model_type` frees the previous model's VRAM and loads the new one
 (one resident at a time).
@@ -148,9 +152,9 @@ so it must be deployed with the token injected:
 
 ```python
 await worker.deploy_app(
-    artifact_id="bioimage-io/micro-sam",
-    version="0.3.0",
-    application_id="micro-sam",
+    artifact_id="bioimage-io/bioimageio-finetune",
+    version="0.10.0",
+    application_id="bioimageio-finetune",
     hypha_token=HYPHA_TOKEN,
 )
 ```

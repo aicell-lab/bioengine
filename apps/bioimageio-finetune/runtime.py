@@ -33,7 +33,18 @@ import numpy as np
 
 logger = bioengine.logger
 
-ModelType = ("vit_l_lm", "vit_b_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h")
+# The six micro-SAM generalists, each pinned to an exact bioimage.io record so a
+# zoo-side update never changes served weights without an app release. Base SAM
+# and fine-tuned checkpoints do not load through here.
+ZOO_MODELS = {
+    "vit_t_lm": ("faithful-chicken", "1.1"),
+    "vit_b_lm": ("diplomatic-bug", "1.2"),
+    "vit_l_lm": ("idealistic-rat", "1.2"),
+    "vit_t_em_organelles": ("greedy-whale", "1"),
+    "vit_b_em_organelles": ("noisy-ox", "1.2"),
+    "vit_l_em_organelles": ("humorous-crab", "1.2"),
+}
+_ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 
 
 def _read_pip(name: str) -> List[str]:
@@ -151,10 +162,32 @@ class RuntimeApp:
             "_rdtype": arr.dtype.name,
         }
 
+    def _zoo_weights(self, model_type: str):
+        """Fetch the pinned bioimage.io generalist (encoder + AIS decoder) into the
+        local cache and return ``(encoder_path, decoder_path)``. Files are pinned by
+        nickname+version so a zoo-side update never changes served weights without a
+        release. Blocking — under the GPU lock; cached after first fetch."""
+        import json
+
+        import pooch
+
+        nickname, version = ZOO_MODELS[model_type]
+        arch = "vit_" + model_type.split("_")[1]
+        cache = Path.home() / ".bioengine" / "micro_sam_zoo_cache" / model_type
+        base = f"{_ZOO_BASE_URL}/{nickname}/{version}/files"
+        enc = pooch.retrieve(f"{base}/{arch}.pt", known_hash=None, fname=f"{arch}.pt", path=cache)
+        dec = pooch.retrieve(f"{base}/{arch}_decoder.pt", known_hash=None, fname=f"{arch}_decoder.pt", path=cache)
+        src = cache / "source.json"
+        if not src.exists():
+            src.write_text(json.dumps({"id": nickname, "version": version, "model_type": model_type}))
+        return enc, dec
+
     def _ensure_model(self, model_type: str, checkpoint: Optional[str] = None):
         """Load (predictor, AIS segmenter), reusing the resident pair when the
-        (model_type, checkpoint) is unchanged. ``checkpoint`` serves a fine-tuned
-        ``best.pt``. Blocking — call via ``asyncio.to_thread`` under the GPU lock.
+        (model_type, checkpoint) is unchanged. A generalist (no checkpoint) loads
+        its pinned encoder + AIS decoder from the zoo cache; ``checkpoint`` serves a
+        fine-tuned ``best.pt``. Blocking — call via ``asyncio.to_thread`` under the
+        GPU lock.
         """
         from micro_sam.automatic_segmentation import get_predictor_and_segmenter
 
@@ -164,13 +197,28 @@ class RuntimeApp:
             self._release_model()
             label = f"{model_type}" + (f" (finetuned: {checkpoint})" if checkpoint else "")
             logger.info(f"🔄 Loading μSAM model '{label}' on {device}...")
-            predictor, segmenter = get_predictor_and_segmenter(
-                model_type=model_type,
-                checkpoint=checkpoint,
-                device=device,
-                # None → μSAM auto-selects AIS when the model ships a decoder.
-                segmentation_mode=None,
-            )
+            if checkpoint is None and model_type in ZOO_MODELS:
+                # get_predictor_and_segmenter has no decoder_path, so pre-load the
+                # two pinned files via get_sam_model and hand it the assembled state.
+                from micro_sam.util import get_sam_model
+
+                enc, dec = self._zoo_weights(model_type)
+                predictor, state = get_sam_model(
+                    model_type=model_type, checkpoint_path=enc, decoder_path=dec,
+                    device=device, return_state=True,
+                )
+                predictor, segmenter = get_predictor_and_segmenter(
+                    model_type=model_type, predictor=predictor, state=state,
+                    segmentation_mode=None,
+                )
+            else:
+                predictor, segmenter = get_predictor_and_segmenter(
+                    model_type=model_type,
+                    checkpoint=checkpoint,
+                    device=device,
+                    # None → μSAM auto-selects AIS when the model ships a decoder.
+                    segmentation_mode=None,
+                )
             self._predictor = predictor
             self._segmenter = segmenter
             self._loaded_key = key
@@ -229,7 +277,7 @@ class RuntimeApp:
     def _auto_segment_from_embedding(self, model_type, features, input_size, original_size,
                                      generate_kwargs, checkpoint):
         """Run the AIS decoder on a **precomputed** SAM embedding (no encoder pass).
-        Blocking — call under the GPU lock. For the AIS (``*_lm``) models; matches
+        Blocking — call under the GPU lock. For the AIS generalist models; matches
         the image path, where ``generate`` returns the instance-label array directly.
         """
         _, segmenter = self._ensure_model(model_type, checkpoint)

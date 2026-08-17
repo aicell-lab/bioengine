@@ -36,7 +36,11 @@ logger = bioengine.logger
 SERVER_URL = "https://hypha.aicell.io"
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
-ModelType = Literal["vit_l_lm", "vit_b_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h"]
+ModelType = Literal[
+    "vit_l_lm", "vit_b_lm", "vit_t_lm",
+    "vit_l_em_organelles", "vit_b_em_organelles", "vit_t_em_organelles",
+    "vit_b", "vit_l", "vit_h",
+]
 
 
 def _read_pip(name: str) -> List[str]:
@@ -326,9 +330,9 @@ class EntryApp:
         ),
         model_type: ModelType = Field(
             "vit_l_lm",
-            description="μSAM model. LM generalists (vit_b_lm / vit_l_lm / vit_t_lm) "
-            "carry the AIS decoder. For embeddings, the model must match the one that "
-            "produced them (inferred from the embedding when available).",
+            description="μSAM generalist. All six — LM (vit_t/b/l_lm) and EM organelles "
+            "(vit_t/b/l_em_organelles) — carry the AIS decoder. For embeddings, the model "
+            "must match the one that produced them (inferred from the embedding when available).",
         ),
         min_size: Optional[int] = Field(
             None, description="Minimum object size in pixels (smaller objects dropped)."
