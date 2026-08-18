@@ -990,6 +990,42 @@ class AnnotationBroker:
                 continue
             images.append({"stem": Path(name).stem})
 
+        # Per-image width/height (0.8.0) so the frontend can flag images
+        # below the segmentation models' input minimum without loading
+        # pixels. Each stem costs one 24-byte ranged read of the PNG IHDR
+        # header, done once and cached in the dataset's broker metadata;
+        # failed reads stay uncached and retry on a later index call.
+        dims_cache: Dict[str, Any] = dict(meta.get("image_dims") or {})
+        missing_dims = [img["stem"] for img in images if img["stem"] not in dims_cache]
+        if missing_dims:
+            dims_sem = asyncio.Semaphore(16)
+
+            async def _fetch_dims(stem: str):
+                async with dims_sem:
+                    try:
+                        url = await self._am.get_file(
+                            artifact_id=artifact_id, file_path=core.image_path(stem), stage=True
+                        )
+                        resp = await self._http.get(url, headers={"Range": "bytes=0-23"})
+                        resp.raise_for_status()
+                        return stem, core.parse_png_dims(resp.content[:24])
+                    except Exception:
+                        return stem, None
+
+            dims_results = await asyncio.gather(*(_fetch_dims(s) for s in missing_dims))
+            cache_grew = False
+            for stem, dims in dims_results:
+                if dims is not None:
+                    dims_cache[stem] = dims
+                    cache_grew = True
+            if cache_grew:
+                meta["image_dims"] = dims_cache
+                core.write_metadata(meta, root=STATE_ROOT)
+        for img in images:
+            dims = dims_cache.get(img["stem"])
+            if dims:
+                img["width"], img["height"] = int(dims[0]), int(dims[1])
+
         embedding_entries = await self._list_files_safe(artifact_id, "embeddings")
         embeddings: Dict[str, Any] = {}
         for entry in embedding_entries:
