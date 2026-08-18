@@ -855,3 +855,27 @@ def test_split_summary():
     assert s["n_train"] == 1 and s["n_test"] == 1
     assert s["name"] == "default" and s["label"] == "cells"
     assert s["checkpoint"] is None
+
+
+# --- parse_png_dims (0.8.0) ---
+
+
+def test_parse_png_dims_valid_header():
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("L", (200, 150)).save(buf, format="PNG")
+    assert bc.parse_png_dims(buf.getvalue()[:24]) == [200, 150]
+
+
+def test_parse_png_dims_rejects_non_png_and_short_input():
+    assert bc.parse_png_dims(b"notapng" * 4) is None
+    assert bc.parse_png_dims(b"\x89PNG\r\n\x1a\n" + b"\x00" * 4) is None
+    assert bc.parse_png_dims(b"") is None
+
+
+def test_parse_png_dims_rejects_zero_dims():
+    header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0d" + b"IHDR" + (0).to_bytes(4, "big") + (150).to_bytes(4, "big")
+    assert bc.parse_png_dims(header) is None

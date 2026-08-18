@@ -234,6 +234,26 @@ def image_path(stem: str, ext: str = ".png") -> str:
     return f"images/{stem}{ext}"
 
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def parse_png_dims(header: bytes) -> Optional[List[int]]:
+    """``[width, height]`` from the first bytes of a PNG file.
+
+    The IHDR chunk is mandatory and always first: 8-byte signature, 4-byte
+    chunk length, ``b'IHDR'``, then width and height as big-endian uint32 —
+    so 24 bytes are enough. Returns ``None`` for anything that is not a
+    plausible PNG header (the caller treats that as "dimensions unknown",
+    never an error)."""
+    if len(header) < 24 or not header.startswith(PNG_SIGNATURE) or header[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(header[16:20], "big")
+    height = int.from_bytes(header[20:24], "big")
+    if width <= 0 or height <= 0:
+        return None
+    return [width, height]
+
+
 def embedding_path(stem: str, model_type: str) -> str:
     return f"embeddings/{stem}_{model_type}.npz"
 
