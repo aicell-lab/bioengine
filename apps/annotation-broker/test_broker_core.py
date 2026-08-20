@@ -367,6 +367,45 @@ class TestParseEmbeddingFilename:
     def test_unknown_model_type_returns_none(self):
         assert bc.parse_embedding_filename("img001_unknown_model.npz") is None
 
+    def test_em_organelles_types(self):
+        # 0.9.0: EM organelle generalists must parse (they were missing from
+        # KNOWN_MODEL_TYPES, silently dropping their embeddings from the index).
+        assert bc.parse_embedding_filename("img001_vit_t_em_organelles.npz") == {
+            "stem": "img001",
+            "model_type": "vit_t_em_organelles",
+        }
+
+
+class TestCollectEmbeddings:
+    def test_multiple_models_per_stem(self):
+        out = bc.collect_embeddings(
+            [
+                "img001_vit_l_lm.npz",
+                "img001_vit_t_em_organelles.npz",
+                "img002_vit_b_lm.npz",
+                "junk.txt",
+            ]
+        )
+        assert out["img001"] == {
+            "model_type": "vit_l_lm",
+            "model_types": ["vit_l_lm", "vit_t_em_organelles"],
+        }
+        assert out["img002"] == {
+            "model_type": "vit_b_lm",
+            "model_types": ["vit_b_lm"],
+        }
+
+    def test_preferred_falls_back_to_first_sorted(self):
+        out = bc.collect_embeddings(
+            ["img_vit_t_lm.npz", "img_vit_b_em_organelles.npz"]
+        )
+        assert out["img"]["model_type"] == "vit_b_em_organelles"
+        assert out["img"]["model_types"] == ["vit_b_em_organelles", "vit_t_lm"]
+
+    def test_duplicates_collapse(self):
+        out = bc.collect_embeddings(["a_vit_l_lm.npz", "a_vit_l_lm.npz"])
+        assert out["a"]["model_types"] == ["vit_l_lm"]
+
 
 # ---------------------------------------------------------------------------
 # Dataset metadata: paths, new/read/write/delete

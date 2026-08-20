@@ -542,7 +542,22 @@ def split_summary(split: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 # Longest-model-type-name-first so "vit_l_lm" isn't mis-split as "vit_l".
-KNOWN_MODEL_TYPES = ("vit_b_lm", "vit_l_lm", "vit_t_lm", "vit_b", "vit_l", "vit_h")
+KNOWN_MODEL_TYPES = (
+    "vit_b_lm",
+    "vit_l_lm",
+    "vit_t_lm",
+    "vit_b_em_organelles",
+    "vit_l_em_organelles",
+    "vit_t_em_organelles",
+    "vit_b",
+    "vit_l",
+    "vit_h",
+)
+
+# The annotate page's pinned default (frontend MICRO_SAM_MODEL_TYPE). Used to
+# pick the backward-compatible single ``model_type`` an index entry reports
+# when a stem has embeddings from more than one model.
+DEFAULT_MODEL_TYPE = "vit_l_lm"
 
 
 def parse_embedding_filename(filename: str) -> Optional[Dict[str, str]]:
@@ -559,6 +574,27 @@ def parse_embedding_filename(filename: str) -> Optional[Dict[str, str]]:
             if stem:
                 return {"stem": stem, "model_type": model_type}
     return None
+
+
+def collect_embeddings(filenames: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Aggregate ``embeddings/`` folder listings into per-stem index entries.
+
+    Returns ``{stem: {"model_type": ..., "model_types": [...]}}`` where
+    ``model_types`` is the sorted list of every model with a stored embedding
+    for that stem, and ``model_type`` is the single backward-compatible pick
+    older clients read: ``DEFAULT_MODEL_TYPE`` when present, else the first
+    entry of the sorted list."""
+    by_stem: Dict[str, set] = {}
+    for name in filenames:
+        parsed = parse_embedding_filename(name)
+        if parsed:
+            by_stem.setdefault(parsed["stem"], set()).add(parsed["model_type"])
+    result: Dict[str, Dict[str, Any]] = {}
+    for stem, models in by_stem.items():
+        model_types = sorted(models)
+        preferred = DEFAULT_MODEL_TYPE if DEFAULT_MODEL_TYPE in models else model_types[0]
+        result[stem] = {"model_type": preferred, "model_types": model_types}
+    return result
 
 
 # ---------------------------------------------------------------------------
