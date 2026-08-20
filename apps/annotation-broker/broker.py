@@ -1027,12 +1027,14 @@ class AnnotationBroker:
                 img["width"], img["height"] = int(dims[0]), int(dims[1])
 
         embedding_entries = await self._list_files_safe(artifact_id, "embeddings")
-        embeddings: Dict[str, Any] = {}
-        for entry in embedding_entries:
-            name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
-            parsed = core.parse_embedding_filename(name)
-            if parsed:
-                embeddings[parsed["stem"]] = {"model_type": parsed["model_type"]}
+        embedding_names = [
+            entry.get("name", "") if isinstance(entry, dict) else str(entry)
+            for entry in embedding_entries
+        ]
+        # Per-stem entries carry every stored model in ``model_types`` (0.9.0,
+        # for the per-model embedding badges) plus the single backward-
+        # compatible ``model_type`` older clients read.
+        embeddings: Dict[str, Any] = core.collect_embeddings(embedding_names)
 
         my_annotations: Dict[str, Any] = {}
         if role != "public":
