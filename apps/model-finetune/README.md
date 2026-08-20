@@ -152,9 +152,9 @@ so it must be deployed with the token injected:
 
 ```python
 await worker.deploy_app(
-    artifact_id="bioimage-io/bioimageio-finetune",
+    artifact_id="bioimage-io/model-finetune",
     version="0.10.0",
-    application_id="bioimageio-finetune",
+    application_id="model-finetune",
     hypha_token=HYPHA_TOKEN,
 )
 ```

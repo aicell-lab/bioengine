@@ -1,5 +1,5 @@
 name: BioImageIO Fine-tune
-id: bioimageio-finetune
+id: model-finetune
 id_emoji: "🔬"
 description: Serves micro-sam (μSAM) with one resident SAM encoder backing image-embedding export, automatic instance segmentation (AIS decoder), and an ONNX interactive prompt decoder for in-browser box→mask annotation — plus in-app fine-tuning (train a μSAM model on annotated pairs and serve the just-trained checkpoint).
 documentation: README.md
