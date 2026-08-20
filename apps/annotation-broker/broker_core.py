@@ -258,6 +258,17 @@ def embedding_path(stem: str, model_type: str) -> str:
     return f"embeddings/{stem}_{model_type}.npz"
 
 
+def embedding_removal_paths(stem: str, model_type: Optional[str] = None) -> List[str]:
+    """Candidate cache paths to delete for one image: a single model's
+    ``.npz`` when ``model_type`` is given, otherwise every known model type
+    plus the legacy suffix-less ``{stem}.npz``."""
+    if model_type:
+        return [embedding_path(stem, model_type)]
+    paths = [embedding_path(stem, mt) for mt in KNOWN_MODEL_TYPES]
+    paths.append(f"embeddings/{stem}.npz")
+    return paths
+
+
 def annotation_save_paths(
     label: str, user_id: Optional[str], stem: str, timestamp: str
 ) -> Dict[str, str]:
