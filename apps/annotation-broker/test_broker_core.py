@@ -918,3 +918,23 @@ def test_parse_png_dims_rejects_non_png_and_short_input():
 def test_parse_png_dims_rejects_zero_dims():
     header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0d" + b"IHDR" + (0).to_bytes(4, "big") + (150).to_bytes(4, "big")
     assert bc.parse_png_dims(header) is None
+
+
+class TestEmbeddingRemovalPaths:
+    def test_single_model(self):
+        assert bc.embedding_removal_paths("img001", "vit_l_lm") == [
+            "embeddings/img001_vit_l_lm.npz"
+        ]
+
+    def test_all_models_plus_legacy(self):
+        paths = bc.embedding_removal_paths("img001")
+        assert len(paths) == len(bc.KNOWN_MODEL_TYPES) + 1
+        for mt in bc.KNOWN_MODEL_TYPES:
+            assert f"embeddings/img001_{mt}.npz" in paths
+        assert paths[-1] == "embeddings/img001.npz"
+
+    def test_stem_with_underscores(self):
+        # Real stems contain underscores; the model suffix must append cleanly.
+        assert bc.embedding_removal_paths("19681_1836_A2_1", "vit_l_lm") == [
+            "embeddings/19681_1836_A2_1_vit_l_lm.npz"
+        ]

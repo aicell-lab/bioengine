@@ -1128,6 +1128,31 @@ class AnnotationBroker:
         }
 
     @bioengine.method(context=True)
+    async def remove_embedding(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        image_stem: str = Field(..., description="Image stem (filename without extension)."),
+        model_type: Optional[str] = Field(
+            None,
+            description="μSAM model type to clear, e.g. 'vit_l_lm'. Omit to clear "
+            "this image's cached embeddings for every model type.",
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Delete cached embedding ``.npz`` files for one image so the next
+        segmentation recomputes them (recovery path for a stale or mismatched
+        embedding). Embeddings are pure cache, so any annotator may clear
+        them."""
+        artifact_id = self._canonical_id(artifact_id)
+        self._require_role(context, artifact_id, "annotator")
+        removed = []
+        for path in core.embedding_removal_paths(image_stem, model_type):
+            if await self._file_exists(artifact_id, path):
+                await self._am.remove_file(artifact_id=artifact_id, file_path=path)
+                removed.append(path)
+        return {"removed": removed}
+
+    @bioengine.method(context=True)
     async def get_save_urls(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
