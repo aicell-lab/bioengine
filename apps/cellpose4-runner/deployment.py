@@ -34,7 +34,7 @@ SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 # bioimage.io ids this service will run. cellpose4-runner is an inference-only
 # service for Cellpose-4 models; any id outside this set is rejected. Extend as
 # new Cellpose-4 models are verified.
-SUPPORTED_MODELS = ("idealistic-eagle",)
+SUPPORTED_MODELS = ("idealistic-eagle", "famous-sheep", "passionate-bug")
 
 
 def _read_pip(name: str) -> List[str]:
@@ -535,7 +535,8 @@ class Cellpose4Runner:
             ...,
             description="bioimage.io id of a supported Cellpose-4 model. Only the "
             "ids returned by ``list_supported_models`` are accepted (currently "
-            "'idealistic-eagle' = Cellpose-SAM, 3-channel input, label output); "
+            "'idealistic-eagle' = Cellpose-SAM, 'famous-sheep' / 'passionate-bug' = "
+            "Cellpose-DINO ViT-L / ViT-B; all 3-channel input, label output); "
             "any other id is rejected.",
         ),
         inputs: Union[np.ndarray, str] = Field(
