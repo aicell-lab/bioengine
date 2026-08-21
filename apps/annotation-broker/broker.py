@@ -1146,10 +1146,24 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         self._require_role(context, artifact_id, "annotator")
         removed = []
-        for path in core.embedding_removal_paths(image_stem, model_type):
-            if await self._file_exists(artifact_id, path):
-                await self._am.remove_file(artifact_id=artifact_id, file_path=path)
-                removed.append(path)
+
+        async def _rm_all():
+            for path in core.embedding_removal_paths(image_stem, model_type):
+                if await self._file_exists(artifact_id, path):
+                    await self._am.remove_file(artifact_id=artifact_id, file_path=path)
+                    removed.append(path)
+
+        await self._ensure_staged(artifact_id, _rm_all)
+        if removed:
+            # Removing a file that exists in the COMMITTED version only stages
+            # a deletion marker; a subsequent put_file + upload for the same
+            # path then stays invisible to list_files (and thus _file_exists)
+            # until the deletion is committed — which made every recompute of
+            # a committed embedding fail with "unavailable after upload".
+            # Commit the removal and re-stage so the path can be re-uploaded
+            # and observed immediately (same pattern as delete_label).
+            await self._commit_tolerating_pending_uploads(artifact_id)
+            await self._am.edit(artifact_id=artifact_id, stage=True)
         return {"removed": removed}
 
     @bioengine.method(context=True)
