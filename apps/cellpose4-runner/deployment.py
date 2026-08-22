@@ -36,6 +36,10 @@ SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 # new Cellpose-4 models are verified.
 SUPPORTED_MODELS = ("idealistic-eagle", "famous-sheep", "passionate-bug")
 
+# Tile size to aim for on loosely-sized models, matching upstream cellpose's
+# default for the DINO backbone (``models.py``: 256 for sam_vitl, else 384).
+DINO_BLOCK_SIZE = 384
+
 
 def _read_pip(name: str) -> List[str]:
     """Load a ``requirements-*.txt`` file next to this module."""
@@ -45,6 +49,25 @@ def _read_pip(name: str) -> List[str]:
         for line in text.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+
+
+def _block_size_ns(model_description) -> dict:
+    """Per-axis block-size parameters for ``predict_sample_with_blocking``.
+
+    Cellpose-DINO declares y/x as ``min + n*step`` rather than a fixed size, and
+    core's default of n=10 would tile it at 144 px — well under the 384 the
+    backbone expects. Returns an empty dict for fixed-size Cellpose-SAM, which
+    has no parameterized axis to choose for.
+    """
+    from bioimageio.spec.model.v0_5 import ParameterizedSize
+
+    ns = {}
+    for ipt in model_description.inputs:
+        for axis in ipt.axes:
+            if axis.type == "space" and isinstance(axis.size, ParameterizedSize):
+                n = -(-(DINO_BLOCK_SIZE - axis.size.min) // axis.size.step)
+                ns[(ipt.id, axis.id)] = max(0, n)
+    return ns
 
 
 @bioengine.app(
@@ -322,22 +345,24 @@ class Cellpose4Runner:
             inputs=inputs,
             sample_id=sample_id,
         )
-        # Cellpose-4 models declare a fixed input size with a halo, so they
-        # must be run tiled: blocking feeds each network call exactly the
-        # model's input size (halo as tile overlap). Running the whole sample
-        # unblocked pads it by the halo and breaks the ViT positional embed.
+        # Cellpose-4 models are tile-based with a halo, so they must be run
+        # tiled: blocking feeds each network call one tile (halo as overlap).
+        # Running the whole sample unblocked pads it by the halo and breaks the
+        # ViT positional embed. ``ns`` picks the tile size on loosely-sized
+        # models; it is empty (and ignored) for fixed-size Cellpose-SAM.
         #
         # ``skip_postprocessing`` drops the samplewise ``cellpose_flow_dynamics``
         # op (which turns the stitched 3-channel flow+cellprob tensor into
         # instance labels), returning the raw flow field instead. It runs after
         # tile stitching, so skipping it yields a correctly stitched flow field.
+        ns = _block_size_ns(self._pipeline.model_description)
         if two_pass:
             # First pass: image -> raw flow field, postprocessing skipped. Feed
             # that 3-channel flow field back through the model as the input of
             # the second pass, which carries the postprocessing (unless the
             # caller wants the raw second-pass flow field via return_flows).
             first = self._pipeline.predict_sample_with_blocking(
-                sample, skip_postprocessing=True
+                sample, skip_postprocessing=True, ns=ns
             )
             flow = next(iter(first.members.values())).data.data
             sample = create_sample_for_model(
@@ -347,7 +372,7 @@ class Cellpose4Runner:
             )
 
         result = self._pipeline.predict_sample_with_blocking(
-            sample, skip_postprocessing=return_flows
+            sample, skip_postprocessing=return_flows, ns=ns
         )
         members = {
             str(key): member.data.data for key, member in result.members.items()
