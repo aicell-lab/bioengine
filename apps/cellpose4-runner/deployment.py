@@ -51,21 +51,25 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
-def _block_size_ns(model_description) -> dict:
+def _block_size_ns(model_description, sample) -> dict:
     """Per-axis block-size parameters for ``predict_sample_with_blocking``.
 
     Cellpose-DINO declares y/x as ``min + n*step`` rather than a fixed size, and
     core's default of n=10 would tile it at 144 px — well under the 384 the
-    backbone expects. Returns an empty dict for fixed-size Cellpose-SAM, which
-    has no parameterized axis to choose for.
+    backbone expects. Capped at the sample's own extent, because core rejects a
+    block larger than the image. Returns an empty dict for fixed-size
+    Cellpose-SAM, which has no parameterized axis to choose for.
     """
     from bioimageio.spec.model.v0_5 import ParameterizedSize
 
     ns = {}
     for ipt in model_description.inputs:
+        member = sample.members.get(ipt.id)
         for axis in ipt.axes:
             if axis.type == "space" and isinstance(axis.size, ParameterizedSize):
-                n = -(-(DINO_BLOCK_SIZE - axis.size.min) // axis.size.step)
+                extent = None if member is None else member.sizes.get(axis.id)
+                target = min(DINO_BLOCK_SIZE, extent or DINO_BLOCK_SIZE)
+                n = (target - axis.size.min) // axis.size.step
                 ns[(ipt.id, axis.id)] = max(0, n)
     return ns
 
@@ -355,7 +359,7 @@ class Cellpose4Runner:
         # op (which turns the stitched 3-channel flow+cellprob tensor into
         # instance labels), returning the raw flow field instead. It runs after
         # tile stitching, so skipping it yields a correctly stitched flow field.
-        ns = _block_size_ns(self._pipeline.model_description)
+        ns = _block_size_ns(self._pipeline.model_description, sample)
         if two_pass:
             # First pass: image -> raw flow field, postprocessing skipped. Feed
             # that 3-channel flow field back through the model as the input of
