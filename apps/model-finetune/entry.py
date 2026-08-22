@@ -278,12 +278,13 @@ class EntryApp:
     async def _fetch_model_package(
         self, model_id: str, model_token: Optional[str]
     ) -> Dict[str, Any]:
-        """Download an exported bioimage.io AIS package (published or the caller's
-        draft/staged) into a shared HOME cache and return
-        ``{weights_path, model_type, use_conv_transpose}``. Reads the RDF for the
-        ``MicroSAMAIS`` architecture kwargs. ``model_token`` (the caller's own token)
-        grants read access to a draft in their workspace; without it the app token is
-        used, which only reaches published models.
+        """Download an exported bioimage.io micro-sam package (published or the
+        caller's draft/staged) into a shared HOME cache and return
+        ``{weights_path, model_type}``. The package is a combined
+        ``{model_state, decoder_state}`` checkpoint served through the same AIS
+        path as a fine-tuned session. ``model_token`` (the caller's own token)
+        grants read access to a draft in their workspace; without it the app token
+        is used, which only reaches published models.
         """
         cache_dir = Path.home() / ".bioengine" / "micro_sam_zoo_cache" / re.sub(r"[^\w.-]", "_", model_id)
         weights_path = cache_dir / "weights.pt"
@@ -299,15 +300,13 @@ class EntryApp:
         rdf_url = await am.get_file(model_id, file_path="rdf.yaml")
         rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
         ps = rdf["weights"]["pytorch_state_dict"]
-        kwargs = ps["architecture"]["kwargs"]
-        model_type = kwargs["model_type"]
-        use_conv_transpose = bool(kwargs["use_conv_transpose"])
+        model_type = ps["architecture"]["kwargs"]["model_type"]
 
         w_url = await am.get_file(model_id, file_path=ps["source"])
         content = (await self._http_retry("GET", w_url, timeout=600.0)).content
         cache_dir.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(weights_path.write_bytes, content)
-        meta = {"model_type": model_type, "use_conv_transpose": use_conv_transpose}
+        meta = {"model_type": model_type}
         meta_path.write_text(json.dumps(meta))
         return {"weights_path": str(weights_path), **meta}
 
@@ -342,10 +341,10 @@ class EntryApp:
         ),
         model_id: Optional[str] = Field(
             None,
-            description="Run an exported BioImage.IO AIS model by artifact id (e.g. "
-            "'bioimage-io/<alias>') — published, or your own draft/staged. Downloads "
-            "the package and runs micro-SAM native watershed → instances. Requires "
-            "input_arrays (not embeddings).",
+            description="Run an exported BioImage.IO micro-sam model by artifact id "
+            "(e.g. 'bioimage-io/<alias>') — published, or your own draft/staged. "
+            "Downloads the combined SAM+decoder package and runs its AIS decoder → "
+            "instances. Requires input_arrays (not embeddings).",
         ),
         model_token: Optional[str] = Field(
             None,
@@ -368,10 +367,9 @@ class EntryApp:
                 raise ValueError("model_id requires input_arrays (images), not embeddings.")
             pkg = await self._fetch_model_package(model_id, model_token)
             images = [await self._resolve_image(src) for src in input_arrays]
-            return await self.runtime.auto_segment_package(
-                images=images, weights_path=pkg["weights_path"],
-                model_type=pkg["model_type"], use_conv_transpose=pkg["use_conv_transpose"],
-                generate_kwargs=generate_kwargs,
+            return await self.runtime.auto_segment(
+                images=images, model_type=pkg["model_type"],
+                checkpoint=pkg["weights_path"], generate_kwargs=generate_kwargs,
             )
         if (input_arrays is None) == (embeddings is None):
             raise ValueError("Provide exactly one of 'input_arrays' or 'embeddings'.")
@@ -620,14 +618,16 @@ class EntryApp:
             "{dataset_artifact_id, label, split_name, session_lineage}.",
         ),
     ) -> Dict[str, Any]:
-        """Start building a **prompt-free** BioImage.IO model package (RGB image ->
-        the 3 AIS maps) from a COMPLETED fine-tuning session. Async, like
-        start_training: returns immediately with an ``export_id`` — poll
-        ``get_export_status``. The package is built server-side and staged on
-        temporary storage; this method **publishes nothing**. The frontend creates
-        the draft artifact with the user's own token and either downloads the zip
-        from ``download_url`` or calls ``push_export`` to stream the package files
-        straight into the draft.
+        """Start building a **standard combined SAM+decoder** BioImage.IO model
+        package (interactive prompt head + AIS decoder in one checkpoint, via
+        ``micro_sam.bioimageio.export_sam_model``) from a COMPLETED fine-tuning
+        session. Async, like start_training: returns immediately with an
+        ``export_id`` — poll ``get_export_status``. The package is self-tested on
+        CPU, built server-side, and staged on temporary storage; this method
+        **publishes nothing**. The frontend creates the draft artifact with the
+        user's own token and either downloads the zip from ``download_url`` or calls
+        ``push_export`` to stream the package files straight into the draft.
+        ``license`` is currently ignored — the upstream export hard-codes CC-BY-4.0.
         """
         self._session_checkpoint(session_id)  # raises if no trained checkpoint
         await self._check_runtime_available()

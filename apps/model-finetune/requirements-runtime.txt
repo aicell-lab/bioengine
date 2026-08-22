@@ -1,8 +1,10 @@
-# micro-sam 1.8.5 is the broadest-compatible pin (Requires-Python >=3.10); the
-# full pip install pulls torch-em / segment-anything / bioimage-cpp, so the old
-# conda-only nifty/vigra/z5py blocker is gone. onnx(runtime) is only for the
-# in-browser prompt-decoder export (get_onnx_model).
-micro-sam==1.8.5
+# micro-sam 1.8.10 ships PR #1337: export_sam_model produces a combined
+# {model_state, decoder_state} AIS-default package and PredictorAdaptor runs
+# automatic instance segmentation when called without prompts. The full pip
+# install pulls torch-em / segment-anything / bioimage-cpp, so the old conda-only
+# nifty/vigra/z5py blocker is gone. onnx(runtime) is only for the in-browser
+# prompt-decoder export (get_onnx_model).
+micro-sam==1.8.10
 segment-anything==1.0
 # micro-sam routes the vit_t_lm base model through MobileSAM's tiny image
 # encoder; without it train_sam / get_predictor raise "'mobile_sam' is required
@@ -13,6 +15,8 @@ torchvision==0.22.1
 onnx==1.17.0
 onnxruntime==1.21.0
 imageio>=2.37.0
+# export_worker reads/rewrites the packaged rdf.yaml to bake provenance.
+pyyaml
 # onnx pulls protobuf transitively; protobuf 6.x's upb FieldDescriptor drops
 # `.label`, which Ray 2.55.1's serve config _proto_to_dict still reads → the GPU
 # replica dies with AttributeError at construction. Cap below 6 to match Ray's base.

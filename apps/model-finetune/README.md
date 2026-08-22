@@ -25,7 +25,7 @@ it composes the runtime by type hint. The client always talks to the entry.
 
 - **EntryApp** (CPU, 1 replica) — Hypha/S3 transport, training data
   materialization, session orchestration, and request routing to the runtime.
-- **RuntimeApp** (GPU, autoscaling `min=1 / max=2`) — the resident SAM encoder,
+- **RuntimeApp** (GPU, autoscaling `min=1 / max=3`) — the resident SAM encoder,
   a single `asyncio` **GPU lock over every GPU op** (serving *and* training), and
   fine-tuning that runs in a **subprocess** (VRAM fully reclaimed on exit; the
   resident inference model is evicted first so the subprocess owns the GPU).
@@ -104,22 +104,27 @@ in each training image.
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
-- **`export_model(...)`** _(present in code but **not currently exposed** as an API method — env-gated, see below)_
-  Export a completed session as a **standard BioImage.IO model package** and
-  register it on Hypha (`type="model"` artifact: rdf.yaml + weights). Built in a
-  CPU subprocess on the runtime via `micro_sam.bioimageio.export_sam_model`, then
-  uploaded by the entry. Returns `{artifact_id, n_files, model_name}`.
+- **`export_model(session_id, name, description="", authors=None, license="CC-BY-4.0", provenance=None)`**
+  Build a **standard combined SAM+decoder** BioImage.IO package from a COMPLETED
+  session — the interactive prompt head *and* the AIS decoder in one
+  `{model_state, decoder_state}` checkpoint (run without prompts for automatic
+  instance segmentation) — via `micro_sam.bioimageio.export_sam_model` in a CPU
+  subprocess on the runtime. That call **self-tests** the package on CPU (prompt
+  round-trip + image-only AIS) before saving, so a returned package is already
+  spec-valid and reproducible. Async, like `start_training`: returns immediately
+  with an `export_id` — poll `get_export_status`.
 
-  > **Known limitation (env-gated).** `export_sam_model` (micro_sam 1.8.5) is not
-  > yet compatible with `bioimageio.core 0.11` / `spec 0.5.12` (what this runtime
-  > resolves to). `export_worker.py` patches the spec-validation mismatches
-  > (`FileDescr` for documentation/covers, the over-strict "too-small" test-tensor
-  > check), but the export's self-test then fails inside **core 0.11's**
-  > `create_model_adapter` (a core-internal incompatibility with the exported
-  > PredictorAdaptor). The same export works end-to-end on `core 0.9.4` /
-  > `spec 0.5.5.6`, but that stack can't be pinned here without regressing
-  > training's `torch-em`. **Revisit when micro_sam supports bioimageio.core 0.11**
-  > (or export offline in a core-0.9.4 env). Serving/training are unaffected.
+  **Draft-only.** The package is staged on temporary storage; `export_model`
+  **publishes nothing**. The frontend creates the draft artifact with the user's
+  own token, then either downloads the zip from `download_url` or calls
+  `push_export(export_id, files)` to stream the package files straight into the
+  draft (no double-move of the ~350 MB). `provenance` is baked server-side into
+  `rdf.yaml`'s `config.microsam_provenance`. `license` is currently **ignored** —
+  `export_sam_model` hard-codes `CC-BY-4.0` on the RDF.
+
+  > Export needs a training label with **≥ 2 instances** — `export_sam_model`
+  > derives its prompt test data from label ids 1 and 2. The first qualifying
+  > training label in the session is used.
 
 **Serve the just-trained model:** once `checkpoint_available` is true, pass
 `session_id` to any serving method — the fine-tuned checkpoint flows through the
@@ -132,9 +137,9 @@ out = await svc.infer(input_arrays=[img], session_id=sid)          # AIS masks f
 emb = await svc.compute_embedding(inputs=img, session_id=sid) # embedding from the fine-tuned encoder
 ```
 
-Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`.
-`export_model(session_id, ...)` publishes the fine-tuned model as a standard
-BioImage.IO artifact (currently env-gated — see the method note above).
+Sessions live under `~/.bioengine/micro_sam_sessions/<session_id>/`. Use
+`export_model(session_id, ...)` to build a standard BioImage.IO package of the
+fine-tuned model (draft-only — see the method note above).
 
 ## Interactive annotation loop (Option A — in-browser decode)
 
@@ -153,7 +158,7 @@ so it must be deployed with the token injected:
 ```python
 await worker.deploy_app(
     artifact_id="bioimage-io/model-finetune",
-    version="0.10.0",
+    version="0.11.0",
     application_id="model-finetune",
     hypha_token=HYPHA_TOKEN,
 )
