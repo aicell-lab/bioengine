@@ -58,6 +58,7 @@ except Exception:
 
 from bioimageio.core import create_prediction_pipeline, load_model_description
 from bioimageio.core.digest_spec import create_sample_for_model
+from bioimageio.spec.model.v0_5 import ParameterizedSize
 
 rdf_path, load_params_path, resp_fd = sys.argv[1:4]
 resp = os.fdopen(int(resp_fd), "w")
@@ -70,15 +71,164 @@ def _respond(obj):
 
 with open(load_params_path) as f:
     lp = json.load(f)
+sys.path.insert(0, lp["app_dir"])
 single_input_key = lp["single_input_key"]
 default_blocksize_parameter = lp["default_blocksize_parameter"]
+overrides = lp["overrides"]
 
-model_description = load_model_description(rdf_path)
+# Channel names the micro-SAM AIS decoder writes, in order. Their presence on
+# an output axis is what identifies an AIS model — the tensor id varies.
+MICROSAM_CHANNELS = ("foreground", "center_distance", "boundary_distance")
+MICROSAM_KEY = "microsam_watershed"
+# Tile size to aim for on loosely-sized Cellpose models, matching upstream
+# cellpose's default for the DINO backbone (``models.py``: 256 for sam_vitl,
+# else 384).
+DINO_BLOCK_SIZE = 384
+
+
+def _proc_id(op):
+    return str(getattr(op, "id", None) or getattr(op, "name", ""))
+
+
+def _apply_overrides(descr, overrides):
+    # Per-request pre/postprocessing overrides. A dict patches the op's kwargs
+    # on a deep copy of the description; ``None`` drops the op, which core can
+    # only express as "skip this whole processing stage" — the declared tensor
+    # shapes assume the ops ran, so a partial drop fails block reassembly.
+    # Returns (description, skip_preprocessing, skip_postprocessing). The
+    # artifact on disk is never touched; the copy lives only as long as this
+    # child, which the parent evicts when the override set changes.
+    pre = dict(overrides.get("preprocessing") or {})
+    post = {k: v for k, v in (overrides.get("postprocessing") or {}).items()
+            if k != MICROSAM_KEY}
+    if not pre and not post:
+        return descr, False, False
+
+    declared = {"preprocessing": set(), "postprocessing": set()}
+    for tensors, attr in (
+        (descr.inputs, "preprocessing"),
+        (descr.outputs, "postprocessing"),
+    ):
+        for tensor in tensors:
+            for op in getattr(tensor, attr, None) or []:
+                declared[attr].add(_proc_id(op))
+
+    skip = {}
+    for attr, updates in (("preprocessing", pre), ("postprocessing", post)):
+        unknown = set(updates) - declared[attr]
+        if unknown:
+            raise ValueError(
+                "model declares no " + attr + " op named: "
+                + ", ".join(sorted(unknown))
+            )
+        dropped = {k for k, v in updates.items() if v is None}
+        if dropped and dropped != set(updates):
+            raise ValueError(
+                "a request either patches or drops " + attr
+                + " ops, not both: dropping one drops them all"
+            )
+        skip[attr] = bool(dropped)
+
+    patched = descr.model_copy(deep=True)
+    for tensors, updates, attr in (
+        (patched.inputs, pre, "preprocessing"),
+        (patched.outputs, post, "postprocessing"),
+    ):
+        if not updates or skip[attr]:
+            continue
+        for tensor in tensors:
+            ops = getattr(tensor, attr, None) or []
+            new_ops = list(ops)
+            changed = False
+            for i, op in enumerate(new_ops):
+                op_id = _proc_id(op)
+                if op_id not in updates:
+                    continue
+                kwargs = getattr(op, "kwargs", None)
+                if kwargs is None:
+                    raise ValueError(op_id + " takes no kwargs to override")
+                new_ops[i] = op.model_copy(
+                    update={"kwargs": kwargs.model_copy(update=updates[op_id])}
+                )
+                changed = True
+            if changed:
+                object.__setattr__(tensor, attr, type(ops)(new_ops))
+
+    return patched, skip["preprocessing"], skip["postprocessing"]
+
+
+def _is_cellpose(descr):
+    for output in descr.outputs:
+        for op in getattr(output, "postprocessing", None) or []:
+            if "cellpose" in _proc_id(op).lower():
+                return True
+    return False
+
+
+def _microsam_output_id(descr):
+    for output in descr.outputs:
+        for axis in getattr(output, "axes", None) or []:
+            names = getattr(axis, "channel_names", None)
+            if names and tuple(str(n) for n in names) == MICROSAM_CHANNELS:
+                return output.id
+    return None
+
+
+def _block_size_ns(descr, sample):
+    # Cellpose-DINO declares y/x as ``min + n*step`` rather than a fixed size,
+    # and core's default of n=10 would tile it at 144 px — well under the 384
+    # the backbone expects. Capped at the sample's own extent, because core
+    # rejects a block larger than the image. Empty for fixed-size Cellpose-SAM.
+    ns = {}
+    for ipt in descr.inputs:
+        member = sample.members.get(ipt.id)
+        for axis in getattr(ipt, "axes", None) or []:
+            if getattr(axis, "type", None) != "space":
+                continue
+            if not isinstance(axis.size, ParameterizedSize):
+                continue
+            extent = None if member is None else member.sizes.get(axis.id)
+            target = min(DINO_BLOCK_SIZE, extent or DINO_BLOCK_SIZE)
+            n = (target - axis.size.min) // axis.size.step
+            ns[(ipt.id, axis.id)] = max(0, n)
+    return ns
+
+
+loaded_description = load_model_description(rdf_path)
+# Cellpose models are tile-based with a halo, so they must run blocked: an
+# unblocked call pads the whole sample by the halo and breaks the ViT
+# positional embedding. Everything else keeps the historical behaviour —
+# blocked only when the caller asked for a block size. How a model has to run
+# is a property of the model, so both flags are read before the overrides get
+# a chance to drop the op they are recognised by.
+cellpose = _is_cellpose(loaded_description)
+microsam_id = _microsam_output_id(loaded_description)
+model_description, skip_pre, skip_post = _apply_overrides(
+    loaded_description, overrides
+)
+watershed_override = (overrides.get("postprocessing") or {}).get(MICROSAM_KEY, {})
+watershed_kwargs = watershed_override or {}
+# The watershed runs unless the caller dropped it explicitly, or asked for the
+# raw model output by dropping the model's declared postprocessing.
+apply_watershed = microsam_id is not None and watershed_override is not None
+if skip_post and not watershed_override:
+    apply_watershed = False
+if apply_watershed:
+    from microsam_watershed import microsam_watershed
+
+# Passing ``default_blocksize_parameter=None`` explicitly would override
+# core's own default with None, and a blocked predict whose per-axis ``ns``
+# is empty (every axis fixed) then falls back to it and crashes.
+blocksize_kwargs = (
+    {"default_blocksize_parameter": default_blocksize_parameter}
+    if default_blocksize_parameter
+    else {}
+)
 pipeline = create_prediction_pipeline(
     model_description,
     weights_format=lp["weights_format"],
     device=lp["device"],
-    default_blocksize_parameter=default_blocksize_parameter,
+    **blocksize_kwargs,
 )
 pipeline.load()
 _respond({"status": "ready"})
@@ -108,14 +258,41 @@ for line in sys.stdin:
             inputs=sample_inputs,
             sample_id=req["sample_id"],
         )
+        skips = {
+            "skip_preprocessing": skip_pre,
+            "skip_postprocessing": skip_post,
+        }
         if default_blocksize_parameter:
-            result = pipeline.predict_sample_with_blocking(sample)
+            result = pipeline.predict_sample_with_blocking(sample, **skips)
+        elif cellpose:
+            result = pipeline.predict_sample_with_blocking(
+                sample,
+                ns=_block_size_ns(pipeline.model_description, sample),
+                **skips,
+            )
         else:
-            result = pipeline.predict_sample_without_blocking(sample)
+            result = pipeline.predict_sample_without_blocking(sample, **skips)
+        members = {
+            str(key): member.data.data for key, member in result.members.items()
+        }
+        # micro-SAM AIS models predict three dense maps; the seeded watershed
+        # that turns them into instance labels is not expressible as a spec
+        # postprocessing op in the pinned core, so it runs here. Overriding it
+        # with ``None`` skips it and returns the maps.
+        if apply_watershed:
+            maps = members.pop(str(microsam_id))
+            maps = np.asarray(maps)
+            if maps.ndim == 4:
+                labels = np.stack(
+                    [microsam_watershed(m, **watershed_kwargs) for m in maps]
+                )
+            else:
+                labels = microsam_watershed(maps, **watershed_kwargs)
+            members["labels"] = labels
         out = Path(req["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
-        for key, member in result.members.items():
-            np.save(str(out / (str(key) + ".npy")), member.data.data)
+        for key, array in members.items():
+            np.save(str(out / (key + ".npy")), array)
         _respond({"status": "ok"})
     except Exception as e:
         _respond({"status": "error", "message": repr(e)})
@@ -765,7 +942,10 @@ class RuntimeDeployment:
         shutil.rmtree(lp_dir, ignore_errors=True)
 
     def _send_predict(
-        self, input_dir: str, output_dir: str, sample_id: str
+        self,
+        input_dir: str,
+        output_dir: str,
+        sample_id: str,
     ) -> None:
         """Send one predict request to the resident child and wait for its
         result. On child crash or error the child is evicted (a poisoned
@@ -773,7 +953,11 @@ class RuntimeDeployment:
         one-shot path used to raise is surfaced for the entry to handle.
         """
         warm = self._warm
-        req = {"input_dir": input_dir, "output_dir": output_dir, "sample_id": sample_id}
+        req = {
+            "input_dir": input_dir,
+            "output_dir": output_dir,
+            "sample_id": sample_id,
+        }
         try:
             warm["stdin"].write(json.dumps(req) + "\n")
             warm["stdin"].flush()
@@ -839,6 +1023,7 @@ class RuntimeDeployment:
         sample_id: str = "sample",
         remote_modified: Optional[str] = None,
         force_reload: bool = False,
+        overrides: Optional[Dict[str, Dict[str, Optional[dict]]]] = None,
     ) -> None:
         """Read inputs from disk, run inference in a subprocess, write
         outputs to disk.
@@ -900,12 +1085,16 @@ class RuntimeDeployment:
             # ``package.latest_remote_modified``): a genuine model update
             # changes it → key mismatch → evict + reload, so the warm
             # pipeline can never outlive a cache refresh.
+            # ``overrides`` patch the model description the pipeline is built
+            # from, so they belong in the identity: a changed override set must
+            # reload rather than silently reuse a differently-configured child.
             key = (
                 rdf_path,
                 remote_modified,
                 weights_format,
                 device,
                 default_blocksize_parameter,
+                json.dumps(overrides or {}, sort_keys=True),
             )
             # ``force_reload`` (entry passes it for cache="skip") bypasses reuse
             # so a byte-identical re-download — which leaves ``remote_modified``
@@ -938,6 +1127,8 @@ class RuntimeDeployment:
                     "device": device,
                     "default_blocksize_parameter": default_blocksize_parameter,
                     "single_input_key": SINGLE_INPUT_KEY,
+                    "overrides": overrides or {},
+                    "app_dir": str(Path(__file__).parent),
                 }
                 await asyncio.to_thread(
                     self._spawn_warm, key, rdf_path, load_params

@@ -5,10 +5,10 @@ RDF validation, end-to-end model testing, and inference. It delegates the
 GPU-bound work (``predict`` and the heavy ``bioimageio.core.test_model``
 call) to :class:`runtime.RuntimeDeployment` via the v0.6 type-hint composition.
 
-The GPU runtime ships Cellpose-3 and cannot run Cellpose-4 models
-(Cellpose-SAM / Cellpose-DINO). Deploy the ``bioimage-io/cellpose4-runner``
-app for those and call its ``list_supported_models()`` for the currently
-accepted model ids.
+The GPU runtime ships Cellpose-4 (Cellpose-SAM / Cellpose-DINO) and
+micro-SAM, and runs those models natively. It cannot run the older
+Cellpose-3 zoo models; deploy the ``bioimage-io/cellpose3-runner`` app for
+those and call its ``list_supported_models()`` for the accepted ids.
 
 Heavier helper modules:
 
@@ -50,6 +50,18 @@ logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
 
 SUPPORTED_FILES_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
+
+# Cellpose-3 zoo models. The runtime ships Cellpose 4, whose API these
+# models' architectures do not survive, so ``infer`` refuses them and points
+# at cellpose3-runner. Mirrors that app's ``SUPPORTED_MODELS``; ``test`` still
+# accepts them because it runs in each model's own conda environment.
+CELLPOSE3_MODELS = (
+    "famous-fish",
+    "happy-elephant",
+    "merry-gorilla",
+    "philosophical-panda",
+    "thoughtful-chipmunk",
+)
 
 
 def _read_pip(name: str) -> List[str]:
@@ -1706,9 +1718,9 @@ class EntryDeployment:
 
         Returns a list of model identifiers with their descriptions that match the search query.
 
-        Cellpose-4 models (Cellpose-SAM / Cellpose-DINO) are served by the
-        ``bioimage-io/cellpose4-runner`` app, not this runner; query that
-        app's ``list_supported_models()`` for its current accepted ids.
+        Cellpose-3 models are served by the ``bioimage-io/cellpose3-runner``
+        app, not this runner; query that app's ``list_supported_models()``
+        for its current accepted ids.
         """
         logger.info(f"🔍 Searching models with keywords={keywords}, limit={limit}")
         collection_id = "bioimage-io/bioimage.io"
@@ -1936,7 +1948,7 @@ class EntryDeployment:
         cache: Literal["skip", "check", "reuse"] = Field(
             "check",
             description="Model-cache policy (same meaning on ``infer`` and on "
-            "cellpose4-runner): 'check' (default) verifies the cached package "
+            "cellpose3-runner): 'check' (default) verifies the cached package "
             "against upstream and re-downloads if stale, also re-checking "
             "cached test-report currency; 'skip' forces a complete re-download "
             "and bypasses cached test results; 'reuse' trusts the local cache "
@@ -2798,7 +2810,7 @@ class EntryDeployment:
         cache: Literal["skip", "check", "reuse"] = Field(
             "check",
             description="Model-cache policy (same meaning on ``test`` and on "
-            "cellpose4-runner): 'check' (default) verifies the cached package "
+            "cellpose3-runner): 'check' (default) verifies the cached package "
             "against upstream and re-downloads if stale, re-checking a warm "
             "model too; 'skip' forces a complete re-download and reload even if "
             "the model is warm; 'reuse' trusts the local cache and any warm "
@@ -2809,6 +2821,27 @@ class EntryDeployment:
             description="Deprecated alias for ``cache``; prefer ``cache``. When "
             "set it overrides ``cache``: True→'skip', False→'check'.",
         ),
+        preprocessing: Optional[Dict[str, Optional[dict]]] = Field(
+            None,
+            description="Per-request overrides of the model's declared "
+            "preprocessing, as {op_id: {kwarg: value}} (e.g. "
+            '{"scale_range": {"min_percentile": 1.0, "max_percentile": 99.0}}). '
+            "A value of None drops the op instead of patching it. Applied to an "
+            "in-memory copy of the RDF; the published artifact is never "
+            "modified. An op id the model does not declare is an error.",
+        ),
+        postprocessing: Optional[Dict[str, Optional[dict]]] = Field(
+            None,
+            description="Per-request overrides of the model's declared "
+            "postprocessing, same form as ``preprocessing`` (e.g. "
+            '{"cellpose_flow_dynamics": {"flow_threshold": 0.4, '
+            '"cellprob_threshold": 0.0, "min_size": 15}}). Dropping an op with '
+            "None returns the model's raw output — "
+            '{"cellpose_flow_dynamics": None} yields Cellpose-4 flow fields. '
+            'The extra key "microsam_watershed" configures the micro-SAM '
+            "instance-segmentation watershed, which is not a declared op; "
+            "setting it to None returns the AIS distance maps.",
+        ),
         return_download_url: Optional[bool] = Field(
             False,
             description="If True, each array in the output will be saved to a temporary .npy file in S3 and the output value will be a presigned download URL (str) instead of the raw np.ndarray. The URL is valid for 1 hour.",
@@ -2817,10 +2850,10 @@ class EntryDeployment:
         """
         Submit an inference request and return a ``request_id`` immediately.
 
-        Cellpose-4 models (Cellpose-SAM / Cellpose-DINO) are not supported
-        here — this runner's runtime ships Cellpose-3. Run them via the
-        ``bioimage-io/cellpose4-runner`` app instead and call its
-        ``list_supported_models()`` for the currently accepted model ids.
+        Cellpose-4 (Cellpose-SAM / Cellpose-DINO) and micro-SAM models run
+        natively here. Cellpose-3 models are not supported — this runner's
+        runtime ships Cellpose 4. Run them via the
+        ``bioimage-io/cellpose3-runner`` app instead.
 
         The call resolves URL / S3-path inputs to numpy arrays, spills
         them to disk under ``$HOME/.model-runner-inference/<request_id>/input/``
@@ -2852,6 +2885,13 @@ class EntryDeployment:
                 provided but the resource does not exist or has expired.
         """
         logger.info(f"🤖 Queuing inference for model '{model_id}'...")
+
+        if model_id.rsplit("/", 1)[-1] in CELLPOSE3_MODELS:
+            raise ValueError(
+                f"model_id {model_id!r} is a Cellpose-3 model, which this "
+                f"runner's Cellpose-4 runtime cannot run. Use the "
+                f"'bioimage-io/cellpose3-runner' app instead."
+            )
 
         # Resolve any URL or temporary file path strings to numpy
         # arrays BEFORE handing off — matches the user's spec ("save
@@ -2926,6 +2966,10 @@ class EntryDeployment:
                 default_blocksize_parameter=default_blocksize_parameter,
                 sample_id=sample_id,
                 cache=cache,
+                overrides={
+                    "preprocessing": preprocessing or {},
+                    "postprocessing": postprocessing or {},
+                },
             )
         )
         return request_id
@@ -2939,6 +2983,7 @@ class EntryDeployment:
         default_blocksize_parameter: Optional[int],
         sample_id: Optional[str],
         cache: str,
+        overrides: Dict[str, Dict[str, Optional[dict]]],
     ) -> None:
         """Background inference driver — model download → runtime dispatch.
 
@@ -2989,6 +3034,7 @@ class EntryDeployment:
                     sample_id=sample_id,
                     remote_modified=package.latest_remote_modified,
                     force_reload=(cache == "skip"),
+                    overrides=overrides,
                 )
 
             self._update_infer_job(job, state="completed")

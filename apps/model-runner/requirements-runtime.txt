@@ -1,13 +1,18 @@
 bioimageio.core==0.10.4
 careamics==0.0.16
-cellpose==3.1.1.2
-nvidia-ml-py==12.555.43
+cellpose==4.2.1.1
+# micro-SAM vit_t artifacts import mobile_sam; segment-anything has no vit_t.
+git+https://github.com/ChaoningZhang/MobileSAM.git@f706ad9c4eb7f219c00d9050e46328518ffb65d2
+git+https://github.com/facebookresearch/dinov3.git@346f38fee679c56a6888f91c51670fae61d364e0
 numpy==1.26.4
+nvidia-ml-py==12.555.43
 onnxruntime==1.20.1
 psutil==6.1.1
+scikit-image==0.25.2
+segment-anything==1.0
 stardist==0.9.1
 tensorflow==2.16.1
 timm==1.0.27
-torch==2.5.1
-torchvision==0.20.1
+torch==2.7.1
+torchvision==0.22.1
 xarray==2025.1.2

@@ -92,14 +92,19 @@ This avoids the need for model-type-specific runtimes and simplifies scheduling,
 **Dependencies**
 
 ```text
-bioimageio.core==0.9.5
+bioimageio.core==0.10.4
 careamics==0.0.16
-cellpose==3.1.1.2
+cellpose==4.2.1.1
+dinov3 (git)
 numpy==1.26.4
 onnxruntime==1.20.1
+scikit-image==0.25.2
+segment-anything==1.0
+stardist==0.9.1
 tensorflow==2.16.1
-torch==2.5.1
-torchvision==0.20.1
+timm==1.0.27
+torch==2.7.1
+torchvision==0.22.1
 xarray==2025.1.2
 ```
 
@@ -110,8 +115,12 @@ Notes:
   * PyTorch models
   * TensorFlow models
   * ONNX models
-  * Cellpose-based workflows
+  * Cellpose-4 workflows (Cellpose-SAM, Cellpose-DINO)
+  * micro-SAM automatic instance segmentation
   * CAREamics-based workflows
+
+  Cellpose-3 models are **not** supported — the runtime ships Cellpose 4.
+  Use the `bioimage-io/cellpose3-runner` app for those.
 * All versions are **strictly pinned** to ensure reproducibility and avoid runtime incompatibilities.
 
 ## Using the Service
@@ -159,6 +168,42 @@ while True:
     await asyncio.sleep(1)
 result = status["result"]                    # dict keyed by output id, or {"error": ...}
 ```
+
+### Adjusting pre/postprocessing
+
+`infer` takes `preprocessing` and `postprocessing` as `{op_id: {kwarg: value}}`, patching
+the ops the model's RDF declares. The patch applies to an in-memory copy — the published
+artifact is never modified — and a changed override set reloads the resident pipeline. An
+op id the model does not declare is an error.
+
+```python
+request_id = await svc.infer(
+    model_id="idealistic-eagle",
+    inputs=image,
+    preprocessing={"scale_range": {"min_percentile": 5, "max_percentile": 95}},
+    postprocessing={"cellpose_flow_dynamics": {"flow_threshold": 0.6, "min_size": 100}},
+)
+```
+
+Passing `None` instead of a kwarg dict **drops** the op, which is how you get a model's
+raw output. `bioimageio.core` can only skip a processing stage as a whole — the declared
+tensor shapes assume the ops ran — so dropping one op drops all of them on that side, and
+mixing a drop with a kwarg patch in the same direction is an error. For a Cellpose model,
+dropping the flow dynamics returns the flow field instead of instance labels:
+
+```python
+request_id = await svc.infer(
+    model_id="idealistic-eagle",
+    inputs=image,
+    postprocessing={"cellpose_flow_dynamics": None},   # (1, 3, y, x) flow field
+)
+```
+
+The same applies to the micro-SAM instance-segmentation watershed. It is not an op the
+RDF declares (the pinned `bioimageio.core` does not implement it yet, so the runner
+applies it itself whenever a model outputs the three AIS maps), but it is addressed the
+same way — `{"microsam_watershed": {...}}` configures it, `{"microsam_watershed": None}`
+skips it and returns the raw distance maps.
 
 ### Key pitfalls
 
