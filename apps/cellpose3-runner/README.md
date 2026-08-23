@@ -91,5 +91,6 @@ await worker.deploy_app(
 
 Notes:
 - First deploy is slow — the runtime env pip-installs torch + `cellpose`.
-- The app requests a GPU, but runs on CPU when deployed with the GPU disabled
-  (the KTH deployment does); the device follows what the replica actually got.
+- The app is CPU-only (the decorator declares no `gpu_memory_mb`); the device
+  follows what the replica actually got, so it uses a GPU if one is ever
+  reserved for it.
