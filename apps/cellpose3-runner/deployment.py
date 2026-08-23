@@ -468,6 +468,7 @@ class Cellpose3Runner:
         """
         pos = self._queue_position(job)
         return {
+            "state": job["state"],
             "queue_position": pos,
             "submitted_at": job["submitted_at"],
             "model_download": job["md_start"],
@@ -715,6 +716,7 @@ class Cellpose3Runner:
         Response shape (mirrors model-runner's ``get_infer_status``)::
 
             {
+              "state":          str,          # queued|running|completed|failed|cancelled
               "queue_position": int,          # 0 = running/done, N = N jobs ahead
               "submitted_at":   float,        # ts when queued
               "model_download": float | None, # cache-check/reload start, None on warm reuse
