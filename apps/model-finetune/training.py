@@ -38,9 +38,22 @@ def session_dir(session_id: str) -> Path:
     return sessions_root() / session_id
 
 
+def session_backend(session_id: str) -> str:
+    """Fine-tuning backend a session used — 'microsam' (default) or 'cellpose'.
+    Recorded in status.json at session start; the two backends save their
+    checkpoint in different places, so this drives ``checkpoint_path``."""
+    return read_status(session_id).get("backend", "microsam")
+
+
 def checkpoint_path(session_id: str) -> Path:
-    # torch_em DefaultTrainer writes <save_root>/checkpoints/<name>/best.pt
-    return session_dir(session_id) / "checkpoints" / session_id / "best.pt"
+    """Servable checkpoint for a finished session, by backend:
+    micro-sam's torch_em writes ``<dir>/checkpoints/<name>/best.pt``; cellpose's
+    ``train_seg`` (save_path=<dir>, model_name='model') writes ``<dir>/models/model``.
+    """
+    sdir = session_dir(session_id)
+    if session_backend(session_id) == "cellpose":
+        return sdir / "models" / "model"
+    return sdir / "checkpoints" / session_id / "best.pt"
 
 
 def _status_path(session_id: str) -> Path:

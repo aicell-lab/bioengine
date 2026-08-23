@@ -1,0 +1,18 @@
+# Second, isolated GPU runtime: Cellpose-SAM (cpsam) fine-tuning + bioimage.io
+# export. numpy is irreconcilable with the micro-sam runtime — cellpose pins
+# numpy==1.26.4 while micro-sam's python-elf needs numpy>=2 — so this backend
+# lives in its own Ray deployment (CellposeRuntime) with its own pip env. Pins
+# mirror the deNBI-validated cellpose4-runner env (drop dinov3: DINO deferred).
+bioimageio.core==0.10.4
+torch==2.7.1
+torchvision==0.22.1
+cellpose==4.2.1.1
+segment-anything==1.0
+numpy==1.26.4
+imageio>=2.37.0
+tifffile
+Pillow
+# export_worker_cellpose reads/writes the packaged rdf.yaml.
+pyyaml
+# Best-effort cover image on export.
+matplotlib

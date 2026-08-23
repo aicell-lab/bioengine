@@ -1,9 +1,12 @@
-# BioImageIO Fine-tune (μSAM) 🔬
+# BioImageIO Fine-tune (μSAM + Cellpose-SAM) 🔬
 
 Serves [micro-sam](https://github.com/computational-cell-analytics/micro-sam)
-(μSAM) for microscopy segmentation and interactive annotation. **One fine-tuned
-SAM image encoder stays resident on the GPU and backs three cheap consumers**
-(the paper's "Leg B" — one resident encoder, many lightweight decoders):
+(μSAM) for microscopy segmentation and interactive annotation, and adds in-app
+fine-tuning of **[Cellpose-SAM](https://github.com/MouseLand/cellpose) (`cpsam`)**
+as an isolated second backend (see *Architecture* below). On the micro-sam side,
+**one fine-tuned SAM image encoder stays resident on the GPU and backs three cheap
+consumers** (the paper's "Leg B" — one resident encoder, many lightweight
+decoders):
 
 1. **Image embedding** — run the encoder once per image; the embedding feeds an
    in-browser ONNX prompt decoder, so "draw a bounding box → get a cell mask"
@@ -17,20 +20,26 @@ SAM image encoder stays resident on the GPU and backs three cheap consumers**
 Motivated by annotation ergonomics and low-contrast brightfield (where drawing
 masks from scratch is slow); **not** an accuracy claim over Cellpose-SAM.
 
-## Architecture (two deployments)
+## Architecture (CPU entry + two GPU runtimes)
 
 Like `model-runner`, the app is split into a **CPU `EntryApp`** (`entry.py`) and
-a **GPU `RuntimeApp`** (`runtime.py`); only the entry is named in the manifest and
-it composes the runtime by type hint. The client always talks to the entry.
+GPU runtimes; only the entry is named in the manifest and it composes the
+runtimes by type hint. The client always talks to the entry.
 
 - **EntryApp** (CPU, 1 replica) — Hypha/S3 transport, training data
-  materialization, session orchestration, and request routing to the runtime.
-- **RuntimeApp** (GPU, autoscaling `min=1 / max=3`) — the resident SAM encoder,
-  a single `asyncio` **GPU lock over every GPU op** (serving *and* training), and
-  fine-tuning that runs in a **subprocess** (VRAM fully reclaimed on exit; the
-  resident inference model is evicted first so the subprocess owns the GPU).
+  materialization, session orchestration, and request routing to the runtimes.
+- **RuntimeApp** (GPU, autoscaling `min=1 / max=3`, `runtime.py`) — the micro-sam
+  backend: resident SAM encoder, a single `asyncio` **GPU lock over every GPU op**
+  (serving *and* training), and fine-tuning in a **subprocess** (VRAM fully
+  reclaimed on exit; the resident inference model is evicted first).
+- **CellposeRuntime** (GPU, same shape, `runtime_cellpose.py`) — the Cellpose-SAM
+  (`cpsam`) backend, in its **own pip env**: cellpose pins `numpy==1.26.4` while
+  micro-sam's `python-elf` needs `numpy>=2`, so the two backends cannot share a
+  deployment. The entry routes by `model_type` (`cpsam` → CellposeRuntime,
+  `vit_*` → RuntimeApp). Only one fine-tuning runs at a time across **both**
+  backends (a single entry-side training lock).
 
-Because the GPU runtime autoscales, a long training run holds one GPU replica's
+Because each GPU runtime autoscales, a long training run holds one GPU replica's
 lock while a concurrent inference request spins up and runs on the **second GPU
 replica** — training and inference at the same time. Returned arrays are
 hypha-rpc ndarray wire-dicts, which decode to real ndarrays on the client.
@@ -50,9 +59,10 @@ served without an app release.
 | `vit_b_lm`, `vit_t_lm` | Lighter/faster LM, lower quality |
 | `vit_l_em_organelles`, `vit_b_em_organelles`, `vit_t_em_organelles` | Organelles in EM (AIS decoder) |
 | `vit_b`, `vit_l`, `vit_h` | Base SAM — no AIS decoder → AMG fallback |
+| `cpsam` | Cellpose-SAM — routed to the isolated CellposeRuntime; segmentation only (no embedding/ONNX). Best for fine-tuning cell segmentation with dense masks. |
 
 Switching `model_type` frees the previous model's VRAM and loads the new one
-(one resident at a time).
+(one resident at a time, per runtime).
 
 ## Methods
 
@@ -65,7 +75,10 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
   `compute_embedding(return_url=True)`, or a `compute_embedding` result dict).
   With `embeddings` the AIS decoder runs on the stored embedding **without
   re-encoding** (the model is inferred from the embedding). `min_size` drops
-  smaller objects. `session_id` serves a fine-tuned checkpoint.
+  smaller objects. `session_id` serves a fine-tuned checkpoint (micro-sam **or**
+  cpsam — the session's backend picks the runtime). `model_type="cpsam"` (or a
+  cpsam `session_id`/`model_id`) routes to the Cellpose-SAM runtime; `embeddings`
+  are micro-sam only.
 - **`compute_embedding(inputs, model_type="vit_l_lm", return_url=False, embedding_upload_url=None, session_id=None)`**
   Run the resident encoder once. Returns `{features (1,256,64,64) f32,
   original_image_shape [H,W], input_size [h,w], sam_scale, mask_threshold,
@@ -77,7 +90,8 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
 - **`get_onnx_model(model_type="vit_l_lm", quantize=True)`**
   The interactive prompt decoder as ONNX bytes (cached per model). Fetch once
   per session, run with `onnxruntime-web`, decode each box locally using the
-  `compute_embedding` features.
+  `compute_embedding` features. `compute_embedding` and `get_onnx_model` are
+  **micro-sam only** — cpsam has no encoder embedding or ONNX prompt decoder.
 - **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
   an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
 
@@ -91,40 +105,48 @@ infer(embeddings=[embedding_url]) → mask`.
 
 ### Fine-tuning (train → serve)
 
-Retrain μSAM on your own annotated pairs (propose-and-prune labels) and serve the
-just-trained model — no export step needed. Fine-tuning **with the AIS decoder**
-(`with_segmentation_decoder=True`) needs **dense** labels: annotate *all* objects
-in each training image.
+Retrain μSAM **or Cellpose-SAM** on your own annotated pairs and serve the
+just-trained model — no export step needed. Both backends need **dense** labels
+(annotate *all* objects per image): micro-sam's AIS decoder
+(`with_segmentation_decoder=True`) and cellpose both learn from full instance
+masks. Pick the backend with `model_type` (`vit_*` vs `cpsam`); the same
+annotated-pair inputs feed both.
 
-- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, label="")`**
+- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, diam_mean=30.0, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, resume_session_id=None, label="")`**
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
   `.geojson` FeatureCollection of polygons (rasterized to instances).
+  `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
+  diameter, px) is the cpsam knob. Only one session trains at a time across both
+  backends (`QUEUED` while another holds the slot).
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
 - **`export_model(session_id, name, description="", authors=None, license="CC-BY-4.0", provenance=None)`**
-  Build a **standard combined SAM+decoder** BioImage.IO package from a COMPLETED
-  session — the interactive prompt head *and* the AIS decoder in one
-  `{model_state, decoder_state}` checkpoint (run without prompts for automatic
-  instance segmentation) — via `micro_sam.bioimageio.export_sam_model` in a CPU
-  subprocess on the runtime. That call **self-tests** the package on CPU (prompt
-  round-trip + image-only AIS) before saving, so a returned package is already
+  Build a BioImage.IO package from a COMPLETED session and **self-test it on CPU**
+  (`bioimageio.core.test_model`) before saving, so a returned package is already
   spec-valid and reproducible. Async, like `start_training`: returns immediately
-  with an `export_id` — poll `get_export_status`.
+  with an `export_id` — poll `get_export_status`. The package shape depends on the
+  session's backend:
+  - **micro-sam** — a **standard combined SAM+decoder** package: the interactive
+    prompt head *and* the AIS decoder in one `{model_state, decoder_state}`
+    checkpoint (run without prompts for AIS), via
+    `micro_sam.bioimageio.export_sam_model`. `provenance` → `config.microsam_provenance`;
+    `license` is **ignored** (`export_sam_model` hard-codes `CC-BY-4.0`). Needs a
+    training label with **≥ 2 instances** (prompt test data uses label ids 1 & 2).
+  - **cpsam** — a `pytorch_state_dict` package wrapping the fine-tuned Cellpose-SAM
+    net (`CellposeSAMWrapper` bundled as `model.py`, with cellpose flow-dynamics
+    postprocessing). The RDF's `output_sample` is a **real CPU forward pass** of
+    the wrapper (so `test_model` reproduces it deterministically — the served GPU
+    path bypasses this RDF). `provenance` → `config.cellpose_provenance`; license
+    is Cellpose's `BSD-3-Clause`.
 
   **Draft-only.** The package is staged on temporary storage; `export_model`
   **publishes nothing**. The frontend creates the draft artifact with the user's
   own token, then either downloads the zip from `download_url` or calls
   `push_export(export_id, files)` to stream the package files straight into the
-  draft (no double-move of the ~350 MB). `provenance` is baked server-side into
-  `rdf.yaml`'s `config.microsam_provenance`. `license` is currently **ignored** —
-  `export_sam_model` hard-codes `CC-BY-4.0` on the RDF.
-
-  > Export needs a training label with **≥ 2 instances** — `export_sam_model`
-  > derives its prompt test data from label ids 1 and 2. The first qualifying
-  > training label in the session is used.
+  draft.
 
 **Serve the just-trained model:** once `checkpoint_available` is true, pass
 `session_id` to any serving method — the fine-tuned checkpoint flows through the
@@ -158,15 +180,16 @@ so it must be deployed with the token injected:
 ```python
 await worker.deploy_app(
     artifact_id="bioimage-io/model-finetune",
-    version="0.11.0",
+    version="0.12.0",
     application_id="model-finetune",
     hypha_token=HYPHA_TOKEN,
 )
 ```
 
 Notes:
-- First deploy is slow — the runtime env pip-installs `micro-sam` (+ `torch-em`,
-  `segment-anything`, `bioimage-cpp`) and `onnxruntime`.
+- First deploy is slow — **two** GPU runtime envs pip-install in parallel: the
+  micro-sam env (`micro-sam` + `torch-em`, `segment-anything`, `bioimage-cpp`,
+  `onnxruntime`) and the Cellpose-SAM env (`cellpose==4.2.1.1`, `numpy==1.26.4`).
 - Requires a GPU replica; SAM ViT encoders are large. `vit_l_lm` (default) needs ~5 GB; `vit_b_lm` is lighter
   in a few GB of VRAM.
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the

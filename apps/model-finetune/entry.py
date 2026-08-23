@@ -30,6 +30,7 @@ from hypha_rpc import connect_to_server
 from pydantic import Field
 
 from runtime import RuntimeApp
+from runtime_cellpose import CellposeRuntime
 
 logger = bioengine.logger
 
@@ -40,7 +41,10 @@ ModelType = Literal[
     "vit_l_lm", "vit_b_lm", "vit_t_lm",
     "vit_l_em_organelles", "vit_b_em_organelles", "vit_t_em_organelles",
     "vit_b", "vit_l", "vit_h",
+    "cpsam",
 ]
+# Model types served by the isolated Cellpose-SAM runtime rather than micro-sam.
+CELLPOSE_MODEL_TYPES = ("cpsam",)
 
 
 def _read_pip(name: str) -> List[str]:
@@ -70,8 +74,9 @@ def _read_pip(name: str) -> List[str]:
 class EntryApp:
     """CPU entry: transport + routing to the GPU runtime + session orchestration."""
 
-    def __init__(self, runtime: RuntimeApp) -> None:
+    def __init__(self, runtime: RuntimeApp, cellpose_runtime: CellposeRuntime) -> None:
         self.runtime = runtime
+        self.cellpose_runtime = cellpose_runtime
         self.start_time = time.time()
         self._hypha_token = os.getenv("HYPHA_TOKEN")
         if not self._hypha_token:
@@ -105,9 +110,15 @@ class EntryApp:
         if self._s3 is None:
             raise RuntimeError("S3 storage service not connected")
 
-    async def _check_runtime_available(self) -> None:
+    def _runtime_for(self, model_type: Optional[str]):
+        """Route to the backend that owns ``model_type`` (cpsam → CellposeRuntime,
+        vit_* / None → micro-sam RuntimeApp)."""
+        return self.cellpose_runtime if model_type in CELLPOSE_MODEL_TYPES else self.runtime
+
+    async def _check_runtime_available(self, model_type: Optional[str] = None) -> None:
+        runtime = self._runtime_for(model_type)
         try:
-            await asyncio.wait_for(self.runtime.ping(), timeout=2.0)
+            await asyncio.wait_for(runtime.ping(), timeout=2.0)
         except Exception as e:
             raise RuntimeError(
                 "GPU runtime is not available yet — inference, embedding, ONNX "
@@ -271,7 +282,7 @@ class EntryApp:
         if not ckpt.exists():
             raise FileNotFoundError(
                 f"No trained checkpoint for session '{session_id}' "
-                "(best.pt not found — training may be unfinished or failed)."
+                "(training may be unfinished or failed)."
             )
         return str(ckpt)
 
@@ -352,13 +363,15 @@ class EntryApp:
             "draft/staged model in your workspace; omit for published models.",
         ),
     ) -> List[Dict[str, Any]]:
-        """Automatic μSAM instance segmentation. Returns a bare list, one item per
-        input, each ``{"output": <int32 [H,W] instance label mask>}``. Pass
-        ``input_arrays`` (images) OR ``embeddings`` (precomputed — runs the AIS
-        decoder on the embedding without re-encoding). Pass ``model_id`` to run an
-        exported BioImage.IO AIS package instead of a built-in/finetuned model.
+        """Automatic instance segmentation (μSAM AIS, or Cellpose-SAM when
+        ``model_type='cpsam'`` / a cpsam session/model). Returns a bare list, one
+        item per input, each ``{"output": <int32 [H,W] instance label mask>}``.
+        Pass ``input_arrays`` (images) OR ``embeddings`` (micro-sam only —
+        precomputed, runs the AIS decoder without re-encoding). Pass ``model_id``
+        to run an exported BioImage.IO package instead of a built-in/finetuned model.
         """
-        await self._check_runtime_available()
+        import training
+
         generate_kwargs: Dict[str, Any] = {}
         if min_size is not None:
             generate_kwargs["min_size"] = min_size
@@ -366,8 +379,9 @@ class EntryApp:
             if input_arrays is None:
                 raise ValueError("model_id requires input_arrays (images), not embeddings.")
             pkg = await self._fetch_model_package(model_id, model_token)
+            await self._check_runtime_available(pkg["model_type"])
             images = [await self._resolve_image(src) for src in input_arrays]
-            return await self.runtime.auto_segment(
+            return await self._runtime_for(pkg["model_type"]).auto_segment(
                 images=images, model_type=pkg["model_type"],
                 checkpoint=pkg["weights_path"], generate_kwargs=generate_kwargs,
             )
@@ -375,15 +389,29 @@ class EntryApp:
             raise ValueError("Provide exactly one of 'input_arrays' or 'embeddings'.")
         checkpoint = self._session_checkpoint(session_id) if session_id else None
         if embeddings is not None:
+            # Embeddings are a micro-sam-only path (cpsam has no encoder embedding).
+            await self._check_runtime_available()
             embs = [await self._resolve_embedding(e) for e in embeddings]
             emb_model = next((e["model_type"] for e in embs if e.get("model_type")), None)
             return await self.runtime.auto_segment_from_embedding(
                 embeddings=embs, model_type=emb_model or model_type,
                 generate_kwargs=generate_kwargs, checkpoint=checkpoint,
             )
+        # A fine-tuned session's backend fixes the runtime; otherwise route by model_type.
+        served_type = (
+            "cpsam" if session_id and training.session_backend(session_id) == "cellpose"
+            else model_type
+        )
+        await self._check_runtime_available(served_type)
+        if served_type == "cpsam" and session_id:
+            # Serve at the diameter the session trained/exports at, so live GPU
+            # masks match the exported package's CPU self-test.
+            diam = training.read_training_params(session_id).get("diam_mean")
+            if diam is not None:
+                generate_kwargs["diameter"] = diam
         images = [await self._resolve_image(src) for src in input_arrays]
-        return await self.runtime.auto_segment(
-            images=images, model_type=model_type,
+        return await self._runtime_for(served_type).auto_segment(
+            images=images, model_type=served_type,
             generate_kwargs=generate_kwargs, checkpoint=checkpoint,
         )
 
@@ -413,6 +441,8 @@ class EntryApp:
         ``embedding_upload_url`` the .npz is PUT to your URL and ``features`` is
         dropped from the return.
         """
+        if model_type in CELLPOSE_MODEL_TYPES:
+            raise ValueError("compute_embedding is micro-sam only; cpsam has no embedding path.")
         await self._check_runtime_available()
         checkpoint = self._session_checkpoint(session_id) if session_id else None
         image = await self._resolve_image(inputs)
@@ -440,6 +470,8 @@ class EntryApp:
         quantize: bool = Field(True, description="Quantize for faster browser runtime."),
     ) -> bytes:
         """The interactive prompt decoder as ONNX bytes for onnxruntime-web."""
+        if model_type in CELLPOSE_MODEL_TYPES:
+            raise ValueError("get_onnx_model is micro-sam only; cpsam has no ONNX prompt decoder.")
         await self._check_runtime_available()
         return await self.runtime.export_onnx(model_type=model_type, quantize=quantize)
 
@@ -508,7 +540,9 @@ class EntryApp:
                     message="waiting for GPU — another fine-tuning is in progress",
                 )
             async with self._training_lock:
-                await self.runtime.train(session_id=session_id, model_type=model_type, params=params)
+                await self._runtime_for(model_type).train(
+                    session_id=session_id, model_type=model_type, params=params
+                )
         except asyncio.CancelledError:
             training.write_status(session_id, status="STOPPED", message="training task cancelled")
             raise
@@ -529,11 +563,15 @@ class EntryApp:
             "needs DENSE labels — annotate all objects per image."),
         val_images: Optional[List[Union[np.ndarray, str]]] = Field(None, description="Optional validation images."),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(None, description="Validation labels."),
-        model_type: ModelType = Field("vit_l_lm", description="Base μSAM model to fine-tune."),
+        model_type: ModelType = Field(
+            "vit_l_lm",
+            description="Base model to fine-tune. vit_* → micro-sam (AIS decoder); "
+            "'cpsam' → Cellpose-SAM (isolated runtime)."),
         n_epochs: int = Field(5, description="Number of training epochs."),
         n_objects_per_batch: int = Field(
-            8, description="Objects per batch — main GPU-memory knob; 8 fits vit_b on 24GB."),
-        patch_size: int = Field(512, description="Square training patch side (clamped to the smallest image)."),
+            8, description="micro-sam only: objects per batch — main GPU-memory knob; 8 fits vit_b on 24GB."),
+        patch_size: int = Field(512, description="micro-sam only: square training patch side (clamped to the smallest image)."),
+        diam_mean: float = Field(30.0, description="cpsam only: mean object diameter in pixels."),
         batch_size: int = Field(1, description="Training batch size."),
         learning_rate: float = Field(1e-5, description="AdamW learning rate."),
         val_fraction: float = Field(0.2, description="Val split fraction when val is omitted."),
@@ -550,15 +588,17 @@ class EntryApp:
         """
         import training
 
-        await self._check_runtime_available()
+        await self._check_runtime_available(model_type)
+        backend = "cellpose" if model_type in CELLPOSE_MODEL_TYPES else "microsam"
         session_id = training.new_session_id()
         training.write_status(
             session_id, status="PREPARING", created_at=time.time(),
-            model_type=model_type, label=label, n_train_inputs=len(train_images),
+            model_type=model_type, backend=backend, label=label,
+            n_train_inputs=len(train_images),
         )
         params = dict(
             n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,
-            batch_size=batch_size, learning_rate=learning_rate,
+            batch_size=batch_size, learning_rate=learning_rate, diam_mean=diam_mean,
             val_fraction=val_fraction, n_samples=n_samples,
             resume_session_id=resume_session_id,
             patch_shape=(patch_size, patch_size), num_workers=0,
@@ -618,19 +658,24 @@ class EntryApp:
             "{dataset_artifact_id, label, split_name, session_lineage}.",
         ),
     ) -> Dict[str, Any]:
-        """Start building a **standard combined SAM+decoder** BioImage.IO model
-        package (interactive prompt head + AIS decoder in one checkpoint, via
-        ``micro_sam.bioimageio.export_sam_model``) from a COMPLETED fine-tuning
-        session. Async, like start_training: returns immediately with an
+        """Start building a BioImage.IO model package from a COMPLETED fine-tuning
+        session — a **combined SAM+decoder** package (interactive prompt head + AIS
+        decoder, via ``micro_sam.bioimageio.export_sam_model``) for micro-sam
+        sessions, or a **Cellpose-SAM pytorch_state_dict** package for cpsam
+        sessions. Async, like start_training: returns immediately with an
         ``export_id`` — poll ``get_export_status``. The package is self-tested on
-        CPU, built server-side, and staged on temporary storage; this method
-        **publishes nothing**. The frontend creates the draft artifact with the
-        user's own token and either downloads the zip from ``download_url`` or calls
-        ``push_export`` to stream the package files straight into the draft.
-        ``license`` is currently ignored — the upstream export hard-codes CC-BY-4.0.
+        CPU (``bioimageio.core.test_model``), built server-side, and staged on
+        temporary storage; this method **publishes nothing**. The frontend creates
+        the draft artifact with the user's own token and either downloads the zip
+        from ``download_url`` or calls ``push_export`` to stream the package files
+        straight into the draft. ``license`` applies to micro-sam packages only
+        (cpsam packages carry Cellpose's BSD-3-Clause).
         """
+        import training
+
         self._session_checkpoint(session_id)  # raises if no trained checkpoint
-        await self._check_runtime_available()
+        served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
+        await self._check_runtime_available(served)
         export_id = uuid.uuid4().hex
         request = {
             "name": name,
@@ -649,10 +694,15 @@ class EntryApp:
         return {"export_id": export_id, "status": "PENDING"}
 
     async def _run_export(self, export_id: str, session_id: str, request: Dict[str, Any]) -> None:
+        import training
+
         rec = self._exports[export_id]
         try:
             rec.update(status="BUILDING", progress=0.1, message="building package")
-            res = await self.runtime.export_bioimageio(session_id=session_id, request=request)
+            served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
+            res = await self._runtime_for(served).export_bioimageio(
+                session_id=session_id, request=request
+            )
             rec["_package_dir"] = res["package_dir"]
             rec.update(progress=0.8, message="staging package")
             zip_path = Path(res["zip"])
