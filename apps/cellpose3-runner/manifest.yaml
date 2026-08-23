@@ -1,0 +1,16 @@
+name: Cellpose3 Runner
+id: cellpose3-runner
+id_emoji: "🔬"
+description: Inference-only service for Cellpose-3 bioimage.io models via bioimageio.core; async submit/poll infer API matching model-runner, with per-request pre/postprocessing overrides.
+documentation: README.md
+authors:
+  - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
+maintainers: []
+license: MIT
+format_version: 0.6.0
+git_repo: https://github.com/aicell-lab/bioengine
+links: []
+tags: []
+type: ray-serve
+version: 0.1.0
+entry: deployment:Cellpose3Runner
