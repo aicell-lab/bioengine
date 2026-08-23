@@ -57,9 +57,10 @@ def _read_pip(name: str) -> List[str]:
 
 @bioengine.app(
     num_cpus=1,
-    # No gpu_memory_mb: Cellpose-3 models are small and KTH's two GPUs are
-    # reserved for model-runner. Omitting the knob is what makes a replica
-    # CPU-only; -1 would book a whole card.
+    # Reserve a whole GPU. Deployments on GPU-tight clusters override this
+    # with ``deploy_app(disable_gpu=True)``, which forces the reservation to
+    # zero without changing this default.
+    gpu_memory_mb=-1,
     memory_mb=12 * 1024,
     pip=_read_pip("requirements-deployment.txt"),
     # Requests queue at the replica behind ``_gpu_lock`` so the Ray Serve

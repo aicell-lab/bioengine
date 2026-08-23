@@ -91,6 +91,7 @@ await worker.deploy_app(
 
 Notes:
 - First deploy is slow — the runtime env pip-installs torch + `cellpose`.
-- The app is CPU-only (the decorator declares no `gpu_memory_mb`); the device
-  follows what the replica actually got, so it uses a GPU if one is ever
-  reserved for it.
+- The app defaults to a whole GPU (`gpu_memory_mb=-1`). Deploy with
+  `disable_gpu=True` (CLI `--no-gpu`) on GPU-tight clusters to force it onto
+  CPU; the device follows what the replica actually got. The KTH deployment
+  runs CPU-only this way because both of its GPUs are held by model-runner.
