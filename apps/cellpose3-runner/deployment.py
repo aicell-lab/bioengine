@@ -662,7 +662,7 @@ class Cellpose3Runner:
                 the resolved inputs are not a numpy array.
             FileNotFoundError: if a URL / file path does not exist or has expired.
         """
-        if model_id not in SUPPORTED_MODELS:
+        if model_id.rsplit("/", 1)[-1] not in SUPPORTED_MODELS:
             raise ValueError(
                 f"model_id {model_id!r} is not supported. cellpose3-runner runs "
                 f"only {list(SUPPORTED_MODELS)}; call list_supported_models() for "
