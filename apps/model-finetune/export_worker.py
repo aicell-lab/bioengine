@@ -49,9 +49,10 @@ HERE = Path(__file__).parent
 # sized training image).
 _AIS_IMAGE_MIN = 256
 _AIS_IMAGE_STEP = 1
-# Set to the zoo's validated value (ppm) only if cross-environment watershed
-# boundary shifts make the mask output fail test_model's exact reproduction.
-_AIS_MASK_MISMATCH_PPM = None
+# Embeddings are raw float features; a CPU-generated reference vs a CUDA (or MPS)
+# test_model run drifts ~255 ppm cross-device class. masks/scores stay strict.
+# Matches the published zoo AIS RDFs (round 3) and upstream export PR #1348.
+_AIS_EMBEDDINGS_MISMATCH_PPM = 1000
 
 
 def _load_array(path: str) -> np.ndarray:
@@ -227,11 +228,11 @@ def _aisify_package(pkg_dir: Path) -> None:
             (pkg_dir / src).unlink(missing_ok=True)
     rdf["inputs"] = [image_desc]
 
-    if _AIS_MASK_MISMATCH_PPM is not None:
-        cfg = rdf.setdefault("config", {}).setdefault("bioimageio", {})
-        cfg.setdefault("reproducibility_tolerance", []).append(
-            {"output_ids": ["masks"], "mismatched_elements_per_million": _AIS_MASK_MISMATCH_PPM}
-        )
+    cfg = rdf.setdefault("config", {}).setdefault("bioimageio", {})
+    cfg.setdefault("reproducibility_tolerance", []).append(
+        {"output_ids": ["embeddings"],
+         "mismatched_elements_per_million": _AIS_EMBEDDINGS_MISMATCH_PPM}
+    )
 
     rdf_path.write_text(yaml.safe_dump(rdf, sort_keys=False))
 
