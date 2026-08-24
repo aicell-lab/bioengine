@@ -40,6 +40,52 @@ STATE_ROOT = Path.home() / "annotation_broker"
 MANIFEST_CACHE_TTL_S = 60.0
 
 
+# A send-side RPC failure: the request never reached the server, so re-resolving
+# the service and retrying is safe even for writes.
+_SEND_FAILURE_MARKERS = ("Failed to send the request", "WebSocket reconnection timed out")
+
+
+def _is_send_failure(exc: Exception) -> bool:
+    return any(marker in str(exc) for marker in _SEND_FAILURE_MARKERS)
+
+
+class _ReconnectingService:
+    """Auto-re-resolving wrapper around a Hypha service proxy.
+
+    hypha_rpc pins a proxy to one *client instance* of the target service. When
+    the Hypha server restarts, that instance is gone and every call fails at
+    send time forever — the websocket underneath reconnects, but the proxy still
+    addresses the dead client id. Re-resolve and retry once instead.
+    """
+
+    def __init__(self, resolve) -> None:
+        self._resolve = resolve
+        self._svc = None
+
+    async def _service(self):
+        if self._svc is None:
+            self._svc = await self._resolve()
+        return self._svc
+
+    def __getattr__(self, name: str):
+        async def call(*args, **kwargs):
+            svc = await self._service()
+            try:
+                return await getattr(svc, name)(*args, **kwargs)
+            except Exception as exc:
+                if not _is_send_failure(exc):
+                    raise
+                logger.warning(
+                    f"annotation-broker: artifact-manager.{name} failed at send time "
+                    f"({exc}); re-resolving the service and retrying once"
+                )
+                self._svc = None
+                svc = await self._service()
+                return await getattr(svc, name)(*args, **kwargs)
+
+        return call
+
+
 def _read_pip(name: str) -> List[str]:
     text = (Path(__file__).parent / name).read_text()
     return [
@@ -82,9 +128,22 @@ class AnnotationBroker:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._am = await self._hypha.get_service("public/artifact-manager")
+        self._am = _ReconnectingService(self._resolve_artifact_manager)
         self._http = httpx.AsyncClient(timeout=60.0)
         logger.info(f"annotation-broker connected to Hypha server at {SERVER_URL}")
+
+    async def _resolve_artifact_manager(self):
+        """Rebuild the Hypha connection too if the socket itself is gone."""
+        try:
+            return await self._hypha.get_service("public/artifact-manager")
+        except Exception as exc:
+            if not _is_send_failure(exc):
+                raise
+            logger.warning(f"annotation-broker: reconnecting to {SERVER_URL} ({exc})")
+            self._hypha = await connect_to_server(
+                {"server_url": SERVER_URL, "token": self._hypha_token}
+            )
+            return await self._hypha.get_service("public/artifact-manager")
 
     @bioengine.health_check
     async def _health(self) -> None:
@@ -155,7 +214,12 @@ class AnnotationBroker:
         try:
             files = await self._am.list_files(artifact_id, dir_path=dir_path, stage=True)
             return files or []
-        except Exception:
+        except Exception as exc:
+            # [] means "no such directory yet". Reporting a transport failure as
+            # an empty directory once turned a Hypha restart into a dataset that
+            # rendered as zero images with the call still logged OK.
+            if _is_send_failure(exc):
+                raise
             return []
 
     async def _file_exists(self, artifact_id: str, file_path: str) -> bool:
@@ -170,7 +234,9 @@ class AnnotationBroker:
     async def _read_json_file(self, artifact_id: str, file_path: str, default: Any) -> Any:
         try:
             url = await self._am.get_file(artifact_id=artifact_id, file_path=file_path, stage=True)
-        except Exception:
+        except Exception as exc:
+            if _is_send_failure(exc):
+                raise
             return default
         resp = await self._http.get(url)
         if resp.status_code == 404:
