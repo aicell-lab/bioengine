@@ -1,8 +1,0 @@
-bioimageio.core==0.10.4
-torch==2.7.1
-torchvision==0.22.1
-cellpose==4.2.1.1
-segment-anything==1.0
-git+https://github.com/facebookresearch/dinov3.git@346f38fee679c56a6888f91c51670fae61d364e0
-numpy==1.26.4
-imageio>=2.37.0
