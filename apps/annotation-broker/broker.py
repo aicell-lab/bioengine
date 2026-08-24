@@ -42,6 +42,8 @@ MANIFEST_CACHE_TTL_S = 60.0
 
 # A send-side RPC failure: the request never reached the server, so re-resolving
 # the service and retrying is safe even for writes.
+_HEALTH_CALL_TIMEOUT_S = 15.0
+
 _SEND_FAILURE_MARKERS = ("Failed to send the request", "WebSocket reconnection timed out")
 
 
@@ -149,6 +151,18 @@ class AnnotationBroker:
     async def _health(self) -> None:
         if self._am is None:
             raise RuntimeError("artifact-manager service not connected")
+        # A non-None handle proves nothing: during the 2026-08-24 outage the proxy
+        # was pinned to a dead client instance and every call failed at send time
+        # while this check kept reporting healthy. Exercise the dependency for real
+        # so an unreachable artifact-manager restarts the replica instead of
+        # serving confidently wrong data. STATE_ROOT is PVC-backed, so a restart
+        # costs nothing.
+        try:
+            await asyncio.wait_for(
+                self._am.read(artifact_id=COLLECTION_ID), timeout=_HEALTH_CALL_TIMEOUT_S
+            )
+        except Exception as exc:
+            raise RuntimeError(f"artifact-manager unreachable: {exc}") from exc
 
     # === context / role helpers ===
 
