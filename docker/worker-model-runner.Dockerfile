@@ -49,6 +49,20 @@ RUN pip install -U pip && \
     pip install -r model-runner/requirements-entry.txt \
                 -r model-runner/requirements-runtime.txt
 
+# micro-sam is an inference-time dependency of BioImage.IO packages exported
+# with an AIS decoder: their vendored predictor_adaptor.py imports
+# micro_sam.instance_segmentation whenever the checkpoint carries a
+# decoder_state. It cannot live in requirements-runtime.txt — python-elf
+# declares numpy>=2.0 against the tensorflow-mandated numpy<2.0, so a normal
+# resolve is impossible, and pip rejects --no-deps inside a requirements file.
+# That numpy floor is not real for the code paths used here; the imports work
+# on the pinned 1.26.4.
+RUN pip install --no-deps \
+        micro-sam==1.8.11 \
+        torch-em==0.10.3 \
+        python-elf==0.9.2 && \
+    pip install bioimage_cpp kornia pooch xxhash
+
 # Worker requirements — intentionally does NOT pin Ray. Ray is installed
 # as the very last step, controlled by the RAY_VERSION build arg, so
 # changing the Ray version doesn't invalidate this layer (or any of the
