@@ -2315,6 +2315,12 @@ class EntryDeployment:
             # artifact. Set on both the fresh and the cached path.
             test_report["latest_remote_modified"] = package.latest_remote_modified
 
+            # ``id`` is optional in an RDF, so core emits null for models that
+            # omit it and consumers keyed on the field drop the whole report.
+            # Stamp it from the identity we were called with; the bare alias is
+            # what core writes when the RDF does carry one.
+            test_report["id"] = model_id.rsplit("/", 1)[-1]
+
             # Persist to disk for fresh successful runs and for reports
             # reused from the collection, so the next run loads from disk
             # instead of re-fetching the report from the collection.
