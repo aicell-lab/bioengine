@@ -134,7 +134,7 @@ annotated-pair inputs feed both.
     checkpoint (run without prompts for AIS), via
     `micro_sam.bioimageio.export_sam_model`. `provenance` → `config.microsam_provenance`;
     `license` is **ignored** (`export_sam_model` hard-codes `CC-BY-4.0`). Needs a
-    training label with **≥ 2 instances** (prompt test data uses label ids 1 & 2).
+    training label with **≥ 2 instances** (test data uses label ids 1 & 2).
   - **cpsam** — a `pytorch_state_dict` package wrapping the fine-tuned Cellpose-SAM
     net (`CellposeSAMWrapper` bundled as `model.py`, with cellpose flow-dynamics
     postprocessing). The RDF's `output_sample` is a **real CPU forward pass** of

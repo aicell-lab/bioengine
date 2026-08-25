@@ -1,10 +1,12 @@
-# micro-sam 1.8.10 ships PR #1337: export_sam_model produces a combined
-# {model_state, decoder_state} AIS-default package and PredictorAdaptor runs
-# automatic instance segmentation when called without prompts. The full pip
-# install pulls torch-em / segment-anything / bioimage-cpp, so the old conda-only
+# micro-sam 1.8.11 ships PR #1348 (on #1337): export_sam_model emits the
+# image-only AIS RDF natively — image-derived y/x minima, embeddings
+# reproducibility_tolerance, and an eval/CPU-deterministic self-test — plus PR
+# #1347's embedding-cache fix in PredictorAdaptor, so export_worker no longer
+# rewrites the package or vendors a patched adaptor. The full pip install pulls
+# torch-em / segment-anything / bioimage-cpp, so the old conda-only
 # nifty/vigra/z5py blocker is gone. onnx(runtime) is only for the in-browser
 # prompt-decoder export (get_onnx_model).
-micro-sam==1.8.10
+micro-sam==1.8.11
 segment-anything==1.0
 # micro-sam routes the vit_t_lm base model through MobileSAM's tiny image
 # encoder; without it train_sam / get_predictor raise "'mobile_sam' is required
