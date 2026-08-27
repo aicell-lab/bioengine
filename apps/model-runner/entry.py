@@ -136,15 +136,6 @@ class EntryDeployment:
     # Test outcome mapped to a numeric quality score, surfaced on the
     # published test-report artifact's manifest for ranking.
 
-    # Inference results published by the bioimage.io inference workflow
-    # (``scripts/bioengine_model_infer.py``) live in a single artifact
-    # under the test-reports collection: ``inference_report.json`` is a
-    # flat ``{model_id: {status, message, tested_at, runner_version}}``
-    # mapping. ``search_models`` reads it to filter to models whose
-    # latest inference passed.
-    _INFERENCE_REPORT_ARTIFACT = "bioimage-io/inference-report"
-    _INFERENCE_REPORT_FILE = "inference_report.json"
-
     # Score at which a published test report says inference passed:
     # 1 (valid format) + 2 (default-env inference). See
     # ``_compute_report_score``.
@@ -1704,43 +1695,27 @@ class EntryDeployment:
         }
 
     async def _runnable_model_ids(self) -> Set[str]:
-        """Model aliases whose most recent inference check passed.
+        """Model aliases a BioEngine runner can actually serve.
 
-        Two sources, unioned, because neither is complete on its own. The
-        legacy ``inference-report`` artifact is a frozen snapshot written by
-        the bioimage.io nightly workflow; it lags the serving runtime by whole
-        releases, so under the Cellpose-4 default runtime it still marks
-        Cellpose-SAM failed and knows nothing of the Cellpose-DINO models. The
-        per-model artifacts under ``test-reports`` are written by this runner
-        as it tests, so they track the current runtime — but only cover models
-        it has actually been asked to test.
+        The per-model artifacts under ``test-reports`` are written by this
+        runner as it tests, so they track the current runtime. They cannot
+        vouch for the Cellpose models older than Cellpose 4: those need the
+        incompatible Cellpose-3 runtime, so they score below the pass mark
+        here however healthy they are. ``cellpose3-runner`` serves them, so
+        they are added back from ``CELLPOSE3_MODELS`` — the same list
+        ``infer`` uses to redirect them.
         """
-        # Fetch the inference report via get_file (a presigned download URL
-        # for the whole file), not read_file: read_file is for small files and
-        # truncates the payload near 64 KB, and this report has grown past
-        # that (JSONDecodeError: Unterminated string).
-        report_url = await self.artifact_manager.get_file(
-            self._INFERENCE_REPORT_ARTIFACT,
-            file_path=self._INFERENCE_REPORT_FILE,
-        )
-        response = await self.model_cache._get_url_with_retry(report_url, params=None)
-        runnable = {
-            model_id
-            for model_id, result in response.json().items()
-            if result and result.get("status") == "passed"
-        }
-
         prefix = "test-report-"
         reports = await self.artifact_manager.list(
             parent_id=self._TEST_REPORTS_COLLECTION, limit=1000, stage=False
         )
-        runnable |= {
+        runnable = {
             report["alias"][len(prefix) :]
             for report in reports
             if report["alias"].startswith(prefix)
             and (report["manifest"].get("score") or 0) >= self._INFERENCE_PASS_SCORE
         }
-        return runnable
+        return runnable | set(CELLPOSE3_MODELS)
 
     @bioengine.method
     async def search_models(
