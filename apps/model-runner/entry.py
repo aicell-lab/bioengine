@@ -506,6 +506,10 @@ class EntryDeployment:
 
     # === Conda env cache housekeeping (sweep + LRU eviction) ===
 
+    # Written into an env directory only after ``mamba env create`` exits 0.
+    # Its absence is what distinguishes a half-built env from a usable one.
+    _ENV_COMPLETE_MARKER = ".bioengine-env-complete"
+
     def _conda_envs_dir(self) -> Path:
         return Path(os.environ["HOME"]) / ".bioengine-conda" / "envs"
 
@@ -1319,24 +1323,58 @@ class EntryDeployment:
 
         return needed_env_names
 
+    def _mark_env_complete(self, env_name: str) -> None:
+        try:
+            marker = self._conda_envs_dir() / env_name / self._ENV_COMPLETE_MARKER
+            marker.touch()
+        except OSError as e:
+            logger.debug(f"could not mark env {env_name} complete: {e}")
+
     async def _mamba_env_exists(self, env_name: str, env_vars: Dict[str, str]) -> bool:
-        """Non-blocking existence check via
-        ``mamba run -n <env_name> python --version``. Returns True
-        iff the child exits 0.
+        """True only for a *complete* env — one whose build finished.
+
+        A bare ``python --version`` probe is not sufficient. An interrupted
+        ``mamba env create`` leaves a directory with a working ``python`` but
+        no ``bioimageio``, and ``mamba run -n <env>`` only *prepends* the env
+        to PATH, so the missing binary falls through to the serving runtime's
+        ``bioimageio``: the model is silently tested against the wrong stack
+        and still reported as ``test_environment=custom``.
+
+        Fast path is the marker this class writes after a successful build.
+        Envs predating the marker are admitted only if ``bioimageio`` resolves
+        *inside* their own prefix, then marked so the probe runs once. Every
+        env built here has ``bioimageio.core`` pinned into its pip section by
+        ``pin_bioimageio_conda_env``, so the console script is always expected.
         """
+        env_dir = self._conda_envs_dir() / env_name
+        if (env_dir / self._ENV_COMPLETE_MARKER).exists():
+            return True
+        if not env_dir.is_dir():
+            return False
         proc = await asyncio.create_subprocess_exec(
             "mamba",
             "run",
             "-n",
             env_name,
             "python",
-            "--version",
+            "-c",
+            "import os, shutil, sys\n"
+            "p = shutil.which('bioimageio') or ''\n"
+            "sys.exit(0 if p and os.path.realpath(p).startswith("
+            "os.path.realpath(sys.prefix) + os.sep) else 1)\n",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env_vars,
         )
         await proc.communicate()
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            logger.warning(
+                f"♻️ Conda env {env_name} is present but incomplete "
+                f"(no bioimageio inside its prefix) — rebuilding"
+            )
+            return False
+        self._mark_env_complete(env_name)
+        return True
 
     async def _mamba_env_create(
         self,
@@ -1361,6 +1399,17 @@ class EntryDeployment:
             tmp.write(yaml_bytes)
             tmp_path = tmp.name
         try:
+            # Reached only when ``_mamba_env_exists`` said no, so any directory
+            # still sitting here is a failed build — clear it so mamba starts
+            # from scratch rather than layering onto a partial prefix.
+            env_dir = self._conda_envs_dir() / env_name
+            if env_dir.exists():
+                logger.warning(
+                    f"🧹 Discarding incomplete conda env {env_name} before rebuild"
+                )
+                await self._mamba_env_remove(env_name, env_vars)
+                shutil.rmtree(env_dir, ignore_errors=True)
+
             logger.info(f"🐍 mamba env create ({wf!r}) → {env_name}")
             proc = await asyncio.create_subprocess_exec(
                 "mamba",
@@ -1380,6 +1429,7 @@ class EntryDeployment:
                     f"mamba env create failed for weight format "
                     f"{wf!r} (env {env_name}): {tail}"
                 )
+            self._mark_env_complete(env_name)
             logger.info(f"✅ Built conda env for {wf!r}: {env_name}")
         finally:
             try:
