@@ -209,6 +209,7 @@ pytest tests/end_to_end/ -v
 - [Applications Guide](docs/apps-guide.md) — build and deploy BioEngine applications
 - [Datasets Guide](docs/datasets-guide.md) — share and stream large scientific datasets
 - [Deployment Guide](docs/deployment-guide.md) — single-machine, Kubernetes, and SLURM setup
+- [Glossary](docs/glossary.md) — canonical names for app packages, applications, workers, and services
 
 ---
 
