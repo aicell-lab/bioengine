@@ -76,10 +76,6 @@ single_input_key = lp["single_input_key"]
 default_blocksize_parameter = lp["default_blocksize_parameter"]
 overrides = lp["overrides"]
 
-# Channel names the micro-SAM AIS decoder writes, in order. Their presence on
-# an output axis is what identifies an AIS model — the tensor id varies.
-MICROSAM_CHANNELS = ("foreground", "center_distance", "boundary_distance")
-MICROSAM_KEY = "microsam_watershed"
 # Tile size to aim for on loosely-sized Cellpose models, matching upstream
 # cellpose's default for the DINO backbone (``models.py``: 256 for sam_vitl,
 # else 384).
@@ -99,8 +95,7 @@ def _apply_overrides(descr, overrides):
     # artifact on disk is never touched; the copy lives only as long as this
     # child, which the parent evicts when the override set changes.
     pre = dict(overrides.get("preprocessing") or {})
-    post = {k: v for k, v in (overrides.get("postprocessing") or {}).items()
-            if k != MICROSAM_KEY}
+    post = dict(overrides.get("postprocessing") or {})
     if not pre and not post:
         return descr, False, False
 
@@ -165,15 +160,6 @@ def _is_cellpose(descr):
     return False
 
 
-def _microsam_output_id(descr):
-    for output in descr.outputs:
-        for axis in getattr(output, "axes", None) or []:
-            names = getattr(axis, "channel_names", None)
-            if names and tuple(str(n) for n in names) == MICROSAM_CHANNELS:
-                return output.id
-    return None
-
-
 def _block_size_ns(descr, sample):
     # Cellpose-DINO declares y/x as ``min + n*step`` rather than a fixed size,
     # and core's default of n=10 would tile it at 144 px — well under the 384
@@ -199,22 +185,12 @@ loaded_description = load_model_description(rdf_path)
 # unblocked call pads the whole sample by the halo and breaks the ViT
 # positional embedding. Everything else keeps the historical behaviour —
 # blocked only when the caller asked for a block size. How a model has to run
-# is a property of the model, so both flags are read before the overrides get
-# a chance to drop the op they are recognised by.
+# is a property of the model, so the flag is read before the overrides get a
+# chance to drop the op it is recognised by.
 cellpose = _is_cellpose(loaded_description)
-microsam_id = _microsam_output_id(loaded_description)
 model_description, skip_pre, skip_post = _apply_overrides(
     loaded_description, overrides
 )
-watershed_override = (overrides.get("postprocessing") or {}).get(MICROSAM_KEY, {})
-watershed_kwargs = watershed_override or {}
-# The watershed runs unless the caller dropped it explicitly, or asked for the
-# raw model output by dropping the model's declared postprocessing.
-apply_watershed = microsam_id is not None and watershed_override is not None
-if skip_post and not watershed_override:
-    apply_watershed = False
-if apply_watershed:
-    from microsam_watershed import microsam_watershed
 
 # Passing ``default_blocksize_parameter=None`` explicitly would override
 # core's own default with None, and a blocked predict whose per-axis ``ns``
@@ -275,20 +251,6 @@ for line in sys.stdin:
         members = {
             str(key): member.data.data for key, member in result.members.items()
         }
-        # micro-SAM AIS models predict three dense maps; the seeded watershed
-        # that turns them into instance labels is not expressible as a spec
-        # postprocessing op in the pinned core, so it runs here. Overriding it
-        # with ``None`` skips it and returns the maps.
-        if apply_watershed:
-            maps = members.pop(str(microsam_id))
-            maps = np.asarray(maps)
-            if maps.ndim == 4:
-                labels = np.stack(
-                    [microsam_watershed(m, **watershed_kwargs) for m in maps]
-                )
-            else:
-                labels = microsam_watershed(maps, **watershed_kwargs)
-            members["labels"] = labels
         out = Path(req["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
         for key, array in members.items():

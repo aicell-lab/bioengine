@@ -5,10 +5,10 @@ RDF validation, end-to-end model testing, and inference. It delegates the
 GPU-bound work (``predict`` and the heavy ``bioimageio.core.test_model``
 call) to :class:`runtime.RuntimeDeployment` via the v0.6 type-hint composition.
 
-The GPU runtime ships Cellpose-4 (Cellpose-SAM / Cellpose-DINO) and
-micro-SAM, and runs those models natively. It cannot run the older
-Cellpose-3 zoo models; deploy the ``bioimage-io/cellpose3-runner`` app for
-those and call its ``list_supported_models()`` for the accepted ids.
+The GPU runtime ships Cellpose-4 (Cellpose-SAM / Cellpose-DINO) and runs
+those models natively. It cannot run the older Cellpose-3 zoo models;
+deploy the ``bioimage-io/cellpose3-runner`` app for those and call its
+``list_supported_models()`` for the accepted ids.
 
 Heavier helper modules:
 
@@ -2848,10 +2848,7 @@ class EntryDeployment:
             '{"cellpose_flow_dynamics": {"flow_threshold": 0.4, '
             '"cellprob_threshold": 0.0, "min_size": 15}}). Dropping an op with '
             "None returns the model's raw output — "
-            '{"cellpose_flow_dynamics": None} yields Cellpose-4 flow fields. '
-            'The extra key "microsam_watershed" configures the micro-SAM '
-            "instance-segmentation watershed, which is not a declared op; "
-            "setting it to None returns the AIS distance maps.",
+            '{"cellpose_flow_dynamics": None} yields Cellpose-4 flow fields.',
         ),
         return_download_url: Optional[bool] = Field(
             False,
@@ -2861,8 +2858,8 @@ class EntryDeployment:
         """
         Submit an inference request and return a ``request_id`` immediately.
 
-        Cellpose-4 (Cellpose-SAM / Cellpose-DINO) and micro-SAM models run
-        natively here. Cellpose models older than Cellpose 4 are not
+        Cellpose-4 (Cellpose-SAM / Cellpose-DINO) models run natively here.
+        Cellpose models older than Cellpose 4 are not
         supported — this runner's runtime ships Cellpose 4, whose API is
         incompatible. Run them via the ``bioimage-io/cellpose3-runner`` app
         instead.

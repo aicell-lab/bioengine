@@ -92,14 +92,13 @@ This avoids the need for model-type-specific runtimes and simplifies scheduling,
 **Dependencies**
 
 ```text
-bioimageio.core==0.10.4
+bioimageio.core==0.11.0
 careamics==0.0.16
 cellpose==4.2.1.1
 dinov3 (git)
 numpy==1.26.4
 onnxruntime==1.20.1
 scikit-image==0.25.2
-segment-anything==1.0
 stardist==0.9.1
 tensorflow==2.16.1
 timm==1.0.27
@@ -116,7 +115,6 @@ Notes:
   * TensorFlow models
   * ONNX models
   * Cellpose-4 workflows (Cellpose-SAM, Cellpose-DINO)
-  * micro-SAM automatic instance segmentation
   * CAREamics-based workflows
 
   Cellpose-3 models are **not** supported — the runtime ships Cellpose 4.
@@ -198,12 +196,6 @@ request_id = await svc.infer(
     postprocessing={"cellpose_flow_dynamics": None},   # (1, 3, y, x) flow field
 )
 ```
-
-The same applies to the micro-SAM instance-segmentation watershed. It is not an op the
-RDF declares (the pinned `bioimageio.core` does not implement it yet, so the runner
-applies it itself whenever a model outputs the three AIS maps), but it is addressed the
-same way — `{"microsam_watershed": {...}}` configures it, `{"microsam_watershed": None}`
-skips it and returns the raw distance maps.
 
 ### Key pitfalls
 
