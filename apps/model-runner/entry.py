@@ -1981,14 +1981,13 @@ class EntryDeployment:
         logger.info(f"✅ RDF validation {'passed' if result['success'] else 'failed'}.")
         return result
 
-    @staticmethod
-    def _normalize_model_id(model_id: str) -> str:
+    def _normalize_model_id(self, model_id: str) -> str:
         """Accept both ``affable-shark`` and ``bioimage-io/affable-shark``.
 
         Artifact URLs built downstream already carry the workspace, so a
         fully-qualified id would repeat it and 404 as a bare "File not found".
         """
-        prefix = f"{EntryDeployment._MODELS_WORKSPACE}/"
+        prefix = f"{self._MODELS_WORKSPACE}/"
         return model_id[len(prefix) :] if model_id.startswith(prefix) else model_id
 
     @staticmethod
