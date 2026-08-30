@@ -133,6 +133,10 @@ class EntryDeployment:
     _TEST_REPORTS_WORKSPACE = "bioimage-io"
     _TEST_REPORTS_COLLECTION = "bioimage-io/test-reports"
 
+    # Workspace the model artifacts live in. Artifact URLs hardcode it, so
+    # ``_normalize_model_id`` strips it back off a fully-qualified model_id.
+    _MODELS_WORKSPACE = "bioimage-io"
+
     # Test outcome mapped to a numeric quality score, surfaced on the
     # published test-report artifact's manifest for ranking.
 
@@ -1833,7 +1837,8 @@ class EntryDeployment:
         self,
         model_id: str = Field(
             ...,
-            description="Unique identifier of the bioimage.io model (e.g., 'ambitious-ant')",
+            description="Unique identifier of the bioimage.io model, either the bare "
+            "alias ('ambitious-ant') or fully qualified ('bioimage-io/ambitious-ant')",
         ),
         stage: Optional[bool] = Field(
             False,
@@ -1851,6 +1856,7 @@ class EntryDeployment:
             ValueError: If model_id is invalid or model not found
             RuntimeError: If download fails
         """
+        model_id = self._normalize_model_id(model_id)
         logger.info(f"📋 Downloading RDF for model '{model_id}' (stage={stage}).")
 
         # Prefer the new ``bioimageio.yaml`` name; fall back to legacy ``rdf.yaml``.
@@ -1887,7 +1893,8 @@ class EntryDeployment:
         self,
         model_id: str = Field(
             ...,
-            description="Unique identifier of the bioimage.io model (e.g., 'ambitious-ant')",
+            description="Unique identifier of the bioimage.io model, either the bare "
+            "alias ('ambitious-ant') or fully qualified ('bioimage-io/ambitious-ant')",
         ),
         stage: Optional[bool] = Field(
             False,
@@ -1904,6 +1911,7 @@ class EntryDeployment:
             The documentation file content as a string, or None if the
             'documentation' field is absent/None or the file does not exist.
         """
+        model_id = self._normalize_model_id(model_id)
         rdf = await self.get_model_rdf(model_id=model_id, stage=stage)
 
         doc_path = rdf.get("documentation")
@@ -1974,6 +1982,16 @@ class EntryDeployment:
         return result
 
     @staticmethod
+    def _normalize_model_id(model_id: str) -> str:
+        """Accept both ``affable-shark`` and ``bioimage-io/affable-shark``.
+
+        Artifact URLs built downstream already carry the workspace, so a
+        fully-qualified id would repeat it and 404 as a bare "File not found".
+        """
+        prefix = f"{EntryDeployment._MODELS_WORKSPACE}/"
+        return model_id[len(prefix) :] if model_id.startswith(prefix) else model_id
+
+    @staticmethod
     def _resolve_cache(cache: str, skip_cache: Optional[bool]) -> str:
         """Resolve the effective cache policy from ``cache`` and the deprecated
         ``skip_cache`` alias. ``skip_cache`` (kept so existing callers keep
@@ -1988,7 +2006,9 @@ class EntryDeployment:
     async def test(
         self,
         model_id: str = Field(
-            ..., description="Unique identifier of the bioimage.io model to test"
+            ...,
+            description="Unique identifier of the bioimage.io model to test, either the "
+            "bare alias ('ambitious-ant') or fully qualified ('bioimage-io/ambitious-ant')",
         ),
         stage: Optional[bool] = Field(
             False,
@@ -2076,6 +2096,8 @@ class EntryDeployment:
             publishing is skipped — the report is still cached locally and
             returned via ``get_test_status``.
         """
+        model_id = self._normalize_model_id(model_id)
+
         # Resolve the default (None) env from the model's prior report for the
         # matching slot: a model last tested in its custom env re-tests custom,
         # else standard. Staged reads never influence a published run and vice
@@ -2841,7 +2863,9 @@ class EntryDeployment:
     async def infer(
         self,
         model_id: str = Field(
-            ..., description="Unique identifier of the published bioimage.io model"
+            ...,
+            description="Unique identifier of the published bioimage.io model, either the "
+            "bare alias ('ambitious-ant') or fully qualified ('bioimage-io/ambitious-ant')",
         ),
         inputs: Union[np.ndarray, Dict[str, Union[np.ndarray, str]], str] = Field(
             ...,
@@ -2943,6 +2967,7 @@ class EntryDeployment:
             FileNotFoundError: if a URL / temporary file path is
                 provided but the resource does not exist or has expired.
         """
+        model_id = self._normalize_model_id(model_id)
         logger.info(f"🤖 Queuing inference for model '{model_id}'...")
 
         if model_id.rsplit("/", 1)[-1] in CELLPOSE3_MODELS:
