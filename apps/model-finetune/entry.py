@@ -158,9 +158,16 @@ class EntryApp:
         backoff above, then returns the final response WITHOUT raising for
         status — callers keep their own handling (e.g. 404 -> FileNotFoundError,
         raise_for_status on a PUT). An exhausted retry loop must surface loudly.
+
+        If ``content`` is callable it is invoked fresh on every attempt to yield
+        a new body — required for streamed uploads, whose async iterators are
+        single-use and would be spent after a retry.
         """
         retry_status = {403, 404, 408, 429}
+        body_factory = kwargs.pop("content", None) if callable(kwargs.get("content")) else None
         for delay in (*self._HTTP_RETRY_BACKOFF, None):
+            if body_factory is not None:
+                kwargs["content"] = body_factory()
             try:
                 resp = await self._http.request(method, url, **kwargs)
             except httpx.TransportError:
@@ -172,6 +179,28 @@ class EntryApp:
                 await asyncio.sleep(delay)
                 continue
             return resp
+
+    @staticmethod
+    async def _file_chunks(fpath: Path, size: int = 1 << 20):
+        with open(fpath, "rb") as fh:
+            while True:
+                chunk = await asyncio.to_thread(fh.read, size)
+                if not chunk:
+                    break
+                yield chunk
+
+    async def _put_file(self, url: str, fpath: Path, timeout: float = 600.0) -> httpx.Response:
+        """PUT a file to a presigned URL, streaming from disk so large weights
+        (cpsam packages ship a ~1.2GB model_weights.pth) never load whole into
+        RAM and OOM the memory-constrained EntryApp actor. Content-Length is set
+        explicitly because S3 presigned PUTs reject chunked transfer encoding."""
+        size = await asyncio.to_thread(lambda: fpath.stat().st_size)
+        return await self._http_retry(
+            "PUT", url,
+            content=lambda: self._file_chunks(fpath),
+            headers={"Content-Length": str(size)},
+            timeout=timeout,
+        )
 
     async def _load_image_from_source(self, source: str) -> np.ndarray:
         ext = Path(source.split("?")[0]).suffix.lower()
@@ -708,8 +737,7 @@ class EntryApp:
             zip_path = Path(res["zip"])
             file_path = f"temp/{export_id}/{zip_path.name}"
             upload_url = await self._s3.put_file(file_path=file_path, ttl=6 * 3600)
-            data = await asyncio.to_thread(zip_path.read_bytes)
-            resp = await self._http_retry("PUT", upload_url, content=data, timeout=600.0)
+            resp = await self._put_file(upload_url, zip_path, timeout=600.0)
             resp.raise_for_status()
             download_url = await self._get_download_url(file_path)
             rec.update(
@@ -760,8 +788,7 @@ class EntryApp:
             fpath = pkg_dir / rel
             if not fpath.is_file():
                 raise FileNotFoundError(f"Package file '{rel}' not found for export '{export_id}'.")
-            data = await asyncio.to_thread(fpath.read_bytes)
-            resp = await self._http_retry("PUT", url, content=data, timeout=600.0)
+            resp = await self._put_file(url, fpath, timeout=600.0)
             resp.raise_for_status()
             pushed.append(rel)
         return {"pushed": pushed, "n_files": len(pushed)}
