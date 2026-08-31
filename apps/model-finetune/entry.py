@@ -332,23 +332,35 @@ class EntryApp:
         if weights_path.exists() and meta_path.exists():
             return {"weights_path": str(weights_path), **json.loads(meta_path.read_text())}
 
-        server = self._hypha
-        if model_token:
-            server = await connect_to_server({"server_url": SERVER_URL, "token": model_token})
-        am = await server.get_service("public/artifact-manager")
+        caller_client = (
+            await connect_to_server({"server_url": SERVER_URL, "token": model_token})
+            if model_token
+            else None
+        )
+        try:
+            am = await (caller_client or self._hypha).get_service("public/artifact-manager")
 
-        rdf_url = await am.get_file(model_id, file_path="rdf.yaml")
-        rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
-        ps = rdf["weights"]["pytorch_state_dict"]
-        model_type = ps["architecture"]["kwargs"]["model_type"]
+            rdf_url = await am.get_file(model_id, file_path="rdf.yaml")
+            rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
+            ps = rdf["weights"]["pytorch_state_dict"]
+            model_type = ps["architecture"]["kwargs"]["model_type"]
 
-        w_url = await am.get_file(model_id, file_path=ps["source"])
-        content = (await self._http_retry("GET", w_url, timeout=600.0)).content
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(weights_path.write_bytes, content)
-        meta = {"model_type": model_type}
-        meta_path.write_text(json.dumps(meta))
-        return {"weights_path": str(weights_path), **meta}
+            w_url = await am.get_file(model_id, file_path=ps["source"])
+            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(weights_path.write_bytes, content)
+            meta = {"model_type": model_type}
+            meta_path.write_text(json.dumps(meta))
+            return {"weights_path": str(weights_path), **meta}
+        finally:
+            if caller_client is not None:
+                # A per-request caller client stays registered server-side until
+                # its socket drops; disconnect frees it now. Bounded so a wedged
+                # transport can't stall the request.
+                try:
+                    await asyncio.wait_for(caller_client.disconnect(), timeout=2.0)
+                except Exception:
+                    pass
 
     # === serving (forwarded to the GPU runtime) ===
 
