@@ -40,13 +40,30 @@ except ImportError:
 
 logger = logging.getLogger("ray.serve")
 
-# How many consecutive Hypha ping/health-check failures we tolerate before
-# concluding the connection is dead and forcing a re-register. A single
-# failed ping usually means bridge tail-latency, not a broken socket —
-# treating each one as fatal caused a flap loop against personal-workspace
-# Hypha bridges where ping p99 sits above the Ray Serve health_check_timeout
-# (PR #135 field report from Chiron/Tabula on ws-user-google-oauth2…).
-_MAX_CONSECUTIVE_PING_FAILURES = 3
+# Hypha connection upkeep runs in a background task, never in check_health:
+# a slow or restarting Hypha server is a *server* problem and must not
+# condemn a Ray replica. The loop wakes on this interval to notice a lost
+# connection quickly, but only spends a Hypha round trip every
+# _REACHABILITY_PROBE_INTERVAL_S.
+_MAINTENANCE_TICK_S = 5
+# hypha-rpc keeps the websocket alive itself (ping_interval=20s) and
+# re-registers our services on every reconnect, so this probe exists only to
+# catch the one case the library cannot signal: an RPC session that has gone
+# stale while the socket stays up. Rare, so it is cheap to look for slowly.
+_REACHABILITY_PROBE_INTERVAL_S = 60
+# Backoff between re-registration attempts. Must stay above Hypha's stale-
+# client TTL (~30-60s) so a rebuild whose disconnect didn't land isn't
+# rejected forever with 'Client already exists and is active'.
+_REREGISTER_BACKOFF_S = 30
+
+# Hypha reports a workspace we may not use as a plain exception with no
+# error code, from two different call sites in hypha_rpc. The message is the
+# only discriminator available at this boundary.
+_PERMANENT_ERROR_MARKERS = ("wrong workspace",)
+
+
+class _PermanentRegistrationError(RuntimeError):
+    """Registration failed for a reason no amount of retrying will fix."""
 
 
 # ``ray_actor_options`` is intentionally minimal here. The proxy needs a
@@ -281,7 +298,17 @@ class ProxyDeployment:
         self.mcp_service_id: str = None
         self.rtc_service_id: str = None
         self.service_semaphore = asyncio.Semaphore(self.max_ongoing_requests)
-        self._consecutive_ping_failures = 0
+
+        # Hypha connection upkeep — owned by the background maintenance task,
+        # never by check_health. ``_connection_lost`` is set from hypha-rpc's
+        # on_disconnected hook (a synchronous callback, so it may only flip a
+        # flag); ``_registration_failure`` holds a permanent config/permission
+        # error for check_health to surface.
+        self._maintenance_task: Optional[asyncio.Task] = None
+        self._connection_lost = False
+        self._registration_failure: Optional[BaseException] = None
+        self._last_probe_at = 0.0
+        self._next_register_at = 0.0
 
         # WebRTC peer connection tracking
         self._active_peer_connections: Dict[str, Dict[str, Any]] = {}
@@ -953,7 +980,22 @@ class ProxyDeployment:
                     f"for '{self.application_id}': {e}"
                 )
         self.server = None
-        self._consecutive_ping_failures = 0
+        self._connection_lost = False
+
+    def _on_connection_lost(self, reason: str) -> None:
+        """hypha-rpc on_disconnected hook — must stay synchronous and cheap.
+
+        The library calls this from inside its listen task's ``finally``
+        block without awaiting it, and only for closures it will *not* retry
+        (a clean server-side close). Unexpected drops are reconnected
+        internally, with services re-registered on reconnect, so they never
+        reach here. All this does is ask the maintenance task to rebuild.
+        """
+        logger.warning(
+            f"🔌 Hypha connection closed for '{self.application_id}': {reason}. "
+            f"Scheduling reconnect."
+        )
+        self._connection_lost = True
 
     async def _register_services(self) -> None:
         """
@@ -990,13 +1032,22 @@ class ProxyDeployment:
             )
             connected_workspace = self.server["config"]["workspace"]
             if connected_workspace != self.workspace:
-                raise RuntimeError(
+                raise _PermanentRegistrationError(
                     f"Workspace mismatch: expected '{self.workspace}', got '{connected_workspace}'"
                 )
             registered_client_id = self.server["config"]["client_id"]
             if registered_client_id != self.client_id:
-                raise RuntimeError(
+                raise _PermanentRegistrationError(
                     f"Client ID mismatch: expected '{self.client_id}', got '{registered_client_id}'"
+                )
+            try:
+                self.server.rpc._connection.on_disconnected(self._on_connection_lost)
+            except Exception as e:
+                # Losing the hook costs latency, not correctness — the
+                # reachability probe still finds a dead connection.
+                logger.warning(
+                    f"⚠️ Could not attach the Hypha disconnect hook for "
+                    f"'{self.application_id}': {e}"
                 )
             logger.info(
                 f"✅ Successfully connected to Hypha server as client "
@@ -1042,7 +1093,7 @@ class ProxyDeployment:
                 f"{self.workspace}/{self.client_id}:{self.application_id}"
             )
             if websocket_service_info["id"] != self.websocket_service_id:
-                raise RuntimeError(
+                raise _PermanentRegistrationError(
                     f"Service ID mismatch: expected '{self.websocket_service_id}', got '{websocket_service_info['id']}'"
                 )
             logger.info(
@@ -1110,6 +1161,113 @@ class ProxyDeployment:
             f"📋 Service functions registered: {list(service_functions.keys())}"
         )
 
+    # ===== Hypha Connection Maintenance =====
+    # Keeps the Hypha connection and registration alive off the health-check
+    # path. A slow, restarting or unreachable Hypha server is a server-side
+    # problem: it must never condemn this replica. Only a registration that
+    # cannot succeed no matter how often it is retried — bad workspace, bad
+    # client id, rejected credentials — is allowed to fail the deployment.
+
+    @staticmethod
+    def _is_permanent_registration_error(exc: BaseException) -> bool:
+        """Whether retrying this registration failure is pointless.
+
+        ``ConnectionAbortedError`` is how hypha-rpc surfaces a handshake the
+        *server actively refused* — bad token, missing permission, unusable
+        protocol — as opposed to one it could not deliver; hypha-rpc itself
+        treats it as terminal and stops its own reconnect loop on it. The one
+        refusal that does clear on its own is a client_id still held by our
+        predecessor, which Hypha releases after its stale-client TTL.
+
+        Everything else is assumed transient. That asymmetry is deliberate:
+        retrying a genuine misconfiguration forever is merely quiet, while
+        misreading a Hypha restart as permanent kills a replica that can
+        still serve — which is the failure this whole design removes.
+        """
+        text = str(exc).lower()
+        if "already exists" in text:
+            return False
+        if isinstance(exc, _PermanentRegistrationError):
+            return True
+        if isinstance(exc, ConnectionAbortedError):
+            return True
+        return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
+
+    async def _maintenance_tick(self) -> None:
+        """One pass of connection upkeep. Never raises.
+
+        Kept separate from the sleeping loop so it can be driven directly.
+        """
+        if not self.entry_deployment_ready:
+            # Not serviceable yet, or deregistered because a sibling went
+            # down. check_health owns that gate; nothing to maintain.
+            return
+
+        needs_registration = (
+            self.server is None or self.websocket_service_id is None or self._connection_lost
+        )
+
+        if needs_registration:
+            now = time.time()
+            if now < self._next_register_at:
+                return
+            self._next_register_at = now + _REREGISTER_BACKOFF_S
+            async with self._registration_lock:
+                try:
+                    await self._register_services()
+                    self._connection_lost = False
+                    self._last_probe_at = time.time()
+                    self._next_register_at = 0.0
+                except Exception as e:
+                    if self._is_permanent_registration_error(e):
+                        logger.error(
+                            f"❌ Hypha registration for '{self.application_id}' failed "
+                            f"permanently and will not be retried: {e}"
+                        )
+                        self._registration_failure = e
+                    else:
+                        logger.warning(
+                            f"⚠️ Hypha registration for '{self.application_id}' failed; "
+                            f"retrying in {_REREGISTER_BACKOFF_S}s: {e}"
+                        )
+            return
+
+        if time.time() - self._last_probe_at < _REACHABILITY_PROBE_INTERVAL_S:
+            return
+        try:
+            await self.server.echo("ping")
+            self._last_probe_at = time.time()
+        except Exception as e:
+            # Not a health-check failure: flag for rebuild on the next tick.
+            logger.warning(
+                f"⚠️ Hypha unreachable from '{self.application_id}'; rebuilding the "
+                f"client: {e}"
+            )
+            self._connection_lost = True
+
+    async def _maintenance_loop(self) -> None:
+        while True:
+            try:
+                await self._maintenance_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Hypha maintenance tick raised for '{self.application_id}': {e}"
+                )
+            if self._registration_failure is not None:
+                return
+            await asyncio.sleep(_MAINTENANCE_TICK_S)
+
+    def _ensure_maintenance_task(self) -> None:
+        """Start the maintenance loop, or restart it if it ever exited."""
+        if self._maintenance_task is None or self._maintenance_task.done():
+            if self._registration_failure is not None:
+                return
+            self._maintenance_task = asyncio.get_event_loop().create_task(
+                self._maintenance_loop()
+            )
+
     # ===== Ray Serve Health Check =====
     # Implements periodic health checks for Ray Serve.
 
@@ -1174,15 +1332,33 @@ class ProxyDeployment:
         periodically thereafter to ensure the deployment is healthy and ready
         to serve requests.
 
+        The check reads local state only. Hypha is never contacted from here:
+        a slow or restarting Hypha server is a server-side problem, and
+        failing this check would tear down a replica that is perfectly able
+        to serve. Connecting, registering and reconnecting all happen in the
+        background maintenance task, which reports back through
+        ``_registration_failure``.
+
         Health Check Process:
-        1. Verifies the underlying BioEngine application deployment is healthy
-        2. Ensures Hypha server connection is established
-        3. Registers services with Hypha if not already done
-        4. Tests Hypha server connectivity with a ping
+        1. Surfaces a permanent Hypha registration failure (bad config or
+           rejected credentials), the one connection problem retrying cannot fix
+        2. Gates the Hypha service on every sibling deployment being RUNNING
+        3. Rotates WebRTC TURN credentials and sweeps abandoned peer connections
 
         Raises:
             RuntimeError: If any health check fails, indicating the deployment is unhealthy
         """
+        # Registration is retried indefinitely for anything that might clear on
+        # its own; reaching here means it never will, so fail loudly rather than
+        # sit registered-with-nobody.
+        if self._registration_failure is not None:
+            raise RuntimeError(
+                f"Hypha service registration for '{self.application_id}' failed "
+                f"permanently: {self._registration_failure}"
+            ) from self._registration_failure
+
+        self._ensure_maintenance_task()
+
         # Gate the Hypha service on the app being serviceable: register only
         # while every sibling deployment (entry + any runtimes) has a RUNNING
         # replica. Read out-of-band from the Serve controller — a saturated app
@@ -1228,68 +1404,6 @@ class ProxyDeployment:
                     await self._deregister_services()
                     return
 
-        # Register services if not already done (with lock to prevent concurrent registration)
-        if not self.server or not self.websocket_service_id:
-            async with self._registration_lock:
-                # Double-check after acquiring lock
-                if not self.server or not self.websocket_service_id:
-                    await self._register_services()
-
-        # Check if Hypha server can be reached. A single failure isn't
-        # decisive — on some Hypha bridges ping p99 sits well above the
-        # 5s Ray Serve health_check_timeout, so occasional tail-latency
-        # spikes must NOT flap the replica. Only after
-        # _MAX_CONSECUTIVE_PING_FAILURES do we conclude the socket is
-        # dead, release the client_id, and hand a failure to Ray Serve.
-        try:
-            logger.debug("Pinging Hypha server to check connection...")
-            await self.server.echo("ping")
-            logger.debug("Received ping response from Hypha server.")
-            if self._consecutive_ping_failures:
-                logger.info(
-                    f"✅ Hypha ping recovered for '{self.application_id}' "
-                    f"after {self._consecutive_ping_failures} transient "
-                    f"failure(s)."
-                )
-                self._consecutive_ping_failures = 0
-        except Exception as e:
-            self._consecutive_ping_failures += 1
-            if self._consecutive_ping_failures < _MAX_CONSECUTIVE_PING_FAILURES:
-                logger.warning(
-                    f"⚠️ Hypha ping failed "
-                    f"({self._consecutive_ping_failures}/"
-                    f"{_MAX_CONSECUTIVE_PING_FAILURES}) for "
-                    f"'{self.application_id}' — likely bridge tail latency, "
-                    f"keeping replica healthy: {e}"
-                )
-                # Transient. Skip the downstream service round-trip too
-                # (it uses the same transport) and return healthy; the
-                # next tick will re-ping.
-                return
-            logger.error(
-                f"❌ Hypha ping failed {self._consecutive_ping_failures} "
-                f"times consecutively for '{self.application_id}'; "
-                f"resetting the connection: {e}"
-            )
-            await self._reset_server_connection()
-            raise RuntimeError("Hypha server connection failed") from e
-
-        # Check if the WebSocket service can be reached
-        try:
-            logger.debug(f"Getting WebSocket service with ID '{self.websocket_service_id}'...")
-            websocket_service = await self.server.get_service(self.websocket_service_id)
-            logger.debug(f"Successfully connected to WebSocket service '{self.websocket_service_id}'. Checking load and uncompleted requests...")
-            await websocket_service.get_load()
-            await websocket_service.get_num_pcs()
-            logger.debug(f"WebSocket service '{self.websocket_service_id}' check passed.")
-        except Exception as e:
-            logger.error(
-                f"❌ WebSocket service connection failed for '{self.application_id}': {e}"
-            )
-            # Reset service ID to trigger re-registration on next call
-            self.websocket_service_id = None
-            raise RuntimeError("WebSocket service connection failed")
-
         # Rotate WebRTC TURN credentials before they expire so long-
         # running deployments don't silently drop TURN relay after ~1h
         # (coturn's default TTL on hypha.aicell.io). See
@@ -1330,6 +1444,9 @@ class ProxyDeployment:
         node reschedule) can reconnect under the same stable id without
         hitting 'Client already exists and is active'.
         """
+        if self._maintenance_task is not None:
+            self._maintenance_task.cancel()
+            self._maintenance_task = None
         try:
             await self._deregister_services()
         except Exception as e:

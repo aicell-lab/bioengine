@@ -63,7 +63,14 @@ def _bare_proxy(**attrs):
     inst.server = None
     inst.websocket_service_id = None
     inst._registration_lock = asyncio.Lock()
-    inst._consecutive_ping_failures = 0
+    inst._registration_failure = None
+    inst._connection_lost = False
+    inst._last_probe_at = 0.0
+    inst._next_register_at = 0.0
+    inst._maintenance_task = None
+    # The maintenance loop is exercised in test_proxy_hypha_decoupled_health;
+    # here it would only spawn a background task the gate tests never await.
+    inst._ensure_maintenance_task = lambda: None
     inst._deregister_services = _Recorder()
     for key, value in attrs.items():
         setattr(inst, key, value)
@@ -125,7 +132,11 @@ async def test_sibling_drop_deregisters() -> None:
 
 @pytest.mark.asyncio
 async def test_initial_gate_waits_for_all_running() -> None:
-    """The service registers only once every sibling is RUNNING."""
+    """The service registers only once every sibling is RUNNING.
+
+    check_health owns the gate; the background maintenance task does the
+    registering, and must stay idle until the gate opens.
+    """
     registered = _Recorder()
     inst = _bare_proxy()
     inst._register_services = registered
@@ -135,6 +146,7 @@ async def test_initial_gate_waits_for_all_running() -> None:
     )
     await _run(inst)
     assert inst.entry_deployment_ready is False
+    await inst._maintenance_tick()
     assert registered.called is False
 
     inst._sibling_running_counts = _stub_counts(
@@ -142,6 +154,7 @@ async def test_initial_gate_waits_for_all_running() -> None:
     )
     await _run(inst)
     assert inst.entry_deployment_ready is True
+    await inst._maintenance_tick()
     assert registered.called is True
 
 
