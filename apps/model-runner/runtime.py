@@ -192,6 +192,17 @@ model_description, skip_pre, skip_post = _apply_overrides(
     loaded_description, overrides
 )
 
+# An architecture that opens an attachment relative to its own file finds
+# nothing: core imports the architecture alone into a temporary directory.
+try:
+    from model_attachments import stage_architecture_attachments
+
+    staged = stage_architecture_attachments(model_description)
+    if staged:
+        print("staged attachments: " + ", ".join(staged), file=sys.stderr)
+except Exception as e:
+    print("could not stage attachments: " + repr(e), file=sys.stderr)
+
 # Passing ``default_blocksize_parameter=None`` explicitly would override
 # core's own default with None, and a blocked predict whose per-axis ``ns``
 # is empty (every axis fixed) then falls back to it and crashes.
@@ -645,8 +656,14 @@ class RuntimeDeployment:
 
         script = (
             "import json, sys\n"
-            "from bioimageio.core import test_description\n"
+            f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
+            "from bioimageio.core import load_model_description, test_description\n"
+            "from model_attachments import stage_architecture_attachments\n"
             "rdf_path, out_path = sys.argv[1], sys.argv[2]\n"
+            "try:\n"
+            "    stage_architecture_attachments(load_model_description(rdf_path))\n"
+            "except Exception as e:\n"
+            "    print('could not stage attachments:', repr(e))\n"
             "summary = test_description(\n"
             "    rdf_path, expected_type='model', runtime_env='currently-active'\n"
             ")\n"
@@ -781,9 +798,15 @@ class RuntimeDeployment:
 
         script = (
             "import sys\n"
+            f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
             "from bioimageio.core import load_model_description, create_prediction_pipeline\n"
             "from bioimageio.core.digest_spec import get_test_inputs\n"
+            "from model_attachments import stage_architecture_attachments\n"
             "descr = load_model_description(sys.argv[1])\n"
+            "try:\n"
+            "    stage_architecture_attachments(descr)\n"
+            "except Exception as e:\n"
+            "    print('could not stage attachments:', repr(e))\n"
             "pipeline = create_prediction_pipeline(descr)\n"
             "pipeline.load()\n"
             "sample = get_test_inputs(descr)\n"
