@@ -214,7 +214,6 @@ blocksize_kwargs = (
 pipeline = create_prediction_pipeline(
     model_description,
     weights_format=lp["weights_format"],
-    device=lp["device"],
     **blocksize_kwargs,
 )
 pipeline.load()
@@ -810,7 +809,12 @@ class RuntimeDeployment:
             "pipeline = create_prediction_pipeline(descr)\n"
             "pipeline.load()\n"
             "sample = get_test_inputs(descr)\n"
-            "pipeline.predict_sample_without_blocking(sample)\n"
+            # Padding by the output halo grows the input, which a model declaring a
+            # fixed input size cannot accept. The two flags are a matched pair:
+            # cropping fires unconditionally and would remove a halo never added.
+            "pipeline.predict_sample_without_blocking(\n"
+            "    sample, skip_input_padding=True, skip_output_cropping=True\n"
+            ")\n"
             "print('SMOKE_OK')\n"
         )
         try:
@@ -1003,7 +1007,6 @@ class RuntimeDeployment:
         request_id: str,
         rdf_path: str,
         weights_format: Optional[str] = None,
-        device: Literal["cuda", "cpu"] = None,
         default_blocksize_parameter: Optional[int] = None,
         sample_id: str = "sample",
         remote_modified: Optional[str] = None,
@@ -1063,7 +1066,7 @@ class RuntimeDeployment:
 
             logger.info(
                 f"🚀 Starting prediction for model at {rdf_path} with "
-                f"device={device} and weights_format={weights_format}"
+                f"weights_format={weights_format}"
             )
             # Identity of the resident child. ``remote_modified`` is the
             # cache's own staleness token (entry passes
@@ -1077,7 +1080,6 @@ class RuntimeDeployment:
                 rdf_path,
                 remote_modified,
                 weights_format,
-                device,
                 default_blocksize_parameter,
                 json.dumps(overrides or {}, sort_keys=True),
             )
@@ -1109,7 +1111,6 @@ class RuntimeDeployment:
                 await asyncio.to_thread(self._evict_warm)
                 load_params: Dict[str, object] = {
                     "weights_format": weights_format,
-                    "device": device,
                     "default_blocksize_parameter": default_blocksize_parameter,
                     "single_input_key": SINGLE_INPUT_KEY,
                     "overrides": overrides or {},

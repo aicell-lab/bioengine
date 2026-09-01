@@ -120,10 +120,12 @@ class EntryDeployment:
     # onnx, tensorflow) — models that declare multiple torch weight
     # formats (pytorch_state_dict + torchscript) can have more.
     # ``CONDA_ENV_CACHE_MAX_GB`` (env var, default 30) is the soft
-    # ceiling — the LRU eviction step keeps the cache under it as
-    # a rough estimate (``du -sk``, not exact). Minimum 30 so a
-    # single 3-env model always fits without evicting envs it
-    # itself needs.
+    # ceiling. It covers the whole ``.bioengine-conda`` root —
+    # ``pkgs/`` as well as ``envs/`` — because the package cache is
+    # the term that grows with build history, and because an env's
+    # files are hardlinks into it, so the two cannot be sized apart.
+    # Minimum 30 so a single 3-env model always fits without evicting
+    # envs it itself needs.
     _CONDA_ENV_CACHE_MIN_GB = 30
     _CONDA_ENV_MAX_AGE_DAYS = 7  # weekly age-based sweep
 
@@ -514,16 +516,20 @@ class EntryDeployment:
     # Its absence is what distinguishes a half-built env from a usable one.
     _ENV_COMPLETE_MARKER = ".bioengine-env-complete"
 
+    def _conda_root_dir(self) -> Path:
+        return Path(os.environ["HOME"]) / ".bioengine-conda"
+
     def _conda_envs_dir(self) -> Path:
-        return Path(os.environ["HOME"]) / ".bioengine-conda" / "envs"
+        return self._conda_root_dir() / "envs"
 
-    async def _du_bytes(self, path: Path) -> int:
-        """Compact wrapper around ``du -sk`` — used for env sizing.
+    async def _du_bytes(self, path: Path) -> Optional[int]:
+        """Compact wrapper around ``du -sk``.
 
-        Walking a 10 GB env with Python's ``rglob`` + ``stat`` takes
-        several seconds per env; ``du`` finishes in ~100 ms. Returns
-        0 on any error (missing path, du unavailable) so callers can
-        continue safely.
+        Walking a 10 GB tree with Python's ``rglob`` + ``stat`` takes
+        several seconds; ``du`` finishes in ~100 ms. Returns ``None``
+        when the size could not be measured — a fork failure, a
+        non-zero ``du``, or unparseable output — so a caller cannot
+        mistake "could not measure" for "empty".
         """
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -535,10 +541,37 @@ class EntryDeployment:
             )
             stdout, _ = await proc.communicate()
             if proc.returncode != 0:
-                return 0
+                return None
             return int(stdout.decode().split()[0]) * 1024
         except Exception:
-            return 0
+            return None
+
+    async def _mamba_clean(self, env_vars: Dict[str, str]) -> None:
+        """Drop package tarballs and packages no env still links to.
+
+        conda hardlinks package files from ``pkgs/`` into each env, so
+        removing an env frees almost nothing until the now-unreferenced
+        packages go too. Best-effort; never raises.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "mamba",
+                "clean",
+                "--packages",
+                "--tarballs",
+                "--yes",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env_vars,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning(
+                    f"⚠️ Failed to clean the conda package cache: "
+                    f"{stderr.decode(errors='replace').strip()[:300]}"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to clean the conda package cache: {e}")
 
     async def _mamba_env_remove(self, env_name: str, env_vars: Dict[str, str]) -> None:
         """Non-blocking ``mamba env remove``. Best-effort — logs
@@ -647,6 +680,10 @@ class EntryDeployment:
             await asyncio.gather(
                 *(self._mamba_env_remove(name, env_vars) for name in candidates)
             )
+        # Unconditional: most orphaned packages belong to envs that were removed
+        # long ago, so gating this on the sweep finding a candidate would leave
+        # them stranded forever.
+        await self._mamba_clean(env_vars)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
 
@@ -655,53 +692,78 @@ class EntryDeployment:
         protected: List[str],
         env_vars: Dict[str, str],
     ) -> None:
-        """LRU eviction: while the on-disk cache exceeds
+        """LRU eviction: while the cache on disk exceeds
         ``_conda_env_cache_max_gb``, remove the least-recently-used
         env that isn't protected. Protected = ``protected`` (the envs the
         current test needs) plus every env a concurrently running test is
         using (``_inuse_env_names``), so a running test never loses its env.
 
-        Approximate: uses ``du -sk`` per env, not fsync-accurate, so the
-        ceiling is a soft target.
+        Measures the whole ``.bioengine-conda`` root in one ``du``, not
+        each env separately. Two reasons, both load-bearing: ``pkgs/``
+        grows with build history and is the term that actually
+        accumulates, and ``du`` only de-duplicates hardlinks within a
+        single invocation — per-env sizes would each re-count the
+        packages they share, overstating occupancy.
+
+        Reclaim is measured rather than accounted: each pass removes one
+        env, drops the packages it was the last to reference, and
+        re-measures. Removing an env without the clean frees almost
+        nothing, since its files are hardlinks into ``pkgs/``.
         """
+        root = self._conda_root_dir()
         envs_dir = self._conda_envs_dir()
         if not envs_dir.exists():
             return
         max_bytes = int(self._conda_env_cache_max_gb * 1024**3)
+        cleaned = False
+        # ``_mamba_env_remove`` is best-effort and never raises, so an env
+        # that refuses to go must not be chosen again — the loop would
+        # otherwise retry it forever.
+        tried: set = set()
 
-        entries = []
-        for entry in envs_dir.iterdir():
-            if not entry.is_dir():
-                continue
-            try:
-                mtime = entry.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            entries.append((entry.name, entry, mtime))
-
-        sizes = await asyncio.gather(*(self._du_bytes(p) for _, p, _ in entries))
-        total = sum(sizes)
-        if total <= max_bytes:
-            return
-
-        logger.info(
-            f"🧹 Conda env cache at {total / 1024**3:.1f} GB > "
-            f"{self._conda_env_cache_max_gb:.0f} GB ceiling — LRU eviction"
-        )
-        protected_set = set(protected) | self._inuse_env_names()
-        ranked = sorted(
-            [
-                (mtime, name, size)
-                for (name, _, mtime), size in zip(entries, sizes)
-                if name not in protected_set
-            ],
-            key=lambda t: t[0],
-        )
-        for mtime, name, size in ranked:
+        while True:
+            total = await self._du_bytes(root)
+            if total is None:
+                logger.warning(
+                    "⚠️ Could not measure the conda cache — skipping eviction "
+                    "rather than deleting envs against an unknown size."
+                )
+                return
             if total <= max_bytes:
-                break
-            await self._mamba_env_remove(name, env_vars)
-            total -= size
+                return
+
+            logger.info(
+                f"🧹 Conda cache at {total / 1024**3:.1f} GB > "
+                f"{self._conda_env_cache_max_gb:.0f} GB ceiling"
+            )
+            # Unreferenced packages cost nothing to lose, so reclaim them
+            # before evicting an env somebody may want again.
+            if not cleaned:
+                cleaned = True
+                await self._mamba_clean(env_vars)
+                continue
+
+            protected_set = set(protected) | self._inuse_env_names() | tried
+            candidates = []
+            for entry in envs_dir.iterdir():
+                if not entry.is_dir() or entry.name in protected_set:
+                    continue
+                try:
+                    candidates.append((entry.stat().st_mtime, entry.name))
+                except FileNotFoundError:
+                    continue
+            if not candidates:
+                logger.warning(
+                    f"⚠️ Conda cache is {total / 1024**3:.1f} GB and no env is "
+                    "still evictable — the rest are protected, in use, or "
+                    "already failed to remove."
+                )
+                return
+
+            _, victim = min(candidates)
+            tried.add(victim)
+            await self._mamba_env_remove(victim, env_vars)
+            await self._mamba_clean(env_vars)
 
     # === Async test-job registry ===
 
@@ -1990,17 +2052,6 @@ class EntryDeployment:
         prefix = f"{self._MODELS_WORKSPACE}/"
         return model_id[len(prefix) :] if model_id.startswith(prefix) else model_id
 
-    @staticmethod
-    def _resolve_cache(cache: str, skip_cache: Optional[bool]) -> str:
-        """Resolve the effective cache policy from ``cache`` and the deprecated
-        ``skip_cache`` alias. ``skip_cache`` (kept so existing callers keep
-        working while ``cache`` rolls out) wins only when explicitly set:
-        True→"skip", False→"check".
-        """
-        if skip_cache is not None:
-            return "skip" if skip_cache else "check"
-        return cache
-
     @bioengine.method
     async def test(
         self,
@@ -2025,11 +2076,6 @@ class EntryDeployment:
             "cached test-report currency; 'skip' forces a complete re-download "
             "and bypasses cached test results; 'reuse' trusts the local cache "
             "as-is with no freshness round-trip.",
-        ),
-        skip_cache: Optional[bool] = Field(
-            None,
-            description="Deprecated alias for ``cache``; prefer ``cache``. When "
-            "set it overrides ``cache``: True→'skip', False→'check'.",
         ),
     ) -> str:
         """
@@ -2101,7 +2147,6 @@ class EntryDeployment:
         # matching slot: a model last tested in its custom env re-tests custom,
         # else standard. Staged reads never influence a published run and vice
         # versa. No prior report → standard (False).
-        cache = self._resolve_cache(cache, skip_cache)
 
         if custom_environment is None:
             model_alias = model_id.rsplit("/", 1)[-1]
@@ -2221,6 +2266,9 @@ class EntryDeployment:
             tested_at: Optional[float] = None
             should_run_test = True
             should_cache_report = True
+            # Distinct from ``should_cache_report``, which also goes False on a
+            # disk-cache hit — that report is trustworthy, just already written.
+            report_is_trustworthy = True
             # A loaded-but-stale local report means the model or env changed,
             # so the collection report is stale too — skip the fallback then.
             local_report_stale = False
@@ -2321,6 +2369,7 @@ class EntryDeployment:
                         f"⚠️ Model test failed for '{model_id}': {str(e)}. Generating fallback report."
                     )
                     should_cache_report = False
+                    report_is_trustworthy = False
 
                     # Load RDF from package for fallback report
                     try:
@@ -2415,7 +2464,16 @@ class EntryDeployment:
                         f"⚠️ Failed to cache test report for '{model_id}': {e}"
                     )
 
-            await self._upload_test_report(model_id, stage, test_report)
+            # The fallback report records that our own test run died, not that
+            # the model is broken. Publishing it would overwrite the model's
+            # durable public verdict with an artefact of our infrastructure.
+            if report_is_trustworthy:
+                await self._upload_test_report(model_id, stage, test_report)
+            else:
+                logger.warning(
+                    f"⚠️ Not publishing the fallback report for '{model_id}': "
+                    "the test did not run, so it is not a verdict on the model."
+                )
 
         return test_report
 
@@ -2879,10 +2937,6 @@ class EntryDeployment:
             None,
             description='Preferred model weights format ("pytorch_state_dict", "torchscript", "onnx", "tensorflow_saved_model"). If None, automatically selects best available.',
         ),
-        device: Optional[Literal["cuda", "cpu"]] = Field(
-            None,
-            description='Target computation device. "cuda" for GPU acceleration, "cpu" for CPU-only. If None, automatically selects based on availability and model compatibility.',
-        ),
         default_blocksize_parameter: Optional[int] = Field(
             None,
             description="Override default tiling block size for memory management. Larger values use more memory but may be faster. Only applicable for models supporting tiled inference.",
@@ -2899,11 +2953,6 @@ class EntryDeployment:
             "model too; 'skip' forces a complete re-download and reload even if "
             "the model is warm; 'reuse' trusts the local cache and any warm "
             "model as-is with no freshness round-trip.",
-        ),
-        skip_cache: Optional[bool] = Field(
-            None,
-            description="Deprecated alias for ``cache``; prefer ``cache``. When "
-            "set it overrides ``cache``: True→'skip', False→'check'.",
         ),
         preprocessing: Optional[Dict[str, Optional[dict]]] = Field(
             None,
@@ -3013,7 +3062,6 @@ class EntryDeployment:
                     f"{type(value).__name__})."
                 )
 
-        cache = self._resolve_cache(cache, skip_cache)
 
         job = self._new_infer_job(
             model_id=model_id, return_download_url=bool(return_download_url)
@@ -3045,7 +3093,6 @@ class EntryDeployment:
                 job=job,
                 model_id=model_id,
                 weights_format=weights_format,
-                device=device,
                 default_blocksize_parameter=default_blocksize_parameter,
                 sample_id=sample_id,
                 cache=cache,
@@ -3062,7 +3109,6 @@ class EntryDeployment:
         job: dict,
         model_id: str,
         weights_format: Optional[str],
-        device: Optional[Literal["cuda", "cpu"]],
         default_blocksize_parameter: Optional[int],
         sample_id: Optional[str],
         cache: str,
@@ -3112,7 +3158,6 @@ class EntryDeployment:
                     request_id=request_id,
                     rdf_path=package.source,
                     weights_format=weights_format,
-                    device=device,
                     default_blocksize_parameter=default_blocksize_parameter,
                     sample_id=sample_id,
                     remote_modified=package.latest_remote_modified,

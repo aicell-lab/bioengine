@@ -7,7 +7,12 @@
 # nifty/vigra/z5py blocker is gone. onnx(runtime) is only for the in-browser
 # prompt-decoder export (get_onnx_model).
 micro-sam==1.8.11
-segment-anything==1.0
+# NOT PyPI segment-anything==1.0: that snapshot's ResizeLongestSide.apply_image_torch
+# reads shape[0],shape[1] (batch,channel) instead of shape[2],shape[3], so it resizes
+# a BCHW batch by its batch/channel dims — silently distorting every training forward
+# pass (micro_sam/training/trainable_sam.py preprocess). Pin the post-fix source; keep
+# it direct so it wins over micro-sam's transitive dep.
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf
 # micro-sam routes the vit_t_lm base model through MobileSAM's tiny image
 # encoder; without it train_sam / get_predictor raise "'mobile_sam' is required
 # for the vit-tiny". Pure-Python (+ timm from PyPI), no PyPI release exists.

@@ -340,7 +340,18 @@ class EntryApp:
         try:
             am = await (caller_client or self._hypha).get_service("public/artifact-manager")
 
-            rdf_url = await am.get_file(model_id, file_path="rdf.yaml")
+            # Prefer the new ``bioimageio.yaml`` name; fall back to legacy ``rdf.yaml``.
+            rdf_url = None
+            for rdf_name in ("bioimageio.yaml", "rdf.yaml"):
+                try:
+                    rdf_url = await am.get_file(model_id, file_path=rdf_name)
+                    break
+                except Exception:
+                    continue
+            if rdf_url is None:
+                raise FileNotFoundError(
+                    f"No RDF (bioimageio.yaml or rdf.yaml) found in artifact '{model_id}'."
+                )
             rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
             ps = rdf["weights"]["pytorch_state_dict"]
             model_type = ps["architecture"]["kwargs"]["model_type"]
