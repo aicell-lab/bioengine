@@ -1,6 +1,6 @@
 ---
 name: bioengine-maintainer
-description: Reference material for agents helping maintain the BioEngine codebase — architecture map, dev image testing workflow, cleanup rules, Hypha platform invariants, PR description style. Loaded on demand by Claude Code in addition to the always-on rules in CLAUDE.md.
+description: Reference material for agents helping maintain the BioEngine codebase — architecture map, dev image testing workflow, cleanup rules, Hypha platform invariants, issue and PR writing style. Loaded on demand by Claude Code in addition to the always-on rules in CLAUDE.md.
 ---
 
 # BioEngine maintainer skill
@@ -346,11 +346,25 @@ Fix shape:
 
 Apply to: services that maintain per-session disk state. Inference-only services with no per-session state are fine on default routing.
 
-## PR description style
+## Writing issues and PR descriptions
 
-PR bodies on `aicell-lab/*` and `bioimage-io/*` repos are standalone documentation read months later by maintainers and contributors who didn't follow the discussion that produced them. Assume the reader knows only how BioEngine is built.
+Issues and PR bodies on this repo are standalone documentation. An issue is triaged by someone who didn't follow the conversation that produced it; a PR body is read months later by a maintainer who didn't follow the review. Assume the reader knows only how BioEngine is built.
 
-**Include:**
+### Open with a lede a cold reader understands
+
+The first paragraph is plain prose: what is broken (or what this changes), what breaks *because* of it, and roughly where. No log excerpts, no symbol names, no `file.py:NNN`. Name the user-visible consequence before the mechanism — "the worker restarts every 20 minutes and takes all three apps down with it" comes before "the liveness probe curls Hypha". **If the first sentence contains a function or symbol name, rewrite it.**
+
+The title follows the same rule: one sentence, consequence first, readable on its own in a list.
+
+Everything after the lede is for the reader who has already decided to act. Dense is fine — timelines, `file.py:NNN`, measured numbers, candidate fixes, caveats. Don't thin the evidence to keep it short; the two halves have different jobs. The lede buys a reader's attention, the detail is what makes the work actionable.
+
+### Issues
+
+After the lede: how it was observed or reproduced, the evidence that localises it, and any candidate fix with its caveats. Attributing a finding to whoever made it is useful here.
+
+### PR descriptions
+
+**Include, after the lede:**
 - Problem / motivation
 - Solution
 - New features or behavioural changes
@@ -360,12 +374,13 @@ PR bodies on `aicell-lab/*` and `bioimage-io/*` repos are standalone documentati
 
 **Do not include:**
 - "Design choice — alternative considered …"
-- Pending follow-ups
-- After-merge / deployment steps
+- Pending follow-ups and after-merge / deployment steps — **file those as issues instead**
 - "Pairs with PR #N …" beyond a single `Depends on #N` line when there's a real ordering constraint
 - "Per the recent discussion …", "As we agreed", "After I tested X" — any direct reference to the conversation flow
 
-Previously-merged PRs that violate this style stay as-is; apply going forward only.
+"Validation still to come" notes are pending follow-ups too. While a PR is a draft they belong in a PR comment; the body's Test plan records what was validated, in its final state.
+
+Previously-merged PRs and existing issues that violate this style stay as-is; apply going forward only.
 
 ## BioEngine skills
 

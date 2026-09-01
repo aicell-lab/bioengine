@@ -3,7 +3,7 @@
 Universal behavioural rules for agents working on this repo. **Hard
 constraints; ignore at your peril.** Reference material (architecture,
 file map, manifest reference, dev image workflow, cleanup rules, Hypha
-platform invariants, PR description style) lives in
+platform invariants, issue and PR writing style) lives in
 `.claude/skills/bioengine-maintainer/SKILL.md` and is loaded on demand.
 
 For agents *using* BioEngine to deploy apps (rather than maintaining
@@ -149,7 +149,7 @@ Don't duplicate this content here:
 | Dev image testing workflow (build, push, helm, GHCR cleanup) | `.claude/skills/bioengine-maintainer/SKILL.md` |
 | Cleanup rules (orphan apps, GHCR test images) | `.claude/skills/bioengine-maintainer/SKILL.md` |
 | Hypha platform invariants (handle expiry, replica pinning) | `.claude/skills/bioengine-maintainer/SKILL.md` |
-| PR description style | `.claude/skills/bioengine-maintainer/SKILL.md` |
+| Issue and PR writing style (lede first, then detail) | `.claude/skills/bioengine-maintainer/SKILL.md` |
 | BioEngine skills overview (user-facing skill structure) | `.claude/skills/bioengine-maintainer/SKILL.md` |
 | End-to-end deploy_app flow (14-step v0.11.4 walkthrough) | `docs/deploy_app_flow.md` |
 | App authoring (`@bioengine.app`, manifest fields, deploying apps) | `../bioimage.io/public/skills/bioengine/SKILL.md` |
