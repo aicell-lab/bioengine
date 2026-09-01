@@ -26,7 +26,11 @@
 #
 # Rebuild whenever apps/model-runner/requirements-*.txt change — the
 # preinstall only short-circuits the deploy-time install while the pins
-# match the deployed app version.
+# match the deployed app version — and whenever the BioEngine code the
+# app runs on changes (the bioengine/ package, requirements-worker.txt,
+# or the Ray pin), since those are baked in too. A BioEngine-only change
+# still needs a new model-runner app version to be publishable at all;
+# the build script refuses to overwrite a published tag.
 
 # Rolling tag — each build picks up current Debian-slim security patches.
 FROM python:3.11-slim
