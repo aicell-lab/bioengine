@@ -180,13 +180,45 @@ def _block_size_ns(descr, sample):
     return ns
 
 
+def _fits_whole(descr, sample):
+    # True when every space extent is already a size the model accepts and is
+    # no larger than the block ``_block_size_ns`` targets, so there is nothing
+    # to tile. A size kind we cannot reason about counts as not fitting, which
+    # keeps the blocked path.
+    for ipt in descr.inputs:
+        member = sample.members.get(ipt.id)
+        if member is None:
+            return False
+        for axis in getattr(ipt, "axes", None) or []:
+            if getattr(axis, "type", None) != "space":
+                continue
+            extent = member.sizes.get(axis.id)
+            if extent is None:
+                return False
+            if isinstance(axis.size, int):
+                if extent != axis.size:
+                    return False
+            elif isinstance(axis.size, ParameterizedSize):
+                if extent > DINO_BLOCK_SIZE:
+                    return False
+                if extent < axis.size.min:
+                    return False
+                if (extent - axis.size.min) % axis.size.step:
+                    return False
+            else:
+                return False
+    return True
+
+
 loaded_description = load_model_description(rdf_path)
-# Cellpose models are tile-based with a halo, so they must run blocked: an
-# unblocked call pads the whole sample by the halo and breaks the ViT
-# positional embedding. Everything else keeps the historical behaviour —
-# blocked only when the caller asked for a block size. How a model has to run
-# is a property of the model, so the flag is read before the overrides get a
-# chance to drop the op it is recognised by.
+# Cellpose models are tile-based with a halo, so a sample that needs tiling
+# must run blocked: a plain unblocked call pads the whole sample by the halo
+# and breaks the ViT positional embedding. A sample that already fits whole
+# takes the unblocked path with padding switched off instead — see the
+# dispatch below. Everything else keeps the historical behaviour — blocked
+# only when the caller asked for a block size. How a model has to run is a
+# property of the model, so the flag is read before the overrides get a chance
+# to drop the op it is recognised by.
 cellpose = _is_cellpose(loaded_description)
 model_description, skip_pre, skip_post = _apply_overrides(
     loaded_description, overrides
@@ -250,6 +282,17 @@ for line in sys.stdin:
         }
         if default_blocksize_parameter:
             result = pipeline.predict_sample_with_blocking(sample, **skips)
+        elif cellpose and _fits_whole(pipeline.model_description, sample):
+            # Nothing to tile, and blocking would still pad the outer boundary
+            # by the declared halo, which the model segments into extra cells
+            # along the border. The skip flags are a matched pair: cropping
+            # fires unconditionally and would remove a halo never added.
+            result = pipeline.predict_sample_without_blocking(
+                sample,
+                skip_input_padding=True,
+                skip_output_cropping=True,
+                **skips,
+            )
         elif cellpose:
             result = pipeline.predict_sample_with_blocking(
                 sample,
