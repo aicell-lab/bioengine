@@ -2221,6 +2221,9 @@ class EntryDeployment:
             tested_at: Optional[float] = None
             should_run_test = True
             should_cache_report = True
+            # Distinct from ``should_cache_report``, which also goes False on a
+            # disk-cache hit — that report is trustworthy, just already written.
+            report_is_trustworthy = True
             # A loaded-but-stale local report means the model or env changed,
             # so the collection report is stale too — skip the fallback then.
             local_report_stale = False
@@ -2321,6 +2324,7 @@ class EntryDeployment:
                         f"⚠️ Model test failed for '{model_id}': {str(e)}. Generating fallback report."
                     )
                     should_cache_report = False
+                    report_is_trustworthy = False
 
                     # Load RDF from package for fallback report
                     try:
@@ -2415,7 +2419,16 @@ class EntryDeployment:
                         f"⚠️ Failed to cache test report for '{model_id}': {e}"
                     )
 
-            await self._upload_test_report(model_id, stage, test_report)
+            # The fallback report records that our own test run died, not that
+            # the model is broken. Publishing it would overwrite the model's
+            # durable public verdict with an artefact of our infrastructure.
+            if report_is_trustworthy:
+                await self._upload_test_report(model_id, stage, test_report)
+            else:
+                logger.warning(
+                    f"⚠️ Not publishing the fallback report for '{model_id}': "
+                    "the test did not run, so it is not a verdict on the model."
+                )
 
         return test_report
 

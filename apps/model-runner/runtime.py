@@ -810,7 +810,12 @@ class RuntimeDeployment:
             "pipeline = create_prediction_pipeline(descr)\n"
             "pipeline.load()\n"
             "sample = get_test_inputs(descr)\n"
-            "pipeline.predict_sample_without_blocking(sample)\n"
+            # Padding by the output halo grows the input, which a model declaring a
+            # fixed input size cannot accept. The two flags are a matched pair:
+            # cropping fires unconditionally and would remove a halo never added.
+            "pipeline.predict_sample_without_blocking(\n"
+            "    sample, skip_input_padding=True, skip_output_cropping=True\n"
+            ")\n"
             "print('SMOKE_OK')\n"
         )
         try:
