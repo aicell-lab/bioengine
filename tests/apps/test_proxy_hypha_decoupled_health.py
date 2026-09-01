@@ -246,13 +246,16 @@ def test_disconnect_hook_is_synchronous_and_only_schedules_a_probe() -> None:
     assert inst._probe_due_at <= time.time() + pd_module._RECONNECT_GRACE_S
 
 
-def test_disconnect_hook_never_delays_a_probe_already_due() -> None:
+def test_disconnect_hook_defers_a_probe_that_was_already_due() -> None:
+    """Observed live: a 65s freeze left the probe overdue, so it ran 1ms
+    after the drop, failed by definition, and rebuilt the client while
+    hypha-rpc was reconnecting. A known-down socket resets the clock."""
     inst = _bare_proxy(server=object(), websocket_service_id="ws")
     inst._probe_due_at = 0.0
 
     inst._on_connection_lost("closed")
 
-    assert inst._probe_due_at == 0.0
+    assert inst._probe_due_at >= time.time() + pd_module._RECONNECT_GRACE_S - 1
 
 
 def test_reconnect_grace_outlasts_the_libraries_own_retry() -> None:

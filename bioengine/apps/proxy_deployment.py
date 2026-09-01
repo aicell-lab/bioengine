@@ -991,17 +991,17 @@ class ProxyDeployment:
 
         The library calls this from inside its listen task's ``finally``
         block without awaiting it, including for drops it goes on to
-        reconnect and re-register by itself. So this only brings the next
-        reachability probe forward; whether a rebuild is needed is decided
-        there, once the library has had its chance.
+        reconnect and re-register by itself. So this only reschedules the
+        reachability probe; whether a rebuild is needed is decided there,
+        once the library has had its chance. Probing a socket we have just
+        been told is down can only fail, and rebuilding on that answer
+        abandons the connection hypha-rpc is repairing.
         """
         logger.warning(
             f"🔌 Hypha connection closed for '{self.application_id}': {reason}. "
             f"Probing in {_RECONNECT_GRACE_S}s."
         )
-        due = time.time() + _RECONNECT_GRACE_S
-        if due < self._probe_due_at:
-            self._probe_due_at = due
+        self._probe_due_at = time.time() + _RECONNECT_GRACE_S
 
     async def _register_services(self) -> None:
         """
