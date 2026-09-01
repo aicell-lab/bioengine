@@ -188,10 +188,8 @@ async def test_model_test_passes(model_runner):
 
 @pytest.mark.asyncio
 @pytest.mark.requires_gpu
-async def test_model_test_skip_cache(model_runner):
-    result = await model_runner.test(
-        model_id=TEST_MODEL_ID, stage=False, skip_cache=True
-    )
+async def test_model_test_cache_skip(model_runner):
+    result = await model_runner.test(model_id=TEST_MODEL_ID, stage=False, cache="skip")
     assert isinstance(result, dict)
     assert result.get("status") == "passed"
 
