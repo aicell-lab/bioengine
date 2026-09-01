@@ -136,15 +136,19 @@ def test_multiple_async_init_rejected():
 
 
 def test_ray_actor_options_translation():
-    @bioengine.app(num_cpus=2, num_gpus=1, memory_mb=512, pip=["pandas"])
+    @bioengine.app(num_cpus=2, gpu_memory_mb=8192, memory_mb=512, pip=["pandas"])
     class App:
         pass
 
     opts = App.ray_actor_options
     assert opts["num_cpus"] == 2
-    assert opts["num_gpus"] == 1
     assert opts["memory"] == 512 * 1024 * 1024
     assert opts["runtime_env"]["pip"] == ["pandas"]
+
+    # VRAM is not a Ray actor option — the worker converts it into a GPU
+    # reservation at deploy time, against the GPUs it actually lands on.
+    assert "num_gpus" not in opts
+    assert App.func_or_class._bioengine_gpu_memory_mb == 8192
 
 
 def test_ray_actor_options_extra_deep_merged():

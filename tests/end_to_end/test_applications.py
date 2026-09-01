@@ -46,7 +46,7 @@ async def test_create_and_delete_artifacts(
     """
     # Define paths to test applications
     demo_app_path = bioengine_apps_dir / "demo-app"
-    composition_app_path = bioengine_apps_dir / "demo-app"
+    composition_app_path = bioengine_apps_dir / "composition-demo"
 
     # Verify the test directories exist
     assert demo_app_path.exists(), f"Demo app directory not found: {demo_app_path}"
@@ -743,20 +743,17 @@ async def test_deploy_app_from_artifact(
     demo_artifact_id = f"{hypha_workspace}/demo-app-{hyphen_test_id}"
     demo_app_config = {
         "artifact_id": demo_artifact_id,
+        "application_kwargs": {"DemoDeployment": {"test_param": "custom_value"}},
         "disable_gpu": True,
-    }  # Test random application ID generation
+    }  # Test random application ID generation and deployment kwargs
 
-    composition_app_path = bioengine_apps_dir / "demo-app"
+    composition_app_path = bioengine_apps_dir / "composition-demo"
     composition_artifact_id = f"{hypha_workspace}/composition-app-{hyphen_test_id}"
     composition_app_config = {
         "artifact_id": composition_artifact_id,
         "application_id": f"composition-app-{hyphen_test_id}",
-        "application_kwargs": {
-            "CompositionDeployment": {"demo_input": "Hello World!"},
-            "Deployment2": {"start_number": 10},
-        },
         "disable_gpu": True,
-    }  # Provide custom application id and deployment kwargs
+    }  # Provide custom application id
 
     app_paths = [demo_app_path, composition_app_path]
     app_configs = [demo_app_config, composition_app_config]
