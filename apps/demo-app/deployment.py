@@ -39,7 +39,6 @@ def _read_pip(name: str) -> List[str]:
 
 @bioengine.app(
     num_cpus=1,
-    num_gpus=0,
     memory_mb=512,
     pip=_read_pip("requirements-deployment.txt"),
     env_vars={"EXAMPLE_ENV_VAR": "example_value"},

@@ -4,7 +4,7 @@ id_emoji: "🔬"
 description: "Multi-deployment composition demo (entry + 3 runtimes, type-hint composition, shared utils)"
 type: ray-serve
 format_version: 0.6.0
-version: 1.0.1
+version: 1.0.2
 authors:
   - {name: "Test User", affiliation: "BioEngine Test"}
 license: MIT
