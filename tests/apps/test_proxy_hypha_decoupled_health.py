@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 
 import pytest
 
@@ -44,7 +45,7 @@ def _bare_proxy(**attrs):
     inst._maintenance_task = None
     inst._connection_lost = False
     inst._registration_failure = None
-    inst._last_probe_at = 0.0
+    inst._probe_due_at = 0.0
     inst._next_register_at = 0.0
     for key, value in attrs.items():
         setattr(inst, key, value)
@@ -217,21 +218,47 @@ async def test_probe_is_skipped_until_the_interval_elapses() -> None:
     server = _CountingServer()
     inst = _bare_proxy(server=server, websocket_service_id="ws")
 
-    await inst._maintenance_tick()  # _last_probe_at is 0 -> probes once
+    await inst._maintenance_tick()  # _probe_due_at is 0 -> probes once
     await inst._maintenance_tick()
     await inst._maintenance_tick()
 
     assert server.pings == 1
 
 
-def test_disconnect_hook_is_synchronous_and_only_sets_a_flag() -> None:
+def test_disconnect_hook_is_synchronous_and_only_schedules_a_probe() -> None:
     """hypha-rpc calls ``on_disconnected`` without awaiting it, so a
-    coroutine handler would never run."""
+    coroutine handler would never run.
+
+    Observed on a live worker during a hypha.aicell.io wobble: the hook
+    fires for drops the library then reconnects and re-registers itself.
+    Rebuilding our client on that signal abandons the connection hypha-rpc
+    is repairing, so the hook only brings the probe forward — the probe
+    decides whether a rebuild is warranted.
+    """
     assert not inspect.iscoroutinefunction(_ProxyCls._on_connection_lost)
 
-    inst = _bare_proxy()
+    inst = _bare_proxy(server=object(), websocket_service_id="ws")
+    inst._probe_due_at = time.time() + pd_module._REACHABILITY_PROBE_INTERVAL_S
+
     inst._on_connection_lost("closed")
-    assert inst._connection_lost is True
+
+    assert inst._connection_lost is False
+    assert inst._probe_due_at <= time.time() + pd_module._RECONNECT_GRACE_S
+
+
+def test_disconnect_hook_never_delays_a_probe_already_due() -> None:
+    inst = _bare_proxy(server=object(), websocket_service_id="ws")
+    inst._probe_due_at = 0.0
+
+    inst._on_connection_lost("closed")
+
+    assert inst._probe_due_at == 0.0
+
+
+def test_reconnect_grace_outlasts_the_libraries_own_retry() -> None:
+    """hypha-rpc retries with its own backoff; probing before it has had a
+    chance turns one drop into a rebuild storm."""
+    assert pd_module._RECONNECT_GRACE_S >= 30
 
 
 def test_register_services_attaches_the_disconnect_hook() -> None:

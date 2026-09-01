@@ -65,7 +65,7 @@ def _bare_proxy(**attrs):
     inst._registration_lock = asyncio.Lock()
     inst._registration_failure = None
     inst._connection_lost = False
-    inst._last_probe_at = 0.0
+    inst._probe_due_at = 0.0
     inst._next_register_at = 0.0
     inst._maintenance_task = None
     # The maintenance loop is exercised in test_proxy_hypha_decoupled_health;

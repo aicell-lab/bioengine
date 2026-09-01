@@ -55,6 +55,11 @@ _REACHABILITY_PROBE_INTERVAL_S = 60
 # client TTL (~30-60s) so a rebuild whose disconnect didn't land isn't
 # rejected forever with 'Client already exists and is active'.
 _REREGISTER_BACKOFF_S = 30
+# How long a dropped socket is left to hypha-rpc before we probe it. The
+# library reconnects and re-registers on its own; rebuilding our client while
+# it is mid-reconnect abandons the connection it is repairing and starts a
+# rebuild storm, so a drop only brings the next probe forward.
+_RECONNECT_GRACE_S = 30
 
 # Hypha reports a workspace we may not use as a plain exception with no
 # error code, from two different call sites in hypha_rpc. The message is the
@@ -300,14 +305,13 @@ class ProxyDeployment:
         self.service_semaphore = asyncio.Semaphore(self.max_ongoing_requests)
 
         # Hypha connection upkeep — owned by the background maintenance task,
-        # never by check_health. ``_connection_lost`` is set from hypha-rpc's
-        # on_disconnected hook (a synchronous callback, so it may only flip a
-        # flag); ``_registration_failure`` holds a permanent config/permission
-        # error for check_health to surface.
+        # never by check_health. ``_connection_lost`` is set when a reachability
+        # probe fails and requests a client rebuild; ``_registration_failure``
+        # holds a permanent config/permission error for check_health to surface.
         self._maintenance_task: Optional[asyncio.Task] = None
         self._connection_lost = False
         self._registration_failure: Optional[BaseException] = None
-        self._last_probe_at = 0.0
+        self._probe_due_at = 0.0
         self._next_register_at = 0.0
 
         # WebRTC peer connection tracking
@@ -986,16 +990,18 @@ class ProxyDeployment:
         """hypha-rpc on_disconnected hook — must stay synchronous and cheap.
 
         The library calls this from inside its listen task's ``finally``
-        block without awaiting it, and only for closures it will *not* retry
-        (a clean server-side close). Unexpected drops are reconnected
-        internally, with services re-registered on reconnect, so they never
-        reach here. All this does is ask the maintenance task to rebuild.
+        block without awaiting it, including for drops it goes on to
+        reconnect and re-register by itself. So this only brings the next
+        reachability probe forward; whether a rebuild is needed is decided
+        there, once the library has had its chance.
         """
         logger.warning(
             f"🔌 Hypha connection closed for '{self.application_id}': {reason}. "
-            f"Scheduling reconnect."
+            f"Probing in {_RECONNECT_GRACE_S}s."
         )
-        self._connection_lost = True
+        due = time.time() + _RECONNECT_GRACE_S
+        if due < self._probe_due_at:
+            self._probe_due_at = due
 
     async def _register_services(self) -> None:
         """
@@ -1216,7 +1222,7 @@ class ProxyDeployment:
                 try:
                     await self._register_services()
                     self._connection_lost = False
-                    self._last_probe_at = time.time()
+                    self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
                     self._next_register_at = 0.0
                 except Exception as e:
                     if self._is_permanent_registration_error(e):
@@ -1232,11 +1238,11 @@ class ProxyDeployment:
                         )
             return
 
-        if time.time() - self._last_probe_at < _REACHABILITY_PROBE_INTERVAL_S:
+        if time.time() < self._probe_due_at:
             return
         try:
             await self.server.echo("ping")
-            self._last_probe_at = time.time()
+            self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
         except Exception as e:
             # Not a health-check failure: flag for rebuild on the next tick.
             logger.warning(
