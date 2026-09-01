@@ -680,7 +680,10 @@ class EntryDeployment:
             await asyncio.gather(
                 *(self._mamba_env_remove(name, env_vars) for name in candidates)
             )
-            await self._mamba_clean(env_vars)
+        # Unconditional: most orphaned packages belong to envs that were removed
+        # long ago, so gating this on the sweep finding a candidate would leave
+        # them stranded forever.
+        await self._mamba_clean(env_vars)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
 
