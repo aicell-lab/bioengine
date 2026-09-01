@@ -134,6 +134,11 @@ class EntryDeployment:
     # workspace; otherwise reports are cached locally but not published.
     _TEST_REPORTS_WORKSPACE = "bioimage-io"
     _TEST_REPORTS_COLLECTION = "bioimage-io/test-reports"
+    # How long an untrustworthy report is allowed to stand in for a real one.
+    # Short enough that consecutive nightlies always re-derive it, long enough
+    # that a persistent node fault cannot turn a burst of calls into an
+    # unbounded retry loop.
+    _UNTRUSTWORTHY_RETRY_FLOOR_S = 6 * 3600
 
     # Workspace the model artifacts live in. Artifact URLs hardcode it, so
     # ``_normalize_model_id`` strips it back off a fully-qualified model_id.
@@ -2075,7 +2080,8 @@ class EntryDeployment:
             "against upstream and re-downloads if stale, also re-checking "
             "cached test-report currency; 'skip' forces a complete re-download "
             "and bypasses cached test results; 'reuse' trusts the local cache "
-            "as-is with no freshness round-trip.",
+            "as-is with no freshness round-trip. A cached report that records a "
+            "run which did not happen is re-derived regardless of this setting.",
         ),
     ) -> str:
         """
@@ -2109,6 +2115,11 @@ class EntryDeployment:
             replica restarts without re-running the test.
         - ``cache="skip"`` forces a complete model package re-download,
             bypasses cached test results, and runs a fresh test.
+        - A cached report carrying ``report_is_trustworthy: False`` records a
+            run that did not really happen, so it is never served as the answer
+            once it is older than six hours — the test is re-run instead. This
+            overrides ``cache="reuse"`` on purpose: ``reuse`` asks for speed,
+            and refusing to stand behind a non-run is a correctness rule.
 
         Environment mode:
         - ``custom_environment=False``: the test runs in the
@@ -2284,7 +2295,18 @@ class EntryDeployment:
                         cached_data = await asyncio.to_thread(json.loads, content)
 
                     cached_report = cached_data["test_report"]
-                    if self._report_is_current(
+                    # An untrustworthy report records that our test did not
+                    # really run, so it must not settle in as the model's
+                    # standing answer — re-derive it instead. Bounded by the
+                    # retry floor so a persistent fault cannot re-test on every
+                    # call. Deliberately overrides an explicit ``cache="reuse"``:
+                    # reuse is a speed request, this is a correctness rule.
+                    retry_untrustworthy = (
+                        cached_report.get("report_is_trustworthy") is False
+                        and time.time() - float(cached_report.get("tested_at") or 0.0)
+                        > self._UNTRUSTWORTHY_RETRY_FLOOR_S
+                    )
+                    if not retry_untrustworthy and self._report_is_current(
                         cached_report, package, current_versions, custom_environment
                     ):
                         logger.info(
@@ -2363,6 +2385,42 @@ class EntryDeployment:
                         custom_environment=custom_environment,
                     )
                     logger.info(f"✅ Model test completed for '{model_id}'.")
+
+                    # A completed run that would wipe out a model's passing
+                    # public verdict is re-run once before we believe it. A
+                    # transient node fault almost never repeats; a genuinely
+                    # broken model always does. Only the drop to score 0 is
+                    # retried — that is the transition that tarnishes the
+                    # collection, and partial score changes are far more likely
+                    # to be real. If the second run fails too we publish it, but
+                    # do not trust it as the cached answer: a wedged GPU node
+                    # fails both attempts identically.
+                    if self._compute_report_score(test_report) == 0.0:
+                        prior = await self._read_published_report(
+                            model_id.rsplit("/", 1)[-1], stage
+                        )
+                        if prior and self._compute_report_score(prior) > 0.0:
+                            logger.warning(
+                                f"⚠️ Test of '{model_id}' would drop a passing "
+                                "published verdict to zero — re-running once "
+                                "before publishing."
+                            )
+                            test_report = await self.runtime.test(
+                                rdf_path=package.source,
+                                custom_environment=custom_environment,
+                            )
+                            if self._compute_report_score(test_report) == 0.0:
+                                report_is_trustworthy = False
+                                logger.warning(
+                                    f"⚠️ Re-run of '{model_id}' failed too; "
+                                    "publishing it but not caching it as the "
+                                    "model's standing answer."
+                                )
+                            else:
+                                logger.info(
+                                    f"✅ Re-run of '{model_id}' passed — the "
+                                    "first failure was not the model."
+                                )
                 except Exception as e:
                     error_traceback = traceback.format_exc()
                     logger.warning(
@@ -2434,6 +2492,12 @@ class EntryDeployment:
                 test_report["test_environment"] = (
                     "custom" if custom_environment else "standard"
                 )
+
+                # Tags the RUN, not the verdict — ``status`` already carries the
+                # verdict. False means "the test did not really happen here",
+                # which keeps the report out of the collection and out of the
+                # cache's answer slot.
+                test_report["report_is_trustworthy"] = report_is_trustworthy
 
             # Record the model artifact's last file-change time in the report
             # so consumers can tell whether a stored report is current with the
