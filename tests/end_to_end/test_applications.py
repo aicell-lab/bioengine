@@ -22,6 +22,44 @@ from hypha_rpc.rpc import ObjectProxy, RemoteService
 from bioengine.utils import create_file_list_from_directory
 
 
+def top_level_name(file: Dict) -> str:
+    """Return the first path segment of an uploaded file's relative name."""
+    return file["name"].split("/")[0]
+
+
+async def resolve_service(lookup, timeout: int = 60):
+    """Retry a Hypha service lookup until the registration shows up.
+
+    `get_app_status` derives `service_ids` from the worker's client id and only
+    gates on a live ProxyDeployment replica, so an id is reported before that
+    replica has finished registering it with Hypha.
+    """
+    start_time = time.time()
+    while True:
+        try:
+            return await lookup()
+        except Exception:
+            if time.time() - start_time >= timeout:
+                raise
+            await asyncio.sleep(2)
+
+
+def bump_manifest_version(files: List[Dict], new_version: str) -> List[Dict]:
+    """Return a copy of ``files`` with the manifest's ``version`` replaced.
+
+    ``upload_app`` rejects a version that is not strictly greater than every
+    existing one, so re-uploading an artifact requires a fresh version.
+    """
+    bumped = []
+    for file in files:
+        if file["name"] == "manifest.yaml":
+            manifest = yaml.safe_load(file["content"])
+            manifest["version"] = new_version
+            file = {**file, "content": yaml.safe_dump(manifest)}
+        bumped.append(file)
+    return bumped
+
+
 @pytest.mark.end_to_end
 @pytest.mark.asyncio
 async def test_create_and_delete_artifacts(
@@ -32,7 +70,7 @@ async def test_create_and_delete_artifacts(
     hypha_user_id: str,
 ):
     """
-    Test creating and deleting artifacts from both demo-app and composition-app applications.
+    Test creating and deleting artifacts from both demo-app and composition-demo applications.
 
     Steps:
     - Create artifacts from both applications
@@ -124,7 +162,7 @@ async def test_create_and_delete_artifacts(
             created_demo_artifact_id == demo_artifact_id
         ), "Created demo artifact ID should match manifest ID and workspace"
 
-        # Create composition-app artifact
+        # Create composition-demo artifact
         created_composition_artifact_id = (
             await bioengine_worker_service.upload_app(
                 files=composition_app_files
@@ -151,18 +189,22 @@ async def test_create_and_delete_artifacts(
             composition_artifact_id in available_artifacts
         ), "Composition artifact should be listed in available artifacts"
 
-        # Update demo-app artifact
+        # Update both artifacts. `upload_app` only accepts a version strictly
+        # greater than every existing one, so the update has to bump it.
+        updated_version = "9999.0.1"
+        demo_manifest["version"] = updated_version
+        composition_manifest["version"] = updated_version
+
         updated_demo_artifact_id = await bioengine_worker_service.upload_app(
-            files=demo_app_files
+            files=bump_manifest_version(demo_app_files, updated_version)
         )
         assert (
             updated_demo_artifact_id == demo_artifact_id
         ), "Updated demo artifact ID should match original"
 
-        # Update composition-app artifact
         updated_composition_artifact_id = (
             await bioengine_worker_service.upload_app(
-                files=composition_app_files
+                files=bump_manifest_version(composition_app_files, updated_version)
             )
         )
         assert (
@@ -178,9 +220,11 @@ async def test_create_and_delete_artifacts(
             composition_artifact_id in available_artifacts
         ), "Composition artifact should be listed in available artifacts"
 
-        # Verify all files in demo-app artifact
+        # Verify all files in demo-app artifact. `list_apps` reports a
+        # non-recursive listing, so a nested upload shows up as its top-level
+        # directory entry rather than its full relative path.
         assert all(
-            f["name"] in available_artifacts[demo_artifact_id]["files"]
+            top_level_name(f) in available_artifacts[demo_artifact_id]["files"]
             for f in demo_app_files
         ), "All demo app files should be listed in artifact files"
         received_manifest = available_artifacts[demo_artifact_id]["manifest"].toDict()
@@ -195,9 +239,9 @@ async def test_create_and_delete_artifacts(
             received_manifest["parent_id"] == f"{hypha_workspace}/applications"
         ), "Demo app manifest should be in applications collection"
 
-        # Verify all files in composition-app artifact
+        # Verify all files in composition-demo artifact
         assert all(
-            f["name"] in available_artifacts[composition_artifact_id]["files"]
+            top_level_name(f) in available_artifacts[composition_artifact_id]["files"]
             for f in composition_app_files
         ), "All composition app files should be listed in artifact files"
         received_manifest = available_artifacts[composition_artifact_id][
@@ -266,6 +310,7 @@ async def test_create_and_delete_artifacts(
 async def test_startup_application(
     bioengine_worker_service: ObjectProxy,
     startup_applications: List[Dict],
+    application_check_timeout: int,
 ):
     """
     Test that all startup applications are properly deployed.
@@ -292,6 +337,19 @@ async def test_startup_application(
         startup_applications and len(startup_applications) > 0
     ), "No startup applications configured for this test. Please define at least one in the fixture."
 
+    # `worker.start()` returns once the startup deployment is submitted, while
+    # its replicas are still building their pip runtime_env, so wait for them.
+    expected_app_count = len(startup_applications)
+    start_time = time.time()
+    while time.time() - start_time < application_check_timeout:
+        apps_status = await bioengine_worker_service.get_app_status()
+        running = [
+            app for app in apps_status.values() if app["status"] == "RUNNING"
+        ]
+        if len(running) >= expected_app_count:
+            break
+        await asyncio.sleep(2)
+
     # Get application status (returns all deployed applications when application_ids is None)
     apps_status = await bioengine_worker_service.get_app_status()
 
@@ -299,7 +357,6 @@ async def test_startup_application(
     assert isinstance(apps_status, dict), "Application status should be a dictionary"
 
     # Assert that applications are deployed based on startup configuration
-    expected_app_count = len(startup_applications)
     assert (
         len(apps_status) > 0
     ), f"Expected {expected_app_count} startup applications to be deployed, but found {len(apps_status)} applications"
@@ -368,8 +425,8 @@ async def test_startup_application(
             app_info["application_resources"], dict
         ), f"application_resources should be a dictionary for '{application_id}'"
         assert isinstance(
-            app_info["authorized_users"], list
-        ), f"authorized_users should be a list for '{application_id}'"
+            app_info["authorized_users"], dict
+        ), f"authorized_users should be a dictionary for '{application_id}'"
         assert isinstance(
             app_info["available_methods"], list
         ), f"available_methods should be a list for '{application_id}'"
@@ -476,14 +533,22 @@ async def test_startup_application(
             app_info["gpu_enabled"], bool
         ), f"gpu_enabled should be a boolean for '{application_id}'"
 
-        # Validate authorized users
+        # Validate authorized users: a per-method map of method name (or '*')
+        # to the list of user IDs/emails allowed to call it.
         assert (
             len(app_info["authorized_users"]) > 0
         ), f"Application '{application_id}' should have authorized users"
-        for user in app_info["authorized_users"]:
+        for method, users in app_info["authorized_users"].items():
             assert isinstance(
-                user, str
-            ), f"Authorized user should be a string in '{application_id}'"
+                method, str
+            ), f"Authorized method should be a string in '{application_id}'"
+            assert isinstance(
+                users, list
+            ), f"Authorized users for '{method}' should be a list in '{application_id}'"
+            for user in users:
+                assert isinstance(
+                    user, str
+                ), f"Authorized user should be a string in '{application_id}'"
 
         # Validate available methods
         for method in app_info["available_methods"]:
@@ -741,10 +806,14 @@ async def test_deploy_app_from_artifact(
     }  # Test random application ID generation and deployment kwargs
 
     composition_app_path = bioengine_apps_dir / "composition-demo"
-    composition_artifact_id = f"{hypha_workspace}/composition-app-{hyphen_test_id}"
+    # Alias follows the `id` in composition-demo/manifest.yaml plus the suffix
+    # `create_file_list_from_directory` appends.
+    composition_artifact_id = (
+        f"{hypha_workspace}/bioengine-composition-demo-{hyphen_test_id}"
+    )
     composition_app_config = {
         "artifact_id": composition_artifact_id,
-        "application_id": f"composition-app-{hyphen_test_id}",
+        "application_id": f"composition-demo-{hyphen_test_id}",
         "disable_gpu": True,
     }  # Provide custom application id
 
@@ -960,7 +1029,9 @@ async def test_call_demo_app_functions(
         websocket_service_id = service_ids["websocket_service_id"]
         webrtc_service_id = service_ids["webrtc_service_id"]
 
-        websocket_service = await hypha_client.get_service(websocket_service_id)
+        websocket_service = await resolve_service(
+            lambda: hypha_client.get_service(websocket_service_id)
+        )
         assert (
             websocket_service
         ), f"Could not connect to WebSocket service {websocket_service_id}"
@@ -987,7 +1058,9 @@ async def test_call_demo_app_functions(
         ), "All ASCII lines should be strings"
 
         # Get the peer connection
-        peer_connection = await get_rtc_service(hypha_client, webrtc_service_id)
+        peer_connection = await resolve_service(
+            lambda: get_rtc_service(hypha_client, webrtc_service_id)
+        )
         assert (
             peer_connection
         ), f"Could not connect to WebRTC service {webrtc_service_id}"
@@ -1108,7 +1181,9 @@ async def test_call_composition_app_functions(
         websocket_service_id = service_ids["websocket_service_id"]
         webrtc_service_id = service_ids["webrtc_service_id"]
 
-        websocket_service = await hypha_client.get_service(websocket_service_id)
+        websocket_service = await resolve_service(
+            lambda: hypha_client.get_service(websocket_service_id)
+        )
         assert (
             websocket_service
         ), f"Could not connect to WebSocket service {websocket_service_id}"
@@ -1179,7 +1254,9 @@ async def test_call_composition_app_functions(
         assert len(run_all_result["time_result"]["timestamps"]) == 2, run_all_result
 
         # Get the peer connection
-        peer_connection = await get_rtc_service(hypha_client, webrtc_service_id)
+        peer_connection = await resolve_service(
+            lambda: get_rtc_service(hypha_client, webrtc_service_id)
+        )
         assert (
             peer_connection
         ), f"Could not connect to WebRTC service {webrtc_service_id}"

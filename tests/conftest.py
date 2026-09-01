@@ -11,6 +11,7 @@ import asyncio
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -90,14 +91,20 @@ def validate_environment(workspace_folder) -> str:
     with open(requirements_file, "r") as file:
         for req in file:
             req = req.strip()
+            if not req or req.startswith("#"):
+                continue
 
             # Use regex to match package names (also ray[serve] and similar)
             match = re.match(r"^\s*([a-zA-Z0-9_\-\.]+)", req)
             if match:
                 package_name = match.group(1)
                 try:
+                    # Query the interpreter running the tests, not whichever
+                    # pip happens to be first on PATH.
                     subprocess.run(
-                        ["pip", "show", package_name], check=True, capture_output=True
+                        [sys.executable, "-m", "pip", "show", package_name],
+                        check=True,
+                        capture_output=True,
                     )
                 except subprocess.CalledProcessError:
                     pytest.exit(

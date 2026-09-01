@@ -52,14 +52,22 @@ def graceful_shutdown_timeout() -> int:
 
 @pytest.fixture(scope="session")
 def application_check_timeout() -> int:
-    """Return 30-second timeout for application readiness checks."""
-    return 30
+    """Return timeout for application readiness checks.
+
+    Generous: each replica builds a pip runtime_env before it turns HEALTHY.
+    """
+    return 300
 
 
 @pytest.fixture(scope="session")
 def num_cpus(worker_mode: str) -> int:
-    """Return CPU cores based on worker mode."""
-    return 4 if worker_mode != "external-cluster" else 0
+    """Return CPU cores based on worker mode.
+
+    `test_deploy_app_locally` runs the startup app, a second demo-app and
+    composition-demo at once: 9 replicas requesting 1 CPU each. Anything
+    smaller leaves replicas pending until the test times out.
+    """
+    return 12 if worker_mode != "external-cluster" else 0
 
 
 @pytest.fixture(scope="session")
@@ -70,8 +78,9 @@ def num_gpus() -> int:
 
 @pytest.fixture(scope="session")
 def memory_in_gb() -> int:
-    """Return 6 GB memory for testing."""
-    return 6
+    """Return memory for testing, sized like `num_cpus` for 9 concurrent
+    replicas requesting 1 GB each."""
+    return 16
 
 
 @pytest_asyncio.fixture(scope="function")
