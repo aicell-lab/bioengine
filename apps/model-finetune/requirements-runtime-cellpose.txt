@@ -7,7 +7,10 @@ bioimageio.core==0.10.4
 torch==2.7.1
 torchvision==0.22.1
 cellpose==4.2.1.1
-segment-anything==1.0
+# NOT PyPI segment-anything==1.0 (broken ResizeLongestSide.apply_image_torch — see
+# requirements-runtime.txt). Latent here (cpsam path doesn't import segment_anything)
+# but pinned to the fixed source for hygiene and parity with the micro-sam runtime.
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf
 numpy==1.26.4
 imageio>=2.37.0
 tifffile
