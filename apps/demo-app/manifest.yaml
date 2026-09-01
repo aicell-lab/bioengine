@@ -14,6 +14,6 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [test, bioengine]
 type: ray-serve
-version: 1.0.2
+version: 1.0.3
 entry: deployment:DemoDeployment
 frontend_entry: "frontend/index.html"

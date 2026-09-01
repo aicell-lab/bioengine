@@ -1,8 +1,9 @@
 """Shared helpers — demonstrates that cross-file imports now Just Work.
 
-This module is imported from runtime_a, runtime_b, runtime_c, and entry
-via relative imports (``from .utils import ...``). That was impossible in
-the v0.5 ``exec()`` model where each file ran in an isolated globals dict.
+This module is imported from runtimes.a, runtimes.b, runtimes.c, and
+entry as ``from utils import ...`` — the artifact root is on ``sys.path``
+on the replica. That was impossible in the v0.5 ``exec()`` model where
+each file ran in an isolated globals dict.
 """
 
 import datetime

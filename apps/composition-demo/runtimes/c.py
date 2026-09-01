@@ -10,7 +10,7 @@ from utils import base_status
 logger = bioengine.logger
 
 
-@bioengine.app(num_cpus=1, num_gpus=0, memory_mb=512, max_ongoing_requests=5)
+@bioengine.app(num_cpus=1, memory_mb=512, max_ongoing_requests=5)
 class RuntimeC:
     @bioengine.async_init
     async def warm_up(self) -> None:

@@ -16,7 +16,6 @@ logger = bioengine.logger
 
 @bioengine.app(
     num_cpus=0,
-    num_gpus=0,
     memory_mb=256,
     max_ongoing_requests=20,
 )
