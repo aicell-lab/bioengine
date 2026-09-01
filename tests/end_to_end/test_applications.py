@@ -26,7 +26,6 @@ from bioengine.utils import create_file_list_from_directory
 @pytest.mark.asyncio
 async def test_create_and_delete_artifacts(
     bioengine_worker_service: ObjectProxy,
-    tests_dir: Path,
     bioengine_apps_dir: Path,
     test_id: str,
     hypha_workspace: str,
@@ -190,9 +189,8 @@ async def test_create_and_delete_artifacts(
             received_manifest["manifest"] == demo_manifest
         ), "Demo app manifest should match expected manifest"
         assert (
-            created_by == hypha_user_id,
-            "Created by user ID should match the test user ID",
-        )
+            created_by == hypha_user_id
+        ), "Created by user ID should match the test user ID"
         assert (
             received_manifest["parent_id"] == f"{hypha_workspace}/applications"
         ), "Demo app manifest should be in applications collection"
@@ -210,9 +208,8 @@ async def test_create_and_delete_artifacts(
             received_manifest["manifest"] == composition_manifest
         ), "Composition app manifest should match expected manifest"
         assert (
-            created_by == hypha_user_id,
-            "Created by user ID should match the test user ID",
-        )
+            created_by == hypha_user_id
+        ), "Created by user ID should match the test user ID"
         assert (
             received_manifest["parent_id"] == f"{hypha_workspace}/applications"
         ), "Composition app manifest should be in applications collection"
@@ -377,8 +374,8 @@ async def test_startup_application(
             app_info["available_methods"], list
         ), f"available_methods should be a list for '{application_id}'"
         assert isinstance(
-            app_info["service_ids"], list
-        ), f"service_ids should be a list for '{application_id}'"
+            app_info["service_ids"], dict
+        ), f"service_ids should be a dictionary for '{application_id}'"
 
         # Validate application status is in expected states
         valid_statuses = [
@@ -593,38 +590,34 @@ async def test_startup_application(
 @pytest.mark.asyncio
 async def test_deploy_app_locally(
     monkeypatch: pytest.MonkeyPatch,
-    tests_dir: Path,
+    bioengine_apps_dir: Path,
     hypha_workspace: str,
     test_id: str,
     bioengine_worker_service: ObjectProxy,
 ):
     """
-    Test deploying the 'demo-app' and 'composition-app' applications from local artifact path.
+    Test deploying the 'demo-app' and 'composition-demo' applications from local artifact path.
     """
-    # Set environment variables for startup application deployment from local path
-    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(tests_dir))
-    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(tests_dir)
+    # Local artifact resolution is by directory name under this root
+    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(bioengine_apps_dir))
+    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(bioengine_apps_dir)
 
-    # iterate over demo_app and composition_app directories
     # Note: the demo app is already deployed by startup_applications, but the deployment below will use a different application ID
 
     demo_artifact_id = f"{hypha_workspace}/demo-app"
     demo_app_config = {
         "artifact_id": demo_artifact_id,
+        "application_kwargs": {"DemoDeployment": {"test_param": "local_value"}},
         "disable_gpu": True,
-    }  # Test random application ID generation
+    }  # Test random application ID generation and deployment kwargs
 
-    composition_artifact_id = f"{hypha_workspace}/composition-app"
+    composition_artifact_id = f"{hypha_workspace}/composition-demo"
     hyphen_test_id = test_id.replace("_", "-")
     composition_app_config = {
         "artifact_id": composition_artifact_id,
-        "application_id": f"composition-app-{hyphen_test_id}",
-        "application_kwargs": {
-            "CompositionDeployment": {"demo_input": "Hello World!"},
-            "Deployment2": {"start_number": 10},
-        },
+        "application_id": f"composition-demo-{hyphen_test_id}",
         "disable_gpu": True,
-    }  # Provide custom application id and deployment kwargs
+    }  # Provide custom application id
 
     app_configs = [demo_app_config, composition_app_config]
     deployed_app_ids = []
@@ -639,7 +632,8 @@ async def test_deploy_app_locally(
             print(f"Deployed application: {application_id}")
 
         # Wait for both applications to finish deploying
-        timeout = 30  # 30 seconds timeout
+        # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
+        timeout = 300
         poll_interval = 2  # Check every 2 seconds
         start_time = time.time()
 
@@ -722,14 +716,13 @@ async def test_deploy_app_locally(
 @pytest.mark.asyncio
 async def test_deploy_app_from_artifact(
     monkeypatch: pytest.MonkeyPatch,
-    tests_dir: Path,
     bioengine_apps_dir: Path,
     test_id: str,
     hypha_workspace: str,
     bioengine_worker_service: ObjectProxy,
 ):
     """
-    Test deploying the 'demo-app' and 'composition-app' applications from remote artifact.
+    Test deploying the 'demo-app' and 'composition-demo' applications from remote artifact.
 
     Note: The demo app is already deployed by startup_applications, deploying again will update the app
     """
@@ -813,7 +806,8 @@ async def test_deploy_app_from_artifact(
             print(f"Deployed application: {application_id}")
 
         # Wait for both applications to finish deploying
-        timeout = 30  # 30 seconds timeout
+        # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
+        timeout = 300
         poll_interval = 2  # Check every 2 seconds
         start_time = time.time()
 
@@ -906,7 +900,7 @@ async def test_deploy_app_from_artifact(
 @pytest.mark.asyncio
 async def test_call_demo_app_functions(
     monkeypatch: pytest.MonkeyPatch,
-    tests_dir: Path,
+    bioengine_apps_dir: Path,
     hypha_workspace: str,
     bioengine_worker_service: ObjectProxy,
     hypha_client: RemoteService,
@@ -914,13 +908,16 @@ async def test_call_demo_app_functions(
     """
     Test calling functions of the deployed demo application.
 
-    Exposed methods:
+    Exposed methods of `DemoDeployment`:
     - `ping`
     - `ascii_art`
+    - `list_datasets`
+    - `reverse_text`
+    - `set_fail_health_check`
     """
-    # Set environment variables for startup application deployment from local path
-    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(tests_dir))
-    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(tests_dir)
+    # Local artifact resolution is by directory name under this root
+    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(bioengine_apps_dir))
+    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(bioengine_apps_dir)
 
     # Deploy the demo-app with apps_manager.deploy_app from local path
     demo_artifact_id = f"{hypha_workspace}/demo-app"
@@ -931,7 +928,8 @@ async def test_call_demo_app_functions(
 
     try:
         # Wait for deployment to complete
-        timeout = 30  # 30 seconds timeout
+        # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
+        timeout = 300
         poll_interval = 2  # Check every 2 seconds
         start_time = time.time()
 
@@ -942,9 +940,9 @@ async def test_call_demo_app_functions(
 
             if app_id in app_status_result:
                 app_status = app_status_result[app_id]
-                if (
-                    app_status["status"] == "RUNNING"
-                    and len(app_status.get("service_ids", [])) > 0
+                service_ids = app_status.get("service_ids") or {}
+                if app_status["status"] == "RUNNING" and service_ids.get(
+                    "websocket_service_id"
                 ):
                     break
 
@@ -1047,7 +1045,7 @@ async def test_call_demo_app_functions(
 @pytest.mark.asyncio
 async def test_call_composition_app_functions(
     monkeypatch: pytest.MonkeyPatch,
-    tests_dir: Path,
+    bioengine_apps_dir: Path,
     hypha_workspace: str,
     bioengine_worker_service: ObjectProxy,
     hypha_client: RemoteService,
@@ -1055,21 +1053,22 @@ async def test_call_composition_app_functions(
     """
     Test calling functions of the deployed composition application.
 
-    Exposed methods:
-    - `ping`
-    - `calculate_result`
+    Only `EntryDeployment` is exposed as a service; it fans out to
+    RuntimeA/B/C through deployment handles. Exposed methods:
+    - `status`
+    - `process_text`
+    - `analyze_numbers`
+    - `time_operations`
+    - `run_all`
     """
-    # Set environment variables for startup application deployment from local path
-    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(tests_dir))
-    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(tests_dir)
+    # Local artifact resolution is by directory name under this root
+    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(bioengine_apps_dir))
+    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(bioengine_apps_dir)
 
-    # Deploy the composition-app with apps_manager.deploy_app from local path
+    # Deploy the composition-demo with apps_manager.deploy_app from local path
+    # EntryDeployment takes only deployment handles, so no application_kwargs.
     composition_app_config = {
-        "artifact_id": f"{hypha_workspace}/composition_app",
-        "application_kwargs": {
-            "CompositionDeployment": {"demo_input": "Test Hello World!"},
-            "Deployment2": {"start_number": 100},
-        },
+        "artifact_id": f"{hypha_workspace}/composition-demo",
         "disable_gpu": True,
     }
 
@@ -1077,7 +1076,8 @@ async def test_call_composition_app_functions(
 
     try:
         # Wait for deployment to complete
-        timeout = 30  # 30 seconds timeout
+        # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
+        timeout = 300
         poll_interval = 2  # Check every 2 seconds
         start_time = time.time()
 
@@ -1088,9 +1088,9 @@ async def test_call_composition_app_functions(
 
             if app_id in app_status_result:
                 app_status = app_status_result[app_id]
-                if (
-                    app_status["status"] == "RUNNING"
-                    and len(app_status.get("service_ids", [])) > 0
+                service_ids = app_status.get("service_ids") or {}
+                if app_status["status"] == "RUNNING" and service_ids.get(
+                    "websocket_service_id"
                 ):
                     break
 
@@ -1114,29 +1114,69 @@ async def test_call_composition_app_functions(
         ), f"Could not connect to WebSocket service {websocket_service_id}"
 
         # Call the application functions using the WebSocket service
-        # Test ping method
-        ping_result = await asyncio.wait_for(websocket_service.ping(), timeout=10)
-        assert ping_result is not None, "Ping should return a result"
-        assert isinstance(ping_result, str), "Ping result should be a string"
-        assert ping_result == "pong", f"Expected 'pong', got {ping_result}"
+        # Test status method — fans out to all three runtimes
+        status_result = await asyncio.wait_for(websocket_service.status(), timeout=30)
+        assert isinstance(status_result, dict), "Status result should be a dictionary"
+        assert "entry_uptime" in status_result, "Status should report the entry uptime"
+        for runtime_key, runtime_name in (
+            ("runtime_a", "runtime_a"),
+            ("runtime_b", "runtime_b"),
+            ("runtime_c", "runtime_c"),
+        ):
+            runtime_status = status_result[runtime_key]
+            assert isinstance(
+                runtime_status, dict
+            ), f"{runtime_key} status should be a dictionary"
+            assert (
+                runtime_status["name"] == runtime_name
+            ), f"Expected name '{runtime_name}', got {runtime_status.get('name')}"
+            assert runtime_status["status"] == "ok", f"{runtime_key} should be ok"
+        # RuntimeB's `pip=` runtime_env is what makes numpy importable there
+        assert status_result["runtime_b"][
+            "numpy_version"
+        ], "RuntimeB should report its numpy version"
 
-        # Test calculate_result method
-        test_number = 42
-        calc_result = await asyncio.wait_for(
-            websocket_service.calculate_result(number=test_number), timeout=15
+        # Test process_text method — routed through RuntimeA
+        text_result = await asyncio.wait_for(
+            websocket_service.process_text(text="hello bioengine"), timeout=30
         )
-        assert calc_result is not None, "Calculate result should return a result"
-        assert isinstance(calc_result, str), "Calculate result should be a string"
-        assert "Uptime:" in calc_result, "Result should contain uptime information"
-        assert "Result:" in calc_result, "Result should contain calculation result"
-        assert "Demo string:" in calc_result, "Result should contain demo string"
-        assert (
-            "Test Hello World!" in calc_result
-        ), "Result should contain the demo input"
-        # The result should be start_number (100) + test_number (42) = 142
-        assert (
-            "142" in calc_result
-        ), f"Result should contain 142 (100 + 42), got: {calc_result}"
+        assert isinstance(text_result, dict), "process_text should return a dictionary"
+        assert text_result["word_count"] == 2, f"Expected 2 words, got {text_result}"
+        assert text_result["words"] == ["hello", "bioengine"], text_result
+        assert text_result["upper"] == "HELLO BIOENGINE", text_result
+        assert text_result["reversed"] == "enigneoib olleh", text_result
+
+        # Test analyze_numbers method — routed through RuntimeB (numpy)
+        numbers_result = await asyncio.wait_for(
+            websocket_service.analyze_numbers(values=[1, 2, 3, 4, 5]), timeout=30
+        )
+        assert isinstance(
+            numbers_result, dict
+        ), "analyze_numbers should return a dictionary"
+        assert numbers_result["mean"] == 3.0, numbers_result
+        assert numbers_result["sum"] == 15.0, numbers_result
+        assert numbers_result["min"] == 1.0 and numbers_result["max"] == 5.0
+        assert numbers_result["count"] == 5, numbers_result
+
+        # Test time_operations method — routed through RuntimeC
+        time_result = await asyncio.wait_for(
+            websocket_service.time_operations(count=3), timeout=30
+        )
+        assert isinstance(
+            time_result, dict
+        ), "time_operations should return a dictionary"
+        assert time_result["count"] == 3, time_result
+        assert len(time_result["timestamps"]) == 3, time_result
+
+        # Test run_all method — fans out to all three runtimes in parallel
+        run_all_result = await asyncio.wait_for(
+            websocket_service.run_all(text="hello bioengine", values=[2, 4], count=2),
+            timeout=30,
+        )
+        assert isinstance(run_all_result, dict), "run_all should return a dictionary"
+        assert run_all_result["text_result"]["word_count"] == 2, run_all_result
+        assert run_all_result["data_result"]["mean"] == 3.0, run_all_result
+        assert len(run_all_result["time_result"]["timestamps"]) == 2, run_all_result
 
         # Get the peer connection
         peer_connection = await get_rtc_service(hypha_client, webrtc_service_id)
@@ -1150,50 +1190,31 @@ async def test_call_composition_app_functions(
             assert peer_service, "Could not get peer service from WebRTC"
 
             # Call the application functions using the peer connection service
-            # Test ping method through WebRTC
-            rtc_ping_result = await asyncio.wait_for(
-                peer_service.ping(context=hypha_client.config), timeout=10
+            # Test status method through WebRTC
+            rtc_status_result = await asyncio.wait_for(
+                peer_service.status(context=hypha_client.config), timeout=30
             )
-            assert rtc_ping_result is not None, "WebRTC ping should return a result"
             assert isinstance(
-                rtc_ping_result, str
-            ), "WebRTC ping result should be a string"
-            assert rtc_ping_result == "pong", f"Expected 'pong', got {rtc_ping_result}"
+                rtc_status_result, dict
+            ), "WebRTC status result should be a dictionary"
+            for runtime_key in ("runtime_a", "runtime_b", "runtime_c"):
+                assert (
+                    rtc_status_result[runtime_key]["status"] == "ok"
+                ), f"WebRTC {runtime_key} should be ok"
 
-            # Test calculate_result method through WebRTC
-            rtc_calc_result = await asyncio.wait_for(
-                peer_service.calculate_result(
-                    number=test_number, context=hypha_client.config
+            # Test process_text method through WebRTC
+            rtc_text_result = await asyncio.wait_for(
+                peer_service.process_text(
+                    text="hello bioengine", context=hypha_client.config
                 ),
-                timeout=15,
+                timeout=30,
             )
-            assert (
-                rtc_calc_result is not None
-            ), "WebRTC calculate result should return a result"
             assert isinstance(
-                rtc_calc_result, str
-            ), "WebRTC calculate result should be a string"
-            assert (
-                "Uptime:" in rtc_calc_result
-            ), "WebRTC result should contain uptime information"
-            assert (
-                "Result:" in rtc_calc_result
-            ), "WebRTC result should contain calculation result"
-            assert (
-                "Demo string:" in rtc_calc_result
-            ), "WebRTC result should contain demo string"
-            assert (
-                "Test Hello World!" in rtc_calc_result
-            ), "WebRTC result should contain the demo input"
-            assert (
-                "142" in rtc_calc_result
-            ), f"WebRTC result should contain 142 (100 + 42), got: {rtc_calc_result}"
+                rtc_text_result, dict
+            ), "WebRTC process_text result should be a dictionary"
 
-            # Results should be the same through both channels
-            assert rtc_ping_result == ping_result, "Ping results should match"
-            # Note: Uptime may differ slightly between calls, so we check key components
-            assert "Test Hello World!" in rtc_calc_result, "Demo string should match"
-            assert "142" in rtc_calc_result, "Calculation result should match"
+            # Deterministic results should be the same through both channels
+            assert rtc_text_result == text_result, "process_text results should match"
 
         finally:
             # Clean up WebRTC connection

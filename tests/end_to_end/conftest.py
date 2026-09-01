@@ -91,7 +91,7 @@ async def bioengine_worker_service_id(
     head_node_port: int,
     dashboard_url: str,
     graceful_shutdown_timeout: int,
-    tests_dir: Path,
+    bioengine_apps_dir: Path,
 ) -> AsyncGenerator[str, None]:
     """
     Create BioEngine worker instance and return service ID.
@@ -100,9 +100,10 @@ async def bioengine_worker_service_id(
     Automatically starts worker and cleans up after test completion.
     """
 
-    # Set environment variables for startup application deployment from local path
-    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(tests_dir))
-    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(tests_dir)
+    # Local artifact resolution is by directory name under this root, so the
+    # reference apps in `apps/` are addressable as `<workspace>/<dir-name>`.
+    monkeypatch.setenv("BIOENGINE_LOCAL_ARTIFACT_PATH", str(bioengine_apps_dir))
+    assert os.getenv("BIOENGINE_LOCAL_ARTIFACT_PATH") == str(bioengine_apps_dir)
 
     # Initialize the BioEngine worker with startup applications
     bioengine_worker = BioEngineWorker(
