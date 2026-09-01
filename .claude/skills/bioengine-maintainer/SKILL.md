@@ -350,6 +350,8 @@ Apply to: services that maintain per-session disk state. Inference-only services
 
 Issues and PR bodies on this repo are standalone documentation. An issue is triaged by someone who didn't follow the conversation that produced it; a PR body is read months later by a maintainer who didn't follow the review. Assume the reader knows only how BioEngine is built.
 
+The test every line has to pass: **would this parse for someone who has never seen the conversation, the internal tracker, or the people involved?** If it needs any of the three, cut it. The lists below are that test failing in the ways it usually fails — they're examples, not the rule.
+
 ### Open with a lede a cold reader understands
 
 The first paragraph is plain prose: what is broken (or what this changes), what breaks *because* of it, and roughly where. No log excerpts, no symbol names, no `file.py:NNN`. Name the user-visible consequence before the mechanism — "the worker restarts every 20 minutes and takes all three apps down with it" comes before "the liveness probe curls Hypha". **If the first sentence contains a function or symbol name, rewrite it.**
@@ -379,6 +381,16 @@ After the lede: how it was observed or reproduced, the evidence that localises i
 - "Per the recent discussion …", "As we agreed", "After I tested X" — any direct reference to the conversation flow
 
 "Validation still to come" notes are pending follow-ups too. While a PR is a draft they belong in a PR comment; the body's Test plan records what was validated, in its final state.
+
+### Every identifier must resolve for the reader
+
+`#N` means a GitHub issue or PR **in this repo** and nothing else. Never write a svamp backlog id into a body — not bare, not zero-padded as `#0026`, not annotated "(internal issue tracker)". The annotation is the tell: if you have to explain that the reader can't follow a reference, the reference doesn't belong there. The same goes for any link only you can open.
+
+`Closes` / `Fixes` / `Resolves` is reserved for a GitHub issue in this repo that this PR really closes, written unpadded. Zero-padding silently disarms it, so it is not a safe way to write a reference you don't mean: `Closes #0026` arms nothing, `Closes #26` closes whatever #26 turns out to be.
+
+### Don't quote or attribute people
+
+State a requirement as a requirement, in your own words. Never quote a person — not from chat, not relayed, not copied out of an internal tracker — and don't name who asked for the change. These repos are public, so a quote publishes private words; and a design that is only defensible because someone asked for it has a hole in it that citing them hides. Attributing a *finding* in an issue is still fine (§Issues above); requirements and design rationale are not.
 
 Previously-merged PRs and existing issues that violate this style stay as-is; apply going forward only.
 
