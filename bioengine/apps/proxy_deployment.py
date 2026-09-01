@@ -52,9 +52,11 @@ _MAINTENANCE_TICK_S = 5
 # registration while our socket stays open, so nothing here ever notices.
 # Rare, so it is cheap to look for slowly.
 _REACHABILITY_PROBE_INTERVAL_S = 60
-# Backoff between re-registration attempts. Must stay above Hypha's stale-
-# client TTL (~30-60s) so a rebuild whose disconnect didn't land isn't
-# rejected forever with 'Client already exists and is active'.
+# Backoff between re-registration attempts, so a Hypha outage costs a retry per
+# interval rather than a reconnect storm. It is NOT what clears a stale client:
+# Hypha's check_client pings the existing client and reaps it on the spot if it
+# doesn't answer, so 'Client already exists and is active' means the old client
+# is genuinely still alive and no amount of backoff will clear it.
 _REREGISTER_BACKOFF_S = 30
 # How long a dropped socket is left to hypha-rpc before we probe it. The
 # library reconnects and re-registers on its own; rebuilding our client while

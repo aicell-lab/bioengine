@@ -15,8 +15,8 @@ The contract now:
 * Connecting, registering and reconnecting live in a background
   maintenance task, where a failure costs a retry rather than a replica.
 * Anything that might clear on its own is retried indefinitely, including
-  the 'Client already exists and is active' collision that clears with
-  Hypha's stale-client TTL.
+  the 'Client already exists and is active' collision, which clears once
+  the old client actually dies.
 
 The shape assertions read the source rather than driving Ray Serve's
 health loop live; the behavioural ones drive ``_maintenance_tick``
@@ -95,10 +95,11 @@ def test_probe_interval_is_far_above_the_health_check_period() -> None:
     assert pd_module._MAINTENANCE_TICK_S < pd_module._REACHABILITY_PROBE_INTERVAL_S
 
 
-def test_reregister_backoff_clears_the_stale_client_ttl() -> None:
-    """A rebuild whose disconnect didn't land is refused with 'Client
-    already exists and is active' until Hypha's TTL (~30-60s) sweeps it;
-    retrying faster than that just burns attempts."""
+def test_reregister_backoff_is_slow_enough_to_not_be_a_storm() -> None:
+    """The backoff exists to keep a Hypha outage costing one retry per
+    interval, not to outlast a stale-client TTL — Hypha's ``check_client``
+    pings the existing client and reaps it on the spot when it doesn't
+    answer, so there is no TTL to wait out."""
     assert pd_module._REREGISTER_BACKOFF_S >= 30
 
 
