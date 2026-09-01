@@ -302,7 +302,8 @@ def test_register_services_attaches_the_disconnect_hook() -> None:
 def test_register_services_calls_reset_before_connect() -> None:
     """_register_services must free the client_id before connect_to_server —
     otherwise a lingering registration causes 'Client already exists and is
-    active' and the reconnect fails until Hypha's stale-client TTL fires."""
+    active' and the reconnect keeps failing for as long as the old client
+    stays alive to answer Hypha's ping."""
     import re
 
     src = inspect.getsource(_ProxyCls._register_services)

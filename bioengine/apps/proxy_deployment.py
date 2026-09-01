@@ -970,10 +970,11 @@ class ProxyDeployment:
         """Cleanly disconnect ``self.server`` before we forget about it.
 
         Nulling ``self.server`` without telling Hypha we're gone leaves a
-        registration lingering server-side; the next ``connect_to_server``
-        with the same ``client_id`` is rejected with 'Client already exists
-        and is active' until Hypha's own stale-client TTL sweeps it (~30-60s).
-        Calling ``disconnect`` here frees the client_id immediately.
+        registration lingering server-side. Hypha's ``check_client`` then pings
+        that predecessor on our next ``connect_to_server``: if it answers we are
+        rejected with 'Client already exists and is active', and since the ping
+        succeeds for as long as the old client lives, nothing clears it on a
+        timer. Calling ``disconnect`` here is what frees the client_id.
 
         Idempotent — safe to call even when ``self.server`` is already None.
         Bounded timeout so a wedged transport can't stall the caller.
@@ -1023,10 +1024,9 @@ class ProxyDeployment:
         registration is required for the deployment to be considered healthy.
         """
         # Any prior connection under our client_id must be released before
-        # ``connect_to_server`` — otherwise the new attempt hits
-        # 'Client already exists and is active' and Ray Serve flaps the
-        # replica until Hypha's stale-client TTL times the old registration
-        # out. See _reset_server_connection for details.
+        # ``connect_to_server`` — otherwise Hypha pings it, finds it alive, and
+        # refuses us with 'Client already exists and is active' for as long as
+        # it keeps answering. See _reset_server_connection for details.
         await self._reset_server_connection()
         # Connect to Hypha server
         try:
@@ -1185,8 +1185,9 @@ class ProxyDeployment:
         *server actively refused* — bad token, missing permission, unusable
         protocol — as opposed to one it could not deliver; hypha-rpc itself
         treats it as terminal and stops its own reconnect loop on it. The one
-        refusal that does clear on its own is a client_id still held by our
-        predecessor, which Hypha releases after its stale-client TTL.
+        refusal that does clear on its own is a client_id still held by a live
+        predecessor, which Hypha releases once that predecessor stops answering
+        its ping — so it clears when the old client dies, not on a timer.
 
         Everything else is assumed transient. That asymmetry is deliberate:
         retrying a genuine misconfiguration forever is merely quiet, while
