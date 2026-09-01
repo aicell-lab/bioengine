@@ -48,8 +48,9 @@ logger = logging.getLogger("ray.serve")
 _MAINTENANCE_TICK_S = 5
 # hypha-rpc keeps the websocket alive itself (ping_interval=20s) and
 # re-registers our services on every reconnect, so this probe exists only to
-# catch the one case the library cannot signal: an RPC session that has gone
-# stale while the socket stays up. Rare, so it is cheap to look for slowly.
+# catch the one case the library cannot signal: Hypha has dropped our
+# registration while our socket stays open, so nothing here ever notices.
+# Rare, so it is cheap to look for slowly.
 _REACHABILITY_PROBE_INTERVAL_S = 60
 # Backoff between re-registration attempts. Must stay above Hypha's stale-
 # client TTL (~30-60s) so a rebuild whose disconnect didn't land isn't
@@ -1241,13 +1242,17 @@ class ProxyDeployment:
         if time.time() < self._probe_due_at:
             return
         try:
-            await self.server.echo("ping")
+            # Ask whether Hypha still knows our service, not merely whether the
+            # socket answers: a freeze long enough for Hypha to evict the client
+            # leaves the socket open from this side, so an echo keeps succeeding
+            # against a server that has dropped the registration.
+            await self.server.get_service_info(self.websocket_service_id)
             self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
         except Exception as e:
             # Not a health-check failure: flag for rebuild on the next tick.
             logger.warning(
-                f"⚠️ Hypha unreachable from '{self.application_id}'; rebuilding the "
-                f"client: {e}"
+                f"⚠️ Hypha no longer serves '{self.websocket_service_id}'; rebuilding "
+                f"the client: {e}"
             )
             self._connection_lost = True
 

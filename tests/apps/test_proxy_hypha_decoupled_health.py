@@ -196,7 +196,7 @@ async def test_gate_closed_means_no_registration() -> None:
 @pytest.mark.asyncio
 async def test_unreachable_hypha_schedules_a_rebuild_without_raising() -> None:
     class _DeadServer:
-        async def echo(self, _msg):
+        async def get_service_info(self, _sid):
             raise asyncio.TimeoutError()
 
     inst = _bare_proxy(server=_DeadServer(), websocket_service_id="ws")
@@ -207,12 +207,38 @@ async def test_unreachable_hypha_schedules_a_rebuild_without_raising() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dropped_registration_on_a_live_socket_schedules_a_rebuild() -> None:
+    """Observed live: a freeze long enough for Hypha to evict the client left
+    the socket open, so ``echo`` kept succeeding for ten minutes while the
+    service was unresolvable. The probe has to ask about the service."""
+
+    class _AmnesiacServer:
+        async def echo(self, _msg):
+            return _msg
+
+        async def get_service_info(self, sid):
+            raise KeyError(f"Service not found: {sid}@*")
+
+    inst = _bare_proxy(server=_AmnesiacServer(), websocket_service_id="ws")
+
+    await inst._maintenance_tick()
+
+    assert inst._connection_lost is True
+
+
+def test_probe_asks_about_our_own_service() -> None:
+    src = inspect.getsource(_ProxyCls._maintenance_tick)
+    assert "get_service_info(self.websocket_service_id)" in src
+    assert 'echo("ping")' not in src
+
+
+@pytest.mark.asyncio
 async def test_probe_is_skipped_until_the_interval_elapses() -> None:
     class _CountingServer:
         def __init__(self):
             self.pings = 0
 
-        async def echo(self, _msg):
+        async def get_service_info(self, _sid):
             self.pings += 1
 
     server = _CountingServer()

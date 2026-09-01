@@ -42,6 +42,9 @@ class _Server:
     async def echo(self, msg):
         return msg
 
+    async def get_service_info(self, service_id):
+        return {"id": service_id}
+
     async def get_service(self, service_id):
         return _WsService()
 
