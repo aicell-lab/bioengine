@@ -9,10 +9,20 @@
 # only the cheap layers on top. Keep the two files in sync when the
 # worker build changes.
 #
-# Build (from the repo root):
+# The image is versioned by the MODEL-RUNNER APP version (from
+# apps/model-runner/manifest.yaml), not by the BioEngine version — the
+# app's pins are what this image exists to preinstall, so they are what
+# a rebuild is triggered by. Each published tag is built against one
+# specific BioEngine version, recorded in the io.bioengine.version label
+# and the BIOENGINE_VERSION env var since the tag no longer carries it.
+#
+# Build (from the repo root) via scripts/build_model_runner.sh, which
+# fills both version args from the checkout. By hand:
 #   docker build \
-#       -f docker/worker-model-runner.Dockerfile \
-#       -t bioengine-worker-model-runner:<bioengine-version> .
+#       -f docker/model-runner.Dockerfile \
+#       --build-arg MODEL_RUNNER_VERSION=<app-version> \
+#       --build-arg BIOENGINE_VERSION=<bioengine-version> \
+#       -t model-runner:<app-version> .
 #
 # Rebuild whenever apps/model-runner/requirements-*.txt change — the
 # preinstall only short-circuits the deploy-time install while the pins
@@ -20,10 +30,6 @@
 
 # Rolling tag — each build picks up current Debian-slim security patches.
 FROM python:3.11-slim
-
-# Links the GHCR package to this repo (CI injects this for the published
-# worker image; this image is built manually, so it's baked in here).
-LABEL org.opencontainers.image.source=https://github.com/aicell-lab/bioengine
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -74,5 +80,17 @@ RUN pip install "ray[client,serve]==${RAY_VERSION}" "protobuf>=4,<5"
 
 # Surface the active Ray version inside the image for diagnostics
 ENV BIOENGINE_RAY_VERSION=${RAY_VERSION}
+
+# Version metadata last, so bumping either version rebuilds nothing but
+# this layer. org.opencontainers.image.source links the GHCR package to
+# this repo (CI injects it for the published worker image; this image is
+# built manually, so it's baked in here).
+ARG MODEL_RUNNER_VERSION=unknown
+ARG BIOENGINE_VERSION=unknown
+ENV BIOENGINE_MODEL_RUNNER_VERSION=${MODEL_RUNNER_VERSION} \
+    BIOENGINE_VERSION=${BIOENGINE_VERSION}
+LABEL org.opencontainers.image.source=https://github.com/aicell-lab/bioengine \
+      org.opencontainers.image.version=${MODEL_RUNNER_VERSION} \
+      io.bioengine.version=${BIOENGINE_VERSION}
 
 CMD [ "/bin/bash" ]
