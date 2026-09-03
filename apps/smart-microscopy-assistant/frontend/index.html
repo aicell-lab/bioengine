@@ -812,6 +812,12 @@
     line-height: 1.45;
     max-height: 8rem; overflow-y: auto;
   }
+  .grid-details-panel .panel-unparsed {
+    color: var(--on-unsure); background: var(--unsure-fill);
+    border: 1px solid var(--unsure-edge); border-radius: 6px;
+    padding: 0.4rem 0.55rem; margin-bottom: 0.6rem;
+    font-size: 0.82rem; line-height: 1.4;
+  }
   .grid-details-panel .pill-row {
     display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.45rem;
   }
@@ -2927,6 +2933,13 @@ function renderDetails(panel, tile) {
   if (tile.mode === "few-shot") reason.textContent = r.reason || r.description || "(no reason returned)";
   else                          reason.textContent = r.description || "(no description)";
   panel.appendChild(reason);
+
+  if (tile.mode === "few-shot" && r.verdict_parsed === false) {
+    const warn = document.createElement("div");
+    warn.className = "panel-unparsed";
+    warn.textContent = "The model returned no readable verdict line. This “unsure” is a fallback, not a judgement — read the raw output below.";
+    panel.appendChild(warn);
+  }
 
   const pills = document.createElement("div");
   pills.className = "pill-row";

@@ -510,16 +510,23 @@ class SmartMicroscopyAssistant:
         )
 
     @staticmethod
-    def _parse_verdict(text: str) -> tuple[str, str]:
-        verdict = "unsure"
-        reason = text.strip()
+    def _parse_verdict(text: str) -> tuple[str, str, bool]:
+        """Parse the ``VERDICT`` / ``REASON`` reply format.
+
+        The third element is False when the model emitted no readable
+        verdict line. Callers must not read that as a model-judged
+        ``unsure``: an unparseable generation routes to ``unsure`` so a
+        gate still holds rather than proceeding, but the two cases are
+        different evidence. The raw generation is always returned
+        separately as ``description``, so ``reason`` stays a single short
+        sentence or empty.
+        """
         m = re.search(r"VERDICT\s*:\s*(passed|failed|unsure)\b", text, flags=re.IGNORECASE)
-        if m:
-            verdict = m.group(1).lower()
         m2 = re.search(r"REASON\s*:\s*(.+?)(?:\n|$)", text, flags=re.IGNORECASE | re.DOTALL)
-        if m2:
-            reason = m2.group(1).strip()
-        return verdict, reason
+        reason = m2.group(1).strip() if m2 else ""
+        if not m:
+            return "unsure", reason, False
+        return m.group(1).lower(), reason, True
 
     # ------------------------------------------------------------ job registry
 
@@ -916,13 +923,14 @@ class SmartMicroscopyAssistant:
                 gen_dt = time.time() - t_gen0
 
             if visual_test is not None:
-                verdict, reason = self._parse_verdict(raw)
+                verdict, reason, verdict_parsed = self._parse_verdict(raw)
                 result = {
                     "mode": "few-shot",
                     "visual_test_name": visual_test["name"],
                     "pass_criterion": visual_test.get("pass_criterion", ""),
                     "fail_criterion": visual_test.get("fail_criterion", ""),
                     "verdict": verdict,
+                    "verdict_parsed": verdict_parsed,
                     "reason": reason,
                     "description": raw,
                     "n_positive_examples": visual_test.get("n_positive", 0),
@@ -1055,6 +1063,14 @@ class SmartMicroscopyAssistant:
         Jobs are held for 24 hours after completion, then dropped. The
         registry is per replica and in-memory — a job submitted to one replica
         is unknown to the others, and a replica restart drops everything.
+
+        In verdict mode the completed ``result`` carries ``verdict``
+        (``passed`` / ``failed`` / ``unsure``) alongside ``verdict_parsed``.
+        A False ``verdict_parsed`` means the model emitted no readable
+        verdict line and the ``unsure`` is the safe fallback, not a judgement
+        — check it before treating ``unsure`` as considered evidence. The
+        full generation is always in ``description``; ``reason`` is the
+        model's one-sentence reason, or empty if it emitted none.
         """
         job = self._inspect_jobs.get(run_id)
         if job is None:
