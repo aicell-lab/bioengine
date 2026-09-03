@@ -106,6 +106,24 @@ def _owner_from_context(context: Optional[Dict[str, Any]]) -> str:
     return _ANON_OWNER
 
 
+def _job_owner_from_context(context: Optional[Dict[str, Any]]) -> str:
+    """Identity for owning an inspect job — stricter than test ownership.
+
+    Tests deliberately put every anonymous caller in one shared bucket, but a
+    job carries the caller's own data, so sharing a bucket would let any
+    anonymous caller read another's result. Hypha gives each anonymous
+    connection its own throwaway workspace, so key on that instead.
+    """
+    owner = _owner_from_context(context)
+    if owner != _ANON_OWNER:
+        return owner
+    ctx = context or {}
+    for value in (ctx.get("ws"), ctx.get("from")):
+        if isinstance(value, str) and value.strip():
+            return f"{_ANON_OWNER}:{value.strip()}"
+    return _ANON_OWNER
+
+
 def _readable_workspaces(context: Optional[Dict[str, Any]]) -> set:
     """Workspaces the caller may read, from the token scope Hypha injected.
 
@@ -1015,7 +1033,9 @@ class SmartMicroscopyAssistant:
 
             result.update({
                 "image_size": list(image.size),
-                "source_url": url,
+                # The caller's own ref, not the resolved URL: for an artifact
+                # ref that resolves to a presigned URL, i.e. a credential.
+                "image_ref": image_ref,
                 "model": _MODEL_ID,
                 "tokens_generated": n_tokens,
                 "generation_time_s": round(gen_dt, 2),
@@ -1056,7 +1076,7 @@ class SmartMicroscopyAssistant:
             self._find_test_for_caller(visual_test_name, caller_id)
             if visual_test_name else None
         )
-        job = self._new_job(caller_id)
+        job = self._new_job(_job_owner_from_context(context))
         job["task"] = asyncio.create_task(
             self._execute_inspect(
                 job, image_ref, instruction, visual_test, max_new_tokens, context,
@@ -1157,8 +1177,7 @@ class SmartMicroscopyAssistant:
                 f"and expire 24 hours after completion. Start a fresh run via "
                 f"submit_inspect()."
             )
-        caller_id = _owner_from_context(context)
-        if job["owner"] != caller_id:
+        if job["owner"] != _job_owner_from_context(context):
             # A result can carry the criteria of a private visual test, so a
             # job is only readable by the identity that submitted it.
             raise PermissionError(f"Run {run_id!r} belongs to a different caller.")
