@@ -106,6 +106,18 @@ def _owner_from_context(context: Optional[Dict[str, Any]]) -> str:
     return _ANON_OWNER
 
 
+def _readable_workspaces(context: Optional[Dict[str, Any]]) -> set:
+    """Workspaces the caller may read, from the token scope Hypha injected.
+
+    Hypha builds `context` server-side from the caller's own token, so a
+    client can neither supply nor widen this. Permission letters are `r`,
+    `rw` and `a` (admin); anything else is no read.
+    """
+    scope = ((context or {}).get("user") or {}).get("scope") or {}
+    perms = scope.get("workspaces") or {}
+    return {ws for ws, perm in perms.items() if perm in ("r", "rw", "a")}
+
+
 def _test_id_for(owner: str, name: str) -> str:
     """Filesystem-safe per-owner test directory name.
 
@@ -154,6 +166,11 @@ class SmartMicroscopyAssistant:
         self._processor = None
         self._server = None
         self._artifact_manager = None
+        # Second, token-less Hypha connection. Used to resolve artifact refs
+        # the caller has no permission for, so those reach public artifacts
+        # and nothing else — see `_resolve_to_url`.
+        self._anon_server = None
+        self._anon_am = None
         self._tests_dir: Optional[Path] = None
         # Submitted inspect jobs, keyed by run id. In-memory and per replica:
         # a restart drops every id, which `get_inspect_status` says out loud.
@@ -219,11 +236,17 @@ class SmartMicroscopyAssistant:
 
     # ---------------------------------------------------------------- helpers
 
-    async def _ensure_artifact_manager(self) -> Any:
-        if self._artifact_manager is not None:
+    async def _ensure_artifact_manager(self, *, anonymous: bool = False) -> Any:
+        """An artifact-manager handle, reconnecting if the websocket went stale.
+
+        With ``anonymous=True`` the handle carries no token and so reaches
+        only publicly readable artifacts.
+        """
+        am = self._anon_am if anonymous else self._artifact_manager
+        if am is not None:
             try:
-                await self._artifact_manager.list(parent_id="public/applications")
-                return self._artifact_manager
+                await am.list(parent_id="public/applications")
+                return am
             except Exception as e:
                 msg = str(e)
                 if "Connection is closed" not in msg and "WebSocket" not in msg:
@@ -231,23 +254,42 @@ class SmartMicroscopyAssistant:
                 logger.warning("Hypha WS appears stale (%s); reconnecting", msg[:120])
 
         from hypha_rpc import connect_to_server
-        token = os.environ.get("HYPHA_TOKEN")
-        if not token:
-            raise RuntimeError("HYPHA_TOKEN environment variable is not set.")
+        config: Dict[str, Any] = {"server_url": _DEFAULT_SERVER_URL}
+        if not anonymous:
+            token = os.environ.get("HYPHA_TOKEN")
+            if not token:
+                raise RuntimeError("HYPHA_TOKEN environment variable is not set.")
+            config["token"] = token
+
+        stale = self._anon_server if anonymous else self._server
         try:
-            if self._server and hasattr(self._server, "disconnect"):
-                await self._server.disconnect()
+            if stale and hasattr(stale, "disconnect"):
+                await stale.disconnect()
         except Exception:
             pass
-        self._server = await connect_to_server({
-            "server_url": _DEFAULT_SERVER_URL,
-            "token": token,
-        })
-        self._artifact_manager = await self._server.get_service("public/artifact-manager")
-        logger.info("Re-connected Hypha artifact-manager.")
-        return self._artifact_manager
 
-    async def _resolve_to_url(self, image_ref: str) -> str:
+        server = await connect_to_server(config)
+        am = await server.get_service("public/artifact-manager")
+        if anonymous:
+            self._anon_server, self._anon_am = server, am
+        else:
+            self._server, self._artifact_manager = server, am
+        logger.info(
+            "Connected Hypha artifact-manager (%s).",
+            "anonymous" if anonymous else "app token",
+        )
+        return am
+
+    async def _resolve_to_url(self, image_ref: str, context=None) -> str:
+        """Turn an image reference into a fetchable URL.
+
+        An artifact ref is resolved with the app's own token only when the
+        caller could have read that workspace themselves; otherwise with no
+        token at all, so the ref reaches public artifacts and nothing more.
+        Resolving every caller-supplied ref with the app's token would make
+        this app a confused deputy — any caller could name any file the
+        app's token can read.
+        """
         if image_ref.startswith(("http://", "https://")):
             return image_ref
         if ":" not in image_ref or "/" not in image_ref.split(":", 1)[0]:
@@ -256,8 +298,19 @@ class SmartMicroscopyAssistant:
                 f"(got: {image_ref!r})"
             )
         artifact_id, file_path = image_ref.split(":", 1)
-        am = await self._ensure_artifact_manager()
-        url = await am.get_file(artifact_id=artifact_id, file_path=file_path)
+        workspace = artifact_id.split("/", 1)[0]
+        privileged = workspace in _readable_workspaces(context)
+
+        am = await self._ensure_artifact_manager(anonymous=not privileged)
+        try:
+            url = await am.get_file(artifact_id=artifact_id, file_path=file_path)
+        except Exception as e:
+            if privileged:
+                raise
+            raise PermissionError(
+                f"{image_ref!r} is not publicly readable, and the caller has no "
+                f"read permission on workspace {workspace!r}."
+            ) from e
         if not url:
             raise RuntimeError(
                 f"artifact-manager.get_file returned no URL for {image_ref!r}."
@@ -375,6 +428,7 @@ class SmartMicroscopyAssistant:
         test_dir: Path,
         side: str,                 # "positive" or "negative"
         image_refs: List[str],
+        context=None,
     ) -> tuple[list[str], list[str]]:
         from PIL import Image  # noqa: F401
 
@@ -382,7 +436,7 @@ class SmartMicroscopyAssistant:
         side_dir.mkdir(parents=True, exist_ok=True)
         rel_paths, source_urls = [], []
         for i, ref in enumerate(image_refs):
-            url = await self._resolve_to_url(ref)
+            url = await self._resolve_to_url(ref, context)
             img, _orig = await self._download_image(
                 url,
                 max_pixels=_EXAMPLE_MAX_PIXELS,
@@ -696,7 +750,8 @@ class SmartMicroscopyAssistant:
             description=(
                 "Optional 0–5 image references that should PASS. Each entry "
                 "can be an HTTPS URL or a Hypha artifact ref "
-                "'<workspace>/<alias>:<path>'. Omit for a text-only test."
+                "'<workspace>/<alias>:<path>', the latter resolvable only if "
+                "public or readable by you. Omit for a text-only test."
             ),
         ),
         negative_image_refs: list = Field(
@@ -753,10 +808,10 @@ class SmartMicroscopyAssistant:
         test_dir.mkdir(parents=True, exist_ok=True)
         try:
             pos_paths, pos_urls = await self._save_example_images(
-                test_dir, "positive", positive_image_refs,
+                test_dir, "positive", positive_image_refs, context,
             )
             neg_paths, neg_urls = await self._save_example_images(
-                test_dir, "negative", negative_image_refs,
+                test_dir, "negative", negative_image_refs, context,
             )
         except Exception:
             shutil.rmtree(test_dir, ignore_errors=True)
@@ -881,6 +936,7 @@ class SmartMicroscopyAssistant:
         instruction: Optional[str],
         visual_test: Optional[dict],
         max_new_tokens: int,
+        context=None,
     ) -> None:
         """Run one submitted inspection, recording its timeline on ``job``.
 
@@ -893,7 +949,7 @@ class SmartMicroscopyAssistant:
         try:
             job["state"] = "preprocess"
             job["preprocess_ts"] = time.time()
-            url = await self._resolve_to_url(image_ref)
+            url = await self._resolve_to_url(image_ref, context)
             image, original_size = await self._download_image(url)
 
             if visual_test is not None:
@@ -984,7 +1040,9 @@ class SmartMicroscopyAssistant:
         )
         job = self._new_job(caller_id)
         job["task"] = asyncio.create_task(
-            self._execute_inspect(job, image_ref, instruction, visual_test, max_new_tokens)
+            self._execute_inspect(
+                job, image_ref, instruction, visual_test, max_new_tokens, context,
+            )
         )
         return job
 
@@ -995,7 +1053,9 @@ class SmartMicroscopyAssistant:
             ...,
             description=(
                 "Image to inspect. HTTPS URL (public or presigned) or "
-                "Hypha artifact reference '<workspace>/<alias>:<path>'."
+                "Hypha artifact reference '<workspace>/<alias>:<path>'. An "
+                "artifact ref resolves only if the artifact is public or "
+                "you have read access to that workspace."
             ),
         ),
         instruction: Optional[str] = Field(
@@ -1093,7 +1153,9 @@ class SmartMicroscopyAssistant:
             ...,
             description=(
                 "Image to inspect. HTTPS URL (public or presigned) or "
-                "Hypha artifact reference '<workspace>/<alias>:<path>'."
+                "Hypha artifact reference '<workspace>/<alias>:<path>'. An "
+                "artifact ref resolves only if the artifact is public or "
+                "you have read access to that workspace."
             ),
         ),
         instruction: Optional[str] = Field(
