@@ -33,6 +33,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -52,6 +53,7 @@ _MAX_LONG_SIDE = 2048
 _HARD_REJECT_PIXELS = 200 * 1024 * 1024
 _DOWNLOAD_TIMEOUT_S = 30
 _GENERATE_TIMEOUT_S = 180
+_INSPECT_JOBS_TTL_SEC = 24 * 3600
 
 _EXAMPLE_MAX_PIXELS = 512 * 512
 _EXAMPLE_MAX_LONG_SIDE = 768
@@ -138,7 +140,9 @@ def _read_pip(name: str) -> List[str]:
         "HF_HOME": "/tmp/hf-home",
         "XDG_CACHE_HOME": "/tmp/xdg-cache",
     },
-    max_ongoing_requests=4,
+    # Generation is serialised by `_gpu_lock`, so this only has to be wide
+    # enough that status polls are never queued behind running inspections.
+    max_ongoing_requests=32,
     health_check_period_s=30.0,
     health_check_timeout_s=600.0,
     graceful_shutdown_timeout_s=120.0,
@@ -151,6 +155,13 @@ class SmartMicroscopyAssistant:
         self._server = None
         self._artifact_manager = None
         self._tests_dir: Optional[Path] = None
+        # Submitted inspect jobs, keyed by run id. In-memory and per replica:
+        # a restart drops every id, which `get_inspect_status` says out loud.
+        self._inspect_jobs: Dict[str, dict] = {}
+        # One generation at a time. Without it, concurrent `to_thread` calls
+        # contend for the same GPU and no caller can be told where it is in
+        # line — queue_position is only meaningful against a real queue.
+        self._gpu_lock = asyncio.Lock()
 
     @bioengine.async_init
     async def _async_init(self) -> None:
@@ -510,6 +521,108 @@ class SmartMicroscopyAssistant:
             reason = m2.group(1).strip()
         return verdict, reason
 
+    # ------------------------------------------------------------ job registry
+
+    def _sweep_expired_jobs(self) -> None:
+        """Drop finished jobs older than ``_INSPECT_JOBS_TTL_SEC``. Runs
+        opportunistically on each new submission.
+        """
+        now = time.time()
+        for run_id in [
+            rid for rid, j in self._inspect_jobs.items()
+            if j["completed_at"] is not None
+            and (now - j["completed_at"]) > _INSPECT_JOBS_TTL_SEC
+        ]:
+            self._inspect_jobs.pop(run_id, None)
+
+    def _new_job(self, owner: str) -> dict:
+        self._sweep_expired_jobs()
+        job = {
+            "job_id": f"ij-{uuid.uuid4().hex[:12]}",
+            "owner": owner,
+            "state": "queued",
+            "started_at": time.time(),
+            "completed_at": None,
+            "result": None,
+            # Kept so `inspect` can re-raise what a caller would have seen
+            # before the job split; `result["error"]` is the polled form.
+            "exception": None,
+            # Stage entry marks.
+            "preprocess_ts": None,
+            "running_ts": None,
+            # Execution start (queue position #0 reached).
+            "run_started_ts": None,
+            "task": None,
+        }
+        self._inspect_jobs[job["job_id"]] = job
+        return job
+
+    def _run_queue_position(self, job: dict) -> Optional[int]:
+        """0-based position in the GPU queue, or None when the job is not
+        currently in the ``running`` stage.
+
+        One ``_gpu_lock`` per replica, so this is a real FIFO queue: 0 = the
+        job holding the lock and generating now, N = N jobs ahead of it.
+        Rank by the *execution* signal (``run_started_ts``, stamped when the
+        lock is acquired), not by raw entry order — an asyncio lock is not
+        always granted in entry order, and the invariant that matters to a
+        caller is that a start timestamp exists iff position == 0.
+        """
+        if job["state"] != "running":
+            return None
+        if job["run_started_ts"] is not None:
+            return 0
+        ts = job["running_ts"]
+        ahead = 0
+        for other in self._inspect_jobs.values():
+            if other["state"] != "running":
+                continue
+            if other["run_started_ts"] is not None:
+                ahead += 1  # generating now, ahead of us
+            elif (
+                other["running_ts"] is not None
+                and ts is not None
+                and other["running_ts"] < ts
+            ):
+                ahead += 1  # queued before us, also waiting for the lock
+        return ahead
+
+    def _job_progress(self, job: dict) -> dict:
+        """Progress dict for an inspect job — a monotonic timeline bracketed
+        by ``submitted_at`` / ``completed_at``.
+
+        * ``state`` — ``queued``, ``preprocess``, ``running``, ``completed``
+          or ``failed``.
+        * ``result`` — the inspect result on success, ``{"error": str}`` on
+          failure, else None.
+        * ``stages`` — per-stage ``{start, end}`` map. ``preprocess`` (image
+          fetch and decode) carries no ``queue_position``: it is pure I/O and
+          runs concurrently. ``run`` does, and its ``start`` is the moment it
+          reached position #0, not when it joined the queue.
+        """
+        run_start = job["run_started_ts"]
+        if run_start is None and job["state"] in ("completed", "failed"):
+            # Finished before any poll caught it at position #0; fall back to
+            # its queue-entry mark so a terminal stage still reports a start.
+            run_start = job["running_ts"]
+        return {
+            "state": job["state"],
+            "submitted_at": job["started_at"],
+            "completed_at": job["completed_at"],
+            "result": job["result"],
+            "stages": {
+                "preprocess": {
+                    "start": job["preprocess_ts"],
+                    "end": job["running_ts"] or job["completed_at"],
+                },
+                "run": {
+                    "start": run_start,
+                    "end": job["completed_at"],
+                    "queue_position": self._run_queue_position(job),
+                },
+            },
+        }
+
     # ---------------------------------------------------------------- public API
 
     @bioengine.method
@@ -726,6 +839,236 @@ class SmartMicroscopyAssistant:
         shutil.rmtree(test_dir)
         logger.info("Deleted visual test %r (owner=%s)", name, caller_id)
         return {"name": name, "deleted": True}
+    # ------------------------------------------------------------ inspect path
+
+    @staticmethod
+    def _validate_inspect_args(
+        instruction: Optional[str],
+        visual_test_name: Optional[str],
+        max_new_tokens: int,
+    ) -> tuple[Optional[str], Optional[str], int]:
+        """Normalise and check the caller-facing inspect arguments.
+
+        Runs at submission time so a bad request fails on the submitting call
+        rather than surfacing seconds later in a status poll.
+        """
+        instruction = _arg(instruction, None)
+        visual_test_name = _arg(visual_test_name, None)
+        max_new_tokens = _arg(max_new_tokens, 512)
+
+        if not visual_test_name and not (isinstance(instruction, str) and instruction.strip()):
+            raise ValueError(
+                "Either `visual_test_name` or `instruction` must be provided."
+            )
+        if isinstance(instruction, str) and len(instruction) > _MAX_INSTRUCTION_CHARS:
+            raise ValueError(
+                f"instruction exceeds {_MAX_INSTRUCTION_CHARS}-char limit "
+                f"(got {len(instruction)})."
+            )
+        return instruction, visual_test_name, max_new_tokens
+
+    async def _execute_inspect(
+        self,
+        job: dict,
+        image_ref: str,
+        instruction: Optional[str],
+        visual_test: Optional[dict],
+        max_new_tokens: int,
+    ) -> None:
+        """Run one submitted inspection, recording its timeline on ``job``.
+
+        Never raises: a failure is recorded as ``{"error": …}`` on the job and
+        re-raised by ``inspect`` for callers that awaited it. A background
+        submission has nobody to receive an exception, and an unretrieved task
+        exception would only show up as noise in the replica log.
+        """
+        t0 = job["started_at"]
+        try:
+            job["state"] = "preprocess"
+            job["preprocess_ts"] = time.time()
+            url = await self._resolve_to_url(image_ref)
+            image, original_size = await self._download_image(url)
+
+            if visual_test is not None:
+                from PIL import Image
+                owner = visual_test.get("created_by", _ANON_OWNER)
+                test_dir = self._test_dir(owner, visual_test["name"])
+                pos_imgs = [Image.open(test_dir / p).convert("RGB")
+                            for p in visual_test.get("positive_images", [])]
+                neg_imgs = [Image.open(test_dir / p).convert("RGB")
+                            for p in visual_test.get("negative_images", [])]
+
+            job["state"] = "running"
+            job["running_ts"] = time.time()
+            async with self._gpu_lock:
+                job["run_started_ts"] = time.time()
+                t_gen0 = time.time()
+                if visual_test is not None:
+                    raw, n_tokens = await self._run_vlm_few_shot(
+                        new_image=image,
+                        visual_test=visual_test,
+                        positive_images=pos_imgs,
+                        negative_images=neg_imgs,
+                        max_new_tokens=max_new_tokens,
+                    )
+                else:
+                    raw, n_tokens = await self._run_vlm(image, instruction, max_new_tokens)
+                gen_dt = time.time() - t_gen0
+
+            if visual_test is not None:
+                verdict, reason = self._parse_verdict(raw)
+                result = {
+                    "mode": "few-shot",
+                    "visual_test_name": visual_test["name"],
+                    "pass_criterion": visual_test.get("pass_criterion", ""),
+                    "fail_criterion": visual_test.get("fail_criterion", ""),
+                    "verdict": verdict,
+                    "reason": reason,
+                    "description": raw,
+                    "n_positive_examples": visual_test.get("n_positive", 0),
+                    "n_negative_examples": visual_test.get("n_negative", 0),
+                }
+            else:
+                result = {"mode": "describe", "description": raw}
+
+            result.update({
+                "image_size": list(image.size),
+                "source_url": url,
+                "model": _MODEL_ID,
+                "tokens_generated": n_tokens,
+                "generation_time_s": round(gen_dt, 2),
+                "tokens_per_second": round(n_tokens / gen_dt, 2) if gen_dt > 0 else None,
+                "processing_time_s": round(time.time() - t0, 2),
+                "run_id": job["job_id"],
+            })
+            if original_size is not None:
+                result["downscaled_from"] = list(original_size)
+                result["downscale_note"] = (
+                    f"Image downscaled from {original_size[0]}x{original_size[1]} "
+                    f"to {image.size[0]}x{image.size[1]} before VLM."
+                )
+            job["result"] = result
+            job["state"] = "completed"
+        except Exception as exc:
+            job["exception"] = exc
+            job["result"] = {"error": f"{type(exc).__name__}: {exc}"}
+            job["state"] = "failed"
+            logger.exception("Inspect job %s failed", job["job_id"])
+        finally:
+            job["completed_at"] = time.time()
+
+    def _submit_inspect(
+        self,
+        image_ref: str,
+        instruction: Optional[str],
+        visual_test_name: Optional[str],
+        max_new_tokens: int,
+        context,
+    ) -> dict:
+        """Validate, register and start one inspect job. Returns the job."""
+        instruction, visual_test_name, max_new_tokens = self._validate_inspect_args(
+            instruction, visual_test_name, max_new_tokens
+        )
+        caller_id = _owner_from_context(context)
+        visual_test = (
+            self._find_test_for_caller(visual_test_name, caller_id)
+            if visual_test_name else None
+        )
+        job = self._new_job(caller_id)
+        job["task"] = asyncio.create_task(
+            self._execute_inspect(job, image_ref, instruction, visual_test, max_new_tokens)
+        )
+        return job
+
+    @bioengine.method(context=True)
+    async def submit_inspect(
+        self,
+        image_ref: str = Field(
+            ...,
+            description=(
+                "Image to inspect. HTTPS URL (public or presigned) or "
+                "Hypha artifact reference '<workspace>/<alias>:<path>'."
+            ),
+        ),
+        instruction: Optional[str] = Field(
+            None,
+            description=(
+                "Free-text instruction for describe mode. Required if "
+                "`visual_test_name` is not given. Max 4000 chars."
+            ),
+        ),
+        visual_test_name: Optional[str] = Field(
+            None,
+            description=(
+                "Name of a visual test created via create_visual_test. The "
+                "caller must either own the test or the test must be public."
+            ),
+        ),
+        max_new_tokens: int = Field(
+            512,
+            description="Maximum response tokens (1-1024).",
+            ge=1, le=1024,
+        ),
+        context=None,
+    ) -> str:
+        """
+        Schedule an inspection and return a run id immediately.
+
+        The inspection runs as a background job. This call returns right away
+        with just the ``run_id`` string; poll ``get_inspect_status(run_id)``
+        for the progress dict and, once the job finishes, the full result in
+        ``result``::
+
+            "ij-…"  # the returned run_id
+            # then poll get_inspect_status(run_id) →
+            # {"state": "running", "submitted_at": 1735689590.0,
+            #  "completed_at": None, "result": None,
+            #  "stages": {"preprocess": {...},
+            #             "run": {"start": None, "end": None,
+            #                     "queue_position": 2}}}
+
+        Bad arguments and an unknown or inaccessible ``visual_test_name``
+        raise here, not in the poll.
+
+        Use ``inspect`` instead when you are happy to hold the connection open
+        for the whole run — it submits and awaits with the same arguments.
+        """
+        return self._submit_inspect(
+            image_ref, instruction, visual_test_name, max_new_tokens, context
+        )["job_id"]
+
+    @bioengine.method(context=True)
+    async def get_inspect_status(
+        self,
+        run_id: str = Field(..., description="Id returned by `submit_inspect` ('ij-…')."),
+        context=None,
+    ) -> dict:
+        """
+        Progress and result for one submitted inspection.
+
+        ``state`` moves ``queued`` → ``preprocess`` → ``running`` →
+        ``completed`` / ``failed``. While a stage is queued its ``start`` is
+        None and ``queue_position`` says how many jobs are ahead in that
+        stage: 0 = generating now, N = N jobs ahead. Generation is serialised
+        on one GPU, so exactly one job reports 0.
+
+        Jobs are held for 24 hours after completion, then dropped. The
+        registry is per replica and in-memory — a job submitted to one replica
+        is unknown to the others, and a replica restart drops everything.
+        """
+        job = self._inspect_jobs.get(run_id)
+        if job is None:
+            raise KeyError(
+                f"Unknown run_id {run_id!r}. Jobs live in-memory per replica "
+                f"and expire 24 hours after completion. Start a fresh run via "
+                f"submit_inspect()."
+            )
+        caller_id = _owner_from_context(context)
+        if job["owner"] != caller_id:
+            # A result can carry the criteria of a private visual test, so a
+            # job is only readable by the identity that submitted it.
+            raise PermissionError(f"Run {run_id!r} belongs to a different caller.")
+        return self._job_progress(job)
 
     @bioengine.method(context=True)
     async def inspect(
@@ -758,83 +1101,18 @@ class SmartMicroscopyAssistant:
         ),
         context=None,
     ) -> dict:
-        """Inspect a microscopy image and return a QC judgement."""
-        t0 = time.time()
-        instruction = _arg(instruction, None)
-        visual_test_name = _arg(visual_test_name, None)
-        max_new_tokens = _arg(max_new_tokens, 512)
+        """Inspect a microscopy image and return a QC judgement.
 
-        if not visual_test_name and not (isinstance(instruction, str) and instruction.strip()):
-            raise ValueError(
-                "Either `visual_test_name` or `instruction` must be provided."
-            )
-        if isinstance(instruction, str):
-            if len(instruction) > _MAX_INSTRUCTION_CHARS:
-                raise ValueError(
-                    f"instruction exceeds {_MAX_INSTRUCTION_CHARS}-char limit "
-                    f"(got {len(instruction)})."
-                )
-
-        url = await self._resolve_to_url(image_ref)
-        image, original_size = await self._download_image(url)
-
-        if visual_test_name:
-            from PIL import Image
-            caller_id = _owner_from_context(context)
-            visual_test = self._find_test_for_caller(visual_test_name, caller_id)
-            owner = visual_test.get("created_by", _ANON_OWNER)
-            test_dir = self._test_dir(owner, visual_test_name)
-            pos_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test.get("positive_images", [])]
-            neg_imgs = [Image.open(test_dir / p).convert("RGB") for p in visual_test.get("negative_images", [])]
-
-            t_gen0 = time.time()
-            raw, n_tokens = await self._run_vlm_few_shot(
-                new_image=image,
-                visual_test=visual_test,
-                positive_images=pos_imgs,
-                negative_images=neg_imgs,
-                max_new_tokens=max_new_tokens,
-            )
-            gen_dt = time.time() - t_gen0
-            verdict, reason = self._parse_verdict(raw)
-            result = {
-                "mode": "few-shot",
-                "visual_test_name": visual_test_name,
-                "pass_criterion": visual_test.get("pass_criterion", ""),
-                "fail_criterion": visual_test.get("fail_criterion", ""),
-                "verdict": verdict,
-                "reason": reason,
-                "description": raw,
-                "n_positive_examples": visual_test.get("n_positive", 0),
-                "n_negative_examples": visual_test.get("n_negative", 0),
-                "image_size": list(image.size),
-                "source_url": url,
-                "model": _MODEL_ID,
-                "tokens_generated": n_tokens,
-                "generation_time_s": round(gen_dt, 2),
-                "tokens_per_second": round(n_tokens / gen_dt, 2) if gen_dt > 0 else None,
-                "processing_time_s": round(time.time() - t0, 2),
-            }
-        else:
-            t_gen0 = time.time()
-            description, n_tokens = await self._run_vlm(image, instruction, max_new_tokens)
-            gen_dt = time.time() - t_gen0
-            result = {
-                "mode": "describe",
-                "description": description,
-                "image_size": list(image.size),
-                "source_url": url,
-                "model": _MODEL_ID,
-                "tokens_generated": n_tokens,
-                "generation_time_s": round(gen_dt, 2),
-                "tokens_per_second": round(n_tokens / gen_dt, 2) if gen_dt > 0 else None,
-                "processing_time_s": round(time.time() - t0, 2),
-            }
-
-        if original_size is not None:
-            result["downscaled_from"] = list(original_size)
-            result["downscale_note"] = (
-                f"Image downscaled from {original_size[0]}x{original_size[1]} "
-                f"to {image.size[0]}x{image.size[1]} before VLM."
-            )
-        return result
+        Submits the same job as ``submit_inspect`` and waits for it, so the
+        connection stays open for the whole run — seconds to minutes when
+        others are queued ahead. Prefer ``submit_inspect`` +
+        ``get_inspect_status`` for anything that should see its queue
+        position, and for callers that would otherwise time out.
+        """
+        job = self._submit_inspect(
+            image_ref, instruction, visual_test_name, max_new_tokens, context
+        )
+        await job["task"]
+        if job.get("exception") is not None:
+            raise job["exception"]
+        return job["result"]

@@ -721,6 +721,8 @@
   .tile-badge.unsure .dot   { background: var(--on-unsure); }
   .tile-badge.analyzed { color: var(--fg); background: var(--accent-fill); border-color: var(--accent-edge); color: var(--on-info); }
   .tile-badge.analyzed .dot { background: var(--on-info); }
+  .tile-badge.queued   { color: var(--on-unsure); background: var(--unsure-fill); border-color: var(--unsure-edge); }
+  .tile-badge.queued .dot   { background: var(--on-unsure); animation: pulse 1.2s ease-in-out infinite; }
   .tile-badge.error    { color: var(--on-fail); background: var(--fail-fill); border-color: var(--fail-edge); }
   .tile-badge.error .dot    { background: var(--on-fail); }
 
@@ -1660,6 +1662,7 @@ const TEST_NAME_RE = /^[a-z0-9][a-z0-9-]{0,49}$/;
 const TOKEN_KEY    = "smart-microscopy-assistant:token";
 const TOKEN_EXPIRY = "smart-microscopy-assistant:tokenExpiry";
 const TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
+const POLL_INTERVAL_MS = 1000;
 
 document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
 for (const el of document.querySelectorAll(".exMax")) el.textContent = MAX_EXAMPLES_PER_CLASS;
@@ -1733,6 +1736,7 @@ const escapeHTML = s => String(s).replace(/[&<>"']/g, c => (
 ));
 const randomSuffix = () => Math.random().toString(36).slice(2, 10);
 const fileExt = f => (f.name.split(".").pop() || "bin").toLowerCase();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 const fmtBytes = n => n < 1024 ? n + " B"
   : n < 1048576 ? (n / 1024).toFixed(0) + " KB" : (n / 1048576).toFixed(1) + " MB";
 const tilesFor = side =>
@@ -2395,7 +2399,21 @@ function makeTileNode(tile) {
 
 function applyBadge(node, tile) {
   const badge = node.querySelector(".tile-badge");
-  badge.classList.remove("shown", "passed", "failed", "unsure", "analyzed", "error");
+  badge.classList.remove("shown", "passed", "failed", "unsure", "analyzed", "error", "queued");
+  // A queued tile is the one case where the badge is shown mid-run: the wait
+  // is not ours and the user has no other way to see it.
+  if (tile.state === "analyzing" && tile.queuePos) {
+    badge.classList.add("queued", "shown");
+    badge.textContent = "";
+    const qdot = document.createElement("span");
+    qdot.className = "dot";
+    badge.appendChild(qdot);
+    const qlabel = document.createElement("span");
+    qlabel.className = "badge-text";
+    qlabel.textContent = `Queued #${tile.queuePos}`;
+    badge.appendChild(qlabel);
+    return;
+  }
   if (tile.state !== "done" && tile.state !== "error") return;
 
   let cls = "analyzed", text = "Analyzed";
@@ -2690,6 +2708,7 @@ async function runPipeline() {
 
   async function runVlmForTile(tile) {
     tile.state = "analyzing";
+    tile.queuePos = null;
     renderGrid("analyze");
     setRun("busy", `Analyzing ${tile.file.name}`);
     try {
@@ -2700,7 +2719,26 @@ async function runPipeline() {
       };
       if (visualTest) callArgs.visual_test_name = visualTest;
       else            callArgs.instruction = instruction;
-      const res = await qcSvc.inspect(callArgs);
+      // Submit and poll rather than holding one RPC open: other users and
+      // microscopes share the single GPU, so a caller can be queued behind
+      // work it did not submit and needs to see where it is in line.
+      const jobId = await qcSvc.submit_inspect(callArgs);
+      tile.jobId = jobId;
+      let st;
+      for (;;) {
+        st = await qcSvc.get_inspect_status({ run_id: jobId, _rkwargs: true });
+        if (st.state === "completed" || st.state === "failed") break;
+        const pos = st.stages?.run?.queue_position;
+        tile.queuePos = (typeof pos === "number" && pos > 0) ? pos : null;
+        renderGrid("analyze");
+        setRun("busy", tile.queuePos
+          ? `Queued #${tile.queuePos} — ${tile.file.name}`
+          : `Analyzing ${tile.file.name}`);
+        await sleep(POLL_INTERVAL_MS);
+      }
+      tile.queuePos = null;
+      if (st.state === "failed") throw new Error(st.result?.error || "Inspection failed.");
+      const res = st.result;
       tile.result = res;
       tile.mode = res.mode || "describe";
       tile.state = "done";
@@ -2714,6 +2752,7 @@ async function runPipeline() {
       log(`inspect(${tile.file.name}): ${tile.mode === "few-shot" ? (res.verdict || "unsure") : "described"} in ${res.generation_time_s}s`, "ok");
     } catch (err) {
       tile.state = "error";
+      tile.queuePos = null;
       tile.error = err.message || String(err);
       vlmErrs++;
       batchErrors.push({ stage: "inspect", file: tile.file.name, detail: formatErr(err) });
