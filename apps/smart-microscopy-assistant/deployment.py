@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional
 
 import bioengine
 from pydantic import Field
+from pydantic.fields import FieldInfo
 
 logger = bioengine.logger
 
@@ -74,25 +75,32 @@ def _resolve_tests_dir() -> Path:
     return Path("/tmp") / "smart-microscopy-assistant" / "visual_tests"
 
 
-def _owner_from_context(
-    context: Optional[Dict[str, Any]],
-    caller_user_id: Optional[str] = None,
-) -> str:
-    """Resolve the caller's stable user id.
+def _arg(value: Any, default: Any) -> Any:
+    """Resolve an optional parameter the caller may have omitted.
 
-    Today the BioEngine proxy consumes Hypha's `require_context` payload at
-    its outer wrapper and does NOT forward it to the deployment method, so
-    `context` here is almost always None. As a pragmatic fix we let the
-    client also pass `caller_user_id` (the workspace name doubles as a
-    stable Hypha identity, e.g. 'ws-user-github|49943582'). Resolution
-    order: explicit caller_user_id -> context -> "anonymous".
+    ``@bioengine.method(context=True)`` skips pydantic on the replica side,
+    so an omitted parameter arrives as the raw ``FieldInfo`` sentinel from
+    the signature instead of its declared default (bioengine 0.16.2).
     """
-    if isinstance(caller_user_id, str) and caller_user_id.strip():
-        return caller_user_id.strip()
-    if isinstance(context, dict) and isinstance(context.get("user"), dict):
-        uid = context["user"].get("id")
-        if isinstance(uid, str) and uid:
-            return uid
+    return default if isinstance(value, FieldInfo) else value
+
+
+def _owner_from_context(context: Optional[Dict[str, Any]]) -> str:
+    """Resolve the caller's stable identity from the injected Hypha context.
+
+    Email first, id second: `user.id` is the token's `sub`, which is a
+    per-token synthetic id for API-token callers (it is only stable for
+    browser logins), so keying a library on it would strand a user's tests
+    every time they mint a new token. Anonymous callers share one bucket and
+    therefore can never own a test.
+    """
+    user = (context or {}).get("user") or {}
+    if user.get("is_anonymous"):
+        return _ANON_OWNER
+    for key in ("email", "id"):
+        value = user.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return _ANON_OWNER
 
 
@@ -120,7 +128,7 @@ def _read_pip(name: str) -> List[str]:
 
 @bioengine.app(
     num_cpus=4,
-    num_gpus=1,
+    gpu_memory_mb=-1,
     memory_mb=12 * 1024,
     pip=_read_pip("requirements-deployment.txt"),
     env_vars={
@@ -537,7 +545,7 @@ class SmartMicroscopyAssistant:
 
     # ----------------------------------------------- visual-test management
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def create_visual_test(
         self,
         name: str = Field(
@@ -586,23 +594,14 @@ class SmartMicroscopyAssistant:
                 "use it. Delete is owner-only regardless."
             ),
         ),
-        caller_user_id: Optional[str] = Field(
-            None,
-            description=(
-                "Stable Hypha user / workspace id of the caller. The "
-                "BioEngine proxy currently does not forward Hypha's auth "
-                "context to deployment methods, so the client must pass "
-                "this explicitly to participate in ownership/visibility. "
-                "Falls back to context.user.id then 'anonymous'."
-            ),
-        ),
-        context: Optional[Dict[str, Any]] = Field(
-            None,
-            description="Authentication context, automatically provided by Hypha.",
-        ),
+        context=None,
     ) -> dict:
         """Define or replace one of your visual tests."""
-        owner = _owner_from_context(context, caller_user_id)
+        positive_image_refs = _arg(positive_image_refs, [])
+        negative_image_refs = _arg(negative_image_refs, [])
+        is_public = _arg(is_public, False)
+
+        owner = _owner_from_context(context)
         if not _TEST_NAME_RE.match(name):
             raise ValueError(
                 f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
@@ -665,18 +664,8 @@ class SmartMicroscopyAssistant:
         )
         return record
 
-    @bioengine.method
-    async def list_visual_tests(
-        self,
-        caller_user_id: Optional[str] = Field(
-            None,
-            description="Stable Hypha user / workspace id of the caller.",
-        ),
-        context: Optional[Dict[str, Any]] = Field(
-            None,
-            description="Authentication context, automatically provided by Hypha.",
-        ),
-    ) -> list:
+    @bioengine.method(context=True)
+    async def list_visual_tests(self, context=None) -> list:
         """List visual tests visible to the caller.
 
         Returns: the caller's own tests + every public test (regardless of
@@ -684,7 +673,7 @@ class SmartMicroscopyAssistant:
         `owned_by_you` boolean so the UI can branch on it without computing
         the comparison itself.
         """
-        caller_id = _owner_from_context(context, caller_user_id)
+        caller_id = _owner_from_context(context)
         out = []
         for rec in self._list_all_test_records():
             owner = rec.get("created_by", _ANON_OWNER)
@@ -695,41 +684,27 @@ class SmartMicroscopyAssistant:
                 out.append(rec)
         return out
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def get_visual_test(
         self,
         name: str = Field(..., description="Visual-test identifier."),
-        caller_user_id: Optional[str] = Field(
-            None,
-            description="Stable Hypha user / workspace id of the caller.",
-        ),
-        context: Optional[Dict[str, Any]] = Field(
-            None,
-            description="Authentication context, automatically provided by Hypha.",
-        ),
+        context=None,
     ) -> dict:
         """Return one visual-test record visible to the caller."""
-        caller_id = _owner_from_context(context, caller_user_id)
+        caller_id = _owner_from_context(context)
         rec = dict(self._find_test_for_caller(name, caller_id))
         rec["owned_by_you"] = (rec.get("created_by") == caller_id)
         return rec
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def delete_visual_test(
         self,
         name: str = Field(..., description="Visual-test identifier."),
-        caller_user_id: Optional[str] = Field(
-            None,
-            description="Stable Hypha user / workspace id of the caller.",
-        ),
-        context: Optional[Dict[str, Any]] = Field(
-            None,
-            description="Authentication context, automatically provided by Hypha.",
-        ),
+        context=None,
     ) -> dict:
         """Delete one of YOUR visual tests. Refuses to delete another user's."""
         import shutil
-        caller_id = _owner_from_context(context, caller_user_id)
+        caller_id = _owner_from_context(context)
         if not _TEST_NAME_RE.match(name):
             raise ValueError(
                 f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
@@ -752,7 +727,7 @@ class SmartMicroscopyAssistant:
         logger.info("Deleted visual test %r (owner=%s)", name, caller_id)
         return {"name": name, "deleted": True}
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def inspect(
         self,
         image_ref: str = Field(
@@ -781,17 +756,13 @@ class SmartMicroscopyAssistant:
             description="Maximum response tokens (1-1024).",
             ge=1, le=1024,
         ),
-        caller_user_id: Optional[str] = Field(
-            None,
-            description="Stable Hypha user / workspace id of the caller.",
-        ),
-        context: Optional[Dict[str, Any]] = Field(
-            None,
-            description="Authentication context, automatically provided by Hypha.",
-        ),
+        context=None,
     ) -> dict:
         """Inspect a microscopy image and return a QC judgement."""
         t0 = time.time()
+        instruction = _arg(instruction, None)
+        visual_test_name = _arg(visual_test_name, None)
+        max_new_tokens = _arg(max_new_tokens, 512)
 
         if not visual_test_name and not (isinstance(instruction, str) and instruction.strip()):
             raise ValueError(
@@ -809,7 +780,7 @@ class SmartMicroscopyAssistant:
 
         if visual_test_name:
             from PIL import Image
-            caller_id = _owner_from_context(context, caller_user_id)
+            caller_id = _owner_from_context(context)
             visual_test = self._find_test_for_caller(visual_test_name, caller_id)
             owner = visual_test.get("created_by", _ANON_OWNER)
             test_dir = self._test_dir(owner, visual_test_name)

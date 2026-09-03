@@ -1646,9 +1646,7 @@ let cachedTests = [];
 async function refreshTests({ popupOnError = false } = {}) {
   if (!qcSvc) return;
   try {
-    cachedTests = await qcSvc.list_visual_tests({
-      caller_user_id: userWorkspace, _rkwargs: true,
-    });
+    cachedTests = await qcSvc.list_visual_tests();
     log(`Loaded ${cachedTests.length} visual test${cachedTests.length === 1 ? "" : "s"}.`);
   } catch (err) {
     cachedTests = [];
@@ -1796,9 +1794,7 @@ function refreshTestList() {
         if (!ok) return;
         del.disabled = true;
         try {
-          await qcSvc.delete_visual_test({
-            name: t.name, caller_user_id: userWorkspace, _rkwargs: true,
-          });
+          await qcSvc.delete_visual_test({ name: t.name, _rkwargs: true });
           log(`Deleted visual test '${t.name}'.`, "ok");
         } catch (err) {
           log(`delete_visual_test(${t.name}) error: ${err.message || err}`, "err");
@@ -2312,7 +2308,6 @@ async function runPipeline() {
       const callArgs = {
         image_ref: tile.remoteUrl,
         max_new_tokens: 512,
-        caller_user_id: userWorkspace,
         _rkwargs: true,
       };
       if (visualTest) callArgs.visual_test_name = visualTest;
@@ -2613,7 +2608,6 @@ $("defineBtn").addEventListener("click", async () => {
       positive_image_refs: posUrls,
       negative_image_refs: negUrls,
       is_public: defineIsPublic,
-      caller_user_id: userWorkspace,
       _rkwargs: true,
     });
     setDefine("ok", "Saved");
