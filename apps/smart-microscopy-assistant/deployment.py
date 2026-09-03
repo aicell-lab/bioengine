@@ -423,18 +423,36 @@ class SmartMicroscopyAssistant:
                 return rec
         raise ValueError(f"visual test {name!r} not found or not accessible.")
 
+    @staticmethod
+    def _view_for_caller(rec: dict, caller_id: str) -> dict:
+        """The record as this caller may see it.
+
+        Source refs are owner-only: a caller-supplied `https://` ref can be a
+        presigned URL, i.e. a bearer capability for a file the reader has no
+        permission on. Running a public test needs only the saved copies.
+        """
+        rec = dict(rec)
+        owned = rec.get("created_by") == caller_id
+        rec["owned_by_you"] = owned
+        if not owned:
+            rec.pop("positive_refs", None)
+            rec.pop("negative_refs", None)
+            rec.pop("positive_source_urls", None)
+            rec.pop("negative_source_urls", None)
+        return rec
+
     async def _save_example_images(
         self,
         test_dir: Path,
         side: str,                 # "positive" or "negative"
         image_refs: List[str],
         context=None,
-    ) -> tuple[list[str], list[str]]:
+    ) -> list[str]:
         from PIL import Image  # noqa: F401
 
         side_dir = test_dir / side
         side_dir.mkdir(parents=True, exist_ok=True)
-        rel_paths, source_urls = [], []
+        rel_paths = []
         for i, ref in enumerate(image_refs):
             url = await self._resolve_to_url(ref, context)
             img, _orig = await self._download_image(
@@ -445,8 +463,7 @@ class SmartMicroscopyAssistant:
             filename = f"{i:02d}.png"
             img.save(side_dir / filename, format="PNG")
             rel_paths.append(f"{side}/{filename}")
-            source_urls.append(url)
-        return rel_paths, source_urls
+        return rel_paths
 
     _SYSTEM_PROMPT_DESCRIBE = (
         "You are a microscopy image analyst. Answer the user's question "
@@ -807,10 +824,10 @@ class SmartMicroscopyAssistant:
             shutil.rmtree(test_dir)
         test_dir.mkdir(parents=True, exist_ok=True)
         try:
-            pos_paths, pos_urls = await self._save_example_images(
+            pos_paths = await self._save_example_images(
                 test_dir, "positive", positive_image_refs, context,
             )
-            neg_paths, neg_urls = await self._save_example_images(
+            neg_paths = await self._save_example_images(
                 test_dir, "negative", negative_image_refs, context,
             )
         except Exception:
@@ -823,8 +840,8 @@ class SmartMicroscopyAssistant:
             "fail_criterion": fail_criterion.strip(),
             "positive_images": pos_paths,
             "negative_images": neg_paths,
-            "positive_source_urls": pos_urls,
-            "negative_source_urls": neg_urls,
+            "positive_refs": list(positive_image_refs),
+            "negative_refs": list(negative_image_refs),
             "n_positive": len(pos_paths),
             "n_negative": len(neg_paths),
             "is_public": bool(is_public),
@@ -846,17 +863,14 @@ class SmartMicroscopyAssistant:
         Returns: the caller's own tests + every public test (regardless of
         owner). Each record carries `is_public`, `created_by`, and an
         `owned_by_you` boolean so the UI can branch on it without computing
-        the comparison itself.
+        the comparison itself. Source refs appear only on your own tests.
         """
         caller_id = _owner_from_context(context)
         out = []
         for rec in self._list_all_test_records():
             owner = rec.get("created_by", _ANON_OWNER)
-            is_public = bool(rec.get("is_public"))
-            if owner == caller_id or is_public:
-                rec = dict(rec)
-                rec["owned_by_you"] = (owner == caller_id)
-                out.append(rec)
+            if owner == caller_id or bool(rec.get("is_public")):
+                out.append(self._view_for_caller(rec, caller_id))
         return out
 
     @bioengine.method(context=True)
@@ -865,11 +879,15 @@ class SmartMicroscopyAssistant:
         name: str = Field(..., description="Visual-test identifier."),
         context=None,
     ) -> dict:
-        """Return one visual-test record visible to the caller."""
+        """Return one visual-test record visible to the caller.
+
+        Source refs appear only on your own tests; they are what
+        `create_visual_test` accepts, so a record you own round-trips.
+        """
         caller_id = _owner_from_context(context)
-        rec = dict(self._find_test_for_caller(name, caller_id))
-        rec["owned_by_you"] = (rec.get("created_by") == caller_id)
-        return rec
+        return self._view_for_caller(
+            self._find_test_for_caller(name, caller_id), caller_id
+        )
 
     @bioengine.method(context=True)
     async def delete_visual_test(
