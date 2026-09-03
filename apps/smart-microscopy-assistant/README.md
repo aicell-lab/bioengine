@@ -120,17 +120,25 @@ If a visual test isn't discriminating well: tighten the `description` (it goes i
 
 | Method | Description |
 |---|---|
-| `create_visual_test(name, description, positive_image_refs, negative_image_refs)` | Define or replace a visual test. References can be HTTPS URLs (public or presigned) or Hypha artifact refs. Images are downloaded, downscaled (capped at ~512×512), and persisted to `$HOME/visual_tests/<name>/`. |
-| `list_visual_tests()` | List all visual tests on this replica. |
-| `get_visual_test(name)` | Return one visual test's full record. |
-| `delete_visual_test(name)` | Remove a visual test and its cached reference images. |
+| `create_visual_test(name, pass_criterion, fail_criterion, positive_image_refs, negative_image_refs, is_public=False)` | Define or replace one of *your* visual tests. References can be HTTPS URLs (public or presigned) or Hypha artifact refs. Images are downloaded, downscaled (capped at ~512×512), and persisted under your own directory. |
+| `list_visual_tests()` | Your own tests plus every public test. Each record carries `created_by`, `is_public`, and `owned_by_you`. |
+| `get_visual_test(name)` | One record you can see — your own test of that name wins over a public one. |
+| `delete_visual_test(name)` | Remove one of your own tests and its cached images. Owner-only, even for public tests. |
 
 Limits enforced by `create_visual_test`:
 
-- `1 ≤ N_positive ≤ 5`, `1 ≤ N_negative ≤ 5`. More examples eat the model's context budget without improving few-shot quality.
-- `name` must match `^[a-z0-9][a-z0-9-]{0,49}$`.
-- `description` ≤ 800 characters.
+- `0 ≤ N_positive ≤ 5`, `0 ≤ N_negative ≤ 5`. Omit both for a text-only test; more than five examples eat the model's context budget without improving few-shot quality.
+- `name` must match `^[a-z0-9][a-z0-9-]{0,49}$`. Two users can hold the same name without colliding; re-using your own overwrites.
+- `pass_criterion` and `fail_criterion` ≤ 800 characters each.
 - Each reference image is fetched once and stored at ≤ 512×512 to keep the prompt's image-token cost bounded.
+
+#### Ownership and visibility
+
+Every test is owned by the identity Hypha reports for the caller — email where the token carries one, otherwise the user id. Tests are private by default; `is_public=True` makes a test listable and usable by everyone, but never deletable or overwritable by anyone but its owner. Source image refs (`positive_refs`/`negative_refs`) are returned **only to the owner**: a caller-supplied `https://` ref may be a presigned URL, which is a bearer capability for a file the reader has no permission on, so handing it to every reader of a public test would route around the permission check that accepted it.
+
+**Changed in 0.11.0 — anonymous callers no longer share one library.** Before 0.11.0, every unauthenticated caller was keyed to the single owner string `"anonymous"`, so any two anonymous callers were the same principal: each could read, overwrite, and delete the others' private tests, and every record reported `owned_by_you: True` to a non-creator. Anonymous callers are now keyed on the throwaway workspace Hypha allocates per connection, so each is a distinct principal — and an anonymous caller's tests are no longer reachable after that connection closes.
+
+That last clause is a real capability removal, so it is worth being explicit about whether anyone was relying on it. As far as we can tell, no one was: the shared pool held no public tests at the time of the change, and the browser UI has never had an anonymous path — `connectToServer` is called from exactly one place, behind a token, and a visitor without one gets a login gate. So the pool was only ever reachable by direct RPC. We cannot enumerate *private* anonymous records to prove the negative outright, but there is no path by which a UI user could have created one. Our reading is that the shared pool was speculative rather than load-bearing.
 
 Persistence: visual tests live under `$HOME/visual_tests/` on the replica's filesystem. On the KTH BioEngine worker (and any worker whose `apps_workdir` resolves to PVC-backed storage), that directory is mounted from a persistent volume — the per-app working directory is the same path across actor restarts, pod rolls, and full stop+deploy cycles. Empirically verified by creating a visual test, performing `stop_app → deploy_app` (fresh deploy, `recovered_app=False`), and seeing the test still present on the new actor.
 
