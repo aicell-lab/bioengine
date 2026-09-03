@@ -45,6 +45,8 @@ logger = bioengine.logger
 
 _MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
 _DEFAULT_SERVER_URL = "https://hypha.aicell.io"
+# This app's own (public) artifact — the smoke test resolves a fixture from it.
+_SELF_ARTIFACT = "bioimage-io/smart-microscopy-assistant"
 
 _MAX_IMAGE_BYTES = 25 * 1024 * 1024
 _MAX_INSTRUCTION_CHARS = 4000
@@ -64,9 +66,9 @@ _MAX_TEST_DESC_CHARS = 800
 _TEST_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,49}$")
 _VERDICT_VALUES = ("passed", "failed", "unsure")
 
-# Reserved owner id for the case where Hypha did not inject a user context
-# (e.g. direct calls bypassing Hypha auth). Tests created under this id are
-# treated as system-owned and cannot be deleted from the UI.
+# Prefix for callers Hypha did not authenticate; the connection's throwaway
+# workspace is appended so each anonymous caller is a distinct principal. Bare
+# `_ANON_OWNER` is only reached when no context arrived at all.
 _ANON_OWNER = "anonymous"
 
 
@@ -93,31 +95,20 @@ def _owner_from_context(context: Optional[Dict[str, Any]]) -> str:
     Email first, id second: `user.id` is the token's `sub`, which is a
     per-token synthetic id for API-token callers (it is only stable for
     browser logins), so keying a library on it would strand a user's tests
-    every time they mint a new token. Anonymous callers share one bucket and
-    therefore can never own a test.
+    every time they mint a new token.
+
+    Anonymous callers get the throwaway workspace Hypha allocates per
+    connection, so each is its own principal. They used to share one bucket,
+    which silently made every ownership check between two anonymous callers
+    compare a constant against itself.
     """
-    user = (context or {}).get("user") or {}
-    if user.get("is_anonymous"):
-        return _ANON_OWNER
-    for key in ("email", "id"):
-        value = user.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return _ANON_OWNER
-
-
-def _job_owner_from_context(context: Optional[Dict[str, Any]]) -> str:
-    """Identity for owning an inspect job — stricter than test ownership.
-
-    Tests deliberately put every anonymous caller in one shared bucket, but a
-    job carries the caller's own data, so sharing a bucket would let any
-    anonymous caller read another's result. Hypha gives each anonymous
-    connection its own throwaway workspace, so key on that instead.
-    """
-    owner = _owner_from_context(context)
-    if owner != _ANON_OWNER:
-        return owner
     ctx = context or {}
+    user = ctx.get("user") or {}
+    if not user.get("is_anonymous"):
+        for key in ("email", "id"):
+            value = user.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     for value in (ctx.get("ws"), ctx.get("from")):
         if isinstance(value, str) and value.strip():
             return f"{_ANON_OWNER}:{value.strip()}"
@@ -243,7 +234,33 @@ class SmartMicroscopyAssistant:
 
     @bioengine.smoke_test
     async def _smoke_test(self) -> None:
-        return None
+        """Assert a stored ref is byte-identical to the one the caller passed.
+
+        Resolving a ref yields a presigned URL — a credential — so storing
+        the resolved form instead of the ref has leaked private files through
+        shared records twice. "Holds no credential" is not something a test
+        can check directly, but equality with the caller's own input is, and
+        it fails the moment a resolve-then-store comes back.
+        """
+        ref = f"{_SELF_ARTIFACT}:fixtures/pixel.png"
+        name = "smoke-ref-invariant"
+        try:
+            rec = await self.create_visual_test(
+                name=name,
+                pass_criterion="smoke test",
+                fail_criterion="smoke test",
+                positive_image_refs=[ref],
+                negative_image_refs=[],
+            )
+            if rec.get("positive_refs") != [ref]:
+                raise AssertionError(
+                    f"stored ref is not the caller's: {rec.get('positive_refs')!r}"
+                )
+        finally:
+            try:
+                await self.delete_visual_test(name=name)
+            except Exception:
+                logger.warning("smoke test could not clean up %r", name)
 
     @bioengine.health_check
     async def _health_check(self) -> None:
@@ -1076,7 +1093,7 @@ class SmartMicroscopyAssistant:
             self._find_test_for_caller(visual_test_name, caller_id)
             if visual_test_name else None
         )
-        job = self._new_job(_job_owner_from_context(context))
+        job = self._new_job(caller_id)
         job["task"] = asyncio.create_task(
             self._execute_inspect(
                 job, image_ref, instruction, visual_test, max_new_tokens, context,
@@ -1177,7 +1194,7 @@ class SmartMicroscopyAssistant:
                 f"and expire 24 hours after completion. Start a fresh run via "
                 f"submit_inspect()."
             )
-        if job["owner"] != _job_owner_from_context(context):
+        if job["owner"] != _owner_from_context(context):
             # A result can carry the criteria of a private visual test, so a
             # job is only readable by the identity that submitted it.
             raise PermissionError(f"Run {run_id!r} belongs to a different caller.")
