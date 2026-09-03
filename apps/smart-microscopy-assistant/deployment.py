@@ -969,6 +969,10 @@ class SmartMicroscopyAssistant:
             "n_positive": len(pos_paths),
             "n_negative": len(neg_paths),
             "is_public": bool(is_public),
+            # Both server-derived, and the app's only write of them. `_owns`
+            # honours a legacy owner key below the cutover, so any later path
+            # that carried a caller's `created_by`/`created_at` in from a blob
+            # (an import, say) would restore the self-assertion 0.7.0 removed.
             "created_by": owner,
             "created_at": time.time(),
         }
