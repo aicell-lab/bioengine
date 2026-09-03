@@ -71,6 +71,12 @@ _VERDICT_VALUES = ("passed", "failed", "unsure")
 # `_ANON_OWNER` is only reached when no context arrived at all.
 _ANON_OWNER = "anonymous"
 
+# Hypha names every user's personal workspace `ws-user-<user id>`, and that
+# name is 1:1 with a human. Shared workspaces (`bioimage-io`, …) do not match,
+# which is what keeps the legacy alias below from turning workspace membership
+# into record ownership.
+_PERSONAL_WS_RE = re.compile(r"^ws-user-.+")
+
 
 def _resolve_tests_dir() -> Path:
     home = os.environ.get("HOME", "")
@@ -113,6 +119,38 @@ def _owner_from_context(context: Optional[Dict[str, Any]]) -> str:
         if isinstance(value, str) and value.strip():
             return f"{_ANON_OWNER}:{value.strip()}"
     return _ANON_OWNER
+
+
+def _owner_keys(context: Optional[Dict[str, Any]]) -> List[str]:
+    """Every key this caller may own records under, most current first.
+
+    New records are always written under `_owner_from_context`. This adds the
+    keys used by *older* versions of the app, so a record does not become
+    unreachable to the person who created it when the scheme changes.
+
+    Only one legacy key is honoured: the caller's own personal workspace.
+    Before 0.7.0 the owner was a `caller_user_id` the client passed in, and
+    clients passed their workspace name. That value was self-asserted, so it
+    is not trustworthy in general -- but Hypha assigns `ctx["ws"]`, and a
+    personal workspace is 1:1 with a human, so matching against *that* is a
+    check on Hypha's word rather than on the record's. Shared workspaces are
+    excluded: aliasing one would make every member an owner of its records.
+
+    Anonymous callers get no legacy key on purpose. Pre-0.11.0 anonymous
+    records were all written under the bare string `"anonymous"`, which
+    identifies nobody; honouring it would hand every anonymous caller the
+    whole pre-0.11.0 anonymous pool and undo the 0.11.0 fix.
+    """
+    keys = [_owner_from_context(context)]
+    ctx = context or {}
+    user = ctx.get("user") or {}
+    if not user.get("is_anonymous"):
+        ws = ctx.get("ws")
+        if isinstance(ws, str) and _PERSONAL_WS_RE.match(ws.strip()):
+            ws = ws.strip()
+            if ws not in keys:
+                keys.append(ws)
+    return keys
 
 
 def _readable_workspaces(context: Optional[Dict[str, Any]]) -> set:
@@ -441,25 +479,26 @@ class SmartMicroscopyAssistant:
                 logger.warning("Skipping corrupt visual test %s: %s", child.name, e)
         return out
 
-    def _find_test_for_caller(self, name: str, caller_id: str) -> dict:
+    def _find_test_for_caller(self, name: str, caller_keys: List[str]) -> dict:
         """Return the most specific accessible record for a given test name.
 
         Resolution order:
-          1. caller's own test (highest priority — your private one wins over
-             a public one with the same name)
+          1. caller's own test under any key they own (highest priority — your
+             private one wins over a public one with the same name)
           2. any public test with that name
         """
-        own = self._test_json_path(caller_id, name)
-        if own.exists():
-            with open(own, "r") as f:
-                return json.load(f)
+        for key in caller_keys:
+            own = self._test_json_path(key, name)
+            if own.exists():
+                with open(own, "r") as f:
+                    return json.load(f)
         for rec in self._list_all_test_records():
             if rec.get("name") == name and bool(rec.get("is_public")):
                 return rec
         raise ValueError(f"visual test {name!r} not found or not accessible.")
 
     @staticmethod
-    def _view_for_caller(rec: dict, caller_id: str) -> dict:
+    def _view_for_caller(rec: dict, caller_keys: List[str]) -> dict:
         """The record as this caller may see it.
 
         Source refs are owner-only: a caller-supplied `https://` ref can be a
@@ -467,7 +506,7 @@ class SmartMicroscopyAssistant:
         permission on. Running a public test needs only the saved copies.
         """
         rec = dict(rec)
-        owned = rec.get("created_by") == caller_id
+        owned = rec.get("created_by") in caller_keys
         rec["owned_by_you"] = owned
         if not owned:
             rec.pop("positive_refs", None)
@@ -854,6 +893,11 @@ class SmartMicroscopyAssistant:
                 )
 
         import shutil
+        # Re-using your own name overwrites — including a copy of it still
+        # filed under an older ownership key, so the library converges on the
+        # current scheme instead of showing the same name twice.
+        for stale in _owner_keys(context)[1:]:
+            shutil.rmtree(self._test_dir(stale, name), ignore_errors=True)
         test_dir = self._test_dir(owner, name)
         if test_dir.exists():
             shutil.rmtree(test_dir)
@@ -900,12 +944,12 @@ class SmartMicroscopyAssistant:
         `owned_by_you` boolean so the UI can branch on it without computing
         the comparison itself. Source refs appear only on your own tests.
         """
-        caller_id = _owner_from_context(context)
+        caller_keys = _owner_keys(context)
         out = []
         for rec in self._list_all_test_records():
             owner = rec.get("created_by", _ANON_OWNER)
-            if owner == caller_id or bool(rec.get("is_public")):
-                out.append(self._view_for_caller(rec, caller_id))
+            if owner in caller_keys or bool(rec.get("is_public")):
+                out.append(self._view_for_caller(rec, caller_keys))
         return out
 
     @bioengine.method(context=True)
@@ -919,9 +963,9 @@ class SmartMicroscopyAssistant:
         Source refs appear only on your own tests; they are what
         `create_visual_test` accepts, so a record you own round-trips.
         """
-        caller_id = _owner_from_context(context)
+        caller_keys = _owner_keys(context)
         return self._view_for_caller(
-            self._find_test_for_caller(name, caller_id), caller_id
+            self._find_test_for_caller(name, caller_keys), caller_keys
         )
 
     @bioengine.method(context=True)
@@ -932,17 +976,18 @@ class SmartMicroscopyAssistant:
     ) -> dict:
         """Delete one of YOUR visual tests. Refuses to delete another user's."""
         import shutil
-        caller_id = _owner_from_context(context)
+        caller_keys = _owner_keys(context)
         if not _TEST_NAME_RE.match(name):
             raise ValueError(
                 f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
             )
-        test_dir = self._test_dir(caller_id, name)
-        if not test_dir.exists():
+        removed = [d for d in (self._test_dir(k, name) for k in caller_keys)
+                   if d.exists()]
+        if not removed:
             # The name may exist as another user's test, but the caller has
             # no delete permission on it — message accordingly.
             other = any(
-                rec.get("name") == name and rec.get("created_by") != caller_id
+                rec.get("name") == name and rec.get("created_by") not in caller_keys
                 for rec in self._list_all_test_records()
             )
             if other:
@@ -951,8 +996,9 @@ class SmartMicroscopyAssistant:
                     f"creator can delete it."
                 )
             raise ValueError(f"visual test {name!r} not found.")
-        shutil.rmtree(test_dir)
-        logger.info("Deleted visual test %r (owner=%s)", name, caller_id)
+        for test_dir in removed:
+            shutil.rmtree(test_dir)
+        logger.info("Deleted visual test %r (owner=%s)", name, caller_keys[0])
         return {"name": name, "deleted": True}
     # ------------------------------------------------------------ inspect path
 
@@ -1090,7 +1136,7 @@ class SmartMicroscopyAssistant:
         )
         caller_id = _owner_from_context(context)
         visual_test = (
-            self._find_test_for_caller(visual_test_name, caller_id)
+            self._find_test_for_caller(visual_test_name, _owner_keys(context))
             if visual_test_name else None
         )
         job = self._new_job(caller_id)
