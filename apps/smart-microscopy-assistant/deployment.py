@@ -77,6 +77,12 @@ _ANON_OWNER = "anonymous"
 # into record ownership.
 _PERSONAL_WS_RE = re.compile(r"^ws-user-.+")
 
+# Commit timestamp of 32968bd (0.7.0), which replaced the client-supplied owner
+# key with one derived server-side. The legacy key below is honoured only for
+# records older than this, so the compatibility window has an end rather than
+# growing into a permanent second identity scheme.
+_LEGACY_OWNER_CUTOVER_TS = 1788455288.0
+
 
 def _resolve_tests_dir() -> Path:
     home = os.environ.get("HOME", "")
@@ -111,7 +117,12 @@ def _owner_from_context(context: Optional[Dict[str, Any]]) -> str:
     ctx = context or {}
     user = ctx.get("user") or {}
     if not user.get("is_anonymous"):
-        for key in ("email", "id"):
+        # `parent` before `id`: for an API-token caller `id` is a per-token
+        # synthetic account (measured: two tokens of the same human gave
+        # `blossom-account-…` and `glacier-gojirasaurus-…`), while `parent`
+        # is the underlying account on both. Keying on `id` would strand an
+        # email-less user's tests every time they mint a token.
+        for key in ("email", "parent", "id"):
             value = user.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -128,13 +139,18 @@ def _owner_keys(context: Optional[Dict[str, Any]]) -> List[str]:
     keys used by *older* versions of the app, so a record does not become
     unreachable to the person who created it when the scheme changes.
 
-    Only one legacy key is honoured: the caller's own personal workspace.
+    Only one legacy key is honoured: the caller's own personal workspace,
+    *derived* as `ws-user-<account>` rather than read from `ctx["ws"]`.
     Before 0.7.0 the owner was a `caller_user_id` the client passed in, and
-    clients passed their workspace name. That value was self-asserted, so it
-    is not trustworthy in general -- but Hypha assigns `ctx["ws"]`, and a
-    personal workspace is 1:1 with a human, so matching against *that* is a
-    check on Hypha's word rather than on the record's. Shared workspaces are
-    excluded: aliasing one would make every member an owner of its records.
+    clients passed their workspace name.
+
+    The derivation is the security-relevant part. `ctx["ws"]` is the workspace
+    the caller's *token* was minted for, not a canonical property of the
+    caller -- measured: one token of this human carries `bioimage-io`. So a
+    token minted against someone else's personal workspace would carry that
+    workspace, and keying on `ctx["ws"]` would make legacy ownership grantable
+    by adding a member. Deriving from the authenticated account instead means
+    a caller can only ever name their own personal workspace.
 
     Anonymous callers get no legacy key on purpose. Pre-0.11.0 anonymous
     records were all written under the bare string `"anonymous"`, which
@@ -145,12 +161,33 @@ def _owner_keys(context: Optional[Dict[str, Any]]) -> List[str]:
     ctx = context or {}
     user = ctx.get("user") or {}
     if not user.get("is_anonymous"):
-        ws = ctx.get("ws")
-        if isinstance(ws, str) and _PERSONAL_WS_RE.match(ws.strip()):
-            ws = ws.strip()
-            if ws not in keys:
-                keys.append(ws)
+        account = user.get("parent") or user.get("id")
+        if isinstance(account, str) and account.strip():
+            legacy = f"ws-user-{account.strip()}"
+            if _PERSONAL_WS_RE.match(legacy) and legacy not in keys:
+                keys.append(legacy)
     return keys
+
+
+def _owns(rec: dict, caller_keys: List[str]) -> bool:
+    """Whether this caller owns `rec`, honouring legacy keys only pre-cutover.
+
+    A match on the caller's current key always counts. A match on a legacy
+    key counts only for a record written before the scheme changed, so the
+    alias cannot be reached by anything created afterwards.
+    """
+    owner = rec.get("created_by")
+    if not caller_keys or owner is None:
+        return False
+    if owner == caller_keys[0]:
+        return True
+    if owner in caller_keys[1:]:
+        try:
+            created_at = float(rec.get("created_at") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return created_at < _LEGACY_OWNER_CUTOVER_TS
+    return False
 
 
 def _readable_workspaces(context: Optional[Dict[str, Any]]) -> set:
@@ -491,7 +528,9 @@ class SmartMicroscopyAssistant:
             own = self._test_json_path(key, name)
             if own.exists():
                 with open(own, "r") as f:
-                    return json.load(f)
+                    rec = json.load(f)
+                if _owns(rec, caller_keys):
+                    return rec
         for rec in self._list_all_test_records():
             if rec.get("name") == name and bool(rec.get("is_public")):
                 return rec
@@ -506,7 +545,7 @@ class SmartMicroscopyAssistant:
         permission on. Running a public test needs only the saved copies.
         """
         rec = dict(rec)
-        owned = rec.get("created_by") in caller_keys
+        owned = _owns(rec, caller_keys)
         rec["owned_by_you"] = owned
         if not owned:
             rec.pop("positive_refs", None)
@@ -896,8 +935,14 @@ class SmartMicroscopyAssistant:
         # Re-using your own name overwrites — including a copy of it still
         # filed under an older ownership key, so the library converges on the
         # current scheme instead of showing the same name twice.
-        for stale in _owner_keys(context)[1:]:
-            shutil.rmtree(self._test_dir(stale, name), ignore_errors=True)
+        caller_keys = _owner_keys(context)
+        for stale in caller_keys[1:]:
+            mj = self._test_dir(stale, name) / "visual_test.json"
+            if not mj.exists():
+                continue
+            with open(mj, "r") as f:
+                if _owns(json.load(f), caller_keys):
+                    shutil.rmtree(mj.parent, ignore_errors=True)
         test_dir = self._test_dir(owner, name)
         if test_dir.exists():
             shutil.rmtree(test_dir)
@@ -947,8 +992,7 @@ class SmartMicroscopyAssistant:
         caller_keys = _owner_keys(context)
         out = []
         for rec in self._list_all_test_records():
-            owner = rec.get("created_by", _ANON_OWNER)
-            if owner in caller_keys or bool(rec.get("is_public")):
+            if _owns(rec, caller_keys) or bool(rec.get("is_public")):
                 out.append(self._view_for_caller(rec, caller_keys))
         return out
 
@@ -981,13 +1025,20 @@ class SmartMicroscopyAssistant:
             raise ValueError(
                 f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
             )
-        removed = [d for d in (self._test_dir(k, name) for k in caller_keys)
-                   if d.exists()]
+        removed = []
+        for key in caller_keys:
+            d = self._test_dir(key, name)
+            mj = d / "visual_test.json"
+            if not mj.exists():
+                continue
+            with open(mj, "r") as f:
+                if _owns(json.load(f), caller_keys):
+                    removed.append(d)
         if not removed:
             # The name may exist as another user's test, but the caller has
             # no delete permission on it — message accordingly.
             other = any(
-                rec.get("name") == name and rec.get("created_by") not in caller_keys
+                rec.get("name") == name and not _owns(rec, caller_keys)
                 for rec in self._list_all_test_records()
             )
             if other:
