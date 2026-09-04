@@ -932,9 +932,10 @@ class SmartMicroscopyAssistant:
             default_factory=list,
             description=(
                 "Optional 0–5 image references that should PASS. Each entry "
-                "can be an HTTPS URL or a Hypha artifact ref "
-                "'<workspace>/<alias>:<path>', the latter resolvable only if "
-                "public or readable by you. Omit for a text-only test."
+                "can be an https URL on this app's own Hypha server or a "
+                "Hypha artifact ref '<workspace>/<alias>:<path>', the latter "
+                "resolvable only if public or readable by you. URLs on any "
+                "other host are refused. Omit for a text-only test."
             ),
         ),
         negative_image_refs: list = Field(
@@ -1261,7 +1262,8 @@ class SmartMicroscopyAssistant:
         image_ref: str = Field(
             ...,
             description=(
-                "Image to inspect. HTTPS URL (public or presigned) or "
+                "Image to inspect. Either an https URL on this app's own "
+                "Hypha server (URLs on any other host are refused) or a "
                 "Hypha artifact reference '<workspace>/<alias>:<path>'. An "
                 "artifact ref resolves only if the artifact is public or "
                 "you have read access to that workspace."
@@ -1360,7 +1362,8 @@ class SmartMicroscopyAssistant:
         image_ref: str = Field(
             ...,
             description=(
-                "Image to inspect. HTTPS URL (public or presigned) or "
+                "Image to inspect. Either an https URL on this app's own "
+                "Hypha server (URLs on any other host are refused) or a "
                 "Hypha artifact reference '<workspace>/<alias>:<path>'. An "
                 "artifact ref resolves only if the artifact is public or "
                 "you have read access to that workspace."
