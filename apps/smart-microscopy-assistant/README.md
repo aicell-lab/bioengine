@@ -51,6 +51,14 @@ An `image_ref` is either a Hypha artifact reference `<workspace>/<alias>:<file_p
 
 The reason is that the app fetches with its own network position, so a caller who can name an arbitrary host gets to probe what the replica can route to. No credential is involved; reachability is. Both URL shapes the app actually consumes are same-origin anyway — `artifact-manager.get_file` and the browser UI's `s3-storage.get_file` both return `https://hypha.aicell.io/s3/...` — so the restriction costs nothing in practice. To use an image held elsewhere, upload it to a Hypha artifact or to `s3-storage` first and pass that reference.
 
+## Whose credential reads an artifact ref
+
+**The app holds none.** Since 0.13.0 the replica has no Hypha token of its own: its standing connection is anonymous, so an artifact ref reaches public artifacts and nothing else.
+
+To read a **private** artifact, pass your own Hypha token as the `token` parameter of `inspect`, `submit_inspect` or `create_visual_test`. It is used for that one call, on a connection opened and closed inside the call, and is never cached, logged, or written onto the job record that `get_inspect_status` returns.
+
+This replaces the arrangement up to 0.12.1, where a ref naming a workspace the caller's token scope showed as readable was resolved with the *app's* token. That was safe as written — the scope came from Hypha server-side and a client could not widen it — but it made the app a standing deputy: a bug anywhere in that check, or a later widening of the app token's own access, would have turned into a read of files the caller never had. Holding no credential removes the class of failure rather than guarding it. The cost is explicit: a private ref that used to resolve silently now needs a `token`.
+
 ## Who can call this app
 
 `authorized_users` in `manifest.yaml` is a named allowlist, not `"*"`. BioEngine matches the caller's Hypha `id` or `email` exactly (`bioengine/utils/permissions.py`), and the app builder additionally admits the deploying identity and the worker's admin users. Anonymous callers are rejected. To widen access, add the address to `authorized_users` and redeploy — note that a Hypha API token carries no email in its JWT payload, but the server enriches the identity from the parent account, so an email entry matches API tokens and browser logins alike.
@@ -66,7 +74,7 @@ Define a visual test once with `create_visual_test(...)`, then call `inspect(ima
 
 ## API
 
-### `inspect(image_ref, instruction=None, visual_test_name=None, max_new_tokens=512) -> dict`
+### `inspect(image_ref, instruction=None, visual_test_name=None, max_new_tokens=512, token=None) -> dict`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -74,6 +82,7 @@ Define a visual test once with `create_visual_test(...)`, then call `inspect(ima
 | `instruction` | `str?` | Free-text instruction. Required when `visual_test_name` is not given. Optional when it is — then it overrides the visual test's stored description. Max 4000 chars. |
 | `visual_test_name` | `str?` | Name of a visual test created via `create_visual_test(...)`. Switches into few-shot verdict mode. |
 | `max_new_tokens` | `int` | Response token budget. Default 512, range 1–1024. |
+| `token` | `str?` | Your own Hypha token, used only to read a **private** artifact ref. Omit for public artifacts and for `https://` URLs. See [Whose credential reads an artifact ref](#whose-credential-reads-an-artifact-ref). |
 
 **Returns (describe mode):**
 
@@ -130,7 +139,7 @@ If a visual test isn't discriminating well: tighten the `description` (it goes i
 
 | Method | Description |
 |---|---|
-| `create_visual_test(name, pass_criterion, fail_criterion, positive_image_refs, negative_image_refs, is_public=False)` | Define or replace one of *your* visual tests. References follow the same rule as `inspect` — a `hypha.aicell.io` URL or a Hypha artifact ref. Images are downloaded, downscaled (capped at ~512×512), and persisted under your own directory. |
+| `create_visual_test(name, pass_criterion, fail_criterion, positive_image_refs, negative_image_refs, is_public=False, token=None)` | Define or replace one of *your* visual tests. References follow the same rule as `inspect` — a `hypha.aicell.io` URL or a Hypha artifact ref, with `token` needed only for a private one. Images are downloaded, downscaled (capped at ~512×512), and persisted under your own directory. |
 | `list_visual_tests()` | Your own tests plus every public test. Each record carries `created_by`, `is_public`, and `owned_by_you`. |
 | `get_visual_test(name)` | One record you can see — your own test of that name wins over a public one. |
 | `delete_visual_test(name)` | Remove one of your own tests and its cached images. Owner-only, even for public tests. |
@@ -262,3 +271,5 @@ result = await qc.inspect(
 )
 print(result["verdict"], "—", result["reason"])
 ```
+
+Both calls above assume `my-workspace/qc-samples` is publicly readable. If it is not, add `token=HYPHA_TOKEN` to each call — the app holds no credential of its own and will otherwise refuse the ref.
