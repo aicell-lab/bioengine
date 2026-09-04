@@ -220,6 +220,7 @@ class AppsManager:
             server_url=server_url,
             log_file=log_file,
             proxy_actor_name=self.ray_cluster.proxy_actor_name,
+            elastic_gpu_cluster=self.ray_cluster.mode == "slurm",
             debug=debug,
         )
 
