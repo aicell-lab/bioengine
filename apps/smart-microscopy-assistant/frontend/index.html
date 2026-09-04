@@ -322,6 +322,13 @@
     color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.07em;
     border-bottom: 1px solid var(--border); margin-bottom: 0.35rem;
   }
+  #infoPopover .prose {
+    padding: 0.1rem 0.95rem 0.6rem;
+    font-size: 0.78rem; line-height: 1.5; color: var(--fg-dim);
+  }
+  #infoPopover .prose p { margin: 0 0 0.45rem; }
+  #infoPopover .prose p:last-child { margin-bottom: 0; }
+  #infoPopover .prose strong { color: var(--fg); font-weight: 600; }
 
   /* --- Inline help button (in the Create panel) ----------------------- */
   .help-btn {
@@ -510,6 +517,16 @@
   .status-dot.busy  { background: var(--unsure); box-shadow: 0 0 0 3px var(--unsure-ring); animation: pulse 1.2s ease-in-out infinite; }
   .status-dot.error { background: var(--fail); box-shadow: 0 0 0 3px var(--fail-ring); }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .gate-error {
+    margin-top: 1rem; font-size: 0.85rem; color: var(--fail);
+    display: flex; align-items: center; justify-content: center; gap: 0.5rem;
+  }
+  .detail-link, .status .detail-link {
+    font: inherit; font-size: 0.8rem; font-weight: 600;
+    background: none; border: 0; padding: 0; cursor: pointer;
+    color: var(--fail); text-decoration: underline; text-underline-offset: 2px;
+  }
+  .detail-link:hover { filter: brightness(1.15); }
 
   /* --- Form widgets --------------------------------------------------- */
   .small { font-size: 0.8rem; color: var(--fg-dim); }
@@ -1024,6 +1041,11 @@
     flex-shrink: 0;
   }
   .dialog .dialog-icon svg { width: 1.05rem; height: 1.05rem; }
+  .dialog .dialog-subtitle {
+    margin: -0.35rem 0 0.7rem 2.4rem;
+    font-size: 0.78rem; color: var(--fg-dim); opacity: 0.8;
+  }
+  .dialog .dialog-subtitle:empty { display: none; }
   .dialog .dialog-message {
     color: var(--fg-dim); font-size: 0.88rem; line-height: 1.5;
     margin-bottom: 1.1rem;
@@ -1062,6 +1084,22 @@
     white-space: pre-wrap; word-break: break-word;
   }
   .dialog .dialog-detail:empty { display: none; }
+  .dialog .detail-wrap { position: relative; margin-bottom: 1.1rem; }
+  .dialog .detail-wrap .dialog-detail { margin-bottom: 0; }
+  /* A stack taller than the box otherwise looks like it simply ends at the
+     fold, so the cue appears only while there is more below. */
+  .dialog .detail-wrap::after {
+    content: "scroll for more";
+    position: absolute; left: 1px; right: 1px; bottom: 1px;
+    padding: 1.5rem 0.85rem 0.45rem;
+    font-size: 0.7rem; font-weight: 600; color: var(--fg-dim);
+    text-align: right; pointer-events: none;
+    border-radius: 0 0 0.5rem 0.5rem;
+    background: linear-gradient(to bottom, transparent, var(--bg-0) 60%);
+    opacity: 0; transition: opacity 0.12s var(--ease-out);
+  }
+  .dialog .detail-wrap.scrollable::after { opacity: 1; }
+  .dialog .detail-wrap.at-end::after { opacity: 0; }
 
   /* --- Define mode submit result block --------------------------------- */
   .create-result {
@@ -1254,6 +1292,13 @@
         </svg>
       </button>
       <div id="infoPopover" class="popover" hidden>
+        <div class="heading" id="infoHeading">About this app</div>
+        <!-- Filled from APP_INFO so the prose lives in one object, not in markup. -->
+        <div class="prose">
+          <p id="infoSummary"></p>
+          <p id="infoInput"></p>
+          <p id="infoReturns"></p>
+        </div>
         <div class="heading">Model &amp; runtime</div>
         <div id="infoBody"><div class="row"><span class="k">loading…</span></div></div>
       </div>
@@ -1317,6 +1362,10 @@
       </svg>
       <span>Sign in to Hypha</span>
     </button>
+    <p class="gate-error" id="gateError" hidden>
+      <span id="gateErrorText"></span>
+      <button class="detail-link" type="button" id="gateDetailBtn">Details</button>
+    </p>
   </div>
 
   <div class="mode-toggle-wrap signed-in-only">
@@ -1380,7 +1429,7 @@
           </button>
           <button class="btn btn-ghost btn-sm" id="clearAllBtn" type="button" hidden>Clear all</button>
         </div>
-        <span class="status"><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span></span>
+        <span class="status"><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span><button class="detail-link" type="button" id="runDetailBtn" hidden>Details</button></span>
       </div>
     </div>
 
@@ -1501,7 +1550,7 @@
       <!-- Save -->
       <div class="run-summary" style="margin-top: 1.25rem;">
         <button class="btn btn-primary-lg" id="defineBtn" disabled>Save visual test</button>
-        <span class="status"><span class="status-dot" id="defineDot"></span><span id="defineStatus">Idle</span></span>
+        <span class="status"><span class="status-dot" id="defineDot"></span><span id="defineStatus">Idle</span><button class="detail-link" type="button" id="defineDetailBtn" hidden>Details</button></span>
       </div>
       <div id="defineResultBlock" class="create-result" style="margin-top: 0.85rem;" hidden></div>
     </div>
@@ -1596,8 +1645,11 @@
       </span>
       <span id="errorTitle">Something went wrong</span>
     </div>
+    <div class="dialog-subtitle" id="errorSubtitle"></div>
     <div class="dialog-message" id="errorMessage"></div>
-    <pre class="dialog-detail" id="errorDetail"></pre>
+    <div class="detail-wrap" id="errorDetailWrap" hidden>
+      <pre class="dialog-detail" id="errorDetail"></pre>
+    </div>
     <div class="dialog-actions">
       <button class="dialog-btn cancel" type="button" id="errorCopy">Copy</button>
       <button class="dialog-btn danger" type="button" id="errorClose">Close</button>
@@ -1669,6 +1721,7 @@ const TOKEN_KEY    = "smart-microscopy-assistant:token";
 const TOKEN_EXPIRY = "smart-microscopy-assistant:tokenExpiry";
 const TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
 const POLL_INTERVAL_MS = 1000;
+const SLOW_HINT_MS = 10000;
 
 document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
 for (const el of document.querySelectorAll(".exMax")) el.textContent = MAX_EXAMPLES_PER_CLASS;
@@ -1691,6 +1744,19 @@ let positiveTiles = [];
 let negativeTiles = [];
 
 const $ = id => document.getElementById(id);
+
+// Prose for the info popover. Kept as one object so the wording can be edited
+// without touching markup; the runtime table below it comes from the worker.
+const APP_INFO = {
+  heading: "About this app",
+  summary: "A vision-language model that looks at microscopy images and answers a question about them in plain language.",
+  input: "<strong>You give it</strong> images plus either a free-text instruction, or a saved visual test — a criterion with a few example images of what passing and failing look like.",
+  returns: "<strong>You get back</strong> a description per image, or, with a visual test, a <strong>passed</strong> / <strong>failed</strong> / <strong>unsure</strong> verdict and the reasoning behind it.",
+};
+$("infoHeading").textContent = APP_INFO.heading;
+$("infoSummary").innerHTML   = APP_INFO.summary;
+$("infoInput").innerHTML     = APP_INFO.input;
+$("infoReturns").innerHTML   = APP_INFO.returns;
 
 /* ---- Theme -------------------------------------------------------------- */
 const THEME_KEY = "bioengine-app:theme";
@@ -1729,17 +1795,19 @@ window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", e 
   applyTheme(e.matches ? "light" : "dark");
 });
 
+const escapeHTML = s => String(s).replace(/[&<>"']/g, c => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+));
+// `msg` carries filenames, server error text and other users' public test
+// names, so it is escaped rather than trusted. No call site passes markup.
 const log = (msg, kind = "") => {
   const ts = new Date().toLocaleTimeString();
-  const cls = kind ? `class="${kind}"` : "";
-  $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${msg}</span>`;
+  const cls = kind ? `class="${escapeHTML(kind)}"` : "";
+  $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${escapeHTML(msg)}</span>`;
   $("log").scrollTop = $("log").scrollHeight;
 };
 const setRun = (state, msg) => { $("runDot").className = "status-dot " + (state || ""); $("runStatus").textContent = msg; };
 const setDefine = (state, msg) => { $("defineDot").className = "status-dot " + (state || ""); $("defineStatus").textContent = msg; };
-const escapeHTML = s => String(s).replace(/[&<>"']/g, c => (
-  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-));
 const randomSuffix = () => Math.random().toString(36).slice(2, 10);
 const fileExt = f => (f.name.split(".").pop() || "bin").toLowerCase();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -1824,9 +1892,25 @@ document.addEventListener("keydown", (e) => {
 async function connectWithToken(token) {
   setLoggingInUI();
   server = await connectToServer({ server_url: SERVER_URL, token });
+  // Only clean closes (server restart, token expiry) reach this hook —
+  // ordinary drops reconnect silently and are unobservable from the page.
+  // The connection is a private field, so a missing hook must degrade to
+  // "no disconnect notice", never to a TypeError at boot.
+  server.rpc?._connection?.on_disconnected?.((reason) => {
+    log("Disconnected from the worker: " + (reason || "connection closed"), "err");
+    setRun("error", "Disconnected — reload to reconnect");
+    setDefine("error", "Disconnected — reload to reconnect");
+    deferError("connect", {
+      title: "Disconnected from the worker",
+      subtitle: "Reload the page to reconnect.",
+      message: "The worker closed the connection. This usually means it restarted or the session token expired.",
+      detail: formatErr(reason),
+    });
+  });
   userWorkspace = server.config.workspace;
   userEmail = (server.config.user && server.config.user.email) || userWorkspace;
   setLoggedInUI();
+  clearDeferredError("connect");
   log(`Connected as ${userEmail} (workspace=${userWorkspace})`, "ok");
   s3 = await server.getService("public/s3-storage", { _rkwargs: true });
   if (!SERVICE_ID) {
@@ -1857,6 +1941,7 @@ async function startLogin() {
     log("Login error: " + err.message, "err");
     showError({
       title: "Login failed",
+      subtitle: "You are still signed out.",
       message: "Could not complete the Hypha auth flow.",
       detail: formatErr(err),
     });
@@ -1885,6 +1970,12 @@ $("logoutBtn").addEventListener("click", async () => {
     if (!URL_TOKEN) clearSavedToken();
     setLoggedOutUI();
     log("Auto-connect failed: " + err.message, "err");
+    deferError("connect", {
+      title: "Auto-connect failed",
+      subtitle: "Sign in again to continue.",
+      message: "The saved session could not be restored, so you have been signed out.",
+      detail: formatErr(err),
+    });
   }
 })();
 
@@ -1925,8 +2016,15 @@ async function refreshModelInfo() {
     add("Examples",   `${info.min_examples_per_class}–${info.max_examples_per_class} per class`);
     add("Verdicts",   (info.verdicts || []).join(" · "));
     add("License",    info.license || "—");
+    clearDeferredError("model-info");
   } catch (err) {
     log("get_model_info failed: " + err.message, "err");
+    deferError("model-info", {
+      title: "Could not read model info",
+      subtitle: "Analysis still works; only the info panel is stale.",
+      message: "<code>get_model_info</code> failed on the worker.",
+      detail: formatErr(err),
+    });
   }
 }
 
@@ -1948,17 +2046,18 @@ async function refreshTests({ popupOnError = false } = {}) {
   if (!qcSvc) return;
   try {
     cachedTests = await qcSvc.list_visual_tests();
+    clearDeferredError("list-tests");
     log(`Loaded ${cachedTests.length} visual test${cachedTests.length === 1 ? "" : "s"}.`);
   } catch (err) {
     cachedTests = [];
     log("list_visual_tests failed: " + err.message, "err");
-    if (popupOnError) {
-      showError({
-        title: "Could not refresh visual tests",
-        message: "<code>list_visual_tests</code> failed on the worker.",
-        detail: formatErr(err),
-      });
-    }
+    const entry = {
+      title: "Could not refresh visual tests",
+      subtitle: "The list below may be empty or out of date.",
+      message: "<code>list_visual_tests</code> failed on the worker.",
+      detail: formatErr(err),
+    };
+    if (popupOnError) showError(entry); else deferError("list-tests", entry);
   }
   refreshTestsDropdown();
   refreshTestList();
@@ -2101,6 +2200,7 @@ function refreshTestList() {
           log(`delete_visual_test(${t.name}) error: ${err.message || err}`, "err");
           showError({
             title: "Delete failed",
+            subtitle: "The test is still there.",
             message: `Could not delete visual test <strong>${escapeHTML(t.name)}</strong>.`,
             detail: formatErr(err),
           });
@@ -2162,21 +2262,68 @@ $("confirmDialog").addEventListener("click", (e) => {
 // Surfaces RPC / button-handler failures as a modal with a scrollable detail
 // block, so users see the real error (stack, server message) instead of a
 // silent log line or a chrome alert().
+// Ray colourises tracebacks, so a server-side error reaches us wrapped in SGR
+// escapes that render as literal "[36m" noise around the useful text.
+const stripAnsi = s => String(s).replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 function formatErr(err) {
   if (!err) return "";
-  if (typeof err === "string") return err;
-  return err.stack || err.message || (() => {
+  if (typeof err === "string") return stripAnsi(err);
+  return stripAnsi(err.stack || err.message || (() => {
     try { return JSON.stringify(err, null, 2); } catch { return String(err); }
-  })();
+  })());
 }
-function showError({ title = "Something went wrong", message = "", detail = "" } = {}) {
+let errorReturnFocus = null;
+function updateDetailCue() {
+  const wrap = $("errorDetailWrap"), pre = $("errorDetail");
+  const hidden = pre.scrollHeight - pre.clientHeight;
+  wrap.classList.toggle("scrollable", hidden > 4);
+  wrap.classList.toggle("at-end", pre.scrollTop >= hidden - 4);
+}
+$("errorDetail").addEventListener("scroll", updateDetailCue);
+function showError({ title = "Something went wrong", subtitle = "", message = "", detail = "" } = {}) {
+  errorReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   $("errorTitle").textContent = title;
+  $("errorSubtitle").textContent = subtitle;
+  // innerHTML is deliberate — callers pass <strong>-marked prose and escape
+  // every value they interpolate.
   $("errorMessage").innerHTML = message;
   $("errorDetail").textContent = detail;
+  $("errorDetailWrap").hidden = !detail;
   $("errorDialog").hidden = false;
-  setTimeout(() => $("errorClose").focus(), 0);
+  setTimeout(() => { $("errorClose").focus(); updateDetailCue(); }, 0);
 }
-function closeError() { $("errorDialog").hidden = true; }
+function closeError() {
+  $("errorDialog").hidden = true;
+  const target = errorReturnFocus;
+  errorReturnFocus = null;
+  if (target && target.isConnected) target.focus();
+}
+
+// A failure the user did not directly ask for — the boot auto-connect, a
+// background refresh — must not steal focus with a modal, but dropping its
+// trace leaves nothing to debug from. Park it behind the status line instead.
+// Keyed by operation so a later success only retires its own parked error.
+let deferredError = null;
+function deferError(key, entry) {
+  deferredError = { key, ...entry };
+  // The status lines live inside the signed-in views, so a failure that leaves
+  // the user signed out — the boot auto-connect above all — also needs a
+  // surface on the login gate or its trace is parked out of reach.
+  $("gateErrorText").textContent = entry.title;
+  $("gateError").hidden = false;
+  $("runDetailBtn").hidden = false;
+  $("defineDetailBtn").hidden = false;
+}
+function clearDeferredError(key) {
+  if (key && deferredError && deferredError.key !== key) return;
+  deferredError = null;
+  $("gateError").hidden = true;
+  $("runDetailBtn").hidden = true;
+  $("defineDetailBtn").hidden = true;
+}
+for (const id of ["runDetailBtn", "defineDetailBtn", "gateDetailBtn"]) {
+  $(id).addEventListener("click", () => { if (deferredError) showError(deferredError); });
+}
 $("errorClose").addEventListener("click", closeError);
 $("errorDialog").addEventListener("click", (e) => {
   if (e.target === $("errorDialog")) closeError();
@@ -2184,6 +2331,7 @@ $("errorDialog").addEventListener("click", (e) => {
 $("errorCopy").addEventListener("click", async () => {
   const text = [
     $("errorTitle").textContent,
+    $("errorSubtitle").textContent,
     $("errorMessage").textContent,
     $("errorDetail").textContent,
   ].filter(Boolean).join("\n\n");
@@ -2263,7 +2411,8 @@ function openInspect({ src, title, sub, trigger }) {
     closeInspect();
     showError({
       title: "Could not display that image",
-      message: `The image data for ${title || "this file"} could not be decoded by the browser.`,
+      subtitle: "The file itself is unaffected.",
+      message: `The image data for <strong>${escapeHTML(title || "this file")}</strong> could not be decoded by the browser.`,
       detail: "Source: " + String(src).slice(0, 300),
     });
   };
@@ -2701,7 +2850,27 @@ async function runPipeline() {
   refreshAnalyzeEnabled();
   $("clearAllBtn").disabled = true;
   collapseOpenDetails();
+  // The release is in a `finally` so that an unexpected throw anywhere in the
+  // body cannot leave the Run button wedged until the page is reloaded.
+  try {
+    await runPipelineBody(pending);
+  } catch (err) {
+    setRun("error", "Analyze failed");
+    log("Analyze failed: " + (err.message || String(err)), "err");
+    showError({
+      title: "Analyze failed",
+      subtitle: "No results were recorded for this run.",
+      message: "The analysis run stopped unexpectedly.",
+      detail: formatErr(err),
+    });
+  } finally {
+    pipelineRunning = false;
+    $("clearAllBtn").disabled = false;
+    refreshAnalyzeEnabled();
+  }
+}
 
+async function runPipelineBody(pending) {
   const useTest = $("srcTest").checked;
   const visualTest = useTest ? $("testSelect").value : null;
   const instruction = !useTest ? $("instruction").value.trim() : null;
@@ -2730,6 +2899,7 @@ async function runPipeline() {
       // work it did not submit and needs to see where it is in line.
       const jobId = await qcSvc.submit_inspect(callArgs);
       tile.jobId = jobId;
+      const startedAt = Date.now();
       let st;
       for (;;) {
         st = await qcSvc.get_inspect_status({ run_id: jobId, _rkwargs: true });
@@ -2737,9 +2907,12 @@ async function runPipeline() {
         const pos = st.stages?.run?.queue_position;
         tile.queuePos = (typeof pos === "number" && pos > 0) ? pos : null;
         renderGrid("analyze");
+        // A queue position is already a liveness signal; without one, silence
+        // past ten seconds reads as a crash.
+        const slow = !tile.queuePos && Date.now() - startedAt > SLOW_HINT_MS;
         setRun("busy", tile.queuePos
           ? `Queued #${tile.queuePos} — ${tile.file.name}`
-          : `Analyzing ${tile.file.name}`);
+          : `Analyzing ${tile.file.name}${slow ? " — still running, large images take longer" : ""}`);
         await sleep(POLL_INTERVAL_MS);
       }
       tile.queuePos = null;
@@ -2803,10 +2976,6 @@ async function runPipeline() {
     await new Promise(r => setTimeout(r, 80));
   }
 
-  pipelineRunning = false;
-  $("clearAllBtn").disabled = false;
-  refreshAnalyzeEnabled();
-
   let summary;
   if (visualTest) {
     const parts = [];
@@ -2827,6 +2996,7 @@ async function runPipeline() {
     const total = pending.length;
     showError({
       title: `Analyze finished with ${batchErrors.length} error${batchErrors.length === 1 ? "" : "s"}`,
+      subtitle: "The images that succeeded kept their results.",
       message: `${batchErrors.length} of ${total} image${total === 1 ? "" : "s"} failed. Tiles are marked in red; full per-image traces below.`,
       detail,
     });
@@ -3073,6 +3243,7 @@ $("defineBtn").addEventListener("click", async () => {
     log("create_visual_test error: " + (err.message || String(err)), "err");
     showError({
       title: "Could not save visual test",
+      subtitle: "Your images and criterion are still in the form.",
       message: `<code>create_visual_test</code> failed for <strong>${escapeHTML(name)}</strong>.`,
       detail: formatErr(err),
     });

@@ -217,7 +217,9 @@ The page has two modes:
 - **Analyze** — drag in one or more images, pick a saved visual test (or type a free-text instruction), and hit *Run analysis*. Each image is uploaded and inspected sequentially; the result row shows a colored verdict chip (Passed / Failed / Unsure / Described / Error), the reason, and an expandable details panel with tok/s, timing, and the raw model output.
 - **Define visual test** — name, criterion, plus positive + negative example galleries (1–5 each). On save, examples are uploaded to a scratch artifact, presigned with the caller's session, and handed to `create_visual_test()`; the worker downloads them once, downscales, and caches under `$HOME/visual_tests/<name>/`.
 
-An info button in the top bar opens a popover with the served model details (pulled from `get_model_info`). The activity log is hidden behind an expandable "Activity log" panel at the bottom.
+An info button in the top bar opens a popover with a short description of the app (prose held in the `APP_INFO` object) followed by the served model details (pulled from `get_model_info`). The activity log is hidden behind an expandable "Activity log" panel at the bottom.
+
+Failures reach the user one of two ways. Something the user asked for opens a modal with the full trace; a background failure — the boot auto-connect, a list refresh — is parked instead behind a *Details* button, which appears on the status line and, because the status lines sit inside the signed-in views, also on the login gate. The activity log escapes everything it renders: it carries filenames, server error text, and other users' public test names, none of which are trusted.
 
 The page expects the service ID via `?ws_service_id=<full-id>&server=<hypha-url>` URL params; without them it falls back to the short artifact form `bioimage-io/smart-microscopy-assistant`.
 
