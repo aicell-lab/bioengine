@@ -1,13 +1,46 @@
 <!DOCTYPE html>
-<html lang="en">
+<!-- data-theme here only governs the first paint when JS has not run or
+     localStorage is blocked. Light, because that is what bioimage.io looks
+     like; the boot script below immediately replaces it. -->
+<html lang="en" data-theme="light">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Smart Microscopy Assistant</title>
+
+<!-- Must run BEFORE the stylesheet paints: it sets data-theme synchronously,
+     so the page never renders in the wrong theme and then snaps. An explicit
+     choice in localStorage always beats the OS preference. -->
+<script>
+  (function () {
+    var KEY = "bioengine-app:theme";
+    var t;
+    // Throws in private mode / with third-party cookies blocked. The OS
+    // branch below is a correct fallback, so this is safe to swallow.
+    try { t = localStorage.getItem(KEY); } catch (e) {}
+    if (t !== "light" && t !== "dark") {
+      // Browsers cannot report "no preference": prefers-color-scheme resolves
+      // to light unless dark is explicitly set, so this is a two-way branch.
+      t = (window.matchMedia &&
+           window.matchMedia("(prefers-color-scheme: light)").matches)
+        ? "light" : "dark";
+    }
+    document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
+
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   [hidden] { display: none !important; }
   :root {
+    /* Emil's strong easing curves */
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  }
+
+  /* Every colour lives in one of the two blocks below and nowhere else, so a
+     third theme is a copy-paste. */
+  [data-theme="dark"] {
     --bg-0: #0b1220;
     --bg-1: #111a2d;
     --bg-2: #18223a;
@@ -17,25 +50,171 @@
     --fg: #e6edf7;
     --fg-dim: #9aa9c2;
     --fg-muted: #6b7a99;
+
     --accent: #38bdf8;
     --accent-strong: #0ea5e9;
     --accent-deep: #0284c7;
+    --accent-fg: #ffffff;              /* text ON an accent fill */
+    --accent-ring: rgba(56, 189, 248, 0.18);
+    --accent-fill: rgba(56, 189, 248, 0.85);
+    --accent-edge: rgba(56, 189, 248, 0.6);
+    --accent-soft: rgba(56, 189, 248, 0.10);
+    --accent-soft-edge: rgba(56, 189, 248, 0.35);
+    --accent-tint: rgba(14, 165, 233, 0.05);
+    --accent-tint-strong: rgba(14, 165, 233, 0.10);
+    --accent-halo: rgba(14, 165, 233, 0.10);
+    --accent-glow: rgba(14, 165, 233, 0.25);
+    --accent-glow-lg: rgba(14, 165, 233, 0.35);
+
     --pass: #22c55e;
     --fail: #ef4444;
     --unsure: #f59e0b;
     --pass-bg: rgba(34, 197, 94, 0.13);
     --fail-bg: rgba(239, 68, 68, 0.13);
     --unsure-bg: rgba(245, 158, 11, 0.13);
+    --pass-fill: rgba(34, 197, 94, 0.85);
+    --fail-fill: rgba(239, 68, 68, 0.85);
+    --unsure-fill: rgba(245, 158, 11, 0.85);
+    --pass-edge: rgba(34, 197, 94, 0.6);
+    --fail-edge: rgba(239, 68, 68, 0.6);
+    --unsure-edge: rgba(245, 158, 11, 0.6);
+    --pass-ring: rgba(34, 197, 94, 0.18);
+    --fail-ring: rgba(239, 68, 68, 0.18);
+    --unsure-ring: rgba(245, 158, 11, 0.18);
+    --fail-soft: rgba(239, 68, 68, 0.10);
+    --fail-soft-edge: rgba(239, 68, 68, 0.4);
 
-    /* Emil's strong easing curves */
-    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
-    --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+    /* Text ON a saturated verdict fill. */
+    --on-pass: #052e16;
+    --on-fail: #450a0a;
+    --on-unsure: #422006;
+    --on-info: #082f49;
+    --danger-fg: #fca5a5;
+    --danger-hover-bg: #450a0a;
+    --success-fg: #86efac;
+    --mine: #fbbf24;
+    --mine-soft: rgba(251, 191, 36, 0.10);
+    --mine-edge: rgba(251, 191, 36, 0.35);
+
+    --topbar-bg: rgba(11, 18, 32, 0.85);
+    --chrome-bg: rgba(11, 18, 32, 0.92);        /* buttons floating on a tile */
+    --chrome-bg-soft: rgba(11, 18, 32, 0.85);
+    --chrome-bg-hover: rgba(15, 23, 41, 0.95);
+    --tile-veil: rgba(11, 18, 32, 0.55);
+    --canvas-hover: rgba(15, 23, 41, 0.6);
+    --scrim: rgba(2, 6, 16, 0.78);
+    --scrim-strong: rgba(2, 6, 16, 0.92);
+    --checker: rgba(255, 255, 255, 0.045);
+
+    --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.02) inset, 0 4px 14px rgba(0, 0, 0, 0.18);
+    --shadow-pop: 0 16px 40px rgba(0, 0, 0, 0.55);
+    --shadow-panel: 0 18px 36px rgba(0, 0, 0, 0.45);
+    --shadow-dialog: 0 22px 50px rgba(0, 0, 0, 0.55);
+    --shadow-gate: 0 12px 36px rgba(0, 0, 0, 0.35);
+    --shadow-modal: 0 24px 60px rgba(0, 0, 0, 0.65);
+
+    --glow-1: rgba(14, 165, 233, 0.10);
+    --glow-2: rgba(34, 197, 94, 0.06);
+    --glow-gate: rgba(14, 165, 233, 0.18);
+  }
+
+  /* Light — a first-class theme, not an inversion. Tailwind slate + the
+     bioimage.io brand blue, so an app dropped next to the website matches. */
+  [data-theme="light"] {
+    --bg-0: #f8fafc;
+    --bg-1: #ffffff;
+    --bg-2: #ffffff;
+    --bg-3: #f1f5f9;
+    --border: #e2e8f0;
+    --border-strong: #cbd5e1;
+    --fg: #0f172a;
+    --fg-dim: #475569;
+    --fg-muted: #94a3b8;
+
+    --accent: #2563eb;
+    --accent-strong: #1d4ed8;
+    --accent-deep: #1e40af;
+    --accent-fg: #ffffff;
+    --accent-ring: rgba(37, 99, 235, 0.18);
+    --accent-fill: rgba(37, 99, 235, 0.92);
+    --accent-edge: rgba(37, 99, 235, 0.55);
+    --accent-soft: rgba(37, 99, 235, 0.09);
+    --accent-soft-edge: rgba(37, 99, 235, 0.30);
+    --accent-tint: rgba(37, 99, 235, 0.05);
+    --accent-tint-strong: rgba(37, 99, 235, 0.10);
+    --accent-halo: rgba(37, 99, 235, 0.10);
+    --accent-glow: rgba(37, 99, 235, 0.22);
+    --accent-glow-lg: rgba(37, 99, 235, 0.30);
+
+    --pass: #16a34a;
+    --fail: #dc2626;
+    --unsure: #b45309;
+    --pass-bg: rgba(22, 163, 74, 0.10);
+    --fail-bg: rgba(220, 38, 38, 0.09);
+    --unsure-bg: rgba(180, 83, 9, 0.10);
+    --pass-fill: rgba(22, 163, 74, 0.92);
+    --fail-fill: rgba(220, 38, 38, 0.92);
+    --unsure-fill: rgba(180, 83, 9, 0.92);
+    --pass-edge: rgba(22, 163, 74, 0.55);
+    --fail-edge: rgba(220, 38, 38, 0.55);
+    --unsure-edge: rgba(180, 83, 9, 0.55);
+    --pass-ring: rgba(22, 163, 74, 0.18);
+    --fail-ring: rgba(220, 38, 38, 0.18);
+    --unsure-ring: rgba(180, 83, 9, 0.18);
+    --fail-soft: rgba(220, 38, 38, 0.09);
+    --fail-soft-edge: rgba(220, 38, 38, 0.35);
+
+    /* White on a saturated fill, except amber, where dark reads better. */
+    --on-pass: #ffffff;
+    --on-fail: #ffffff;
+    --on-unsure: #ffffff;
+    --on-info: #ffffff;
+    --danger-fg: #b91c1c;
+    --danger-hover-bg: #fee2e2;
+    --success-fg: #15803d;
+    --mine: #b45309;
+    --mine-soft: rgba(180, 83, 9, 0.10);
+    --mine-edge: rgba(180, 83, 9, 0.32);
+
+    --topbar-bg: rgba(255, 255, 255, 0.85);
+    --chrome-bg: rgba(255, 255, 255, 0.94);
+    --chrome-bg-soft: rgba(255, 255, 255, 0.88);
+    --chrome-bg-hover: rgba(241, 245, 249, 0.96);
+    --tile-veil: rgba(248, 250, 252, 0.62);
+    --canvas-hover: rgba(241, 245, 249, 0.75);
+    --scrim: rgba(15, 23, 42, 0.42);
+    --scrim-strong: rgba(15, 23, 42, 0.62);
+    --checker: rgba(15, 23, 42, 0.05);
+
+    --shadow-card: 0 1px 0 rgba(15, 23, 42, 0.02) inset, 0 4px 14px rgba(15, 23, 42, 0.06);
+    --shadow-pop: 0 16px 40px rgba(15, 23, 42, 0.14);
+    --shadow-panel: 0 18px 36px rgba(15, 23, 42, 0.12);
+    --shadow-dialog: 0 22px 50px rgba(15, 23, 42, 0.18);
+    --shadow-gate: 0 12px 36px rgba(15, 23, 42, 0.10);
+    --shadow-modal: 0 24px 60px rgba(15, 23, 42, 0.28);
+
+    --glow-1: rgba(37, 99, 235, 0.07);
+    --glow-2: rgba(22, 163, 74, 0.05);
+    --glow-gate: rgba(37, 99, 235, 0.10);
+  }
+
+  /* Theme switch: colours only, 160ms, never layout. The class is added for
+     exactly the length of the transition and then removed, so it can never
+     interfere with the interaction transitions below. */
+  html.theme-switching, html.theme-switching *,
+  html.theme-switching *::before, html.theme-switching *::after {
+    transition: background-color 160ms var(--ease-out),
+                border-color     160ms var(--ease-out),
+                color            160ms var(--ease-out),
+                fill             160ms var(--ease-out),
+                stroke           160ms var(--ease-out) !important;
+    transition-delay: 0s !important;
   }
   body {
     font-family: -apple-system, "Inter", system-ui, "Segoe UI", sans-serif;
     background:
-      radial-gradient(1200px 600px at 80% -200px, rgba(14, 165, 233, 0.10), transparent 70%),
-      radial-gradient(900px 500px at -10% 110%, rgba(34, 197, 94, 0.06), transparent 70%),
+      radial-gradient(1200px 600px at 80% -200px, var(--glow-1), transparent 70%),
+      radial-gradient(900px 500px at -10% 110%, var(--glow-2), transparent 70%),
       var(--bg-0);
     color: var(--fg);
     min-height: 100vh;
@@ -50,7 +229,7 @@
     position: fixed; top: 0; left: 0; right: 0; z-index: 50;
     display: flex; align-items: center; justify-content: space-between;
     padding: 0.75rem 1.25rem;
-    background: rgba(11, 18, 32, 0.85);
+    background: var(--topbar-bg);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border);
   }
@@ -91,12 +270,25 @@
   .topbar-iconbtn:hover { background: var(--bg-3); color: var(--fg); }
   .topbar-iconbtn:active { transform: scale(0.95); }
   .topbar-iconbtn svg { width: 1.25rem; height: 1.25rem; }
+
+  /* Theme toggle — the two icons are stacked and crossfade, so the button
+     never changes size and nothing around it reflows. */
+  #themeBtn { position: relative; }
+  #themeBtn .icon {
+    position: absolute; width: 1.25rem; height: 1.25rem;
+    transition: opacity 180ms var(--ease-out), transform 180ms var(--ease-out);
+  }
+  [data-theme="dark"]  #themeBtn .icon-sun  { opacity: 1; transform: rotate(0deg)   scale(1); }
+  [data-theme="dark"]  #themeBtn .icon-moon { opacity: 0; transform: rotate(-45deg) scale(0.75); }
+  [data-theme="light"] #themeBtn .icon-sun  { opacity: 0; transform: rotate(45deg)  scale(0.75); }
+  [data-theme="light"] #themeBtn .icon-moon { opacity: 1; transform: rotate(0deg)   scale(1); }
+
   #userWrap, #infoWrap { position: relative; }
   .popover {
     position: absolute; top: 2.5rem; right: 0; min-width: 17rem;
     background: var(--bg-2); border: 1px solid var(--border-strong);
     border-radius: 0.6rem; padding: 0.35rem 0;
-    box-shadow: 0 16px 40px rgba(0,0,0,.55);
+    box-shadow: var(--shadow-pop);
     opacity: 1; transform: translateY(0) scale(1);
     transform-origin: top right;
     transition: opacity 160ms var(--ease-out),
@@ -130,6 +322,13 @@
     color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.07em;
     border-bottom: 1px solid var(--border); margin-bottom: 0.35rem;
   }
+  #infoPopover .prose {
+    padding: 0.1rem 0.95rem 0.6rem;
+    font-size: 0.78rem; line-height: 1.5; color: var(--fg-dim);
+  }
+  #infoPopover .prose p { margin: 0 0 0.45rem; }
+  #infoPopover .prose p:last-child { margin-bottom: 0; }
+  #infoPopover .prose strong { color: var(--fg); font-weight: 600; }
 
   /* --- Inline help button (in the Create panel) ----------------------- */
   .help-btn {
@@ -263,7 +462,7 @@
   .mode-toggle .seg:active { transform: scale(0.97); }
   .mode-toggle .seg.active {
     background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
-    color: #fff; box-shadow: 0 6px 16px rgba(14,165,233,0.25);
+    color: var(--accent-fg); box-shadow: 0 6px 16px var(--accent-glow);
   }
 
   /* --- Cards ---------------------------------------------------------- */
@@ -271,7 +470,7 @@
     background: var(--bg-1); border: 1px solid var(--border);
     border-radius: 0.9rem; padding: 1.25rem 1.4rem;
     margin-bottom: 1rem;
-    box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 4px 14px rgba(0,0,0,0.18);
+    box-shadow: var(--shadow-card);
   }
   .card h2 {
     font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.09em;
@@ -284,7 +483,7 @@
   /* --- Buttons -------------------------------------------------------- */
   .btn {
     background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
-    color: #fff; border: none; border-radius: 0.55rem;
+    color: var(--accent-fg); border: none; border-radius: 0.55rem;
     padding: 0.6rem 1.2rem; cursor: pointer;
     font-size: 0.9rem; font-weight: 600;
     transition: filter 0.14s var(--ease-out),
@@ -314,10 +513,20 @@
     transition: background 0.16s var(--ease-out),
                 box-shadow 0.16s var(--ease-out);
   }
-  .status-dot.ok    { background: var(--pass); box-shadow: 0 0 0 3px rgba(34,197,94,0.18); }
-  .status-dot.busy  { background: var(--unsure); box-shadow: 0 0 0 3px rgba(245,158,11,0.18); animation: pulse 1.2s ease-in-out infinite; }
-  .status-dot.error { background: var(--fail); box-shadow: 0 0 0 3px rgba(239,68,68,0.18); }
+  .status-dot.ok    { background: var(--pass); box-shadow: 0 0 0 3px var(--pass-ring); }
+  .status-dot.busy  { background: var(--unsure); box-shadow: 0 0 0 3px var(--unsure-ring); animation: pulse 1.2s ease-in-out infinite; }
+  .status-dot.error { background: var(--fail); box-shadow: 0 0 0 3px var(--fail-ring); }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .gate-error {
+    margin-top: 1rem; font-size: 0.85rem; color: var(--fail);
+    display: flex; align-items: center; justify-content: center; gap: 0.5rem;
+  }
+  .detail-link, .status .detail-link {
+    font: inherit; font-size: 0.8rem; font-weight: 600;
+    background: none; border: 0; padding: 0; cursor: pointer;
+    color: var(--fail); text-decoration: underline; text-underline-offset: 2px;
+  }
+  .detail-link:hover { filter: brightness(1.15); }
 
   /* --- Form widgets --------------------------------------------------- */
   .small { font-size: 0.8rem; color: var(--fg-dim); }
@@ -333,7 +542,7 @@
   textarea { min-height: 5rem; resize: vertical; }
   input[type=text]:focus, textarea:focus, select:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
+    box-shadow: 0 0 0 3px var(--accent-ring);
   }
   .radio-row { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem;
                font-size: 0.85rem; flex-wrap: wrap; }
@@ -361,18 +570,18 @@
   }
   .image-canvas:hover {
     border-color: var(--border-strong);
-    background: rgba(15, 23, 41, 0.6);
+    background: var(--canvas-hover);
   }
   .image-canvas.selected {
     border-color: var(--accent);
     border-style: solid;
-    background: rgba(14, 165, 233, 0.05);
-    box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18),
-                0 12px 28px rgba(14, 165, 233, 0.10);
+    background: var(--accent-tint);
+    box-shadow: 0 0 0 3px var(--accent-ring),
+                0 12px 28px var(--accent-halo);
   }
   .image-canvas.drag {
     border-color: var(--accent);
-    background: rgba(14, 165, 233, 0.10);
+    background: var(--accent-tint-strong);
   }
   .image-canvas.locked {
     opacity: 0.85; pointer-events: none; cursor: not-allowed;
@@ -432,7 +641,7 @@
   .image-tile .tile-x {
     position: absolute; top: 0.3rem; right: 0.3rem;
     width: 1.55rem; height: 1.55rem; border-radius: 999px;
-    background: rgba(11, 18, 32, 0.92); color: #fca5a5;
+    background: var(--chrome-bg); color: var(--danger-fg);
     border: 1px solid var(--border-strong);
     display: inline-flex; align-items: center; justify-content: center;
     font-size: 0.95rem; line-height: 1; cursor: pointer; padding: 0;
@@ -456,14 +665,14 @@
   @media not all and (hover: hover) {
     .image-tile .tile-x { opacity: 1; pointer-events: auto; }
   }
-  .image-tile .tile-x:hover { background: #450a0a; color: #fca5a5; border-color: var(--fail); }
+  .image-tile .tile-x:hover { background: var(--danger-hover-bg); color: var(--danger-fg); border-color: var(--fail); }
   .image-tile .tile-x:active { transform: scale(0.93); }
 
   /* Cloud-upload indicator (local-only, pre-upload) */
   .image-tile .cloud-icon {
     position: absolute; top: 0.3rem; right: 2rem;
     width: 1.55rem; height: 1.55rem; border-radius: 999px;
-    background: rgba(11, 18, 32, 0.92);
+    background: var(--chrome-bg);
     border: 1px solid var(--border-strong);
     color: var(--fg-dim);
     display: inline-flex; align-items: center; justify-content: center;
@@ -521,21 +730,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .tile-badge.passed   { color: var(--pass);   background: rgba(34,197,94,0.85);  border-color: rgba(34,197,94,0.6); color: #052e16; }
-  .tile-badge.passed .dot   { background: #052e16; }
-  .tile-badge.failed   { color: #450a0a; background: rgba(239,68,68,0.85); border-color: rgba(239,68,68,0.6); }
-  .tile-badge.failed .dot   { background: #450a0a; }
-  .tile-badge.unsure   { color: #422006; background: rgba(245,158,11,0.85); border-color: rgba(245,158,11,0.6); }
-  .tile-badge.unsure .dot   { background: #422006; }
-  .tile-badge.analyzed { color: var(--fg); background: rgba(56,189,248,0.85); border-color: rgba(56,189,248,0.6); color: #082f49; }
-  .tile-badge.analyzed .dot { background: #082f49; }
-  .tile-badge.error    { color: #450a0a; background: rgba(239,68,68,0.85); border-color: rgba(239,68,68,0.6); }
-  .tile-badge.error .dot    { background: #450a0a; }
+  .tile-badge.passed   { color: var(--pass);   background: var(--pass-fill);  border-color: var(--pass-edge); color: var(--on-pass); }
+  .tile-badge.passed .dot   { background: var(--on-pass); }
+  .tile-badge.failed   { color: var(--on-fail); background: var(--fail-fill); border-color: var(--fail-edge); }
+  .tile-badge.failed .dot   { background: var(--on-fail); }
+  .tile-badge.unsure   { color: var(--on-unsure); background: var(--unsure-fill); border-color: var(--unsure-edge); }
+  .tile-badge.unsure .dot   { background: var(--on-unsure); }
+  .tile-badge.analyzed { color: var(--fg); background: var(--accent-fill); border-color: var(--accent-edge); color: var(--on-info); }
+  .tile-badge.analyzed .dot { background: var(--on-info); }
+  .tile-badge.queued   { color: var(--on-unsure); background: var(--unsure-fill); border-color: var(--unsure-edge); }
+  .tile-badge.queued .dot   { background: var(--on-unsure); animation: pulse 1.2s ease-in-out infinite; }
+  .tile-badge.error    { color: var(--on-fail); background: var(--fail-fill); border-color: var(--fail-edge); }
+  .tile-badge.error .dot    { background: var(--on-fail); }
 
   /* Tile state overlay for analyzing */
   .tile-overlay {
     position: absolute; inset: 0;
-    background: rgba(11, 18, 32, 0.55);
+    background: var(--tile-veil);
     backdrop-filter: blur(2px);
     display: flex; align-items: center; justify-content: center;
     z-index: 1;
@@ -546,7 +757,7 @@
   .image-tile[data-state="analyzing"] .tile-overlay { opacity: 1; }
   .tile-overlay-spinner {
     width: 1.7rem; height: 1.7rem; border-radius: 50%;
-    border: 2.5px solid rgba(56, 189, 248, 0.25);
+    border: 2.5px solid var(--accent-soft-edge);
     border-top-color: var(--accent);
     animation: spin 0.8s linear infinite;
   }
@@ -555,7 +766,7 @@
   /* Details toggle and expanded panel */
   .tile-details-toggle {
     position: absolute; bottom: 0; left: 0; right: 0;
-    background: rgba(11, 18, 32, 0.85);
+    background: var(--chrome-bg-soft);
     color: var(--fg); border: 0; border-top: 1px solid var(--border-strong);
     padding: 0.35rem 0.6rem; font: inherit; font-size: 0.72rem;
     font-weight: 600; cursor: pointer;
@@ -568,7 +779,7 @@
   }
   .image-tile[data-state="done"] .tile-details-toggle,
   .image-tile[data-state="error"] .tile-details-toggle { opacity: 1; }
-  .tile-details-toggle:hover { background: rgba(15, 23, 41, 0.95); }
+  .tile-details-toggle:hover { background: var(--chrome-bg-hover); }
   .tile-details-toggle .chev {
     display: inline-block; transition: transform 180ms var(--ease-out);
   }
@@ -582,7 +793,7 @@
     border: 1px solid var(--border-strong);
     border-radius: 0.6rem;
     padding: 0.85rem 1rem;
-    box-shadow: 0 18px 36px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-panel);
     z-index: 10;
     opacity: 0; transform: translateY(-4px);
     transition: opacity 200ms var(--ease-out),
@@ -617,6 +828,12 @@
     color: var(--fg); margin-bottom: 0.6rem;
     line-height: 1.45;
     max-height: 8rem; overflow-y: auto;
+  }
+  .grid-details-panel .panel-unparsed {
+    color: var(--on-unsure); background: var(--unsure-fill);
+    border: 1px solid var(--unsure-edge); border-radius: 6px;
+    padding: 0.4rem 0.55rem; margin-bottom: 0.6rem;
+    font-size: 0.82rem; line-height: 1.4;
   }
   .grid-details-panel .pill-row {
     display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.45rem;
@@ -691,9 +908,9 @@
     font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
     letter-spacing: 0.04em; border: 1px solid;
   }
-  .chip.chip-public  { color: var(--accent); background: rgba(56,189,248,0.10); border-color: rgba(56,189,248,0.35); }
+  .chip.chip-public  { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-soft-edge); }
   .chip.chip-private { color: var(--fg-dim); background: var(--bg-2); border-color: var(--border-strong); }
-  .chip.chip-yours   { color: #fbbf24; background: rgba(251,191,36,0.10); border-color: rgba(251,191,36,0.35); }
+  .chip.chip-yours   { color: var(--mine); background: var(--mine-soft); border-color: var(--mine-edge); }
   .test-row-delete {
     background: transparent; color: var(--fg-dim);
     border: 1px solid var(--border); border-radius: 0.45rem;
@@ -706,8 +923,8 @@
                 transform 0.12s var(--ease-out);
   }
   .test-row-delete:hover {
-    background: rgba(239,68,68,0.10); color: var(--fail);
-    border-color: rgba(239,68,68,0.4);
+    background: var(--fail-soft); color: var(--fail);
+    border-color: var(--fail-soft-edge);
   }
   .test-row-delete:active { transform: scale(0.96); }
   .test-row-delete:disabled {
@@ -788,7 +1005,7 @@
   /* --- Confirm dialog ---------------------------------------------- */
   .dialog-backdrop {
     position: fixed; inset: 0; z-index: 110;
-    background: rgba(2, 6, 16, 0.78);
+    background: var(--scrim);
     backdrop-filter: blur(4px);
     display: flex; align-items: center; justify-content: center;
     padding: 2rem 1.25rem;
@@ -802,7 +1019,7 @@
     background: var(--bg-1);
     border: 1px solid var(--border-strong);
     border-radius: 0.85rem;
-    box-shadow: 0 22px 50px rgba(0, 0, 0, 0.55);
+    box-shadow: var(--shadow-dialog);
     width: 100%; max-width: 26rem;
     padding: 1.4rem 1.4rem 1.2rem;
     transform: translateY(0) scale(1);
@@ -819,11 +1036,16 @@
   }
   .dialog .dialog-icon {
     width: 1.85rem; height: 1.85rem; border-radius: 999px;
-    background: rgba(239,68,68,0.13); color: var(--fail);
+    background: var(--fail-bg); color: var(--fail);
     display: inline-flex; align-items: center; justify-content: center;
     flex-shrink: 0;
   }
   .dialog .dialog-icon svg { width: 1.05rem; height: 1.05rem; }
+  .dialog .dialog-subtitle {
+    margin: -0.35rem 0 0.7rem 2.4rem;
+    font-size: 0.78rem; color: var(--fg-dim); opacity: 0.8;
+  }
+  .dialog .dialog-subtitle:empty { display: none; }
   .dialog .dialog-message {
     color: var(--fg-dim); font-size: 0.88rem; line-height: 1.5;
     margin-bottom: 1.1rem;
@@ -847,7 +1069,7 @@
   }
   .dialog .dialog-btn.cancel:hover { background: var(--bg-3); color: var(--fg); }
   .dialog .dialog-btn.danger {
-    background: var(--fail); color: #450a0a; border-color: var(--fail);
+    background: var(--fail); color: var(--on-fail); border-color: var(--fail);
   }
   .dialog .dialog-btn.danger:hover { filter: brightness(1.08); }
   .dialog.dialog-wide { max-width: 36rem; }
@@ -862,6 +1084,22 @@
     white-space: pre-wrap; word-break: break-word;
   }
   .dialog .dialog-detail:empty { display: none; }
+  .dialog .detail-wrap { position: relative; margin-bottom: 1.1rem; }
+  .dialog .detail-wrap .dialog-detail { margin-bottom: 0; }
+  /* A stack taller than the box otherwise looks like it simply ends at the
+     fold, so the cue appears only while there is more below. */
+  .dialog .detail-wrap::after {
+    content: "scroll for more";
+    position: absolute; left: 1px; right: 1px; bottom: 1px;
+    padding: 1.5rem 0.85rem 0.45rem;
+    font-size: 0.7rem; font-weight: 600; color: var(--fg-dim);
+    text-align: right; pointer-events: none;
+    border-radius: 0 0 0.5rem 0.5rem;
+    background: linear-gradient(to bottom, transparent, var(--bg-0) 60%);
+    opacity: 0; transition: opacity 0.12s var(--ease-out);
+  }
+  .dialog .detail-wrap.scrollable::after { opacity: 1; }
+  .dialog .detail-wrap.at-end::after { opacity: 0; }
 
   /* --- Define mode submit result block --------------------------------- */
   .create-result {
@@ -904,28 +1142,28 @@
     border-radius: 0 0 0.6rem 0.6rem;
   }
   .log-body .ts { color: var(--fg-muted); }
-  .log-body .err { color: #fca5a5; }
-  .log-body .ok { color: #86efac; }
+  .log-body .err { color: var(--danger-fg); }
+  .log-body .ok { color: var(--success-fg); }
 
   /* --- Auth gate ------------------------------------------------------- */
   .auth-gate {
     background:
-      radial-gradient(800px 300px at 50% -50px, rgba(14, 165, 233, 0.18), transparent 70%),
+      radial-gradient(800px 300px at 50% -50px, var(--glow-gate), transparent 70%),
       var(--bg-1);
     border: 1px solid var(--border-strong);
     border-radius: 1rem;
     padding: 2rem 1.75rem;
     margin-bottom: 1.5rem;
     text-align: center;
-    box-shadow: 0 12px 36px rgba(0,0,0,0.35);
+    box-shadow: var(--shadow-gate);
   }
   .auth-gate .lock-icon {
     width: 3rem; height: 3rem; margin: 0 auto 0.85rem;
     border-radius: 999px;
     background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
     display: inline-flex; align-items: center; justify-content: center;
-    color: #fff; font-size: 1.4rem;
-    box-shadow: 0 8px 24px rgba(14, 165, 233, 0.35);
+    color: var(--accent-fg); font-size: 1.4rem;
+    box-shadow: 0 8px 24px var(--accent-glow-lg);
   }
   .auth-gate h2 {
     font-size: 1.25rem; font-weight: 700; color: var(--fg);
@@ -945,53 +1183,75 @@
     user-select: none;
   }
 
-  /* --- Lightbox (click-to-enlarge) ------------------------------------ */
-  .lightbox {
+  /* --- Inspect viewer (zoom / pan / fit / 1:1) ------------------------- */
+  .inspect-backdrop {
     position: fixed; inset: 0; z-index: 100;
-    background: rgba(2, 6, 16, 0.92);
-    backdrop-filter: blur(6px);
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    padding: 4rem 1.5rem 2rem;
-    cursor: zoom-out;
+    display: flex; align-items: center; justify-content: center; padding: 1.5rem;
+    background: var(--scrim-strong);
+    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
     opacity: 1;
     transition: opacity 200ms var(--ease-out);
   }
-  @starting-style {
-    .lightbox { opacity: 0; }
+  @starting-style { .inspect-backdrop { opacity: 0; } }
+  .inspect-modal {
+    display: flex; flex-direction: column; min-height: 0;
+    width: min(1080px, 100%); height: min(760px, 100%);
+    background: var(--bg-2); border: 1px solid var(--border-strong);
+    border-radius: 0.9rem; box-shadow: var(--shadow-modal); overflow: hidden;
+    transform-origin: center;
+    opacity: 1; transform: scale(1);
+    transition: opacity 220ms var(--ease-out), transform 220ms var(--ease-out);
   }
-  .lightbox img {
-    max-width: 92vw; max-height: 80vh; object-fit: contain;
-    border-radius: 0.6rem;
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
-    cursor: default;
-    background: var(--bg-0);
-    transform: scale(1);
-    transition: transform 220ms var(--ease-out);
+  @starting-style { .inspect-modal { opacity: 0; transform: scale(0.96); } }
+  .inspect-head {
+    display: flex; align-items: center; gap: 0.75rem; flex-shrink: 0;
+    padding: 0.7rem 0.8rem 0.7rem 1rem; border-bottom: 1px solid var(--border);
   }
-  @starting-style {
-    .lightbox img { transform: scale(0.95); }
+  .inspect-head .title { font-size: 0.88rem; font-weight: 650; min-width: 0;
+                         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .inspect-head .sub { font-size: 0.74rem; color: var(--fg-muted);
+                       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .inspect-head .spacer { flex: 1 1 auto; }
+
+  .viewer {
+    position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden;
+    background:
+      repeating-conic-gradient(var(--checker) 0% 25%, transparent 0% 50%) 0 0 / 20px 20px,
+      var(--bg-0);
+    cursor: grab; touch-action: none;
   }
-  .lightbox-caption {
-    margin-top: 0.95rem; color: var(--fg-dim); font-size: 0.85rem;
-    text-align: center; max-width: 92vw;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    cursor: default;
+  .viewer.panning { cursor: grabbing; }
+  .viewer img {
+    position: absolute; top: 0; left: 0; transform-origin: 0 0;
+    max-width: none; max-height: none; user-select: none; -webkit-user-drag: none;
   }
-  .lightbox-close {
-    position: absolute; top: 1.25rem; right: 1.25rem;
-    width: 2.5rem; height: 2.5rem; border-radius: 999px;
-    background: rgba(11, 18, 32, 0.85); color: var(--fg);
-    border: 1px solid var(--border-strong);
-    display: inline-flex; align-items: center; justify-content: center;
-    cursor: pointer;
-    transition: background 0.12s var(--ease-out),
-                color 0.12s var(--ease-out),
-                transform 0.12s var(--ease-out);
+  /* Without this, pixel inspection at high zoom is useless — the browser
+     smooths exactly the detail a microscopist zoomed in to see. */
+  .viewer.pixelated img { image-rendering: pixelated; }
+
+  .viewer-bar {
+    display: flex; align-items: center; gap: 0.4rem; flex-shrink: 0; flex-wrap: wrap;
+    padding: 0.55rem 0.8rem; border-top: 1px solid var(--border); background: var(--bg-1);
   }
-  .lightbox-close:hover { background: var(--bg-3); color: #fff; }
-  .lightbox-close:active { transform: scale(0.93); }
-  .lightbox-close svg { width: 1.2rem; height: 1.2rem; }
+  .vbtn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.35rem;
+    font: inherit; font-size: 0.78rem; font-weight: 600; color: var(--fg-dim);
+    background: var(--bg-3); border: 1px solid var(--border); border-radius: 0.5rem;
+    min-width: 2rem; height: 2rem; padding: 0 0.55rem; cursor: pointer;
+    transition: background-color 130ms var(--ease-out), color 130ms var(--ease-out),
+                border-color 130ms var(--ease-out), transform 130ms var(--ease-out);
+  }
+  .vbtn:active { transform: scale(0.94); }
+  .vbtn svg { width: 0.95rem; height: 0.95rem; }
+  @media (hover: hover) and (pointer: fine) {
+    .vbtn:hover { background: var(--bg-2); color: var(--fg); border-color: var(--border-strong); }
+  }
+  #zoomLevel {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.76rem; color: var(--fg); min-width: 4rem; text-align: center;
+  }
+  .viewer-bar .spacer { flex: 1 1 auto; }
+  .viewer-bar .hint { font-size: 0.72rem; color: var(--fg-muted); }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -1011,6 +1271,17 @@
     <span>Smart Microscopy Assistant</span>
   </div>
   <div class="actions">
+    <button id="themeBtn" class="topbar-iconbtn" type="button" aria-label="Toggle theme">
+      <svg class="icon icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+      </svg>
+      <svg class="icon icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+    </button>
     <div id="infoWrap">
       <button id="infoBtn" class="topbar-iconbtn" type="button" aria-label="App info">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -1021,6 +1292,13 @@
         </svg>
       </button>
       <div id="infoPopover" class="popover" hidden>
+        <div class="heading" id="infoHeading">About this app</div>
+        <!-- Filled from APP_INFO so the prose lives in one object, not in markup. -->
+        <div class="prose">
+          <p id="infoSummary"></p>
+          <p id="infoInput"></p>
+          <p id="infoReturns"></p>
+        </div>
         <div class="heading">Model &amp; runtime</div>
         <div id="infoBody"><div class="row"><span class="k">loading…</span></div></div>
       </div>
@@ -1084,6 +1362,10 @@
       </svg>
       <span>Sign in to Hypha</span>
     </button>
+    <p class="gate-error" id="gateError" hidden>
+      <span id="gateErrorText"></span>
+      <button class="detail-link" type="button" id="gateDetailBtn">Details</button>
+    </p>
   </div>
 
   <div class="mode-toggle-wrap signed-in-only">
@@ -1147,7 +1429,7 @@
           </button>
           <button class="btn btn-ghost btn-sm" id="clearAllBtn" type="button" hidden>Clear all</button>
         </div>
-        <span class="status"><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span></span>
+        <span class="status"><span class="status-dot" id="runDot"></span><span id="runStatus">Idle</span><button class="detail-link" type="button" id="runDetailBtn" hidden>Details</button></span>
       </div>
     </div>
 
@@ -1268,7 +1550,7 @@
       <!-- Save -->
       <div class="run-summary" style="margin-top: 1.25rem;">
         <button class="btn btn-primary-lg" id="defineBtn" disabled>Save visual test</button>
-        <span class="status"><span class="status-dot" id="defineDot"></span><span id="defineStatus">Idle</span></span>
+        <span class="status"><span class="status-dot" id="defineDot"></span><span id="defineStatus">Idle</span><button class="detail-link" type="button" id="defineDetailBtn" hidden>Details</button></span>
       </div>
       <div id="defineResultBlock" class="create-result" style="margin-top: 0.85rem;" hidden></div>
     </div>
@@ -1363,8 +1645,11 @@
       </span>
       <span id="errorTitle">Something went wrong</span>
     </div>
+    <div class="dialog-subtitle" id="errorSubtitle"></div>
     <div class="dialog-message" id="errorMessage"></div>
-    <pre class="dialog-detail" id="errorDetail"></pre>
+    <div class="detail-wrap" id="errorDetailWrap" hidden>
+      <pre class="dialog-detail" id="errorDetail"></pre>
+    </div>
     <div class="dialog-actions">
       <button class="dialog-btn cancel" type="button" id="errorCopy">Copy</button>
       <button class="dialog-btn danger" type="button" id="errorClose">Close</button>
@@ -1372,17 +1657,43 @@
   </div>
 </div>
 
-<!-- Lightbox -->
-<div id="lightbox" class="lightbox" role="dialog" aria-label="Image preview" hidden>
-  <button id="lightboxClose" class="lightbox-close" type="button" aria-label="Close preview">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
-         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <line x1="18" y1="6" x2="6" y2="18"/>
-      <line x1="6" y1="6" x2="18" y2="18"/>
-    </svg>
-  </button>
-  <img id="lightboxImg" alt="" />
-  <div id="lightboxCaption" class="lightbox-caption"></div>
+<!-- Inspect viewer -->
+<div id="inspect" class="inspect-backdrop" role="dialog" aria-modal="true"
+     aria-label="Image viewer" hidden>
+  <div class="inspect-modal">
+    <div class="inspect-head">
+      <span class="title" id="inspectTitle">Image</span>
+      <span class="sub" id="inspectSub"></span>
+      <span class="spacer"></span>
+      <button class="vbtn" id="inspectClose" type="button" aria-label="Close (Esc)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+             stroke-linecap="round" aria-hidden="true">
+          <line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="viewer" id="viewer">
+      <img id="viewerImg" alt="" draggable="false" />
+    </div>
+
+    <div class="viewer-bar">
+      <button class="vbtn" id="zoomOut" type="button" aria-label="Zoom out">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+             stroke-linecap="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+      <span id="zoomLevel" role="status" aria-label="Zoom level">100%</span>
+      <button class="vbtn" id="zoomIn" type="button" aria-label="Zoom in">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+             stroke-linecap="round" aria-hidden="true">
+          <line x1="5" y1="12" x2="19" y2="12"/><line x1="12" y1="5" x2="12" y2="19"/></svg>
+      </button>
+      <button class="vbtn" id="zoomFit" type="button">Fit</button>
+      <button class="vbtn" id="zoomOne" type="button">1:1</button>
+      <span class="spacer"></span>
+      <span class="hint">Scroll to zoom · drag to pan · Esc to close</span>
+    </div>
+  </div>
 </div>
 
 <script type="module">
@@ -1409,6 +1720,8 @@ const TEST_NAME_RE = /^[a-z0-9][a-z0-9-]{0,49}$/;
 const TOKEN_KEY    = "smart-microscopy-assistant:token";
 const TOKEN_EXPIRY = "smart-microscopy-assistant:tokenExpiry";
 const TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
+const POLL_INTERVAL_MS = 1000;
+const SLOW_HINT_MS = 10000;
 
 document.getElementById("charCap").textContent = MAX_INSTRUCTION_CHARS;
 for (const el of document.querySelectorAll(".exMax")) el.textContent = MAX_EXAMPLES_PER_CLASS;
@@ -1431,19 +1744,75 @@ let positiveTiles = [];
 let negativeTiles = [];
 
 const $ = id => document.getElementById(id);
+
+// Prose for the info popover. Kept as one object so the wording can be edited
+// without touching markup; the runtime table below it comes from the worker.
+const APP_INFO = {
+  heading: "About this app",
+  summary: "A vision-language model that looks at microscopy images and answers a question about them in plain language.",
+  input: "<strong>You give it</strong> images plus either a free-text instruction, or a saved visual test — a criterion with a few example images of what passing and failing look like.",
+  returns: "<strong>You get back</strong> a description per image, or, with a visual test, a <strong>passed</strong> / <strong>failed</strong> / <strong>unsure</strong> verdict and the reasoning behind it.",
+};
+$("infoHeading").textContent = APP_INFO.heading;
+$("infoSummary").innerHTML   = APP_INFO.summary;
+$("infoInput").innerHTML     = APP_INFO.input;
+$("infoReturns").innerHTML   = APP_INFO.returns;
+
+/* ---- Theme -------------------------------------------------------------- */
+const THEME_KEY = "bioengine-app:theme";
+const prefersReduced = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+let themeTimer = null;
+function applyTheme(theme, { animate = true } = {}) {
+  const root = document.documentElement;
+  if (animate && !prefersReduced()) {
+    root.classList.add("theme-switching");
+    clearTimeout(themeTimer);
+    // Dropped as soon as the colour crossfade is done, so this class can never
+    // interfere with the interaction transitions.
+    themeTimer = setTimeout(() => root.classList.remove("theme-switching"), 200);
+  }
+  root.setAttribute("data-theme", theme);
+  const label = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  $("themeBtn").setAttribute("aria-label", label);
+  $("themeBtn").setAttribute("title", label);
+}
+applyTheme(document.documentElement.getAttribute("data-theme") || "dark", { animate: false });
+
+$("themeBtn").addEventListener("click", () => {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  applyTheme(next);
+  // Ignorable: localStorage is blocked in private mode. Only persistence is
+  // lost; the theme still applies for this page.
+  try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+});
+
+// Follow the OS only while the user has never chosen explicitly.
+window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", e => {
+  let stored = null;
+  try { stored = localStorage.getItem(THEME_KEY); } catch (_) {}
+  if (stored === "light" || stored === "dark") return;
+  applyTheme(e.matches ? "light" : "dark");
+});
+
+const escapeHTML = s => String(s).replace(/[&<>"']/g, c => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+));
+// `msg` carries filenames, server error text and other users' public test
+// names, so it is escaped rather than trusted. No call site passes markup.
 const log = (msg, kind = "") => {
   const ts = new Date().toLocaleTimeString();
-  const cls = kind ? `class="${kind}"` : "";
-  $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${msg}</span>`;
+  const cls = kind ? `class="${escapeHTML(kind)}"` : "";
+  $("log").innerHTML += `\n<span class="ts">[${ts}]</span> <span ${cls}>${escapeHTML(msg)}</span>`;
   $("log").scrollTop = $("log").scrollHeight;
 };
 const setRun = (state, msg) => { $("runDot").className = "status-dot " + (state || ""); $("runStatus").textContent = msg; };
 const setDefine = (state, msg) => { $("defineDot").className = "status-dot " + (state || ""); $("defineStatus").textContent = msg; };
-const escapeHTML = s => String(s).replace(/[&<>"']/g, c => (
-  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-));
 const randomSuffix = () => Math.random().toString(36).slice(2, 10);
 const fileExt = f => (f.name.split(".").pop() || "bin").toLowerCase();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fmtBytes = n => n < 1024 ? n + " B"
+  : n < 1048576 ? (n / 1024).toFixed(0) + " KB" : (n / 1048576).toFixed(1) + " MB";
 const tilesFor = side =>
   side === "positive" ? positiveTiles :
   side === "negative" ? negativeTiles : analyzeTiles;
@@ -1523,9 +1892,25 @@ document.addEventListener("keydown", (e) => {
 async function connectWithToken(token) {
   setLoggingInUI();
   server = await connectToServer({ server_url: SERVER_URL, token });
+  // Only clean closes (server restart, token expiry) reach this hook —
+  // ordinary drops reconnect silently and are unobservable from the page.
+  // The connection is a private field, so a missing hook must degrade to
+  // "no disconnect notice", never to a TypeError at boot.
+  server.rpc?._connection?.on_disconnected?.((reason) => {
+    log("Disconnected from the worker: " + (reason || "connection closed"), "err");
+    setRun("error", "Disconnected — reload to reconnect");
+    setDefine("error", "Disconnected — reload to reconnect");
+    deferError("connect", {
+      title: "Disconnected from the worker",
+      subtitle: "Reload the page to reconnect.",
+      message: "The worker closed the connection. This usually means it restarted or the session token expired.",
+      detail: formatErr(reason),
+    });
+  });
   userWorkspace = server.config.workspace;
   userEmail = (server.config.user && server.config.user.email) || userWorkspace;
   setLoggedInUI();
+  clearDeferredError("connect");
   log(`Connected as ${userEmail} (workspace=${userWorkspace})`, "ok");
   s3 = await server.getService("public/s3-storage", { _rkwargs: true });
   if (!SERVICE_ID) {
@@ -1556,6 +1941,7 @@ async function startLogin() {
     log("Login error: " + err.message, "err");
     showError({
       title: "Login failed",
+      subtitle: "You are still signed out.",
       message: "Could not complete the Hypha auth flow.",
       detail: formatErr(err),
     });
@@ -1584,6 +1970,12 @@ $("logoutBtn").addEventListener("click", async () => {
     if (!URL_TOKEN) clearSavedToken();
     setLoggedOutUI();
     log("Auto-connect failed: " + err.message, "err");
+    deferError("connect", {
+      title: "Auto-connect failed",
+      subtitle: "Sign in again to continue.",
+      message: "The saved session could not be restored, so you have been signed out.",
+      detail: formatErr(err),
+    });
   }
 })();
 
@@ -1624,8 +2016,15 @@ async function refreshModelInfo() {
     add("Examples",   `${info.min_examples_per_class}–${info.max_examples_per_class} per class`);
     add("Verdicts",   (info.verdicts || []).join(" · "));
     add("License",    info.license || "—");
+    clearDeferredError("model-info");
   } catch (err) {
     log("get_model_info failed: " + err.message, "err");
+    deferError("model-info", {
+      title: "Could not read model info",
+      subtitle: "Analysis still works; only the info panel is stale.",
+      message: "<code>get_model_info</code> failed on the worker.",
+      detail: formatErr(err),
+    });
   }
 }
 
@@ -1646,20 +2045,19 @@ let cachedTests = [];
 async function refreshTests({ popupOnError = false } = {}) {
   if (!qcSvc) return;
   try {
-    cachedTests = await qcSvc.list_visual_tests({
-      caller_user_id: userWorkspace, _rkwargs: true,
-    });
+    cachedTests = await qcSvc.list_visual_tests();
+    clearDeferredError("list-tests");
     log(`Loaded ${cachedTests.length} visual test${cachedTests.length === 1 ? "" : "s"}.`);
   } catch (err) {
     cachedTests = [];
     log("list_visual_tests failed: " + err.message, "err");
-    if (popupOnError) {
-      showError({
-        title: "Could not refresh visual tests",
-        message: "<code>list_visual_tests</code> failed on the worker.",
-        detail: formatErr(err),
-      });
-    }
+    const entry = {
+      title: "Could not refresh visual tests",
+      subtitle: "The list below may be empty or out of date.",
+      message: "<code>list_visual_tests</code> failed on the worker.",
+      detail: formatErr(err),
+    };
+    if (popupOnError) showError(entry); else deferError("list-tests", entry);
   }
   refreshTestsDropdown();
   refreshTestList();
@@ -1796,14 +2194,13 @@ function refreshTestList() {
         if (!ok) return;
         del.disabled = true;
         try {
-          await qcSvc.delete_visual_test({
-            name: t.name, caller_user_id: userWorkspace, _rkwargs: true,
-          });
+          await qcSvc.delete_visual_test({ name: t.name, _rkwargs: true });
           log(`Deleted visual test '${t.name}'.`, "ok");
         } catch (err) {
           log(`delete_visual_test(${t.name}) error: ${err.message || err}`, "err");
           showError({
             title: "Delete failed",
+            subtitle: "The test is still there.",
             message: `Could not delete visual test <strong>${escapeHTML(t.name)}</strong>.`,
             detail: formatErr(err),
           });
@@ -1865,21 +2262,68 @@ $("confirmDialog").addEventListener("click", (e) => {
 // Surfaces RPC / button-handler failures as a modal with a scrollable detail
 // block, so users see the real error (stack, server message) instead of a
 // silent log line or a chrome alert().
+// Ray colourises tracebacks, so a server-side error reaches us wrapped in SGR
+// escapes that render as literal "[36m" noise around the useful text.
+const stripAnsi = s => String(s).replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 function formatErr(err) {
   if (!err) return "";
-  if (typeof err === "string") return err;
-  return err.stack || err.message || (() => {
+  if (typeof err === "string") return stripAnsi(err);
+  return stripAnsi(err.stack || err.message || (() => {
     try { return JSON.stringify(err, null, 2); } catch { return String(err); }
-  })();
+  })());
 }
-function showError({ title = "Something went wrong", message = "", detail = "" } = {}) {
+let errorReturnFocus = null;
+function updateDetailCue() {
+  const wrap = $("errorDetailWrap"), pre = $("errorDetail");
+  const hidden = pre.scrollHeight - pre.clientHeight;
+  wrap.classList.toggle("scrollable", hidden > 4);
+  wrap.classList.toggle("at-end", pre.scrollTop >= hidden - 4);
+}
+$("errorDetail").addEventListener("scroll", updateDetailCue);
+function showError({ title = "Something went wrong", subtitle = "", message = "", detail = "" } = {}) {
+  errorReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   $("errorTitle").textContent = title;
+  $("errorSubtitle").textContent = subtitle;
+  // innerHTML is deliberate — callers pass <strong>-marked prose and escape
+  // every value they interpolate.
   $("errorMessage").innerHTML = message;
   $("errorDetail").textContent = detail;
+  $("errorDetailWrap").hidden = !detail;
   $("errorDialog").hidden = false;
-  setTimeout(() => $("errorClose").focus(), 0);
+  setTimeout(() => { $("errorClose").focus(); updateDetailCue(); }, 0);
 }
-function closeError() { $("errorDialog").hidden = true; }
+function closeError() {
+  $("errorDialog").hidden = true;
+  const target = errorReturnFocus;
+  errorReturnFocus = null;
+  if (target && target.isConnected) target.focus();
+}
+
+// A failure the user did not directly ask for — the boot auto-connect, a
+// background refresh — must not steal focus with a modal, but dropping its
+// trace leaves nothing to debug from. Park it behind the status line instead.
+// Keyed by operation so a later success only retires its own parked error.
+let deferredError = null;
+function deferError(key, entry) {
+  deferredError = { key, ...entry };
+  // The status lines live inside the signed-in views, so a failure that leaves
+  // the user signed out — the boot auto-connect above all — also needs a
+  // surface on the login gate or its trace is parked out of reach.
+  $("gateErrorText").textContent = entry.title;
+  $("gateError").hidden = false;
+  $("runDetailBtn").hidden = false;
+  $("defineDetailBtn").hidden = false;
+}
+function clearDeferredError(key) {
+  if (key && deferredError && deferredError.key !== key) return;
+  deferredError = null;
+  $("gateError").hidden = true;
+  $("runDetailBtn").hidden = true;
+  $("defineDetailBtn").hidden = true;
+}
+for (const id of ["runDetailBtn", "defineDetailBtn", "gateDetailBtn"]) {
+  $(id).addEventListener("click", () => { if (deferredError) showError(deferredError); });
+}
 $("errorClose").addEventListener("click", closeError);
 $("errorDialog").addEventListener("click", (e) => {
   if (e.target === $("errorDialog")) closeError();
@@ -1887,6 +2331,7 @@ $("errorDialog").addEventListener("click", (e) => {
 $("errorCopy").addEventListener("click", async () => {
   const text = [
     $("errorTitle").textContent,
+    $("errorSubtitle").textContent,
     $("errorMessage").textContent,
     $("errorDetail").textContent,
   ].filter(Boolean).join("\n\n");
@@ -1903,27 +2348,125 @@ document.addEventListener("keydown", (e) => {
   if (!$("confirmDialog").hidden) closeConfirm(false);
 });
 
-// ===== Lightbox ===========================================================
-function openLightbox(src, caption) {
+// ===== Inspect viewer (zoom / pan / fit / 1:1) ============================
+const viewer = $("viewer"), viewerImg = $("viewerImg");
+const view = { scale: 1, tx: 0, ty: 0, w: 0, h: 0 };
+let inspectTrigger = null;
+
+function applyView() {
+  viewerImg.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`;
+  $("zoomLevel").textContent = Math.round(view.scale * 100) + "%";
+  // Below ~1.25x the browser is downsampling and smoothing helps; above it,
+  // smoothing destroys exactly the detail you zoomed in for.
+  viewer.classList.toggle("pixelated", view.scale >= 1.25);
+}
+// clientWidth/Height, NOT getBoundingClientRect(): the rect is the *transformed*
+// box, so while the modal is still scaling in from 0.96 it reports 96% of the
+// real size and "Fit" lands on the wrong zoom.
+function viewportSize() { return [viewer.clientWidth, viewer.clientHeight]; }
+function fitView() {
+  const [vw, vh] = viewportSize();
+  if (!view.w || !view.h || !vw || !vh) return;
+  view.scale = Math.min(vw / view.w, vh / view.h);
+  view.tx = (vw - view.w * view.scale) / 2;
+  view.ty = (vh - view.h * view.scale) / 2;
+  applyView();
+}
+function zoomTo(nextScale, cx, cy) {
+  const [vw, vh] = viewportSize();
+  if (cx === undefined) { cx = vw / 2; cy = vh / 2; }
+  const s = Math.min(40, Math.max(0.02, nextScale));
+  // Keep the point under the cursor pinned while the scale changes.
+  view.tx = cx - (cx - view.tx) * (s / view.scale);
+  view.ty = cy - (cy - view.ty) * (s / view.scale);
+  view.scale = s;
+  applyView();
+}
+function oneToOne() {
+  const [vw, vh] = viewportSize();
+  zoomTo(1, vw / 2, vh / 2);
+  view.tx = (vw - view.w) / 2;
+  view.ty = (vh - view.h) / 2;
+  applyView();
+}
+
+function openInspect({ src, title, sub, trigger }) {
   if (!src) return;
-  $("lightboxImg").src = src;
-  $("lightboxCaption").textContent = caption || "";
-  $("lightbox").hidden = false;
+  inspectTrigger = trigger || null;
+  $("inspectTitle").textContent = title || "Image";
+  $("inspectSub").textContent = sub || "";
+  $("inspect").hidden = false;
   document.body.style.overflow = "hidden";
+  viewerImg.src = src;
+  const start = () => {
+    view.w = viewerImg.naturalWidth || viewerImg.width;
+    view.h = viewerImg.naturalHeight || viewerImg.height;
+    viewerImg.style.width = view.w + "px";
+    viewerImg.style.height = view.h + "px";
+    fitView();
+  };
+  if (viewerImg.complete && viewerImg.naturalWidth) start();
+  else viewerImg.onload = start;
+  viewerImg.onerror = () => {
+    closeInspect();
+    showError({
+      title: "Could not display that image",
+      subtitle: "The file itself is unaffected.",
+      message: `The image data for <strong>${escapeHTML(title || "this file")}</strong> could not be decoded by the browser.`,
+      detail: "Source: " + String(src).slice(0, 300),
+    });
+  };
+  setTimeout(() => $("inspectClose").focus(), 0);
 }
-function closeLightbox() {
-  $("lightbox").hidden = true;
-  $("lightboxImg").src = "";
-  $("lightboxCaption").textContent = "";
+function closeInspect() {
+  $("inspect").hidden = true;
   document.body.style.overflow = "";
+  // Detach the handlers BEFORE clearing src: dropping the src can itself fire
+  // `error`, which would pop the decode dialog every time the viewer closes.
+  viewerImg.onload = viewerImg.onerror = null;
+  viewerImg.removeAttribute("src");
+  viewerImg.style.width = viewerImg.style.height = "";
+  if (inspectTrigger) { inspectTrigger.focus(); inspectTrigger = null; }
 }
-$("lightboxClose").addEventListener("click", closeLightbox);
-$("lightbox").addEventListener("click", (e) => {
-  if (e.target.id === "lightbox") closeLightbox();
+$("inspectClose").addEventListener("click", closeInspect);
+$("inspect").addEventListener("click", e => { if (e.target === $("inspect")) closeInspect(); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !$("inspect").hidden) closeInspect();
 });
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("lightbox").hidden) closeLightbox();
+
+viewer.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = viewer.getBoundingClientRect();
+  zoomTo(view.scale * Math.exp(-e.deltaY * 0.0016), e.clientX - r.left, e.clientY - r.top);
+}, { passive: false });
+
+let panning = false, panId = null, lastX = 0, lastY = 0;
+viewer.addEventListener("pointerdown", e => {
+  if (panning) return;                       // ignore extra touch points mid-drag
+  panning = true; panId = e.pointerId;
+  lastX = e.clientX; lastY = e.clientY;
+  viewer.classList.add("panning");
+  viewer.setPointerCapture(e.pointerId);     // keep panning outside the bounds
 });
+viewer.addEventListener("pointermove", e => {
+  if (!panning || e.pointerId !== panId) return;
+  view.tx += e.clientX - lastX;
+  view.ty += e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+  applyView();
+});
+const endPan = e => {
+  if (!panning || (e && e.pointerId !== panId)) return;
+  panning = false; panId = null;
+  viewer.classList.remove("panning");
+};
+viewer.addEventListener("pointerup", endPan);
+viewer.addEventListener("pointercancel", endPan);
+
+$("zoomIn").addEventListener("click", () => zoomTo(view.scale * 1.5));
+$("zoomOut").addEventListener("click", () => zoomTo(view.scale / 1.5));
+$("zoomFit").addEventListener("click", fitView);
+$("zoomOne").addEventListener("click", oneToOne);
 
 // ===== Tile rendering =====================================================
 function previewSrcFor(file) {
@@ -2003,7 +2546,7 @@ function makeTileNode(tile) {
   node.addEventListener("click", (e) => {
     if (e.target.closest(".tile-x")) return;
     if (e.target.closest(".tile-details-toggle")) return;
-    if (img.src) openLightbox(img.src, tile.file.name);
+    openInspect({ src: img.src, title: tile.file.name, sub: fmtBytes(tile.file.size), trigger: node });
   });
 
   return node;
@@ -2011,7 +2554,21 @@ function makeTileNode(tile) {
 
 function applyBadge(node, tile) {
   const badge = node.querySelector(".tile-badge");
-  badge.classList.remove("shown", "passed", "failed", "unsure", "analyzed", "error");
+  badge.classList.remove("shown", "passed", "failed", "unsure", "analyzed", "error", "queued");
+  // A queued tile is the one case where the badge is shown mid-run: the wait
+  // is not ours and the user has no other way to see it.
+  if (tile.state === "analyzing" && tile.queuePos) {
+    badge.classList.add("queued", "shown");
+    badge.textContent = "";
+    const qdot = document.createElement("span");
+    qdot.className = "dot";
+    badge.appendChild(qdot);
+    const qlabel = document.createElement("span");
+    qlabel.className = "badge-text";
+    qlabel.textContent = `Queued #${tile.queuePos}`;
+    badge.appendChild(qlabel);
+    return;
+  }
   if (tile.state !== "done" && tile.state !== "error") return;
 
   let cls = "analyzed", text = "Analyzed";
@@ -2293,7 +2850,27 @@ async function runPipeline() {
   refreshAnalyzeEnabled();
   $("clearAllBtn").disabled = true;
   collapseOpenDetails();
+  // The release is in a `finally` so that an unexpected throw anywhere in the
+  // body cannot leave the Run button wedged until the page is reloaded.
+  try {
+    await runPipelineBody(pending);
+  } catch (err) {
+    setRun("error", "Analyze failed");
+    log("Analyze failed: " + (err.message || String(err)), "err");
+    showError({
+      title: "Analyze failed",
+      subtitle: "No results were recorded for this run.",
+      message: "The analysis run stopped unexpectedly.",
+      detail: formatErr(err),
+    });
+  } finally {
+    pipelineRunning = false;
+    $("clearAllBtn").disabled = false;
+    refreshAnalyzeEnabled();
+  }
+}
 
+async function runPipelineBody(pending) {
   const useTest = $("srcTest").checked;
   const visualTest = useTest ? $("testSelect").value : null;
   const instruction = !useTest ? $("instruction").value.trim() : null;
@@ -2306,18 +2883,41 @@ async function runPipeline() {
 
   async function runVlmForTile(tile) {
     tile.state = "analyzing";
+    tile.queuePos = null;
     renderGrid("analyze");
     setRun("busy", `Analyzing ${tile.file.name}`);
     try {
       const callArgs = {
         image_ref: tile.remoteUrl,
         max_new_tokens: 512,
-        caller_user_id: userWorkspace,
         _rkwargs: true,
       };
       if (visualTest) callArgs.visual_test_name = visualTest;
       else            callArgs.instruction = instruction;
-      const res = await qcSvc.inspect(callArgs);
+      // Submit and poll rather than holding one RPC open: other users and
+      // microscopes share the single GPU, so a caller can be queued behind
+      // work it did not submit and needs to see where it is in line.
+      const jobId = await qcSvc.submit_inspect(callArgs);
+      tile.jobId = jobId;
+      const startedAt = Date.now();
+      let st;
+      for (;;) {
+        st = await qcSvc.get_inspect_status({ run_id: jobId, _rkwargs: true });
+        if (st.state === "completed" || st.state === "failed") break;
+        const pos = st.stages?.run?.queue_position;
+        tile.queuePos = (typeof pos === "number" && pos > 0) ? pos : null;
+        renderGrid("analyze");
+        // A queue position is already a liveness signal; without one, silence
+        // past ten seconds reads as a crash.
+        const slow = !tile.queuePos && Date.now() - startedAt > SLOW_HINT_MS;
+        setRun("busy", tile.queuePos
+          ? `Queued #${tile.queuePos} — ${tile.file.name}`
+          : `Analyzing ${tile.file.name}${slow ? " — still running, large images take longer" : ""}`);
+        await sleep(POLL_INTERVAL_MS);
+      }
+      tile.queuePos = null;
+      if (st.state === "failed") throw new Error(st.result?.error || "Inspection failed.");
+      const res = st.result;
       tile.result = res;
       tile.mode = res.mode || "describe";
       tile.state = "done";
@@ -2331,6 +2931,7 @@ async function runPipeline() {
       log(`inspect(${tile.file.name}): ${tile.mode === "few-shot" ? (res.verdict || "unsure") : "described"} in ${res.generation_time_s}s`, "ok");
     } catch (err) {
       tile.state = "error";
+      tile.queuePos = null;
       tile.error = err.message || String(err);
       vlmErrs++;
       batchErrors.push({ stage: "inspect", file: tile.file.name, detail: formatErr(err) });
@@ -2375,10 +2976,6 @@ async function runPipeline() {
     await new Promise(r => setTimeout(r, 80));
   }
 
-  pipelineRunning = false;
-  $("clearAllBtn").disabled = false;
-  refreshAnalyzeEnabled();
-
   let summary;
   if (visualTest) {
     const parts = [];
@@ -2399,6 +2996,7 @@ async function runPipeline() {
     const total = pending.length;
     showError({
       title: `Analyze finished with ${batchErrors.length} error${batchErrors.length === 1 ? "" : "s"}`,
+      subtitle: "The images that succeeded kept their results.",
       message: `${batchErrors.length} of ${total} image${total === 1 ? "" : "s"} failed. Tiles are marked in red; full per-image traces below.`,
       detail,
     });
@@ -2505,6 +3103,13 @@ function renderDetails(panel, tile) {
   if (tile.mode === "few-shot") reason.textContent = r.reason || r.description || "(no reason returned)";
   else                          reason.textContent = r.description || "(no description)";
   panel.appendChild(reason);
+
+  if (tile.mode === "few-shot" && r.verdict_parsed === false) {
+    const warn = document.createElement("div");
+    warn.className = "panel-unparsed";
+    warn.textContent = "The model returned no readable verdict line. This “unsure” is a fallback, not a judgement — read the raw output below.";
+    panel.appendChild(warn);
+  }
 
   const pills = document.createElement("div");
   pills.className = "pill-row";
@@ -2613,7 +3218,6 @@ $("defineBtn").addEventListener("click", async () => {
       positive_image_refs: posUrls,
       negative_image_refs: negUrls,
       is_public: defineIsPublic,
-      caller_user_id: userWorkspace,
       _rkwargs: true,
     });
     setDefine("ok", "Saved");
@@ -2639,6 +3243,7 @@ $("defineBtn").addEventListener("click", async () => {
     log("create_visual_test error: " + (err.message || String(err)), "err");
     showError({
       title: "Could not save visual test",
+      subtitle: "Your images and criterion are still in the form.",
       message: `<code>create_visual_test</code> failed for <strong>${escapeHTML(name)}</strong>.`,
       detail: formatErr(err),
     });

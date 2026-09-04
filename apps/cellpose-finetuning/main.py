@@ -935,7 +935,7 @@ class SessionStatus(TypedDict, total=False):
     weight_decay: float
     min_train_masks: int
     validation_interval: int | None
-    user_id: str | None  # Hypha user ID of the session owner
+    user_id: str | None  # Stable owner key (Hypha account `parent`, falls back to per-token `id`)
     label: str | None  # Annotation label (e.g. "cells") used for this training session
 
 
@@ -1129,6 +1129,37 @@ def get_status_path(session_id: str) -> Path:
 def get_stop_request_path(session_id: str) -> Path:
     """Get the path to the stop-request marker for a training session."""
     return get_session_path(session_id) / STOP_REQUESTED_FILENAME
+
+
+def session_owner_key(context: Any) -> str | None:
+    """Stable identity to record as a session's owner.
+
+    Prefer the Hypha account `parent` (e.g. github|NNN, stable across tokens)
+    over `id`, which is a per-token synthetic account that changes whenever the
+    user mints a new token — keying on `id` would lock owners out of their own
+    sessions after a token rotation.
+    """
+    if isinstance(context, dict) and isinstance(context.get("user"), dict):
+        user = context["user"]
+        return user.get("parent") or user.get("id")
+    return None
+
+
+def caller_identity_keys(context: Any) -> set[str]:
+    """Every identity the caller can prove, for matching a stored session owner.
+
+    Includes the legacy per-token `id` so sessions recorded before the owner key
+    was stabilised stay deletable by the same token that created them, and
+    `email` so an email-keyed owner still matches.
+    """
+    keys: set[str] = set()
+    if isinstance(context, dict) and isinstance(context.get("user"), dict):
+        user = context["user"]
+        for field in ("parent", "id", "email"):
+            value = user.get(field)
+            if value:
+                keys.add(value)
+    return keys
 
 
 def update_status(
@@ -4182,9 +4213,7 @@ class CellposeFinetune:
         session_id = now.strftime("%Y-%m-%d-%H%M%S") + "-" + short_uuid
         get_session_path(session_id).mkdir(parents=True, exist_ok=True)
 
-        user_id: str | None = None
-        if isinstance(context, dict) and isinstance(context.get("user"), dict):
-            user_id = context["user"].get("id")
+        user_id = session_owner_key(context)
 
         update_status(
             session_id=session_id,
@@ -4777,12 +4806,14 @@ class CellposeFinetune:
                 pass
 
         # Enforce ownership check
-        caller_id: str | None = None
-        if isinstance(context, dict) and isinstance(context.get("user"), dict):
-            caller_id = context["user"].get("id")
-
+        caller_keys = caller_identity_keys(context)
         owner_id: str | None = session_data.get("user_id")
-        if owner_id is not None and caller_id != owner_id:
+        if owner_id is None:
+            raise PermissionError(
+                f"Session '{session_id}' has no recorded owner and cannot be "
+                "deleted through the API."
+            )
+        if owner_id not in caller_keys:
             raise PermissionError(
                 f"Session '{session_id}' belongs to another user. "
                 "You can only delete your own sessions."
@@ -4799,7 +4830,7 @@ class CellposeFinetune:
         import shutil
 
         shutil.rmtree(session_path, ignore_errors=True)
-        logger.info(f"Deleted training session {session_id} (caller: {caller_id})")
+        logger.info(f"Deleted training session {session_id} (owner: {owner_id})")
         return {"deleted": session_id}
 
     @bioengine.method

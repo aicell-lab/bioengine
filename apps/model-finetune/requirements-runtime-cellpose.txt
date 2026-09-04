@@ -1,12 +1,20 @@
-# Second, isolated GPU runtime: Cellpose-SAM (cpsam) fine-tuning + bioimage.io
-# export. numpy is irreconcilable with the micro-sam runtime — cellpose pins
-# numpy==1.26.4 while micro-sam's python-elf needs numpy>=2 — so this backend
-# lives in its own Ray deployment (CellposeRuntime) with its own pip env. Pins
-# mirror the deNBI-validated cellpose4-runner env (drop dinov3: DINO deferred).
+# Second, isolated GPU runtime: Cellpose-SAM (cpsam) + Cellpose-DINO (cpdino /
+# cpdino-vitb) fine-tuning + bioimage.io export. numpy is irreconcilable with the
+# micro-sam runtime — cellpose pins numpy==1.26.4 while micro-sam's python-elf
+# needs numpy>=2 — so this backend lives in its own Ray deployment
+# (CellposeRuntime) with its own pip env. Pins mirror the deNBI-validated
+# cellpose4-runner env.
 bioimageio.core==0.10.4
 torch==2.7.1
 torchvision==0.22.1
 cellpose==4.2.1.1
+# cpdino's DINOv3 ViT backbone. cellpose vit.py imports dinov3.hub.backbones in a
+# try/except and silently loses the cpdino arch if it's absent (upstream #1474);
+# with dinov3 installed CellposeModel(pretrained_model="cpdino[-vitb]") builds. It
+# imposes no numpy constraint (cellpose only needs numpy>=1.20), so numpy stays
+# 1.26.4. pretrained=False, so no DINOv3 pretrained download — the cpdino
+# checkpoint carries all weights.
+dinov3 @ git+https://github.com/facebookresearch/dinov3.git@346f38fee679c56a6888f91c51670fae61d364e0
 # NOT PyPI segment-anything==1.0 (broken ResizeLongestSide.apply_image_torch — see
 # requirements-runtime.txt). Latent here (cpsam path doesn't import segment_anything)
 # but pinned to the fixed source for hygiene and parity with the micro-sam runtime.

@@ -1025,6 +1025,7 @@ class AnnotationBroker:
         empty placeholder files are written."""
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+        description = description if isinstance(description, str) else ""
         core.add_label(meta, name, description)  # raises ValueError on a bad name
         meta = core.write_metadata(meta, root=STATE_ROOT)
 
@@ -1225,6 +1226,7 @@ class AnnotationBroker:
         them."""
         artifact_id = self._canonical_id(artifact_id)
         self._require_role(context, artifact_id, "annotator")
+        model_type = model_type if isinstance(model_type, str) else None
         removed = []
 
         async def _rm_all():

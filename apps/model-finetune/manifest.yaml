@@ -1,7 +1,7 @@
 name: BioImageIO Fine-tune
 id: model-finetune
 id_emoji: "🔬"
-description: Serves micro-sam (μSAM) with one resident SAM encoder backing image-embedding export, automatic instance segmentation (AIS decoder), and an ONNX interactive prompt decoder for in-browser box→mask annotation — plus in-app fine-tuning of either micro-sam or Cellpose-SAM (cpsam) on annotated pairs, with a BioImage.IO export for each, serving the just-trained checkpoint.
+description: Serves micro-sam (μSAM) with one resident SAM encoder backing image-embedding export, automatic instance segmentation (AIS decoder), and an ONNX interactive prompt decoder for in-browser box→mask annotation — plus in-app fine-tuning of micro-sam, Cellpose-SAM (cpsam), or Cellpose-DINO (cpdino / cpdino-vitb) on annotated pairs, with a BioImage.IO export for each, serving the just-trained checkpoint.
 documentation: README.md
 authors:
   - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
@@ -12,5 +12,5 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [cell-segmentation, segment-anything, interactive-annotation, fine-tuning, deep-learning, biomedical-imaging]
 type: ray-serve
-version: 0.12.6
+version: 0.13.0
 entry: entry:EntryApp
