@@ -937,7 +937,11 @@ class SmartMicroscopyAssistant:
             "model": _MODEL_ID,
             "task": "vision-language",
             "engine": "huggingface-transformers",
-            "dtype": "float16",
+            "dtype": "4-bit NF4 (float16 compute)",
+            "quantization": (
+                "bitsandbytes nf4, double-quantised; visual tower and lm_head "
+                "kept in float16"
+            ),
             "device": "cuda:0",
             "max_image_bytes": _MAX_IMAGE_BYTES,
             "max_instruction_chars": _MAX_INSTRUCTION_CHARS,
