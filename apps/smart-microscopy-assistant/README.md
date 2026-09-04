@@ -259,7 +259,8 @@ qc      = await server.get_service(ws_sid)
 # Define a visual test once
 await qc.create_visual_test(
     name="has-cells",
-    description="PASS: visible cellular structures with nuclei. FAIL: flat, empty, or uniform regions.",
+    pass_criterion="Visible cellular structures with nuclei.",
+    fail_criterion="Flat, empty, or uniform regions.",
     positive_image_refs=["my-workspace/qc-samples:cells_1.tif", "my-workspace/qc-samples:cells_2.tif"],
     negative_image_refs=["my-workspace/qc-samples:flat_1.png",  "my-workspace/qc-samples:flat_2.png"],
 )
