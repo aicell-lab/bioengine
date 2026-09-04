@@ -45,6 +45,16 @@ VLM-backed microscopy analyst. Define re-usable visual tests with a few positive
 
 If the server downscales, the response carries `downscaled_from: [W, H]` and a `downscale_note` so callers can see whether the verdict was rendered on the original or a resized version.
 
+## Accepted image references
+
+An `image_ref` is either a Hypha artifact reference `<workspace>/<alias>:<file_path>`, or an `https://` URL whose host is the app's own Hypha server (`hypha.aicell.io`). Anything else — another host, plain `http://`, a URL carrying userinfo — is refused before any request is made, and a same-origin URL that redirects off-origin is refused at the hop.
+
+The reason is that the app fetches with its own network position, so a caller who can name an arbitrary host gets to probe what the replica can route to. No credential is involved; reachability is. Both URL shapes the app actually consumes are same-origin anyway — `artifact-manager.get_file` and the browser UI's `s3-storage.get_file` both return `https://hypha.aicell.io/s3/...` — so the restriction costs nothing in practice. To use an image held elsewhere, upload it to a Hypha artifact or to `s3-storage` first and pass that reference.
+
+## Who can call this app
+
+`authorized_users` in `manifest.yaml` is a named allowlist, not `"*"`. BioEngine matches the caller's Hypha `id` or `email` exactly (`bioengine/utils/permissions.py`), and the app builder additionally admits the deploying identity and the worker's admin users. Anonymous callers are rejected. To widen access, add the address to `authorized_users` and redeploy — note that a Hypha API token carries no email in its JWT payload, but the server enriches the identity from the parent account, so an email entry matches API tokens and browser logins alike.
+
 ## Two modes
 
 The app has two operating modes that share the same `inspect()` entry point:
@@ -60,7 +70,7 @@ Define a visual test once with `create_visual_test(...)`, then call `inspect(ima
 
 | Parameter | Type | Description |
 |---|---|---|
-| `image_ref` | `str` | Either an `https://...` URL (public or presigned) **or** a Hypha artifact reference `<workspace>/<alias>:<file_path>` (e.g. `ws-user-github\|49943582/qc-samples:images/frame_001.tif`). |
+| `image_ref` | `str` | Either an `https://hypha.aicell.io/...` URL issued by that server (an artifact or `s3-storage` presigned link) **or** a Hypha artifact reference `<workspace>/<alias>:<file_path>` (e.g. `ws-user-github\|49943582/qc-samples:images/frame_001.tif`). URLs on any other host are refused — see [Accepted image references](#accepted-image-references). |
 | `instruction` | `str?` | Free-text instruction. Required when `visual_test_name` is not given. Optional when it is — then it overrides the visual test's stored description. Max 4000 chars. |
 | `visual_test_name` | `str?` | Name of a visual test created via `create_visual_test(...)`. Switches into few-shot verdict mode. |
 | `max_new_tokens` | `int` | Response token budget. Default 512, range 1–1024. |
@@ -120,7 +130,7 @@ If a visual test isn't discriminating well: tighten the `description` (it goes i
 
 | Method | Description |
 |---|---|
-| `create_visual_test(name, pass_criterion, fail_criterion, positive_image_refs, negative_image_refs, is_public=False)` | Define or replace one of *your* visual tests. References can be HTTPS URLs (public or presigned) or Hypha artifact refs. Images are downloaded, downscaled (capped at ~512×512), and persisted under your own directory. |
+| `create_visual_test(name, pass_criterion, fail_criterion, positive_image_refs, negative_image_refs, is_public=False)` | Define or replace one of *your* visual tests. References follow the same rule as `inspect` — a `hypha.aicell.io` URL or a Hypha artifact ref. Images are downloaded, downscaled (capped at ~512×512), and persisted under your own directory. |
 | `list_visual_tests()` | Your own tests plus every public test. Each record carries `created_by`, `is_public`, and `owned_by_you`. |
 | `get_visual_test(name)` | One record you can see — your own test of that name wins over a public one. |
 | `delete_visual_test(name)` | Remove one of your own tests and its cached images. Owner-only, even for public tests. |
@@ -136,7 +146,7 @@ Limits enforced by `create_visual_test`:
 
 Every test is owned by the identity Hypha reports for the caller — email where the token carries one, otherwise the user id. Tests are private by default; `is_public=True` makes a test listable and usable by everyone, but never deletable or overwritable by anyone but its owner. Source image refs (`positive_refs`/`negative_refs`) are returned **only to the owner**: a caller-supplied `https://` ref may be a presigned URL, which is a bearer capability for a file the reader has no permission on, so handing it to every reader of a public test would route around the permission check that accepted it.
 
-**Changed in 0.11.0 — anonymous callers no longer share one library.** Before 0.11.0, every unauthenticated caller was keyed to the single owner string `"anonymous"`, so any two anonymous callers were the same principal: each could read, overwrite, and delete the others' private tests, and every record reported `owned_by_you: True` to a non-creator. Anonymous callers are now keyed on the throwaway workspace Hypha allocates per connection, so each is a distinct principal — and an anonymous caller's tests are no longer reachable after that connection closes.
+**Changed in 0.11.0 — anonymous callers no longer share one library.** Before 0.11.0, every unauthenticated caller was keyed to the single owner string `"anonymous"`, so any two anonymous callers were the same principal: each could read, overwrite, and delete the others' private tests, and every record reported `owned_by_you: True` to a non-creator. Anonymous callers are now keyed on the throwaway workspace Hypha allocates per connection, so each is a distinct principal — and an anonymous caller's tests are no longer reachable after that connection closes. Since 0.12.0 the allowlist rejects anonymous callers outright, so this keying no longer has a live path; it is kept because records written before 0.12.0 still carry those owner keys.
 
 That last clause is a real capability removal, so it is worth being explicit about whether anyone was relying on it. Our reading is that no one was — but the evidence is bounded, and the bound matters more than the conclusion.
 
@@ -241,13 +251,13 @@ qc      = await server.get_service(ws_sid)
 await qc.create_visual_test(
     name="has-cells",
     description="PASS: visible cellular structures with nuclei. FAIL: flat, empty, or uniform regions.",
-    positive_image_refs=["https://example.org/cells_1.tif", "https://example.org/cells_2.tif"],
-    negative_image_refs=["https://example.org/flat_1.png",  "https://example.org/flat_2.png"],
+    positive_image_refs=["my-workspace/qc-samples:cells_1.tif", "my-workspace/qc-samples:cells_2.tif"],
+    negative_image_refs=["my-workspace/qc-samples:flat_1.png",  "my-workspace/qc-samples:flat_2.png"],
 )
 
 # Run it against any number of new images
 result = await qc.inspect(
-    image_ref="https://example.org/scan.tif",
+    image_ref="my-workspace/qc-samples:scan.tif",
     visual_test_name="has-cells",
 )
 print(result["verdict"], "—", result["reason"])

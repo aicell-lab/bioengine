@@ -1,6 +1,7 @@
 """Smart Microscopy Assistant — VLM-backed analyst for microscopy images.
 
-Accepts a microscopy image (Hypha artifact reference OR HTTPS URL) and either
+Accepts a microscopy image (Hypha artifact reference OR an HTTPS URL on the
+app's own Hypha origin — see `_assert_same_origin_url`) and either
 a free-text instruction (describe-what-you-see) or the name of a previously-
 defined "visual test" (few-shot verdict mode), and returns the VLM's textual
 judgement.
@@ -54,6 +55,7 @@ _MAX_PIXELS = 1280 * 28 * 28
 _MAX_LONG_SIDE = 2048
 _HARD_REJECT_PIXELS = 200 * 1024 * 1024
 _DOWNLOAD_TIMEOUT_S = 30
+_MAX_REDIRECTS = 5
 _GENERATE_TIMEOUT_S = 180
 _INSPECT_JOBS_TTL_SEC = 24 * 3600
 
@@ -200,6 +202,30 @@ def _readable_workspaces(context: Optional[Dict[str, Any]]) -> set:
     scope = ((context or {}).get("user") or {}).get("scope") or {}
     perms = scope.get("workspaces") or {}
     return {ws for ws, perm in perms.items() if perm in ("r", "rw", "a")}
+
+
+def _assert_same_origin_url(url: str) -> str:
+    """Accept only an HTTPS URL issued by this app's own Hypha server.
+
+    The app fetches with its own network position, so a caller who can name
+    an arbitrary host gets to probe what the replica can route to. Both URL
+    shapes the app actually consumes — `artifact-manager.get_file` and the
+    browser's `s3-storage.get_file` — are served from the Hypha origin, so
+    an origin allowlist costs nothing and removes the surface entirely.
+    """
+    from urllib.parse import urlparse
+
+    expected = urlparse(_DEFAULT_SERVER_URL).netloc.lower()
+    parsed = urlparse(url)
+    # `netloc` keeps any userinfo, so `https://<expected>@evil.example/`
+    # would pass a naive comparison while resolving to `evil.example`.
+    if parsed.scheme != "https" or "@" in parsed.netloc or parsed.netloc.lower() != expected:
+        raise ValueError(
+            f"Refusing to fetch {url.split('?', 1)[0]!r}: only https URLs on "
+            f"{expected} are accepted. Pass a Hypha artifact reference "
+            f"'<workspace>/<alias>:<file_path>' instead."
+        )
+    return url
 
 
 def _test_id_for(owner: str, name: str) -> str:
@@ -393,6 +419,9 @@ class SmartMicroscopyAssistant:
     async def _resolve_to_url(self, image_ref: str, context=None) -> str:
         """Turn an image reference into a fetchable URL.
 
+        A URL ref must be on this app's own Hypha origin — see
+        `_assert_same_origin_url`.
+
         An artifact ref is resolved with the app's own token only when the
         caller could have read that workspace themselves; otherwise with no
         token at all, so the ref reaches public artifacts and nothing more.
@@ -401,7 +430,7 @@ class SmartMicroscopyAssistant:
         app's token can read.
         """
         if image_ref.startswith(("http://", "https://")):
-            return image_ref
+            return _assert_same_origin_url(image_ref)
         if ":" not in image_ref or "/" not in image_ref.split(":", 1)[0]:
             raise ValueError(
                 "image_ref must be 'https://...' or '<workspace>/<alias>:<path>' "
@@ -438,15 +467,39 @@ class SmartMicroscopyAssistant:
         from PIL import Image
 
         buf = bytearray()
-        async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT_S, follow_redirects=True) as client:
-            async with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
-                    buf.extend(chunk)
-                    if len(buf) > _MAX_IMAGE_BYTES:
-                        raise ValueError(
-                            f"Image exceeds {_MAX_IMAGE_BYTES // (1024 * 1024)} MB limit."
-                        )
+        # Redirects are followed by hand so every hop is re-checked. Letting
+        # httpx follow them would check only the caller's URL, and a
+        # same-origin URL is free to redirect anywhere.
+        async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT_S, follow_redirects=False) as client:
+            for _ in range(_MAX_REDIRECTS + 1):
+                try:
+                    async with client.stream("GET", url) as resp:
+                        if resp.is_redirect:
+                            from urllib.parse import urljoin
+
+                            url = _assert_same_origin_url(
+                                urljoin(url, resp.headers.get("location", ""))
+                            )
+                            continue
+                        resp.raise_for_status()
+                        async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                            buf.extend(chunk)
+                            if len(buf) > _MAX_IMAGE_BYTES:
+                                raise ValueError(
+                                    f"Image exceeds {_MAX_IMAGE_BYTES // (1024 * 1024)} MB limit."
+                                )
+                except httpx.HTTPStatusError as e:
+                    raise ValueError(
+                        f"Could not fetch the image: HTTP {e.response.status_code} "
+                        "(a presigned URL may have expired)."
+                    ) from None
+                except httpx.HTTPError as e:
+                    # The httpx traceback carries the replica's venv path, so
+                    # the caller gets the reason and nothing about the host.
+                    raise ValueError(f"Could not fetch the image: {type(e).__name__}.") from None
+                break
+            else:
+                raise ValueError(f"Image URL redirected more than {_MAX_REDIRECTS} times.")
 
         try:
             img = Image.open(io.BytesIO(bytes(buf)))
