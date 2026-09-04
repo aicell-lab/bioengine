@@ -932,7 +932,12 @@ class SmartMicroscopyAssistant:
 
     @bioengine.method
     async def get_model_info(self) -> dict:
-        """Describe the served model and the input/output contract."""
+        """Describe the served model and the input/output contract.
+
+        `dtype`, `quantization` and `license` describe _MODEL_ID but are not
+        derived from it — revisit all three on any model swap. The 3B this app
+        served until 0.13.2 is qwen-research (non-commercial), not Apache 2.0.
+        """
         return {
             "model": _MODEL_ID,
             "task": "vision-language",
@@ -953,7 +958,7 @@ class SmartMicroscopyAssistant:
             "max_visual_test_name_chars": _MAX_TEST_NAME_CHARS,
             "max_visual_test_desc_chars": _MAX_TEST_DESC_CHARS,
             "verdicts": list(_VERDICT_VALUES),
-            "license": "Qwen2.5-VL Apache 2.0 weights",
+            "license": "apache-2.0 (Qwen2.5-VL-7B-Instruct weights)",
         }
 
     # ----------------------------------------------- visual-test management
