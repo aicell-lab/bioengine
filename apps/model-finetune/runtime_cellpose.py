@@ -75,6 +75,7 @@ class CellposeRuntime:
         self._model = None
         self._loaded_key: Optional[str] = None
         self._device_cached: Optional[str] = None
+        self._gpu_mem_cached: Optional[Dict[str, Any]] = None
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""
@@ -84,6 +85,15 @@ class CellposeRuntime:
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
         }
+
+    async def gpu_memory_info(self) -> Dict[str, Any]:
+        """Total/free VRAM of this runtime's GPU, for the entry's training gate
+        (mirrors RuntimeApp). Cached after the first sample; total VRAM is static."""
+        if self._gpu_mem_cached is None:
+            import training
+
+            self._gpu_mem_cached = training.detect_gpu_memory()
+        return self._gpu_mem_cached
 
     def _device(self) -> str:
         if self._device_cached is None:

@@ -118,6 +118,24 @@ backbone — `cpsam` (SAM ViT-L), `cpdino` (DINOv3 ViT-L), `cpdino-vitb` (DINOv3
 ViT-B) — and share the same training/serve/export path; a fine-tuned checkpoint
 self-identifies its backbone, so serving is identical.
 
+**Hardware requirements (model gating).** Fine-tuning is gated on detected GPU
+VRAM: the runtime reads its card's total memory and each model carries a minimum
+(`training.MODEL_TRAIN_VRAM_MB`). `get_training_capabilities()` reports, per
+model, whether it fits the hardware, and `start_training` rejects an unfit model
+immediately rather than OOMing mid-run. The gate is **on/off per model** at the
+smallest viable config — it does not cap `n_objects_per_batch`, which stays your
+lever to fit a model that does qualify (lower it on small GPUs). On our 16 GB
+clusters (deNBI T4, KTH A40-16C slices) `vit_b`/`vit_t`, `cpsam`, `cpdino*` train
+fine, while **`vit_l`/`vit_h` are inference-only** — full-encoder ViT-L
+fine-tuning needs >16 GB (an A100/A40), though ViT-L *inference* runs on 16 GB.
+
+- **`get_training_capabilities()`** → `{gpus: {microsam, cellpose}, models: [{model_type, backend, min_gpu_memory_mb, trainable, reason}, ...]}`.
+  Which models the worker's GPU(s) can fine-tune, so a UI can offer every model
+  and grey out the unfit ones. `trainable` is `false` when the detected total
+  VRAM is below the model's minimum (e.g. `vit_l`/`vit_h` on a 16 GB card), and
+  `null` when that backend's runtime is unavailable. `start_training`
+  **hard-rejects** a model whose backend GPU can't fit it (a clear `ValueError`
+  up front, instead of a mid-training CUDA OOM). See *Hardware requirements* below.
 - **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, diam_mean=30.0, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, resume_session_id=None, label="")`**
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`

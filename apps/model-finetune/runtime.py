@@ -98,6 +98,7 @@ class RuntimeApp:
         self._loaded_key: Optional[tuple] = None
         self._onnx_cache: Dict[str, bytes] = {}
         self._device_cached: Optional[str] = None
+        self._gpu_mem_cached: Optional[Dict[str, Any]] = None
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check — not a Hypha method,
@@ -110,6 +111,16 @@ class RuntimeApp:
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
         }
+
+    async def gpu_memory_info(self) -> Dict[str, Any]:
+        """Total/free VRAM of this runtime's GPU, for the entry's training gate.
+        Composition endpoint (not a Hypha method); total VRAM is static so it's
+        cached after the first sample."""
+        if self._gpu_mem_cached is None:
+            import training
+
+            self._gpu_mem_cached = training.detect_gpu_memory()
+        return self._gpu_mem_cached
 
     def _device(self) -> str:
         """Pick the compute device internally (device is not a public API param)."""

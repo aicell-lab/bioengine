@@ -58,6 +58,54 @@ def cellpose_base_model(model_type: str) -> str:
     return _CELLPOSE_BASE.get(model_type, "cpsam_v2")
 
 
+# Minimum total GPU VRAM (MB) a model needs to fine-tune AT ALL, at the smallest
+# viable config (micro-sam: n_objects_per_batch=1, patch 256; cellpose:
+# batch_size=1). The training gate compares detected device VRAM against this to
+# offer/reject a model per-hardware — it does NOT bound n_objects_per_batch, which
+# stays user-tunable. Anchored empirically on deNBI's T4 (~14.9 GiB usable): ViT-L
+# OOMs there, ViT-B/T fit. cpsam/cpdino tiers set from the same calibration sweep;
+# vit_h has no cluster that fits it, which the gate should reflect.
+MODEL_TRAIN_VRAM_MB = {
+    "vit_t_lm": 6000,
+    "vit_t_em_organelles": 6000,
+    "vit_b_lm": 12000,
+    "vit_b_em_organelles": 12000,
+    "vit_b": 12000,
+    "vit_l_lm": 24000,
+    "vit_l_em_organelles": 24000,
+    "vit_l": 24000,
+    "vit_h": 40000,
+    "cpsam": 14000,
+    "cpdino": 14000,
+    "cpdino-vitb": 10000,
+}
+
+_MAX_VRAM_MB = max(MODEL_TRAIN_VRAM_MB.values())
+
+
+def min_training_vram_mb(model_type: str) -> int:
+    """Minimum total GPU VRAM (MB) needed to fine-tune ``model_type``. Unknown
+    types fail closed at the largest known requirement."""
+    return MODEL_TRAIN_VRAM_MB.get(model_type, _MAX_VRAM_MB)
+
+
+def detect_gpu_memory() -> Dict[str, Any]:
+    """Total/free VRAM of the runtime's GPU. Runs GPU-side (torch imported lazily
+    so the CPU entry never loads it). ``available`` is False when no CUDA device."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return {"available": False, "total_mb": 0, "free_mb": 0, "device_name": ""}
+    free_b, total_b = torch.cuda.mem_get_info()
+    props = torch.cuda.get_device_properties(0)
+    return {
+        "available": True,
+        "total_mb": int(props.total_memory / (1024 * 1024)),
+        "free_mb": int(free_b / (1024 * 1024)),
+        "device_name": props.name,
+    }
+
+
 def checkpoint_path(session_id: str) -> Path:
     """Servable checkpoint for a finished session, by backend:
     micro-sam's torch_em writes ``<dir>/checkpoints/<name>/best.pt``; cellpose's

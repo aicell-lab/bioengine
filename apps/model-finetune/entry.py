@@ -125,6 +125,15 @@ class EntryApp:
                 "export, and training are unavailable until it starts."
             ) from e
 
+    async def _runtime_gpu_memory(self, model_type: Optional[str] = None) -> Dict[str, Any]:
+        """VRAM of the backend runtime that owns ``model_type`` (empty dict if the
+        runtime doesn't answer)."""
+        runtime = self._runtime_for(model_type)
+        try:
+            return await asyncio.wait_for(runtime.gpu_memory_info(), timeout=5.0)
+        except Exception:
+            return {}
+
     # === I/O transport (S3 + URL) ===
 
     @bioengine.method
@@ -605,6 +614,35 @@ class EntryApp:
             self._training_tasks.pop(session_id, None)
 
     @bioengine.method
+    async def get_training_capabilities(self) -> Dict[str, Any]:
+        """Which models this worker's GPU(s) can fine-tune. The annotate-page
+        finetuning selector calls this to offer every model and grey out the ones
+        the hardware can't train. Returns detected VRAM per backend and, for all
+        model types, ``{model_type, backend, min_gpu_memory_mb, trainable, reason}``.
+        ``trainable`` is None when that backend's runtime is unavailable."""
+        import training
+
+        microsam = await self._runtime_gpu_memory(None)
+        cellpose = await self._runtime_gpu_memory("cpsam")
+        models = []
+        for m in ModelType.__args__:
+            backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
+            gpu = cellpose if backend == "cellpose" else microsam
+            required = training.min_training_vram_mb(m)
+            rec = {"model_type": m, "backend": backend, "min_gpu_memory_mb": required}
+            if not gpu:
+                rec["trainable"], rec["reason"] = None, "runtime unavailable"
+            elif not gpu.get("available"):
+                rec["trainable"], rec["reason"] = False, "no GPU detected on the runtime"
+            elif gpu["total_mb"] < required:
+                rec["trainable"] = False
+                rec["reason"] = f"needs ~{required} MB, GPU has {gpu['total_mb']} MB"
+            else:
+                rec["trainable"], rec["reason"] = True, "fits"
+            models.append(rec)
+        return {"gpus": {"microsam": microsam, "cellpose": cellpose}, "models": models}
+
+    @bioengine.method
     async def start_training(
         self,
         train_images: List[Union[np.ndarray, str]] = Field(
@@ -622,7 +660,8 @@ class EntryApp:
             "(all cellpose types share the isolated Cellpose runtime)."),
         n_epochs: int = Field(5, description="Number of training epochs."),
         n_objects_per_batch: int = Field(
-            8, description="micro-sam only: objects per batch — main GPU-memory knob; 8 fits vit_b on 24GB."),
+            8, description="micro-sam only: objects per batch — main GPU-memory knob; "
+            "lower it on small GPUs, raise it on large ones (8 fits vit_b on 24GB)."),
         patch_size: int = Field(512, description="micro-sam only: square training patch side (clamped to the smallest image)."),
         diam_mean: float = Field(30.0, description="cellpose only (cpsam/cpdino): mean object diameter in pixels."),
         batch_size: int = Field(1, description="Training batch size."),
@@ -642,6 +681,24 @@ class EntryApp:
         import training
 
         await self._check_runtime_available(model_type)
+
+        gpu = await self._runtime_gpu_memory(model_type)
+        required = training.min_training_vram_mb(model_type)
+        if gpu.get("available") and gpu["total_mb"] < required:
+            same_backend = (model_type in CELLPOSE_MODEL_TYPES)
+            fits = [
+                m for m, req in training.MODEL_TRAIN_VRAM_MB.items()
+                if (m in CELLPOSE_MODEL_TYPES) == same_backend and req <= gpu["total_mb"]
+            ]
+            raise ValueError(
+                f"{model_type} needs ~{required} MB of GPU memory to fine-tune, but "
+                f"this runtime's GPU ({gpu.get('device_name') or 'unknown'}) has only "
+                f"{gpu['total_mb']} MB. Models that fit here: "
+                f"{', '.join(fits) or 'none'}. Call get_training_capabilities() for "
+                f"the full per-model list, or reduce n_objects_per_batch and retry a "
+                f"smaller model."
+            )
+
         backend = "cellpose" if model_type in CELLPOSE_MODEL_TYPES else "microsam"
         session_id = training.new_session_id()
         training.write_status(
