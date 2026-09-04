@@ -41,10 +41,10 @@ ModelType = Literal[
     "vit_l_lm", "vit_b_lm", "vit_t_lm",
     "vit_l_em_organelles", "vit_b_em_organelles", "vit_t_em_organelles",
     "vit_b", "vit_l", "vit_h",
-    "cpsam",
+    "cpsam", "cpdino", "cpdino-vitb",
 ]
-# Model types served by the isolated Cellpose-SAM runtime rather than micro-sam.
-CELLPOSE_MODEL_TYPES = ("cpsam",)
+# Model types served by the isolated Cellpose runtime rather than micro-sam.
+CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
 
 
 def _read_pip(name: str) -> List[str]:
@@ -415,8 +415,9 @@ class EntryApp:
             "draft/staged model in your workspace; omit for published models.",
         ),
     ) -> List[Dict[str, Any]]:
-        """Automatic instance segmentation (μSAM AIS, or Cellpose-SAM when
-        ``model_type='cpsam'`` / a cpsam session/model). Returns a bare list, one
+        """Automatic instance segmentation (μSAM AIS, or Cellpose when
+        ``model_type`` is a cellpose type — cpsam / cpdino / cpdino-vitb — or a
+        cellpose session/model). Returns a bare list, one
         item per input, each ``{"output": <int32 [H,W] instance label mask>}``.
         Pass ``input_arrays`` (images) OR ``embeddings`` (micro-sam only —
         precomputed, runs the AIS decoder without re-encoding). Pass ``model_id``
@@ -450,17 +451,16 @@ class EntryApp:
                 generate_kwargs=generate_kwargs, checkpoint=checkpoint,
             )
         # A fine-tuned session's backend fixes the runtime; otherwise route by model_type.
-        served_type = (
-            "cpsam" if session_id and training.session_backend(session_id) == "cellpose"
-            else model_type
-        )
-        await self._check_runtime_available(served_type)
-        if served_type == "cpsam" and session_id:
+        served_type = model_type
+        if session_id and training.session_backend(session_id) == "cellpose":
+            cparams = training.read_training_params(session_id)
+            served_type = cparams.get("model_type", "cpsam")
             # Serve at the diameter the session trained/exports at, so live GPU
             # masks match the exported package's CPU self-test.
-            diam = training.read_training_params(session_id).get("diam_mean")
+            diam = cparams.get("diam_mean")
             if diam is not None:
                 generate_kwargs["diameter"] = diam
+        await self._check_runtime_available(served_type)
         images = [await self._resolve_image(src) for src in input_arrays]
         return await self._runtime_for(served_type).auto_segment(
             images=images, model_type=served_type,
@@ -618,12 +618,13 @@ class EntryApp:
         model_type: ModelType = Field(
             "vit_l_lm",
             description="Base model to fine-tune. vit_* → micro-sam (AIS decoder); "
-            "'cpsam' → Cellpose-SAM (isolated runtime)."),
+            "'cpsam' → Cellpose-SAM, 'cpdino'/'cpdino-vitb' → Cellpose-DINO "
+            "(all cellpose types share the isolated Cellpose runtime)."),
         n_epochs: int = Field(5, description="Number of training epochs."),
         n_objects_per_batch: int = Field(
             8, description="micro-sam only: objects per batch — main GPU-memory knob; 8 fits vit_b on 24GB."),
         patch_size: int = Field(512, description="micro-sam only: square training patch side (clamped to the smallest image)."),
-        diam_mean: float = Field(30.0, description="cpsam only: mean object diameter in pixels."),
+        diam_mean: float = Field(30.0, description="cellpose only (cpsam/cpdino): mean object diameter in pixels."),
         batch_size: int = Field(1, description="Training batch size."),
         learning_rate: float = Field(1e-5, description="AdamW learning rate."),
         val_fraction: float = Field(0.2, description="Val split fraction when val is omitted."),
@@ -713,15 +714,15 @@ class EntryApp:
         """Start building a BioImage.IO model package from a COMPLETED fine-tuning
         session — a **combined SAM+decoder** package (interactive prompt head + AIS
         decoder, via ``micro_sam.bioimageio.export_sam_model``) for micro-sam
-        sessions, or a **Cellpose-SAM pytorch_state_dict** package for cpsam
-        sessions. Async, like start_training: returns immediately with an
+        sessions, or a **Cellpose pytorch_state_dict** package for cellpose
+        (cpsam / cpdino) sessions. Async, like start_training: returns immediately with an
         ``export_id`` — poll ``get_export_status``. The package is self-tested on
         CPU (``bioimageio.core.test_model``), built server-side, and staged on
         temporary storage; this method **publishes nothing**. The frontend creates
         the draft artifact with the user's own token and either downloads the zip
         from ``download_url`` or calls ``push_export`` to stream the package files
         straight into the draft. ``license`` applies to micro-sam packages only
-        (cpsam packages carry Cellpose's BSD-3-Clause).
+        (cellpose packages carry Cellpose's BSD-3-Clause).
         """
         import training
 

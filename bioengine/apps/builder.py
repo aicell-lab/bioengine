@@ -141,6 +141,11 @@ class AppBuilder:
             if local_path.exists():
                 with open(local_path, "r") as f:
                     manifest = yaml.safe_load(f)
+                # No artifact history to resolve a version against, but every
+                # downstream consumer (introspect task, replica setup hook)
+                # requires a non-empty BIOENGINE_ARTIFACT_VERSION to key the
+                # source cache on.
+                resolved_version = version or manifest.get("version") or "local"
             else:
                 self.logger.warning(
                     f"Local manifest file not found: {local_path}. "

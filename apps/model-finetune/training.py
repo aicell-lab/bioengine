@@ -45,6 +45,19 @@ def session_backend(session_id: str) -> str:
     return read_status(session_id).get("backend", "microsam")
 
 
+# Our public cpsam/cpdino model_type strings → the cellpose ``pretrained_model``
+# name to initialise a base net from. cellpose 4.x ignores its ``model_type``
+# kwarg and selects the architecture by this string (or auto-detects the backbone
+# when given a fine-tuned checkpoint path). "cpsam" maps to "cpsam_v2" to preserve
+# the base the validated cpsam path already trains/serves from.
+_CELLPOSE_BASE = {"cpsam": "cpsam_v2", "cpdino": "cpdino", "cpdino-vitb": "cpdino-vitb"}
+
+
+def cellpose_base_model(model_type: str) -> str:
+    """cellpose ``pretrained_model`` name for one of our cpsam/cpdino model types."""
+    return _CELLPOSE_BASE.get(model_type, "cpsam_v2")
+
+
 def checkpoint_path(session_id: str) -> Path:
     """Servable checkpoint for a finished session, by backend:
     micro-sam's torch_em writes ``<dir>/checkpoints/<name>/best.pt``; cellpose's

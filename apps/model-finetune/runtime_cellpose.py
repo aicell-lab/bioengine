@@ -1,11 +1,13 @@
-"""Cellpose-SAM GPU runtime — resident cpsam model + shared GPU lock + training.
+"""Cellpose GPU runtime — resident cpsam/cpdino model + shared GPU lock + training.
 
 The second, isolated GPU deployment of the model-finetune app. numpy is
 irreconcilable between the two backends — micro-sam's python-elf needs numpy>=2
-while cellpose pins numpy==1.26.4 — so Cellpose-SAM lives in its own Ray
+while cellpose pins numpy==1.26.4 — so the Cellpose backend lives in its own Ray
 deployment with its own pip env (``requirements-runtime-cellpose.txt``) rather
-than sharing the micro-sam ``RuntimeApp``. The CPU ``EntryApp`` composes both by
-type hint and routes by ``model_type`` (``cpsam`` → here, ``vit_*`` → RuntimeApp).
+than sharing the micro-sam ``RuntimeApp``. It serves both Cellpose-SAM (cpsam)
+and Cellpose-DINO (cpdino / cpdino-vitb); the CPU ``EntryApp`` composes both
+deployments by type hint and routes by ``model_type`` (cellpose types → here,
+``vit_*`` → RuntimeApp).
 
 Mirrors ``RuntimeApp``'s contract: a single ``asyncio.Lock`` serialises all GPU
 work (serving + training); fine-tuning and export run in **subprocesses** so the
@@ -126,23 +128,28 @@ class CellposeRuntime:
             )
         return array.astype(np.float32)
 
-    def _ensure_model(self, checkpoint: Optional[str]):
-        """Load a resident CellposeModel, reusing it when ``checkpoint`` is
-        unchanged. ``None`` loads base cpsam; a path serves a fine-tuned session's
-        bare-net state dict. Blocking — call via ``asyncio.to_thread`` under lock."""
+    def _ensure_model(self, checkpoint: Optional[str], model_type: str = "cpsam"):
+        """Load a resident CellposeModel, reusing it when the target is unchanged.
+        A ``checkpoint`` path serves a fine-tuned session's bare-net state dict
+        (cellpose auto-detects cpsam vs cpdino from it); ``None`` loads the base
+        model for ``model_type``. Blocking — call via ``asyncio.to_thread`` under
+        lock."""
+        import training
         from cellpose import models as cpmodels
 
-        if checkpoint != self._loaded_key:
+        # Two different base models both have checkpoint=None, so the reuse key
+        # must include the base identity.
+        key = checkpoint if checkpoint else f"base:{model_type}"
+        if key != self._loaded_key:
             self._release_model()
             gpu = self._device() == "cuda"
-            label = f"finetuned: {checkpoint}" if checkpoint else "base cpsam"
-            logger.info(f"🔄 Loading Cellpose-SAM model ({label}) gpu={gpu}...")
-            if checkpoint:
-                self._model = cpmodels.CellposeModel(gpu=gpu, pretrained_model=checkpoint)
-            else:
-                self._model = cpmodels.CellposeModel(gpu=gpu, model_type="cpsam")
-            self._loaded_key = checkpoint
-            logger.info(f"✅ Cellpose-SAM model ({label}) loaded.")
+            base = training.cellpose_base_model(model_type)
+            label = f"finetuned: {checkpoint}" if checkpoint else f"base {base}"
+            logger.info(f"🔄 Loading Cellpose model ({label}) gpu={gpu}...")
+            pretrained = checkpoint if checkpoint else base
+            self._model = cpmodels.CellposeModel(gpu=gpu, pretrained_model=pretrained)
+            self._loaded_key = key
+            logger.info(f"✅ Cellpose model ({label}) loaded.")
         return self._model
 
     def _release_model(self) -> None:
@@ -157,9 +164,9 @@ class CellposeRuntime:
         except Exception:
             pass
 
-    def _segment(self, image, generate_kwargs, checkpoint):
-        """cpsam instance segmentation → int32 [H,W] mask. Blocking."""
-        model = self._ensure_model(checkpoint)
+    def _segment(self, image, generate_kwargs, checkpoint, model_type="cpsam"):
+        """Cellpose instance segmentation → int32 [H,W] mask. Blocking."""
+        model = self._ensure_model(checkpoint, model_type)
         img = self._to_hwc3(image)
         eval_kwargs = dict(
             channels=[0, 0], channel_axis=None, diameter=_SERVE_DIAMETER,
@@ -181,15 +188,16 @@ class CellposeRuntime:
         generate_kwargs: Optional[Dict[str, Any]] = None,
         checkpoint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """cpsam masks for a batch of (already-resolved) images → wire-dict list.
-        ``model_type`` is accepted for a symmetric signature with RuntimeApp but is
-        always cpsam here."""
+        """Cellpose masks for a batch of (already-resolved) images → wire-dict list.
+        ``model_type`` selects the base (cpsam / cpdino / cpdino-vitb) when no
+        ``checkpoint`` is given; a fine-tuned ``checkpoint`` self-identifies its
+        backbone regardless."""
         generate_kwargs = generate_kwargs or {}
         results: List[Dict[str, Any]] = []
         async with self._gpu_lock:
             for image in images:
                 labels = await asyncio.to_thread(
-                    self._segment, image, generate_kwargs, checkpoint
+                    self._segment, image, generate_kwargs, checkpoint, model_type
                 )
                 results.append({"output": self._nd(labels)})
         return results

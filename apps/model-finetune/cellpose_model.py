@@ -1,11 +1,13 @@
-"""BioImage.IO wrapper for a fine-tuned Cellpose-SAM (cpsam) model.
+"""BioImage.IO wrapper for a fine-tuned Cellpose model (cpsam or cpdino).
 
-Bundled verbatim into every cpsam export as ``model.py`` — the exported RDF's
+Bundled verbatim into every Cellpose export as ``model.py`` — the exported RDF's
 ``weights.pytorch_state_dict.architecture`` points ``callable: CellposeSAMWrapper``
 here, and bioimageio.core imports this file to instantiate the model. It wraps
-the raw Cellpose-SAM Transformer (``net``) as an ``nn.Module`` whose ``forward``
-runs cellpose's flow-dynamics postprocessing and returns an instance-label mask,
-so the package self-tests and serves without a separate postprocessing op.
+the raw Cellpose Transformer (``net``) as an ``nn.Module`` whose ``forward`` runs
+cellpose's flow-dynamics postprocessing and returns an instance-label mask, so the
+package self-tests and serves without a separate postprocessing op. ``model_type``
+selects the backbone: ``cpsam`` → CPSAM (SAM ViT-L), ``cpdino`` → CPDINO ViT-L,
+``cpdino-vitb`` → CPDINO ViT-B.
 
 The exported ``pytorch_state_dict`` is the bare ``net`` state dict (what
 ``net.save_model`` writes during training), loaded via ``load_state_dict`` below.
@@ -15,7 +17,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from cellpose import models as cpmodels
-from cellpose.vit import CPSAM
 from cellpose.core import assign_device
 
 
@@ -59,16 +60,26 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
         self.device, self.gpu = assign_device(use_torch=True, gpu=gpu)
 
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-        self.net = CPSAM(dtype=dtype).to(self.device)
+        # CellposeModel.eval / _run_net read self.backbone (cellpose 4.2.x) to pick
+        # the tile size (256 for cpsam, 384 for cpdino). We bypass
+        # CellposeModel.__init__, so set net + backbone by hand.
+        if model_type in ("cpdino", "cpdino-vitb"):
+            from cellpose.vit import CPDINO
+
+            model_name = "vitb" if model_type == "cpdino-vitb" else "vitl"
+            self.net = CPDINO(model_name=model_name, dtype=dtype).to(self.device)
+            self.backbone = "dino_" + model_name
+        else:
+            from cellpose.vit import CPSAM
+
+            self.net = CPSAM(dtype=dtype).to(self.device)
+            self.backbone = "sam_vitl"
 
         self.net.diam_labels = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
         self.net.diam_mean = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
 
         self.nclasses = 3
         self.channel_axis = None
-        # CellposeModel.eval / _run_net read self.backbone (cellpose 4.2.x); the
-        # cpsam net is the vit-l SAM backbone. We bypass CellposeModel.__init__.
-        self.backbone = "sam_vitl"
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         from collections import namedtuple

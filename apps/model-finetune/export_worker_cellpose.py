@@ -1,4 +1,4 @@
-"""Cellpose-SAM (cpsam) BioImage.IO export subprocess.
+"""Cellpose (cpsam / cpdino) BioImage.IO export subprocess.
 
 Launched by ``CellposeRuntime.export_bioimageio`` as
 ``python export_worker_cellpose.py <session_id> <export_dir>`` with
@@ -6,7 +6,8 @@ Launched by ``CellposeRuntime.export_bioimageio`` as
 serving/training). Reads ``<export_dir>/request.json`` and the session's
 fine-tuned cellpose checkpoint (``<session>/models/model``), then hand-rolls a
 BioImage.IO ``pytorch_state_dict`` package around ``cellpose_model.py``'s
-``CellposeSAMWrapper`` (bundled as ``model.py``).
+``CellposeSAMWrapper`` (bundled as ``model.py``); the wrapper builds the CPSAM or
+CPDINO backbone from the session's ``model_type``.
 
 Two deliberate departures from ``apps/cellpose-finetuning``'s exporter:
   * ``output_sample.npy`` is a **real forward pass** of the wrapper (CPU,
@@ -95,18 +96,19 @@ def _authors(raw):
 
 
 def _build_rdf(name, description, authors, license_id, diam_mean, provenance,
-               input_shape, output_shape):
+               input_shape, output_shape, model_type="cpsam"):
     import torch
 
-    desc = (f"Fine-tuned Cellpose-SAM model. {description}".strip()
-            if description else "Fine-tuned Cellpose-SAM model.")
+    family = "Cellpose-DINO" if model_type in ("cpdino", "cpdino-vitb") else "Cellpose-SAM"
+    desc = (f"Fine-tuned {family} model. {description}".strip()
+            if description else f"Fine-tuned {family} model.")
     rdf = {
         "name": name,
         "description": desc,
         "authors": _authors(authors),
         "cite": _cite(),
         "license": license_id,
-        "tags": ["Cellpose", "Cellpose-SAM", "Cell Segmentation", "Segmentation", "Fine-tuned"],
+        "tags": ["Cellpose", family, "Cell Segmentation", "Segmentation", "Fine-tuned"],
         "version": "0.1.0",
         "format_version": "0.5.6",
         "type": "model",
@@ -138,7 +140,7 @@ def _build_rdf(name, description, authors, license_id, diam_mean, provenance,
                     "source": "model.py",
                     "callable": "CellposeSAMWrapper",
                     "kwargs": {
-                        "model_type": "cpsam",
+                        "model_type": model_type,
                         "diam_mean": float(diam_mean),
                         "cp_batch_size": 8,
                         "channels": [0, 0],
@@ -225,6 +227,7 @@ def main(session_id: str, export_dir: str) -> None:
     license_id = "BSD-3-Clause"
 
     params = training.read_training_params(session_id)
+    model_type = params.get("model_type", "cpsam")
     ckpt = training.checkpoint_path(session_id)
     if not ckpt.exists():
         raise FileNotFoundError(f"No cellpose checkpoint for session '{session_id}' at {ckpt}.")
@@ -245,7 +248,7 @@ def main(session_id: str, export_dir: str) -> None:
     from cellpose_model import CellposeSAMWrapper
 
     wrapper = CellposeSAMWrapper(
-        model_type="cpsam", diam_mean=diam_mean, cp_batch_size=8, channels=[0, 0],
+        model_type=model_type, diam_mean=diam_mean, cp_batch_size=8, channels=[0, 0],
         flow_threshold=0.4, cellprob_threshold=0.0, stitch_threshold=0.0,
         estimate_diam=False, normalize=True, do_3D=False, gpu=False, use_bfloat16=False,
     )
@@ -261,6 +264,7 @@ def main(session_id: str, export_dir: str) -> None:
     rdf = _build_rdf(
         name, request.get("description", ""), request.get("authors"), license_id,
         diam_mean, provenance, input_sample.shape[1:], output_sample.shape[1:],
+        model_type=model_type,
     )
     (pkg_dir / "rdf.yaml").write_text(yaml.safe_dump(rdf, sort_keys=False))
     (pkg_dir / "documentation.md").write_text(_doc(name, session_id, diam_mean))
@@ -299,7 +303,7 @@ def main(session_id: str, export_dir: str) -> None:
         "zip_size": zip_path.stat().st_size,
         "files": files,
         "total_bytes": sum(f["size"] for f in files),
-        "model_type": "cpsam",
+        "model_type": model_type,
         "test_model_status": status,
         "build_seconds": round(time.time() - t0, 1),
     }
