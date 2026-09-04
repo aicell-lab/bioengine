@@ -1,12 +1,13 @@
-"""Cellpose-SAM (cpsam) fine-tuning subprocess.
+"""Cellpose (cpsam / cpdino) fine-tuning subprocess.
 
 Launched by ``CellposeRuntime.train`` as ``python train_worker_cellpose.py
 <session_id>`` so training runs in a child process — the OS reclaims all
 training VRAM when it exits, keeping the runtime replica's serving state clean.
 Reads the materialized TIFF-pair paths + hyperparameters from the session dir
 (written by the entry via ``training.materialize_pairs``), runs
-``cellpose.train.train_seg`` on the raw cpsam Transformer (``model.net``), and
-writes the terminal status. Runs in the CellposeRuntime pip env (cellpose /
+``cellpose.train.train_seg`` on the raw Cellpose Transformer (``model.net``) —
+the base is picked from the session's ``model_type`` (cpsam or a cpdino variant) —
+and writes the terminal status. Runs in the CellposeRuntime pip env (cellpose /
 numpy-1.x installed).
 
 ``train_seg`` with ``save_path=<session_dir>, model_name='model'`` writes the
@@ -47,9 +48,12 @@ def main(session_id: str) -> None:
     try:
         resume = p.get("checkpoint_path")
         if resume:
+            # A fine-tuned checkpoint carries its architecture — cellpose
+            # auto-detects the backbone (cpsam or cpdino) from it.
             model = cpmodels.CellposeModel(gpu=gpu, pretrained_model=resume)
         else:
-            model = cpmodels.CellposeModel(gpu=gpu, model_type="cpsam")
+            base = training.cellpose_base_model(p.get("model_type", "cpsam"))
+            model = cpmodels.CellposeModel(gpu=gpu, pretrained_model=base)
         net = model.net
         # bf16 precision is insufficient for weight updates at lr<=1e-4; train and
         # save in float32 (matches cellpose-finetuning's train_seg_with_callbacks).

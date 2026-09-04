@@ -1,9 +1,10 @@
-# BioImageIO Fine-tune (μSAM + Cellpose-SAM) 🔬
+# BioImageIO Fine-tune (μSAM + Cellpose) 🔬
 
 Serves [micro-sam](https://github.com/computational-cell-analytics/micro-sam)
 (μSAM) for microscopy segmentation and interactive annotation, and adds in-app
-fine-tuning of **[Cellpose-SAM](https://github.com/MouseLand/cellpose) (`cpsam`)**
-as an isolated second backend (see *Architecture* below). On the micro-sam side,
+fine-tuning of **[Cellpose](https://github.com/MouseLand/cellpose)** — both the
+SAM backbone (`cpsam`) and the DINOv3 backbone (`cpdino` / `cpdino-vitb`) — as an
+isolated second backend (see *Architecture* below). On the micro-sam side,
 **one fine-tuned SAM image encoder stays resident on the GPU and backs three cheap
 consumers** (the paper's "Leg B" — one resident encoder, many lightweight
 decoders):
@@ -32,12 +33,13 @@ runtimes by type hint. The client always talks to the entry.
   backend: resident SAM encoder, a single `asyncio` **GPU lock over every GPU op**
   (serving *and* training), and fine-tuning in a **subprocess** (VRAM fully
   reclaimed on exit; the resident inference model is evicted first).
-- **CellposeRuntime** (GPU, same shape, `runtime_cellpose.py`) — the Cellpose-SAM
-  (`cpsam`) backend, in its **own pip env**: cellpose pins `numpy==1.26.4` while
-  micro-sam's `python-elf` needs `numpy>=2`, so the two backends cannot share a
-  deployment. The entry routes by `model_type` (`cpsam` → CellposeRuntime,
-  `vit_*` → RuntimeApp). Only one fine-tuning runs at a time across **both**
-  backends (a single entry-side training lock).
+- **CellposeRuntime** (GPU, same shape, `runtime_cellpose.py`) — the Cellpose
+  backend (`cpsam`, `cpdino`, `cpdino-vitb`), in its **own pip env**: cellpose
+  pins `numpy==1.26.4` while micro-sam's `python-elf` needs `numpy>=2`, so the two
+  backends cannot share a deployment. The env also carries `dinov3` for the cpdino
+  ViT backbone. The entry routes by `model_type` (`cpsam`/`cpdino*` →
+  CellposeRuntime, `vit_*` → RuntimeApp). Only one fine-tuning runs at a time
+  across **both** backends (a single entry-side training lock).
 
 Because each GPU runtime autoscales, a long training run holds one GPU replica's
 lock while a concurrent inference request spins up and runs on the **second GPU
@@ -59,7 +61,8 @@ served without an app release.
 | `vit_b_lm`, `vit_t_lm` | Lighter/faster LM, lower quality |
 | `vit_l_em_organelles`, `vit_b_em_organelles`, `vit_t_em_organelles` | Organelles in EM (AIS decoder) |
 | `vit_b`, `vit_l`, `vit_h` | Base SAM — no AIS decoder → AMG fallback |
-| `cpsam` | Cellpose-SAM — routed to the isolated CellposeRuntime; segmentation only (no embedding/ONNX). Best for fine-tuning cell segmentation with dense masks. |
+| `cpsam` | Cellpose-SAM (SAM ViT-L backbone) — routed to the isolated CellposeRuntime; segmentation only (no embedding/ONNX). Best for fine-tuning cell segmentation with dense masks. |
+| `cpdino`, `cpdino-vitb` | Cellpose-DINO (DINOv3 ViT-L / ViT-B backbone) — same CellposeRuntime, segmentation only. `cpdino-vitb` is the lighter ViT-B variant. |
 
 Switching `model_type` frees the previous model's VRAM and loads the new one
 (one resident at a time, per runtime).
@@ -76,9 +79,9 @@ Switching `model_type` frees the previous model's VRAM and loads the new one
   With `embeddings` the AIS decoder runs on the stored embedding **without
   re-encoding** (the model is inferred from the embedding). `min_size` drops
   smaller objects. `session_id` serves a fine-tuned checkpoint (micro-sam **or**
-  cpsam — the session's backend picks the runtime). `model_type="cpsam"` (or a
-  cpsam `session_id`/`model_id`) routes to the Cellpose-SAM runtime; `embeddings`
-  are micro-sam only.
+  cellpose — the session's backend picks the runtime). `model_type` in
+  `{cpsam, cpdino, cpdino-vitb}` (or a cellpose `session_id`/`model_id`) routes to
+  the Cellpose runtime; `embeddings` are micro-sam only.
 - **`compute_embedding(inputs, model_type="vit_l_lm", return_url=False, embedding_upload_url=None, session_id=None)`**
   Run the resident encoder once. Returns `{features (1,256,64,64) f32,
   original_image_shape [H,W], input_size [h,w], sam_scale, mask_threshold,
@@ -105,12 +108,15 @@ infer(embeddings=[embedding_url]) → mask`.
 
 ### Fine-tuning (train → serve)
 
-Retrain μSAM **or Cellpose-SAM** on your own annotated pairs and serve the
+Retrain μSAM **or Cellpose** on your own annotated pairs and serve the
 just-trained model — no export step needed. Both backends need **dense** labels
 (annotate *all* objects per image): micro-sam's AIS decoder
 (`with_segmentation_decoder=True`) and cellpose both learn from full instance
-masks. Pick the backend with `model_type` (`vit_*` vs `cpsam`); the same
-annotated-pair inputs feed both.
+masks. Pick the backend with `model_type` (`vit_*` vs `cpsam`/`cpdino`/`cpdino-vitb`);
+the same annotated-pair inputs feed both. The cellpose types differ only in
+backbone — `cpsam` (SAM ViT-L), `cpdino` (DINOv3 ViT-L), `cpdino-vitb` (DINOv3
+ViT-B) — and share the same training/serve/export path; a fine-tuned checkpoint
+self-identifies its backbone, so serving is identical.
 
 - **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, diam_mean=30.0, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, resume_session_id=None, label="")`**
   Starts a background fine-tuning session and returns immediately with the
@@ -118,8 +124,8 @@ annotated-pair inputs feed both.
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
   `.geojson` FeatureCollection of polygons (rasterized to instances).
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
-  diameter, px) is the cpsam knob. Only one session trains at a time across both
-  backends (`QUEUED` while another holds the slot).
+  diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
+  trains at a time across both backends (`QUEUED` while another holds the slot).
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
@@ -135,12 +141,13 @@ annotated-pair inputs feed both.
     `micro_sam.bioimageio.export_sam_model`. `provenance` → `config.microsam_provenance`;
     `license` is **ignored** (`export_sam_model` hard-codes `CC-BY-4.0`). Needs a
     training label with **≥ 2 instances** (test data uses label ids 1 & 2).
-  - **cpsam** — a `pytorch_state_dict` package wrapping the fine-tuned Cellpose-SAM
-    net (`CellposeSAMWrapper` bundled as `model.py`, with cellpose flow-dynamics
-    postprocessing). The RDF's `output_sample` is a **real CPU forward pass** of
-    the wrapper (so `test_model` reproduces it deterministically — the served GPU
-    path bypasses this RDF). `provenance` → `config.cellpose_provenance`; license
-    is Cellpose's `BSD-3-Clause`.
+  - **cpsam / cpdino / cpdino-vitb** — a `pytorch_state_dict` package wrapping the
+    fine-tuned Cellpose net (`CellposeSAMWrapper` bundled as `model.py`, which
+    rebuilds the SAM or DINOv3 backbone from the session's `model_type`, with
+    cellpose flow-dynamics postprocessing). The RDF's `output_sample` is a **real
+    CPU forward pass** of the wrapper (so `test_model` reproduces it
+    deterministically — the served GPU path bypasses this RDF). `provenance` →
+    `config.cellpose_provenance`; license is Cellpose's `BSD-3-Clause`.
 
   **Draft-only.** The package is staged on temporary storage; `export_model`
   **publishes nothing**. The frontend creates the draft artifact with the user's
@@ -180,7 +187,7 @@ so it must be deployed with the token injected:
 ```python
 await worker.deploy_app(
     artifact_id="bioimage-io/model-finetune",
-    version="0.12.0",
+    version="0.13.0",
     application_id="model-finetune",
     hypha_token=HYPHA_TOKEN,
 )
@@ -189,7 +196,8 @@ await worker.deploy_app(
 Notes:
 - First deploy is slow — **two** GPU runtime envs pip-install in parallel: the
   micro-sam env (`micro-sam` + `torch-em`, `segment-anything`, `bioimage-cpp`,
-  `onnxruntime`) and the Cellpose-SAM env (`cellpose==4.2.1.1`, `numpy==1.26.4`).
+  `onnxruntime`) and the Cellpose env (`cellpose==4.2.1.1`, `numpy==1.26.4`, plus
+  `dinov3` for the cpdino backbone).
 - Requires a GPU replica; SAM ViT encoders are large. `vit_l_lm` (default) needs ~5 GB; `vit_b_lm` is lighter
   in a few GB of VRAM.
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the
