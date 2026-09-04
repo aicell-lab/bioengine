@@ -9,6 +9,7 @@ metadata manipulation and proxy attribute access.
 """
 
 import asyncio
+from typing import List, Optional
 
 import pytest
 from pydantic import Field
@@ -163,6 +164,74 @@ def test_ray_actor_options_extra_deep_merged():
     opts = App.ray_actor_options
     assert opts["resources"] == {"custom": 1}
     assert opts["runtime_env"]["pip"] == ["numpy"]
+
+
+# ──────────────────── @bioengine.method defaults ─────────────────────────
+
+# ``context=True`` bypasses pydantic on the replica, so an omitted optional
+# parameter used to arrive as the raw FieldInfo sentinel.
+
+
+class _Defaults:
+    @bioengine.method
+    async def plain(
+        self,
+        x: Optional[str] = Field(None, description="x"),
+        n: int = Field(512, description="n"),
+    ) -> dict:
+        """Plain."""
+        return {"x": x, "n": n}
+
+    @bioengine.method(context=True)
+    async def ctx(
+        self,
+        x: Optional[str] = Field(None, description="x"),
+        n: int = Field(512, description="n"),
+        tags: List[str] = Field(default_factory=list, description="tags"),
+        context=None,
+    ) -> dict:
+        """Ctx."""
+        return {"x": x, "n": n, "tags": tags}
+
+    @bioengine.method(context=True)
+    async def needs(
+        self,
+        x: str = Field(..., description="x"),
+        context=None,
+    ) -> str:
+        """Needs."""
+        return x
+
+
+def test_plain_method_omitted_field_arrives_as_declared_default():
+    assert asyncio.run(_Defaults().plain()) == {"x": None, "n": 512}
+
+
+def test_context_method_omitted_field_arrives_as_declared_default():
+    assert asyncio.run(_Defaults().ctx(context={})) == {
+        "x": None,
+        "n": 512,
+        "tags": [],
+    }
+
+
+def test_context_method_default_factory_is_fresh_per_call():
+    first = asyncio.run(_Defaults().ctx(context={}))["tags"]
+    first.append("mutated")
+    assert asyncio.run(_Defaults().ctx(context={}))["tags"] == []
+
+
+def test_context_method_supplied_arguments_win():
+    assert asyncio.run(_Defaults().ctx("a", n=1, tags=["t"], context={})) == {
+        "x": "a",
+        "n": 1,
+        "tags": ["t"],
+    }
+
+
+def test_context_method_required_field_raises_typeerror():
+    with pytest.raises(TypeError, match="missing required argument: 'x'"):
+        asyncio.run(_Defaults().needs(context={}))
 
 
 # ─────────────────────── composition params ──────────────────────────────

@@ -130,17 +130,29 @@ def method(
             "parameters": params_schema,
         }
 
+        # Without pydantic in the call path, Python's ordinary default
+        # binding applies, and the ordinary default of
+        # ``x: str = Field("a", ...)`` is the FieldInfo object, not "a".
+        # Resolve those once here and fill them in per call.
+        field_defaults = _field_default_resolvers(sig)
+
         if inspect.iscoroutinefunction(f):
 
             @wraps(f)
             async def wrapper(self, *args, **kwargs):
-                return await f(self, *args, **kwargs)
+                args, kwargs = _apply_field_defaults(
+                    sig, field_defaults, f, (self, *args), kwargs
+                )
+                return await f(*args, **kwargs)
 
         else:
 
             @wraps(f)
             def wrapper(self, *args, **kwargs):
-                return f(self, *args, **kwargs)
+                args, kwargs = _apply_field_defaults(
+                    sig, field_defaults, f, (self, *args), kwargs
+                )
+                return f(*args, **kwargs)
 
         wrapper.__schema__ = public_schema
         setattr(wrapper, _KIND_ATTR, "method")
@@ -311,6 +323,60 @@ def app(
 
 
 # ────────────────────────── internal helpers ─────────────────────────────
+
+
+def _field_default_resolvers(
+    sig: inspect.Signature,
+) -> Dict[str, Optional[Callable[[], Any]]]:
+    """Map each ``Field(...)``-defaulted parameter to a producer of its value.
+
+    ``None`` marks a parameter declared required (``Field(...)``), which has
+    no default to bind. Factories are stored rather than called so a mutable
+    ``default_factory`` yields a fresh object per call.
+    """
+    from pydantic.fields import FieldInfo
+    from pydantic_core import PydanticUndefined
+
+    resolvers: Dict[str, Optional[Callable[[], Any]]] = {}
+    for name, param in sig.parameters.items():
+        default = param.default
+        if not isinstance(default, FieldInfo):
+            continue
+        if default.default_factory is not None:
+            resolvers[name] = default.default_factory
+        elif default.default is PydanticUndefined or default.default is Ellipsis:
+            resolvers[name] = None
+        else:
+            resolvers[name] = _constant(default.default)
+    return resolvers
+
+
+def _constant(value: Any) -> Callable[[], Any]:
+    return lambda: value
+
+
+def _apply_field_defaults(
+    sig: inspect.Signature,
+    resolvers: Dict[str, Optional[Callable[[], Any]]],
+    f: Callable[..., Any],
+    args: tuple,
+    kwargs: Dict[str, Any],
+) -> tuple:
+    if not resolvers:
+        return args, kwargs
+
+    bound = sig.bind_partial(*args, **kwargs)
+    for name, resolve in resolvers.items():
+        if name in bound.arguments:
+            continue
+        if resolve is None:
+            raise TypeError(
+                f"{getattr(f, '__qualname__', f.__name__)}() missing "
+                f"required argument: '{name}'"
+            )
+        bound.arguments[name] = resolve()
+    bound.apply_defaults()
+    return bound.args, bound.kwargs
 
 
 def _reject_reserved_names(cls: type) -> None:
