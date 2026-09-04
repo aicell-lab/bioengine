@@ -1341,7 +1341,7 @@
       differences, focus, presence/absence.
     </p>
     <p class="header-runtime">
-      Backed by Qwen2.5-VL-3B-Instruct on one NVIDIA A40-16C vGPU slice. See
+      Backed by Qwen2.5-VL-7B-Instruct (4-bit NF4) on one NVIDIA A40-16C vGPU slice. See
       the info button (top right) for the live runtime details, or the help
       icon next to <em>Create a new visual test</em> for what the model
       reliably handles.
@@ -1588,7 +1588,7 @@
   <div class="h-section fail-h">Struggles with</div>
   <ul>
     <li><strong>Precise counting.</strong> Reliable up to roughly ten distinct objects; large counts drift by 30 %+ in our tests, matching reports in the literature.</li>
-    <li><strong>Reading text.</strong> OCR is unreliable on small, low-contrast, rotated, or stylised text — OCRBench v2 places the 3B well behind dedicated OCR models.</li>
+    <li><strong>Reading text.</strong> OCR is unreliable on small, low-contrast, rotated, or stylised text — OCRBench v2 places this model class well behind dedicated OCR models.</li>
     <li><strong>Fine geometric judgements.</strong> Small rotations, angle measurements, sub-millimetre offsets and pixel-level localisation drop below 15 % on segmentation benchmarks.</li>
     <li><strong>Multi-clause "AND" criteria.</strong> When PASS requires several conditions at once the model checks the most prominent one and asserts the rest.</li>
     <li><strong>3D spatial relationships.</strong> "On top of" / "under" / "behind" are routinely mis-judged, especially when reference images push the wrong way (a well-known anchor-bias failure).</li>
@@ -1605,7 +1605,7 @@
     <li>Always <strong>validate on held-out images</strong> before relying on a new test.</li>
   </ul>
 
-  <div class="footer">Backed by Qwen2.5-VL-3B-Instruct. A larger model improves precision; the trade-offs above are the baseline for the 3B class.</div>
+  <div class="footer">Backed by Qwen2.5-VL-7B-Instruct at 4-bit. The trade-offs above are the baseline for this model class and are not removed by a larger model.</div>
 </div>
 
 <!-- Confirm dialog -->

@@ -28,9 +28,11 @@ where <test-id> is a hash of owner + name. Each user can have a test
 named "focus-quality" without colliding with another user's. Public
 tests are visible to and usable by everyone; delete is owner-only.
 
-Backed by Qwen2.5-VL-3B-Instruct via HuggingFace transformers on a single
+Backed by Qwen2.5-VL-7B-Instruct via HuggingFace transformers on a single
 NVIDIA A40-16C vGPU slice (Ampere, sm_86; 16 GB framebuffer time-shared
-with co-tenants on the host A40).
+with co-tenants on the host A40). The 7B is served in 4-bit NF4 because
+its FP16 weights (~15.4 GiB) do not leave room for a CUDA context and
+activations under a 16 GiB ceiling.
 """
 
 import asyncio
@@ -49,7 +51,7 @@ from pydantic.fields import FieldInfo
 
 logger = bioengine.logger
 
-_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 _DEFAULT_SERVER_URL = "https://hypha.aicell.io"
 # This app's own (public) artifact — the smoke test resolves a fixture from it.
 _SELF_ARTIFACT = "bioimage-io/smart-microscopy-assistant"
@@ -328,7 +330,11 @@ class SmartMicroscopyAssistant:
             self._tests_dir, len(existing), "" if len(existing) == 1 else "s",
         )
 
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        from transformers import (
+            AutoProcessor,
+            BitsAndBytesConfig,
+            Qwen2_5_VLForConditionalGeneration,
+        )
         import torch
 
         logger.info("Connecting to Hypha for artifact-manager access...")
@@ -337,16 +343,27 @@ class SmartMicroscopyAssistant:
         logger.info("Loading Qwen2.5-VL processor (%s)...", _MODEL_ID)
         self._processor = AutoProcessor.from_pretrained(_MODEL_ID)
 
-        logger.info("Loading Qwen2.5-VL-3B weights on cuda:0 (FP16)...")
+        logger.info("Loading Qwen2.5-VL-7B weights on cuda:0 (NF4)...")
+        # The vision tower stays in FP16: it is a small share of the weights
+        # and 4-bit quantising it is what degrades fine visual detail, which
+        # is the whole job here.
+        quantization = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            llm_int8_skip_modules=["visual", "lm_head"],
+        )
         self._engine = await asyncio.to_thread(
             Qwen2_5_VLForConditionalGeneration.from_pretrained,
             _MODEL_ID,
             torch_dtype=torch.float16,
             device_map="cuda:0",
+            quantization_config=quantization,
             low_cpu_mem_usage=True,
         )
         self._engine.eval()
-        logger.info("Qwen2.5-VL-3B ready on %s.", next(self._engine.parameters()).device)
+        logger.info("Qwen2.5-VL-7B ready on %s.", next(self._engine.parameters()).device)
 
     @bioengine.smoke_test
     async def _smoke_test(self) -> None:

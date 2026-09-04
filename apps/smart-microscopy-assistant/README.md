@@ -6,24 +6,25 @@ VLM-backed microscopy analyst. Define re-usable visual tests with a few positive
 
 | | |
 |---|---|
-| Model | `Qwen/Qwen2.5-VL-3B-Instruct` |
+| Model | `Qwen/Qwen2.5-VL-7B-Instruct` |
 | License | Apache 2.0 |
 | Engine | HuggingFace `transformers` 4.51.3 + `torch==2.5.1` |
-| Precision | FP16 |
+| Precision | 4-bit NF4 (`bitsandbytes`, double-quantised, FP16 compute); vision tower and `lm_head` left in FP16 |
 | Hardware | 1× NVIDIA A40-16C vGPU slice per replica (Ampere sm_86, 16 GB framebuffer, time-shared with co-tenants on the host A40) |
 | Image budget | server-side downscale to ≤ `1280 × 28 × 28` pixels and ≤ 2048 longest side, with a hard reject above 200 MP |
 
-### Why Qwen2.5-VL-3B-Instruct (FP16)
+### Why Qwen2.5-VL-7B-Instruct (NF4)
 
 - Apache 2.0 license — usable in any deployment.
-- 3B FP16 weights (~6 GB) + Qwen's vision encoder + KV cache fit comfortably in one A40-16C vGPU slice with substantial headroom for activations.
-- Loaded directly via `transformers.Qwen2_5_VLForConditionalGeneration.from_pretrained(...)` — no quantisation kernel in the path.
+- 7B FP16 weights are ~15.4 GiB against a 16 GiB framebuffer, which leaves nothing for the CUDA context and activations. NF4 lands the same model at **9.02 GiB measured under load** — 2 GiB *less* than the 3B at FP16 used, with 7 GiB of headroom.
 - Dynamic input resolution via Qwen's processor — works with arbitrary microscopy frame sizes once the server-side downscale step has bounded them.
 - Returns coherent multi-bullet QC reports (focus, illumination uniformity, object count, contamination, etc.) on real fluorescence-microscopy frames; see Operating characteristics below for measured behaviour.
 
-### Why not the 7B AWQ variant (initial target)
+The vision tower is excluded from quantisation. It is a small share of the weights, and 4-bit quantising the encoder is what costs fine visual detail — the one thing this app exists to read.
 
-7B-AWQ would be the higher-quality choice but no AWQ kernel stack currently serves Qwen2.5-VL on this cluster:
+### Why not AWQ (the earlier 7B attempt)
+
+`bitsandbytes` replaced AWQ as the route to a 7B here. AWQ was tried first and no kernel stack served Qwen2.5-VL on this cluster:
 
 - **vLLM 0.10.x** — V0 multimodal input-prep raises `InputProcessingError: list index out of range` on every prompt shape; V1 engine refuses to initialise from a Ray Serve actor thread.
 - **vLLM 0.9.x** — model-registry subprocess fails to inspect `Qwen2_5_VLForConditionalGeneration` and swallows the underlying error.
@@ -31,7 +32,7 @@ VLM-backed microscopy analyst. Define re-usable visual tests with a few positive
 - **autoawq Triton kernel** — bundled `awq_gemm_triton` doesn't compile against the Triton shipped with current torch.
 - **autoawq-kernels CUDA path** — `awq_ext.gemm_forward_cuda` raises `expected scalar type Int but found Half` on the `lm_head` linear for `Qwen2.5-VL-7B-Instruct-AWQ` (known upstream issue, fix sits in autoawq 0.2.8 which itself caps `transformers <= 4.47.1` — older than the 4.49 minimum Qwen2.5-VL needs).
 
-3B FP16 lands on this cluster as-is. Revisit 7B-AWQ when any of the upstream stacks above unblocks.
+The app shipped on 3B FP16 from 0.11.x to 0.13.2 for that reason. 0.14.0 moves to the 7B on NF4, which needs no kernel beyond `bitsandbytes` and the stock `transformers` integration.
 
 ## Image and instruction limits
 
@@ -94,7 +95,7 @@ Define a visual test once with `create_visual_test(...)`, then call `inspect(ima
   "description": "- Focus: in focus, clear outlines …",
   "image_size": [1024, 1024],
   "source_url": "https://hypha.aicell.io/s3/…",
-  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "model": "Qwen/Qwen2.5-VL-7B-Instruct",
   "tokens_generated": 66,
   "generation_time_s": 2.55,
   "tokens_per_second": 25.9,
@@ -116,7 +117,7 @@ Define a visual test once with `create_visual_test(...)`, then call `inspect(ima
   "n_negative_examples": 3,
   "image_size": [1024, 1024],
   "source_url": "https://hypha.aicell.io/s3/…",
-  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "model": "Qwen/Qwen2.5-VL-7B-Instruct",
   "tokens_generated": 24,
   "generation_time_s": 0.92,
   "tokens_per_second": 26.1,
@@ -130,12 +131,25 @@ Define a visual test once with `create_visual_test(...)`, then call `inspect(ima
 
 ### Few-shot quality notes
 
-The 3B model handles **specific, visually-grounded criteria** ("at least 5 distinct cells", "any saturated pixels", "vertical motion blur") considerably better than **coarse class differences** ("good vs. bad image"). Two patterns observed on the live deployment:
+The model handles **specific, visually-grounded criteria** ("at least 5 distinct cells", "any saturated pixels", "vertical motion blur") considerably better than **coarse class differences** ("good vs. bad image"). Two patterns observed on the live deployment:
 
 - A criterion phrased as a measurable property (cell count, focus sharpness on a defined region, presence of a specific artefact) generally returns a verdict aligned with the actual content.
-- A criterion phrased as broad quality vs. anti-quality, with references that span very different visual styles, can occasionally produce verdicts that echo the positive-class reason regardless of the new image. The 3B model isn't large enough to discriminate sharply by visual gestalt alone.
+- A criterion phrased as broad quality vs. anti-quality, with references that span very different visual styles, can produce verdicts that echo the positive-class reason regardless of the new image.
 
-If a visual test isn't discriminating well: tighten the `description` (it goes into the prompt verbatim) to spell out *what to look for*; consider asking a more specific question via the `instruction` override at inspect time.
+If a visual test isn't discriminating well: tighten the criteria (they go into the prompt verbatim) to spell out *what to look for*; consider asking a more specific question via the `instruction` override at inspect time.
+
+**Do not treat a verdict as a measurement.** Both models were run against three labelled microscopy defect axes (defocus, histology air bubbles, tissue folds) with pre-registered criterion wordings, 3B and 7B on the same images through the same instrument:
+
+| | 3B FP16 (0.13.2) | 7B NF4 (0.14.0) |
+|---|---|---|
+| Defocus, balanced accuracy, text-only | 0.609 | 0.797 |
+| Defocus, verdict flips when PASS/FAIL are swapped in the criterion | 0.109 | 0.016 |
+| Bubbles, balanced accuracy, text-only | 0.500 (120/120 `passed`) | 0.508 (119/120 `passed`) |
+| Bubbles, balanced accuracy, 5+5 references | 0.500 | 0.542 |
+| Bubbles, verdict flips when PASS/FAIL are swapped | 0.000 | 0.908 |
+| Median serial latency | 1.5 s | 1.9 s |
+
+Neither model beat a trivial per-image pixel statistic on any axis (0.98 defocus, 0.84 bubbles). The 7B is the better model on the axis it can see and it is the only one of the two that changes its answer when the criterion's PASS/FAIL assignment is swapped — but on bubbles it flips the verdict while its stated reason describes the same image state 118 times out of 120, so the movement is in mapping the instruction, not in seeing the defect. The app is an assistant for a human reading the reason text, not an unattended gate.
 
 ### Visual-test management
 
@@ -193,7 +207,7 @@ Describes the served model and the input/output contract:
 
 ```json
 {
-  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "model": "Qwen/Qwen2.5-VL-7B-Instruct",
   "task": "vision-language",
   "engine": "huggingface-transformers",
   "dtype": "float16",
