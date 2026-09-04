@@ -209,16 +209,40 @@ class SlurmWorkers:
                     f"Additional apptainer args: {self.further_apptainer_args}"
                 )
 
-            # Define the Ray worker command that will run inside the container and add it to the command
+            # Define the Ray worker command that will run inside the container and add it to the command.
+            # RAY_RESOURCES is assembled by the job script so it can include the
+            # node's real VRAM (see vram_detection below).
             ray_worker_cmd = (
                 "ray start "
                 f"--address={self.ray_cluster.address} "
                 f"--num-cpus={num_cpus} "
                 f"--num-gpus={num_gpus} "
-                "--resources='{\"slurm_job_id:'${SLURM_JOB_ID}'\": 1}' "
+                '--resources="$RAY_RESOURCES" '
                 "--block"
             )
-            # Example: ray start --address='10.81.254.11:6379' --num-cpus=8 --num-gpus=1 --resources='{"slurm_job_id:${SLURM_JOB_ID}": 1}' --block
+            # Example: ray start --address='10.81.254.11:6379' --num-cpus=8 --num-gpus=1 --resources='{"slurm_job_id:12345": 1, "VRAM_MB": 40960}' --block
+
+            # VRAM_MB lets the AppBuilder pack several replicas onto one GPU by
+            # real memory instead of falling back to whole-GPU reservations.
+            # Only nvidia-smi on the allocated node knows the true GPU size, so
+            # it is resolved inside the job rather than at submission time.
+            # Single-GPU workers only, matching the head: on a multi-GPU node the
+            # node-level VRAM_MB would be a sum Ray could satisfy across devices,
+            # letting a replica claim more memory than any one GPU has.
+            vram_detection = (
+                f"""
+            VRAM_RESOURCE=""
+            if [ {num_gpus} -eq 1 ] && command -v nvidia-smi >/dev/null 2>&1; then
+                VRAM_PER_GPU=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -dc '0-9')
+                if [ -n "$VRAM_PER_GPU" ] && [ "$VRAM_PER_GPU" -gt 0 ] 2>/dev/null; then
+                    VRAM_RESOURCE=", \\"VRAM_MB\\": $VRAM_PER_GPU"
+                else
+                    echo "Could not detect GPU VRAM; VRAM-based packing will be unavailable on this node."
+                fi
+            fi
+            RAY_RESOURCES="{{\\"slurm_job_id:${{SLURM_JOB_ID}}\\": 1${{VRAM_RESOURCE}}}}"
+            """
+            ).strip()
 
             # Add the container image and Ray worker command to the apptainer command
             apptainer_cmd += f" {self.image} {ray_worker_cmd}"
@@ -251,6 +275,8 @@ class SlurmWorkers:
             #SBATCH --error={self.worker_workspace_dir}/slurm_logs/%x_%j.err
             {further_slurm_args}
 
+            {vram_detection}
+
             # Print some diagnostic information
             echo "Host: $(hostname)"
             echo "Date: $(date)"
@@ -258,7 +284,7 @@ class SlurmWorkers:
             echo "GPU info: $(nvidia-smi -L)"
             echo "Job ID: $SLURM_JOB_ID"
             echo "Working directory: $(pwd)"
-            echo "Running command: {apptainer_cmd}"
+            echo "Ray resources: $RAY_RESOURCES"
             echo ""
             echo "========================================"
             echo ""
@@ -746,8 +772,13 @@ class SlurmWorkers:
             )
             required_resources = {}
 
-        num_cpus = required_resources.get("CPU", 1)
+        num_cpus = required_resources.get("CPU", 1) or 1
         num_gpus = required_resources.get("GPU", 0)
+        # VRAM-packed replicas carry their GPU demand as a custom resource and
+        # only a sub-1 num_gpus to bind a device, so a VRAM request alone must
+        # still provision a GPU worker.
+        if required_resources.get("VRAM_MB", 0) and num_gpus < 1:
+            num_gpus = 1
         memory = required_resources.get("memory", 0) / 1024**3  # Convert bytes to GB
         mem_in_gb_per_cpu = math.ceil(
             memory / num_cpus
@@ -1090,21 +1121,27 @@ class SlurmWorkers:
             # Get all worker nodes
             worker_nodes = self.ray_cluster.status["nodes"]
 
-            if not worker_nodes:
+            if worker_nodes:
+                self.logger.info(f"Found {len(worker_nodes)} active worker nodes")
+
+                # Stop each worker node
+                graceful_stops = []
+                for node_id, node_resources in worker_nodes.items():
+                    job_id = node_resources["slurm_job_id"]
+                    task = asyncio.create_task(
+                        self._close_worker(node_id=node_id, job_id=job_id),
+                        name=f"WorkerScaleDownTask_{node_id}",
+                    )
+                    self.worker_deletion_tasks[node_id] = task
+                    graceful_stops.append(task)
+
+                await asyncio.gather(*graceful_stops, return_exceptions=True)
+            else:
                 self.logger.info("No active worker nodes found")
-                return
 
-            self.logger.info(f"Found {len(worker_nodes)} active worker nodes")
-
-            # Stop each worker node
-            for node_id, node_resources in worker_nodes.items():
-                job_id = node_resources["slurm_job_id"]
-                self.worker_deletion_tasks[node_id] = asyncio.create_task(
-                    self._close_worker(node_id=node_id, job_id=job_id),
-                    name=f"WorkerScaleDownTask_{node_id}",
-                )
-
-            # Make sure no jobs are left running
+            # Always sweep SLURM: jobs that are still queued, or started but not
+            # yet joined to Ray, have no node entry and would otherwise survive
+            # the worker's shutdown and burn allocation until their time limit.
             remaining_jobs = await self._get_job_ids()
             if remaining_jobs:
                 self.logger.warning(
