@@ -221,6 +221,40 @@ def _assert_same_origin_url(url: str) -> str:
     return url
 
 
+def _artifact_read_error(
+    artifact_id: str, file_path: str, exc: Exception, had_token: bool
+) -> Exception:
+    """The actionable failure behind an `artifact-manager.get_file` error.
+
+    A missing artifact, a missing file inside one, and a real access denial
+    all arrive over RPC as one flattened `RemoteException`, so the message
+    text is the only discriminator. Telling them apart matters because the
+    remedies are opposites: a typo'd path reported as "pass a token" sends
+    the caller hunting for credentials they already have. An unrecognised
+    text keeps the access-denied reading, which is the safe default.
+
+    Existence is not concealed here because Hypha does not conceal it: an
+    anonymous `get_file` already answers `KeyError` for a missing artifact
+    and `PermissionError` for a private one.
+    """
+    text = str(exc)
+    if "does not exist in the artifact" in text:
+        return FileNotFoundError(f"Artifact {artifact_id!r} has no file {file_path!r}.")
+    if "Artifact with ID" in text and "does not exist" in text:
+        return FileNotFoundError(
+            f"No artifact {artifact_id!r} on this Hypha server. Check the "
+            "workspace and alias."
+        )
+    if had_token:
+        return PermissionError(
+            f"The supplied token cannot read {artifact_id}:{file_path}."
+        )
+    return PermissionError(
+        f"{artifact_id}:{file_path} is not publicly readable. Pass `token` "
+        "with a Hypha token that can read it."
+    )
+
+
 def _test_id_for(owner: str, name: str) -> str:
     """Filesystem-safe per-owner test directory name.
 
@@ -412,10 +446,7 @@ class SmartMicroscopyAssistant:
             try:
                 url = await am.get_file(artifact_id=artifact_id, file_path=file_path)
             except Exception as e:
-                raise PermissionError(
-                    f"{image_ref!r} is not publicly readable. Pass `token` with a "
-                    "Hypha token that can read it."
-                ) from e
+                raise _artifact_read_error(artifact_id, file_path, e, False) from e
         if not url:
             raise RuntimeError(
                 f"artifact-manager.get_file returned no URL for {image_ref!r}."
@@ -435,19 +466,24 @@ class SmartMicroscopyAssistant:
 
         server = None
         try:
-            server = await connect_to_server(
-                {"server_url": _DEFAULT_SERVER_URL, "token": token}
-            )
-            am = await server.get_service("public/artifact-manager")
-            return await am.get_file(artifact_id=artifact_id, file_path=file_path)
-        except Exception as e:
-            # The underlying error can quote the token back; report the class
-            # of failure and the ref instead.
-            raise PermissionError(
-                f"Could not read {artifact_id}:{file_path} with the supplied "
-                f"token ({type(e).__name__}). Check the token is valid and has "
-                "read access."
-            ) from None
+            try:
+                server = await connect_to_server(
+                    {"server_url": _DEFAULT_SERVER_URL, "token": token}
+                )
+                am = await server.get_service("public/artifact-manager")
+            except Exception as e:
+                # Only a connect failure is genuinely about the token; a
+                # `get_file` failure below may well be a typo'd ref.
+                raise PermissionError(
+                    f"Could not connect with the supplied token "
+                    f"({type(e).__name__}). Check the token is valid and "
+                    "has not expired."
+                ) from None
+            try:
+                return await am.get_file(artifact_id=artifact_id, file_path=file_path)
+            except Exception as e:
+                # `from None`: the underlying error can quote the token back.
+                raise _artifact_read_error(artifact_id, file_path, e, True) from None
         finally:
             try:
                 if server and hasattr(server, "disconnect"):

@@ -57,6 +57,8 @@ The reason is that the app fetches with its own network position, so a caller wh
 
 To read a **private** artifact, pass your own Hypha token as the `token` parameter of `inspect`, `submit_inspect` or `create_visual_test`. It is used for that one call, on a connection opened and closed inside the call, and is never cached, logged, or written onto the job record that `get_inspect_status` returns.
 
+A ref that fails to resolve reports why: a missing artifact and a missing file inside one raise `FileNotFoundError`, and only a genuine access denial raises `PermissionError` asking for a `token`. Before 0.13.2 all three read as "pass a token", which sent callers hunting for credentials they already had.
+
 This replaces the arrangement up to 0.12.1, where a ref naming a workspace the caller's token scope showed as readable was resolved with the *app's* token. That was safe as written — the scope came from Hypha server-side and a client could not widen it — but it made the app a standing deputy: a bug anywhere in that check, or a later widening of the app token's own access, would have turned into a read of files the caller never had. Holding no credential removes the class of failure rather than guarding it. The cost is explicit: a private ref that used to resolve silently now needs a `token`.
 
 ## Who can call this app
