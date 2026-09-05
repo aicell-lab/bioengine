@@ -89,6 +89,34 @@ def min_training_vram_mb(model_type: str) -> int:
     return MODEL_TRAIN_VRAM_MB.get(model_type, _MAX_VRAM_MB)
 
 
+# Machine-readable grouping keys the training UI keys off instead of string-matching
+# model_type: ``family`` groups by architecture, ``size`` is the capacity tier.
+MODEL_FAMILY = {
+    "vit_t_lm": "lm", "vit_b_lm": "lm", "vit_l_lm": "lm",
+    "vit_t_em_organelles": "em_organelles",
+    "vit_b_em_organelles": "em_organelles",
+    "vit_l_em_organelles": "em_organelles",
+    "vit_b": "sam", "vit_l": "sam", "vit_h": "sam",
+    "cpsam": "cpsam", "cpdino": "cpdino", "cpdino-vitb": "cpdino",
+}
+MODEL_SIZE = {
+    "vit_t_lm": "tiny", "vit_t_em_organelles": "tiny",
+    "vit_b_lm": "base", "vit_b_em_organelles": "base", "vit_b": "base",
+    "cpdino-vitb": "base",
+    "vit_l_lm": "large", "vit_l_em_organelles": "large", "vit_l": "large",
+    "cpsam": "large", "cpdino": "large",
+    "vit_h": "huge",
+}
+
+
+def model_family(model_type: str) -> str:
+    return MODEL_FAMILY.get(model_type, "unknown")
+
+
+def model_size(model_type: str) -> str:
+    return MODEL_SIZE.get(model_type, "unknown")
+
+
 def detect_gpu_memory() -> Dict[str, Any]:
     """Total/free VRAM of the runtime's GPU. Runs GPU-side (torch imported lazily
     so the CPU entry never loads it). ``available`` is False when no CUDA device."""

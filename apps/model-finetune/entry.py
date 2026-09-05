@@ -46,6 +46,20 @@ ModelType = Literal[
 # Model types served by the isolated Cellpose runtime rather than micro-sam.
 CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
 
+# Which backends each start_training parameter actually affects. The training UI
+# reads this (via get_training_capabilities) to show a control only for the
+# selected model's backend. Parameters common to both are listed under both.
+TRAINING_PARAM_BACKENDS = {
+    "n_epochs": ["microsam", "cellpose"],
+    "batch_size": ["microsam", "cellpose"],
+    "learning_rate": ["microsam", "cellpose"],
+    "val_fraction": ["microsam", "cellpose"],
+    "n_samples": ["microsam", "cellpose"],
+    "n_objects_per_batch": ["microsam"],
+    "patch_size": ["microsam"],
+    "diam_mean": ["cellpose"],
+}
+
 
 def _read_pip(name: str) -> List[str]:
     text = (Path(__file__).parent / name).read_text()
@@ -574,6 +588,7 @@ class EntryApp:
                 training.write_status(session_id, val_reused_train=True)
             resolved = {}
             resume_id = params.get("resume_session_id")
+            init_checkpoint = params.get("init_checkpoint")
             if resume_id:
                 prior_model = training.read_training_params(resume_id).get("model_type")
                 if prior_model and prior_model != model_type:
@@ -582,6 +597,21 @@ class EntryApp:
                         f"not {model_type}; model_type must match to resume."
                     )
                 resolved["checkpoint_path"] = self._session_checkpoint(resume_id)
+            elif init_checkpoint:
+                url = (
+                    init_checkpoint
+                    if init_checkpoint.startswith(("http://", "https://"))
+                    else await self._get_download_url(init_checkpoint)
+                )
+                resp = await self._http_retry("GET", url, timeout=600.0)
+                if resp.status_code != 200:
+                    raise FileNotFoundError(
+                        f"init_checkpoint download failed ({resp.status_code}) for {init_checkpoint}"
+                    )
+                dest = training.session_dir(session_id) / "init_checkpoint.pt"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(dest.write_bytes, resp.content)
+                resolved["checkpoint_path"] = str(dest)
             training.write_training_params(session_id, {
                 **params, "model_type": model_type,
                 "patch_shape": list(data["patch_shape"]),
@@ -629,7 +659,10 @@ class EntryApp:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
             gpu = cellpose if backend == "cellpose" else microsam
             required = training.min_training_vram_mb(m)
-            rec = {"model_type": m, "backend": backend, "min_gpu_memory_mb": required}
+            rec = {
+                "model_type": m, "backend": backend, "min_gpu_memory_mb": required,
+                "family": training.model_family(m), "size": training.model_size(m),
+            }
             if not gpu:
                 rec["trainable"], rec["reason"] = None, "runtime unavailable"
             elif not gpu.get("available"):
@@ -640,7 +673,38 @@ class EntryApp:
             else:
                 rec["trainable"], rec["reason"] = True, "fits"
             models.append(rec)
-        return {"gpus": {"microsam": microsam, "cellpose": cellpose}, "models": models}
+        return {
+            "gpus": {"microsam": microsam, "cellpose": cellpose},
+            "models": models,
+            "parameters": self._training_parameter_schema(),
+        }
+
+    def _training_parameter_schema(self) -> List[Dict[str, Any]]:
+        """Per-parameter schema for the start_training controls, derived from
+        ``start_training.__schema__`` so it can't drift from the actual signature.
+        Emits ``{name, applies_to, type, default, min, max, description}`` for
+        each tunable in ``TRAINING_PARAM_BACKENDS``; ``min``/``max`` are the
+        inclusive/exclusive Field bounds, ``applies_to`` the backends it affects."""
+        props = self.start_training.__schema__["parameters"]["properties"]
+        out = []
+        for name, backends in TRAINING_PARAM_BACKENDS.items():
+            spec = props.get(name, {})
+            # Optional params surface as anyOf([<real>, {"type": "null"}]).
+            typed = spec
+            if "anyOf" in spec:
+                typed = next((s for s in spec["anyOf"] if s.get("type") != "null"), {})
+            lo = typed.get("minimum", typed.get("exclusiveMinimum"))
+            hi = typed.get("maximum", typed.get("exclusiveMaximum"))
+            out.append({
+                "name": name,
+                "applies_to": backends,
+                "type": typed.get("type"),
+                "default": spec.get("default"),
+                "min": lo,
+                "max": hi,
+                "description": spec.get("description", ""),
+            })
+        return out
 
     @bioengine.method
     async def start_training(
@@ -658,18 +722,24 @@ class EntryApp:
             description="Base model to fine-tune. vit_* → micro-sam (AIS decoder); "
             "'cpsam' → Cellpose-SAM, 'cpdino'/'cpdino-vitb' → Cellpose-DINO "
             "(all cellpose types share the isolated Cellpose runtime)."),
-        n_epochs: int = Field(5, description="Number of training epochs."),
+        n_epochs: int = Field(5, ge=1, description="Number of training epochs."),
         n_objects_per_batch: int = Field(
-            8, description="micro-sam only: objects per batch — main GPU-memory knob; "
+            8, ge=1, description="micro-sam only: objects per batch — main GPU-memory knob; "
             "lower it on small GPUs, raise it on large ones (8 fits vit_b on 24GB)."),
-        patch_size: int = Field(512, description="micro-sam only: square training patch side (clamped to the smallest image)."),
-        diam_mean: float = Field(30.0, description="cellpose only (cpsam/cpdino): mean object diameter in pixels."),
-        batch_size: int = Field(1, description="Training batch size."),
-        learning_rate: float = Field(1e-5, description="AdamW learning rate."),
-        val_fraction: float = Field(0.2, description="Val split fraction when val is omitted."),
-        n_samples: Optional[int] = Field(None, description="Patches sampled per epoch (auto if omitted)."),
+        patch_size: int = Field(512, ge=16, description="micro-sam only: square training patch side (clamped to the smallest image)."),
+        diam_mean: float = Field(30.0, gt=0, description="cellpose only (cpsam/cpdino): mean object diameter in pixels."),
+        batch_size: int = Field(1, ge=1, description="Training batch size."),
+        learning_rate: float = Field(1e-5, gt=0, description="AdamW learning rate."),
+        val_fraction: float = Field(0.2, ge=0.0, le=0.9, description="Val split fraction when val is omitted."),
+        n_samples: Optional[int] = Field(None, ge=1, description="Patches sampled per epoch (auto if omitted)."),
         resume_session_id: Optional[str] = Field(
             None, description="Continue fine-tuning from a prior session's checkpoint (same model_type)."),
+        init_checkpoint: Optional[str] = Field(
+            None, description="Start fine-tuning from an existing checkpoint given as an "
+            "http(s) URL (or a get_upload_url path) — e.g. the resumable weights file of an "
+            "exported BioImage.IO draft (see get_export_status.resume_checkpoint_file) — instead "
+            "of the base model. Mutually exclusive with resume_session_id; model_type must match "
+            "the checkpoint's architecture."),
         label: str = Field("", description="Optional human-readable tag for this session."),
     ) -> Dict[str, Any]:
         """Start a μSAM fine-tuning session (AIS decoder) and return immediately
@@ -679,6 +749,12 @@ class EntryApp:
         ``infer(session_id=...)``.
         """
         import training
+
+        if init_checkpoint and resume_session_id:
+            raise ValueError(
+                "Pass either init_checkpoint or resume_session_id, not both — "
+                "they select different starting checkpoints."
+            )
 
         await self._check_runtime_available(model_type)
 
@@ -710,7 +786,7 @@ class EntryApp:
             n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,
             batch_size=batch_size, learning_rate=learning_rate, diam_mean=diam_mean,
             val_fraction=val_fraction, n_samples=n_samples,
-            resume_session_id=resume_session_id,
+            resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
             patch_shape=(patch_size, patch_size), num_workers=0,
         )
         task = asyncio.create_task(self._run_training(
@@ -824,6 +900,7 @@ class EntryApp:
             rec.update(
                 status="READY", progress=1.0, message="ready",
                 download_url=download_url, size_bytes=res["zip_size"], files=res["files"],
+                resume_checkpoint_file=res.get("resume_checkpoint_file"),
             )
         except Exception as e:
             logger.exception(f"Export {export_id} failed")
@@ -836,7 +913,9 @@ class EntryApp:
         """Export progress. ``status`` ∈ {PENDING, BUILDING, READY, FAILED}.
         ``download_url`` (6h TTL) + ``size_bytes`` are set on READY; ``error`` on
         FAILED. ``files`` lists the package members (name + size) so the frontend
-        can mirror them when creating the draft artifact and calling push_export."""
+        can mirror them when creating the draft artifact and calling push_export.
+        ``resume_checkpoint_file`` names the package's resumable weights file, to
+        feed back into ``start_training(init_checkpoint=...)``."""
         rec = self._exports.get(export_id)
         if rec is None:
             raise KeyError(f"Unknown export_id '{export_id}'.")
