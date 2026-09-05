@@ -436,8 +436,21 @@ class AppsManager:
                 * 1024
                 * 1024
             )
+            # A submitted job that has not registered as a Ray node yet is
+            # capacity on the way, not consumed headroom. Deploying on a cluster
+            # scaled to zero triggers that scale-up itself, so counting those
+            # jobs against max_workers rejects the very deployment they serve.
+            registered_jobs = {
+                node["slurm_job_id"]
+                for node in self.ray_cluster.status["nodes"].values()
+                if node.get("slurm_job_id")
+            }
+            pending_worker_jobs = max(0, num_worker_jobs - len(registered_jobs))
             if (
-                num_worker_jobs < self.ray_cluster.slurm_workers.max_workers
+                (
+                    num_worker_jobs < self.ray_cluster.slurm_workers.max_workers
+                    or pending_worker_jobs > 0
+                )
                 and default_num_cpus >= required_resources["num_cpus"]
                 and default_num_gpus >= required_resources["num_gpus"]
                 and default_memory_bytes >= required_resources["memory"]
