@@ -129,7 +129,9 @@ class FederatedUNetSite:
             },
             "model_initialised": self._model is not None,
             "torch": {
-                "version": torch.__version__,
+                # str(): torch.__version__ is a torch-defined str subclass, and
+                # the proxy that unpickles this reply has no torch installed.
+                "version": str(torch.__version__),
                 "device": self._device.type,
                 "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
                 "cuda_version": torch.version.cuda,

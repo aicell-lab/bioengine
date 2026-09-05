@@ -12,7 +12,7 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [federated-learning, segmentation, u-net, privacy-preserving, dev]
 type: ray-serve
-version: 0.1.0
+version: 0.1.1
 entry: entry:FederatedUNetSite
 authorized_users:
   - nils.mech@gmail.com
