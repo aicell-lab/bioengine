@@ -94,6 +94,7 @@ class AppBuilder:
         server_url: str,
         log_file: Optional[str] = None,
         proxy_actor_name: Optional[str] = None,
+        elastic_gpu_cluster: bool = False,
         debug: bool = False,
     ) -> None:
         self.logger = create_logger(
@@ -106,6 +107,7 @@ class AppBuilder:
         self.artifact_manager: Optional[ObjectProxy] = None
         self.worker_service_id: Optional[str] = None
         self.proxy_actor_name: Optional[str] = proxy_actor_name
+        self.elastic_gpu_cluster: bool = elastic_gpu_cluster
         self.server_url: str = server_url
         self.data_server_url: Optional[str] = None
 
@@ -408,31 +410,39 @@ class AppBuilder:
         totals["num_cpus"] += proxy_opts.get("num_cpus", 0)
         totals["num_gpus"] += proxy_opts.get("num_gpus", 0)
         totals["memory"] += int(proxy_memory_in_gb * (1024**3))
-        return {k: int(v) if isinstance(v, (int, float)) else v for k, v in totals.items()}
+        # num_gpus stays a float: fractional and epsilon reservations round to
+        # zero as ints, which would understate the app's GPU demand.
+        return {
+            k: (float(v) if k == "num_gpus" else int(v))
+            for k, v in totals.items()
+        }
 
     async def _get_cluster_gpu_sizing(self) -> Dict[str, Any]:
         """Ask the proxy actor how to size GPU reservations on this cluster.
 
         Returns ``{"vram_resource_advertised": bool, "min_gpu_total_mb":
-        Optional[int]}``. Falls back to a "nothing known" answer (whole-GPU
-        reservation downstream) if the proxy is unreachable or has no GPU view
-        yet — safer than guessing a fraction from stale data.
+        Optional[int], "elastic_gpu_cluster": bool}``. Falls back to a "nothing
+        known" answer (whole-GPU reservation downstream) if the proxy is
+        unreachable or has no GPU view yet — safer than guessing a fraction
+        from stale data.
         """
         default = {"vram_resource_advertised": False, "min_gpu_total_mb": None}
-        if not self.proxy_actor_name:
-            return default
-        try:
-            proxy = ray.get_actor(name=self.proxy_actor_name, namespace="bioengine")
-            return await asyncio.to_thread(
-                ray.get, proxy.get_gpu_memory_sizing.remote()
-            )
-        except Exception:
-            self.logger.warning(
-                "Could not query cluster GPU sizing from the proxy actor; "
-                "GPU apps will reserve a whole GPU each.",
-                exc_info=True,
-            )
-            return default
+        sizing = default
+        if self.proxy_actor_name:
+            try:
+                proxy = ray.get_actor(name=self.proxy_actor_name, namespace="bioengine")
+                sizing = await asyncio.to_thread(
+                    ray.get, proxy.get_gpu_memory_sizing.remote()
+                )
+            except Exception:
+                self.logger.warning(
+                    "Could not query cluster GPU sizing from the proxy actor; "
+                    "GPU apps will reserve a whole GPU each.",
+                    exc_info=True,
+                )
+        sizing = dict(sizing)
+        sizing["elastic_gpu_cluster"] = self.elastic_gpu_cluster
+        return sizing
 
     @staticmethod
     def _apply_gpu_memory(
@@ -476,7 +486,14 @@ class AppBuilder:
                 opts["num_gpus"] = 1.0
                 continue
 
-            if vram_advertised:
+            # An elastic cluster (SLURM) may have no GPU node at deploy time, but
+            # every worker it launches advertises VRAM_MB. Requesting VRAM up
+            # front keeps the replica pending until the autoscaler provides such
+            # a node, instead of locking in a whole-GPU reservation that would
+            # then never be repacked.
+            if vram_advertised or (
+                gpu_sizing.get("elastic_gpu_cluster") and not min_gpu_mb
+            ):
                 opts["num_gpus"] = _GPU_HANDLE_EPSILON
                 opts.setdefault("resources", {})["VRAM_MB"] = int(gmb)
             elif min_gpu_mb:
