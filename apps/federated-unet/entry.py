@@ -42,13 +42,16 @@ def _read_pip(name: str) -> List[str]:
 
 @bioengine.app(
     num_cpus=2,
-    gpu_memory_mb=6144,
+    # Sized so the consortium's seven instances fit on two GPUs: 24576 / 5120
+    # admits 4 on Europa's RTX 3090, and on de.NBI (no VRAM_MB, so the worker
+    # falls back to a fraction) 5120 / 15360 = 0.33 admits 3 on one T4.
+    gpu_memory_mb=5120,
     # Host RAM, not VRAM, is what bounds how many replicas a single-machine
-    # worker admits: Europa has 30 GiB of Ray memory against one 24 GB GPU, so
-    # 12 GiB per replica capped it at two. A replica's real footprint is 0.65 GiB
+    # worker admits: Europa has 30 GiB of Ray memory shared across every app, so
+    # 8 GiB per replica capped it at three. A replica's real footprint is 0.65 GiB
     # idle and about 1 GiB more with a whole dataset resident — every image is
     # float32 at native resolution and the largest pool is ~650 of them.
-    memory_mb=8 * 1024,
+    memory_mb=6 * 1024,
     pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=4,
     autoscaling_config={"min_replicas": 1, "initial_replicas": 1, "max_replicas": 1},
@@ -159,7 +162,7 @@ class FederatedUNetSite:
     @bioengine.method
     async def prepare_data(
         self,
-        n_train: int = Field(55, description="Training images per dataset"),
+        n_train: Optional[int] = Field(55, description="Training images per dataset; null takes everything left after the test and val blocks"),
         n_val: int = Field(15, description="Validation images per dataset"),
         n_test: int = Field(25, description="Held-out test images per dataset"),
         split_seed: int = Field(20260905, description="Seed for the train/val/test partition; identical across sites and arms"),

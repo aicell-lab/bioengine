@@ -3,10 +3,12 @@
 Every arm consumes the same number of optimiser steps, so the comparison
 measures federation rather than compute:
 
-  <client>-only  trained only on that client's images, one arm per client
-  fedavg         R rounds of local training, sample-count-weighted state_dict average
-  pooled         an extra instance holding every client's data — the deliberate
-                 premise violation, used as the upper bound
+  <client>-only    trained only on that client's images, one arm per client
+  fedavg           R rounds of local training, sample-count-weighted state_dict average
+  fedavg-uniform   the same merge weighting every client equally (--uniform-arm)
+  loso-<client>    federate everyone except <client>, then score on <client> (--loso)
+  pooled           an extra instance holding every client's data — the deliberate
+                   premise violation, used as the upper bound
 
 Every arm is scored the same way: the checkpoint is pushed to each client and
 evaluated there against that client's held-out test split. Test images never
@@ -14,7 +16,9 @@ move. This process never receives an image; it reads checkpoints, averages them,
 and writes the average back.
 
 Usage:
-    python run_federated.py --layout acquisition-4site --seeds 0 --rounds 10 --steps 50
+    python run_federated.py --layout consortium --seeds 0 1 2 3 4 --rounds 60 \\
+        --steps 50 --loso --uniform-arm \\
+        --pre-registration ../../../bioengine-paper/analysis/results/federated-consortium-design.md
 """
 
 import argparse
@@ -176,6 +180,94 @@ async def train_arm(
     return history
 
 
+async def federated_arm(
+    apps,
+    store,
+    driver_log,
+    run_artifact_id: str,
+    participants: List[str],
+    eval_on: List[str],
+    prefix: str,
+    arm: str,
+    args,
+    seed: int,
+    weighting: str,
+) -> Dict[str, Any]:
+    """One FedAvg arm: R rounds of local training over `participants`, merged each round.
+
+    The same coroutine runs the full-consortium arm, the uniform-weighting arm
+    and each leave-one-site-out fold, so a fold cannot silently differ from the
+    headline arm in anything but who is in `participants`.
+    """
+    started = time.time()
+    for name in participants:
+        await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
+
+    round_records = []
+    for r in range(args.rounds):
+        local = await asyncio.gather(
+            *(
+                apps[name].train(
+                    steps=args.steps, lr=args.lr, seed=seed * 1000 + r, tag=f"{arm}/r{r:02d}"
+                )
+                for name in participants
+            )
+        )
+        state_dicts, counts = [], []
+        for name in participants:
+            path = f"{prefix}/{arm}/round_{r:02d}/{name}.pt"
+            push = await apps[name].push_weights(
+                run_artifact_id=run_artifact_id, path=path, note=f"{arm} round {r}"
+            )
+            state_dicts.append(load_state_dict(await store.get(path)))
+            # Uniform weighting is the same merge with every client counted once:
+            # the design choice is which of the two is primary, not two merges.
+            counts.append(push["n_train_images"] if weighting == "sample-count" else 1)
+        merged = fedavg(state_dicts, counts)
+        global_path = f"{prefix}/{arm}/round_{r:02d}/global.pt"
+        await store.put(global_path, dump_state_dict(merged), note=f"{arm} round {r} aggregate")
+        for name in participants:
+            await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
+        # Scored after the merge and pull, so this is the aggregate's curve.
+        merged_val = await val_dice(apps, eval_on)
+        round_records.append(
+            {
+                "round": r,
+                "merge_weights": dict(zip(participants, counts)),
+                "local": [{k: v for k, v in item.items() if k != "loss_curve"} for item in local],
+                "val_dice": merged_val,
+                "global_sha256": driver_log.dump()["entries"][-1]["sha256"],
+            }
+        )
+        print(
+            f"  {arm} r{r:02d} loss {[round(x['loss_last'], 4) for x in local]} "
+            f"val {[round(v, 4) for v in merged_val.values()]}",
+            flush=True,
+        )
+
+    checkpoint = f"{prefix}/arms/{arm}.pt"
+    await apps[participants[0]].push_weights(
+        run_artifact_id=run_artifact_id, path=checkpoint, note=f"final {arm} aggregate"
+    )
+    curve = [float(np.mean(list(rec["val_dice"].values()))) for rec in round_records]
+    return {
+        "checkpoint": checkpoint,
+        "participants": participants,
+        "weighting": weighting,
+        "rounds": round_records,
+        "val_curve": curve,
+        "plateau": {
+            dataset: block_plateau(values)
+            for dataset, values in per_dataset_curves(round_records).items()
+        },
+        "convergence_round": convergence_round(
+            curve, CONVERGENCE["secondary"]["window"], CONVERGENCE["secondary"]["tolerance"]
+        ),
+        "wall_time_s": time.time() - started,
+        "total_steps_per_model": args.rounds * args.steps,
+    }
+
+
 def resolve_pre_registration(path: str) -> dict:
     """Pin the commit that holds this run's predictions, refusing an unstaged one.
 
@@ -217,6 +309,16 @@ async def main() -> None:
     parser.add_argument("--previews", action="store_true")
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument(
+        "--loso",
+        action="store_true",
+        help="Add one leave-one-site-out fold per client: federate the others, score on the held-out client",
+    )
+    parser.add_argument(
+        "--uniform-arm",
+        action="store_true",
+        help="Add a second FedAvg arm weighting every client equally instead of by sample count",
+    )
+    parser.add_argument(
         "--pre-registration",
         default=None,
         help="Path to a design file whose predictions must already be committed",
@@ -256,8 +358,11 @@ async def main() -> None:
 
     site_status = {name: await app.get_status() for name, app in apps.items()}
     if not args.skip_prepare:
+        # The layout decides whether train sizes are fixed or natural; the driver
+        # does not carry a per-client size table that could drift from it.
+        n_train = LAYOUTS[args.layout]["n_train"]
         for name, app in apps.items():
-            loaded = await app.prepare_data()
+            loaded = await app.prepare_data(n_train=n_train)
             print(f"{name}: {[(k, v['n_train'], v['n_val'], v['n_test']) for k, v in loaded.items()]}", flush=True)
             site_status[name] = await app.get_status()
 
@@ -307,66 +412,33 @@ async def main() -> None:
         print(f"init: {init['n_parameters']} params, sha256 {init_entry['sha256'][:12]}", flush=True)
 
         arms: Dict[str, Dict[str, Any]] = {}
+        scored_on = sorted(set(eval_sites.values()))
 
-        # --- Arm: federated ------------------------------------------------
-        started = time.time()
-        round_records = []
-        for r in range(args.rounds):
-            local = await asyncio.gather(
-                *(
-                    apps[name].train(
-                        steps=args.steps, lr=args.lr, seed=seed * 1000 + r, tag=f"fedavg/r{r:02d}"
+        async def fed(arm: str, participants: List[str], weighting: str) -> None:
+            arms[arm] = await federated_arm(
+                apps, store, driver_log, run_artifact_id, participants,
+                scored_on, prefix, arm, args, seed, weighting,
+            )
+
+        # --- Arm: federated, every client -----------------------------------
+        await fed("fedavg", clients, "sample-count")
+        if args.uniform_arm:
+            await fed("fedavg-uniform", clients, "uniform")
+
+        # --- Arms: leave one site out ----------------------------------------
+        # The held-out unit is a whole client, i.e. a whole domain — never a
+        # shard of one — so the fold asks what a site that never joined would
+        # get from the federation, not what a site with half its own data would.
+        if args.loso:
+            for held_out in clients:
+                if len(sites[held_out]["datasets"]) != 1 or "@" in sites[held_out]["datasets"][0]:
+                    raise SystemExit(
+                        f"--loso needs one whole domain per client; {held_out} holds "
+                        f"{sites[held_out]['datasets']}"
                     )
-                    for name in clients
+                await fed(
+                    f"loso-{held_out}", [n for n in clients if n != held_out], "sample-count"
                 )
-            )
-            state_dicts, counts = [], []
-            for name in clients:
-                path = f"{prefix}/round_{r:02d}/{name}.pt"
-                push = await apps[name].push_weights(
-                    run_artifact_id=run_artifact_id, path=path, note=f"fedavg round {r}"
-                )
-                state_dicts.append(load_state_dict(await store.get(path)))
-                counts.append(push["n_train_images"])
-            merged = fedavg(state_dicts, counts)
-            global_path = f"{prefix}/round_{r:02d}/global.pt"
-            await store.put(global_path, dump_state_dict(merged), note=f"fedavg round {r} aggregate")
-            for name in clients:
-                await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
-            # Scored after the merge and pull, so this is the aggregate's curve.
-            merged_val = await val_dice(apps, sorted(set(eval_sites.values())))
-            round_records.append(
-                {
-                    "round": r,
-                    "merge_weights": dict(zip(clients, counts)),
-                    "local": [{k: v for k, v in item.items() if k != "loss_curve"} for item in local],
-                    "val_dice": merged_val,
-                    "global_sha256": driver_log.dump()["entries"][-1]["sha256"],
-                }
-            )
-            print(
-                f"  fedavg r{r:02d} loss {[round(x['loss_last'], 4) for x in local]} "
-                f"val {[round(v, 4) for v in merged_val.values()]}",
-                flush=True,
-            )
-        await apps[origin].push_weights(
-            run_artifact_id=run_artifact_id, path=f"{prefix}/arms/fedavg.pt", note="final fedavg aggregate"
-        )
-        fedavg_curve = [float(np.mean(list(rec["val_dice"].values()))) for rec in round_records]
-        arms["fedavg"] = {
-            "checkpoint": f"{prefix}/arms/fedavg.pt",
-            "rounds": round_records,
-            "val_curve": fedavg_curve,
-            "plateau": {
-                dataset: block_plateau(curve)
-                for dataset, curve in per_dataset_curves(round_records).items()
-            },
-            "convergence_round": convergence_round(
-                fedavg_curve, CONVERGENCE["secondary"]["window"], CONVERGENCE["secondary"]["tolerance"]
-            ),
-            "wall_time_s": time.time() - started,
-            "total_steps_per_model": args.rounds * args.steps,
-        }
 
         # --- Arms: single-site and pooled ----------------------------------
         single_site_arms = [(f"{name}-only", name) for name in clients]
@@ -443,6 +515,17 @@ async def main() -> None:
         "app_version": app_records[clients[0]].get("version"),
         "run_artifact_id": run_artifact_id,
         "aggregation_rule": "sample-count-weighted FedAvg over the full state_dict",
+        "arm_structure": {
+            "fedavg": "all clients, sample-count weighted — the primary aggregate",
+            "fedavg-uniform": "all clients, every client weighted equally" if args.uniform_arm else None,
+            "loso-<client>": (
+                "federate every client except <client>, then score on <client>'s held-out "
+                "test split; the held-out unit is a whole domain, never a shard"
+            ) if args.loso else None,
+            "<client>-only": "that client's own data alone, the baseline LOSO is compared against",
+            "pooled": "one instance holding every client's data — the premise violation, an upper bound",
+        },
+        "train_sizes": "natural" if LAYOUTS[args.layout]["n_train"] is None else LAYOUTS[args.layout]["n_train"],
         "normalisation": "GroupNorm (no running statistics, so the merge averages weights only)",
         "convergence_criterion": CONVERGENCE,
         "pre_registration": pre_registration,

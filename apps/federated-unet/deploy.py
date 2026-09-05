@@ -1,6 +1,6 @@
 """Deploy or redeploy the instances of one federation layout.
 
-    python deploy.py --version 0.3.1 --layout acquisition-4site [--only fluo-0 pooled]
+    python deploy.py --version 0.4.0 --layout acquisition-4site [--only fluo-0 pooled]
 
 A layout names the clients, what each one holds, and which cluster it lands on.
 Placement is a capacity decision rather than a scientific one — see PLACEMENT —
@@ -33,17 +33,49 @@ WORKERS = {
 }
 
 #: How many replicas of this app each worker admits, measured rather than
-#: assumed. On Europa the binding resource is host RAM, not the GPU: the worker
-#: sees one 24576 MB RTX 3090 and advertises it as VRAM_MB, which would allow
-#: floor(24576 / 6144) = 4, but its Ray cluster has 30 GiB of memory shared with
-#: other apps, so floor(30 / 8) = 3 replicas is the real ceiling. de.NBI is a
-#: Kubernetes cluster with no VRAM_MB, so the worker falls back to a GPU fraction
-#: of 6144 / 15360 = 0.40 per replica, and only one of its three T4 nodes has
-#: free fraction: floor(1 / 0.40) = 2. Both ceilings are set by the declarations,
-#: not by the app — a replica measures 0.65 GiB of RAM and ~2.5 GB of VRAM.
-PLACEMENT = {EUROPA: 3, DENBI: 2}
+#: assumed. Europa's worker sees one 24576 MB RTX 3090 and advertises it as
+#: VRAM_MB, so at gpu_memory_mb 5120 the GPU allows floor(24576 / 5120) = 4; its
+#: Ray cluster has 30 GiB of memory shared with other apps, so memory_mb 6144
+#: allows floor(30 / 6) = 5 and the GPU is the binding resource again. (At the
+#: earlier memory_mb of 8192 it was RAM that bound, at 3.) de.NBI is a Kubernetes
+#: cluster with no VRAM_MB, so the worker falls back to a GPU fraction of
+#: 5120 / 15360 = 0.33 per replica and one T4 takes 3 x 0.33 = 0.99. Both
+#: ceilings are set by the declarations, not by the app — a replica measures
+#: 0.65 GiB of RAM and ~2.5 GB of VRAM, so both still carry about 2x headroom.
+PLACEMENT = {EUROPA: 4, DENBI: 3}
 
 LAYOUTS = {
+    # The consortium: one client per public dataset, so a client boundary is an
+    # acquisition-setup boundary rather than a slice of one collection. Rostered
+    # in bioengine-paper analysis/data/federated_consortium/README.md, frozen
+    # against analysis/results/federated-consortium-design.md.
+    "consortium": {
+        "caveat": (
+            "Six clients are six public datasets from six acquisition setups, not "
+            "six labs that agreed to federate: the data was gathered by others and "
+            "partitioned here. Client size is natural and therefore not randomised, "
+            "so it is entangled with client domain and no causal claim about size "
+            "follows. Seven instances run on two physical GPUs; see "
+            "co_located_clients."
+        ),
+        # Train sizes are whatever each client has left after the fixed test and
+        # val blocks, which is what puts a 16x span on the size axis.
+        "n_train": None,
+        "clients": {
+            "bbbc038-fluo": (EUROPA, ["bbbc038-fluo"]),
+            "bbbc039": (EUROPA, ["bbbc039"]),
+            "nuinsseg": (EUROPA, ["nuinsseg"]),
+            "bbbc038-histo": (DENBI, ["bbbc038-histo"]),
+            "cellbindb": (DENBI, ["cellbindb"]),
+            "kromp": (DENBI, ["kromp"]),
+        },
+        # The oracle holds every client's data, which includes the 1.6 GB
+        # NuInsSeg archive, so it goes on the worker with the larger disk.
+        "pooled": (
+            EUROPA,
+            ["bbbc038-fluo", "bbbc038-histo", "bbbc039", "cellbindb", "nuinsseg", "kromp"],
+        ),
+    },
     # Two modalities out of BBBC038, with the fluorescence pool cut into three
     # disjoint clients so the federation has four participants at 3:1 modality
     # representation. Shard 0 of 3 reproduces the two-site run's split exactly,
@@ -56,6 +88,7 @@ LAYOUTS = {
             "separate lab. It exercises N-client FedAvg and unequal client sizes; it "
             "does not demonstrate cross-site generalisation."
         ),
+        "n_train": 55,
         "clients": {
             "fluo-0": (EUROPA, ["bbbc038-fluo@0/3"]),
             "fluo-1": (EUROPA, ["bbbc038-fluo@1/3"]),
@@ -71,6 +104,7 @@ LAYOUTS = {
             "enough apart that a single-site model collapses out of domain, which "
             "makes federation look very good. An existence proof, not a utility bound."
         ),
+        "n_train": 55,
         "clients": {
             "site-a": (EUROPA, ["dsb2018-fluo"]),
             "site-b": (DENBI, ["bbbc010-worms"]),
@@ -82,6 +116,7 @@ LAYOUTS = {
             "Two clients cut out of one collection by imaging modality, not two labs. "
             "The shift is real but it is the only shift present."
         ),
+        "n_train": 55,
         "clients": {
             "site-a": (EUROPA, ["bbbc038-fluo"]),
             "site-b": (DENBI, ["bbbc038-histo"]),
@@ -113,7 +148,7 @@ def instances(layout_name: str):
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="0.3.1")
+    parser.add_argument("--version", default="0.4.0")
     parser.add_argument("--layout", choices=sorted(LAYOUTS), default="acquisition-4site")
     parser.add_argument("--only", nargs="+", default=None)
     args = parser.parse_args()
