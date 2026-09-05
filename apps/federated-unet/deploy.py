@@ -49,6 +49,13 @@ LAYOUTS = {
     # representation. Shard 0 of 3 reproduces the two-site run's split exactly,
     # so the test fingerprints — and the earlier numbers — still line up.
     "acquisition-4site": {
+        "caveat": (
+            "This is the mechanics rig, not the consortium: one fluorescence domain "
+            "cut into three disjoint shards plus one histology domain, so three of "
+            "the four clients are near-IID with each other and none of them is a "
+            "separate lab. It exercises N-client FedAvg and unequal client sizes; it "
+            "does not demonstrate cross-site generalisation."
+        ),
         "clients": {
             "fluo-0": (EUROPA, ["bbbc038-fluo@0/3"]),
             "fluo-1": (EUROPA, ["bbbc038-fluo@1/3"]),
@@ -59,6 +66,11 @@ LAYOUTS = {
     },
     # The original two-site pairings, kept so either earlier run can be rebuilt.
     "caricature": {
+        "caveat": (
+            "Deliberately a caricature of non-IID: nuclei against C. elegans are far "
+            "enough apart that a single-site model collapses out of domain, which "
+            "makes federation look very good. An existence proof, not a utility bound."
+        ),
         "clients": {
             "site-a": (EUROPA, ["dsb2018-fluo"]),
             "site-b": (DENBI, ["bbbc010-worms"]),
@@ -66,6 +78,10 @@ LAYOUTS = {
         "pooled": (EUROPA, ["dsb2018-fluo", "bbbc010-worms"]),
     },
     "acquisition": {
+        "caveat": (
+            "Two clients cut out of one collection by imaging modality, not two labs. "
+            "The shift is real but it is the only shift present."
+        ),
         "clients": {
             "site-a": (EUROPA, ["bbbc038-fluo"]),
             "site-b": (DENBI, ["bbbc038-histo"]),

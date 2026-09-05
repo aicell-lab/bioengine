@@ -48,6 +48,15 @@ but a consortium demonstration wants more participants than that. Without it,
 two sites asking for the same dataset receive the *same images*, and the
 federation would be duplicating one site rather than joining several.
 
+**A sharded layout is a mechanics rig, not a consortium.** In
+`acquisition-4site` three of the four clients are disjoint slices of one
+fluorescence pool, so they are near-IID with each other and none of them is a
+separate lab. It exercises N-client FedAvg and unequal client sizes; it does not
+demonstrate cross-site generalisation, and a four-row table must not be read as
+four labs. Each layout carries this sentence in `deploy.py`, and the driver
+copies it into `provenance.json` as `layout_caveat` so it travels with the
+numbers rather than staying in the message that announced them.
+
 The test block is cut where an unsharded site would put it and is identical for
 every *n*, so all arms are still scored on the same held-out images and
 **shard 0 of 1 reproduces the unsharded split exactly, indices included** — the

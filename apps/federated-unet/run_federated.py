@@ -456,6 +456,10 @@ async def main() -> None:
             "crop": 256,
         },
         "layout": args.layout,
+        # What the layout is not. A table of four clients reads as four labs
+        # unless the record says otherwise, so it travels with every run rather
+        # than living only in the message that announced the layout.
+        "layout_caveat": LAYOUTS[args.layout]["caveat"],
         "clients": clients,
         "scored_on": eval_sites,
         # "one client per site" is the framing, so clients that share a worker
