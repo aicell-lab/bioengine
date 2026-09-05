@@ -86,16 +86,62 @@ def dump_state_dict(state_dict: Dict[str, torch.Tensor]) -> bytes:
 
 
 CONVERGENCE = {
-    "metric": "mean validation Dice over the datasets the arm trains on",
-    "window": 5,
-    "tolerance": 0.005,
-    "rule": (
-        "An arm is converged at round r if no round in (r, r+window] exceeds the "
-        "best validation Dice seen up to and including r by more than tolerance. "
-        "The converged round reported is the smallest such r; an arm counts as "
-        "having converged within the run only if r + window <= last round."
-    ),
+    "primary": {
+        "name": "block plateau, per dataset",
+        "metric": "validation Dice on one dataset the arm trains on",
+        "tolerance": 0.005,
+        "rule": (
+            "Split the rounds into equal thirds. The arm has converged on that "
+            "dataset if the mean validation Dice over the final third exceeds "
+            "the mean over the middle third by less than tolerance. Reported "
+            "per dataset and never averaged across datasets."
+        ),
+        "why": (
+            "Replaces the window rule below, which was pre-registered for the "
+            "20260905-115455 run and failed there: it fires on the first "
+            "transient stall in a noisy curve, reporting convergence at round 8 "
+            "of 60 for arms whose best value came at round 50+. Averaging the "
+            "two datasets also diluted the harder domain by half."
+        ),
+    },
+    "secondary": {
+        "name": "first-stall window (superseded, still reported for continuity)",
+        "metric": "mean validation Dice over the datasets the arm trains on",
+        "window": 5,
+        "tolerance": 0.005,
+        "rule": (
+            "An arm is converged at round r if no round in (r, r+window] exceeds "
+            "the best validation Dice seen up to and including r by more than "
+            "tolerance. The converged round reported is the smallest such r; an "
+            "arm counts as having converged within the run only if "
+            "r + window <= last round."
+        ),
+    },
 }
+
+
+def block_plateau(curve: List[float], tolerance: float = 0.005) -> Dict[str, Any]:
+    """Does the last third of training still buy anything over the middle third?
+
+    Noise-robust where `convergence_round` is not: it asks whether more rounds
+    would move the number, rather than whether the curve happened to stall once.
+    """
+    third = len(curve) // 3
+    middle = float(np.mean(curve[third : 2 * third]))
+    final = float(np.mean(curve[2 * third :]))
+    return {
+        "middle_third_mean": middle,
+        "final_third_mean": final,
+        "improvement": final - middle,
+        "converged": (final - middle) < tolerance,
+    }
+
+
+def per_dataset_curves(history: List[Dict]) -> Dict[str, List[float]]:
+    return {
+        dataset: [record["val_dice"][dataset] for record in history]
+        for dataset in history[0]["val_dice"]
+    }
 
 
 def convergence_round(curve: List[float], window: int = 5, tolerance: float = 0.005):
@@ -251,8 +297,12 @@ async def main() -> None:
             "checkpoint": f"{prefix}/arms/fedavg.pt",
             "rounds": round_records,
             "val_curve": fedavg_curve,
+            "plateau": {
+                dataset: block_plateau(curve)
+                for dataset, curve in per_dataset_curves(round_records).items()
+            },
             "convergence_round": convergence_round(
-                fedavg_curve, CONVERGENCE["window"], CONVERGENCE["tolerance"]
+                fedavg_curve, CONVERGENCE["secondary"]["window"], CONVERGENCE["secondary"]["tolerance"]
             ),
             "wall_time_s": time.time() - started,
             "total_steps_per_model": args.rounds * args.steps,
@@ -273,8 +323,12 @@ async def main() -> None:
                 "checkpoint": f"{prefix}/arms/{arm}.pt",
                 "history": [{k: v for k, v in h.items() if k != "loss_curve"} for h in history],
                 "val_curve": curve,
+                "plateau": {
+                    dataset: block_plateau(values)
+                    for dataset, values in per_dataset_curves(history).items()
+                },
                 "convergence_round": convergence_round(
-                    curve, CONVERGENCE["window"], CONVERGENCE["tolerance"]
+                    curve, CONVERGENCE["secondary"]["window"], CONVERGENCE["secondary"]["tolerance"]
                 ),
                 "wall_time_s": time.time() - started,
                 "total_steps_per_model": args.rounds * args.steps,
