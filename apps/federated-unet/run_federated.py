@@ -300,6 +300,9 @@ async def main() -> None:
             print(f"  {arm} test dice: {summary}", flush=True)
 
         results[f"seed_{seed}"] = arms
+        # Flushed per seed: a transient transport failure on seed 4 should cost
+        # one seed, not the four that already finished.
+        (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
 
         if args.previews:
             for name in ("site-a", "site-b"):
