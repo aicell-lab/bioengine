@@ -38,25 +38,26 @@ from hypha_rpc import connect_to_server
 sys.path.insert(0, str(Path(__file__).parent))
 from checkpoints import CheckpointStore, TransportLog, ensure_run_artifact  # noqa: E402
 from unet import fedavg, signature  # noqa: E402
+from workers import resolve_worker  # noqa: E402
 
 SERVER_URL = "https://hypha.aicell.io"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 SITES = {
     "site-a": {
-        "worker": "ws-user-github|49943582/bioengine-worker-europa:bioengine-worker",
+        "worker": "ws-user-github|49943582/bioengine-worker-europa",
         "application_id": "fedunet-site-a",
         "token_key": "HYPHA_TOKEN",
         "description": "Europa single-machine worker, Stockholm",
     },
     "site-b": {
-        "worker": "bioimage-io/bioengine-worker-denbi-6d8d6dd6d5-zvwxn:bioengine-worker",
+        "worker": "bioimage-io/bioengine-worker-denbi",
         "application_id": "fedunet-site-b",
         "token_key": "BIOIMAGE_IO_TOKEN",
         "description": "de.NBI cloud worker, last free GPU node",
     },
     "pooled": {
-        "worker": "ws-user-github|49943582/bioengine-worker-europa:bioengine-worker",
+        "worker": "ws-user-github|49943582/bioengine-worker-europa",
         "application_id": "fedunet-pooled",
         "token_key": "HYPHA_TOKEN",
         "description": "Pooled-oracle control on Europa; holds both domains",
@@ -64,13 +65,13 @@ SITES = {
 }
 
 
-async def resolve(server, worker_service_id: str, application_id: str):
+async def resolve(server, worker_prefix: str, application_id: str):
     """Turn an application_id into a callable app service handle."""
-    worker = await server.get_service(worker_service_id)
+    worker = await resolve_worker(server, worker_prefix)
     status = await worker.get_app_status([application_id])
     record = status.get(application_id)
     if not record:
-        raise RuntimeError(f"{application_id} is not deployed on {worker_service_id}")
+        raise RuntimeError(f"{application_id} is not deployed on {worker_prefix}")
     if record["status"] != "RUNNING":
         raise RuntimeError(f"{application_id} is {record['status']}: {record.get('message')}")
     return await server.get_service(record["service_ids"]["websocket_service_id"]), record

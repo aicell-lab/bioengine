@@ -12,6 +12,8 @@ from pathlib import Path
 from dotenv import dotenv_values
 from hypha_rpc import connect_to_server
 
+from workers import resolve_worker
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVER_URL = "https://hypha.aicell.io"
 ARTIFACT = "bioimage-io/federated-unet"
@@ -40,24 +42,6 @@ SPLITS = {
     "caricature": ("dsb2018-fluo", "bbbc010-worms"),
     "acquisition": ("bbbc038-fluo", "bbbc038-histo"),
 }
-
-
-async def resolve_worker(server, prefix: str):
-    """Find the worker service whose id starts with ``prefix``.
-
-    Kubernetes bakes the pod name into the service id, so a hardcoded id goes
-    stale the moment the worker pod is replaced -- which has already happened
-    once here, on de.NBI.
-    """
-    workspace = prefix.split("/", 1)[0]
-    matches = [
-        service["id"]
-        for service in await server.list_services(workspace)
-        if service["id"].startswith(prefix) and service["id"].endswith(":bioengine-worker")
-    ]
-    if len(matches) != 1:
-        raise RuntimeError(f"expected exactly one worker matching {prefix!r}, got {matches}")
-    return await server.get_service(matches[0])
 
 
 async def main() -> None:
