@@ -21,6 +21,7 @@ Usage:
 import argparse
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import subprocess
@@ -179,6 +180,33 @@ async def train_arm(
     return history
 
 
+def resolve_pre_registration(path: str) -> dict:
+    """Pin the commit that holds this run's predictions, refusing an unstaged one.
+
+    A prediction only counts as pre-registered if it was in git before the first
+    optimiser step, so an uncommitted edit is a hard failure rather than a
+    warning: the recorded hash would otherwise describe a different document
+    than the one the run was designed against.
+    """
+    if path is None:
+        return {}
+    design = Path(path).resolve()
+    repo = design.parent
+    def git(*cmd):
+        return subprocess.run(["git", *cmd], cwd=repo, capture_output=True, text=True).stdout.strip()
+    if git("status", "--porcelain", "--", str(design)):
+        raise SystemExit(f"{design} has uncommitted changes; commit the predictions before training")
+    commit = git("log", "-1", "--format=%H", "--", str(design))
+    if not commit:
+        raise SystemExit(f"{design} is not committed; commit the predictions before training")
+    return {
+        "file": design.name,
+        "commit": commit,
+        "committed_at": git("log", "-1", "--format=%cI", "--", str(design)),
+        "sha256": hashlib.sha256(design.read_bytes()).hexdigest(),
+    }
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
@@ -189,7 +217,14 @@ async def main() -> None:
     parser.add_argument("--out", default=None)
     parser.add_argument("--previews", action="store_true")
     parser.add_argument("--skip-prepare", action="store_true")
+    parser.add_argument(
+        "--pre-registration",
+        default=None,
+        help="Path to a design file whose predictions must already be committed",
+    )
     args = parser.parse_args()
+
+    pre_registration = resolve_pre_registration(args.pre_registration)
 
     env = dotenv_values(REPO_ROOT / ".env")
     out_dir = Path(args.out or (REPO_ROOT.parent / "bioengine-paper" / "analysis" / "results" / f"federated-unet-{args.run_id}"))
@@ -384,6 +419,7 @@ async def main() -> None:
         "aggregation_rule": "sample-count-weighted FedAvg over the full state_dict",
         "normalisation": "GroupNorm (no running statistics, so the merge averages weights only)",
         "convergence_criterion": CONVERGENCE,
+        "pre_registration": pre_registration,
         "config": {
             "seeds": args.seeds,
             "rounds": args.rounds,
