@@ -1,6 +1,6 @@
 """Deploy or redeploy the instances of one federation layout.
 
-    python deploy.py --version 0.4.2 --layout acquisition-4site [--only fluo-0 pooled]
+    python deploy.py --version 0.4.3 --layout acquisition-4site [--only fluo-0 pooled]
 
 A layout names the clients, what each one holds, and which cluster it lands on.
 Placement is a capacity decision rather than a scientific one — see PLACEMENT —
@@ -148,7 +148,7 @@ def instances(layout_name: str):
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="0.4.2")
+    parser.add_argument("--version", default="0.4.3")
     parser.add_argument("--layout", choices=sorted(LAYOUTS), default="acquisition-4site")
     parser.add_argument("--only", nargs="+", default=None)
     args = parser.parse_args()

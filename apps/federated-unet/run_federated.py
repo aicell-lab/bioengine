@@ -226,7 +226,11 @@ async def federated_arm(
         merged = fedavg(state_dicts, counts)
         global_path = f"{prefix}/{arm}/round_{r:02d}/global.pt"
         await store.put(global_path, dump_state_dict(merged), note=f"{arm} round {r} aggregate")
-        for name in participants:
+        # Every site that is scored must hold the merged weights, not just the
+        # ones that trained. A LOSO fold's held-out client trains on nothing and
+        # would otherwise be scored on whatever weights it last happened to
+        # hold — which is the one number the fold exists to produce.
+        for name in dict.fromkeys([*participants, *eval_on]):
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
         # Scored after the merge and pull, so this is the aggregate's curve.
         merged_val = await val_dice(apps, eval_on)
