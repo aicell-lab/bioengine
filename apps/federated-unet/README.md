@@ -88,18 +88,53 @@ before training starts.
 
 ## Data
 
-Two public, permissively licensed datasets with obviously different object
-shapes:
+All CC0. Two pairings are available, and `deploy.py --split` picks one:
+
+| Split | Site A | Site B | What differs |
+|---|---|---|---|
+| `caricature` | `dsb2018-fluo` | `bbbc010-worms` | the object **class** |
+| `acquisition` | `bbbc038-fluo` | `bbbc038-histo` | the imaging **modality** |
 
 | Dataset | Objects | Source | Licence |
 |---|---|---|---|
 | `dsb2018-fluo` | fluorescence cell nuclei — many small round objects | BBBC038v1 (2018 Data Science Bowl), fluorescence subset as repackaged by StarDist | CC0 |
 | `bbbc010-worms` | *C. elegans* — few long thin objects | BBBC010 v1/v2, Broad Bioimage Benchmark Collection | CC0 |
+| `bbbc038-fluo` | cell nuclei by fluorescence (546 images) | BBBC038v1 `stage1_train`, direct | CC0 |
+| `bbbc038-histo` | cell nuclei in H&E histology (108 images) | BBBC038v1 `stage1_train`, direct | CC0 |
+
+### The caricature pairing
 
 Both are bright objects on a dark background, and every image is percentile
 (1 / 99.8) normalised per image, so the domain difference the model has to
 bridge is **object shape**, not intensity or contrast. A generalisation failure
 therefore cannot be waved away as a contrast artefact.
+
+It is, deliberately, a caricature of non-IID: the classes are far enough apart
+that a single-site model collapses out of domain, which makes federation look
+very good. Useful as an existence proof, not as a utility bound.
+
+### The acquisition pairing
+
+One object class — nuclei — split by imaging modality inside a single archive,
+so nothing but the modality differs. This is the hospital-consortium setting:
+every site segments the same thing, but their scanners differ.
+
+`metadata.xlsx` has a `stain_type` column, but only per project group and with no
+mapping to an ImageId, so it cannot label images. The split is read off the
+pixels instead, where for this collection it is a physical consequence of the
+stain rather than a proxy for it: saturation is exactly zero up to the 80th
+percentile, all 108 coloured images have a bright background, and only 2 of 670
+images fall anywhere in the ambiguous band. The 16 greyscale bright-background
+**brightfield** images are excluded — a third modality, the only 1024×1024 images
+in the set, and a foreground fraction 7× below the other two.
+
+Each modality is reduced to its own physically correct signal: fluorescence is
+emission, so intensity is the signal; histology is absorbance, so **optical
+density** is, being linear in stain concentration. This is load-bearing rather
+than cosmetic. Raw greyscale polarity is *inverted* between the two — objects are
+brighter than background in 100% of fluorescence images and 0% of histology ones
+— so putting both through one intensity pipeline would turn an acquisition shift
+into a sign flip, and rebuild the caricature by accident.
 
 ### Why worms and not leaves, and not the Cellpose training set
 
@@ -114,10 +149,9 @@ The original suggestion was "cells vs leaves" on the Cellpose data. Two changes:
   object class so a small model shows the effect fast". Long thin worms against
   small round nuclei delivers that at CC0.
 
-`dsb2018-fluo` is currently fetched via the StarDist repackaging of BBBC038,
-which is one hop from the primary source. Swapping to BBBC038 directly is
-available and is a change to one URL and one loader in `datasets.py`; it should
-be done if this becomes a paper figure.
+`dsb2018-fluo` is fetched via the StarDist repackaging of BBBC038, one hop from
+the primary source. The `bbbc038-*` datasets read `stage1_train.zip` from the
+Broad directly, so the acquisition split has no intermediary.
 
 ## Verifying that no image left a site
 

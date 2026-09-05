@@ -35,6 +35,26 @@ DATASETS: Dict[str, Dict[str, str]] = {
         "licence": "CC0",
         "citation": "Ljosa et al., Nature Methods, 2012",
     },
+    # The acquisition-split pair: one object class, two imaging modalities, cut
+    # out of a single archive so nothing but the modality differs between them.
+    "bbbc038-fluo": {
+        "url": "https://data.broadinstitute.org/bbbc/BBBC038/stage1_train.zip",
+        "slot": "bbbc038",
+        "modality": "fluorescence",
+        "objects": "cell nuclei imaged by fluorescence",
+        "source": "BBBC038v1 (2018 Data Science Bowl), fluorescence subset",
+        "licence": "CC0",
+        "citation": "Caicedo et al., Nature Methods, 2019",
+    },
+    "bbbc038-histo": {
+        "url": "https://data.broadinstitute.org/bbbc/BBBC038/stage1_train.zip",
+        "slot": "bbbc038",
+        "modality": "histology",
+        "objects": "cell nuclei in H&E-stained histology",
+        "source": "BBBC038v1 (2018 Data Science Bowl), histology subset",
+        "licence": "CC0",
+        "citation": "Caicedo et al., Nature Methods, 2019",
+    },
 }
 
 
@@ -73,7 +93,11 @@ def _normalize(image: np.ndarray) -> np.ndarray:
     lo, hi = np.percentile(image, (1.0, 99.8))
     if hi <= lo:
         return np.zeros_like(image)
-    return np.clip((image - lo) / (hi - lo), 0.0, 1.0)
+    # np.percentile returns float64 scalars, which under NumPy 2's NEP 50 promote
+    # the whole array; nothing downstream calls .float() on the tensor, so a
+    # float64 image reaches a float32 model and raises. Harmless under the pinned
+    # numpy 1.26, load-bearing the moment that pin moves.
+    return np.clip((image - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
 
 
 def _load_dsb2018(root: Path) -> List[Tuple[np.ndarray, np.ndarray]]:
@@ -114,6 +138,58 @@ def _load_bbbc010(root: Path, mask_root: Path) -> List[Tuple[np.ndarray, np.ndar
     return pairs
 
 
+def _bbbc038_modality(rgb: np.ndarray) -> str:
+    """Which imaging modality produced this image.
+
+    Read off the pixels rather than out of metadata.xlsx, whose stain_type is
+    per project group with no mapping to an ImageId. The two classes separate
+    absolutely on this collection: saturation is exactly zero up to the 80th
+    percentile, every one of the 108 coloured images has a bright background,
+    and only 2 of 670 images sit anywhere in the ambiguous band.
+    """
+    saturation = float((rgb.max(-1) - rgb.min(-1)).mean())
+    if saturation > 0.02:
+        return "histology"
+    # Greyscale on a bright background is brightfield -- a third modality, and
+    # the only 1024x1024 images here. Assigning it to either side would put two
+    # modalities on one side of a two-site modality split.
+    return "brightfield" if float(np.median(rgb.mean(-1))) > 0.35 else "fluorescence"
+
+
+def _signal(rgb: np.ndarray, modality: str) -> np.ndarray:
+    """The physically correct 'amount of signal' for the modality.
+
+    Fluorescence is emission, so intensity is the signal. Histology is
+    absorbance, so optical density is, and it is linear in stain concentration.
+    Both make nuclei the bright class, which matters: the raw greyscale polarity
+    is inverted between the two (objects are brighter than background in 100% of
+    fluorescence images and 0% of histology ones), and feeding both through one
+    intensity pipeline would turn an acquisition shift into a sign flip.
+    """
+    if modality == "histology":
+        return -np.log10((rgb * 255.0 + 1.0) / 256.0).mean(-1)
+    return rgb.mean(-1)
+
+
+def _load_bbbc038(root: Path, modality: str) -> List[Tuple[np.ndarray, np.ndarray]]:
+    import imageio.v3 as iio
+
+    pairs = []
+    for image_dir in sorted(root.iterdir()):
+        image_paths = list((image_dir / "images").glob("*.png"))
+        if not image_paths:
+            continue
+        rgb = iio.imread(image_paths[0])[..., :3].astype(np.float32) / 255.0
+        if _bbbc038_modality(rgb) != modality:
+            continue
+        # One PNG per nucleus; the task here is foreground, not instances.
+        mask = np.zeros(rgb.shape[:2], dtype=bool)
+        for mask_path in (image_dir / "masks").glob("*.png"):
+            mask |= iio.imread(mask_path) > 0
+        pairs.append((_normalize(_signal(rgb, modality)), mask.astype(np.float32)))
+    return pairs
+
+
 def load_dataset(
     name: str,
     cache_dir: Path,
@@ -132,12 +208,16 @@ def load_dataset(
     if name not in DATASETS:
         raise ValueError(f"unknown dataset {name!r}; available: {sorted(DATASETS)}")
     spec = DATASETS[name]
-    slot = cache_dir / name
+    # The two BBBC038 modalities come out of one archive, so they share a slot
+    # and the pooled instance downloads it once rather than twice.
+    slot = cache_dir / spec.get("slot", name)
     archive = _download(spec["url"], slot / "images.zip")
     extracted = _extract(archive, slot / "images")
 
     if name == "dsb2018-fluo":
         pairs = _load_dsb2018(extracted)
+    elif "modality" in spec:
+        pairs = _load_bbbc038(extracted, spec["modality"])
     else:
         mask_archive = _download(spec["mask_url"], slot / "masks.zip")
         mask_root = _extract(mask_archive, slot / "masks") / "BBBC010_v1_foreground"

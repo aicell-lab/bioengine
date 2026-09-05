@@ -20,22 +20,25 @@ INSTANCES = {
     "site-a": {
         "worker": "ws-user-github|49943582/bioengine-worker-europa:bioengine-worker",
         "token_key": "HYPHA_TOKEN",
-        "kwargs": {"site_name": "site-a-europa", "datasets": ["dsb2018-fluo"], "role": "participant"},
+        "kwargs": {"site_name": "site-a-europa", "role": "participant"},
     },
     "site-b": {
         "worker": "bioimage-io/bioengine-worker-denbi-6d8d6dd6d5-zvwxn:bioengine-worker",
         "token_key": "BIOIMAGE_IO_TOKEN",
-        "kwargs": {"site_name": "site-b-denbi", "datasets": ["bbbc010-worms"], "role": "participant"},
+        "kwargs": {"site_name": "site-b-denbi", "role": "participant"},
     },
     "pooled": {
         "worker": "ws-user-github|49943582/bioengine-worker-europa:bioengine-worker",
         "token_key": "HYPHA_TOKEN",
-        "kwargs": {
-            "site_name": "pooled-oracle-europa",
-            "datasets": ["dsb2018-fluo", "bbbc010-worms"],
-            "role": "pooled-oracle",
-        },
+        "kwargs": {"site_name": "pooled-oracle-europa", "role": "pooled-oracle"},
     },
+}
+
+# caricature: two object classes, an existence proof that flatters federation.
+# acquisition: one class split by imaging modality, the honest utility bound.
+SPLITS = {
+    "caricature": ("dsb2018-fluo", "bbbc010-worms"),
+    "acquisition": ("bbbc038-fluo", "bbbc038-histo"),
 }
 
 
@@ -43,11 +46,16 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", default="0.1.0")
     parser.add_argument("--only", nargs="+", default=list(INSTANCES))
+    parser.add_argument("--split", choices=sorted(SPLITS), default="caricature")
     args = parser.parse_args()
+
+    site_a, site_b = SPLITS[args.split]
+    datasets = {"site-a": [site_a], "site-b": [site_b], "pooled": [site_a, site_b]}
 
     env = dotenv_values(REPO_ROOT / ".env")
     for name in args.only:
         spec = INSTANCES[name]
+        spec["kwargs"] = {**spec["kwargs"], "datasets": datasets[name]}
         server = await connect_to_server({"server_url": SERVER_URL, "token": env[spec["token_key"]]})
         worker = await server.get_service(spec["worker"])
         app_id = await worker.deploy_app(
