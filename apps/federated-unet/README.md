@@ -12,30 +12,78 @@ be *checked* rather than asserted.
 
 ## Design
 
-One app, deployed three times:
+One app, deployed once per participant plus once for the control. `deploy.py
+--layout` picks a named layout; `LAYOUTS` in `deploy.py` is the definition, and
+the default is `acquisition-4site`:
 
 | Instance | Where | Data | Role |
 |---|---|---|---|
-| `fedunet-site-a` | Europa worker | site A of the chosen split | participant |
-| `fedunet-site-b` | de.NBI worker, GPU node | site B of the chosen split | participant |
-| `fedunet-pooled` | Europa worker | both | pooled-oracle control |
+| `fedunet-fluo-0` | Europa worker | `bbbc038-fluo@0/3` | participant |
+| `fedunet-fluo-1` | Europa worker | `bbbc038-fluo@1/3` | participant |
+| `fedunet-fluo-2` | de.NBI worker, GPU node | `bbbc038-fluo@2/3` | participant |
+| `fedunet-histo` | de.NBI worker, GPU node | `bbbc038-histo` | participant |
+| `fedunet-pooled` | Europa worker | `bbbc038-fluo@*/3` + `bbbc038-histo` | pooled-oracle control |
 
-`deploy.py --split` picks which pair of datasets the three instances hold; see
-**Data** below.
+The two earlier two-site pairings are kept as the `caricature` and `acquisition`
+layouts so either previous run can be rebuilt unchanged.
 
-Sites A and B physically hold disjoint domains and never load the other's data.
-The pooled instance deliberately violates the premise — it holds both — and
+Participants physically hold disjoint images and never load another's data. The
+pooled instance deliberately violates the premise — it holds the union — and
 exists only to give the federated arm an upper bound to be compared against.
-Keeping it as a separate deployment rather than loading both datasets into site
-A means the two participants' transport logs stay clean.
+Keeping it as a separate deployment rather than loading everything into one
+participant means the participants' transport logs stay clean.
+
+### Dataset specs and sharding
+
+A site's data is named by a spec, not just a dataset name:
+
+| Spec | Meaning |
+|---|---|
+| `name` | the whole training pool of that dataset |
+| `name@k/n` | slice *k* of *n* disjoint slices of the training pool |
+| `name@*/n` | the union of all *n* slices — what the pooled oracle needs |
+
+Sharding exists because there are only three non-overlapping domains available
+but a consortium demonstration wants more participants than that. Without it,
+two sites asking for the same dataset receive the *same images*, and the
+federation would be duplicating one site rather than joining several.
+
+The test block is cut where an unsharded site would put it and is identical for
+every *n*, so all arms are still scored on the same held-out images and
+**shard 0 of 1 reproduces the unsharded split exactly, indices included** — the
+`split_fingerprint`s from the two-site runs are unchanged, and those numbers stay
+comparable. Each site additionally reports a `shard_fingerprint` over its *train*
+indices, and the driver refuses to start if two clients on one domain report the
+same one.
+
+### Where the instances fit
+
+Placement is a capacity decision, not a scientific one, and it is measured rather
+than assumed (`PLACEMENT` in `deploy.py`):
+
+| Worker | GPU seen by the worker | Admission mechanism | Replicas of this app |
+|---|---|---|---|
+| Europa | one RTX 3090, 24576 MB | `VRAM_MB` packing (single-machine head) | ⌊24576 / 6144⌋ = 4 |
+| de.NBI | T4, 15360 MB | GPU **fraction** (Kubernetes, no `VRAM_MB`) | ⌊1 / 0.40⌋ = 2 |
+
+Both ceilings are set by the app's declared `gpu_memory_mb = 6144`, not by what
+it uses: a replica's measured device-wide peak is about 2.5 GB. `gpu_memory_mb`
+is a scheduling declaration and not an enforced limit — nothing stops a replica
+from over-running and OOM-ing a co-tenant, which is why the declaration is left
+comfortably above the measurement. Only one of de.NBI's three T4 nodes has free
+fraction; the other two are fully booked by whole-GPU apps.
+
+**Clients that share a worker share a physical GPU.** "One client per site" is
+the framing, so this is disclosed rather than left to be inferred:
+`provenance.json` records `co_located_clients` per run.
 
 No Flower, no gRPC mesh, no persistent peer connections. A round is:
 
 1. each site runs `train(steps=S)` on its own images;
 2. each site calls `push_weights(...)` — a `torch.save` of its `state_dict`
    into a shared Hypha artifact;
-3. the driver downloads both checkpoints, computes a sample-count-weighted
-   average, uploads it as `round_rr/global.pt`;
+3. the driver downloads every participant's checkpoint, computes a
+   sample-count-weighted average, uploads it as `round_rr/global.pt`;
 4. each site calls `pull_weights(...)` and continues from the aggregate.
 
 The driver (`run_federated.py`) runs outside both clusters and never receives an
@@ -53,9 +101,9 @@ learned parameters and nothing else.
 ### Step-matched compute
 
 Every arm gets the same number of optimiser steps per model (`rounds × steps`).
-The pooled arm sees twice as many distinct images per epoch, so matching epochs
-would have handed it 2× the gradient updates and the comparison would have
-measured compute rather than data access.
+The pooled arm sees every participant's images per epoch, so matching epochs
+would have handed it a multiple of the gradient updates and the comparison would
+have measured compute rather than data access.
 
 **To lengthen a run, raise `--rounds`, not `--steps`.** `steps` is the number of
 local optimiser steps between two merges, so it *is* the FedAvg synchronisation
@@ -104,24 +152,34 @@ exploratory run cannot later be mistaken for a pre-registered one.
 ### Federated evaluation
 
 Checkpoints travel to the test data, never the reverse. Each arm's final
-checkpoint is pushed to site A and site B in turn and scored locally against
-that site's held-out test split. `metrics.json` records per-image Dice and IoU,
+checkpoint is pushed to one scoring client per domain and scored locally against
+that client's held-out test split. `metrics.json` records per-image Dice and IoU,
 not only means, so any number in it can be independently recomputed.
 
+One client per domain does the scoring, not all of them: clients sharing a domain
+hold the identical test split, so scoring on each would only repeat the same
+number under the same key. `provenance.json` records which client scored which
+domain in `scored_on`.
+
 Each dataset's split carries a `split_fingerprint` — a sha256 over the dataset
-name, split seed, dataset length and the exact test indices. All four arms and
-both sites must report the same fingerprint for a dataset, otherwise they were
-not scored on the same images and the comparison is void. The driver checks this
-before training starts.
+name, split seed, dataset length and the exact test indices. Every arm and every
+client holding a dataset must report the same fingerprint for it, otherwise they
+were not scored on the same images and the comparison is void. The driver checks
+this — and the `shard_fingerprint` disjointness — before training starts.
 
 ## Data
 
-All CC0. Two pairings are available, and `deploy.py --split` picks one:
+All CC0. `deploy.py --layout` picks which one the instances hold:
 
-| Split | Site A | Site B | What differs |
-|---|---|---|---|
-| `caricature` | `dsb2018-fluo` | `bbbc010-worms` | the object **class** |
-| `acquisition` | `bbbc038-fluo` | `bbbc038-histo` | the imaging **modality** |
+| Layout | Participants | What differs |
+|---|---|---|
+| `caricature` | `dsb2018-fluo`, `bbbc010-worms` | the object **class** |
+| `acquisition` | `bbbc038-fluo`, `bbbc038-histo` | the imaging **modality** |
+| `acquisition-4site` | `bbbc038-fluo` in three disjoint shards, `bbbc038-histo` | modality, at 3:1 representation |
+
+`dsb2018-fluo` and `bbbc038-fluo` are the **same primary source** — the BBBC038v1
+fluorescence subset, one via StarDist's repackaging — so they can never be two
+independent sites of one federation.
 
 | Dataset | Objects | Source | Licence |
 |---|---|---|---|
@@ -207,31 +265,24 @@ metrics.
 | `datasets.py` | dataset download, splits, fingerprints, licence metadata |
 | `training.py` | step-based training loop and evaluation |
 | `checkpoints.py` | artifact transport plus the audit log |
-| `run_federated.py` | the four-arm driver; runs outside the clusters |
+| `deploy.py` | the layouts, the measured placement, and the deploy calls |
+| `run_federated.py` | the driver; runs outside the clusters, reads the layout |
 
 ## Running it
 
-Deploy the three instances (`hypha_token` is required — `entry.py` reads
-`HYPHA_TOKEN` at `__init__`):
-
-```python
-await worker.deploy_app(
-    artifact_id="bioimage-io/federated-unet",
-    version="0.1.0",
-    application_id="fedunet-site-a",
-    application_kwargs={"FederatedUNetSite": {
-        "site_name": "site-a-europa",
-        "datasets": ["dsb2018-fluo"],
-    }},
-    hypha_token=BIOIMAGE_IO_TOKEN,
-)
-```
-
-Then:
+Deploy the instances of a layout (`hypha_token` is required — `entry.py` reads
+`HYPHA_TOKEN` at `__init__`; `deploy.py` passes it):
 
 ```bash
-python deploy.py --version 0.2.0 --split acquisition
-python run_federated.py --seeds 0 1 2 3 4 --rounds 60 --steps 50 --previews \
+python deploy.py --version 0.3.0 --layout acquisition-4site
+python deploy.py --version 0.3.0 --layout acquisition-4site --only fluo-2 pooled
+```
+
+Then run the driver, which reads the same layout to learn who the clients are:
+
+```bash
+python run_federated.py --layout acquisition-4site \
+    --seeds 0 1 2 3 4 --rounds 60 --steps 50 --previews \
     --pre-registration ../../../bioengine-paper/analysis/results/<design>.md
 ```
 

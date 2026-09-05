@@ -7,9 +7,9 @@ Hypha artifact. Aggregation is driven from outside by ``run_federated.py``,
 which never sees an image — it reads checkpoints, averages them, and writes the
 average back.
 
-Three instances make up a run: two sites holding disjoint domains, and a third
-"pooled" instance holding both, which is the deliberate premise violation used
-as an upper bound. The pooled instance is a control, not a participant.
+A run is N participant instances holding disjoint data, plus one "pooled"
+instance holding the union — the deliberate premise violation used as an upper
+bound. The pooled instance is a control, not a participant.
 """
 
 import asyncio
@@ -61,7 +61,9 @@ class FederatedUNetSite:
         role: str = "participant",
     ) -> None:
         self.site_name = site_name
-        # A pooled-oracle instance is handed both domains; a real site gets one.
+        # Dataset specs, not bare names: "bbbc038-fluo@1/3" is one of three
+        # disjoint slices, "@*/3" is all of them. A participant holds one slice
+        # of one domain; the pooled oracle holds every domain in full.
         self.dataset_names = list(datasets or ["dsb2018-fluo"])
         self.role = role
         self.start_time = time.time()
@@ -123,6 +125,10 @@ class FederatedUNetSite:
                     "licence": d["licence"],
                     "citation": d["citation"],
                     "split_fingerprint": d["split_fingerprint"],
+                    "shard_fingerprint": d["shard_fingerprint"],
+                    "spec": d["spec"],
+                    "shards": d["shards"],
+                    "n_shards": d["n_shards"],
                     "mean_foreground_fraction": d["mean_foreground_fraction"],
                 }
                 for name, d in self._data.items()
@@ -161,17 +167,21 @@ class FederatedUNetSite:
         from datasets import load_dataset
 
         def _work() -> Dict[str, Any]:
-            return {
-                name: load_dataset(
-                    name,
+            loaded = {}
+            for spec in self.dataset_names:
+                data = load_dataset(
+                    spec,
                     cache_dir=self._cache_dir,
                     n_train=n_train,
                     n_val=n_val,
                     n_test=n_test,
                     split_seed=split_seed,
                 )
-                for name in self.dataset_names
-            }
+                # Keyed by the bare dataset name, not the spec: a site holds at
+                # most one slice of a domain, and every arm has to report the
+                # same key for the domain it is scored on.
+                loaded[data["name"]] = data
+            return loaded
 
         async with self._lock:
             loop = asyncio.get_running_loop()

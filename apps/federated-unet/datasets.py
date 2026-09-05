@@ -190,8 +190,31 @@ def _load_bbbc038(root: Path, modality: str) -> List[Tuple[np.ndarray, np.ndarra
     return pairs
 
 
+def parse_spec(spec: str) -> Tuple[str, List[int], int]:
+    """Read a dataset spec: ``name``, ``name@k/n`` or ``name@*/n``.
+
+    ``@k/n`` gives a site one of n disjoint slices of the training pool, so two
+    sites can hold the same domain without holding the same images. ``@*/n`` is
+    the union of all n, which is what the pooled oracle needs to remain an upper
+    bound once a domain is spread over several sites.
+    """
+    name, _, shard_part = spec.partition("@")
+    if not shard_part:
+        return name, [0], 1
+    which, _, total = shard_part.partition("/")
+    n_shards = int(total)
+    if n_shards < 1:
+        raise ValueError(f"{spec!r}: shard count must be >= 1")
+    if which == "*":
+        return name, list(range(n_shards)), n_shards
+    index = int(which)
+    if not 0 <= index < n_shards:
+        raise ValueError(f"{spec!r}: shard {index} is outside 0..{n_shards - 1}")
+    return name, [index], n_shards
+
+
 def load_dataset(
-    name: str,
+    dataset_spec: str,
     cache_dir: Path,
     n_train: int = 55,
     n_val: int = 15,
@@ -203,8 +226,12 @@ def load_dataset(
     The test split is the held-out set every arm of the experiment is scored on,
     so it is cut once from a fixed permutation that does not depend on the
     training seed — otherwise the four arms would not share a test set and the
-    comparison between them would be meaningless.
+    comparison between them would be meaningless. It is cut from a position that
+    does not move with the shard count either, so a run that spreads a domain
+    over several sites is still scored on exactly the images an earlier two-site
+    run was scored on.
     """
+    name, shards, n_shards = parse_spec(dataset_spec)
     if name not in DATASETS:
         raise ValueError(f"unknown dataset {name!r}; available: {sorted(DATASETS)}")
     spec = DATASETS[name]
@@ -225,21 +252,30 @@ def load_dataset(
 
     if not pairs:
         raise RuntimeError(f"dataset {name!r} extracted but no image/mask pairs were found")
-    if len(pairs) < n_train + n_val + n_test:
+    block = n_train + n_val
+    if len(pairs) < n_test + n_shards * block:
         raise RuntimeError(
-            f"dataset {name!r} has {len(pairs)} pairs, too few for "
-            f"n_train={n_train} + n_val={n_val} + n_test={n_test}"
+            f"dataset {name!r} has {len(pairs)} pairs, too few for {n_shards} disjoint "
+            f"site(s) of n_train={n_train} + n_val={n_val} plus n_test={n_test}"
         )
 
     order = np.random.default_rng(split_seed).permutation(len(pairs))
+    # The test block sits where a single unsharded site would put it, and the
+    # per-site blocks are cut from what is left. Shard 0 of 1 therefore
+    # reproduces the unsharded split exactly, indices included.
+    test_idx = order[block : block + n_test]
+    rest = np.concatenate([order[:block], order[block + n_test :]])
     cuts = {
-        "train": order[:n_train],
-        "val": order[n_train : n_train + n_val],
-        "test": order[n_train + n_val : n_train + n_val + n_test],
+        "train": np.concatenate([rest[k * block : k * block + n_train] for k in shards]),
+        "val": np.concatenate([rest[k * block + n_train : (k + 1) * block] for k in shards]),
+        "test": test_idx,
     }
     splits = {k: [pairs[i] for i in idx] for k, idx in cuts.items()}
     return {
         "name": name,
+        "spec": dataset_spec,
+        "shards": shards,
+        "n_shards": n_shards,
         **splits,
         "n_available": len(pairs),
         "objects": spec["objects"],
@@ -253,6 +289,14 @@ def load_dataset(
             (
                 f"{name}|{split_seed}|{len(pairs)}|"
                 + ",".join(str(int(i)) for i in cuts["test"])
+            ).encode("utf-8")
+        ).hexdigest()[:16],
+        # Two sites on the same domain must not hold the same images; comparing
+        # these across sites is how that is checked rather than assumed.
+        "shard_fingerprint": hashlib.sha256(
+            (
+                f"{name}|{split_seed}|{len(pairs)}|"
+                + ",".join(str(int(i)) for i in cuts["train"])
             ).encode("utf-8")
         ).hexdigest()[:16],
     }

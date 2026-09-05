@@ -1,21 +1,20 @@
-"""Drive a four-arm federated segmentation experiment across two BioEngine sites.
+"""Drive a federated segmentation experiment across N BioEngine clients.
 
-The four arms all consume the same number of optimiser steps, so the comparison
+Every arm consumes the same number of optimiser steps, so the comparison
 measures federation rather than compute:
 
-  site-a-only   trained only on site A's images
-  site-b-only   trained only on site B's images
-  fedavg        R rounds of local training, sample-count-weighted state_dict average
-  pooled        a third instance holding both datasets — the deliberate premise
-                violation, used as the upper bound
+  <client>-only  trained only on that client's images, one arm per client
+  fedavg         R rounds of local training, sample-count-weighted state_dict average
+  pooled         an extra instance holding every client's data — the deliberate
+                 premise violation, used as the upper bound
 
-Every arm is scored the same way: the checkpoint is pushed to each site and
-evaluated there against that site's held-out test split. Test images never move.
-This process never receives an image; it reads checkpoints, averages them, and
-writes the average back.
+Every arm is scored the same way: the checkpoint is pushed to each client and
+evaluated there against that client's held-out test split. Test images never
+move. This process never receives an image; it reads checkpoints, averages them,
+and writes the average back.
 
 Usage:
-    python run_federated.py --seeds 0 --rounds 10 --steps 50 --out <dir>
+    python run_federated.py --layout acquisition-4site --seeds 0 --rounds 10 --steps 50
 """
 
 import argparse
@@ -37,32 +36,28 @@ from hypha_rpc import connect_to_server
 
 sys.path.insert(0, str(Path(__file__).parent))
 from checkpoints import CheckpointStore, TransportLog, ensure_run_artifact  # noqa: E402
+# The layout is the single definition of who holds what and where; importing it
+# rather than restating it is what stops the driver and the deployer drifting.
+from deploy import LAYOUTS, WORKERS, instances  # noqa: E402
 from unet import fedavg, signature  # noqa: E402
 from workers import resolve_worker  # noqa: E402
 
 SERVER_URL = "https://hypha.aicell.io"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-SITES = {
-    "site-a": {
-        "worker": "ws-user-github|49943582/bioengine-worker-europa",
-        "application_id": "fedunet-site-a",
-        "token_key": "HYPHA_TOKEN",
-        "description": "Europa single-machine worker, Stockholm",
-    },
-    "site-b": {
-        "worker": "bioimage-io/bioengine-worker-denbi",
-        "application_id": "fedunet-site-b",
-        "token_key": "BIOIMAGE_IO_TOKEN",
-        "description": "de.NBI cloud worker, last free GPU node",
-    },
-    "pooled": {
-        "worker": "ws-user-github|49943582/bioengine-worker-europa",
-        "application_id": "fedunet-pooled",
-        "token_key": "HYPHA_TOKEN",
-        "description": "Pooled-oracle control on Europa; holds both domains",
-    },
-}
+
+def build_sites(layout_name: str) -> Dict[str, Dict[str, Any]]:
+    return {
+        name: {
+            "worker": worker,
+            "application_id": f"fedunet-{name}",
+            "token_key": WORKERS[worker]["token_key"],
+            "description": WORKERS[worker]["description"],
+            "role": role,
+            "datasets": datasets,
+        }
+        for name, (worker, datasets, role) in instances(layout_name).items()
+    }
 
 
 async def resolve(server, worker_prefix: str, application_id: str):
@@ -212,6 +207,7 @@ def resolve_pre_registration(path: str) -> dict:
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--layout", choices=sorted(LAYOUTS), default="acquisition-4site")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--steps", type=int, default=50, help="Optimiser steps per round per site")
@@ -228,6 +224,10 @@ async def main() -> None:
     args = parser.parse_args()
 
     pre_registration = resolve_pre_registration(args.pre_registration)
+
+    sites = build_sites(args.layout)
+    clients = [name for name, spec in sites.items() if spec["role"] == "participant"]
+    print(f"layout {args.layout}: {len(clients)} clients {clients} + pooled oracle", flush=True)
 
     env = dotenv_values(REPO_ROOT / ".env")
     out_dir = Path(args.out or (REPO_ROOT.parent / "bioengine-paper" / "analysis" / "results" / f"federated-unet-{args.run_id}"))
@@ -249,7 +249,7 @@ async def main() -> None:
     print(f"run artifact: {run_artifact_id}", flush=True)
 
     servers, apps, app_records = {}, {}, {}
-    for name, spec in SITES.items():
+    for name, spec in sites.items():
         servers[name] = await connect_to_server({"server_url": SERVER_URL, "token": env[spec["token_key"]]})
         apps[name], app_records[name] = await resolve(servers[name], spec["worker"], spec["application_id"])
         print(f"{name}: resolved {spec['application_id']}", flush=True)
@@ -261,17 +261,34 @@ async def main() -> None:
             print(f"{name}: {[(k, v['n_train'], v['n_val'], v['n_test']) for k, v in loaded.items()]}", flush=True)
             site_status[name] = await app.get_status()
 
-    fingerprints = {
-        name: {k: v["split_fingerprint"] for k, v in status["datasets_loaded"].items()}
-        for name, status in site_status.items()
+    loaded = {name: status["datasets_loaded"] for name, status in site_status.items()}
+    holders = {
+        dataset: [name for name in clients if dataset in loaded[name]]
+        for dataset in loaded["pooled"]
     }
-    for dataset in set(fingerprints["pooled"]):
-        site = "site-a" if dataset in fingerprints["site-a"] else "site-b"
-        if fingerprints["pooled"][dataset] != fingerprints[site][dataset]:
+    for dataset, names in holders.items():
+        if not names:
+            raise RuntimeError(f"pooled holds {dataset} but no client does")
+        for name in names:
+            if loaded[name][dataset]["split_fingerprint"] != loaded["pooled"][dataset]["split_fingerprint"]:
+                raise RuntimeError(
+                    f"pooled control and {name} disagree on the {dataset} split — "
+                    "the arms would not share a test set"
+                )
+        # Clients on the same domain must hold disjoint images, or the
+        # federation is duplicating one site rather than joining several.
+        shards = [loaded[name][dataset]["shard_fingerprint"] for name in names]
+        if len(set(shards)) != len(shards):
             raise RuntimeError(
-                f"pooled control and {site} disagree on the {dataset} split — "
-                "the arms would not share a test set"
+                f"clients {names} report the same {dataset} training shard — "
+                "they hold the same images"
             )
+
+    # One client per domain does the scoring: with a domain spread over several
+    # clients they all hold the identical test split, so scoring on each would
+    # only repeat the same number under the same key.
+    eval_sites = {dataset: names[0] for dataset, names in holders.items()}
+    print(f"scoring each domain on: {eval_sites}", flush=True)
 
     results: Dict[str, Any] = {}
     for seed in args.seeds:
@@ -279,12 +296,13 @@ async def main() -> None:
         prefix = f"seed_{seed}"
 
         # One common starting point, distributed rather than re-derived, so the
-        # transport log shows all three instances loading the same digest.
-        init = await apps["site-a"].init_model(seed=seed)
-        init_entry = await apps["site-a"].push_weights(
+        # transport log shows every instance loading the same digest.
+        origin = clients[0]
+        init = await apps[origin].init_model(seed=seed)
+        init_entry = await apps[origin].push_weights(
             run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt", note="common initialisation"
         )
-        for name in ("site-b", "pooled"):
+        for name in (n for n in sites if n != origin):
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
         print(f"init: {init['n_parameters']} params, sha256 {init_entry['sha256'][:12]}", flush=True)
 
@@ -295,12 +313,16 @@ async def main() -> None:
         round_records = []
         for r in range(args.rounds):
             local = await asyncio.gather(
-                apps["site-a"].train(steps=args.steps, lr=args.lr, seed=seed * 1000 + r, tag=f"fedavg/r{r:02d}"),
-                apps["site-b"].train(steps=args.steps, lr=args.lr, seed=seed * 1000 + r, tag=f"fedavg/r{r:02d}"),
+                *(
+                    apps[name].train(
+                        steps=args.steps, lr=args.lr, seed=seed * 1000 + r, tag=f"fedavg/r{r:02d}"
+                    )
+                    for name in clients
+                )
             )
             state_dicts, counts = [], []
-            for name, site_key in (("site-a", "a"), ("site-b", "b")):
-                path = f"{prefix}/round_{r:02d}/site-{site_key}.pt"
+            for name in clients:
+                path = f"{prefix}/round_{r:02d}/{name}.pt"
                 push = await apps[name].push_weights(
                     run_artifact_id=run_artifact_id, path=path, note=f"fedavg round {r}"
                 )
@@ -309,14 +331,14 @@ async def main() -> None:
             merged = fedavg(state_dicts, counts)
             global_path = f"{prefix}/round_{r:02d}/global.pt"
             await store.put(global_path, dump_state_dict(merged), note=f"fedavg round {r} aggregate")
-            for name in ("site-a", "site-b"):
+            for name in clients:
                 await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
             # Scored after the merge and pull, so this is the aggregate's curve.
-            merged_val = await val_dice(apps, ("site-a", "site-b"))
+            merged_val = await val_dice(apps, sorted(set(eval_sites.values())))
             round_records.append(
                 {
                     "round": r,
-                    "merge_weights": counts,
+                    "merge_weights": dict(zip(clients, counts)),
                     "local": [{k: v for k, v in item.items() if k != "loss_curve"} for item in local],
                     "val_dice": merged_val,
                     "global_sha256": driver_log.dump()["entries"][-1]["sha256"],
@@ -327,7 +349,7 @@ async def main() -> None:
                 f"val {[round(v, 4) for v in merged_val.values()]}",
                 flush=True,
             )
-        await apps["site-a"].push_weights(
+        await apps[origin].push_weights(
             run_artifact_id=run_artifact_id, path=f"{prefix}/arms/fedavg.pt", note="final fedavg aggregate"
         )
         fedavg_curve = [float(np.mean(list(rec["val_dice"].values()))) for rec in round_records]
@@ -347,7 +369,8 @@ async def main() -> None:
         }
 
         # --- Arms: single-site and pooled ----------------------------------
-        for arm, instance in (("site-a-only", "site-a"), ("site-b-only", "site-b"), ("pooled", "pooled")):
+        single_site_arms = [(f"{name}-only", name) for name in clients]
+        for arm, instance in single_site_arms + [("pooled", "pooled")]:
             started = time.time()
             await apps[instance].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
             history = await train_arm(
@@ -381,7 +404,7 @@ async def main() -> None:
         # --- Evaluation: every arm, on both sites' held-out test splits -----
         for arm, record in arms.items():
             record["evaluation"] = {}
-            for name in ("site-a", "site-b"):
+            for name in sorted(set(eval_sites.values())):
                 await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=record["checkpoint"])
                 record["evaluation"][name] = await apps[name].evaluate(split="test")
             summary = {
@@ -397,8 +420,8 @@ async def main() -> None:
         (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
 
         if args.previews:
-            for name in ("site-a", "site-b"):
-                for arm in ("site-a-only", "site-b-only", "fedavg", "pooled"):
+            for name in sorted(set(eval_sites.values())):
+                for arm in arms:
                     await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=arms[arm]["checkpoint"])
                     status = await apps[name].get_status()
                     for dataset in status["datasets_loaded"]:
@@ -416,8 +439,8 @@ async def main() -> None:
         "git_commit": subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True
         ).stdout.strip(),
-        "app_artifact": app_records["site-a"].get("artifact_id"),
-        "app_version": app_records["site-a"].get("version"),
+        "app_artifact": app_records[clients[0]].get("artifact_id"),
+        "app_version": app_records[clients[0]].get("version"),
         "run_artifact_id": run_artifact_id,
         "aggregation_rule": "sample-count-weighted FedAvg over the full state_dict",
         "normalisation": "GroupNorm (no running statistics, so the merge averages weights only)",
@@ -432,15 +455,27 @@ async def main() -> None:
             "batch_size": 8,
             "crop": 256,
         },
+        "layout": args.layout,
+        "clients": clients,
+        "scored_on": eval_sites,
+        # "one client per site" is the framing, so clients that share a worker
+        # share a physical GPU and are not independent sites in any hardware
+        # sense. Disclosed here rather than left to be inferred from the table.
+        "co_located_clients": {
+            worker: [n for n in clients if sites[n]["worker"] == worker]
+            for worker in {sites[n]["worker"] for n in clients}
+        },
         "sites": {
             name: {
-                "description": SITES[name]["description"],
-                "worker_service_id": SITES[name]["worker"],
-                "application_id": SITES[name]["application_id"],
+                "description": sites[name]["description"],
+                "worker_service_id": sites[name]["worker"],
+                "application_id": sites[name]["application_id"],
+                "role": sites[name]["role"],
+                "dataset_specs": sites[name]["datasets"],
                 "status": site_status[name],
                 "app_record": {k: v for k, v in app_records[name].items() if k != "deployments"},
             }
-            for name in SITES
+            for name in sites
         },
         "architecture_signature": signature(
             load_state_dict(await store.get(f"seed_{args.seeds[0]}/init.pt"))
