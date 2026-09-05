@@ -6,9 +6,10 @@ async def resolve_worker(server, prefix: str):
 
     Kubernetes bakes the pod name into the service id, so a hardcoded id goes
     stale the moment the worker pod is replaced -- which has already happened
-    twice here, on de.NBI. Fail loudly rather than pick one if the prefix is
-    ambiguous: two workers in a workspace would silently split the run across
-    two clusters.
+    three times here, on de.NBI. During a rolling replacement both pods are
+    registered at once and they front the *same* Ray cluster, so the match is
+    ambiguous but harmless; two pods on different clusters would silently split
+    the run and must not be. The head address is what tells the two cases apart.
     """
     workspace = prefix.split("/", 1)[0]
     matches = [
@@ -16,6 +17,12 @@ async def resolve_worker(server, prefix: str):
         for service in await server.list_services(workspace)
         if service["id"].startswith(prefix) and service["id"].endswith(":bioengine-worker")
     ]
-    if len(matches) != 1:
-        raise RuntimeError(f"expected exactly one worker matching {prefix!r}, got {matches}")
-    return await server.get_service(matches[0])
+    if not matches:
+        raise RuntimeError(f"no worker matching {prefix!r}")
+    workers = [await server.get_service(match) for match in matches]
+    heads = {(await worker.get_status())["ray_cluster"]["head_address"] for worker in workers}
+    if len(heads) != 1:
+        raise RuntimeError(
+            f"{prefix!r} matches workers on different Ray clusters {heads}: {matches}"
+        )
+    return workers[0]

@@ -43,7 +43,12 @@ def _read_pip(name: str) -> List[str]:
 @bioengine.app(
     num_cpus=2,
     gpu_memory_mb=6144,
-    memory_mb=12 * 1024,
+    # Host RAM, not VRAM, is what bounds how many replicas a single-machine
+    # worker admits: Europa has 30 GiB of Ray memory against one 24 GB GPU, so
+    # 12 GiB per replica capped it at two. A replica's real footprint is 0.65 GiB
+    # idle and about 1 GiB more with a whole dataset resident — every image is
+    # float32 at native resolution and the largest pool is ~650 of them.
+    memory_mb=8 * 1024,
     pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=4,
     autoscaling_config={"min_replicas": 1, "initial_replicas": 1, "max_replicas": 1},

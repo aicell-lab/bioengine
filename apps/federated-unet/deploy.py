@@ -1,6 +1,6 @@
 """Deploy or redeploy the instances of one federation layout.
 
-    python deploy.py --version 0.3.0 --layout acquisition-4site [--only fluo-0 pooled]
+    python deploy.py --version 0.3.1 --layout acquisition-4site [--only fluo-0 pooled]
 
 A layout names the clients, what each one holds, and which cluster it lands on.
 Placement is a capacity decision rather than a scientific one — see PLACEMENT —
@@ -33,13 +33,15 @@ WORKERS = {
 }
 
 #: How many replicas of this app each worker admits, measured rather than
-#: assumed. Europa's worker sees one 24576 MB RTX 3090 and advertises it as a
-#: VRAM_MB resource, so it packs by declared memory: floor(24576 / 6144) = 4.
-#: de.NBI is a Kubernetes cluster with no VRAM_MB, so the worker falls back to a
-#: GPU fraction of 6144 / 15360 = 0.40 per replica, and only one of its three
-#: T4 nodes has free fraction: floor(1 / 0.40) = 2. A replica's measured peak is
-#: about 2.5 GB, so both ceilings are set by the declaration, not by the app.
-PLACEMENT = {EUROPA: 4, DENBI: 2}
+#: assumed. On Europa the binding resource is host RAM, not the GPU: the worker
+#: sees one 24576 MB RTX 3090 and advertises it as VRAM_MB, which would allow
+#: floor(24576 / 6144) = 4, but its Ray cluster has 30 GiB of memory shared with
+#: other apps, so floor(30 / 8) = 3 replicas is the real ceiling. de.NBI is a
+#: Kubernetes cluster with no VRAM_MB, so the worker falls back to a GPU fraction
+#: of 6144 / 15360 = 0.40 per replica, and only one of its three T4 nodes has
+#: free fraction: floor(1 / 0.40) = 2. Both ceilings are set by the declarations,
+#: not by the app — a replica measures 0.65 GiB of RAM and ~2.5 GB of VRAM.
+PLACEMENT = {EUROPA: 3, DENBI: 2}
 
 LAYOUTS = {
     # Two modalities out of BBBC038, with the fluorescence pool cut into three
@@ -88,14 +90,14 @@ def instances(layout_name: str):
         if placed > capacity:
             raise SystemExit(
                 f"layout {layout_name!r} puts {placed} instances on {worker} which "
-                f"admits {capacity} at the app's declared gpu_memory_mb"
+                f"admits {capacity} at the app's declared resources"
             )
     return expanded
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="0.3.0")
+    parser.add_argument("--version", default="0.3.1")
     parser.add_argument("--layout", choices=sorted(LAYOUTS), default="acquisition-4site")
     parser.add_argument("--only", nargs="+", default=None)
     args = parser.parse_args()

@@ -61,17 +61,21 @@ same one.
 Placement is a capacity decision, not a scientific one, and it is measured rather
 than assumed (`PLACEMENT` in `deploy.py`):
 
-| Worker | GPU seen by the worker | Admission mechanism | Replicas of this app |
+| Worker | Admission mechanism | Binding resource | Replicas of this app |
 |---|---|---|---|
-| Europa | one RTX 3090, 24576 MB | `VRAM_MB` packing (single-machine head) | ⌊24576 / 6144⌋ = 4 |
-| de.NBI | T4, 15360 MB | GPU **fraction** (Kubernetes, no `VRAM_MB`) | ⌊1 / 0.40⌋ = 2 |
+| Europa | `VRAM_MB` packing (single-machine head) | host RAM, 30 GiB | ⌊30 / 8⌋ = 3 |
+| de.NBI | GPU **fraction** (Kubernetes, no `VRAM_MB`) | GPU fraction, 0.40 each | ⌊1 / 0.40⌋ = 2 |
 
-Both ceilings are set by the app's declared `gpu_memory_mb = 6144`, not by what
-it uses: a replica's measured device-wide peak is about 2.5 GB. `gpu_memory_mb`
-is a scheduling declaration and not an enforced limit — nothing stops a replica
-from over-running and OOM-ing a co-tenant, which is why the declaration is left
-comfortably above the measurement. Only one of de.NBI's three T4 nodes has free
-fraction; the other two are fully booked by whole-GPU apps.
+On Europa the GPU is *not* what runs out: `VRAM_MB` packing would allow
+⌊24576 / 6144⌋ = 4, but the Ray cluster's 30 GiB of memory is shared with other
+apps and `memory_mb` is what caps it. Only one of de.NBI's three T4 nodes has
+free GPU fraction; the other two are fully booked by whole-GPU apps.
+
+Both ceilings are set by the declarations, not by what the app uses: a replica
+measures 0.65 GiB of RAM and about 2.5 GB of device-wide VRAM. Neither
+`gpu_memory_mb` nor `memory_mb` is an enforced limit — nothing stops a replica
+from over-running and OOM-ing a co-tenant — which is why both are left
+comfortably above the measurement rather than trimmed to it.
 
 **Clients that share a worker share a physical GPU.** "One client per site" is
 the framing, so this is disclosed rather than left to be inferred:
@@ -274,8 +278,8 @@ Deploy the instances of a layout (`hypha_token` is required — `entry.py` reads
 `HYPHA_TOKEN` at `__init__`; `deploy.py` passes it):
 
 ```bash
-python deploy.py --version 0.3.0 --layout acquisition-4site
-python deploy.py --version 0.3.0 --layout acquisition-4site --only fluo-2 pooled
+python deploy.py --version 0.3.1 --layout acquisition-4site
+python deploy.py --version 0.3.1 --layout acquisition-4site --only fluo-2 pooled
 ```
 
 Then run the driver, which reads the same layout to learn who the clients are:
