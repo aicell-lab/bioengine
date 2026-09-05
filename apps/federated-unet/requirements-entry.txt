@@ -4,5 +4,7 @@ torch==2.7.1
 numpy==1.26.4
 imageio>=2.37.0
 tifffile
+# CellBinDB's TIFFs are LZW-compressed and tifffile refuses those without it.
+imagecodecs
 Pillow
 httpx
