@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
 import torch
 from dotenv import dotenv_values
 from hypha_rpc import connect_to_server
@@ -84,11 +85,51 @@ def dump_state_dict(state_dict: Dict[str, torch.Tensor]) -> bytes:
     return buffer.getvalue()
 
 
-async def train_arm(app, rounds: int, steps: int, lr: float, seed: int, tag: str) -> List[Dict]:
-    """Run rounds x steps of purely local training on one instance."""
+CONVERGENCE = {
+    "metric": "mean validation Dice over the datasets the arm trains on",
+    "window": 5,
+    "tolerance": 0.005,
+    "rule": (
+        "An arm is converged at round r if no round in (r, r+window] exceeds the "
+        "best validation Dice seen up to and including r by more than tolerance. "
+        "The converged round reported is the smallest such r; an arm counts as "
+        "having converged within the run only if r + window <= last round."
+    ),
+}
+
+
+def convergence_round(curve: List[float], window: int = 5, tolerance: float = 0.005):
+    """First round after which `window` further rounds buy less than `tolerance`.
+
+    Pre-registered before the run; see CONVERGENCE. Returns None if the arm was
+    still improving at the end, which is the outcome that would say the step
+    budget was too short.
+    """
+    for r in range(window - 1, len(curve) - window):
+        best = max(curve[: r + 1])
+        if all(value <= best + tolerance for value in curve[r + 1 : r + 1 + window]):
+            return r
+    return None
+
+
+async def val_dice(apps, names) -> Dict[str, float]:
+    """Mean validation Dice per dataset, across one or more instances."""
+    scores: Dict[str, float] = {}
+    for name in names:
+        for dataset, result in (await apps[name].evaluate(split="val")).items():
+            scores[dataset] = float(result["dice_mean"])
+    return scores
+
+
+async def train_arm(
+    app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str
+) -> List[Dict]:
+    """Run rounds x steps of purely local training, scoring validation each round."""
     history = []
     for r in range(rounds):
-        history.append(await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}"))
+        record = await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}")
+        record["val_dice"] = await val_dice(apps, [instance])
+        history.append(record)
     return history
 
 
@@ -186,21 +227,33 @@ async def main() -> None:
             await store.put(global_path, dump_state_dict(merged), note=f"fedavg round {r} aggregate")
             for name in ("site-a", "site-b"):
                 await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
+            # Scored after the merge and pull, so this is the aggregate's curve.
+            merged_val = await val_dice(apps, ("site-a", "site-b"))
             round_records.append(
                 {
                     "round": r,
                     "merge_weights": counts,
                     "local": [{k: v for k, v in item.items() if k != "loss_curve"} for item in local],
+                    "val_dice": merged_val,
                     "global_sha256": driver_log.dump()["entries"][-1]["sha256"],
                 }
             )
-            print(f"  fedavg r{r:02d} loss {[round(x['loss_last'], 4) for x in local]}", flush=True)
+            print(
+                f"  fedavg r{r:02d} loss {[round(x['loss_last'], 4) for x in local]} "
+                f"val {[round(v, 4) for v in merged_val.values()]}",
+                flush=True,
+            )
         await apps["site-a"].push_weights(
             run_artifact_id=run_artifact_id, path=f"{prefix}/arms/fedavg.pt", note="final fedavg aggregate"
         )
+        fedavg_curve = [float(np.mean(list(rec["val_dice"].values()))) for rec in round_records]
         arms["fedavg"] = {
             "checkpoint": f"{prefix}/arms/fedavg.pt",
             "rounds": round_records,
+            "val_curve": fedavg_curve,
+            "convergence_round": convergence_round(
+                fedavg_curve, CONVERGENCE["window"], CONVERGENCE["tolerance"]
+            ),
             "wall_time_s": time.time() - started,
             "total_steps_per_model": args.rounds * args.steps,
         }
@@ -209,17 +262,29 @@ async def main() -> None:
         for arm, instance in (("site-a-only", "site-a"), ("site-b-only", "site-b"), ("pooled", "pooled")):
             started = time.time()
             await apps[instance].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
-            history = await train_arm(apps[instance], args.rounds, args.steps, args.lr, seed, arm)
+            history = await train_arm(
+                apps[instance], apps, instance, args.rounds, args.steps, args.lr, seed, arm
+            )
             await apps[instance].push_weights(
                 run_artifact_id=run_artifact_id, path=f"{prefix}/arms/{arm}.pt", note=f"{arm} final"
             )
+            curve = [float(np.mean(list(h["val_dice"].values()))) for h in history]
             arms[arm] = {
                 "checkpoint": f"{prefix}/arms/{arm}.pt",
                 "history": [{k: v for k, v in h.items() if k != "loss_curve"} for h in history],
+                "val_curve": curve,
+                "convergence_round": convergence_round(
+                    curve, CONVERGENCE["window"], CONVERGENCE["tolerance"]
+                ),
                 "wall_time_s": time.time() - started,
                 "total_steps_per_model": args.rounds * args.steps,
             }
-            print(f"  {arm}: loss {history[0]['loss_first']:.4f} -> {history[-1]['loss_last']:.4f}", flush=True)
+            print(
+                f"  {arm}: loss {history[0]['loss_first']:.4f} -> {history[-1]['loss_last']:.4f}, "
+                f"val {curve[0]:.4f} -> {curve[-1]:.4f}, converged at round "
+                f"{arms[arm]['convergence_round']}",
+                flush=True,
+            )
 
         # --- Evaluation: every arm, on both sites' held-out test splits -----
         for arm, record in arms.items():
@@ -261,6 +326,7 @@ async def main() -> None:
         "run_artifact_id": run_artifact_id,
         "aggregation_rule": "sample-count-weighted FedAvg over the full state_dict",
         "normalisation": "GroupNorm (no running statistics, so the merge averages weights only)",
+        "convergence_criterion": CONVERGENCE,
         "config": {
             "seeds": args.seeds,
             "rounds": args.rounds,

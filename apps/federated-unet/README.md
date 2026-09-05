@@ -54,6 +54,25 @@ The pooled arm sees twice as many distinct images per epoch, so matching epochs
 would have handed it 2× the gradient updates and the comparison would have
 measured compute rather than data access.
 
+**To lengthen a run, raise `--rounds`, not `--steps`.** `steps` is the number of
+local optimiser steps between two merges, so it *is* the FedAvg synchronisation
+frequency: doubling it to buy a longer run would silently double the local drift
+the aggregate has to reconcile, changing the federated algorithm under the label
+"train longer". Raising `rounds` leaves the merge cadence untouched and only
+extends the run, which keeps a longer run comparable to a shorter one.
+
+### Convergence criterion
+
+Validation Dice is scored after every round on each arm's own val split — for
+the federated arm after the merge and pull, so the curve belongs to the
+aggregate rather than to either local model. An arm is converged at round `r` if
+no round in `(r, r+5]` beats the best value seen up to and including `r` by more
+than 0.005 absolute; the reported round is the smallest such `r`, and an arm
+only counts as converged within the run if `r+5` fits inside it. `None` means
+the arm was still improving at the end — that is, the step budget was too short.
+The rule lives in `CONVERGENCE` in `run_federated.py` and is copied verbatim
+into each run's `provenance.json`, so it is fixed before the numbers exist.
+
 ### Federated evaluation
 
 Checkpoints travel to the test data, never the reverse. Each arm's final
