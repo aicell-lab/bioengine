@@ -190,7 +190,8 @@ def resolve_pre_registration(path: str) -> dict:
     than the one the run was designed against.
     """
     if path is None:
-        return {}
+        print("WARNING: no --pre-registration; this run's results are exploratory", flush=True)
+        return {"declared": False}
     design = Path(path).resolve()
     repo = design.parent
     def git(*cmd):
@@ -201,6 +202,7 @@ def resolve_pre_registration(path: str) -> dict:
     if not commit:
         raise SystemExit(f"{design} is not committed; commit the predictions before training")
     return {
+        "declared": True,
         "file": design.name,
         "commit": commit,
         "committed_at": git("log", "-1", "--format=%cI", "--", str(design)),

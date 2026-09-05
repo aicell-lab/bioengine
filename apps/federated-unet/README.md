@@ -97,6 +97,10 @@ has unstaged edits**. A prediction stated in a message is a promise; a committed
 hash is evidence, and the guard is what stops the recorded hash from describing
 a different document than the one the run was designed against.
 
+Omitting the flag is allowed but not silent: the driver warns, and
+`provenance.json` records `"pre_registration": {"declared": false}` so an
+exploratory run cannot later be mistaken for a pre-registered one.
+
 ### Federated evaluation
 
 Checkpoints travel to the test data, never the reverse. Each arm's final
