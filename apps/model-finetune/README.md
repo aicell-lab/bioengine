@@ -118,22 +118,33 @@ backbone — `cpsam` (SAM ViT-L), `cpdino` (DINOv3 ViT-L), `cpdino-vitb` (DINOv3
 ViT-B) — and share the same training/serve/export path; a fine-tuned checkpoint
 self-identifies its backbone, so serving is identical.
 
-**Hardware requirements (model gating).** Fine-tuning is gated on detected GPU
-VRAM: the runtime reads its card's total memory and each model carries a minimum
-(`training.MODEL_TRAIN_VRAM_MB`). `get_training_capabilities()` reports, per
-model, whether it fits the hardware, and `start_training` rejects an unfit model
-immediately rather than OOMing mid-run. The gate is **on/off per model** at the
-smallest viable config — it does not cap `n_objects_per_batch`, which stays your
-lever to fit a model that does qualify (lower it on small GPUs). On our 16 GB
+**Hardware requirements (model gating).** Fine-tuning is gated on GPU VRAM: each
+model carries a minimum (`training.MODEL_TRAIN_VRAM_MB`). `get_training_capabilities()`
+reports, per model, whether it fits the hardware, and `start_training` rejects an
+unfit model immediately rather than OOMing mid-run. The gate is **on/off per model**
+at the smallest viable config — it does not cap `n_objects_per_batch`, which stays
+your lever to fit a model that does qualify (lower it on small GPUs). On our 16 GB
 clusters (deNBI T4, KTH A40-16C slices) `vit_b`/`vit_t`, `cpsam`, `cpdino*` train
 fine, while **`vit_l`/`vit_h` are inference-only** — full-encoder ViT-L
 fine-tuning needs >16 GB (an A100/A40), though ViT-L *inference* runs on 16 GB.
 
-- **`get_training_capabilities()`** → `{gpus: {microsam, cellpose}, models: [{model_type, backend, min_gpu_memory_mb, trainable, reason, family, size}, ...], parameters: [{name, applies_to, type, default, min, max, description}, ...]}`.
+`get_training_capabilities()` answers the VRAM question **CPU-side** so it never
+wakes a GPU. On a SLURM-autoscaled worker (where a live probe would trigger a cold
+GPU allocation and time out the call) deploy the entry with a declared VRAM number:
+`deploy_app(..., application_kwargs={"EntryApp": {"declared_gpu_memory_mb": 40960}})`,
+matching the launch flavour and assuming one GPU per worker. Capabilities then report
+`source: "declared"`; with no declaration they fall back to a live runtime probe
+(`source: "detected"`), the default on a warm cluster. Either way `start_training`
+enforces against the **real** detected VRAM, so a wrong declaration fails fast at
+launch instead of OOMing mid-train.
+
+- **`get_training_capabilities()`** → `{gpus: {microsam, cellpose}, models: [{model_type, backend, min_gpu_memory_mb, trainable, reason, family, size, source}, ...], parameters: [{name, applies_to, type, default, min, max, description}, ...]}`.
   Which models the worker's GPU(s) can fine-tune, so a UI can offer every model
-  and grey out the unfit ones. `trainable` is `false` when the detected total
-  VRAM is below the model's minimum (e.g. `vit_l`/`vit_h` on a 16 GB card), and
-  `null` when that backend's runtime is unavailable. `family` ∈ `{lm,
+  and grey out the unfit ones. `trainable` is `false` when the total VRAM is below
+  the model's minimum (e.g. `vit_l`/`vit_h` on a 16 GB card), and `null` when that
+  backend's runtime is unavailable. `source` says where the VRAM figure came from
+  — `declared` (deploy-time config), `detected` (live probe), or `unavailable`
+  (runtime down, pairs with `trainable: null`). `family` ∈ `{lm,
   em_organelles, sam, cpsam, cpdino}` and `size` ∈ `{tiny, base, large, huge}`
   are machine-readable grouping keys so a UI needn't string-match `model_type`.
   `parameters` is the `start_training` control schema, derived from its signature

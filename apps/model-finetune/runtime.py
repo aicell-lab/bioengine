@@ -430,11 +430,12 @@ class RuntimeApp:
         }
 
     def _run_train_subprocess(self, session_id: str):
+        import training
+
         worker = str(Path(__file__).parent / "train_worker.py")
-        return subprocess.run(
-            [sys.executable, worker, session_id],
-            cwd=str(Path(__file__).parent),
-            capture_output=True, text=True, env=self._subprocess_env(),
+        return training.run_cancellable_subprocess(
+            [sys.executable, worker, session_id], session_id,
+            cwd=str(Path(__file__).parent), env=self._subprocess_env(),
         )
 
     def _run_export_subprocess(self, session_id: str, export_dir: str):
@@ -487,15 +488,19 @@ class RuntimeApp:
                 session_id, status="TRAINING", start_time=time.time(),
                 n_epochs=params.get("n_epochs"), device=self._device(),
             )
-            proc = await asyncio.to_thread(self._run_train_subprocess, session_id)
+            rc, tail, stopped = await asyncio.to_thread(self._run_train_subprocess, session_id)
 
-        # Fallback: if the child died without writing a terminal status, record it.
-        st = training.read_status(session_id)
-        if st.get("status") not in ("COMPLETED", "FAILED", "STOPPED"):
-            tail = (proc.stderr or "")[-800:]
+        if stopped:
             training.write_status(
-                session_id, status="FAILED",
-                message=f"training subprocess exited rc={proc.returncode}: {tail}",
-                end_time=time.time(),
+                session_id, status="STOPPED", message="stopped by user", end_time=time.time()
             )
-        return {"session_id": session_id, "returncode": proc.returncode}
+        else:
+            # Fallback: if the child died without writing a terminal status, record it.
+            st = training.read_status(session_id)
+            if st.get("status") not in ("COMPLETED", "FAILED", "STOPPED"):
+                training.write_status(
+                    session_id, status="FAILED",
+                    message=f"training subprocess exited rc={rc}: {tail}",
+                    end_time=time.time(),
+                )
+        return {"session_id": session_id, "returncode": rc}

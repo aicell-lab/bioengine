@@ -88,9 +88,23 @@ def _read_pip(name: str) -> List[str]:
 class EntryApp:
     """CPU entry: transport + routing to the GPU runtime + session orchestration."""
 
-    def __init__(self, runtime: RuntimeApp, cellpose_runtime: CellposeRuntime) -> None:
+    def __init__(
+        self,
+        runtime: RuntimeApp,
+        cellpose_runtime: CellposeRuntime,
+        declared_gpu_memory_mb: Optional[int] = None,
+        declared_gpu_device: Optional[str] = None,
+    ) -> None:
         self.runtime = runtime
         self.cellpose_runtime = cellpose_runtime
+        # Deploy-time declared GPU VRAM (via deploy_app application_kwargs). When
+        # set, get_training_capabilities answers entirely CPU-side from it and
+        # never composes to a GPU runtime — required under SLURM autoscale, where
+        # a live probe would wake a cold GPU allocation and time out the RPC. The
+        # detected value still enforces in start_training, so a wrong declaration
+        # (declare 40 GB, land on a T4) fails fast instead of OOMing mid-train.
+        self.declared_gpu_memory_mb = declared_gpu_memory_mb
+        self.declared_gpu_device = declared_gpu_device
         self.start_time = time.time()
         self._hypha_token = os.getenv("HYPHA_TOKEN")
         if not self._hypha_token:
@@ -147,6 +161,21 @@ class EntryApp:
             return await asyncio.wait_for(runtime.gpu_memory_info(), timeout=5.0)
         except Exception:
             return {}
+
+    async def _gpu_view(self, backend: str) -> Dict[str, Any]:
+        """VRAM view for a backend used by get_training_capabilities. A deploy-time
+        declared value wins and is answered CPU-side (never wakes a GPU); otherwise
+        fall back to a live runtime probe, which is only cheap on a warm cluster."""
+        if self.declared_gpu_memory_mb is not None:
+            return {
+                "available": True,
+                "total_mb": self.declared_gpu_memory_mb,
+                "device_name": self.declared_gpu_device or "declared",
+                "source": "declared",
+            }
+        model_type = "cpsam" if backend == "cellpose" else None
+        gpu = await self._runtime_gpu_memory(model_type)
+        return {**gpu, "source": "detected"} if gpu else {}
 
     # === I/O transport (S3 + URL) ===
 
@@ -647,13 +676,15 @@ class EntryApp:
     async def get_training_capabilities(self) -> Dict[str, Any]:
         """Which models this worker's GPU(s) can fine-tune. The annotate-page
         finetuning selector calls this to offer every model and grey out the ones
-        the hardware can't train. Returns detected VRAM per backend and, for all
-        model types, ``{model_type, backend, min_gpu_memory_mb, trainable, reason}``.
-        ``trainable`` is None when that backend's runtime is unavailable."""
+        the hardware can't train. Returns VRAM per backend and, for all model
+        types, ``{model_type, backend, min_gpu_memory_mb, family, size, trainable,
+        reason, source}``. ``source`` is ``declared`` (deploy-time config, answered
+        CPU-side without waking a GPU), ``detected`` (live runtime probe), or
+        ``unavailable`` (backend runtime down → ``trainable`` is None)."""
         import training
 
-        microsam = await self._runtime_gpu_memory(None)
-        cellpose = await self._runtime_gpu_memory("cpsam")
+        microsam = await self._gpu_view("microsam")
+        cellpose = await self._gpu_view("cellpose")
         models = []
         for m in ModelType.__args__:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
@@ -662,6 +693,7 @@ class EntryApp:
             rec = {
                 "model_type": m, "backend": backend, "min_gpu_memory_mb": required,
                 "family": training.model_family(m), "size": training.model_size(m),
+                "source": gpu.get("source", "unavailable") if gpu else "unavailable",
             }
             if not gpu:
                 rec["trainable"], rec["reason"] = None, "runtime unavailable"
@@ -781,6 +813,7 @@ class EntryApp:
             session_id, status="PREPARING", created_at=time.time(),
             model_type=model_type, backend=backend, label=label,
             n_train_inputs=len(train_images),
+            resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
         )
         params = dict(
             n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,

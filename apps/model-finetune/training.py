@@ -167,11 +167,21 @@ def read_status(session_id: str) -> Dict[str, Any]:
         return {}
 
 
+_TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
+
+
 def write_status(session_id: str, **fields) -> Dict[str, Any]:
-    """Atomically merge fields into the session's status.json."""
+    """Atomically merge fields into the session's status.json.
+
+    A terminal status is final: once COMPLETED/FAILED/STOPPED is recorded, an
+    incoming non-terminal status is dropped so a late TRAINING heartbeat from a
+    subprocess that is about to be killed can't resurrect a session the user
+    already stopped."""
     p = _status_path(session_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     cur = read_status(session_id)
+    if cur.get("status") in _TERMINAL and "status" in fields and fields["status"] not in _TERMINAL:
+        return cur
     cur.update(fields)
     cur["updated_at"] = time.time()
     tmp = p.with_suffix(".json.tmp")
@@ -213,6 +223,47 @@ def request_stop(session_id: str) -> None:
 
 def stop_requested(session_id: str) -> bool:
     return _stop_path(session_id).exists()
+
+
+def run_cancellable_subprocess(
+    argv: List[str], session_id: str, cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None, poll: float = 2.0, grace: float = 10.0,
+) -> Tuple[int, str, bool]:
+    """Run a training subprocess that a concurrent ``stop_training`` can kill.
+
+    Polls the session's stop marker while the child runs; on stop it terminates
+    the child (SIGTERM, then SIGKILL after ``grace``). The stop marker is written
+    by the entry, which shares this session dir, so this works without the caller
+    knowing which runtime replica holds the process. Child stdout+stderr go to a
+    log file (not a pipe) so the poll loop never deadlocks on a full pipe buffer.
+    Returns ``(returncode, log_tail, stopped)``."""
+    import subprocess
+
+    log_path = session_dir(session_id) / "train.log"
+    stopped = False
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True
+        )
+        while True:
+            try:
+                proc.wait(timeout=poll)
+                break
+            except subprocess.TimeoutExpired:
+                if stop_requested(session_id):
+                    stopped = True
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=grace)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    break
+    try:
+        tail = log_path.read_text()[-800:]
+    except Exception:
+        tail = ""
+    return proc.returncode, tail, stopped
 
 
 # === annotation interpretation ===
