@@ -16,9 +16,11 @@ import csv
 import hashlib
 import io
 import re
+import time
 import zipfile
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+from urllib.error import URLError
 from urllib.request import urlopen
 
 import numpy as np
@@ -105,13 +107,27 @@ DATASETS: Dict[str, Dict[str, str]] = {
 
 
 def _download(url: str, dest: Path) -> Path:
+    """Fetch one file, retrying on transient refusals.
+
+    CellBinDB is fetched file by file, so the pooled oracle makes a few hundred
+    requests to the same host in a row and BioStudies refuses some of them. One
+    refused file out of hundreds must not fail a whole client's load.
+    """
     if dest.exists() and dest.stat().st_size > 0:
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urlopen(url, timeout=300) as response, open(tmp, "wb") as handle:
-        while chunk := response.read(1 << 20):
-            handle.write(chunk)
+    for attempt in range(5):
+        try:
+            with urlopen(url, timeout=300) as response, open(tmp, "wb") as handle:
+                while chunk := response.read(1 << 20):
+                    handle.write(chunk)
+            break
+        except (URLError, OSError):
+            tmp.unlink(missing_ok=True)
+            if attempt == 4:
+                raise
+            time.sleep(2**attempt)
     tmp.rename(dest)
     return dest
 
