@@ -151,6 +151,8 @@ If a visual test isn't discriminating well: tighten the criteria (they go into t
 
 Neither model beat a trivial per-image pixel statistic on any axis (0.98 defocus, 0.84 bubbles). The 7B is the better model on the axis it can see and it is the only one of the two that changes its answer when the criterion's PASS/FAIL assignment is swapped — but on bubbles it flips the verdict while its stated reason describes the same image state 118 times out of 120, so the movement is in mapping the instruction, not in seeing the defect. The app is an assistant for a human reading the reason text, not an unattended gate.
 
+**A yes/no question in `describe` mode inherits the same bias.** Rephrasing a criterion as free text does not route around the verdict channel. Asking a question and its negation about the same frame (1932 calls over brightfield frames) produced answers that agree only 31 % of the time; the model leans toward the affirmative regardless of which way the question points. A positive control on natural photographs isolates where this comes from: on an easy, in-domain call the app is exactly right 60 times out of 60, yet swapping PASS and FAIL in the criterion still fails to remap the verdict — perception is fine, the verdict is what drifts. So when you need a binary answer, ask it both ways and treat disagreement as `unsure`, or read the reason text and decide yourself.
+
 ### Visual-test management
 
 | Method | Description |

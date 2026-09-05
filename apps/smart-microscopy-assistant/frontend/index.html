@@ -1582,7 +1582,7 @@
     <li>Focus and sharpness questions: sharp vs. blurry, in-focus vs. out-of-focus areas.</li>
     <li>Coarse colour and channel description in fluorescence and brightfield images.</li>
     <li>Locating clearly distinguishable objects via bounding boxes or points (the model was trained for this and is competitive with specialist detectors on common categories).</li>
-    <li>One yes/no question about a single visually-prominent property.</li>
+    <li>Describing a single visually-prominent property in words — read the description, don't lean on the yes/no.</li>
   </ul>
 
   <div class="h-section fail-h">Struggles with</div>
@@ -1594,6 +1594,7 @@
     <li><strong>3D spatial relationships.</strong> "On top of" / "under" / "behind" are routinely mis-judged, especially when reference images push the wrong way (a well-known anchor-bias failure).</li>
     <li><strong>Domain-specific patterns it wasn't trained on.</strong> Zero-shot detection on novel medical / microscopy categories is below 7 % mAP — references carry most of the signal.</li>
     <li><strong>Hallucination under ambiguity.</strong> When visual evidence is weak the model falls back on language priors and can invent details that aren't there.</li>
+    <li><strong>The yes/no itself, more than the seeing.</strong> Ask a question and its negation about the same image and the answers agree only 31 % of the time (1932 calls) — the model leans affirmative whichever way the question points. This survives even where perception is perfect: on an easy natural-image control it was right 60 times out of 60, yet swapping PASS and FAIL in the criterion still failed to move the verdict. Ask both ways and treat disagreement as unsure, or read the reason and decide yourself.</li>
   </ul>
 
   <div class="h-section tip-h">Tips for a useful test</div>
