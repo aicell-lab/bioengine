@@ -173,14 +173,17 @@ _TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
 def write_status(session_id: str, **fields) -> Dict[str, Any]:
     """Atomically merge fields into the session's status.json.
 
-    A terminal status is final: once COMPLETED/FAILED/STOPPED is recorded, an
-    incoming non-terminal status is dropped so a late TRAINING heartbeat from a
-    subprocess that is about to be killed can't resurrect a session the user
-    already stopped."""
+    A terminal status is sticky: once COMPLETED/FAILED/STOPPED is recorded, a
+    write that would change it to a *different* status is dropped. This blocks
+    both a late TRAINING heartbeat resurrecting a stopped session and a late
+    COMPLETED from a not-yet-reaped child overwriting the user's STOPPED. A
+    same-status write still lands, so the stop path can refine STOPPED with
+    end_time."""
     p = _status_path(session_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     cur = read_status(session_id)
-    if cur.get("status") in _TERMINAL and "status" in fields and fields["status"] not in _TERMINAL:
+    cur_status, new_status = cur.get("status"), fields.get("status")
+    if cur_status in _TERMINAL and new_status is not None and new_status != cur_status:
         return cur
     cur.update(fields)
     cur["updated_at"] = time.time()
