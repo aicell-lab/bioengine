@@ -16,9 +16,12 @@ One app, deployed three times:
 
 | Instance | Where | Data | Role |
 |---|---|---|---|
-| `fedunet-site-a` | Europa worker | `dsb2018-fluo` | participant |
-| `fedunet-site-b` | de.NBI worker, GPU node | `bbbc010-worms` | participant |
+| `fedunet-site-a` | Europa worker | site A of the chosen split | participant |
+| `fedunet-site-b` | de.NBI worker, GPU node | site B of the chosen split | participant |
 | `fedunet-pooled` | Europa worker | both | pooled-oracle control |
+
+`deploy.py --split` picks which pair of datasets the three instances hold; see
+**Data** below.
 
 Sites A and B physically hold disjoint domains and never load the other's data.
 The pooled instance deliberately violates the premise — it holds both — and
@@ -65,13 +68,34 @@ extends the run, which keeps a longer run comparable to a shorter one.
 
 Validation Dice is scored after every round on each arm's own val split — for
 the federated arm after the merge and pull, so the curve belongs to the
-aggregate rather than to either local model. An arm is converged at round `r` if
-no round in `(r, r+5]` beats the best value seen up to and including `r` by more
-than 0.005 absolute; the reported round is the smallest such `r`, and an arm
-only counts as converged within the run if `r+5` fits inside it. `None` means
-the arm was still improving at the end — that is, the step budget was too short.
-The rule lives in `CONVERGENCE` in `run_federated.py` and is copied verbatim
-into each run's `provenance.json`, so it is fixed before the numbers exist.
+aggregate rather than to either local model.
+
+The rule is **block plateau, per dataset**: split the rounds into equal thirds;
+the arm has converged on a dataset if the mean validation Dice over the final
+third exceeds the mean over the middle third by less than 0.005. It is reported
+per dataset and **never averaged across datasets**.
+
+It replaces a first-stall window rule that was pre-registered for the
+`20260905-115455` run and **failed there**, declaring convergence at round 8 of
+60 for arms whose best value arrived at round 50+. It fires on the first
+transient stall in a noisy curve, and averaging the two datasets diluted the
+harder domain by half. The superseded rule is still computed and reported so the
+two runs stay comparable, but its verdict is retracted.
+
+Both live in `CONVERGENCE` in `run_federated.py` and are copied verbatim into
+each run's `provenance.json`, so they are fixed before the numbers exist.
+
+`summary.json` also carries **deficit stability** — pooled − fedavg by block of
+rounds — which is what makes a comparison budget-robust even when the absolute
+values have not converged.
+
+### Pre-registering predictions
+
+`--pre-registration <file>` records that file's commit hash, commit timestamp
+and sha256 in `provenance.json`, and **hard-fails if the file is uncommitted or
+has unstaged edits**. A prediction stated in a message is a promise; a committed
+hash is evidence, and the guard is what stops the recorded hash from describing
+a different document than the one the run was designed against.
 
 ### Federated evaluation
 
@@ -202,7 +226,9 @@ await worker.deploy_app(
 Then:
 
 ```bash
-python run_federated.py --seeds 0 1 2 --rounds 10 --steps 50
+python deploy.py --version 0.2.0 --split acquisition
+python run_federated.py --seeds 0 1 2 3 4 --rounds 60 --steps 50 --previews \
+    --pre-registration ../../../bioengine-paper/analysis/results/<design>.md
 ```
 
 which writes `metrics.json`, `provenance.json` and `transport_audit.json` into
