@@ -129,14 +129,20 @@ clusters (deNBI T4, KTH A40-16C slices) `vit_b`/`vit_t`, `cpsam`, `cpdino*` trai
 fine, while **`vit_l`/`vit_h` are inference-only** — full-encoder ViT-L
 fine-tuning needs >16 GB (an A100/A40), though ViT-L *inference* runs on 16 GB.
 
-- **`get_training_capabilities()`** → `{gpus: {microsam, cellpose}, models: [{model_type, backend, min_gpu_memory_mb, trainable, reason}, ...]}`.
+- **`get_training_capabilities()`** → `{gpus: {microsam, cellpose}, models: [{model_type, backend, min_gpu_memory_mb, trainable, reason, family, size}, ...], parameters: [{name, applies_to, type, default, min, max, description}, ...]}`.
   Which models the worker's GPU(s) can fine-tune, so a UI can offer every model
   and grey out the unfit ones. `trainable` is `false` when the detected total
   VRAM is below the model's minimum (e.g. `vit_l`/`vit_h` on a 16 GB card), and
-  `null` when that backend's runtime is unavailable. `start_training`
-  **hard-rejects** a model whose backend GPU can't fit it (a clear `ValueError`
-  up front, instead of a mid-training CUDA OOM). See *Hardware requirements* below.
-- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, diam_mean=30.0, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, resume_session_id=None, label="")`**
+  `null` when that backend's runtime is unavailable. `family` ∈ `{lm,
+  em_organelles, sam, cpsam, cpdino}` and `size` ∈ `{tiny, base, large, huge}`
+  are machine-readable grouping keys so a UI needn't string-match `model_type`.
+  `parameters` is the `start_training` control schema, derived from its signature
+  (so it never drifts): each entry carries the numeric bounds (`min`/`max`),
+  `default`, and `applies_to` (which backends the control affects — micro-sam,
+  cellpose, or both). `start_training` **hard-rejects** a model whose backend GPU
+  can't fit it (a clear `ValueError` up front, instead of a mid-training CUDA
+  OOM). See *Hardware requirements* below.
+- **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, diam_mean=30.0, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, resume_session_id=None, init_checkpoint=None, label="")`**
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
@@ -144,6 +150,13 @@ fine-tuning needs >16 GB (an A100/A40), though ViT-L *inference* runs on 16 GB.
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
   diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
   trains at a time across both backends (`QUEUED` while another holds the slot).
+  The starting checkpoint comes from one of three sources: the base model
+  (default), `resume_session_id` (continue a prior session on this worker), or
+  `init_checkpoint` — an http(s) URL (or `get_upload_url` path) to a weights file
+  to fine-tune *from*, e.g. an exported BioImage.IO draft's
+  `resume_checkpoint_file`. This closes the train → export → refine loop with a
+  replica-independent checkpoint. `resume_session_id` and `init_checkpoint` are
+  mutually exclusive, and `model_type` must match the checkpoint's architecture.
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
@@ -171,7 +184,10 @@ fine-tuning needs >16 GB (an A100/A40), though ViT-L *inference* runs on 16 GB.
   **publishes nothing**. The frontend creates the draft artifact with the user's
   own token, then either downloads the zip from `download_url` or calls
   `push_export(export_id, files)` to stream the package files straight into the
-  draft.
+  draft. `get_export_status` also returns `resume_checkpoint_file` — the name of
+  the package's resumable weights file (micro-sam: the combined
+  `{model_state, decoder_state}` checkpoint; cellpose: `model_weights.pth`) — to
+  feed back into `start_training(init_checkpoint=<presigned url of that file>)`.
 
 **Serve the just-trained model:** once `checkpoint_available` is true, pass
 `session_id` to any serving method — the fine-tuned checkpoint flows through the

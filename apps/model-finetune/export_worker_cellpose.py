@@ -304,6 +304,8 @@ def main(session_id: str, export_dir: str) -> None:
         "files": files,
         "total_bytes": sum(f["size"] for f in files),
         "model_type": model_type,
+        # Raw cellpose checkpoint, resumable via start_training(init_checkpoint=...).
+        "resume_checkpoint_file": "model_weights.pth",
         "test_model_status": status,
         "build_seconds": round(time.time() - t0, 1),
     }

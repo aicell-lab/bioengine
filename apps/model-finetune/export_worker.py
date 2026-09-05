@@ -151,10 +151,24 @@ def main(session_id: str, export_dir: str) -> None:
         "files": files,
         "total_bytes": sum(f["size"] for f in files),
         "model_type": model_type,
+        "resume_checkpoint_file": _resume_checkpoint_file(pkg_dir),
         "build_seconds": round(time.time() - t0, 1),
     }
     (export_path / "export_result.json").write_text(json.dumps(result))
     print("EXPORT_OK", pkg_dir, flush=True)
+
+
+def _resume_checkpoint_file(pkg_dir):
+    """Filename of the package's pytorch weights — a combined
+    ``{model_state, decoder_state}`` checkpoint that ``start_training`` can
+    resume from via ``init_checkpoint``. Returned to the caller so it can offer
+    'fine-tune from this export' without hardcoding a filename."""
+    for rdf_name in ("bioimageio.yaml", "rdf.yaml"):
+        rdf_path = pkg_dir / rdf_name
+        if rdf_path.exists():
+            rdf = yaml.safe_load(rdf_path.read_text())
+            return rdf["weights"]["pytorch_state_dict"]["source"]
+    return None
 
 
 if __name__ == "__main__":
