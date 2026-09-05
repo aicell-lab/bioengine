@@ -180,6 +180,39 @@ client holding a dataset must report the same fingerprint for it, otherwise they
 were not scored on the same images and the comparison is void. The driver checks
 this — and the `shard_fingerprint` disjointness — before training starts.
 
+### Failure mode: scoring a site on stale weights
+
+The failure this implementation actually hit, recorded because the next
+federated implementation will be able to hit it too.
+
+Each round, the driver merged the participants' weights and then pushed the
+aggregate back — to the participants. In a leave-one-site-out fold the held-out
+client is not a participant: it trains on nothing and exists only to be scored.
+It was therefore scored on whatever weights it still held from an earlier arm.
+It did not raise. It returned a Dice, in range, on the right split, with the
+right `split_fingerprint` — the one number the fold exists to produce, silently
+measuring a different model than the one named.
+
+**The tell** is that the held-out client's validation Dice is *identical to four
+decimals across consecutive rounds* while every participant's moves.
+`loso-bbbc038-fluo` read 0.5664 in both round 0 and round 1; `loso-bbbc039` read
+0.9106 in both. A frozen curve next to moving ones is not a converged model, it
+is a model that never received anything.
+
+Two guards now make it an error rather than something to notice:
+
+- `federated_arm` pulls the aggregate to `participants ∪ eval_on`, so every site
+  that gets scored is a site that got the merge.
+- `evaluate` returns `weights_sha256`, the sha256 of the tensors the site
+  actually scored with, and the driver hard-fails if a scored site's hash repeats
+  across rounds while the aggregate's hash changes. Recorded per round in
+  `metrics.json` as `scored_with` alongside `global_sha256`.
+
+The general shape, worth carrying elsewhere: **a site that is scored and a site
+that trains are different sets, and only the second one is obviously wrong when
+you forget it.** Anything derived from a sync should be checkable against the
+sync having happened, not assumed from the call having been made.
+
 ## Data
 
 All CC0. `deploy.py --layout` picks which one the instances hold:

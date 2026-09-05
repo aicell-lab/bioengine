@@ -264,6 +264,7 @@ class FederatedUNetSite:
     ) -> Dict[str, Any]:
         """Score the current weights on a local split, per dataset and per image."""
         from training import evaluate as run_eval
+        from unet import digest
 
         if self._model is None:
             raise RuntimeError("no model loaded")
@@ -279,9 +280,13 @@ class FederatedUNetSite:
         async with self._lock:
             loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(None, _work)
+            # Reported alongside the score so a caller can tell which weights
+            # produced it, rather than assuming the sync it asked for happened.
+            scored_with = digest(self._model.state_dict())
         for name, result in results.items():
             result["split"] = split
             result["split_fingerprint"] = self._data[name]["split_fingerprint"]
+            result["weights_sha256"] = scored_with
             result["site"] = self.site_name
         return results
 

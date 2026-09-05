@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -159,13 +159,15 @@ def convergence_round(curve: List[float], window: int = 5, tolerance: float = 0.
     return None
 
 
-async def val_dice(apps, names) -> Dict[str, float]:
-    """Mean validation Dice per dataset, across one or more instances."""
+async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str]]:
+    """Mean validation Dice per dataset, plus the weights each site scored with."""
     scores: Dict[str, float] = {}
+    scored_with: Dict[str, str] = {}
     for name in names:
         for dataset, result in (await apps[name].evaluate(split="val")).items():
             scores[dataset] = float(result["dice_mean"])
-    return scores
+            scored_with[name] = result["weights_sha256"]
+    return scores, scored_with
 
 
 async def train_arm(
@@ -175,7 +177,7 @@ async def train_arm(
     history = []
     for r in range(rounds):
         record = await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}")
-        record["val_dice"] = await val_dice(apps, [instance])
+        record["val_dice"], _ = await val_dice(apps, [instance])
         history.append(record)
     return history
 
@@ -183,7 +185,6 @@ async def train_arm(
 async def federated_arm(
     apps,
     store,
-    driver_log,
     run_artifact_id: str,
     participants: List[str],
     eval_on: List[str],
@@ -204,6 +205,8 @@ async def federated_arm(
         await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
 
     round_records = []
+    previous_aggregate: str = ""
+    previous_scored_with: Dict[str, str] = {}
     for r in range(args.rounds):
         local = await asyncio.gather(
             *(
@@ -225,7 +228,9 @@ async def federated_arm(
             counts.append(push["n_train_images"] if weighting == "sample-count" else 1)
         merged = fedavg(state_dicts, counts)
         global_path = f"{prefix}/{arm}/round_{r:02d}/global.pt"
-        await store.put(global_path, dump_state_dict(merged), note=f"{arm} round {r} aggregate")
+        aggregate = await store.put(
+            global_path, dump_state_dict(merged), note=f"{arm} round {r} aggregate"
+        )
         # Every site that is scored must hold the merged weights, not just the
         # ones that trained. A LOSO fold's held-out client trains on nothing and
         # would otherwise be scored on whatever weights it last happened to
@@ -233,14 +238,27 @@ async def federated_arm(
         for name in dict.fromkeys([*participants, *eval_on]):
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
         # Scored after the merge and pull, so this is the aggregate's curve.
-        merged_val = await val_dice(apps, eval_on)
+        merged_val, scored_with = await val_dice(apps, eval_on)
+        # A site whose weights did not move while the aggregate did was scored on
+        # stale weights. That failure produces plausible numbers instead of an
+        # error — a LOSO fold's held-out client trains on nothing, so a missed
+        # pull leaves it reporting a frozen curve that reads as a real result.
+        if previous_aggregate and aggregate["sha256"] != previous_aggregate:
+            stale = sorted(n for n, h in scored_with.items() if previous_scored_with.get(n) == h)
+            if stale:
+                raise RuntimeError(
+                    f"{arm} round {r}: aggregate changed but {stale} scored on the same "
+                    f"weights as round {r - 1} — these sites did not receive the merge"
+                )
+        previous_aggregate, previous_scored_with = aggregate["sha256"], scored_with
         round_records.append(
             {
                 "round": r,
                 "merge_weights": dict(zip(participants, counts)),
                 "local": [{k: v for k, v in item.items() if k != "loss_curve"} for item in local],
                 "val_dice": merged_val,
-                "global_sha256": driver_log.dump()["entries"][-1]["sha256"],
+                "global_sha256": aggregate["sha256"],
+                "scored_with": scored_with,
             }
         )
         print(
@@ -420,7 +438,7 @@ async def main() -> None:
 
         async def fed(arm: str, participants: List[str], weighting: str) -> None:
             arms[arm] = await federated_arm(
-                apps, store, driver_log, run_artifact_id, participants,
+                apps, store, run_artifact_id, participants,
                 scored_on, prefix, arm, args, seed, weighting,
             )
 

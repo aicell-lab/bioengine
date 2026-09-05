@@ -7,6 +7,7 @@ learned weights. GroupNorm carries no running state, so a merged checkpoint is
 a pure function of the site weights.
 """
 
+import hashlib
 from collections import OrderedDict
 from typing import Dict, List
 
@@ -74,6 +75,19 @@ def build_model(seed: int = 0) -> UNet:
 def signature(state_dict: Dict[str, torch.Tensor]) -> List[str]:
     """Ordered ``name:shape`` list — compared before merging two checkpoints."""
     return [f"{k}:{tuple(v.shape)}" for k, v in state_dict.items()]
+
+
+def digest(state_dict: Dict[str, torch.Tensor]) -> str:
+    """sha256 over names and tensor bytes — which weights, not which file.
+
+    Hashed from the live tensors rather than a serialised blob so it identifies
+    what a model is actually holding, independent of how it got there.
+    """
+    hasher = hashlib.sha256()
+    for key in sorted(state_dict):
+        hasher.update(key.encode())
+        hasher.update(state_dict[key].detach().cpu().contiguous().numpy().tobytes())
+    return hasher.hexdigest()
 
 
 def fedavg(state_dicts: List[Dict[str, torch.Tensor]], weights: List[float]) -> Dict[str, torch.Tensor]:
