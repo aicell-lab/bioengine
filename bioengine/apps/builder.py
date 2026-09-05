@@ -312,8 +312,9 @@ class AppBuilder:
         """Submit :func:`introspect_app_in_ray_task` as a Ray task.
 
         The task syncs the user package from Hypha (token in ``env_vars``),
-        walks the type-hint composition graph, and returns the ``{spec}``
-        payload. We never touch the worker's filesystem.
+        walks the type-hint composition graph, and returns the
+        ``{spec, source_signature}`` payload. We never touch the worker's
+        filesystem.
 
         Strips the ``_BIOENGINE_SECRET_*`` keys from ``env_vars`` before
         passing into the task to keep secrets out of Ray's logs; the
@@ -669,11 +670,13 @@ class AppBuilder:
 
         # 3. Introspect the user package via a Ray task — the task syncs the
         # source from Hypha and walks the @bioengine.app composition. Returns
-        # spec only; replicas sync their own source per file from Hypha.
+        # the spec plus a content hash of the synced source; replicas sync their
+        # own source per file from Hypha.
         introspect_result = await self._introspect_via_ray_task(
             entry_id, env_vars, runtime_env
         )
         spec = introspect_result["spec"]
+        source_signature = introspect_result.get("source_signature")
         self.logger.info(f"Introspect task returned for '{application_id}'")
 
         # Sanity check: format_version round-trip.
@@ -731,6 +734,7 @@ class AppBuilder:
             "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
             "entry": entry_id,
             "spec_hash": spec_hash,
+            "source_signature": source_signature,
             "display_name": manifest["name"],
             "description": manifest["description"],
             "artifact_id": artifact_id,
@@ -779,6 +783,7 @@ class AppBuilder:
             "name": manifest["name"],
             "description": manifest["description"],
             "version": version,
+            "source_signature": source_signature,
             "resources": required_resources,
             "authorized_users": effective_authorized_users,
             "available_methods": available_methods,
