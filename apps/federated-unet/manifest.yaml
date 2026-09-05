@@ -1,0 +1,18 @@
+name: Federated U-Net
+id: federated-unet
+id_emoji: "🤝"
+description: One site of a federated segmentation experiment. Each deployment downloads its own dataset into its replica, trains a small U-Net locally, and exchanges only state_dict bytes with the other sites through a Hypha artifact. Every payload crossing the site boundary is recorded with a sha256 digest so the "no image left the site" claim can be checked rather than asserted.
+documentation: README.md
+authors:
+  - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
+maintainers: []
+license: MIT
+format_version: 0.6.0
+git_repo: https://github.com/aicell-lab/bioengine
+links: []
+tags: [federated-learning, segmentation, u-net, privacy-preserving, dev]
+type: ray-serve
+version: 0.1.0
+entry: entry:FederatedUNetSite
+authorized_users:
+  - nils.mech@gmail.com

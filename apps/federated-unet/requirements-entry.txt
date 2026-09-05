@@ -1,0 +1,8 @@
+# Pins mirror the versions validated on the deNBI T4 nodes by the other GPU
+# apps in this repo, so the wheel set is already known to resolve there.
+torch==2.7.1
+numpy==1.26.4
+imageio>=2.37.0
+tifffile
+Pillow
+httpx
