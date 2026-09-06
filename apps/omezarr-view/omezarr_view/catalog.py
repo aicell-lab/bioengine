@@ -257,7 +257,9 @@ def _from_derived(spec: Dict[str, Any]) -> List[DatasetEntry]:
             continue
         entries.append(DatasetEntry(
             id=item.get("id") or f"{base_id}-derived",
-            source=f"derived from {base_id}",
+            # Left blank until the view is built, when the report fills in the
+            # underlying file; the card already names the base dataset.
+            source="",
             title=item.get("title") or f"{base_id} (derived)",
             location="computed",
             licence=item.get("licence", spec.get("licence")),
