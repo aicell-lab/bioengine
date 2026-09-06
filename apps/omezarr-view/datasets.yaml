@@ -1,15 +1,12 @@
 title: OME-Zarr views over existing files
 
-# Two halves of the same claim: a local archive folder, and files that stay in
-# remote object storage. Neither is converted; both are served as OME-Zarr.
+# Deployed configuration. Local files are commented out because a worker
+# replica has no demo folder; point local_dir at a path on the cluster's shared
+# storage to serve an existing archive in place.
 sources:
 
-  # LOCAL — everything under this folder. Populate it with `fetch_demo_data.py`,
-  # or point `path` at your own archive.
-  - type: local_dir
-    path: ./data
-    licence: CC-BY-4.0
-    source_page: https://zenodo.org/records/8305531
+  # - type: local_dir
+  #   path: /mnt/archive/imaging
 
   # REMOTE, explicit URLs — the Viv demo bucket serves range reads but denies
   # listing (403 on ?list-type=2), so its contents must be named.
@@ -20,50 +17,26 @@ sources:
         title: idr0106 — human lung, 3-channel pyramid (42 GB)
         licence: CC-BY-4.0
         attribution: >-
-          IDR study idr0106; hosted as Viv demo data by HMS DBMI.
-        source_page: https://idr.openmicroscopy.org/webclient/?show=project-1102
+          IDR study idr0106; hosted as Viv demo data by HMS DBMI. Licence from
+          the IDR site-wide policy; the mirror exposes no per-dataset field.
+        source_page: https://idr.openmicroscopy.org/
       - id: spraggins-kidney
         url: https://viv-demo.storage.googleapis.com/Vanderbilt-Spraggins-Kidney-MxIF.ome.tif
         title: Human kidney, multiplexed immunofluorescence
         licence: CC-BY-4.0
         attribution: >-
           HuBMAP / Vanderbilt BIOMIC (Spraggins lab), mirrored as Viv demo data.
-          Licence from the HuBMAP portal-wide CC-BY-4.0 policy; this mirror
-          exposes no per-dataset licence field and no HBM id.
+          Licence from the HuBMAP portal-wide policy; this mirror exposes no
+          per-dataset licence field and no HBM id.
         source_page: https://portal.hubmapconsortium.org/
-      - id: brain-pyramid
-        url: https://viv-demo.storage.googleapis.com/brain.pyramid.ome.tif
-        title: Brain, pyramidal OME-TIFF
-        licence: unverified
-        attribution: >-
-          Viv demo bucket. No licence or provenance metadata is exposed for
-          this file — included to exercise the catalog, NOT for publication.
-        source_page: https://github.com/hms-dbmi/viv
 
-  # REMOTE, listed from a bucket prefix. Works where the bucket allows listing;
-  # logs a warning and yields nothing where it does not.
+  # REMOTE, listed from a bucket prefix. Works where the bucket allows listing.
   # - type: remote_prefix
   #   url: s3://my-bucket/imaging/
   #   anonymous: true
 
-  # AUTHENTICATION demo — same recipe, but the view refuses to answer without
-  # a token. token_env fails closed: if the variable is unset the entry is
-  # dropped rather than served in the open.
-  - type: files
-    token_env: OMEZARR_VIEW_DEMO_TOKEN
-    files:
-      - id: protected-mousebrain
-        path: ./data/MouseBrain_41Slices_1Tile_3Channel_2Illuminations_2Angles.czi
-        title: Mouse brain (access-controlled copy)
-        licence: CC-BY-4.0
-        attribution: >-
-          Same file as the public entry, served through a token-protected view
-          to demonstrate access control on a lazy OME-Zarr endpoint.
-        source_page: https://zenodo.org/records/8305531
-
-  # DERIVED views — computed per request from a raw view above. The original
-  # file is still never rewritten, but these pixels are COMPUTED, not the
-  # source's own; each view reports its transform chain and says so.
+  # DERIVED views — computed per request from a view above. The original file is
+  # still never rewritten, but these pixels are COMPUTED, not the source's own.
   - type: derived
     views:
       - id: idr0106-training-10um
@@ -79,9 +52,3 @@ sources:
         target_spacing_um: 4.0
         dtype: uint8
         normalise: percentile
-      - id: mousebrain-half
-        from: mousebrain-41slices-1tile-3channel-2illuminations-2angles
-        title: Mouse brain — half scale, float32, unnormalised
-        target_scale: 0.5
-        dtype: float32
-        normalise: none

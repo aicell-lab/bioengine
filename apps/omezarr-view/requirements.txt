@@ -1,13 +1,19 @@
-bioio>=3.5.0
-bioio-czi>=2.9.0
+# Pinned to the combination this app was validated and measured against.
+# Two of these are load-bearing, not hygiene:
+#   tifffile — newer releases require zarr>=3 for aszarr(), but the reference
+#     index format and the NGFF 0.4 consumers here are zarr v2.
+#   numpy    — bioio's compiled extensions are ABI-sensitive; an unpinned
+#     resolve produced "numpy.dtype size changed" in the replica.
+bioio==3.5.0
+bioio-czi==2.9.1
 fastapi>=0.115
 fsspec>=2024.9.0
-httpx[http2]>=0.28
-imagecodecs>=2025.3.30
-numcodecs>=0.13,<0.14
-numpy>=1.26
+httpx>=0.28
+imagecodecs==2025.3.30
+numcodecs==0.13.1
+numpy==2.2.6
 pillow>=10.0
 pyyaml>=6.0
-tifffile>=2025.5.10
+tifffile==2025.5.10
 uvicorn>=0.30
-zarr>=2.18,<3
+zarr==2.18.3

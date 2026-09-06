@@ -82,7 +82,10 @@ def md5(path: Path) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dest", default="data")
+    ap.add_argument("--dest",
+                    default="../../.dev/omezarr-view-data",
+                    help="where to put demo files; kept OUTSIDE the app directory "
+                         "because upload_app ships the whole directory")
     ap.add_argument("--skip-large", action="store_true",
                     help="skip files over ~1 GB")
     args = ap.parse_args()
