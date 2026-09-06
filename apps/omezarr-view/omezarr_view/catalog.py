@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from .derived import DerivedView
 from .recipes import BaseView, ViewError, open_view
 
 logger = logging.getLogger("omezarr-view")
@@ -50,6 +51,11 @@ class DatasetEntry:
     token: Optional[str] = None
     view: Optional[BaseView] = None
     error: Optional[str] = None
+    # Set for a derived entry: the base dataset id, this view's transform
+    # config, and a resolver the Catalog injects so it can find the base.
+    derived_from: Optional[str] = None
+    derived_config: Optional[Dict[str, Any]] = None
+    resolve_base: Optional[Any] = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -64,7 +70,16 @@ class DatasetEntry:
             if self.error is not None:
                 raise ViewError(self.error)
             try:
-                self.view = open_view(self.id, self.source, self.title, self.recipe)
+                if self.derived_from:
+                    base = self.resolve_base(self.derived_from)
+                    if base is None:
+                        raise ViewError(
+                            f"derived view '{self.id}' needs dataset "
+                            f"'{self.derived_from}', which is not in the catalog")
+                    self.view = DerivedView(self.id, base.ensure_view(), self.title,
+                                            **(self.derived_config or {}))
+                else:
+                    self.view = open_view(self.id, self.source, self.title, self.recipe)
             except Exception as e:
                 self.error = str(e)
                 raise
@@ -77,6 +92,7 @@ class DatasetEntry:
             "title": self.title,
             "source": self.source,
             "location": self.location,
+            "derived_from": self.derived_from,
             "licence": self.licence,
             "attribution": self.attribution,
             "source_page": self.source_page,
@@ -225,11 +241,42 @@ def _from_files(spec: Dict[str, Any]) -> List[DatasetEntry]:
     return entries
 
 
+def _from_derived(spec: Dict[str, Any]) -> List[DatasetEntry]:
+    """Computed views over other catalog entries."""
+    entries = []
+    for item in spec["views"]:
+        item = dict(item)
+        base_id = item.pop("from")
+        config = {k: item.pop(k) for k in
+                  ("target_spacing_um", "target_scale", "channels", "dtype",
+                   "normalise") if k in item}
+        token, ok = _resolve_token(item, spec)
+        if not ok:
+            logger.warning("derived view %s names an unset token_env; skipping",
+                           item.get("id"))
+            continue
+        entries.append(DatasetEntry(
+            id=item.get("id") or f"{base_id}-derived",
+            source=f"derived from {base_id}",
+            title=item.get("title") or f"{base_id} (derived)",
+            location="computed",
+            licence=item.get("licence", spec.get("licence")),
+            attribution=item.get("attribution", spec.get("attribution")),
+            source_page=item.get("source_page", spec.get("source_page")),
+            token=token,
+            derived_from=base_id,
+            derived_config=config,
+        ))
+    logger.info("derived -> %d view(s)", len(entries))
+    return entries
+
+
 _LOADERS = {
     "local_dir": _from_local_dir,
     "remote_prefix": _from_remote_prefix,
     "remote_files": _from_files,
     "files": _from_files,
+    "derived": _from_derived,
 }
 
 
@@ -245,6 +292,7 @@ class Catalog:
             while eid in self.entries:
                 eid, n = f"{entry.id}-{n}", n + 1
             entry.id = eid
+            entry.resolve_base = self.get
             self.entries[eid] = entry
 
     @classmethod

@@ -60,3 +60,28 @@ sources:
           Same file as the public entry, served through a token-protected view
           to demonstrate access control on a lazy OME-Zarr endpoint.
         source_page: https://zenodo.org/records/8305531
+
+  # DERIVED views — computed per request from a raw view above. The original
+  # file is still never rewritten, but these pixels are COMPUTED, not the
+  # source's own; each view reports its transform chain and says so.
+  - type: derived
+    views:
+      - id: idr0106-training-10um
+        from: idr0106
+        title: idr0106 — training view, 10 µm/px, 2 channels, uint8
+        target_spacing_um: 10.0
+        channels: [alpha-SMA-FITC, A549-mCherry]
+        dtype: uint8
+        normalise: percentile
+      - id: kidney-training-4um
+        from: spraggins-kidney
+        title: Human kidney — training view, 4 µm/px, uint8
+        target_spacing_um: 4.0
+        dtype: uint8
+        normalise: percentile
+      - id: mousebrain-half
+        from: mousebrain-41slices-1tile-3channel-2illuminations-2angles
+        title: Mouse brain — half scale, float32, unnormalised
+        target_scale: 0.5
+        dtype: float32
+        normalise: none

@@ -5,3 +5,4 @@ served_measurements.json
 .svamp/
 __pycache__/
 *.pyc
+served_derived.json

@@ -90,6 +90,7 @@
   }
   .badge.local { background: var(--local-soft); color: var(--local); }
   .badge.remote { background: var(--remote-soft); color: var(--remote); }
+  .badge.computed { background: var(--accent-soft); color: var(--accent); }
   .badge.fmt { background: var(--accent-soft); color: var(--accent); }
   .badge.lock { background: var(--accent-soft); color: var(--accent); }
 
@@ -187,6 +188,15 @@
   </p>
   <div class="grid" id="grid-remote"></div>
 
+  <h2>Derived views</h2>
+  <p class="section-note">
+    Computed from a view above, per request — rescaled, channel-selected,
+    normalised into what a model wants to be fed. The original file is still
+    never rewritten, but unlike the views above these pixels are
+    <strong>computed, not the source's own</strong>.
+  </p>
+  <div class="grid" id="grid-derived"></div>
+
   <footer>
     <p>
       Views are built on first use — that is the measurement the demo is making,
@@ -270,12 +280,14 @@ function card(d) {
   const el = document.createElement("article");
   el.className = "card";
   const isLocal = d.location === "local";
+  const isComputed = d.location === "computed";
   el.innerHTML = `
     <div class="thumb" data-thumb>
       <span class="ph">not indexed</span>
       <div class="badges">
-        <span class="badge ${isLocal ? "local" : "remote"}">${isLocal ? "local" : "remote"}</span>
-        <span class="badge fmt">${suffix(d.source)}</span>
+        <span class="badge ${isComputed ? "computed" : isLocal ? "local" : "remote"}">${
+          isComputed ? "computed" : isLocal ? "local" : "remote"}</span>
+        ${isComputed ? "" : `<span class="badge fmt">${suffix(d.source)}</span>`}
         ${d.protected ? '<span class="badge lock">token</span>' : ""}
       </div>
     </div>
@@ -325,6 +337,15 @@ function card(d) {
       ["Pyramid", dd.levels ? `${dd.levels} level${dd.levels > 1 ? "s" : ""}` : null],
       ["Chunk", dd.chunks ? `<code>${dd.chunks.join("×")}</code>` : null],
       ["Pixel size", pixelSize(dd)],
+      ["Derived from", dd.derived_from ? `<code>${dd.derived_from}</code>` : null],
+      ["Transform", dd.transform_chain
+        ? dd.transform_chain.map((t) => `<div>${t}</div>`).join("") : null],
+      ["Reads source", Array.isArray(dd.source_level_read)
+        ? `level ${dd.source_level_read.join(", ")} of the source pyramid` : null],
+      ["Source cache", dd.source_chunk_cache && dd.source_chunk_cache.hit_rate !== null
+        ? `${(dd.source_chunk_cache.hit_rate * 100).toFixed(0)}% chunk hit rate ` +
+          `(${dd.source_chunk_cache.source_chunk_hits} hits, ` +
+          `${dd.source_chunk_cache.source_chunk_misses} misses)` : null],
       ["File size", dd.size_bytes ? fmtBytes(dd.size_bytes) : null],
       ["Licence", dd.licence],
     ].filter(([, v]) => v);
@@ -413,7 +434,7 @@ function card(d) {
   document.title = title;
 
   const local = datasets.filter((d) => d.location === "local");
-  const remote = datasets.filter((d) => d.location !== "local");
+  const remote = datasets.filter((d) => d.location === "remote");
   const put = (sel, list) => {
     const g = $(sel);
     if (!list.length) {
@@ -424,11 +445,13 @@ function card(d) {
   };
   put("#grid-local", local);
   put("#grid-remote", remote);
+  put("#grid-derived", datasets.filter((d) => d.location === "computed"));
 
   const totalBytes = datasets.reduce((a, d) => a + (d.size_bytes || 0), 0);
   $("#facts").innerHTML = [
     `<b>${datasets.length}</b> files`,
-    `<b>${local.length}</b> local · <b>${remote.length}</b> remote`,
+    `<b>${local.length}</b> local · <b>${remote.length}</b> remote · ` +
+      `<b>${datasets.filter((d) => d.location === "computed").length}</b> derived`,
     `<b>${fmtBytes(totalBytes)}</b> of source data`,
     `<b>0</b> converted`,
   ].map((t) => `<span class="fact">${t}</span>`).join("");
