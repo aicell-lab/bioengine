@@ -37,7 +37,47 @@ back to BioIO.
 - **A derived view is never zero-copy.** Its pixels are computed. Label it
   `computed_product` and state its transform chain.
 
-## Metadata: generate the report, never write it by hand
+## Falsify your own generated report against the source
+
+The report is quoted verbatim in publications, so an unchecked claim in it is a
+falsehood rather than a rough edge. Before publishing any view's mapping, open
+the source metadata yourself and try to prove the report wrong. A fresh-agent
+exam of this skill found **three separate false "not declared in the source"
+lines** that had survived review, plus two fields dropped with no line at all.
+
+Two rules, and make the code enforce them rather than trusting care:
+
+1. **"Not declared" is only sayable if you looked.** Track which fields the
+   extractor actually inspected. Anything it never examined is "not read by
+   this recipe, so its presence is unknown" — a different and honest claim.
+2. **Every dropped field appears in one list or the other.** An undisclosed loss
+   is worse than a disclosed one, because the reader has no way to know to ask.
+   Keep an explicit roster of droppable fields and assert each is accounted for.
+
+Concrete traps, all of which shipped here at least once:
+
+- **Colour read on neither path.** OME `Channel Color` is a signed 32-bit RGBA
+  int; CZI uses `#AARRGGBB`. Normalise in ONE place — converting in both the
+  extractor and the builder made the second pass reject its own output and
+  43 declared colours came out as "not declared".
+- **A field populated on one recipe and not the other.** `acquisition_date` was
+  read by the reference path and never by the BioIO path, so the BioIO report
+  carried a guaranteed false claim on any dated source.
+- **The time axis.** Iterating `("x", "y", "z")` for physical sizes drops a
+  declared `TimeIncrement` silently, and the view then serves `t` with scale 1.0
+  and no unit. It also makes Neuroglancer open on a t-z cross-section.
+- **Bit depth versus container width.** A 14-bit camera in a uint16 container
+  published `window.max = 65535`, four times the real full scale. Read
+  `SignificantBits` / `ComponentBitCount`, and say so when you cannot.
+- **A late override that re-asserts absence.** A display-window helper that
+  rewrote its own not-mapped line kept saying "not declared" after the
+  extractor had learned to read the declaration.
+- **Scenes and series.** A multi-scene CZI or multi-series OME-TIFF is served as
+  its first, silently, unless the report names scenes present versus served.
+  Announce it only when there is a real choice; "scene X of 1" on every file is
+  noise that buries the case that matters.
+
+## Metadata: generate the report, never write it by hand — then falsify it
 
 Each view emits `metadata_mapping.mapped` / `.not_mapped` and a prose `caption`.
 Quote those verbatim; do not paraphrase into a sentence, because a paraphrase
@@ -48,6 +88,48 @@ Usually mapped: dimensions and axis order, physical pixel sizes with units,
 channel names, dtype, pyramid levels with true scale factors, acquisition date.
 Usually **not** mapped: channel colours, display windows, objective/instrument,
 stage position, plate/well context, ROIs.
+
+**Quoting it verbatim is necessary and not sufficient.** The report is
+generated, so it is faithful to what the code did — but it is not evidence about
+what the *file* declared, and those come apart. Before you stand behind a view,
+open the source's own metadata and check **every `not_mapped` line that claims
+"not declared in the source"** against it. Two runs against real files found
+four such lines, all false:
+
+| view said | file actually declared |
+|---|---|
+| channel colours: not declared | `Color` on all 43 OME `<Channel>`s; 34/43 then rendered in a palette colour the acquisition did not choose |
+| channel colours: not declared | `DisplaySetting/Channels/Channel/Color` per channel in a CZI |
+| acquisition date: not declared | `Information/Image/AcquisitionDateAndTime` in a CZI |
+| display windows: not declared | `DisplaySetting/Channels/Channel/High`, normalised against `BitCountRange` |
+
+The mechanism is always the same and is easy to reproduce: an extractor reads a
+subset of the fields, and `build_ngff_attrs` emits the disclaimer
+unconditionally without asking whether the extractor even looked. On the BioIO
+path `_source_metadata()` never populates `acquisition_date` at all, so that
+line **cannot** be true for any file that has one.
+
+Two consequences for how you write the report and the code:
+
+- **`"not mapped by this recipe"` is the phrasing that survives an unseen
+  file. `"not declared in the source"` is a claim about someone else's data
+  and needs evidence you usually do not have.** The same module already gets
+  this right for objective, stage position, plate/well and ROIs — and wrong
+  for exactly the fields where it guessed. Prefer the recipe-scoped wording
+  unless you have parsed the source and can point at the absence.
+- **A field the mapping mentions in neither list is worse than a wrong
+  disclaimer.** A CZI declaring
+  `Information/Image/Dimensions/T/Positions/Interval/Increment = 2.526` was
+  served with `t` scale `1.0` and no unit, and nothing in `mapped` or
+  `not_mapped` said so, because the size loop iterates only `("x","y","z")`.
+  Silent loss reads as completeness. It also has downstream teeth: it is what
+  makes Neuroglancer render that view as a grey rectangle (see Neuroglancer,
+  below). Same for `ComponentBitCount 14` under a `uint16` container, where
+  the view publishes `window.max 65535` — four times the real full scale.
+
+Read the source metadata directly for this; do not ask the view. For OME-TIFF
+that is `tifffile.TiffFile(...).ome_metadata`; for CZI, `BioImage(...).metadata`
+is the acquisition's own XML tree.
 
 ## Consumers — all verified against this implementation
 
@@ -86,6 +168,37 @@ Pass the measured window explicitly:
 `layer.shaderControls = {normalized: {range: [start, end]}}`. Do not set
 `crossSectionScale` unless you know the right value — the default framing fits,
 and a wrong value renders uniform background grey.
+
+**For any view with a `t` axis, also pin `dimensions` with the spatial axes
+first.** Neuroglancer takes the **first three non-channel dimensions of the
+coordinate space** as its display dimensions. NGFF's canonical order is
+`t,c,z,y,x`, so left to itself it picks **t, z, y** and opens on a t–z
+cross-section. On a 3×5×256×256 CZI view that is a hugely magnified 3×5 grid:
+a flat grey rectangle, **with every chunk fetched and returned 200**, no error
+in the console and nothing wrong on the server. A `CYX` view never shows this,
+so it will not appear until the first file with a time axis.
+
+```json
+{"dimensions": {"x": [1e-7, "m"], "y": [1e-7, "m"], "z": [1e-6, "m"],
+                "t": [2.526, "s"], "c^": [1, ""]},
+ "position": [128, 128, 2.5, 1.5, 0.5],
+ "layers": [{"type": "image", "name": "view", "source": "zarr://<zarr_url>",
+             "opacity": 1.0,
+             "shaderControls": {"normalized": {"range": [1208.0, 16383.0]}}}],
+ "layout": "xy"}
+```
+
+Order the `dimensions` keys `x, y, z` before `t`; suffix the channel dimension
+`c^`. Nothing else needs overriding — `displayDimensions` at the top level had
+no effect in the deployed viewer, and giving `t` a seconds unit while leaving
+it first did not help either. It is the **ordering** that decides.
+
+The scale and unit you give `t` there come from the source file, not from the
+view: the view publishes `t` with scale `1.0` and no unit (see "Metadata",
+above). That unitless `1.0` is precisely why Neuroglancer treats `t` as a
+plausible display axis, so the two problems are one problem. Fixing the mapping
+so `t` carries a real spacing and a `second` unit would remove the need for the
+override; until then, pass it.
 
 ### OpenLayers / Leaflet and custom annotation UIs (tiles)
 
@@ -185,7 +298,22 @@ pool). Measure it; see "Honest measurement" below.
     speedup into a reported 19x. Make the working sets disjoint at the level the
     cache is keyed on, and write that rule into the record so the wrong number
     cannot resurface from the artefact.
-13. **Playwright's headless Chromium has no WebGL at all.** Vizarr and
+13. **A uniform canvas passes a naive spread check too.** The skill already says
+    a lit-pixel count cannot tell an image from a black canvas. Whole-frame
+    standard deviation is no better: a flat grey Neuroglancer frame with two
+    panel dividers scored 24.45, because the DIVIDERS carried the variance.
+    Measure spread over the middle half of the frame, where only pixels can be —
+    that reads 8 distinct levels on a broken render and 256 on a working one.
+14. **Neuroglancer needs an explicit `dimensions` block for any view with a t
+    axis.** Without one it picks its own axis pair, opens a 5-D view on a t-z
+    cross-section, and renders flat grey. It looks exactly like a data failure
+    and is a framing one.
+15. **A token in the request line lands in access logs.** Both credential forms
+    that survive a proxy — `?token=` and the `/t/<token>/` path prefix — put the
+    secret in the URL, so it is logged by every hop. The path form is still the
+    only one a viewer can use; treat such URLs as secrets, scope them narrowly,
+    and say so rather than presenting them as equivalent to a header.
+16. **Playwright's headless Chromium has no WebGL at all.** Vizarr and
     Neuroglancer render nothing. Run under `xvfb-run` with `headless=False` and
     swiftshader.
 
@@ -204,7 +332,14 @@ pool). Measure it; see "Honest measurement" below.
   to a bogus 19x until it was fixed.
 - A screenshot is not evidence on its own. Record the viewer's requests and
   their statuses, and count lit pixels **and** pixel spread — a uniform grey
-  canvas passes a lit-pixel check.
+  canvas passes a lit-pixel check. **Measure the spread over the middle of the
+  frame, not the whole frame:** the broken Neuroglancer render described above
+  scored a whole-frame stdev of 24.4 and passed, because panel dividers and
+  scale bars carry all the variance a whole-frame stdev needs. Cropping to the
+  central half, where only pixels can be, separated it cleanly — 8 distinct
+  grey levels on the grey rectangle against 256 on the working render.
+  All-200 chunk statuses do not rescue this: that render fetched every chunk
+  successfully.
 - Report what a local copy costs to materialise beside its throughput. It is
   fast per sample only after paying the same read up front.
 

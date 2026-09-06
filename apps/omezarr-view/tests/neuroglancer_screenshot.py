@@ -30,6 +30,14 @@ def _ink(path: Path) -> dict:
     import numpy as np
 
     arr = np.asarray(img, dtype=float)
+    import numpy as np
+
+    # Whole-frame spread is not enough: a flat grey canvas with two panel
+    # dividers scores well because the DIVIDERS carry all the variance. Measure
+    # the middle half, where only pixels can be.
+    arr = np.asarray(img, dtype=float)
+    h, w = arr.shape
+    central = arr[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
     hist = img.histogram()
     total = sum(hist)
     # Lit fraction alone cannot tell an image from a flat background: a canvas
@@ -65,7 +73,15 @@ def state_for(source: str, info: dict, window: dict | None) -> dict:
     # the volume, and forcing a scale zoomed so far out that the canvas was
     # uniform background grey — which the lit-pixel check happily called a
     # successful render.
-    return {"layers": [layer], "layout": "xy", "showDefaultAnnotations": False}
+    state = {"layers": [layer], "layout": "xy", "showDefaultAnnotations": False}
+    # Without an explicit dimensions block Neuroglancer picks its own axis pair
+    # and opens a 5-D view on a t-z cross-section, which renders as flat grey
+    # and looks like a data failure rather than a framing one.
+    axes = (info.get("axes") or "").lower()
+    if "t" in axes:
+        state["dimensions"] = {a: [1, ""] for a in axes if a in "xyz"}
+        state["displayDimensions"] = ["x", "y"]
+    return state
 
 
 async def shoot(base: str, dataset: str, out_dir: Path, scale: int,
@@ -126,7 +142,10 @@ async def shoot(base: str, dataset: str, out_dir: Path, scale: int,
         "chunk_requests_ok": len(ok),
         "canvas": ink,
         "page_errors": errors[:8],
-        "rendered": bool(ok) and ink["lit_fraction"] > 0.005 and ink["stdev"] > 3.0,
+        # Both halves, and the spread measured centrally: a broken render scored
+        # 8 distinct central levels, a working one 256.
+        "rendered": (bool(ok) and ink["lit_fraction"] > 0.005
+                     and ink["central_distinct_levels"] > 32),
     }
 
 

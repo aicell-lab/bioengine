@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numcodecs
 import numpy as np
 
+from .czi_meta import read_czi_extras
 from .ngff import SourceMetadata, build_ngff_attrs, from_ome_xml
 
 # Every Zarr client has zlib; blosc/zstd coverage in the browser is patchier.
@@ -104,14 +105,22 @@ class BaseView:
             if axis in axes:
                 size = self.level_shapes[0][axes.index(axis)]
                 self.attrs["omero"].setdefault("rdefs", {})[key] = size // 2
+        # Say what was DONE without asserting anything about the source: the
+        # builder already recorded whether the file declared windows, and
+        # overwriting that line with a hardcoded "not declared" is how a false
+        # claim survived even after the extractor learned to read them.
+        declared = bool(self.mapping.mapped.get("declared_display_windows"))
         self.mapping.unmapped = [
             m for m in self.mapping.unmapped if not m.startswith("display windows")
         ]
         self.mapping.miss(
             "display windows (contrast limits)",
-            "not declared in the source; view computes 1-99.8 percentiles from "
-            "a coarse level",
-        )
+            ("the source declares them; this view publishes windows measured "
+             "from the pixels instead (1-99.8 percentiles of a coarse level), "
+             "and the declared values are recorded but not applied")
+            if declared else
+            ("not declared in the source; view computes 1-99.8 percentiles "
+             "from a coarse level"))
         self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
 
 
@@ -172,15 +181,23 @@ class ReferenceView(BaseView):
         self.level_shapes = [list(lv.shape) for lv in s.levels]
         self.axes = s.axes.lower()
         self.dtype = np.dtype(s.dtype)
+        self.n_series = len(tf.series)
 
         t0 = time.perf_counter()
-        attrs, self.mapping = build_ngff_attrs(from_ome_xml(
+        source_md = from_ome_xml(
             ome_xml=tf.ome_metadata,
             axes=s.axes,
             level_shapes=self.level_shapes,
             dtype=str(self.dtype.str),
             name=self.title,
-        ))
+        )
+        # A multi-series file serves ONE series; silently picking the first and
+        # saying nothing would hide the rest from the reader entirely.
+        source_md.mark("scenes")
+        source_md.scenes = [getattr(x, "name", None) or f"series {i}"
+                            for i, x in enumerate(tf.series)]
+        source_md.served_scene = source_md.scenes[series]
+        attrs, self.mapping = build_ngff_attrs(source_md)
         self.build_timings["synthesise_metadata_s"] = time.perf_counter() - t0
 
         if ".zgroup" not in refs:
@@ -371,7 +388,8 @@ class BioIOView(BaseView):
         names: Optional[List[Optional[str]]] = None
         if self.img.channel_names:
             names = [str(n) for n in self.img.channel_names]
-        return SourceMetadata(
+
+        md = SourceMetadata(
             axes=self.axes,
             level_shapes=[list(self.shape)],
             dtype=self.dtype.str,
@@ -379,6 +397,29 @@ class BioIOView(BaseView):
             physical_sizes=sizes,
             channel_names=names,
         )
+        md.mark("physical pixel sizes", "channel names")
+
+        # BioIO's accessors stop at names and pixel sizes. Anything beyond them
+        # has to be read from the raw metadata, or the view must say it did not
+        # look — claiming "not declared" for a field nobody inspected is how
+        # three false statements got into published captions.
+        try:
+            extras, inspected = read_czi_extras(self.img.metadata)
+        except Exception:
+            extras, inspected = {}, []
+        md.mark(*inspected)
+        for attr, value in extras.items():
+            setattr(md, attr, value)
+
+        # BioIO's scene list is what is actually REACHABLE through this view, so
+        # it wins over the names in the raw metadata, which may be spelled
+        # differently and would otherwise disagree with served_scene.
+        scenes = [str(x) for x in (self.img.scenes or [])]
+        if scenes:
+            md.mark("scenes")
+            md.scenes = scenes
+            md.served_scene = str(self.img.current_scene)
+        return md
 
     def _plane(self, index: Tuple[int, ...]) -> np.ndarray:
         sel = tuple(slice(i, i + 1) for i in index[:-2])

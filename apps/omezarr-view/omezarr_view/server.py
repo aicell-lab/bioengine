@@ -126,13 +126,16 @@ def _redacted(summary: Dict[str, Any]) -> Dict[str, Any]:
     names are themselves the sensitive part of an image, so an unauthorised
     listing must not carry the view's report at all.
     """
+    # The title is author-written free text and routinely contains exactly what
+    # redaction is for — "3-channel pyramid (42 GB)", "T=3_Z=5_CH=2". Keeping it
+    # while stripping the shape fields is redaction in name only.
     return {
         "id": summary["id"],
-        "title": summary["title"],
         "location": summary["location"],
         "protected": True,
         "indexed": False,
         "redacted": True,
+        "note": "title and structure withheld; supply a token to see them",
     }
 
 
@@ -392,8 +395,14 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
 
     @app.get("/zarr/{dataset_id}")
     @app.get("/zarr/{dataset_id}/")
-    async def zarr_root(request: Request, dataset_id: str):
-        return await zarr_key(request, dataset_id, ".zgroup")
+    async def zarr_root(request: Request, dataset_id: str,
+                        authorization: Optional[str] = Header(None),
+                        token: Optional[str] = Query(None)):
+        # Must declare its own credential params and pass real values through:
+        # calling zarr_key as a plain function handed FastAPI's Header/Query
+        # sentinel objects to the authoriser, which then raised instead of
+        # answering 401 for a missing credential.
+        return await zarr_key(request, dataset_id, ".zgroup", authorization, token)
 
     @app.get("/zarr/{dataset_id}/{key:path}")
     async def zarr_key(request: Request, dataset_id: str, key: str,

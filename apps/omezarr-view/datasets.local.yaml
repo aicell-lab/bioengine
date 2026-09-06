@@ -1,0 +1,44 @@
+title: OME-Zarr views over existing files
+
+# STAGING config: the deployed datasets.yaml is remote-only because a worker
+# replica has no demo folder. This one adds the local files back, so the BioIO
+# recipe is demonstrable. Fetch them with `python fetch_demo_data.py`.
+sources:
+  - type: local_dir
+    path: ../../.dev/omezarr-view-data
+    licence: CC-BY-4.0
+    source_page: https://zenodo.org/records/8305531
+
+  - type: remote_files
+    files:
+      - id: idr0106
+        url: https://viv-demo.storage.googleapis.com/idr0106.pyramid.ome.tif
+        title: idr0106 — human lung, 3-channel pyramid (42 GB)
+        licence: CC-BY-4.0
+        attribution: IDR study idr0106, hosted as Viv demo data by HMS DBMI.
+        source_page: https://idr.openmicroscopy.org/
+      - id: spraggins-kidney
+        url: https://viv-demo.storage.googleapis.com/Vanderbilt-Spraggins-Kidney-MxIF.ome.tif
+        title: Human kidney, multiplexed immunofluorescence
+        licence: CC-BY-4.0
+        attribution: HuBMAP / Vanderbilt BIOMIC (Spraggins lab), Viv demo mirror.
+        source_page: https://portal.hubmapconsortium.org/
+
+  - type: files
+    token_env: OMEZARR_VIEW_DEMO_TOKEN
+    files:
+      - id: protected-mousebrain
+        path: ../../.dev/omezarr-view-data/MouseBrain_41Slices_1Tile_3Channel_2Illuminations_2Angles.czi
+        title: Mouse brain (access-controlled copy)
+        licence: CC-BY-4.0
+        source_page: https://zenodo.org/records/8305531
+
+  - type: derived
+    views:
+      - id: idr0106-training-10um
+        from: idr0106
+        title: idr0106 — training view, 10 µm/px, 2 channels, uint8
+        target_spacing_um: 10.0
+        channels: [alpha-SMA-FITC, A549-mCherry]
+        dtype: uint8
+        normalise: percentile

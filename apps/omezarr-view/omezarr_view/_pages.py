@@ -299,7 +299,7 @@ function card(d) {
       </div>
     </div>
     <div class="body">
-      <h3 class="title">${d.title}</h3>
+      <h3 class="title">${d.title || "(withheld)"}</h3>
       <p class="src">${d.source || (d.protected ? "path withheld until unlocked" : "")}</p>
       <dl class="specs" data-specs></dl>
       <div class="status" data-status></div>
@@ -721,4 +721,4 @@ function say(msg, cls = "") {
 ''',
 }
 
-SOURCE_HASHES = {'index.html': 'd8932bf1d77d6820', 'annotate.html': 'efc7143cad9c9317'}
+SOURCE_HASHES = {'index.html': '4e7606ad90ed87fb', 'annotate.html': 'efc7143cad9c9317'}

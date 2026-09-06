@@ -292,7 +292,7 @@ function card(d) {
       </div>
     </div>
     <div class="body">
-      <h3 class="title">${d.title}</h3>
+      <h3 class="title">${d.title || "(withheld)"}</h3>
       <p class="src">${d.source || (d.protected ? "path withheld until unlocked" : "")}</p>
       <dl class="specs" data-specs></dl>
       <div class="status" data-status></div>

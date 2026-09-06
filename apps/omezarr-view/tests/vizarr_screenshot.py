@@ -33,6 +33,14 @@ def _ink(path: Path) -> dict:
     # Ignore the control panel in the top-left corner.
     w, h = img.size
     img = img.crop((int(w * 0.25), 0, w, h))
+    import numpy as np
+
+    # Whole-frame spread is not enough: a flat grey canvas with two panel
+    # dividers scores well because the DIVIDERS carry all the variance. Measure
+    # the middle half, where only pixels can be.
+    arr = np.asarray(img, dtype=float)
+    h, w = arr.shape
+    central = arr[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
     hist = img.histogram()
     total = sum(hist)
     lit = sum(hist[12:])
@@ -146,7 +154,8 @@ async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120,
         "canvas": ink,
         "page_errors": errors[:10],
         # Both halves are required: tiles arrived AND the canvas is lit.
-        "rendered": bool(ok) and ink["lit_fraction"] > 0.005,
+        "rendered": (bool(ok) and ink["lit_fraction"] > 0.005
+                     and ink["central_distinct_levels"] > 32),
     }
 
 
