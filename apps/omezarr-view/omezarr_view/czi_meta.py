@@ -71,7 +71,14 @@ def read_czi_extras(metadata: Any) -> Tuple[Dict[str, Any], List[str]]:
         # Low/High are normalised fractions of the declared bit range. Files
         # commonly carry High alone, so requiring both silently discarded the
         # declaration and produced a false "not declared" line.
-        if high is not None and "bit_depth" in fields:
+        # Guard against the beamsplitter trap: this file carries ~200 other
+        # Low/High pairs under HardwareSetting/SpectralInfluencer, which are
+        # passband edges in NANOMETRES (412, 438, ...). A display Low/High is a
+        # normalised fraction, so anything outside 0..1 is not one, whatever
+        # element it was found in.
+        normalised = (high is not None and 0.0 <= high <= 1.0
+                      and (low is None or 0.0 <= low <= 1.0))
+        if normalised and "bit_depth" in fields:
             full = 2 ** fields["bit_depth"] - 1
             windows.append(((low or 0.0) * full, high * full))
         else:
