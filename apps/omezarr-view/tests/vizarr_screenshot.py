@@ -44,7 +44,12 @@ def _ink(path: Path) -> dict:
     hist = img.histogram()
     total = sum(hist)
     lit = sum(hist[12:])
-    return {"lit_fraction": round(lit / total, 4), "pixels": total}
+    return {
+        "lit_fraction": round(lit / total, 4),
+        "central_stdev": round(float(central.std()), 2),
+        "central_distinct_levels": int(np.unique(central.astype(np.uint8)).size),
+        "pixels": total,
+    }
 
 
 async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120,
