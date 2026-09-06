@@ -97,11 +97,16 @@ class MetadataMapping:
         self._named.add(field_name)
 
     def absent(self, field_name: str, checked: bool, detail: str = "") -> None:
-        """Record a field that did not make it in, saying WHY honestly."""
-        if checked:
-            reason = "not declared in the source"
-        else:
-            reason = "not read by this recipe, so its presence is unknown"
+        """Record a field that did not make it in, saying WHY honestly.
+
+        "not declared in the source" is a claim ABOUT THE FILE and may only be
+        made after actually looking. "not mapped by this recipe" is a claim
+        about this code, which is true whatever the file turns out to contain —
+        so it is the default, and it is the phrasing that survives contact with
+        a file nobody has seen.
+        """
+        reason = ("not declared in the source" if checked
+                  else "not mapped by this recipe")
         self.miss(field_name, f"{reason}{'; ' + detail if detail else ''}")
 
     def named(self, field_name: str) -> bool:
@@ -390,7 +395,7 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
 
     for absent in ("objective / instrument metadata", "stage position",
                    "plate / well context", "ROIs and annotations"):
-        mapping.miss(absent, "not read by this recipe")
+        mapping.miss(absent, "not mapped by this recipe")
 
     # Nothing this module knows how to drop may go unmentioned. The mapped dict
     # uses snake_case keys, so compare on a normalised form or the sweep
@@ -412,7 +417,7 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
             continue
         if slug in aliases and slug in {_slug(k) for k in mapping.mapped}:
             continue
-        mapping.miss(name, "not read by this recipe")
+        mapping.miss(name, "not mapped by this recipe")
 
     return attrs, mapping
 
