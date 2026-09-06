@@ -299,7 +299,9 @@ function card(d) {
       <div class="actions">
         <button class="primary" data-build>Build view</button>
         <button data-copy>Copy URL</button>
-        <a class="btn" data-vizarr target="_blank" rel="noopener">Open in Vizarr ↗</a>
+        <a class="btn" data-vizarr target="_blank" rel="noopener">Vizarr ↗</a>
+        <a class="btn" data-ng target="_blank" rel="noopener">Neuroglancer ↗</a>
+        <a class="btn" data-annotate target="_blank" rel="noopener">Annotate ↗</a>
         <button data-unlock hidden>Unlock</button>
       </div>
       <details data-details hidden>
@@ -309,6 +311,8 @@ function card(d) {
     </div>`;
 
   const unlockBtn = el.querySelector("[data-unlock]");
+  const ngEl = el.querySelector("[data-ng]");
+  const annEl = el.querySelector("[data-annotate]");
   const statusEl = el.querySelector("[data-status]");
   const specsEl = el.querySelector("[data-specs]");
   const buildBtn = el.querySelector("[data-build]");
@@ -321,8 +325,21 @@ function card(d) {
   const zarrUrl = () => d.token
     ? d.zarr_url.replace("/zarr/", `/t/${encodeURIComponent(d.token)}/zarr/`)
     : d.zarr_url;
+  // Neuroglancer takes its whole state in the fragment. It reads NGFF axes and
+  // scales but not the OME display windows, so the contrast measured for this
+  // view is passed explicitly — otherwise 16-bit data opens near black.
+  const ngUrl = () => {
+    const win = d.metadata_mapping && d.omero_window;
+    const layer = { type: "image", name: d.id, source: `zarr://${zarrUrl()}` };
+    if (win) layer.shaderControls = { normalized: { range: [win.start, win.end] } };
+    const state = { layers: [layer], layout: "xy", showDefaultAnnotations: false };
+    return "https://neuroglancer-demo.appspot.com/#!" + encodeURIComponent(JSON.stringify(state));
+  };
   const refreshLinks = () => {
     vizarrEl.href = `https://hms-dbmi.github.io/vizarr/?source=${zarrUrl()}`;
+    ngEl.href = ngUrl();
+    annEl.href = `annotate?dataset=${encodeURIComponent(d.id)}` +
+      (d.token ? `&token=${encodeURIComponent(d.token)}` : "");
   };
   refreshLinks();
   el.querySelector("[data-copy]").onclick = async () => {

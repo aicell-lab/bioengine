@@ -439,30 +439,44 @@ class BioIOView(BaseView):
 # ---------------------------------------------------------------------------
 
 
-def _default_fetcher(attempts: int = 4):
+def _default_fetcher(attempts: int = 5, max_inflight: int = 8):
     """Range-read bytes from a URL or a local path.
 
-    Object stores drop pooled connections freely, and a viewer opening a
-    pyramid fires dozens of range requests at once — without a retry the first
-    dropped connection surfaces to the browser as a 500 and the tile renders
-    black. Retries rebuild the client, since a torn-down HTTP/2 connection
-    stays broken.
+    Two things this has to survive, both learned the hard way against Google
+    Cloud Storage. Object stores drop pooled connections freely, so a dropped
+    connection must be retried rather than surfaced as a 500 that renders a
+    black tile. And HTTP/2 multiplexes every range read onto ONE connection,
+    so a single reset takes out all of them at once; under a viewer's or a
+    training loader's parallel reads that happened often enough to fail whole
+    requests. Pooled HTTP/1.1 with bounded concurrency isolates the failures
+    to one read, which the retry then absorbs.
     """
     import httpx
 
-    state = {"client": httpx.Client(http2=True, timeout=120, follow_redirects=True)}
+    def _new() -> "httpx.Client":
+        return httpx.Client(
+            http2=False,
+            timeout=120,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=max_inflight * 2,
+                                max_keepalive_connections=max_inflight),
+        )
+
+    state = {"client": _new()}
     lock = threading.Lock()
+    inflight = threading.Semaphore(max_inflight)
 
     def _reset(dead) -> None:
+        """Swap in a fresh client. Deliberately does NOT close the old one.
+
+        httpx.Client is safe to share across threads, but closing one is not:
+        a sibling thread mid-request on the same client gets "Cannot send a
+        request, as the client has been closed". Dropping the reference lets
+        it be collected once its in-flight requests finish.
+        """
         with lock:
             if state["client"] is dead:
-                try:
-                    dead.close()
-                except Exception:
-                    pass
-                state["client"] = httpx.Client(
-                    http2=True, timeout=120, follow_redirects=True
-                )
+                state["client"] = _new()
 
     def fetch(url: str, offset: int, length: int) -> bytes:
         if "://" not in url or url.startswith("file://"):
@@ -475,16 +489,19 @@ def _default_fetcher(attempts: int = 4):
         for attempt in range(attempts):
             client = state["client"]
             try:
-                r = client.get(url, headers=headers)
+                with inflight:
+                    r = client.get(url, headers=headers)
                 r.raise_for_status()
                 return r.content
-            except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            except (httpx.TransportError, httpx.HTTPStatusError, RuntimeError) as e:
                 last = e
                 if isinstance(e, httpx.HTTPStatusError) and \
                         e.response.status_code not in (429, 500, 502, 503, 504):
                     raise
+                if isinstance(e, RuntimeError) and "closed" not in str(e):
+                    raise
                 _reset(client)
-                time.sleep(0.2 * (2 ** attempt))
+                time.sleep(0.25 * (2 ** attempt))
         raise RuntimeError(f"range read failed after {attempts} attempts: {last}")
 
     return fetch

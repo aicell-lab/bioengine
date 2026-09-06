@@ -6,3 +6,6 @@ served_measurements.json
 __pycache__/
 *.pyc
 served_derived.json
+.training_demo/
+annotations/
+training_run.log

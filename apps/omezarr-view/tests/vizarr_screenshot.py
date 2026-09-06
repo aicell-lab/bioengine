@@ -40,7 +40,8 @@ def _ink(path: Path) -> dict:
 
 
 async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120,
-                warm: bool = True) -> dict:
+                warm: bool = True, scale: int = 1, zoom: int = 0,
+                suffix: str = "") -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     source = f"{base}/zarr/{dataset}"
     url = f"{VIZARR}?source={source}"
@@ -69,7 +70,8 @@ async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120,
             "--enable-unsafe-swiftshader",
             "--ignore-gpu-blocklist",
         ])
-        page = await browser.new_page(viewport={"width": 1280, "height": 860})
+        page = await browser.new_page(viewport={"width": 1280, "height": 860},
+                                      device_scale_factor=scale)
 
         def on_response(r):
             if source in r.url:
@@ -106,7 +108,25 @@ async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120,
                 # screenshots the gap and reports a black canvas as a failure.
                 break
 
-        shot = out_dir / f"vizarr-{dataset}.png"
+        if zoom:
+            # Zooming in forces the finest levels to load, which is what proves
+            # the full-resolution tiles are really being served rather than a
+            # thumbnail standing in for them.
+            await page.mouse.move(820, 430)
+            for _ in range(zoom):
+                await page.mouse.wheel(0, -240)
+                await asyncio.sleep(0.7)
+            settle = time.perf_counter()
+            last = len(calls)
+            while time.perf_counter() - settle < 25:
+                await asyncio.sleep(0.5)
+                if len(calls) != last:
+                    last = len(calls)
+                    settle = time.perf_counter()
+                elif time.perf_counter() - settle > 8:
+                    break
+
+        shot = out_dir / f"vizarr-{dataset}{suffix}.png"
         await page.screenshot(path=str(shot))
         await browser.close()
 
@@ -134,15 +154,23 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
     ap.add_argument("--out", default="../../.dev/omezarr-probe/shots")
+    ap.add_argument("--scale", type=int, default=1,
+                    help="device pixel ratio; use 2 for figure-grade assets")
+    ap.add_argument("--zoom", type=int, default=0,
+                    help="wheel ticks to zoom in before the shot, forcing the "
+                         "finest pyramid levels to load")
+    ap.add_argument("--suffix", default="")
     ap.add_argument("datasets", nargs="+")
     args = ap.parse_args()
 
     results = []
     for ds in args.datasets:
-        r = await shoot(args.base, ds, Path(args.out))
+        r = await shoot(args.base, ds, Path(args.out), scale=args.scale,
+                        zoom=args.zoom, suffix=args.suffix)
         results.append(r)
         print(json.dumps(r, indent=1))
-    Path(args.out, "vizarr_results.json").write_text(json.dumps(results, indent=1))
+    Path(args.out, f"vizarr_results{args.suffix or ''}.json").write_text(
+        json.dumps(results, indent=1))
     return 0 if all(r["rendered"] for r in results) else 1
 
 

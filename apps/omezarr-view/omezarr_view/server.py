@@ -34,6 +34,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from .catalog import Catalog, DatasetEntry
 from .recipes import ViewError
+from .tiles import TileRenderer
 
 logger = logging.getLogger("omezarr-view")
 
@@ -146,6 +147,10 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
     public_url = (public_url or os.getenv("OMEZARR_VIEW_PUBLIC_URL", "")).rstrip("/")
     thumbnails: Dict[str, bytes] = {}
     cache = ChunkCache(int(os.getenv("OMEZARR_VIEW_CACHE_BYTES", 512 << 20)))
+    renderers: Dict[str, TileRenderer] = {}
+    annotations_dir = Path(os.getenv(
+        "OMEZARR_VIEW_ANNOTATIONS",
+        Path(config_path).resolve().parent / "annotations"))
 
     app = FastAPI(title="BioEngine OME-Zarr view", docs_url="/api/docs")
     app.add_middleware(
@@ -186,6 +191,85 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         except ViewError as e:
             raise HTTPException(422, str(e)) from e
 
+    async def renderer_for(entry: DatasetEntry) -> TileRenderer:
+        view = await build_view(entry)
+        if entry.id not in renderers:
+            renderers[entry.id] = TileRenderer(view)
+        return renderers[entry.id]
+
+    def _indices(request: Request) -> Dict[str, int]:
+        """Non-spatial axis positions (z, t, ...) from the query string."""
+        out: Dict[str, int] = {}
+        for axis in ("t", "z"):
+            raw = request.query_params.get(axis)
+            if raw is not None:
+                try:
+                    out[axis] = int(raw)
+                except ValueError:
+                    raise HTTPException(400, f"{axis} must be an integer")
+        return out
+
+    @app.get("/api/datasets/{dataset_id}/tilegrid.json")
+    async def tilegrid(dataset_id: str,
+                       authorization: Optional[str] = Header(None),
+                       token: Optional[str] = Query(None)):
+        entry = entry_or_404(dataset_id)
+        _authorise(entry, authorization, token)
+        renderer = await renderer_for(entry)
+        return await asyncio.to_thread(renderer.grid)
+
+    @app.get("/tiles/{dataset_id}/{zoom}/{tx}/{ty}.png")
+    async def tile(request: Request, dataset_id: str, zoom: int, tx: int, ty: int,
+                   channels: Optional[str] = Query(None),
+                   authorization: Optional[str] = Header(None),
+                   token: Optional[str] = Query(None)):
+        """RGB tiles, so tile-based clients (OpenLayers, Leaflet) can consume
+        the same lazy view that Zarr clients read directly."""
+        entry = entry_or_404(dataset_id)
+        _authorise(entry, authorization, token)
+        renderer = await renderer_for(entry)
+        picked = ([int(c) for c in channels.split(",") if c.strip().isdigit()]
+                  if channels else None)
+        png = await asyncio.to_thread(renderer.render, zoom, tx, ty,
+                                      _indices(request), picked)
+        if png is None:
+            raise HTTPException(404, "no such tile")
+        return Response(png, media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+    @app.get("/api/datasets/{dataset_id}/annotations")
+    async def get_annotations(dataset_id: str,
+                              authorization: Optional[str] = Header(None),
+                              token: Optional[str] = Query(None)):
+        entry = entry_or_404(dataset_id)
+        _authorise(entry, authorization, token)
+        path = annotations_dir / f"{entry.id}.geojson"
+        if not path.exists():
+            return {"type": "FeatureCollection", "features": []}
+        return json.loads(path.read_text())
+
+    @app.put("/api/datasets/{dataset_id}/annotations")
+    async def put_annotations(dataset_id: str, payload: Dict[str, Any],
+                              authorization: Optional[str] = Header(None),
+                              token: Optional[str] = Query(None)):
+        """Annotations are stored beside the catalog, never in the image.
+
+        The source file stays the untouched record — that is the whole claim —
+        so anything a user draws lands in its own GeoJSON file.
+        """
+        entry = entry_or_404(dataset_id)
+        _authorise(entry, authorization, token)
+        if payload.get("type") != "FeatureCollection":
+            raise HTTPException(400, "expected a GeoJSON FeatureCollection")
+        annotations_dir.mkdir(parents=True, exist_ok=True)
+        path = annotations_dir / f"{entry.id}.geojson"
+        path.write_text(json.dumps(payload, indent=1))
+        return {"saved": len(payload.get("features", [])), "path": str(path)}
+
+    @app.get("/annotate", response_class=HTMLResponse)
+    async def annotate():
+        return HTMLResponse((FRONTEND / "annotate.html").read_text())
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "datasets": len(catalog.entries),
@@ -221,6 +305,12 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         root = base_url(request)
         summary["zarr_url"] = f"{root}/zarr/{entry.id}"
         summary["vizarr_url"] = f"{VIZARR}?source={summary['zarr_url']}"
+        view = entry.view
+        channels = ((view.attrs.get("omero") or {}).get("channels") or []) if view else []
+        if channels:
+            # Neuroglancer ignores the omero block, so a client building a
+            # Neuroglancer link needs the measured window handed to it.
+            summary["omero_window"] = channels[0]["window"]
         return summary
 
     @app.get("/api/datasets/{dataset_id}/reference.json")
