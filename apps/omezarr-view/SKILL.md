@@ -193,12 +193,18 @@ Order the `dimensions` keys `x, y, z` before `t`; suffix the channel dimension
 no effect in the deployed viewer, and giving `t` a seconds unit while leaving
 it first did not help either. It is the **ordering** that decides.
 
-The scale and unit you give `t` there come from the source file, not from the
-view: the view publishes `t` with scale `1.0` and no unit (see "Metadata",
-above). That unitless `1.0` is precisely why Neuroglancer treats `t` as a
-plausible display axis, so the two problems are one problem. Fixing the mapping
-so `t` carries a real spacing and a `second` unit would remove the need for the
-override; until then, pass it.
+**The override is required even when the view's own `t` axis is correct.** An
+earlier version of this section guessed the opposite — that a `t` axis
+published with scale `1.0` and no unit was what made Neuroglancer treat it as a
+display axis, so fixing the mapping would make the override unnecessary. That
+guess has since been tested and is **wrong**. Against a view publishing `t` as
+scale `2.526`, unit `second`, the minimal state still fetched five chunks with
+status 200 and painted the same flat grey frame (`central_distinct_levels` 8);
+the same view with `x, y, z` ordered ahead of `t` fetched one chunk and
+rendered (256 levels). Neuroglancer picks by **position in the coordinate
+space, not by unit**, so a correct mapping does not rescue it. Pass the
+override on every view with a `t` axis, and treat a metadata fix and this
+override as two separate obligations.
 
 ### OpenLayers / Leaflet and custom annotation UIs (tiles)
 
@@ -298,22 +304,41 @@ pool). Measure it; see "Honest measurement" below.
     speedup into a reported 19x. Make the working sets disjoint at the level the
     cache is keyed on, and write that rule into the record so the wrong number
     cannot resurface from the artefact.
-13. **A uniform canvas passes a naive spread check too.** The skill already says
+13. **A percentile over a spatially biased subsample is WRONG, not approximate,
+    and adding pixels does not fix it.** Sampling a few windows to estimate a
+    display range looks like a bounded-cost win and is a correctness bug:
+    intensity in a tissue section is structured in space, so the estimate stays
+    biased however many pixels it draws from inside the bias. Measured on a
+    43-channel slide, a 2-chunk diagonal sample (131,072 px) was **33x less
+    accurate** than striding across every chunk (82,628 px) — fewer pixels, more
+    coverage, better answer — and put 28 of 43 channels outside 5%, worst case
+    publishing [0, 4] where the truth was [0, 244]. Read a level in FULL when
+    that is affordable (a pyramid's coarsest level nearly always is), and when
+    it is not, say the window is unmeasured rather than publish one that is
+    quietly wrong. A screenshot will not catch this: the default-active channels
+    can be the accurate ones, so the first render looks right and the damage is
+    wherever the user goes next.
+14. **A uniform canvas passes a naive spread check too.** The skill already says
     a lit-pixel count cannot tell an image from a black canvas. Whole-frame
     standard deviation is no better: a flat grey Neuroglancer frame with two
     panel dividers scored 24.45, because the DIVIDERS carried the variance.
     Measure spread over the middle half of the frame, where only pixels can be —
     that reads 8 distinct levels on a broken render and 256 on a working one.
-14. **Neuroglancer needs an explicit `dimensions` block for any view with a t
+15. **Neuroglancer needs an explicit `dimensions` block for any view with a t
     axis.** Without one it picks its own axis pair, opens a 5-D view on a t-z
     cross-section, and renders flat grey. It looks exactly like a data failure
-    and is a framing one.
-15. **A token in the request line lands in access logs.** Both credential forms
+    and is a framing one. **Mapping the time increment correctly does NOT
+    remove the need for it** — Neuroglancer chooses display dimensions by
+    POSITION in the coordinate space, not by unit — so publishing a real t
+    scale and supplying the override are two separate obligations. (Verified
+    against a view publishing t as scale 2.526 unit second: minimal state still
+    broken, x/y/z-first renders.)
+16. **A token in the request line lands in access logs.** Both credential forms
     that survive a proxy — `?token=` and the `/t/<token>/` path prefix — put the
     secret in the URL, so it is logged by every hop. The path form is still the
     only one a viewer can use; treat such URLs as secrets, scope them narrowly,
     and say so rather than presenting them as equivalent to a header.
-16. **Playwright's headless Chromium has no WebGL at all.** Vizarr and
+17. **Playwright's headless Chromium has no WebGL at all.** Vizarr and
     Neuroglancer render nothing. Run under `xvfb-run` with `headless=False` and
     swiftshader.
 

@@ -91,6 +91,11 @@ the metadata, the chunks, the thumbnail, and the catalog entry, which is
 reduced to a stub — image dimensions, pixel sizes and channel names are
 themselves sensitive.
 
+**The dataset id is public even when the dataset is not.** Every route needs it,
+so redaction cannot withhold it — and `local_dir` / `remote_prefix` derive ids
+from filenames, so `patient_042_HER2_biopsy.czi` becomes the public id
+`patient-042-her2-biopsy`. Set an explicit `id:` for anything sensitive.
+
 Tokens travel three ways: `Authorization: Bearer …`, `?token=…`, or a
 `/t/{token}/zarr/…` path prefix. **Use the path form for viewers.** A Zarr
 client builds chunk URLs by appending the key to the store root, so a

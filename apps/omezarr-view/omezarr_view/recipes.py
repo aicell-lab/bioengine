@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -98,9 +99,21 @@ class BaseView:
             # Bounded sample, NOT the thumbnail: on a single-scale source the
             # thumbnail path reads a whole plane per channel, which is the
             # entire file.
-            level = len(self.level_shapes) - 1
-            while level > 0 and max(self.level_shapes[level][-2:]) < 256:
-                level -= 1
+            level, n_chunks, affordable = _display_sample_plan(self)
+            if not affordable:
+                self.display_sample_note = (
+                    f"NOT measured: full coverage of level {level} would need "
+                    f"{n_chunks} chunk reads, over the budget of "
+                    f"{FULL_COVERAGE_CHUNK_BUDGET}. A partial sample of a tissue "
+                    "section is spatially biased at any pixel count, so no "
+                    "window is published and the range shown is the declared "
+                    "bit depth. Raise OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS to measure it.")
+                self.mapping.unmapped = [m for m in self.mapping.unmapped
+                                         if not m.startswith("display windows")]
+                self.mapping.miss("display windows (contrast limits)",
+                                  self.display_sample_note)
+                self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
+                return
             sample = _sample_for_display(self, level)
         except Exception:
             return
@@ -138,9 +151,9 @@ class BaseView:
              "from a coarse level"))
         self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
         self.display_sample_note = (
-            f"{SAMPLE_WINDOWS_PER_CHANNEL} chunk-aligned windows per channel at "
-            f"level {level}, spread across the frame and fetched in parallel; "
-            "the cost does not scale with the file")
+            f"every chunk of level {level} ({n_chunks} chunk reads, in "
+            "parallel) — full spatial coverage, because a partial sample of a "
+            "tissue section is biased at any pixel count")
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +599,15 @@ def _default_fetcher(attempts: int = 5, max_inflight: int = 8):
 # read the entire image: 529 s of a 634 s first request on a 116 MB file, and
 # an eleven-minute first click for whoever opens a cold view. The sample only
 # needs enough pixels for a percentile, so it is bounded by construction.
-SAMPLE_WINDOWS_PER_CHANNEL = 2
+# An UNBIASED percentile needs spatial COVERAGE, not pixel count. An
+# independent sweep found a 2-chunk diagonal sample (131,072 px) was 33x less
+# accurate than striding across every chunk (82,628 px) — fewer pixels, more
+# coverage, better answer — because intensity in a tissue section is structured
+# in space, so any partial sample stays biased however many pixels it draws.
+# So: read a level in FULL when that is affordable, and when it is not, say the
+# window is unmeasured rather than publish one that is wrong on most channels.
+FULL_COVERAGE_CHUNK_BUDGET = int(os.environ.get(
+    "OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS", "512"))
 SAMPLE_FETCH_WORKERS = 12
 
 
@@ -626,19 +647,26 @@ def _read_level(view: BaseView, level: int, max_side: int = 4096) -> np.ndarray:
     return out
 
 
-def _sample_for_display(view: BaseView, level: int) -> np.ndarray:
-    """A bounded, spread pixel sample per channel, for percentile estimation.
+def _display_sample_plan(view: "BaseView"):
+    """Pick a level to sample and say whether full coverage is affordable."""
+    level = len(view.level_shapes) - 1
+    while level > 0 and max(view.level_shapes[level][-2:]) < 256:
+        level -= 1
+    arr = _level_array(view, level)
+    axes = view.axes
+    yi, xi = len(axes) - 2, len(axes) - 1
+    grid_y = max(1, -(-arr.shape[yi] // arr.chunks[yi]))
+    grid_x = max(1, -(-arr.shape[xi] // arr.chunks[xi]))
+    n_c = arr.shape[axes.index("c")] if "c" in axes else 1
+    total = grid_y * grid_x * n_c
+    return level, total, total <= FULL_COVERAGE_CHUNK_BUDGET
 
-    Three properties, each of which cost real time to learn:
 
-    * **Bounded.** A couple of windows per channel, never a whole plane. On a
-      single-scale source the coarsest level IS the full image, so a per-plane
-      sample read the entire file.
-    * **Chunk-aligned.** A window that straddles the chunk grid pulls up to
-      four chunks to show one; aligning makes it exactly one.
-    * **Fetched in parallel.** These are independent remote range reads, and
-      doing 86 of them in series is the difference between two minutes and two
-      seconds.
+def _sample_for_display(view: "BaseView", level: int) -> np.ndarray:
+    """Read EVERY chunk of one plane per channel at ``level``, in parallel.
+
+    Full spatial coverage is what makes the percentile unbiased. Cost is bounded
+    by CHOOSING the level, never by skipping parts of it.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -647,34 +675,32 @@ def _sample_for_display(view: BaseView, level: int) -> np.ndarray:
     shape, chunks = arr.shape, arr.chunks
     yi, xi = len(axes) - 2, len(axes) - 1
     n_c = shape[axes.index("c")] if "c" in axes else 1
-
     grid_y = max(1, -(-shape[yi] // chunks[yi]))
     grid_x = max(1, -(-shape[xi] // chunks[xi]))
-    fracs = [(i + 1) / (SAMPLE_WINDOWS_PER_CHANNEL + 1)
-             for i in range(SAMPLE_WINDOWS_PER_CHANNEL)]
 
     jobs = []
     for c in range(n_c):
-        for f in fracs:
-            cy, cx = min(int(grid_y * f), grid_y - 1), min(int(grid_x * f), grid_x - 1)
-            y0, x0 = cy * chunks[yi], cx * chunks[xi]
-            sel: List[Any] = []
-            for i, a in enumerate(axes):
-                if i == yi:
-                    sel.append(slice(y0, min(y0 + chunks[yi], shape[yi])))
-                elif i == xi:
-                    sel.append(slice(x0, min(x0 + chunks[xi], shape[xi])))
-                elif a == "c":
-                    sel.append(c)
-                else:
-                    sel.append(shape[i] // 2)
-            jobs.append((c, tuple(sel)))
+        for gy in range(grid_y):
+            for gx in range(grid_x):
+                sel = []
+                for i, a in enumerate(axes):
+                    if i == yi:
+                        sel.append(slice(gy * chunks[yi],
+                                         min((gy + 1) * chunks[yi], shape[yi])))
+                    elif i == xi:
+                        sel.append(slice(gx * chunks[xi],
+                                         min((gx + 1) * chunks[xi], shape[xi])))
+                    elif a == "c":
+                        sel.append(c)
+                    else:
+                        sel.append(shape[i] // 2)
+                jobs.append((c, tuple(sel)))
 
     def fetch(job):
         c, sel = job
         return c, np.asarray(arr[sel]).reshape(-1)
 
-    per_channel: Dict[int, List[np.ndarray]] = {c: [] for c in range(n_c)}
+    per_channel = {c: [] for c in range(n_c)}
     with ThreadPoolExecutor(max_workers=SAMPLE_FETCH_WORKERS) as pool:
         for c, values in pool.map(fetch, jobs):
             per_channel[c].append(values)

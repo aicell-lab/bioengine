@@ -135,7 +135,10 @@ def _redacted(summary: Dict[str, Any]) -> Dict[str, Any]:
         "protected": True,
         "indexed": False,
         "redacted": True,
-        "note": "title and structure withheld; supply a token to see them",
+        "note": "title and structure withheld; supply a token to see them. "
+                "NOTE the id itself is public — every route needs it — and ids "
+                "derived from filenames leak what the filename said, so set an "
+                "explicit id for anything sensitive.",
     }
 
 

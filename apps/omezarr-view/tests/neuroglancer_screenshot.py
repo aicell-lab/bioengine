@@ -146,10 +146,12 @@ async def shoot(base: str, dataset: str, out_dir: Path, scale: int,
         "chunk_requests_ok": len(ok),
         "canvas": ink,
         "page_errors": errors[:8],
-        # Both halves, and the spread measured centrally: a broken render scored
-        # 8 distinct central levels, a working one 256.
+        # 128, not 32. Against nine labelled frames the broken set scored
+        # [8, 8, 8, 37] and the working set [216, 227, 231, 256, 256], so the
+        # real gap is [37, 216]: a 4-panel Neuroglancer layout of nothing but
+        # grey panels and section rules scores 37 and passed the old threshold.
         "rendered": (bool(ok) and ink["lit_fraction"] > 0.005
-                     and ink["central_distinct_levels"] > 32),
+                     and ink["central_distinct_levels"] > 128),
     }
 
 

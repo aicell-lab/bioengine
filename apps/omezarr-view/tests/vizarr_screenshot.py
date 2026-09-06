@@ -158,9 +158,14 @@ async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120,
         "chunk_statuses": sorted({c["status"] for c in chunks}),
         "canvas": ink,
         "page_errors": errors[:10],
-        # Both halves are required: tiles arrived AND the canvas is lit.
+        # 128, not 32. Against nine labelled frames the broken set scored
+        # [8, 8, 8, 37] and the working set [216, 227, 231, 256, 256], so the
+        # real gap is [37, 216]: a 4-panel Neuroglancer layout of nothing but
+        # grey panels and section rules scores 37 and passed the old threshold.
+        # 128 sits 3.5x above the worst broken frame and 1.7x below the best
+        # working one.
         "rendered": (bool(ok) and ink["lit_fraction"] > 0.005
-                     and ink["central_distinct_levels"] > 32),
+                     and ink["central_distinct_levels"] > 128),
     }
 
 
