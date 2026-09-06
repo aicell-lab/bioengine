@@ -38,7 +38,26 @@ from .tiles import TileRenderer
 
 logger = logging.getLogger("omezarr-view")
 
-FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
+def _find_frontend() -> Optional[Path]:
+    """Locate the static pages.
+
+    A BioEngine replica receives the app source through Hypha's per-file
+    transport, and a __file__-relative sibling directory is not guaranteed to
+    land where it sits in the repo. Check the plausible roots rather than
+    assuming one, and let /health report the answer instead of failing with a
+    500 that says nothing.
+    """
+    here = Path(__file__).resolve()
+    for candidate in (here.parent.parent / "frontend",
+                      here.parent / "frontend",
+                      Path.cwd() / "frontend",
+                      Path.cwd() / "omezarr-view" / "frontend"):
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
+
+
+FRONTEND = _find_frontend()
 VIZARR = "https://hms-dbmi.github.io/vizarr/"
 
 
@@ -268,16 +287,34 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
 
     @app.get("/annotate", response_class=HTMLResponse)
     async def annotate():
-        return HTMLResponse((FRONTEND / "annotate.html").read_text())
+        return _page("annotate.html")
 
     @app.get("/health")
     async def health():
         return {"status": "ok", "datasets": len(catalog.entries),
-                "chunk_cache": cache.stats()}
+                "chunk_cache": cache.stats(),
+                "pages": "on-disk" if FRONTEND else "bundled"}
+
+    def _page(name: str) -> HTMLResponse:
+        # On disk when running from a checkout, so editing the HTML is live.
+        # Bundled when deployed, because a replica only receives Python modules.
+        if FRONTEND is not None:
+            return HTMLResponse((FRONTEND / name).read_text())
+        try:
+            from ._pages import PAGES
+        except ImportError:
+            raise HTTPException(
+                503,
+                "static pages are neither on disk nor bundled; run "
+                "`python -m omezarr_view.bundle`. The JSON API at /api/datasets "
+                "and the zarr endpoints at /zarr/{id} work regardless")
+        if name not in PAGES:
+            raise HTTPException(404, f"no page {name!r}")
+        return HTMLResponse(PAGES[name])
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
-        return HTMLResponse((FRONTEND / "index.html").read_text())
+        return _page("index.html")
 
     @app.get("/api/datasets")
     async def list_datasets(request: Request,

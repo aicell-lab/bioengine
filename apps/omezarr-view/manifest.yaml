@@ -13,6 +13,6 @@ git_repo: https://github.com/aicell-lab/bioengine
 links: []
 tags: [ome-zarr, ngff, data-access, bioio, kerchunk, vizarr]
 type: ray-serve
-version: 0.2.2
+version: 0.2.4
 entry: deployment:OmeZarrViewApp
 frontend_entry: "frontend/index.html"
