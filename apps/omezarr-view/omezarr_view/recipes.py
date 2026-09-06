@@ -66,6 +66,15 @@ class BaseView:
     def zarr_key(self, key: str) -> Optional[bytes]:
         raise NotImplementedError
 
+    def contains(self, key: str) -> bool:
+        """Does this key exist, WITHOUT fetching its bytes?
+
+        zarr asks `key in store` before reading it. Answering that by doing the
+        read and throwing it away doubles every chunk fetch on the build path —
+        measured at exactly 2.0x. Recipes that can answer from their index must.
+        """
+        return self.zarr_key(key) is not None
+
     def report(self) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -86,7 +95,13 @@ class BaseView:
             return
         t0 = time.perf_counter()
         try:
-            sample = self.thumbnail_array()
+            # Bounded sample, NOT the thumbnail: on a single-scale source the
+            # thumbnail path reads a whole plane per channel, which is the
+            # entire file.
+            level = len(self.level_shapes) - 1
+            while level > 0 and max(self.level_shapes[level][-2:]) < 256:
+                level -= 1
+            sample = _sample_for_display(self, level)
         except Exception:
             return
         for i, channel in enumerate(channels):
@@ -122,6 +137,10 @@ class BaseView:
             ("not declared in the source; view computes 1-99.8 percentiles "
              "from a coarse level"))
         self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
+        self.display_sample_note = (
+            f"{SAMPLE_WINDOWS_PER_CHANNEL} chunk-aligned windows per channel at "
+            f"level {level}, spread across the frame and fetched in parallel; "
+            "the cost does not scale with the file")
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +272,9 @@ class ReferenceView(BaseView):
         level = key.split("/", 1)[0]
         return OUT_COMPRESSOR.encode(self._decode_source_chunk(level, raw))
 
+    def contains(self, key: str) -> bool:
+        return normalise_chunk_key(key) in self.refs
+
     def raw_reference(self) -> Dict[str, Any]:
         """The index as the client would use it to bypass the server entirely.
 
@@ -296,8 +318,10 @@ class ReferenceView(BaseView):
             "source_pages_indexed": self.n_pages,
             "index_keys": len(self.refs),
             "build_reads": (
-                "file headers only to build the index; then one coarse level "
-                "sampled to set display range"),
+                "file headers only to build the index; then a bounded pixel "
+                "sample to set display range — " + getattr(
+                    self, "display_sample_note",
+                    "a few small windows per channel, not a whole level")),
             "index_copies_pixel_data": False,
             "build_timings_s": {k: round(v, 3) for k, v in self.build_timings.items()},
             "direct_client_access": True,
@@ -425,9 +449,7 @@ class BioIOView(BaseView):
         sel = tuple(slice(i, i + 1) for i in index[:-2])
         return np.ascontiguousarray(self.img.dask_data[sel].compute())
 
-    def zarr_key(self, key: str) -> Optional[bytes]:
-        if key in self._meta:
-            return self._meta[key]
+    def _chunk_index(self, key: str) -> Optional[Tuple[int, ...]]:
         key = normalise_chunk_key(key)
         if not key.startswith("0/"):
             return None
@@ -438,6 +460,17 @@ class BioIOView(BaseView):
         if len(index) != len(self.shape):
             return None
         if any(i < 0 or i * c >= s for i, c, s in zip(index, self.chunks, self.shape)):
+            return None
+        return index
+
+    def contains(self, key: str) -> bool:
+        return key in self._meta or self._chunk_index(key) is not None
+
+    def zarr_key(self, key: str) -> Optional[bytes]:
+        if key in self._meta:
+            return self._meta[key]
+        index = self._chunk_index(key)
+        if index is None:
             return None
         return OUT_COMPRESSOR.encode(self._plane(index))
 
@@ -548,18 +581,41 @@ def _default_fetcher(attempts: int = 5, max_inflight: int = 8):
     return fetch
 
 
-def _read_level(view: BaseView, level: int) -> np.ndarray:
-    """Read the middle plane of each channel at ``level``, as (C, Y, X)."""
+# A display-range sample must never scale with the file. On a SINGLE-SCALE
+# source the "coarsest level" IS level 0, so reading a whole plane per channel
+# read the entire image: 529 s of a 634 s first request on a 116 MB file, and
+# an eleven-minute first click for whoever opens a cold view. The sample only
+# needs enough pixels for a percentile, so it is bounded by construction.
+SAMPLE_WINDOWS_PER_CHANNEL = 2
+SAMPLE_FETCH_WORKERS = 12
+
+
+def _level_array(view: BaseView, level: int):
     import zarr
 
     store = _ViewStore(view)
-    arr = zarr.open_group(zarr.storage.KVStore(store), mode="r")[str(level)]
+    return zarr.open_group(zarr.storage.KVStore(store), mode="r")[str(level)]
+
+
+def _read_level(view: BaseView, level: int, max_side: int = 4096) -> np.ndarray:
+    """Read the middle plane of each channel at ``level``, as (C, Y, X).
+
+    Bounded: past ``max_side`` this returns a centred crop rather than the whole
+    plane, because the caller wants something to look at, not the whole file.
+    """
+    arr = _level_array(view, level)
     axes = view.axes
     shape = arr.shape
+    yi, xi = len(axes) - 2, len(axes) - 1
     sel: List[Any] = []
     for i, a in enumerate(axes):
-        if a in "yx":
-            sel.append(slice(None))
+        if i in (yi, xi):
+            extent = shape[i]
+            if extent > max_side:
+                start = (extent - max_side) // 2
+                sel.append(slice(start, start + max_side))
+            else:
+                sel.append(slice(None))
         elif a == "c":
             sel.append(slice(None))
         else:
@@ -568,6 +624,61 @@ def _read_level(view: BaseView, level: int) -> np.ndarray:
     if "c" not in axes:
         out = out[None]
     return out
+
+
+def _sample_for_display(view: BaseView, level: int) -> np.ndarray:
+    """A bounded, spread pixel sample per channel, for percentile estimation.
+
+    Three properties, each of which cost real time to learn:
+
+    * **Bounded.** A couple of windows per channel, never a whole plane. On a
+      single-scale source the coarsest level IS the full image, so a per-plane
+      sample read the entire file.
+    * **Chunk-aligned.** A window that straddles the chunk grid pulls up to
+      four chunks to show one; aligning makes it exactly one.
+    * **Fetched in parallel.** These are independent remote range reads, and
+      doing 86 of them in series is the difference between two minutes and two
+      seconds.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    arr = _level_array(view, level)
+    axes = view.axes
+    shape, chunks = arr.shape, arr.chunks
+    yi, xi = len(axes) - 2, len(axes) - 1
+    n_c = shape[axes.index("c")] if "c" in axes else 1
+
+    grid_y = max(1, -(-shape[yi] // chunks[yi]))
+    grid_x = max(1, -(-shape[xi] // chunks[xi]))
+    fracs = [(i + 1) / (SAMPLE_WINDOWS_PER_CHANNEL + 1)
+             for i in range(SAMPLE_WINDOWS_PER_CHANNEL)]
+
+    jobs = []
+    for c in range(n_c):
+        for f in fracs:
+            cy, cx = min(int(grid_y * f), grid_y - 1), min(int(grid_x * f), grid_x - 1)
+            y0, x0 = cy * chunks[yi], cx * chunks[xi]
+            sel: List[Any] = []
+            for i, a in enumerate(axes):
+                if i == yi:
+                    sel.append(slice(y0, min(y0 + chunks[yi], shape[yi])))
+                elif i == xi:
+                    sel.append(slice(x0, min(x0 + chunks[xi], shape[xi])))
+                elif a == "c":
+                    sel.append(c)
+                else:
+                    sel.append(shape[i] // 2)
+            jobs.append((c, tuple(sel)))
+
+    def fetch(job):
+        c, sel = job
+        return c, np.asarray(arr[sel]).reshape(-1)
+
+    per_channel: Dict[int, List[np.ndarray]] = {c: [] for c in range(n_c)}
+    with ThreadPoolExecutor(max_workers=SAMPLE_FETCH_WORKERS) as pool:
+        for c, values in pool.map(fetch, jobs):
+            per_channel[c].append(values)
+    return np.stack([np.concatenate(per_channel[c]) for c in range(n_c)])
 
 
 class _ViewStore(dict):
@@ -584,13 +695,9 @@ class _ViewStore(dict):
         return value
 
     def __contains__(self, key: object) -> bool:
-        if not isinstance(key, str):
-            return False
-        try:
-            self[key]
-        except KeyError:
-            return False
-        return True
+        # Ask, do not fetch: reading the chunk to answer an existence question
+        # made every build-path chunk arrive twice.
+        return isinstance(key, str) and self._view.contains(key)
 
     def __iter__(self):
         return iter(())

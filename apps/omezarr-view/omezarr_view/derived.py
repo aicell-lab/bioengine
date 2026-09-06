@@ -431,6 +431,21 @@ class DerivedView(BaseView):
         tile[..., : y1 - y0, : x1 - x0] = resized.astype(self.dtype, copy=False)
         return tile
 
+    def contains(self, key: str) -> bool:
+        if key in self._meta:
+            return True
+        head, _, rest = normalise_chunk_key(key).partition("/")
+        try:
+            level, index = int(head), tuple(int(p) for p in rest.split("."))
+        except ValueError:
+            return False
+        if not 0 <= level < len(self.level_shapes):
+            return False
+        shape = self.level_shapes[level]
+        return (len(index) == len(shape)
+                and not any(i < 0 or i * c >= s
+                            for i, c, s in zip(index, self.chunks, shape)))
+
     def zarr_key(self, key: str) -> Optional[bytes]:
         if key in self._meta:
             return self._meta[key]
