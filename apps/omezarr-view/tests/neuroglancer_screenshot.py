@@ -22,35 +22,36 @@ NEUROGLANCER = "https://neuroglancer-demo.appspot.com/"
 
 
 def _ink(path: Path) -> dict:
+    """Is anything actually drawn?
+
+    Lit-fraction alone passes a black canvas. Whole-frame spread alone passes a
+    flat grey one, because the viewer's panel dividers carry the variance — a
+    broken Neuroglancer render scored stdev 24.45 that way. Spread over the
+    MIDDLE HALF is the metric that separates them: 8 distinct levels on the
+    broken frame, 256 on a working one.
+    """
+    import numpy as np
     from PIL import Image
 
     img = Image.open(path).convert("L")
     w, h = img.size
     img = img.crop((int(w * 0.02), int(h * 0.10), int(w * 0.98), int(h * 0.98)))
-    import numpy as np
-
-    arr = np.asarray(img, dtype=float)
-    import numpy as np
-
-    # Whole-frame spread is not enough: a flat grey canvas with two panel
-    # dividers scores well because the DIVIDERS carry all the variance. Measure
-    # the middle half, where only pixels can be.
     arr = np.asarray(img, dtype=float)
     h, w = arr.shape
     central = arr[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
     hist = img.histogram()
     total = sum(hist)
-    # Lit fraction alone cannot tell an image from a flat background: a canvas
-    # of uniform grey scores 1.0. Structure (pixel spread) is the half that
-    # distinguishes them.
     return {
         "lit_fraction": round(sum(hist[12:]) / total, 4),
         "stdev": round(float(arr.std()), 2),
+        "central_stdev": round(float(central.std()), 2),
+        "central_distinct_levels": int(np.unique(central.astype(np.uint8)).size),
         "pixels": total,
     }
 
 
-def state_for(source: str, info: dict, window: dict | None) -> dict:
+def state_for(source: str, info: dict, window: dict | None,
+              force_dimensions: bool = False) -> dict:
     """A viewer state: one image layer over the served view.
 
     Neuroglancer reads the NGFF axes and scales, but it does not read the OME
@@ -74,18 +75,21 @@ def state_for(source: str, info: dict, window: dict | None) -> dict:
     # uniform background grey — which the lit-pixel check happily called a
     # successful render.
     state = {"layers": [layer], "layout": "xy", "showDefaultAnnotations": False}
-    # Without an explicit dimensions block Neuroglancer picks its own axis pair
-    # and opens a 5-D view on a t-z cross-section, which renders as flat grey
-    # and looks like a data failure rather than a framing one.
+    # An override is OFF by default. What made Neuroglancer pick t as a display
+    # axis was a unitless t of scale 1.0; once the view maps the real time
+    # increment, the override is unnecessary — and leaving it on would hide
+    # whether that mapping actually works. Opt in with --force-dimensions only
+    # to measure the delta against a view that still has the bug.
     axes = (info.get("axes") or "").lower()
-    if "t" in axes:
+    if force_dimensions and "t" in axes:
         state["dimensions"] = {a: [1, ""] for a in axes if a in "xyz"}
         state["displayDimensions"] = ["x", "y"]
     return state
 
 
 async def shoot(base: str, dataset: str, out_dir: Path, scale: int,
-                settle_s: int, timeout_s: int) -> dict:
+                settle_s: int, timeout_s: int,
+                force_dimensions: bool = False) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     source = f"{base}/zarr/{dataset}"
 
@@ -95,7 +99,7 @@ async def shoot(base: str, dataset: str, out_dir: Path, scale: int,
     attrs = httpx.get(f"{base}/zarr/{dataset}/.zattrs", timeout=900).json()
     channels = (attrs.get("omero") or {}).get("channels") or []
     window = channels[0]["window"] if channels else None
-    state = state_for(source, info, window)
+    state = state_for(source, info, window, force_dimensions)
     url = NEUROGLANCER + "#!" + urllib.parse.quote(json.dumps(state))
 
     calls: list[dict] = []
@@ -155,6 +159,9 @@ async def main() -> int:
     ap.add_argument("--out", default="../../.dev/omezarr-probe/shots")
     ap.add_argument("--scale", type=int, default=1)
     ap.add_argument("--settle", type=int, default=10)
+    ap.add_argument("--force-dimensions", action="store_true",
+                    help="emit an x,y,z dimensions override; only useful to "
+                         "measure the delta against a view with an unmapped t axis")
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("datasets", nargs="+")
     args = ap.parse_args()
@@ -162,7 +169,7 @@ async def main() -> int:
     results = []
     for ds in args.datasets:
         r = await shoot(args.base, ds, Path(args.out), args.scale, args.settle,
-                        args.timeout)
+                        args.timeout, args.force_dimensions)
         results.append(r)
         print(json.dumps(r, indent=1))
     Path(args.out, "neuroglancer_results.json").write_text(
