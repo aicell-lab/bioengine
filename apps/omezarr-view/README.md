@@ -187,3 +187,10 @@ What it does under the hood, and what that costs:
 - **Normalisation bounds are measured, not declared** — the 1–99.8 percentiles
   the base view sampled. Absolute intensities are therefore not preserved, which
   the mapping report also states.
+
+## Agent-facing guide
+
+The recipes, the claim boundary, the metadata-report rules, the verified
+consumers and the gotchas are published as part of the BioEngine skill at
+<https://bioimage.io/skills/bioengine/apps/omezarr-view.md>. Edit it there;
+this repo no longer carries a second copy.
