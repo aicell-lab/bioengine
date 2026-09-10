@@ -555,7 +555,7 @@ async def main() -> None:
         servers[name] = await connect_to_server({"server_url": SERVER_URL, "token": env[spec["token_key"]]})
         apps[name] = SiteHandle(servers[name], spec["worker"], spec["application_id"])
         app_records[name] = await apps[name].connect()
-        print(f"{name}: resolved {spec['application_id']}", flush=True)
+        print(f"{name}: resolved {spec['application_id']} at {app_records[name].get('version')}", flush=True)
 
     site_status = {name: await app.get_status() for name, app in apps.items()}
     if not args.skip_prepare:
@@ -716,6 +716,7 @@ async def main() -> None:
     transport = {name: await app.get_transport_log() for name, app in apps.items()}
     transport["driver"] = driver_log.dump()
 
+    app_versions = {name: record.get("version") for name, record in app_records.items()}
     provenance = {
         "run_id": args.run_id,
         "generated_at": time.time(),
@@ -723,7 +724,14 @@ async def main() -> None:
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True
         ).stdout.strip(),
         "app_artifact": app_records[clients[0]].get("artifact_id"),
-        "app_version": app_records[clients[0]].get("version"),
+        # Seven instances are seven separate deployments and a run can mix their
+        # versions — the instance an arm trains on is not one of the clients, so
+        # clients[0]'s version would be attributed to all seven. Scalar only when
+        # they agree; null otherwise, which reads as "look at the map".
+        "app_version": (
+            app_versions[clients[0]] if len(set(app_versions.values())) == 1 else None
+        ),
+        "app_version_per_instance": app_versions,
         "run_artifact_id": run_artifact_id,
         "aggregation_rule": "sample-count-weighted FedAvg over the full state_dict",
         "arm_structure": {
