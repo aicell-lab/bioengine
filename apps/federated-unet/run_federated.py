@@ -1,7 +1,9 @@
 """Drive a federated segmentation experiment across N BioEngine clients.
 
-Every arm consumes the same number of optimiser steps, so the comparison
-measures federation rather than compute:
+Every arm consumes the same number of optimiser steps PER MODEL. The federated
+arms train N models per round and average them, so at the system level they
+spend N times the gradient computation of a single-instance arm; compute is
+matched per model and is not matched overall.
 
   <client>-only    trained only on that client's images, one arm per client
   fedavg           R rounds of local training, sample-count-weighted state_dict average
@@ -9,6 +11,9 @@ measures federation rather than compute:
   loso-<client>    federate everyone except <client>, then score on <client> (--loso)
   pooled           an extra instance holding every client's data — the deliberate
                    premise violation, used as the upper bound
+  pooled-balanced  pooled, drawing a domain uniformly and then an image within it,
+                   so its per-domain training weight matches the evaluation's
+                   instead of the shard fraction (--balanced-arm)
 
 Every arm is scored the same way: the checkpoint is pushed to each client and
 evaluated there against that client's held-out test split. Test images never
@@ -284,7 +289,8 @@ async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str], Dict[
 
 
 async def train_arm(
-    app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str
+    app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str,
+    domain_balanced: bool = False,
 ) -> List[Dict]:
     """Run rounds x steps of purely local training, scoring validation each round.
 
@@ -293,7 +299,10 @@ async def train_arm(
     """
     history = []
     for r in range(rounds):
-        record = await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}")
+        record = await app.train(
+            steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}",
+            domain_balanced=domain_balanced,
+        )
         record["val_dice"], _, record["scored_by"] = await val_dice(apps, [instance])
         history.append(record)
     return history
@@ -498,6 +507,12 @@ async def main() -> None:
         help="Add a second FedAvg arm weighting every client equally instead of by sample count",
     )
     parser.add_argument(
+        "--balanced-arm",
+        action="store_true",
+        help="Add a second pooled arm that draws a domain uniformly and then an image within it, "
+             "matching the pooled arm's per-domain training weight to the evaluation's",
+    )
+    parser.add_argument(
         "--pre-registration",
         default=None,
         help="Path to a design file whose predictions must already be committed",
@@ -643,8 +658,11 @@ async def main() -> None:
                 )
 
         # --- Arms: single-site and pooled ----------------------------------
-        single_site_arms = [(f"{name}-only", name) for name in clients]
-        for arm, instance in single_site_arms + [("pooled", "pooled")]:
+        single_site_arms = [(f"{name}-only", name, False) for name in clients]
+        pooled_arms = [("pooled", "pooled", False)]
+        if args.balanced_arm:
+            pooled_arms.append(("pooled-balanced", "pooled", True))
+        for arm, instance, domain_balanced in single_site_arms + pooled_arms:
             if arm in arms:
                 print(f"  {arm}: kept from {metrics_path}", flush=True)
                 continue
@@ -652,7 +670,7 @@ async def main() -> None:
             await apps[instance].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
             history = await train_arm(
                 apps[instance], apps, instance, args.rounds, args.steps, args.lr, seed,
-                f"{prefix}/{arm}",
+                f"{prefix}/{arm}", domain_balanced,
             )
             await apps[instance].push_weights(
                 run_artifact_id=run_artifact_id, path=f"{prefix}/arms/{arm}.pt", note=f"{arm} final"
@@ -717,6 +735,13 @@ async def main() -> None:
             ) if args.loso else None,
             "<client>-only": "that client's own data alone, the baseline LOSO is compared against",
             "pooled": "one instance holding every client's data — the premise violation, an upper bound",
+            "pooled-balanced": (
+                "pooled, but drawing a domain uniformly and then an image within it, so its "
+                "per-domain training weight is 1/6 each instead of the shard fraction. Isolates the "
+                "SAMPLER axis only: it still differs from the federated arms in whether updates are "
+                "exchanged and in system-level local-step budget (6:1; per-model steps are matched), "
+                "and those two are not separable in this design"
+            ) if args.balanced_arm else None,
         },
         "train_sizes": "natural" if LAYOUTS[args.layout]["n_train"] is None else LAYOUTS[args.layout]["n_train"],
         "normalisation": "GroupNorm (no running statistics, so the merge averages weights only)",

@@ -225,6 +225,7 @@ class FederatedUNetSite:
         crop: int = Field(256, description="Training crop size in pixels"),
         seed: int = Field(0, description="Seed for crop sampling and augmentation"),
         tag: str = Field("", description="Free-form label recorded in this site's history"),
+        domain_balanced: bool = Field(False, description="Draw a domain uniformly and then an image within it, instead of drawing uniformly over the site's pooled images; only differs on a site holding more than one domain"),
     ) -> Dict[str, Any]:
         """Run local training on this site's data. Nothing leaves the site."""
         from training import train_steps
@@ -235,11 +236,12 @@ class FederatedUNetSite:
             raise RuntimeError("call prepare_data before train")
 
         pairs = [pair for d in self._data.values() for pair in d["train"]]
+        groups = [d["train"] for d in self._data.values()] if domain_balanced else None
 
         def _work() -> Dict[str, Any]:
             return train_steps(
                 self._model, pairs, steps=steps, lr=lr, batch_size=batch_size,
-                crop=crop, device=self._device, seed=seed,
+                crop=crop, device=self._device, seed=seed, groups=groups,
             )
 
         async with self._lock:
@@ -253,6 +255,7 @@ class FederatedUNetSite:
                 datasets=list(self._data),
                 wall_time_s=time.time() - started,
                 lr=lr, batch_size=batch_size, crop=crop, seed=seed,
+                domain_balanced=domain_balanced,
             )
             self._history.append(result)
         return result

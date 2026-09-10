@@ -2,10 +2,12 @@
 
 Deliberately step-based rather than epoch-based: the pooled-oracle arm sees
 twice the data of a single-site arm, so matching epochs would hand it twice the
-gradient steps and the comparison would measure compute, not federation.
+gradient steps and the comparison would measure compute, not federation. This
+matches steps PER MODEL only — a federated arm still runs one of these per site
+per round, so the system-level budget is not matched.
 """
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -15,11 +17,22 @@ Pair = Tuple[np.ndarray, np.ndarray]
 
 
 def _random_crop_batch(
-    pairs: Sequence[Pair], batch_size: int, crop: int, rng: np.random.Generator
+    pairs: Sequence[Pair],
+    batch_size: int,
+    crop: int,
+    rng: np.random.Generator,
+    groups: Optional[Sequence[Sequence[Pair]]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     images, masks = [], []
     for _ in range(batch_size):
-        image, mask = pairs[rng.integers(len(pairs))]
+        # Kept as a branch rather than folding the flat case into a single group:
+        # the group draw would consume an extra value and shift the RNG stream of
+        # every arm already run.
+        if groups is None:
+            image, mask = pairs[rng.integers(len(pairs))]
+        else:
+            group = groups[rng.integers(len(groups))]
+            image, mask = group[rng.integers(len(group))]
         pad_y = max(0, crop - image.shape[0])
         pad_x = max(0, crop - image.shape[1])
         if pad_y or pad_x:
@@ -58,15 +71,21 @@ def train_steps(
     crop: int,
     device: torch.device,
     seed: int,
+    groups: Optional[Sequence[Sequence[Pair]]] = None,
 ) -> Dict[str, object]:
-    """Run exactly ``steps`` optimiser steps and report the loss trajectory."""
+    """Run exactly ``steps`` optimiser steps and report the loss trajectory.
+
+    With ``groups`` the batch is drawn domain-uniformly rather than
+    image-uniformly, so a site holding several domains weights them equally
+    instead of by their image counts.
+    """
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     model.to(device).train()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     losses = []
     for _ in range(steps):
-        images, masks = _random_crop_batch(pairs, batch_size, crop, rng)
+        images, masks = _random_crop_batch(pairs, batch_size, crop, rng, groups)
         images, masks = images.to(device), masks.to(device)
         optimizer.zero_grad(set_to_none=True)
         loss = _loss(model(images), masks)
