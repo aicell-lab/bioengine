@@ -32,8 +32,12 @@ WORKERS = {
     DENBI: {"token_key": "BIOIMAGE_IO_TOKEN", "description": "de.NBI cloud worker, Germany"},
 }
 
-#: How many replicas of this app each worker admits, measured rather than
-#: assumed. Europa's worker sees one 24576 MB RTX 3090 and advertises it as
+#: How many replicas of this app each worker admits **with the cluster to
+#: itself**, measured rather than assumed. This is not the placement ceiling on
+#: a shared cluster: co-tenants take Ray memory first, so europa can admit zero
+#: of these while its VRAM_MB is nearly untouched (2026-09-10: 1536 MiB of 30720
+#: free, 21316 of 24576 VRAM_MB free). Check the worker before deploying.
+#: Europa's worker sees one 24576 MB RTX 3090 and advertises it as
 #: VRAM_MB, so at gpu_memory_mb 5120 the GPU allows floor(24576 / 5120) = 4; its
 #: Ray cluster has 30 GiB of memory shared with other apps, so memory_mb 6144
 #: allows floor(30 / 6) = 5 and the GPU is the binding resource again. (At the
