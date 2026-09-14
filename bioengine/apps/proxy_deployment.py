@@ -6,7 +6,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ray
 from pydantic import Field
@@ -72,6 +72,20 @@ _PERMANENT_ERROR_MARKERS = ("wrong workspace",)
 
 class _PermanentRegistrationError(RuntimeError):
     """Registration failed for a reason no amount of retrying will fix."""
+
+
+# Serve's own verdict on a deployment, for deployments sitting at zero replicas.
+# Zero replicas is the correct idle state under ``min_replicas: 0``, so a replica
+# count alone cannot tell a crash from a deliberate scale-down. UPSCALING matters
+# as much as HEALTHY: it is the state a scaled-to-zero deployment enters when a
+# request wakes it, and deregistering there would remove the service during the
+# very wake-up it is meant to allow.
+_SERVICEABLE_AT_ZERO_REPLICAS = ("HEALTHY", "UPSCALING", "DOWNSCALING")
+
+
+def _is_serviceable(running: int, status: str) -> bool:
+    """Whether a sibling deployment can serve a request, now or after an upscale."""
+    return running > 0 or status in _SERVICEABLE_AT_ZERO_REPLICAS
 
 
 # ``ray_actor_options`` is intentionally minimal here. The proxy needs a
@@ -1285,10 +1299,10 @@ class ProxyDeployment:
     # ===== Ray Serve Health Check =====
     # Implements periodic health checks for Ray Serve.
 
-    async def _sibling_running_counts(self) -> Optional[Dict[str, int]]:
-        """RUNNING replica count of every sibling deployment (all deployments in
-        this app but the proxy itself), read out-of-band from the Serve
-        controller.
+    async def _sibling_states(self) -> Optional[Dict[str, Tuple[int, str]]]:
+        """``(RUNNING replica count, deployment status)`` for every sibling
+        deployment (all deployments in this app but the proxy itself), read
+        out-of-band from the Serve controller.
 
         The controller already health-checks every replica; this reads that
         collected state and never issues an in-band request, so a saturated app
@@ -1296,6 +1310,9 @@ class ProxyDeployment:
         Returns ``None`` when the status can't be determined (controller
         mid-restart, app not yet in the view) — the caller treats ``None`` as
         "unknown" and never deregisters on it.
+
+        The status is carried because the replica count alone cannot separate a
+        deployment idling at ``min_replicas: 0`` from one that crashed to zero.
         """
         from ray import serve as _serve
 
@@ -1305,22 +1322,24 @@ class ProxyDeployment:
             except Exception:
                 self._own_deployment_name = None
 
-        def _query() -> Optional[Dict[str, int]]:
+        def _query() -> Optional[Dict[str, Tuple[int, str]]]:
             app = _serve.status().applications.get(self.application_id)
             if app is None:
                 return None
-            counts: Dict[str, int] = {}
+            states: Dict[str, Tuple[int, str]] = {}
             for name, deployment in app.deployments.items():
                 if name == self._own_deployment_name:
                     continue
-                counts[name] = sum(
+                running = sum(
                     count
                     for state, count in deployment.replica_states.items()
                     if str(getattr(state, "value", state)) == "RUNNING"
                 )
-            return counts
+                status = str(getattr(deployment.status, "value", deployment.status))
+                states[name] = (running, status)
+            return states
 
-        def _read() -> Optional[Dict[str, int]]:
+        def _read() -> Optional[Dict[str, Tuple[int, str]]]:
             try:
                 return _query()
             except Exception:
@@ -1380,20 +1399,20 @@ class ProxyDeployment:
         # against any deployment's ``max_ongoing_requests``. Ray's own controller
         # already health-checks each replica; a sibling that crashes or whose
         # ``health_check`` raises drops out of the RUNNING count here.
-        counts = await self._sibling_running_counts()
+        states = await self._sibling_states()
 
         if not self.entry_deployment_ready:
-            if counts and all(running > 0 for running in counts.values()):
+            if states and all(_is_serviceable(*s) for s in states.values()):
                 self.entry_deployment_ready = True
-                for dep in counts:
+                for dep in states:
                     self._dep_seen_ready[dep] = True
                 logger.info(
-                    f"✅ All deployments of app '{self.application_id}' are RUNNING."
+                    f"✅ All deployments of app '{self.application_id}' are serviceable."
                 )
             else:
                 pending = (
-                    [dep for dep, running in counts.items() if running == 0]
-                    if counts
+                    [dep for dep, s in states.items() if not _is_serviceable(*s)]
+                    if states
                     else "unknown"
                 )
                 logger.info(
@@ -1401,19 +1420,23 @@ class ProxyDeployment:
                     f"(pending: {pending})."
                 )
                 return
-        elif counts is not None:
-            # A sibling that came up and then dropped to zero means the app can
-            # no longer serve: deregister so the service disappears from Hypha,
-            # and re-gate. The outage stays visible in the app status via the
-            # down deployment itself, so the proxy need not fail its own health.
-            for dep, running in counts.items():
-                if running > 0:
+        elif states is not None:
+            # A sibling that came up and then stopped being serviceable means the
+            # app can no longer serve: deregister so the service disappears from
+            # Hypha, and re-gate. The outage stays visible in the app status via
+            # the down deployment itself, so the proxy need not fail its own
+            # health. Serviceability is not a replica count: a deployment idling
+            # at ``min_replicas: 0`` is at zero replicas on purpose, and
+            # deregistering it would be unrecoverable — waking it needs a request,
+            # and a request needs the registration this would remove.
+            for dep, (running, status) in states.items():
+                if _is_serviceable(running, status):
                     self._dep_seen_ready[dep] = True
-                elif running == 0 and self._dep_seen_ready.get(dep):
+                elif self._dep_seen_ready.get(dep):
                     logger.error(
                         f"❌ Deployment '{dep}' of app '{self.application_id}' has "
-                        f"no RUNNING replica. Deregistering Hypha service until it "
-                        f"recovers."
+                        f"no RUNNING replica and is not serviceable (status: "
+                        f"{status}). Deregistering Hypha service until it recovers."
                     )
                     await self._deregister_services()
                     return
