@@ -1232,9 +1232,22 @@ class EntryDeployment:
 
     @staticmethod
     def _model_declares_custom_env(rdf_path: str) -> bool:
-        """True iff any weight-format entry carries an explicit
-        ``dependencies.source`` (an authored ``environment.yaml`` bundled
-        with the model).
+        """True iff any weight-format entry declares an authored dependency
+        file, in either spec dialect.
+
+        The RDF is read as raw YAML rather than through ``bioimageio.spec``,
+        so both dialects appear verbatim and BOTH must be handled:
+
+        * v0.5 — ``dependencies: {source: environment.yaml, ...}``
+        * v0.4 — ``dependencies: "conda:environment.yaml"``, a
+          ``"<manager>:<path>"`` string
+
+        Matching only the v0.5 mapping silently denied every v0.4 model its
+        declared environment: 9 of the zoo's models use the string form
+        (7 ``conda:environment.yaml``, 1 ``conda:dependencies.yaml``, 1
+        ``pip:./requirements.txt``). ``stupendous-sheep`` is one, which is why
+        a ``custom_environment=True`` test on it came back stamped
+        ``test_environment=standard`` in ~90s, too fast to have solved an env.
 
         When False, ``bioimageio.spec.get_conda_env`` builds a
         framework-default env from the framework name alone. Those
@@ -1258,6 +1271,10 @@ class EntryDeployment:
                 continue
             deps = wf.get("dependencies")
             if isinstance(deps, dict) and deps.get("source"):
+                return True
+            # v0.4: "<manager>:<path>". Require a non-empty path so a bare
+            # "conda:" does not read as a declaration.
+            if isinstance(deps, str) and deps.partition(":")[2].strip():
                 return True
         return False
 
