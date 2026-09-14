@@ -35,6 +35,13 @@ _REGISTRATION_PROBE_INTERVAL_S = 60
 # Bound on the probe itself: an unanswered round trip must not hold up the rest
 # of the monitoring tick.
 _REGISTRATION_PROBE_TIMEOUT_S = 10
+# How long the worker's own service may stay unreachable before the monitoring
+# loop is allowed to condemn the pod. Hypha routinely serves nothing for a minute
+# or two and recovers by itself, and cycling a pod through that costs more than
+# waiting; five minutes of failed re-registration is a fault worth restarting
+# for. Once past this the check raises every tick, so the degraded threshold
+# (5 ticks) is reached one monitoring interval at a time.
+_REGISTRATION_GRACE_S = 300
 # Bound on disconnect() while rebuilding the connection. The transport being
 # closed there is the one already suspected of being wedged, so an unbounded
 # close can stall the monitoring loop on exactly the socket that prompted the
@@ -291,6 +298,10 @@ class BioEngineWorker:
         self.start_time = None
         self._last_monitoring = 0
         self._registration_probe_due_at = 0.0
+        self._registration_failing = False
+        # Start the grace clock at construction: a worker that never manages to
+        # serve its registration must condemn itself just as one that loses it.
+        self._registration_ok_at = time.time()
 
         # Backstop for the in-place Serve recovery in
         # ``AppsManager.monitor_applications``: after this many consecutive
@@ -693,42 +704,46 @@ class BioEngineWorker:
                 f"Service ID mismatch: {self.full_service_id} (expected) vs {service_info.id} (registered)"
             )
 
-    async def _check_hypha_connection(self, reconnect: bool = True) -> None:
-        # Catches a dead socket at the monitoring interval. It cannot catch an
-        # evicted registration — echo keeps succeeding for as long as the socket
-        # is open — which is what _check_service_registration is for.
-        try:
-            await asyncio.wait_for(self.server.echo("ping"), timeout=10)
-        except Exception as e:
-            if reconnect:
-                self.logger.warning(
-                    f"Hypha server connection error. Attempting to reconnect..."
-                )
-                await self._connect_to_server()
-                await self._register_bioengine_worker_service()
-            else:
-                raise RuntimeError(f"Hypha server connection error: {e}")
-
     async def _check_service_registration(self) -> None:
-        """Rebuild the Hypha connection when the server stops serving our service.
+        """Keep this worker's Hypha service reachable, and condemn the pod if it
+        cannot be made reachable again.
 
-        A freeze long enough for Hypha to evict this client leaves the socket
-        open from our side, so ``echo`` keeps answering while
+        This is the only Hypha liveness check in the monitoring loop. It
+        subsumes a plain ``echo`` probe: anything that kills the socket also
+        fails this one, while the reverse is not true. A freeze long enough for
+        Hypha to evict this client leaves the socket open from our side, so
+        ``echo`` keeps answering while
         ``<workspace>/<client-id>:bioengine-worker`` has stopped resolving for
         everyone else. Asking whether our own registration is still served is
         the only signal that separates the two.
 
-        Never raises, and never reports the outcome upwards: rebuilding is the
-        whole response. Hypha can also serve nothing for a few minutes and then
-        recover on its own, and a redundant rebuild there costs one reconnect,
-        whereas feeding the degraded counter would cycle a pod that was about to
-        come back.
+        ``echo`` is still used, but as a *diagnostic* rather than a heartbeat:
+        it only runs once the probe has already failed, to pick the cheapest
+        repair that can work.
+
+            echo answers    registration evicted, socket fine  -> re-register only
+            echo fails      the connection itself is gone      -> reconnect, then register
+
+        While healthy the probe costs one round trip per
+        ``_REGISTRATION_PROBE_INTERVAL_S``. While failing the throttle is
+        dropped and it retries every tick, so a dead socket is detected within
+        one probe interval and then repaired at the monitoring interval rather
+        than once a minute.
+
+        Transient Hypha outages must not cycle the pod — Hypha can serve
+        nothing for minutes and recover on its own — so failures are absorbed
+        silently for ``_REGISTRATION_GRACE_S``. Past that the service has been
+        unreachable long enough that waiting is no longer the better bet, and
+        this raises so the monitoring loop's degraded counter can flip
+        ``get_status`` to not-ready and let the liveness probe restart the pod.
         """
         if not self.server or not self.full_service_id:
             return
 
         now = time.time()
-        if now < self._registration_probe_due_at:
+        # Only throttle while healthy; a failing registration is retried on
+        # every tick, which is also what feeds the degraded counter.
+        if not self._registration_failing and now < self._registration_probe_due_at:
             return
         self._registration_probe_due_at = now + _REGISTRATION_PROBE_INTERVAL_S
 
@@ -737,24 +752,65 @@ class BioEngineWorker:
                 self.server.get_service_info(self.full_service_id),
                 timeout=_REGISTRATION_PROBE_TIMEOUT_S,
             )
+            if self._registration_failing:
+                self.logger.info(
+                    f"Hypha serves '{self.full_service_id}' again after "
+                    f"{now - self._registration_ok_at:.0f}s."
+                )
+            self._registration_failing = False
+            self._registration_ok_at = now
             return
-        except Exception as e:
-            self.logger.warning(
-                f"Hypha no longer serves '{self.full_service_id}': {e}. "
-                "Rebuilding the connection to the Hypha server..."
-            )
+        except Exception as exc:
+            first_failure = not self._registration_failing
+            self._registration_failing = True
+            # Rebind: Python unbinds the ``as`` target when the block exits.
+            probe_error = exc
 
+        socket_alive = True
         try:
-            await self._connect_to_server()
-            await self._register_bioengine_worker_service()
-            self.logger.info(
-                f"Re-registered BioEngine worker service '{self.full_service_id}'."
+            await asyncio.wait_for(
+                self.server.echo("ping"), timeout=_REGISTRATION_PROBE_TIMEOUT_S
             )
-        except Exception as e:
-            self.logger.warning(
-                f"Failed to rebuild the Hypha server connection, retrying in "
-                f"{_REGISTRATION_PROBE_INTERVAL_S}s: {e}"
+        except Exception:
+            socket_alive = False
+
+        # Only the first failure of a streak is a warning. A Hypha outage is
+        # retried every tick, and logging each attempt would bury the recovery.
+        log = self.logger.warning if first_failure else self.logger.debug
+        try:
+            if socket_alive:
+                log(
+                    f"Hypha no longer serves '{self.full_service_id}' "
+                    f"({probe_error}) but the connection is alive. "
+                    "Re-registering..."
+                )
+                await self._register_bioengine_worker_service()
+            else:
+                log(
+                    f"Lost the connection to the Hypha server "
+                    f"({probe_error}). Reconnecting and re-registering..."
+                )
+                await self._connect_to_server()
+                await self._register_bioengine_worker_service()
+        except Exception as repair_error:
+            unreachable_for = time.time() - self._registration_ok_at
+            if unreachable_for >= _REGISTRATION_GRACE_S:
+                raise RuntimeError(
+                    f"Hypha service '{self.full_service_id}' has been "
+                    f"unreachable for {unreachable_for:.0f}s and cannot be "
+                    f"re-registered: {repair_error}"
+                ) from repair_error
+            log(
+                f"Failed to restore the Hypha service registration, retrying "
+                f"next tick: {repair_error}"
             )
+            return
+
+        self._registration_failing = False
+        self._registration_ok_at = time.time()
+        self.logger.info(
+            f"Re-registered BioEngine worker service '{self.full_service_id}'."
+        )
 
     async def _check_token_expiry(self) -> None:
         if self._token_expires_at - time.time() < 3600:
@@ -947,7 +1003,6 @@ class BioEngineWorker:
                     await _step("geo_location", self._fetch_geo_location())
 
                     # ===== 1. Hypha server connection check =====
-                    await _step("hypha_connection", self._check_hypha_connection())
                     await _step(
                         "service_registration", self._check_service_registration()
                     )
