@@ -1,22 +1,36 @@
-"""Place a model's declared attachment files beside its imported architecture.
+"""Compatibility shim for models that misuse ``attachments`` as a weights channel.
 
-``bioimageio.core`` imports a file-sourced architecture by writing *only* that
-one source file into a fresh temporary directory, so a file the architecture
-opens relative to its own ``__file__`` is never there — no matter that the
-package ships it. MitoNet 2D (``stupendous-sheep``) passes its TorchScript
-graph that way (``kwargs: {model: MitoNet_v1.pth}``, declared under
-``attachments``) and dies with "The provided filename ... does not exist".
+DEPRECATED. Scheduled for removal once ``stupendous-sheep`` is republished; it
+is the only model in the zoo that needs this (276 scanned, 27 declare both a
+file-sourced architecture and attachments, 26 of those never open the
+attachment at import).
 
-Importing the architecture ahead of the pipeline populates ``sys.modules``
-under the same sha-keyed module name core will look up, so core reuses the
-module — and the directory it lives in, which by then holds the attachments.
+``attachments`` is not a weights channel and passing a weights path to an
+architecture's ``__init__`` is not a supported pattern — a conforming model
+declares its weights under ``weights.<format>.source`` and lets
+``bioimageio.core`` load them, which needs no filesystem access at all. See
+bioimage-io/core-bioimage-io-python#503.
+
+MitoNet 2D (``stupendous-sheep``) does neither: it declares its TorchScript
+graph under ``attachments``, passes the filename as ``kwargs: {model:
+MitoNet_v1.pth}``, and ``torch.jit.load``s it from a path built off the
+architecture's own ``__file__``. Core imports a file-sourced architecture into
+a fresh directory holding only that ``.py``, so the join cannot resolve and the
+model fails to load.
+
+This module works around that by importing the architecture ahead of the
+pipeline, which populates ``sys.modules`` under the sha-keyed name core will
+look up, so core reuses the module — and the directory it lives in, which by
+then holds the attachments. Do not extend it to new models: fix the model.
 """
 
+import logging
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, List
+
+logger = logging.getLogger(__name__)
 
 from bioimageio.core.digest_spec import import_callable
 from bioimageio.spec.utils import get_reader
@@ -73,10 +87,22 @@ def stage_architecture_attachments(model_description: Any) -> List[str]:
             continue
         root = getattr(reader, "original_root", None)
         local = Path(root, reader.original_file_name) if isinstance(root, Path) else None
-        if local is not None and local.is_file():
-            os.symlink(local, destination)
-        else:
-            with open(destination, "wb") as f:
-                shutil.copyfileobj(reader, f)
+        # Symlink only. Copying would spend a full download on every model that
+        # declares an attachment its architecture never opens — 26 of the 27 in
+        # the zoo, including six micro-SAM models attaching 100+ MB decoders.
+        if local is None or not local.is_file():
+            continue
+        os.symlink(local, destination)
         staged.append(reader.original_file_name)
+
+    if staged:
+        logger.warning(
+            "DEPRECATED: staged %s beside the architecture of %r. This model "
+            "reads a declared attachment at import time, which the spec does "
+            "not support (core-bioimage-io-python#503); it should declare the "
+            "file under weights.<format>.source instead. This shim will be "
+            "removed — the model needs fixing, not the runner.",
+            ", ".join(staged),
+            getattr(model_description, "id", None) or getattr(model_description, "name", "?"),
+        )
     return staged
