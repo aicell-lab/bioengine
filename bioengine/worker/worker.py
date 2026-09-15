@@ -42,6 +42,12 @@ _REGISTRATION_PROBE_TIMEOUT_S = 10
 # for. Once past this the check raises every tick, so the degraded threshold
 # (5 ticks) is reached one monitoring interval at a time.
 _REGISTRATION_GRACE_S = 300
+# The grace above resets on any successful probe, so a registration that answers
+# intermittently never condemns and never logs. These bound a second, purely
+# observational window that does NOT reset on success: enough failures inside it
+# and the worker says so once. It can never cycle a pod.
+_REGISTRATION_FLAP_WINDOW_S = 3600
+_REGISTRATION_FLAP_THRESHOLD = 5
 # Bound on disconnect() while rebuilding the connection. The transport being
 # closed there is the one already suspected of being wedged, so an unbounded
 # close can stall the monitoring loop on exactly the socket that prompted the
@@ -302,6 +308,9 @@ class BioEngineWorker:
         # Start the grace clock at construction: a worker that never manages to
         # serve its registration must condemn itself just as one that loses it.
         self._registration_ok_at = time.time()
+        # Flap detection, on a clock that deliberately never resets on success.
+        self._registration_window_start = self._registration_ok_at
+        self._registration_window_failures = 0
 
         # Backstop for the in-place Serve recovery in
         # ``AppsManager.monitor_applications``: after this many consecutive
@@ -745,6 +754,11 @@ class BioEngineWorker:
         Counting attempts instead would be strictly worse: a flap refills an
         attempt budget faster than it can be spent, so the escalation would be
         unreachable exactly when the connection is worst.
+
+        That leaves one thing invisible, so it is reported separately: a
+        registration that answers one probe in ten never condemns and never
+        produces a line anyone reads. The flap window below counts failures on
+        a clock that does *not* reset on success, and only ever warns.
         """
         if not self.server or not self.full_service_id:
             return
@@ -755,6 +769,19 @@ class BioEngineWorker:
         if not self._registration_failing and now < self._registration_probe_due_at:
             return
         self._registration_probe_due_at = now + _REGISTRATION_PROBE_INTERVAL_S
+
+        if now - self._registration_window_start >= _REGISTRATION_FLAP_WINDOW_S:
+            if self._registration_window_failures >= _REGISTRATION_FLAP_THRESHOLD:
+                self.logger.warning(
+                    f"Hypha service registration for '{self.full_service_id}' "
+                    f"failed {self._registration_window_failures} times in the "
+                    f"last {(now - self._registration_window_start) / 60:.0f} "
+                    f"minutes but recovered each time. The connection is "
+                    f"flapping; this never reaches the degraded threshold "
+                    f"because every recovery resets it."
+                )
+            self._registration_window_start = now
+            self._registration_window_failures = 0
 
         try:
             await asyncio.wait_for(
@@ -772,6 +799,7 @@ class BioEngineWorker:
         except Exception as exc:
             first_failure = not self._registration_failing
             self._registration_failing = True
+            self._registration_window_failures += 1
             # Rebind: Python unbinds the ``as`` target when the block exits.
             probe_error = exc
 

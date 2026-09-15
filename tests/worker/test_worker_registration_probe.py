@@ -88,6 +88,8 @@ def _bare_worker(server, **attrs):
     worker._registration_probe_due_at = 0.0
     worker._registration_failing = False
     worker._registration_ok_at = time.time()
+    worker._registration_window_start = worker._registration_ok_at
+    worker._registration_window_failures = 0
     worker._monitor_consecutive_errors = 0
     worker.reconnects = 0
     worker.registrations = 0
@@ -245,6 +247,61 @@ async def test_one_good_probe_resets_the_grace_clock():
     server._serves = False
     worker._registration_probe_due_at = 0.0
     await worker._check_service_registration()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_a_flapping_registration_is_reported_even_though_it_never_condemns(caplog):
+    """The blind spot the reset-on-success property creates, closed by warning.
+
+    A registration that answers one probe in ten recovers the grace clock every
+    time, so it never reaches the degraded threshold — and today it produces no
+    condemnation, no page and no log anyone reads. The flap window counts on a
+    clock that does not reset on success and only ever warns.
+    """
+    server = _Server(serves=True)
+    worker = _bare_worker(server)
+    worker._registration_window_start = time.time()
+
+    for _ in range(worker_module._REGISTRATION_FLAP_THRESHOLD):
+        server._serves = False
+        worker._registration_probe_due_at = 0.0
+        await worker._check_service_registration()  # fails, then repairs
+        server._serves = True
+        worker._registration_probe_due_at = 0.0
+        await worker._check_service_registration()  # recovers, resets the grace
+
+    # Nothing has escalated: every failure was followed by a recovery.
+    assert worker._registration_failing is False
+
+    # Roll the observation window.
+    worker._registration_window_start = (
+        time.time() - worker_module._REGISTRATION_FLAP_WINDOW_S - 1
+    )
+    worker._registration_probe_due_at = 0.0
+    with caplog.at_level(logging.WARNING, logger="test-bioengine-worker"):
+        await worker._check_service_registration()
+
+    assert any(
+        "flapping" in record.message for record in caplog.records
+    ), "an intermittent registration must be reported even though it never condemns"
+
+
+@pytest.mark.asyncio
+async def test_the_flap_window_stays_quiet_below_its_threshold(caplog):
+    server = _Server(serves=True)
+    worker = _bare_worker(server)
+    worker._registration_window_failures = (
+        worker_module._REGISTRATION_FLAP_THRESHOLD - 1
+    )
+    worker._registration_window_start = (
+        time.time() - worker_module._REGISTRATION_FLAP_WINDOW_S - 1
+    )
+
+    with caplog.at_level(logging.WARNING, logger="test-bioengine-worker"):
+        await worker._check_service_registration()
+
+    assert not any("flapping" in record.message for record in caplog.records)
+    assert worker._registration_window_failures == 0, "the window must roll"
 
 
 @pytest.mark.asyncio
