@@ -46,6 +46,22 @@ _PROXY_MAYBE_SENT_MARKERS = (
     "service not found",
 )
 
+# Reads are safe to repeat even when the first attempt may already have run, so
+# they are retried on either failure kind. This matters because the call that
+# hung in the observed outage was a read — the write before it had already
+# succeeded — so without this a stale handle still costs one failed deploy.
+# Enumerated against the live service 2026-09-15 (50 methods); everything not
+# listed (create, commit, edit, delete, publish, discard, put_file, vector and
+# PR operations) re-raises instead.
+_RETRY_SAFE_READS = frozenset(
+    {"read", "list", "search", "get_file", "read_file", "list_files"}
+)
+# ...but reads are not side-effect-free: ``silent`` defaults to False and
+# ``read`` increments a view count. Only these three accept the parameter, so
+# only these three can be silenced, and only on the retry — the first attempt
+# should still count as a real view.
+_SILENCEABLE_READS = frozenset({"read", "list", "get_file"})
+
 
 def _stale_proxy_kind(exc: BaseException) -> Optional[str]:
     """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
@@ -67,10 +83,14 @@ class _ReconnectingArtifactManager:
     ``artifact_utils`` helper, so one wrapper covers all of them and no caller
     has to remember the retry rule.
 
-    A call that provably never left the process is retried once against the
-    fresh proxy. Anything that may already have executed re-raises — the caller
-    sees one failure instead of an indefinite outage, and the next call uses the
-    refreshed handle.
+    Two axes decide whether the call is repeated against the fresh proxy:
+
+    * a call that provably never left the process is always safe to repeat;
+    * a call that may already have executed is repeated only if it is a read,
+      because replaying a ``create`` or ``commit`` would double-execute it.
+
+    Anything else re-raises, so the caller sees one failure rather than an
+    indefinite outage and the next call uses the refreshed handle.
     """
 
     def __init__(self, server: RemoteService, proxy: Any, logger: logging.Logger):
@@ -104,8 +124,11 @@ class _ReconnectingArtifactManager:
                     f"service proxy: {exc}"
                 )
                 await self._re_resolve(seen_generation)
-                if kind != "never_sent":
+                if kind != "never_sent" and name not in _RETRY_SAFE_READS:
                     raise
+                if kind == "maybe_sent" and name in _SILENCEABLE_READS:
+                    # The first attempt may already have counted this view.
+                    kwargs = {**kwargs, "silent": True}
                 return await getattr(self._proxy, name)(*args, **kwargs)
 
         return call

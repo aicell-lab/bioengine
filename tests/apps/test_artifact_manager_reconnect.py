@@ -41,18 +41,23 @@ class _Proxy:
         self.name = name
         self._fails_with = fails_with
         self.calls: list[tuple] = []
+        self.kwargs_seen: list[dict] = []
+
+    def _answer(self, method, artifact_id, kwargs):
+        self.calls.append((method, artifact_id))
+        self.kwargs_seen.append(kwargs)
+        if self._fails_with is not None:
+            raise self._fails_with
+        return {"id": artifact_id, "served_by": self.name}
 
     async def read(self, artifact_id, **kwargs):
-        self.calls.append(("read", artifact_id))
-        if self._fails_with is not None:
-            raise self._fails_with
-        return {"id": artifact_id, "served_by": self.name}
+        return self._answer("read", artifact_id, kwargs)
+
+    async def read_file(self, artifact_id, **kwargs):
+        return self._answer("read_file", artifact_id, kwargs)
 
     async def commit(self, artifact_id, **kwargs):
-        self.calls.append(("commit", artifact_id))
-        if self._fails_with is not None:
-            raise self._fails_with
-        return {"id": artifact_id, "served_by": self.name}
+        return self._answer("commit", artifact_id, kwargs)
 
 
 class _Server:
@@ -147,12 +152,11 @@ async def test_a_send_side_failure_re_resolves_and_retries():
 
 
 @pytest.mark.asyncio
-async def test_a_timeout_refreshes_the_handle_but_does_not_retry():
-    """#0074's own signature, and the double-execute guard.
+async def test_a_timed_out_write_refreshes_the_handle_but_is_never_replayed():
+    """The double-execute guard.
 
-    A dead client id reached through a cached proxy hangs rather than erroring,
-    so this is the path that mattered in production. The call may already have
-    executed at the far end, so it must not be replayed.
+    A timeout cancels nothing at the far end, so a ``commit`` that timed out may
+    still be running. Replaying it would create a second version snapshot.
     """
     dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
     fresh = _Proxy("fresh")
@@ -163,11 +167,77 @@ async def test_a_timeout_refreshes_the_handle_but_does_not_retry():
         await am.commit("ws/my-app")
 
     assert server.resolutions == 1, "the handle must still be refreshed"
-    assert fresh.calls == [], "a call that may have landed must not be replayed"
+    assert fresh.calls == [], "a write that may have landed must not be replayed"
 
 
 @pytest.mark.asyncio
-async def test_the_next_call_after_a_timeout_succeeds():
+async def test_a_timed_out_read_is_retried_against_the_fresh_proxy():
+    """#0074's own signature, end to end.
+
+    The call that hung in the outage was ``read`` — the ``upload_app`` write
+    before it had already succeeded, and ``deploy_app`` then failed at manifest
+    load. Repeating a read is safe however the first attempt failed, so this is
+    the case that takes the observed fault to zero failed calls rather than one.
+    """
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    result = await am.read("ws/my-app")
+
+    assert server.resolutions == 1
+    assert result["served_by"] == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_a_retried_read_does_not_count_a_second_view():
+    """Reads are repeatable but not side-effect-free.
+
+    ``silent`` defaults to False and ``read`` increments a view count, so a
+    naive retry would double-count. The first attempt still counts normally;
+    only the retry is silenced.
+    """
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    await am.read("ws/my-app")
+
+    assert fresh.kwargs_seen[-1].get("silent") is True
+
+
+@pytest.mark.asyncio
+async def test_a_send_side_read_retry_is_not_silenced():
+    """A call that never reached the server counted nothing, so the retry is
+    the *first* real view and must be recorded as one."""
+    dead = _Proxy("dead", fails_with=RuntimeError("Failed to send the request"))
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    await am.read("ws/my-app")
+
+    assert "silent" not in fresh.kwargs_seen[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_read_without_a_silent_parameter_is_retried_unsilenced():
+    """``read_file`` and ``list_files`` do not accept ``silent``; passing it
+    would turn a recoverable timeout into a TypeError."""
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    await am.read_file("ws/my-app", file_path="manifest.yaml")
+
+    assert "silent" not in fresh.kwargs_seen[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_next_call_after_a_timed_out_write_succeeds():
     """The outage is one failed call, not an indefinite wedge."""
     dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
     fresh = _Proxy("fresh")
