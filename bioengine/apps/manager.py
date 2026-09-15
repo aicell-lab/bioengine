@@ -28,6 +28,89 @@ from bioengine.utils import (
 )
 
 
+# A hypha_rpc service proxy is pinned to ONE client instance of the remote
+# service. That instance can change client id at any time — the artifact manager
+# re-registered under a new one with nothing restarted — and hypha_rpc's own
+# websocket reconnect does not re-resolve cached proxies, so every later call
+# addresses a client that no longer exists and hangs to timeout. Split by whether
+# the call can have reached the server: a send-side failure provably did not, so
+# retrying it is safe even for a write; a timeout or a mid-call disconnect may
+# already have landed, so retrying those could double-execute a create or commit.
+_PROXY_NEVER_SENT_MARKERS = (
+    "failed to send the request",
+    "websocket reconnection timed out",
+)
+_PROXY_MAYBE_SENT_MARKERS = (
+    "client disconnected",
+    "method call timed out",
+    "service not found",
+)
+
+
+def _stale_proxy_kind(exc: BaseException) -> Optional[str]:
+    """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
+    message = str(exc).lower()
+    if any(marker in message for marker in _PROXY_NEVER_SENT_MARKERS):
+        return "never_sent"
+    if isinstance(exc, asyncio.TimeoutError) or any(
+        marker in message for marker in _PROXY_MAYBE_SENT_MARKERS
+    ):
+        return "maybe_sent"
+    return None
+
+
+class _ReconnectingArtifactManager:
+    """The artifact-manager proxy, re-resolved when its client id goes stale.
+
+    Wrapping at the point of resolution rather than at each call site is
+    deliberate: this object is handed to ``AppBuilder`` and to every
+    ``artifact_utils`` helper, so one wrapper covers all of them and no caller
+    has to remember the retry rule.
+
+    A call that provably never left the process is retried once against the
+    fresh proxy. Anything that may already have executed re-raises — the caller
+    sees one failure instead of an indefinite outage, and the next call uses the
+    refreshed handle.
+    """
+
+    def __init__(self, server: RemoteService, proxy: Any, logger: logging.Logger):
+        self._server = server
+        self._proxy = proxy
+        self._logger = logger
+        self._generation = 0
+        self._lock = asyncio.Lock()
+
+    async def _re_resolve(self, seen_generation: int) -> None:
+        async with self._lock:
+            # Concurrent callers all fail against the same dead proxy; only the
+            # first needs to replace it.
+            if self._generation != seen_generation:
+                return
+            self._proxy = await self._server.get_service("public/artifact-manager")
+            self._generation += 1
+            self._logger.info("Re-resolved the artifact manager service proxy.")
+
+    def __getattr__(self, name: str):
+        async def call(*args, **kwargs):
+            seen_generation = self._generation
+            try:
+                return await getattr(self._proxy, name)(*args, **kwargs)
+            except Exception as exc:
+                kind = _stale_proxy_kind(exc)
+                if kind is None:
+                    raise
+                self._logger.warning(
+                    f"Artifact manager call '{name}' failed against a stale "
+                    f"service proxy: {exc}"
+                )
+                await self._re_resolve(seen_generation)
+                if kind != "never_sent":
+                    raise
+                return await getattr(self._proxy, name)(*args, **kwargs)
+
+        return call
+
+
 def _is_serve_controller_gone(exc: BaseException) -> bool:
     """Whether a ``serve.*`` call failed because the Serve controller is gone.
 
@@ -1075,9 +1158,13 @@ class AppsManager:
         self.admin_users = admin_users
 
         try:
-            # Get artifact manager service
-            self.artifact_manager = await self.server.get_service(
-                "public/artifact-manager"
+            # Get artifact manager service. Wrapped because the proxy is cached
+            # for the process lifetime and the remote service can change client
+            # id without anything restarting.
+            self.artifact_manager = _ReconnectingArtifactManager(
+                server=self.server,
+                proxy=await self.server.get_service("public/artifact-manager"),
+                logger=self.logger,
             )
             self.logger.info("Successfully connected to artifact manager.")
         except Exception as e:
