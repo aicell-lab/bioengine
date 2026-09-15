@@ -31,7 +31,7 @@ import traceback
 import uuid
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 import bioengine
 import httpx
