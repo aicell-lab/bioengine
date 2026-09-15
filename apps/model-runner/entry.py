@@ -143,6 +143,10 @@ class EntryDeployment:
     # Workspace the model artifacts live in. Artifact URLs hardcode it, so
     # ``_normalize_model_id`` strips it back off a fully-qualified model_id.
     _MODELS_WORKSPACE = "bioimage-io"
+    _MODELS_COLLECTION = "bioimage-io/bioimage.io"
+    # Grants that authorize editing an artifact. '@' (every authenticated user)
+    # carries read/list/create/draft only and must never authorize a publish.
+    _WRITE_GRANTS = ("rw", "rw+", "*", "a")
 
     # Test outcome mapped to a numeric quality score, surfaced on the
     # published test-report artifact's manifest for ranking.
@@ -2074,7 +2078,7 @@ class EntryDeployment:
         prefix = f"{self._MODELS_WORKSPACE}/"
         return model_id[len(prefix) :] if model_id.startswith(prefix) else model_id
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def test(
         self,
         model_id: str = Field(
@@ -2100,6 +2104,7 @@ class EntryDeployment:
             "as-is with no freshness round-trip. A cached report that records a "
             "run which did not happen is re-derived regardless of this setting.",
         ),
+        context=None,
     ) -> str:
         """
         Schedule comprehensive model testing and return a run id immediately.
@@ -2183,6 +2188,12 @@ class EntryDeployment:
                 (prior_report or {}).get("test_environment") == "custom"
             )
 
+        # Publishing is authorized by the CALLER's identity; the write itself
+        # still uses the app's own bioimage-io token. Authorization and
+        # authorship stay separate, so a report can only ever be written by a
+        # run this service performed.
+        caller_id = ((context or {}).get("user") or {}).get("id")
+
         job = self._new_test_job(model_id, custom_environment)
 
         async def _bg_execute():
@@ -2193,6 +2204,7 @@ class EntryDeployment:
                     stage=stage,
                     custom_environment=custom_environment,
                     cache=cache,
+                    caller_id=caller_id,
                 )
                 self._update_test_job(job, state="completed", result=report)
             except Exception as exc:
@@ -2216,6 +2228,7 @@ class EntryDeployment:
         stage: bool,
         custom_environment: bool,
         cache: str,
+        caller_id: Optional[str] = None,
     ) -> dict:
         """Run the full test pipeline for a scheduled run and return the report.
 
@@ -2548,13 +2561,24 @@ class EntryDeployment:
             # The fallback report records that our own test run died, not that
             # the model is broken. Publishing it would overwrite the model's
             # durable public verdict with an artefact of our infrastructure.
-            if report_is_trustworthy:
-                await self._upload_test_report(model_id, stage, test_report)
-            else:
+            published = False
+            if not report_is_trustworthy:
                 logger.warning(
                     f"⚠️ Not publishing the fallback report for '{model_id}': "
                     "the test did not run, so it is not a verdict on the model."
                 )
+            elif not await self._caller_may_publish(model_id, caller_id):
+                logger.info(
+                    f"🔒 Not publishing the report for '{model_id}': caller "
+                    f"{caller_id or 'anonymous'!r} has no write grant on the "
+                    f"model or on '{self._MODELS_COLLECTION}'. The report is "
+                    "returned to the caller regardless."
+                )
+            else:
+                published = await self._upload_test_report(
+                    model_id, stage, test_report
+                )
+            test_report["published"] = published
 
         return test_report
 
@@ -2647,6 +2671,38 @@ class EntryDeployment:
             )
             return covers
 
+    async def _caller_may_publish(
+        self, model_id: str, caller_id: Optional[str]
+    ) -> bool:
+        """True when the caller may overwrite this model's public verdict.
+
+        Authorized by a write grant on EITHER the model artifact (uploader,
+        developer) or the models collection (bioimage.io reviewers and
+        maintainers), so a reviewer stays authorized for a model whose
+        per-model permission mirror has not synced.
+
+        Anonymous callers and callers holding only ``'*': 'r'`` or the ``'@'``
+        authenticated-user grant get their test run and their report returned;
+        only the publish is skipped.
+        """
+        if not caller_id:
+            return False
+        model_alias = model_id.rsplit("/", 1)[-1]
+        for artifact_id in (
+            f"{self._MODELS_WORKSPACE}/{model_alias}",
+            self._MODELS_COLLECTION,
+        ):
+            try:
+                artifact = await self.artifact_manager.read(
+                    artifact_id, silent=True
+                )
+            except Exception:
+                continue
+            permissions = (artifact.get("config") or {}).get("permissions") or {}
+            if permissions.get(caller_id) in self._WRITE_GRANTS:
+                return True
+        return False
+
     async def _upload_test_report(
         self, model_id: str, stage: bool, test_report: dict
     ) -> None:
@@ -2662,7 +2718,7 @@ class EntryDeployment:
         swallowed — the report is already cached and returned regardless.
         """
         if not self._test_reports_writable:
-            return
+            return False
 
         model_alias = model_id.rsplit("/", 1)[-1]
         report_artifact_id = (
@@ -2701,7 +2757,7 @@ class EntryDeployment:
                                 f"ℹ️ {slot} test report for '{model_alias}' is up to "
                                 f"date; skipping upload."
                             )
-                            return
+                            return True
                     except Exception:
                         pass
 
@@ -2798,11 +2854,13 @@ class EntryDeployment:
                     f"📤 Published {slot} test report for '{model_alias}' to "
                     f"'{report_artifact_id}'."
                 )
+                return True
             except Exception as e:
                 logger.warning(
                     f"⚠️ Failed to publish test report for '{model_alias}' to "
                     f"'{report_artifact_id}': {e}"
                 )
+                return False
 
     async def _create_report_artifact(
         self, report_artifact_id: str, model_alias: str, manifest: dict
