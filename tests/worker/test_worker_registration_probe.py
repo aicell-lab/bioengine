@@ -216,6 +216,38 @@ async def test_the_grace_is_measured_from_the_last_good_probe_not_the_first_fail
 
 
 @pytest.mark.asyncio
+async def test_one_good_probe_resets_the_grace_clock():
+    """The grace measures CONTINUOUS unreachability, not cumulative.
+
+    Deliberate, and worth pinning because "unreachable for 300s" reads as
+    cumulative. A probe that answers means the service really was resolvable at
+    that instant, so a flapping connection never condemns the pod — the same
+    way every other check in the monitoring loop resets on a clean tick.
+    """
+    server = _Server(serves=False)
+    worker = _bare_worker(server)
+
+    async def _register():
+        raise RuntimeError("Hypha is returning 500")
+
+    worker._register_bioengine_worker_service = _register
+    worker._registration_ok_at = time.time() - worker_module._REGISTRATION_GRACE_S + 5
+
+    # One tick short of escalating.
+    await worker._check_service_registration()
+
+    # The connection flaps back for a single probe.
+    server._serves = True
+    await worker._check_service_registration()
+    assert worker._registration_failing is False
+
+    # Now failing again, and past what would have been the original deadline.
+    server._serves = False
+    worker._registration_probe_due_at = 0.0
+    await worker._check_service_registration()  # must not raise
+
+
+@pytest.mark.asyncio
 async def test_the_probe_reaches_the_degraded_threshold_one_tick_at_a_time():
     """A throttled check cannot feed a CONSECUTIVE-tick counter.
 

@@ -736,6 +736,15 @@ class BioEngineWorker:
         unreachable long enough that waiting is no longer the better bet, and
         this raises so the monitoring loop's degraded counter can flip
         ``get_status`` to not-ready and let the liveness probe restart the pod.
+
+        The grace is a deadline, not a budget, and it measures **continuous**
+        unreachability: any successful probe resets it. A flapping connection
+        therefore never condemns the pod, which is deliberate — a probe that
+        answers means the service really was resolvable at that instant, and
+        every other check in the monitoring loop resets on a clean tick too.
+        Counting attempts instead would be strictly worse: a flap refills an
+        attempt budget faster than it can be spent, so the escalation would be
+        unreachable exactly when the connection is worst.
         """
         if not self.server or not self.full_service_id:
             return
