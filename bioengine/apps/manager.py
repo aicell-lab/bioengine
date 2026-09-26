@@ -246,6 +246,13 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
+# Consecutive monitor ticks an app may be missing from the Serve status report
+# before absence is acted on as a failure. Absence is not a verdict — the report
+# can be momentarily incomplete — but it must still converge: never redeploying
+# a genuinely dead app is its own outage. Three ticks ≈ 30 s at the default
+# monitor interval.
+_MISSING_FROM_STATUS_TOLERANCE = 3
+
 # Minimum gap between in-place Serve-controller-loss recovery sweeps: long
 # enough for a redeploy's serve.run to bootstrap the controller before we'd
 # consider re-firing.
@@ -383,6 +390,15 @@ class AppsManager:
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
         # moment an app is observed healthy again. See monitor_applications.
         self._redeploy_backoff: Dict[str, Dict[str, Any]] = {}
+
+        # Consecutive monitor ticks each app has been missing from the Serve
+        # status report. Cleared the moment the app reappears, in any state.
+        self._missing_from_status: Dict[str, int] = {}
+
+        # Apps the monitor itself deleted to force fresh replicas. Their next
+        # absence is expected, not an untrustworthy report, so it skips the
+        # tolerance above. See monitor_applications.
+        self._deleted_pending_redeploy: set = set()
 
         # Timestamp of the last in-place Serve-controller-loss recovery sweep,
         # used to rate-limit re-firing while a redeploy's serve.run is still
@@ -838,6 +854,8 @@ class AppsManager:
         # first makes the app invisible to the monitor for the rest of teardown.
         self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
+        self._missing_from_status.pop(application_id, None)
+        self._deleted_pending_redeploy.discard(application_id)
 
         try:
             await self.ray_cluster.call_with_reconnect(
@@ -867,6 +885,8 @@ class AppsManager:
         # Remove from internal tracking after all cleanup operations complete
         self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
+        self._missing_from_status.pop(application_id, None)
+        self._deleted_pending_redeploy.discard(application_id)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
     def _project_replicas(
@@ -1515,8 +1535,10 @@ class AppsManager:
 
         Each monitor tick walks every app whose ``deploy_app(..., auto_redeploy=True)``
         flag is set and pulls its Ray Serve status. An app is considered unhealthy
-        when ``serve.status`` reports ``DEPLOY_FAILED`` / ``UNHEALTHY`` or has
-        dropped out of the response entirely. The recovery rule:
+        when ``serve.status`` reports ``DEPLOY_FAILED`` / ``UNHEALTHY``, or when it
+        has been missing from the response for ``_MISSING_FROM_STATUS_TOLERANCE``
+        consecutive ticks — absence is treated as unknown until then, since a
+        momentarily incomplete report is not a failure verdict. The recovery rule:
 
         - On the first unhealthy observation, fire a fresh ``_deploy_application``
           task immediately and seed the backoff state (1 consecutive failure,
@@ -1584,6 +1606,9 @@ class AppsManager:
             state = application.status.value if application else None
             backoff_state = self._redeploy_backoff.get(application_id)
 
+            if application is not None:
+                self._missing_from_status.pop(application_id, None)
+
             if state == "RUNNING":
                 # Truly healthy — reset the backoff so the next failure
                 # restarts from the initial delay.
@@ -1615,17 +1640,44 @@ class AppsManager:
                         await self.ray_cluster.call_with_reconnect(
                             serve.delete, application_id
                         )
+                        self._deleted_pending_redeploy.add(application_id)
                     except Exception as del_err:
                         self.logger.error(
                             f"Error deleting stale '{application_id}': {del_err}"
                         )
+                else:
+                    self._deleted_pending_redeploy.discard(application_id)
                 continue
 
-            unhealthy = application is None or state in (
-                "DEPLOY_FAILED",
-                "UNHEALTHY",
-            )
-            if not unhealthy:
+            if application is None and application_id in self._deleted_pending_redeploy:
+                # Missing because the stale-replica branch above deleted it, so
+                # this gap is known, not unknown, and must not wait out the
+                # tolerance below.
+                self._deleted_pending_redeploy.discard(application_id)
+                reason = "deleted to force fresh replicas after a version mismatch"
+            elif application is None:
+                # Absence is not a verdict. "Ray says it is broken" is a fact;
+                # "Ray did not mention it" can just mean the report was
+                # incomplete for a tick, and redeploying on that destroys the
+                # in-flight state of a healthy app. Tolerate a few, then let it
+                # through — an unknown that never converges is its own outage.
+                missing_ticks = self._missing_from_status.get(application_id, 0) + 1
+                self._missing_from_status[application_id] = missing_ticks
+                if missing_ticks < _MISSING_FROM_STATUS_TOLERANCE:
+                    self.logger.info(
+                        f"Application '{application_id}' is absent from the Ray "
+                        f"Serve status report ({missing_ticks}/"
+                        f"{_MISSING_FROM_STATUS_TOLERANCE}); treating as unknown "
+                        f"rather than unhealthy."
+                    )
+                    continue
+                reason = (
+                    f"absent from the Ray Serve status report for "
+                    f"{missing_ticks} consecutive checks"
+                )
+            elif state in ("DEPLOY_FAILED", "UNHEALTHY"):
+                reason = f"Ray Serve reports status {state}"
+            else:
                 # Transitional state (NOT_STARTED, DEPLOYING, DELETING) —
                 # keep any existing backoff state but wait for the in-flight
                 # transition to settle before deciding to retry.
@@ -1633,7 +1685,9 @@ class AppsManager:
 
             if backoff_state is None:
                 # First failure observation — fire immediately, seed backoff.
-                self._fire_redeploy(application_id, application_info, attempt=1)
+                self._fire_redeploy(
+                    application_id, application_info, attempt=1, reason=reason
+                )
                 self._redeploy_backoff[application_id] = {
                     "consecutive_failures": 1,
                     "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
@@ -1645,7 +1699,9 @@ class AppsManager:
                 continue
 
             attempt = backoff_state["consecutive_failures"] + 1
-            self._fire_redeploy(application_id, application_info, attempt=attempt)
+            self._fire_redeploy(
+                application_id, application_info, attempt=attempt, reason=reason
+            )
             delay = min(
                 _REDEPLOY_BACKOFF_MAX_SECONDS,
                 _REDEPLOY_BACKOFF_INITIAL_SECONDS * (2 ** (attempt - 1)),
@@ -1680,19 +1736,30 @@ class AppsManager:
                 f"Ray Serve controller lost (Ray head restart?); "
                 f"re-establishing application '{application_id}' in-place."
             )
-            self._fire_redeploy(application_id, info, attempt=1)
+            self._fire_redeploy(
+                application_id,
+                info,
+                attempt=1,
+                reason="the Ray Serve controller was lost",
+            )
 
     def _fire_redeploy(
         self,
         application_id: str,
         application_info: Dict[str, Any],
         attempt: int,
+        reason: str,
     ) -> None:
-        """Schedule a redeploy task and log the attempt number."""
+        """Schedule a redeploy task, logging what triggered it.
+
+        ``reason`` is what makes an incident readable afterwards: an explicit
+        UNHEALTHY verdict and a missing status entry are different failures and
+        used to produce the same line.
+        """
         self.logger.warning(
             f"Application '{application_id}' for artifact "
-            f"'{application_info['artifact_id']}' is unhealthy; triggering "
-            f"redeployment (attempt #{attempt})."
+            f"'{application_info['artifact_id']}' is unhealthy ({reason}); "
+            f"triggering redeployment (attempt #{attempt})."
         )
         deployment_task = asyncio.create_task(
             self._deploy_application(application_id=application_id),
