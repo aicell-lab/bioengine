@@ -275,6 +275,9 @@ class ProxyDeployment:
                     exc_info=True,
                 )
 
+        self._proxy_actor_handle = proxy_actor_handle
+        self._replica_id = replica_id
+
         # BioEngine application metadata
         self.application_id = application_id
         self.application_name = application_name
@@ -345,21 +348,27 @@ class ProxyDeployment:
 
         # No Hypha service exists until _register_services succeeds, so seed the
         # worker-visible record as unregistered rather than leaving it unknown.
-        self._proxy_actor_handle = proxy_actor_handle
         self._report_service_registration(False)
 
     def _report_service_registration(self, registered: bool) -> None:
         """Tell the proxy actor whether our Hypha services exist right now.
 
+        Tagged with our replica id so the actor can drop a departing replica's
+        deregistration that lands after its successor has already registered.
+
         Fire-and-forget: the worker reads this to decide whether to advertise
         this app's service address, and a failed report must never affect the
-        replica.
+        replica. Reachable from ``__del__`` after a part-built ``__init__``,
+        hence the tolerant attribute read.
         """
-        if self._proxy_actor_handle is None:
+        handle = getattr(self, "_proxy_actor_handle", None)
+        if handle is None:
             return
         try:
-            self._proxy_actor_handle.report_service_registration.remote(
-                application_id=self.application_id, registered=registered
+            handle.report_service_registration.remote(
+                application_id=self.application_id,
+                registered=registered,
+                replica_id=self._replica_id,
             )
         except Exception as e:
             logger.warning(

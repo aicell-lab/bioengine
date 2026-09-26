@@ -22,7 +22,7 @@ The contract now:
 from __future__ import annotations
 
 import asyncio
-import inspect
+import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -225,7 +225,8 @@ def test_the_actor_round_trips_both_registration_states() -> None:
 
 
 def test_clearing_an_application_forgets_its_registration() -> None:
-    # Otherwise a redeployed app inherits the previous deployment's verdict.
+    # Called from undeploy_app only, so this is about an app_id that is later
+    # deployed afresh — not about redeploy, which is covered by the init seed.
     actor = _bare_actor()
     actor.report_service_registration(APP_ID, True)
     actor.clear_application_replicas(APP_ID)
@@ -242,14 +243,18 @@ class _Handle:
         self.reports = []
         self.report_service_registration = MagicMock()
         self.report_service_registration.remote = self._record
+        self.register_serve_replica = MagicMock()
 
-    def _record(self, application_id: str, registered: bool) -> None:
+    def _record(
+        self, application_id: str, registered: bool, replica_id=None
+    ) -> None:
         self.reports.append((application_id, registered))
 
 
 def _bare_proxy(**attrs):
     inst = object.__new__(_ProxyCls)
     inst.application_id = APP_ID
+    inst._replica_id = "replica-0"
     inst.entry_deployment_ready = True
     inst.server = None
     inst.websocket_service_id = None
@@ -306,11 +311,56 @@ async def test_deregistering_reports_the_service_as_gone() -> None:
     assert inst._proxy_actor_handle.reports == [(APP_ID, False)]
 
 
-def test_the_proxy_seeds_the_record_as_unregistered_at_init() -> None:
+def _construct_proxy(monkeypatch, handle: _Handle, replica_tag: str = "replica-0"):
+    """Build a real ProxyDeployment, with only Ray's two lookups stubbed."""
+    monkeypatch.setattr(pd_module.ray, "get_actor", lambda name, namespace: handle)
+    monkeypatch.setattr(
+        pd_module,
+        "get_replica_context",
+        lambda: MagicMock(
+            deployment="ProxyDeployment", replica_tag=replica_tag, app_name=APP_ID
+        ),
+    )
+    return _ProxyCls(
+        application_id=APP_ID,
+        application_name="Nuclei Segmentation",
+        application_description="Segment nuclei.",
+        app_data={},
+        entry_deployment_handle=MagicMock(),
+        method_schemas=[],
+        max_ongoing_requests=1,
+        server_url="https://hypha.example",
+        workspace="bioimage-io",
+        proxy_service_token="tok",
+        worker_client_id=WORKER_CLIENT_ID,
+        authorized_users={"*": ["*"]},
+        proxy_actor_name="proxy-actor",
+        debug=False,
+    )
+
+
+def test_the_proxy_seeds_the_record_as_unregistered_at_init(monkeypatch) -> None:
     # Without the seed the worker sees "never reported" on a brand-new app and
-    # falls back to the replica-alive gate — i.e. the original bug.
-    src = inspect.getsource(_ProxyCls.__init__)
-    assert "self._report_service_registration(False)" in src
+    # falls back to the replica-alive gate — i.e. the original bug. Constructing
+    # the real class is the point: a seed call placed where the actor handle is
+    # not set yet would silently no-op and still read fine in the source.
+    handle = _Handle()
+
+    _construct_proxy(monkeypatch, handle)
+
+    assert handle.reports == [(APP_ID, False)]
+
+
+def test_the_seed_carries_the_reporting_replica_tag(monkeypatch) -> None:
+    handle = _Handle()
+    payloads = []
+    handle.report_service_registration.remote = (
+        lambda application_id, registered, replica_id: payloads.append(replica_id)
+    )
+
+    _construct_proxy(monkeypatch, handle, replica_tag="replica-7")
+
+    assert payloads == ["replica-7"]
 
 
 def test_a_missing_actor_handle_never_breaks_the_replica() -> None:
@@ -318,12 +368,96 @@ def test_a_missing_actor_handle_never_breaks_the_replica() -> None:
     inst._report_service_registration(True)  # must not raise
 
 
+def test_reporting_survives_a_part_built_replica() -> None:
+    # __del__ -> _deregister_services -> here, reachable before __init__ has
+    # assigned the handle at all.
+    inst = object.__new__(_ProxyCls)
+    inst._report_service_registration(False)  # must not raise AttributeError
+
+
+# ===== a departing replica cannot overwrite its successor's verdict =====
+
+
+def test_a_late_deregistration_from_the_old_replica_is_ignored() -> None:
+    # Rolling update: the incoming replica seeds False, registers and reports
+    # True; the outgoing replica's __del__ deregisters afterwards. Taking that
+    # last write pins a healthy app at False for good — nothing re-reports True
+    # until the next _register_services, which the running replica will not do.
+    actor = _bare_actor()
+    actor.report_service_registration(APP_ID, True, replica_id="old")
+    actor.report_service_registration(APP_ID, False, replica_id="new")
+    actor.report_service_registration(APP_ID, True, replica_id="new")
+
+    actor.report_service_registration(APP_ID, False, replica_id="old")
+
+    assert actor.get_service_registration(APP_ID) is True
+
+
+def test_the_current_replica_can_still_deregister() -> None:
+    actor = _bare_actor()
+    actor.report_service_registration(APP_ID, True, replica_id="new")
+
+    actor.report_service_registration(APP_ID, False, replica_id="new")
+
+    assert actor.get_service_registration(APP_ID) is False
+
+
+def test_the_old_replica_leaving_first_still_leaves_the_app_registered() -> None:
+    # The other interleaving of the same update: __del__ lands before the
+    # incoming replica gets as far as registering.
+    actor = _bare_actor()
+    actor.report_service_registration(APP_ID, True, replica_id="old")
+
+    actor.report_service_registration(APP_ID, False, replica_id="old")
+    actor.report_service_registration(APP_ID, False, replica_id="new")
+    actor.report_service_registration(APP_ID, True, replica_id="new")
+
+    assert actor.get_service_registration(APP_ID) is True
+
+
+def test_an_untagged_report_still_works() -> None:
+    # A replica that could not read its Ray replica context reports None, which
+    # must degrade to the plain last-writer behaviour rather than being dropped.
+    actor = _bare_actor()
+    actor.report_service_registration(APP_ID, True)
+
+    actor.report_service_registration(APP_ID, False)
+
+    assert actor.get_service_registration(APP_ID) is False
+
+
 # ===== the deployment log no longer claims completion =====
 
 
-def test_deploy_does_not_claim_completion_before_the_replicas_run() -> None:
-    src = inspect.getsource(AppsManager._deploy_application)
-    assert "Successfully completed deployment" not in src, (
-        "serve.run is non-blocking here — the replicas are only starting, and "
-        "the Hypha service does not exist until the proxy registers it."
-    )
+@pytest.mark.asyncio
+async def test_deploy_does_not_claim_completion_before_the_replicas_run(
+    caplog,
+) -> None:
+    # serve.run is non-blocking here — the replicas are only starting, and the
+    # Hypha service does not exist until the proxy registers it.
+    manager = object.__new__(AppsManager)
+    manager.logger = logging.getLogger("test.deploy_log")
+    manager._deployed_applications = {APP_ID: _make_app_info()}
+    manager._deployed_applications[APP_ID]["is_deployed"] = asyncio.Event()
+    manager._deployed_applications[APP_ID]["built_app"] = MagicMock()
+    manager.app_builder = MagicMock()
+    manager.app_builder.submit = AsyncMock()
+
+    with caplog.at_level(logging.INFO, logger="test.deploy_log"):
+        task = asyncio.create_task(manager._deploy_application(APP_ID))
+        await asyncio.wait_for(
+            manager._deployed_applications[APP_ID]["is_deployed"].wait(), timeout=5
+        )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    manager.app_builder.submit.assert_awaited_once()
+    emitted = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "test.deploy_log" and r.levelno == logging.INFO
+    ]
+    submitted = [m for m in emitted if APP_ID in m and "1.0.1" in m]
+    assert submitted, emitted
+    assert not any("completed deployment" in m.lower() for m in emitted)
