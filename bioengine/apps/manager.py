@@ -445,6 +445,56 @@ class AppsManager:
             # If artifact_id does not contain a slash, prepend the workspace
             return f"{self.server.config.workspace}/{artifact_id}"
 
+    def _get_startup_version_pin(
+        self, application_id: str, artifact_id: str
+    ) -> Optional[str]:
+        """Return the version the startup config will restore on the next restart.
+
+        None when the app is not a startup application, or is pinned without a
+        version — in that case a restart redeploys whatever is already running.
+        """
+        for app_config in self.startup_applications:
+            if not isinstance(app_config, dict):
+                continue
+            if app_config.get("application_id") != application_id:
+                continue
+            config_artifact_id = app_config.get("artifact_id")
+            if not config_artifact_id:
+                continue
+            if self._get_full_artifact_id(config_artifact_id) == artifact_id:
+                return app_config.get("version")
+        return None
+
+    def _warn_on_startup_pin_divergence(self, app_config: Dict[str, Any]) -> None:
+        """Report a startup pin that is about to move a running app to another version.
+
+        ``recover_deployed_applications()`` runs first, so both numbers are in
+        hand here. Without this the revert is indistinguishable from a clean
+        start — same RUNNING status, same healthy probes, just older code.
+        """
+        pinned_version = app_config.get("version")
+        application_id = app_config.get("application_id")
+        if not pinned_version or not application_id:
+            return
+
+        running = self._deployed_applications.get(application_id)
+        if not running or running["version"] == pinned_version:
+            return
+        if running["artifact_id"] != self._get_full_artifact_id(
+            app_config["artifact_id"]
+        ):
+            return
+
+        self.logger.warning(
+            f"Startup application '{application_id}' (artifact "
+            f"'{running['artifact_id']}') was found running version "
+            f"{running['version'] or 'latest'!r} but is pinned to "
+            f"{pinned_version!r} — deploying the pinned version. If "
+            f"{running['version'] or 'latest'!r} was rolled out over the API, "
+            f"that change is being reverted; update the worker's "
+            f"startup_applications config to keep it."
+        )
+
     async def _generate_application_id(self) -> str:
         """
         Generate a unique identifier for a new application deployment.
@@ -1121,6 +1171,13 @@ class AppsManager:
                 application_id, application_details, application_info["version"]
             )
 
+        # The version a worker restart would restore. Differs from ``version``
+        # only when the app was rolled out over the API without updating the
+        # worker's startup_applications config; None when it isn't pinned.
+        pinned_version = self._get_startup_version_pin(
+            application_id, application_info["artifact_id"]
+        )
+
         # Build static site URL with runtime config params so the frontend
         # knows which Hypha server and service to connect to.
         base_static_url = application_info.get("static_site_url")
@@ -1141,6 +1198,7 @@ class AppsManager:
             "version": application_info["version"] or "latest",
             "running_version": running_version,
             "version_verified": version_verified,
+            "pinned_version": pinned_version,
             "recovered_app": application_info["recovered_app"],
             "status": status,
             "message": message,
@@ -1431,6 +1489,8 @@ class AppsManager:
                         f"Invalid keys in startup application config for artifact '{app_config.get('artifact_id', 'unknown')}': "
                         f"{', '.join(sorted(invalid_keys))}. Valid keys are: {', '.join(sorted(valid_keys))}"
                     )
+
+                self._warn_on_startup_pin_divergence(app_config)
 
                 if "hypha_token" not in app_config:
                     app_config["hypha_token"] = startup_applications_token
