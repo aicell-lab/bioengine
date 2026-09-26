@@ -65,6 +65,10 @@ _REACHABILITY_PROBE_INTERVAL_S = 60
 # doesn't answer, so 'Client already exists and is active' means the old client
 # is genuinely still alive and no amount of backoff will clear it.
 _REREGISTER_BACKOFF_S = 30
+# Ceiling on a usage-shard write. The maintenance loop flushes before it does
+# anything else, so a wedged PVC must cost it two tick periods, not the rest of
+# the replica's life.
+_USAGE_FLUSH_TIMEOUT_S = 10
 # How long a dropped socket is left to hypha-rpc before we probe it. The
 # library reconnects and re-registers on its own; rebuilding our client while
 # it is mid-reconnect abandons the connection it is repairing and starts a
@@ -350,6 +354,7 @@ class ProxyDeployment:
         # Lock for service registration
         self._registration_lock = asyncio.Lock()
 
+        self._usage_flush_lock = asyncio.Lock()
         self._usage_ledger = self._open_usage_ledger(replica_id)
 
     async def get_app_data(self) -> Dict[str, Any]:
@@ -402,15 +407,21 @@ class ProxyDeployment:
         """Persist pending counts without touching the event loop's thread.
 
         Shards live on cluster storage that can stall; a synchronous write here
-        would put that stall on the request path.
+        would put that stall on the request path, and an unbounded wait for the
+        executor would put it on the maintenance loop instead — which calls this
+        first and is the only thing that re-registers a dropped Hypha client.
         """
         if self._usage_ledger is None or not self._usage_ledger.dirty:
             return
         try:
-            revision, payload = self._usage_ledger.serialize()
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._usage_ledger.write, revision, payload
-            )
+            async with self._usage_flush_lock:
+                revision, payload = self._usage_ledger.serialize()
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, self._usage_ledger.write, revision, payload
+                    ),
+                    timeout=_USAGE_FLUSH_TIMEOUT_S,
+                )
         except Exception as e:
             logger.warning(
                 f"⚠️ Could not flush the usage ledger for '{self.application_id}': {e}"
@@ -560,6 +571,14 @@ class ProxyDeployment:
             # between this check and the acquire below, making the decision
             # race-free.
             if self.service_semaphore.locked():
+                # Counted, because attempted saturates at max_ongoing_requests
+                # once a deployment wedges — without this every further real
+                # call during the wedge is invisible to all three counters.
+                self._record_usage(
+                    method_name,
+                    classify_caller(context, self.workspace, self.authorized_users),
+                    "rejected",
+                )
                 logger.warning(
                     f"⚠️ '{self.application_id}' at capacity "
                     f"({self.max_ongoing_requests} concurrent requests); "
@@ -1040,17 +1059,22 @@ class ProxyDeployment:
         replica logs, which are destroyed whenever the Ray session restarts. They are read from
         durable per-writer shards on the cluster's application storage and summed on every call.
 
-        Three counters are kept per method and per caller class:
+        Four counters are kept per method and per caller class:
         - attempted: the call was authorized and dispatched to the application
-        - answered: the application returned a result
+        - answered: the application returned a result. This is application completion, not
+          client receipt — a caller whose own RPC timed out still increments it.
         - failed: the application raised, or the call was cancelled
+        - rejected: the call was turned away at the concurrency limit and never dispatched
 
         attempted minus answered minus failed is the number of calls that were dispatched and
-        never came back — the signature of a deployment that wedged mid-request.
+        never came back — the signature of a deployment that wedged mid-request. attempted
+        stops rising at max_ongoing_requests once that happens, so rejected is what carries
+        the size of the demand the wedge is refusing.
 
         Caller classes are coarse by design, and no caller identity is ever recorded:
-        - internal: the caller can operate this deployment (write access to the hosting
-          workspace, or a named entry in the application's authorized users)
+        - internal: the caller holds a grant on the workspace hosting the application, or is
+          named in a non-public authorized-users rule. Read access counts, so the external
+          figure is a floor rather than an estimate.
         - external: any other authenticated caller
         - anonymous: the caller was not authenticated by Hypha
 

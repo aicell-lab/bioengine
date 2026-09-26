@@ -14,7 +14,9 @@ Three properties the storage layout buys:
   ``clear_app_directory``.
 * **Concurrency-safe.** Each writer owns exactly one shard file and never
   touches another's, so there is no shared read-modify-write to lose an
-  increment and no lock to take. A read sums every shard in the directory.
+  increment. A read sums every shard in the directory. Every write stages
+  through its own uniquely named temporary file, so even two writes racing on
+  one shard leave a whole file behind rather than a torn one.
 * **Attributable.** Counts are bucketed by method and by caller *class*
   (:func:`classify_caller`) — never by caller identity. An unattributed total
   is dominated by whoever drives the app hardest, which is usually its own
@@ -31,6 +33,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -41,7 +44,7 @@ FORMAT_VERSION = 1
 #: counter that is supposed to be cumulative forever.
 LEDGER_DIRNAME = ".bioengine-usage"
 
-EVENTS = ("attempted", "answered", "failed")
+EVENTS = ("attempted", "answered", "failed", "rejected")
 
 ANONYMOUS = "anonymous"
 EXTERNAL = "external"
@@ -49,10 +52,14 @@ INTERNAL = "internal"
 UNKNOWN = "unknown"
 CALLER_CLASSES = (ANONYMOUS, EXTERNAL, INTERNAL, UNKNOWN)
 
-#: Hypha workspace permission values that imply write access. A caller holding
-#: one of these on the workspace hosting the app can operate the deployment, so
-#: their traffic is the project's own rather than a user's.
-_OPERATOR_GRANTS = frozenset({"rw", "rw+", "a", "*"})
+#: Every ``UserPermission`` Hypha can put on a workspace (``r``, ``rw``, ``a``).
+#: Holding *any* grant on the workspace hosting the app means the caller was
+#: deliberately given a key to it, which a genuine outside user never is:
+#: ``update_user_scope`` only records a workspace the caller already had a
+#: permission on, and ``get_user_info`` only adds their own ``ws-user-<id>``.
+#: Read is included so the residual error runs one way — a read-scoped operator
+#: is counted internal rather than inflating the published external figure.
+_OPERATOR_GRANTS = frozenset({"r", "rw", "a"})
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -70,15 +77,25 @@ def classify_caller(
 ) -> str:
     """Bucket a Hypha caller into one of :data:`CALLER_CLASSES`.
 
-    ``internal`` means the caller can operate this deployment — a write grant
-    on the workspace hosting the app (or globally), or a named entry in the
-    app's own ``authorized_users``, which carries the deploying user and the
-    worker's admin users. ``external`` is any other logged-in caller and
+    ``internal`` means the caller holds a key to this deployment — any grant on
+    the workspace hosting the app (or a global one), or a named entry in the
+    app's ``authorized_users``. ``external`` is any other logged-in caller and
     ``anonymous`` any caller Hypha did not authenticate.
 
-    The split is deliberately biased: a maintainer of the hosting workspace who
-    is also a genuine user counts as internal, so the external figure
-    under-reports rather than over-reports.
+    The split is deliberately biased so the external figure is a floor: a
+    maintainer of the hosting workspace who is also a genuine user counts as
+    internal, and any doubt resolves that way too.
+
+    The ``authorized_users`` leg only fires on apps that are not public. A
+    ``visibility: public`` app's rule is ``["*"]``, and neither the builder nor
+    the manager injects the deploying user or the worker's admins into a rule
+    that already contains ``"*"`` — for those apps the workspace grant is the
+    whole of the classification.
+
+    ``UNKNOWN`` is unreachable from the proxy request path, where
+    ``_check_permissions`` has already rejected a context carrying neither an
+    id nor an email. It exists so a direct caller of this function cannot be
+    silently mis-bucketed as external.
     """
     user = (context or {}).get("user")
     if not isinstance(user, dict):
@@ -194,7 +211,10 @@ class UsageLedger:
 
     def write(self, revision: int, payload: str) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(f".{self.path.name}.tmp.{os.getpid()}")
+        # Unique per call, not per process: both writers of a racing pair are
+        # the same process, and a shared staging path lets one rename a file
+        # the other is still filling.
+        tmp = self.path.with_name(f".{self.path.name}.tmp.{uuid.uuid4().hex}")
         try:
             tmp.write_text(payload)
             os.replace(tmp, self.path)
