@@ -17,6 +17,8 @@ import numpy as np
 import pytest
 
 TEST_MODEL_ID = "ambitious-ant"
+# Declares its own conda env (v0.4 ``conda:environment.yaml``).
+CUSTOM_ENV_MODEL_ID = "stupendous-sheep"
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -192,6 +194,38 @@ async def test_model_test_cache_skip(model_runner):
     result = await model_runner.test(model_id=TEST_MODEL_ID, stage=False, cache="skip")
     assert isinstance(result, dict)
     assert result.get("status") == "passed"
+
+    # A verdict must name the hardware and the worker that produced it (#0042).
+    env = {str(r[0]): str(r[1]) for r in result.get("env") or [] if len(r) >= 2}
+    assert env.get("replica_accelerator") not in (None, "", "unknown")
+    # Must be the worker service id, not a per-connection client id: the latter
+    # is regenerated every replica restart and maps back to nothing.
+    assert "bioengine-worker" in env.get("worker", ""), env.get("worker")
+
+
+@pytest.mark.asyncio
+@pytest.mark.requires_gpu
+async def test_custom_env_model_skips_the_default_env_inference_check(model_runner):
+    """A custom-environment model must not be recorded as FAILING a check that
+    runs in an environment it never claimed to work in (#0079).
+
+    Uses CUSTOM_ENV_MODEL_ID, not TEST_MODEL_ID: ``custom_environment=True`` is a
+    request, not a guarantee — a model that declares no environment is silently
+    downgraded to standard, which would make this assert on the wrong path.
+    Assumes the declared env is already cached on the cluster PVC; on a cold
+    cache this model took ~1900 s to solve. ``cache="skip"`` also forces a full
+    re-download of the package, which is not small for this model.
+    """
+    result = await model_runner.test(
+        model_id=CUSTOM_ENV_MODEL_ID, stage=False, cache="skip", custom_environment=True
+    )
+    assert result.get("test_environment") == "custom", result.get("test_environment")
+
+    check = result.get("inference_check") or {}
+    assert check.get("status") == "skipped", check
+    # Populated, not null: the website renders this field, and a null blanks the
+    # message in its dialog.
+    assert check.get("error"), check
 
 
 @pytest.mark.asyncio
