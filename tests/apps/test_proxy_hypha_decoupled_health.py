@@ -45,6 +45,7 @@ def _bare_proxy(**attrs):
     inst._maintenance_task = None
     inst._connection_lost = False
     inst._registration_failure = None
+    inst._usage_ledger = None
     inst._probe_due_at = 0.0
     inst._next_register_at = 0.0
     inst._proxy_actor_handle = None

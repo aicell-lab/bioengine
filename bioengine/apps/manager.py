@@ -1990,7 +1990,7 @@ class AppsManager:
                 running, or every node's delete failed for a reason other than
                 "not_found".
             ValueError: If no node had a matching directory, or
-                application_id contains path separators.
+                application_id contains path separators or starts with a dot.
         """
         self._check_initialized()
         check_permissions(
@@ -1999,7 +1999,14 @@ class AppsManager:
             resource_name=f"clearing app directory '{application_id}'",
         )
 
-        if "/" in application_id or "\\" in application_id or application_id in (".", ".."):
+        # A leading dot is rejected along with path separators: the usage
+        # ledger root is a dotted sibling of the app directories, so a bare
+        # name is otherwise enough to rmtree every app's cumulative counts.
+        if (
+            "/" in application_id
+            or "\\" in application_id
+            or application_id.startswith(".")
+        ):
             raise ValueError(
                 f"application_id must be a plain name, not a path: '{application_id}'"
             )
