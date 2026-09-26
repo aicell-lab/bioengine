@@ -170,9 +170,9 @@ def __getattr__(name: str) -> Any:
 
         return _datasets_module
     if name == "logger":
-        from bioengine._app.accessors import _get_logger
+        from bioengine._app.accessors import _LazyLogger
 
-        return _get_logger()
+        return _LazyLogger()
     if name in _LAZY_FROM_APP:
         import bioengine._app as _app_module
 

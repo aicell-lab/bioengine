@@ -493,6 +493,14 @@ def build_and_run_application(
     for key, value in replica_env_vars.items():
         os.environ[key] = value
 
+    # ``_setup_replica`` also sets this, but only once the user's ``__init__``
+    # is already running, so anything the replica logs before then took the
+    # fallback branch. In the runtime_env it is true from the replica's first
+    # line. Deliberately added after the loop above: this build task imports
+    # the user module but is not itself a replica, and claiming otherwise
+    # would be a lie the accessor believes.
+    replica_env_vars = {**replica_env_vars, "BIOENGINE_REPLICA": "1"}
+
     head_app_dir = Path(replica_env_vars["BIOENGINE_APP_DIR"])
     head_version = replica_env_vars.get("BIOENGINE_ARTIFACT_VERSION") or spec.get(
         "version", ""
