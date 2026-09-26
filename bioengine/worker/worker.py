@@ -305,8 +305,6 @@ class BioEngineWorker:
         self._last_monitoring = 0
         self._registration_probe_due_at = 0.0
         self._registration_failing = False
-        # Start the grace clock at construction: a worker that never manages to
-        # serve its registration must condemn itself just as one that loses it.
         self._registration_ok_at = time.time()
         # Flap detection, on a clock that deliberately never resets on success.
         self._registration_window_start = self._registration_ok_at
@@ -995,6 +993,12 @@ class BioEngineWorker:
                 monitoring tick are handled and retried.
         """
         try:
+            # Start the registration grace clock here rather than at
+            # construction: startup takes minutes, so a clock started before
+            # the first probe can run is already spent when it does.
+            self._registration_ok_at = time.time()
+            self._registration_window_start = self._registration_ok_at
+
             # Signal that the worker is ready
             self.is_ready.set()
 
