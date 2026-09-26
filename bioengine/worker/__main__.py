@@ -278,13 +278,6 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         "to connect to the cluster.",
     )
     ray_cluster_group.add_argument(
-        "--redis-password",
-        type=str,
-        metavar="PASSWORD",
-        help="Password for Ray cluster Redis authentication. If not specified, "
-        "a secure random password will be generated automatically.",
-    )
-    ray_cluster_group.add_argument(
         "--head-num-cpus",
         type=int,
         metavar="COUNT",

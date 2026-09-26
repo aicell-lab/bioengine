@@ -88,7 +88,6 @@ class RayCluster:
         serve_port: int = 8000,
         dashboard_port: int = 8265,
         client_server_port: int = 10001,
-        redis_password: Optional[str] = None,
         ray_temp_dir: Union[str, Path] = f"{os.environ['HOME']}/.bioengine/ray",
         head_num_cpus: int = 0,
         head_num_gpus: int = 0,
@@ -131,7 +130,6 @@ class RayCluster:
             serve_port: Port for Ray Serve HTTP server. Default 8000.
             dashboard_port: Port for Ray dashboard. Default 8265.
             client_server_port: Base port for Ray client services. Default 10001.
-            redis_password: Password for Redis server. Generated randomly if None.
             ray_temp_dir: Temporary directory for Ray. Default '/home/<user>/.bioengine/ray'.
             head_num_cpus: Number of CPUs for head node (single-machine mode). Default 0.
             head_num_gpus: Number of GPUs for head node (single-machine mode). Default 0.
@@ -245,7 +243,6 @@ class RayCluster:
                         if head_memory_in_gb is not None
                         else None
                     ),
-                    "redis_password": str(redis_password or os.urandom(16).hex()),
                     "force_clean_up": bool(force_clean_up),
                 }
             )
@@ -774,7 +771,6 @@ class RayCluster:
                 f"--max-worker-port={self.ray_cluster_config['ports']['max_worker']}",
                 "--include-dashboard=True",
                 f"--dashboard-port={self.ray_cluster_config['ports']['dashboard']}",
-                f"--redis-password={self.ray_cluster_config['redis_password']}",
                 f"--temp-dir={ray_temp_dir}",
             ]
 
@@ -793,13 +789,8 @@ class RayCluster:
                 if vram_mb:
                     args.append(f"--resources={json.dumps({'VRAM_MB': vram_mb})}")
 
-            # Prevent logging of Redis password in debug logs
-            censored_args = [
-                arg if "redis-password" not in arg else "--redis-password=****"
-                for arg in args
-            ]
             self.logger.debug(
-                f"Ray start command: {self.ray_exec_path} {' '.join(censored_args)}"
+                f"Ray start command: {self.ray_exec_path} {' '.join(args)}"
             )
 
             proc = await asyncio.create_subprocess_exec(
