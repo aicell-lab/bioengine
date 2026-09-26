@@ -14,8 +14,15 @@ import pytest
 
 from bioengine.apps import manager as manager_module
 from bioengine.apps.manager import AppsManager
+from bioengine.cluster import ray_cluster as ray_cluster_module
+from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.heartbeat import heartbeat_stale_after_seconds
-from bioengine.utils import connect_with_retry, is_transient_connect_error
+from bioengine.utils import (
+    RECONNECT_BUDGET_S,
+    STARTUP_CONNECT_BUDGET_S,
+    connect_with_retry,
+    is_transient_connect_error,
+)
 from bioengine.utils import network as network_module
 from bioengine.worker import worker as worker_module
 from bioengine.worker.worker import BioEngineWorker
@@ -321,3 +328,93 @@ async def test_a_reconnect_pass_fits_inside_the_heartbeat_deadline(monkeypatch):
         f"one repair pass blocks the monitoring loop for {clock.elapsed:.0f}s, "
         f"past the {deadline:.0f}s heartbeat deadline"
     )
+
+
+class _Reached(Exception):
+    """Ends a start() once the value under test has been recorded."""
+
+
+def _budget_recorder(budgets):
+    """Stands in for a connect method, defaulting exactly as the real one does."""
+
+    async def _connect(retry_budget_seconds: float = RECONNECT_BUDGET_S):
+        budgets.append(retry_budget_seconds)
+        raise _Reached
+
+    return _connect
+
+
+async def test_worker_startup_connects_on_the_startup_budget(tmp_path):
+    """start() must pass the startup budget; inheriting the default is the bug.
+
+    The reconnect default is deliberately short because the monitoring loop
+    retries every tick. Startup has no loop yet, so a silent fall-back to it
+    puts the worker back inside the hypha restart gap it exits on.
+    """
+    budgets = []
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    worker = BioEngineWorker.__new__(BioEngineWorker)
+    worker.logger = _RecordingLogger()
+    worker.start_time = None
+    worker.heartbeat_file = tmp_path / "worker_heartbeat.json"
+    worker._shutdown_event = asyncio.Event()
+    worker.ray_cluster = SimpleNamespace(start=_noop)
+    worker._connect_to_server = _budget_recorder(budgets)
+    worker._stop = _noop
+
+    with pytest.raises(_Reached):
+        await worker.start(blocking=False)
+
+    assert budgets == [STARTUP_CONNECT_BUDGET_S]
+
+
+async def test_ray_startup_connects_on_the_startup_budget(monkeypatch):
+    """The Ray client half of the same split, pinned at its own call site."""
+    budgets = []
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(ray_cluster_module.ray, "is_initialized", lambda: False)
+
+    cluster = RayCluster.__new__(RayCluster)
+    cluster.logger = _RecordingLogger()
+    cluster.start_time = None
+    cluster.mode = "external-cluster"
+    cluster.is_ready = asyncio.Event()
+    cluster._set_head_node_address = lambda: None
+    cluster._set_serve_http_url = lambda: None
+    cluster._connect_to_cluster = _budget_recorder(budgets)
+    cluster.stop = _noop
+
+    with pytest.raises(_Reached):
+        await cluster.start()
+
+    assert budgets == [STARTUP_CONNECT_BUDGET_S]
+
+
+async def test_cleanup_cancels_a_pending_startup_retry():
+    """A teardown must not leave the startup retry loop deploying into it."""
+
+    async def _never():
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_never())
+    await asyncio.sleep(0)
+    manager = SimpleNamespace(_startup_retry_task=task)
+    manager.cancel_startup_retry = lambda: AppsManager.cancel_startup_retry(manager)
+
+    worker = BioEngineWorker.__new__(BioEngineWorker)
+    worker.logger = _RecordingLogger()
+    worker.start_time = None
+    worker.apps_manager = manager
+    worker.ray_cluster = SimpleNamespace(mode="external-cluster")
+    worker._shutdown_event = asyncio.Event()
+
+    await worker._cleanup()
+    await asyncio.sleep(0)
+
+    assert task.cancelled()
