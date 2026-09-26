@@ -174,7 +174,7 @@ def test_worker_cli_accepts_a_heartbeat_path():
 # that has to return before a pass counts as complete.
 _STEP_NAMES = (
     "geo_location",
-    "hypha_connection",
+    "service_registration",
     "token_expiry",
     "ray_check_connection",
     "cluster_monitoring",
@@ -218,7 +218,7 @@ def _make_worker(tmp_path: Path, steps: _MonitoringSteps) -> BioEngineWorker:
     worker._monitor_degraded_threshold = 2
 
     worker._fetch_geo_location = steps.step("geo_location")
-    worker._check_hypha_connection = steps.step("hypha_connection")
+    worker._check_service_registration = steps.step("service_registration")
     worker._check_token_expiry = steps.step("token_expiry")
     worker._ping_data_server = steps.step("data_server_ping")
     worker._discover_data_server = steps.step("data_server_discover")
@@ -346,6 +346,10 @@ async def test_failing_steps_keep_the_heartbeat_beating(tmp_path):
 
         # Every step failed on every pass, past the point where get_status
         # reports not-ready — and the loop is still alive, so it keeps beating.
+        # A step stubbed under a name the loop no longer awaits leaves the real
+        # method to run, which fails here for entirely the wrong reason.
+        unreached = [name for name, calls in steps.calls.items() if calls == 0]
+        assert not unreached, f"the loop never awaited {unreached}"
         assert worker._monitor_consecutive_errors >= worker._monitor_degraded_threshold
         is_fresh, reason = check_heartbeat(worker.heartbeat_file)
         assert is_fresh is True, reason
