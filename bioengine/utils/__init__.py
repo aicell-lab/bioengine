@@ -6,11 +6,13 @@ try:
         create_file_list_from_directory,
         ensure_applications_collection,
         get_static_site_url,
+        latest_committed_version,
         validate_manifest,
     )
 except ImportError:
     pass
 from .geo_location import fetch_centroid_coordinates, fetch_geolocation
+from .host_memory import head_memory_budget_warning, read_meminfo
 from .logger import (
     create_logger,
     date_format,
