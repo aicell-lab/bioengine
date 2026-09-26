@@ -17,9 +17,9 @@ from bioengine.utils.host_memory import head_memory_budget_warning, read_meminfo
 
 GIB = 1024**3
 
-# The co-tenancy reported on a 62.49 GiB host: one worker reserved 40 GB and a
-# build service with no container of its own held a further 17 GiB by the time
-# the second worker started.
+# A 62.49 GiB host. The loaded figure is constructed to cross the budget, not
+# measured: the reported host holds around 22 GiB, which a 30 GiB reservation
+# does not push past 0.9 x MemTotal.
 HOST_TOTAL = int(62.49 * GIB)
 HOST_AVAILABLE_WITH_CO_TENANTS = HOST_TOTAL - int(57 * GIB)
 HOST_AVAILABLE_WHEN_IDLE = HOST_TOTAL - int(2 * GIB)
@@ -97,6 +97,40 @@ def test_co_tenant_occupancy_alone_can_trip_the_budget():
     assert warning is not None
 
 
+def test_message_blames_the_host_when_the_reservation_is_not_the_cause():
+    """Occupancy alone over the budget must not be reported as a config error."""
+    warning = head_memory_budget_warning(
+        reserved_gb=0,
+        mem_total_bytes=100 * GIB,
+        mem_available_bytes=5 * GIB,
+        budget_fraction=0.9,
+    )
+    assert "would fit an idle host" in warning
+    assert "lowering --head-memory-in-gb cannot bring this back inside it" in warning
+
+
+def test_message_blames_the_reservation_when_it_alone_exceeds_the_budget():
+    warning = head_memory_budget_warning(
+        reserved_gb=95,
+        mem_total_bytes=100 * GIB,
+        mem_available_bytes=100 * GIB,
+        budget_fraction=0.9,
+    )
+    assert "reservation alone is over the budget" in warning
+    assert "Lower --head-memory-in-gb" in warning
+
+
+def test_message_names_the_headroom_left_by_the_other_tenants():
+    warning = head_memory_budget_warning(
+        reserved_gb=30,
+        mem_total_bytes=100 * GIB,
+        mem_available_bytes=35 * GIB,
+        budget_fraction=0.9,
+    )
+    assert "would fit an idle host" in warning
+    assert "reserve no more than 25.0 GiB" in warning
+
+
 def test_warning_reports_the_reservation_the_occupancy_and_the_total():
     warning = head_memory_budget_warning(
         reserved_gb=30,
@@ -120,7 +154,7 @@ def test_warning_describes_a_broken_guarantee_not_imminent_exhaustion():
         budget_fraction=0.9,
     )
     assert "guarantee" in warning
-    assert "not a prediction that the host will run out of memory" in warning
+    assert "not a prediction" in warning
 
 
 def test_read_meminfo_converts_kilobytes_to_bytes(tmp_path):
@@ -265,18 +299,24 @@ def _patch_cluster_startup(monkeypatch, cluster):
 
 
 @pytest.mark.parametrize(
-    "mem_available",
-    [HOST_AVAILABLE_WITH_CO_TENANTS, HOST_AVAILABLE_WHEN_IDLE],
+    "mem_available,expected_warnings",
+    [(HOST_AVAILABLE_WITH_CO_TENANTS, 1), (HOST_AVAILABLE_WHEN_IDLE, 0)],
     ids=["oversubscribed", "within_budget"],
 )
-def test_startup_proceeds_whether_or_not_the_budget_is_exceeded(
-    make_cluster, monkeypatch, mem_available
+def test_startup_warns_from_the_start_path_and_still_starts_ray(
+    make_cluster, monkeypatch, mem_available, expected_warnings
 ):
-    cluster, _ = make_cluster(head_memory_in_gb=30)
+    cluster, collector = make_cluster(head_memory_in_gb=30)
     _patch_meminfo(monkeypatch, HOST_TOTAL, mem_available)
     commands = _patch_cluster_startup(monkeypatch, cluster)
 
     asyncio.run(cluster._start_cluster())
 
+    budget_warnings = [
+        message
+        for message in collector.messages
+        if "exceeds this host's memory budget" in message
+    ]
+    assert len(budget_warnings) == expected_warnings
     assert any("--head" in command for command in commands)
     assert any(f"--memory={30 * GIB}" in command for command in commands)

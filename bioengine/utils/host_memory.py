@@ -55,6 +55,28 @@ def head_memory_budget_warning(
     if total <= budget:
         return None
 
+    headroom = budget - held_by_others
+    if reserved > budget:
+        cause = (
+            "The reservation alone is over the budget, so this worker is oversized for the "
+            "host whatever its co-tenants do. Lower --head-memory-in-gb, or raise "
+            "--head-memory-budget-fraction if this host is deliberately oversubscribed."
+        )
+    elif headroom <= 0:
+        cause = (
+            "The reservation would fit an idle host; the memory already held by other tenants "
+            "is over the budget on its own, so lowering --head-memory-in-gb cannot bring this "
+            "back inside it. Free memory on the host, or raise "
+            "--head-memory-budget-fraction if this host is deliberately oversubscribed."
+        )
+    else:
+        cause = (
+            f"The reservation would fit an idle host; it is the memory already held by other "
+            f"tenants that leaves only {headroom / _GIB:.1f} GiB inside the budget. Free memory "
+            f"on the host, reserve no more than {headroom / _GIB:.1f} GiB, or raise "
+            f"--head-memory-budget-fraction if this host is deliberately oversubscribed."
+        )
+
     return (
         f"Head memory reservation exceeds this host's memory budget: this worker reserves "
         f"{reserved / _GIB:.1f} GiB while {held_by_others / _GIB:.1f} GiB of the host's "
@@ -64,6 +86,5 @@ def head_memory_budget_warning(
         f"guarantee, and the host cannot keep every tenant's guarantee at once. This is not a "
         f"prediction that the host will run out of memory - the peaks may never coincide - but "
         f"if they do, the kernel or Ray's memory monitor kills a process that need not be one "
-        f"of this worker's. Lower --head-memory-in-gb, or raise --head-memory-budget-fraction "
-        f"if this host is deliberately oversubscribed."
+        f"of this worker's. {cause}"
     )
