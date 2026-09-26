@@ -9,7 +9,11 @@ lifetime, so every artifact-backed call (``deploy_app``, ``list_apps``,
 ``get_app_manifest``) then hung to timeout while every local call stayed green.
 Nothing recovered it: ``auto_redeploy`` needs the artifact read that is broken,
 and ``run_code`` executes in Ray tasks so it cannot reach the in-process handle.
-model-runner was down ~62 minutes and only a pod restart cleared it (#0074).
+model-runner was down ~62 minutes and only a pod restart cleared it.
+
+hypha_rpc ships its own re-resolve retry for a *disjoint* set of error patterns
+(``_STALE_SERVICE_ERROR_PATTERNS``); the ``_method_timeout`` expiry that produced
+the outage is not one of them. These tests cover this layer only.
 
 The retry rule is the delicate part, and it is not "retry transport errors":
 

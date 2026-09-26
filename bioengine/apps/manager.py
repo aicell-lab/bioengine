@@ -36,6 +36,11 @@ from bioengine.utils import (
 # the call can have reached the server: a send-side failure provably did not, so
 # retrying it is safe even for a write; a timeout or a mid-call disconnect may
 # already have landed, so retrying those could double-execute a create or commit.
+#
+# hypha_rpc 0.21.40 wraps every resolved service method in its own re-resolve
+# retry, but only for ``_STALE_SERVICE_ERROR_PATTERNS`` — a disjoint set that
+# does not include the ``_method_timeout`` expiry below. Keep these markers
+# disjoint from that tuple so the two layers never both retry one failure.
 _PROXY_NEVER_SENT_MARKERS = (
     "failed to send the request",
     "websocket reconnection timed out",
@@ -50,9 +55,8 @@ _PROXY_MAYBE_SENT_MARKERS = (
 # they are retried on either failure kind. This matters because the call that
 # hung in the observed outage was a read — the write before it had already
 # succeeded — so without this a stale handle still costs one failed deploy.
-# Enumerated against the live service 2026-09-15 (50 methods); everything not
-# listed (create, commit, edit, delete, publish, discard, put_file, vector and
-# PR operations) re-raises instead.
+# Everything not listed (create, commit, edit, delete, publish, discard,
+# put_file, vector and PR operations) re-raises instead.
 _RETRY_SAFE_READS = frozenset(
     {"read", "list", "search", "get_file", "read_file", "list_files"}
 )
@@ -85,8 +89,10 @@ class _ReconnectingArtifactManager:
 
     Wrapping at the point of resolution rather than at each call site is
     deliberate: this object is handed to ``AppBuilder`` and to every
-    ``artifact_utils`` helper, so one wrapper covers all of them and no caller
-    has to remember the retry rule.
+    ``artifact_utils`` helper, so none of them has to remember the retry rule.
+    The one artifact-manager proxy this does not cover is the user-mode
+    ``upload_app`` handle, which is resolved per call on a connection closed in
+    the same ``finally`` and so cannot outlive the client it is pinned to.
 
     Two axes decide whether the call is repeated against the fresh proxy:
 
@@ -95,7 +101,9 @@ class _ReconnectingArtifactManager:
       because replaying a ``create`` or ``commit`` would double-execute it.
 
     Anything else re-raises, so the caller sees one failure rather than an
-    indefinite outage and the next call uses the refreshed handle.
+    indefinite outage and the next call uses the refreshed handle. That is a
+    property of this layer only: hypha_rpc's own retry wrapper sits underneath
+    and does replay writes, on its own disjoint set of error patterns.
     """
 
     def __init__(self, server: RemoteService, proxy: Any, logger: logging.Logger):
