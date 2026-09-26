@@ -19,6 +19,13 @@ from .logger import (
     file_logging_format,
     stream_logging_format,
 )
-from .network import acquire_free_port, get_internal_ip
+from .network import (
+    RECONNECT_BUDGET_S,
+    STARTUP_CONNECT_BUDGET_S,
+    acquire_free_port,
+    connect_with_retry,
+    get_internal_ip,
+    is_transient_connect_error,
+)
 from .permissions import check_permissions, create_context
 from .requirements import get_pip_requirements, update_requirements

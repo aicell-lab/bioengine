@@ -401,6 +401,10 @@ class AppsManager:
         # tolerance above. See monitor_applications.
         self._deleted_pending_redeploy: set = set()
 
+        # Background retry of startup applications that never reached
+        # _deployed_applications. See _retry_startup_applications.
+        self._startup_retry_task: Optional[asyncio.Task] = None
+
         # Timestamp of the last in-place Serve-controller-loss recovery sweep,
         # used to rate-limit re-firing while a redeploy's serve.run is still
         # bootstrapping the controller. See _recover_from_controller_loss.
@@ -1518,8 +1522,8 @@ class AppsManager:
                 }
             )
 
-            # Initialize deployment of each startup application
-            application_ids = []
+            # Startup applications whose deployment could not even be started
+            failed_configs = []
 
             # Get valid startup config keys
             deploy_app_schema = self.deploy_app.__schema__
@@ -1564,8 +1568,61 @@ class AppsManager:
                 }
                 deploy_app_kwargs["context"] = admin_context
 
-                application_id = await self.deploy_app(**deploy_app_kwargs)
-                application_ids.append(application_id)
+                try:
+                    await self.deploy_app(**deploy_app_kwargs)
+                except Exception as e:
+                    # One application's bad minute must not take the worker
+                    # and its other applications down with it.
+                    self.logger.error(
+                        f"Failed to start deployment of startup application "
+                        f"'{app_config['artifact_id']}': {e}. Continuing without it."
+                    )
+                    failed_configs.append(deploy_app_kwargs)
+
+            if failed_configs:
+                self._startup_retry_task = asyncio.create_task(
+                    self._retry_startup_applications(failed_configs),
+                    name="Retry_startup_applications",
+                )
+
+    async def _retry_startup_applications(
+        self, app_configs: List[Dict[str, Any]]
+    ) -> None:
+        """Keep retrying startup applications whose deployment never started.
+
+        An application that fails inside ``deploy_app`` leaves no entry in
+        ``_deployed_applications``, so ``monitor_applications`` cannot see it;
+        this reuses that method's backoff schedule to retry it instead.
+
+        Args:
+            app_configs: ``deploy_app`` keyword arguments of the failed applications.
+        """
+        pending = list(app_configs)
+        delay = _REDEPLOY_BACKOFF_INITIAL_SECONDS
+        while pending:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _REDEPLOY_BACKOFF_MAX_SECONDS)
+
+            still_pending = []
+            for app_config in pending:
+                artifact_id = app_config["artifact_id"]
+                try:
+                    await self.deploy_app(**app_config)
+                    self.logger.info(
+                        f"Startup application '{artifact_id}' deployed on retry."
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Retry of startup application '{artifact_id}' failed: {e}"
+                    )
+                    still_pending.append(app_config)
+            pending = still_pending
+
+    def cancel_startup_retry(self) -> None:
+        """Stop retrying startup applications that failed to deploy."""
+        if self._startup_retry_task and not self._startup_retry_task.done():
+            self._startup_retry_task.cancel()
+        self._startup_retry_task = None
 
     async def monitor_applications(self) -> None:
         """Auto-redeploy unhealthy apps with per-app exponential backoff.

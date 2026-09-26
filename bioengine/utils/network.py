@@ -1,8 +1,119 @@
+import asyncio
 import ipaddress
+import logging
 import socket
 import struct
+import time
 from copy import copy
-from typing import List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple, TypeVar
+
+T = TypeVar("T")
+
+# Message fragments of deterministic rejections. hypha_rpc raises every connect
+# failure as ConnectionAbortedError — a bad token, a mismatched workspace and a
+# client id already in use all arrive as ConnectionError subclasses — so the
+# isinstance test below cannot tell them from a refused socket. Measured against
+# hypha.aicell.io with hypha-rpc 0.21.x.
+_FATAL_CONNECT_MARKERS = (
+    "authentication error",
+    "failed to authenticate",
+    "client already exists",
+)
+
+# Message fragments of connection-level failures that are not raised as an
+# OSError subclass: a server that is up but not yet serving (503), and the Ray
+# client's own connect timeout.
+_TRANSIENT_CONNECT_MARKERS = (
+    "connect call failed",
+    "connection refused",
+    "connection timeout",
+    "name resolution",
+    "temporarily unavailable",
+    "timed out",
+    "http 502",
+    "http 503",
+    "http 504",
+)
+
+
+def is_transient_connect_error(error: BaseException) -> bool:
+    """Whether a failed connection attempt is worth retrying.
+
+    Authentication, permission and configuration errors are deterministic —
+    retrying them only delays the same failure — so anything not recognised
+    here is treated as fatal. The fatal markers are checked first because the
+    exception type alone does not separate the two cases.
+    """
+    message = str(error).lower()
+    if any(marker in message for marker in _FATAL_CONNECT_MARKERS):
+        return False
+    if isinstance(error, (ConnectionError, TimeoutError, socket.gaierror)):
+        return True
+    return any(marker in message for marker in _TRANSIENT_CONNECT_MARKERS)
+
+
+# Retry budgets for connect_with_retry, split by call site. At startup nothing
+# is watching the worker yet, so it can wait out a server restart.
+# The startup budget must stay above the observed 20-45 s hypha-server restart
+# window: under it the worker crash-loops through the restart rather than
+# waiting it out.
+# A reconnect runs inside one monitoring pass, and that pass — registration
+# probe, disconnect, retries and everything after — must still finish inside
+# the liveness heartbeat's staleness deadline (see bioengine.heartbeat; 120 s
+# at the default monitoring interval).
+STARTUP_CONNECT_BUDGET_S = 120.0
+RECONNECT_BUDGET_S = 15.0
+
+
+async def connect_with_retry(
+    connect: Callable[[], Awaitable[T]],
+    description: str,
+    logger: logging.Logger,
+    total_seconds: float = RECONNECT_BUDGET_S,
+    initial_delay: float = 2.0,
+    max_delay: float = 15.0,
+) -> T:
+    """Await ``connect()``, retrying connection-level failures within a budget.
+
+    Both hypha_rpc and the Ray client reconnect an *established* connection,
+    but neither retries the initial connect. A worker started inside a server's
+    restart window therefore exits on the first refusal; ``STARTUP_CONNECT_BUDGET_S``
+    covers the observed ~45 s hypha-server restart gap with margin while
+    staying well under the Kubernetes startup probe's own budget.
+
+    Args:
+        connect: Zero-argument coroutine function performing the connection.
+        description: Used in the retry log line, e.g. "Connection to Hypha".
+        logger: Logger for the retry messages.
+        total_seconds: Overall budget; the last attempt may start just before it
+            expires. Defaults to the reconnect budget; startup callers pass
+            ``STARTUP_CONNECT_BUDGET_S``.
+        initial_delay: Delay before the second attempt, doubled thereafter.
+        max_delay: Cap on the delay between attempts.
+
+    Returns:
+        Whatever ``connect()`` returns.
+
+    Raises:
+        Exception: The last failure, once the budget is spent or the error is
+            not a connection-level one.
+    """
+    deadline = time.monotonic() + total_seconds
+    delay = initial_delay
+    while True:
+        try:
+            return await connect()
+        except Exception as error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not is_transient_connect_error(error):
+                raise
+            wait = min(delay, max_delay, remaining)
+            logger.warning(
+                f"{description} failed: {error}. Retrying in {wait:.1f}s "
+                f"({remaining:.0f}s of retry budget left)..."
+            )
+            await asyncio.sleep(wait)
+            delay *= 2
 
 
 def _enumerate_ipv4_addresses() -> List[str]:

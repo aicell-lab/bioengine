@@ -25,9 +25,12 @@ from bioengine.heartbeat import (
 )
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.utils import (
+    RECONNECT_BUDGET_S,
+    STARTUP_CONNECT_BUDGET_S,
     fetch_centroid_coordinates,
     fetch_geolocation,
     check_permissions,
+    connect_with_retry,
     create_context,
     create_logger,
 )
@@ -636,7 +639,9 @@ class BioEngineWorker:
             # Ping the data server to check connectivity; clear if unreachable
             await self._ping_data_server()
 
-    async def _connect_to_server(self) -> None:
+    async def _connect_to_server(
+        self, retry_budget_seconds: float = RECONNECT_BUDGET_S
+    ) -> None:
         """
         Establish connection to Hypha server and configure admin user permissions.
 
@@ -650,6 +655,11 @@ class BioEngineWorker:
         3. Extracts user information from the server configuration
         4. Updates admin users list with authenticated user (ID and email)
         5. Creates admin context for internal operations
+
+        Args:
+            retry_budget_seconds: How long to keep retrying a connection-level
+                failure. Defaults to the reconnect budget so the monitoring
+                loop's repair fits inside one pass.
 
         Raises:
             ConnectionError: If unable to connect to Hypha server
@@ -666,13 +676,18 @@ class BioEngineWorker:
                 self.logger.error(f"Error closing Hypha server connection: {e}")
 
         self.logger.info(f"Connecting to Hypha server at '{self.server_url}'...")
-        self.server = await connect_to_server(
-            {
-                "server_url": self.server_url,
-                "token": self._token,
-                "workspace": self.workspace,
-                "client_id": self.client_id,
-            }
+        self.server = await connect_with_retry(
+            lambda: connect_to_server(
+                {
+                    "server_url": self.server_url,
+                    "token": self._token,
+                    "workspace": self.workspace,
+                    "client_id": self.client_id,
+                }
+            ),
+            description=f"Connection to Hypha server at '{self.server_url}'",
+            logger=self.logger,
+            total_seconds=retry_budget_seconds,
         )
 
         # Check if provided token has admin permission level to generate new tokens
@@ -994,6 +1009,7 @@ class BioEngineWorker:
         # letting stop_all_apps unregister cleanly first is just hygiene.
         ray_mode = getattr(getattr(self, "ray_cluster", None), "mode", None)
         if hasattr(self, "apps_manager") and self.apps_manager:
+            self.apps_manager.cancel_startup_retry()
             if ray_mode == "external-cluster":
                 self.logger.info(
                     "External-cluster mode: leaving deployed apps in place on the "
@@ -1317,7 +1333,7 @@ class BioEngineWorker:
 
             # Connect the BioEngine worker to the Hypha server
             # Completes initialization of AppsManager and CodeExecutor
-            await self._connect_to_server()
+            await self._connect_to_server(STARTUP_CONNECT_BUDGET_S)
 
             # Check for running data server
             await self._discover_data_server()
