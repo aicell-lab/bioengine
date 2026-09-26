@@ -31,15 +31,18 @@ def _is_gpu_error(exc: Exception) -> bool:
 
 
 
-async def _run_test(model_runner, **kwargs) -> dict:
+async def _run_test(model_runner, timeout_s: int = 1800, **kwargs) -> dict:
     """Submit a test run and return its report.
 
     ``test()`` is asynchronous — it returns a run id, not a report — so an
     assertion against its return value tests nothing about the model.
+
+    ``timeout_s`` has to cover a COLD conda solve for a custom-environment
+    model: ~1900 s measured, i.e. longer than the default on its own.
     """
     run_id = await model_runner.test(**kwargs)
     assert isinstance(run_id, str), f"test() should return a run id, got {run_id!r}"
-    for _ in range(180):
+    for _ in range(timeout_s // 10):
         status = await model_runner.get_test_status(test_run_id=run_id)
         state = (status or {}).get("state")
         if state in ("completed", "failed", "cancelled"):
@@ -47,7 +50,7 @@ async def _run_test(model_runner, **kwargs) -> dict:
             assert isinstance(result, dict), f"state={state} result={result!r}"
             return dict(result)
         await asyncio.sleep(10)
-    raise AssertionError(f"test run {run_id} did not finish within 30 minutes")
+    raise AssertionError(f"test run {run_id} unfinished after {timeout_s}s")
 
 
 # ─── search_models ─────────────────────────────────────────────────────────────
@@ -233,12 +236,14 @@ async def test_custom_env_model_skips_the_default_env_inference_check(model_runn
     Uses CUSTOM_ENV_MODEL_ID, not TEST_MODEL_ID: ``custom_environment=True`` is a
     request, not a guarantee — a model that declares no environment is silently
     downgraded to standard, which would make this assert on the wrong path.
-    Assumes the declared env is already cached on the cluster PVC; on a cold
-    cache this model took ~1900 s to solve. ``cache="skip"`` also forces a full
-    re-download of the package, which is not small for this model.
+    Slow by construction, hence the generous timeout: ``cache="skip"`` forces a
+    full re-download of the package, and the declared conda env is solved from
+    scratch whenever the cluster PVC cache does not hold it (~1900 s measured).
+    Do not assume the cache is warm — it was not on 2026-09-26.
     """
     result = await _run_test(
         model_runner,
+        timeout_s=3600,
         model_id=CUSTOM_ENV_MODEL_ID,
         stage=False,
         cache="skip",
