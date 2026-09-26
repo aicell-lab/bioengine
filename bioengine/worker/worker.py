@@ -35,17 +35,17 @@ _REGISTRATION_PROBE_INTERVAL_S = 60
 # Bound on the probe itself: an unanswered round trip must not hold up the rest
 # of the monitoring tick.
 _REGISTRATION_PROBE_TIMEOUT_S = 10
-# How long the worker's own service may stay unreachable before the monitoring
-# loop is allowed to condemn the pod. Hypha routinely serves nothing for a minute
-# or two and recovers by itself, and cycling a pod through that costs more than
-# waiting; five minutes of failed re-registration is a fault worth restarting
-# for. Once past this the check raises every tick, so the degraded threshold
-# (5 ticks) is reached one monitoring interval at a time.
+# How long the worker's own service may stay unreachable before the check
+# escalates. Hypha routinely serves nothing for a minute or two and recovers by
+# itself, and reporting a worker degraded through that costs more than waiting;
+# five minutes of failed re-registration is a real fault. Once past this the
+# check raises every tick, so the degraded threshold (5 ticks) is reached one
+# monitoring interval at a time.
 _REGISTRATION_GRACE_S = 300
 # The grace above resets on any successful probe, so a registration that answers
-# intermittently never condemns and never logs. These bound a second, purely
-# observational window that does NOT reset on success: enough failures inside it
-# and the worker says so once. It can never cycle a pod.
+# intermittently never escalates and never logs. These bound a second, purely
+# observational window that does NOT reset on success: enough failure episodes
+# inside it and the worker says so once.
 _REGISTRATION_FLAP_WINDOW_S = 3600
 _REGISTRATION_FLAP_THRESHOLD = 5
 # Bound on disconnect() while rebuilding the connection. The transport being
@@ -711,9 +711,37 @@ class BioEngineWorker:
                 f"Service ID mismatch: {self.full_service_id} (expected) vs {service_info.id} (registered)"
             )
 
+    async def _probe_service_registration(self) -> Optional[Exception]:
+        """Ask Hypha whether it still serves this worker's own service id.
+
+        Returns the failure instead of raising it: both callers below decide
+        what a failure means from where they are in the repair, not from the
+        exception.
+        """
+        try:
+            await asyncio.wait_for(
+                self.server.get_service_info(self.full_service_id),
+                timeout=_REGISTRATION_PROBE_TIMEOUT_S,
+            )
+            return None
+        except Exception as exc:
+            return exc
+
+    def _absorb_or_condemn_registration(self, error: Exception, log) -> None:
+        unreachable_for = time.time() - self._registration_ok_at
+        if unreachable_for >= _REGISTRATION_GRACE_S:
+            raise RuntimeError(
+                f"Hypha service '{self.full_service_id}' has been unreachable "
+                f"for {unreachable_for:.0f}s and cannot be restored: {error}"
+            ) from error
+        log(
+            f"Failed to restore the Hypha service registration, retrying next "
+            f"tick: {error}"
+        )
+
     async def _check_service_registration(self) -> None:
-        """Keep this worker's Hypha service reachable, and condemn the pod if it
-        cannot be made reachable again.
+        """Keep this worker's Hypha service reachable, and rebuild the client
+        when it is not.
 
         This is the only Hypha liveness check in the monitoring loop. It
         subsumes a plain ``echo`` probe: anything that kills the socket also
@@ -724,29 +752,41 @@ class BioEngineWorker:
         everyone else. Asking whether our own registration is still served is
         the only signal that separates the two.
 
-        ``echo`` is still used, but as a *diagnostic* rather than a heartbeat:
-        it only runs once the probe has already failed, to pick the cheapest
-        repair that can work.
+        The repair is always a full rebuild — disconnect, reconnect, register.
+        Re-registering on the client we already hold looks cheaper and cannot
+        work: ``hypha_rpc`` keeps a local service registry that a server-side
+        eviction never touches, so ``register_service`` on that client fails
+        with *Service already exists* however the server feels about us. A
+        fresh client starts with an empty registry, and is also the only thing
+        that can restore an evicted *client* rather than an evicted service.
 
-            echo answers    registration evicted, socket fine  -> re-register only
-            echo fails      the connection itself is gone      -> reconnect, then register
+        A repair counts only once the probe answers again. Reconnecting and
+        registering can both succeed locally while the service stays
+        unresolvable; believing that would refill the grace clock every tick
+        and make the escalation below unreachable.
 
         While healthy the probe costs one round trip per
         ``_REGISTRATION_PROBE_INTERVAL_S``. While failing the throttle is
-        dropped and it retries every tick, so a dead socket is detected within
-        one probe interval and then repaired at the monitoring interval rather
-        than once a minute.
+        dropped and it retries every tick, so a dead registration is detected
+        within one probe interval and then repaired at the monitoring interval
+        rather than once a minute.
 
-        Transient Hypha outages must not cycle the pod — Hypha can serve
+        Transient Hypha outages must not condemn the worker — Hypha can serve
         nothing for minutes and recover on its own — so failures are absorbed
-        silently for ``_REGISTRATION_GRACE_S``. Past that the service has been
-        unreachable long enough that waiting is no longer the better bet, and
-        this raises so the monitoring loop's degraded counter can flip
-        ``get_status`` to not-ready and let the liveness probe restart the pod.
+        silently for ``_REGISTRATION_GRACE_S``. Past that this raises, which
+        feeds the monitoring loop's degraded counter; at the degraded threshold
+        ``get_status`` reports the worker not-ready.
+
+        Nothing acts on that report today. The deployed liveness probe is a
+        local PID check that never reads readiness, and ``get_status`` is
+        served by the very registration that has been evicted, so in the case
+        this check exists for there is no one left to ask. Escalating is
+        therefore a log line and a status flag, not a restart; the restart
+        needs an external consumer that does not yet exist.
 
         The grace is a deadline, not a budget, and it measures **continuous**
         unreachability: any successful probe resets it. A flapping connection
-        therefore never condemns the pod, which is deliberate — a probe that
+        therefore never condemns the worker, which is deliberate — a probe that
         answers means the service really was resolvable at that instant, and
         every other check in the monitoring loop resets on a clean tick too.
         Counting attempts instead would be strictly worse: a flap refills an
@@ -755,8 +795,9 @@ class BioEngineWorker:
 
         That leaves one thing invisible, so it is reported separately: a
         registration that answers one probe in ten never condemns and never
-        produces a line anyone reads. The flap window below counts failures on
-        a clock that does *not* reset on success, and only ever warns.
+        produces a line anyone reads. The flap window below counts failure
+        *episodes* on a clock that does *not* reset on success, and only ever
+        warns.
         """
         if not self.server or not self.full_service_id:
             return
@@ -781,11 +822,8 @@ class BioEngineWorker:
             self._registration_window_start = now
             self._registration_window_failures = 0
 
-        try:
-            await asyncio.wait_for(
-                self.server.get_service_info(self.full_service_id),
-                timeout=_REGISTRATION_PROBE_TIMEOUT_S,
-            )
+        probe_error = await self._probe_service_registration()
+        if probe_error is None:
             if self._registration_failing:
                 self.logger.info(
                     f"Hypha serves '{self.full_service_id}' again after "
@@ -794,51 +832,29 @@ class BioEngineWorker:
             self._registration_failing = False
             self._registration_ok_at = now
             return
-        except Exception as exc:
-            first_failure = not self._registration_failing
-            self._registration_failing = True
-            self._registration_window_failures += 1
-            # Rebind: Python unbinds the ``as`` target when the block exits.
-            probe_error = exc
 
-        socket_alive = True
-        try:
-            await asyncio.wait_for(
-                self.server.echo("ping"), timeout=_REGISTRATION_PROBE_TIMEOUT_S
-            )
-        except Exception:
-            socket_alive = False
+        first_failure = not self._registration_failing
+        self._registration_failing = True
+        if first_failure:
+            self._registration_window_failures += 1
 
         # Only the first failure of a streak is a warning. A Hypha outage is
         # retried every tick, and logging each attempt would bury the recovery.
         log = self.logger.warning if first_failure else self.logger.debug
+        log(
+            f"Hypha no longer serves '{self.full_service_id}' ({probe_error}). "
+            "Rebuilding the connection and re-registering..."
+        )
         try:
-            if socket_alive:
-                log(
-                    f"Hypha no longer serves '{self.full_service_id}' "
-                    f"({probe_error}) but the connection is alive. "
-                    "Re-registering..."
-                )
-                await self._register_bioengine_worker_service()
-            else:
-                log(
-                    f"Lost the connection to the Hypha server "
-                    f"({probe_error}). Reconnecting and re-registering..."
-                )
-                await self._connect_to_server()
-                await self._register_bioengine_worker_service()
+            await self._connect_to_server()
+            await self._register_bioengine_worker_service()
         except Exception as repair_error:
-            unreachable_for = time.time() - self._registration_ok_at
-            if unreachable_for >= _REGISTRATION_GRACE_S:
-                raise RuntimeError(
-                    f"Hypha service '{self.full_service_id}' has been "
-                    f"unreachable for {unreachable_for:.0f}s and cannot be "
-                    f"re-registered: {repair_error}"
-                ) from repair_error
-            log(
-                f"Failed to restore the Hypha service registration, retrying "
-                f"next tick: {repair_error}"
-            )
+            self._absorb_or_condemn_registration(repair_error, log)
+            return
+
+        probe_error = await self._probe_service_registration()
+        if probe_error is not None:
+            self._absorb_or_condemn_registration(probe_error, log)
             return
 
         self._registration_failing = False
