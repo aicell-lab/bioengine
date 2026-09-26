@@ -25,6 +25,7 @@ from bioengine.utils import (
     create_logger,
     ensure_applications_collection,
     get_static_site_url,
+    latest_committed_version,
 )
 
 
@@ -2276,35 +2277,28 @@ class AppsManager:
         """
         try:
             artifact = await self.artifact_manager.read(artifact_id)
+            return latest_committed_version(artifact)
         except Exception as e:
             self.logger.debug(
                 f"Could not read versions of artifact '{artifact_id}': {e}"
             )
             return None
 
-        versions = artifact.get("versions") or []
-        if not versions:
-            return None
-        return max(versions, key=lambda v: v["created_at"])["version"]
-
-    async def _report_inherited_version(
+    async def _warn_if_inherited_version_is_stale(
         self, application_id: str, artifact_id: str, version: Optional[str]
     ) -> None:
-        """Announce a version that was inherited from the running app, not requested.
+        """Warn when an update inherited a version the artifact has already moved past.
 
         An update without an explicit ``version`` redeploys whatever is already
         running, so a caller who has just uploaded newer code gets a successful
         deploy of the old one and nothing anywhere that says so. Pinning to an
-        older version stays legal — it just stops being silent.
+        older version stays legal — it just stops being silent. The resolved
+        version itself is already logged by the update branch below; only the
+        mismatch is new signal.
         """
         if version is None:
             # The running app was itself deployed as "latest", so this update
             # resolves latest again and does roll forward.
-            self.logger.info(
-                f"Updating application '{application_id}' without a version; the "
-                f"running app is unpinned, so the latest version of "
-                f"'{artifact_id}' will be deployed."
-            )
             return
 
         latest_version = await self._get_latest_artifact_version(artifact_id)
@@ -2315,11 +2309,6 @@ class AppsManager:
                 f"'{artifact_id}' now has {latest_version!r}. This redeploys the "
                 f"code that is already running — pass version='{latest_version}' "
                 f"to roll forward."
-            )
-        else:
-            self.logger.info(
-                f"Updating application '{application_id}' without a version: "
-                f"keeping the running version {version!r}."
             )
 
     @schema_method
@@ -2518,7 +2507,7 @@ class AppsManager:
                     scaling = dict(existing_app.get("scaling") or {})
 
                 if version_inherited:
-                    await self._report_inherited_version(
+                    await self._warn_if_inherited_version_is_stale(
                         application_id, artifact_id, version
                     )
             else:
