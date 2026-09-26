@@ -48,7 +48,13 @@ class _FakeGlobalState:
         return {node_id: dict(res) for node_id, res in self._totals.items()}
 
 
-def _actor(totals, dashboard_payload=None, dashboard_error=None, monkeypatch=None):
+def _actor(
+    totals,
+    dashboard_payload=None,
+    dashboard_error=None,
+    dashboard_read_error=None,
+    monkeypatch=None,
+):
     actor = object.__new__(_ProxyActor)
     actor.global_state = _FakeGlobalState(totals)
     actor.exclude_head_node = False
@@ -65,6 +71,9 @@ def _actor(totals, dashboard_payload=None, dashboard_error=None, monkeypatch=Non
             return False
 
         def read(self):
+            # A truncated or reset response surfaces here, not from urlopen.
+            if dashboard_read_error is not None:
+                raise dashboard_read_error
             return json.dumps(dashboard_payload).encode("utf-8")
 
     def _urlopen(request, timeout=None):
@@ -209,6 +218,29 @@ def _break_fetch(monkeypatch, error):
 def test_a_failing_dashboard_fetch_still_reports_status(error, monkeypatch):
     totals = {"n1": {"CPU": 8.0, "GPU": 1.0, "accelerator_type:G": 1.0}}
     actor = _actor(totals, dashboard_error=error, monkeypatch=monkeypatch)
+
+    node = actor.get_cluster_state()["nodes"]["n1"]
+
+    assert node["accelerator_type"] == "G"
+    assert node["gpu_device_name"] is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http.client.IncompleteRead(b'{"result": tr'),
+        ConnectionResetError(104, "Connection reset by peer"),
+        http.client.BadStatusLine("garbage"),
+    ],
+    ids=["incomplete_read", "connection_reset", "bad_status_line"],
+)
+def test_a_failure_raised_while_reading_the_body_still_reports_status(
+    error, monkeypatch
+):
+    """These surface from response.read(), not from urlopen — the guard has to
+    cover both call sites, and injecting only at urlopen would not show it."""
+    totals = {"n1": {"CPU": 8.0, "GPU": 1.0, "accelerator_type:G": 1.0}}
+    actor = _actor(totals, dashboard_read_error=error, monkeypatch=monkeypatch)
 
     node = actor.get_cluster_state()["nodes"]["n1"]
 

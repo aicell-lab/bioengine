@@ -413,8 +413,9 @@ class BioEngineProxyActor:
             with urllib.request.urlopen(request, timeout=2.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         # OSError covers URLError, TimeoutError and the raw socket errors urllib
-        # leaves unwrapped; IncompleteRead is an HTTPException, not an OSError.
-        except (OSError, http.client.IncompleteRead, json.JSONDecodeError, ValueError):
+        # leaves unwrapped; HTTPException covers the ones it does not, which
+        # getresponse() re-raises unwrapped.
+        except (OSError, http.client.HTTPException, json.JSONDecodeError, ValueError):
             logger.debug(
                 "Failed to fetch Ray node summary from dashboard endpoint %s",
                 url,
