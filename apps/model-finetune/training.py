@@ -169,22 +169,33 @@ def read_status(session_id: str) -> Dict[str, Any]:
 
 _TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
 
+# A terminal status may only be changed by an equal-or-higher-ranked writer.
+# user stop must outrank a late child COMPLETED (the user asked it to stop); the
+# child (the training outcome) outranks the supervisor (which only sees the
+# subprocess rc) and the entry bare-except (which cannot see the child at all).
+_TERMINATED_BY = {"entry": 1, "supervisor": 2, "child": 3, "user_stop": 4}
+
 
 def write_status(session_id: str, **fields) -> Dict[str, Any]:
     """Atomically merge fields into the session's status.json.
 
-    A terminal status is sticky: once COMPLETED/FAILED/STOPPED is recorded, a
-    write that would change it to a *different* status is dropped. This blocks
-    both a late TRAINING heartbeat resurrecting a stopped session and a late
-    COMPLETED from a not-yet-reaped child overwriting the user's STOPPED. A
-    same-status write still lands, so the stop path can refine STOPPED with
-    end_time."""
+    A terminal status is provenance-ranked, not blanket-sticky: once
+    COMPLETED/FAILED/STOPPED is recorded, a write to a *different* status is
+    dropped only when its writer (``terminated_by``) ranks equal-or-lower than
+    the incumbent's. This lets the child's authoritative COMPLETED correct a
+    bystander's premature terminal (e.g. the entry bare-except FAILED) while a
+    user's STOPPED still survives a late child COMPLETED. A same-status write or
+    a field-only write (no ``status``) always lands, so heartbeats and end_time
+    refinements are unaffected. An unknown/absent ``terminated_by`` ranks 0."""
     p = _status_path(session_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     cur = read_status(session_id)
     cur_status, new_status = cur.get("status"), fields.get("status")
     if cur_status in _TERMINAL and new_status is not None and new_status != cur_status:
-        return cur
+        cur_prec = _TERMINATED_BY.get(cur.get("terminated_by"), 0)
+        new_prec = _TERMINATED_BY.get(fields.get("terminated_by"), 0)
+        if new_prec <= cur_prec:
+            return cur
     cur.update(fields)
     cur["updated_at"] = time.time()
     tmp = p.with_suffix(".json.tmp")

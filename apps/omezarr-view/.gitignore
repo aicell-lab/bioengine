@@ -5,3 +5,7 @@ served_measurements.json
 .svamp/
 __pycache__/
 *.pyc
+served_derived.json
+.training_demo/
+annotations/
+training_run.log
