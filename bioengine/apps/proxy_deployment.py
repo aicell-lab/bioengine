@@ -74,12 +74,10 @@ class _PermanentRegistrationError(RuntimeError):
     """Registration failed for a reason no amount of retrying will fix."""
 
 
-# Serve's own verdict on a deployment, for deployments sitting at zero replicas.
 # Zero replicas is the correct idle state under ``min_replicas: 0``, so a replica
-# count alone cannot tell a crash from a deliberate scale-down. UPSCALING matters
-# as much as HEALTHY: it is the state a scaled-to-zero deployment enters when a
-# request wakes it, and deregistering there would remove the service during the
-# very wake-up it is meant to allow.
+# count alone cannot tell a crash from a deliberate scale-down. UPSCALING is the
+# state a scaled-to-zero deployment enters when a request wakes it; deregistering
+# there would remove the service during the very wake-up it is meant to allow.
 _SERVICEABLE_AT_ZERO_REPLICAS = ("HEALTHY", "UPSCALING", "DOWNSCALING")
 
 
@@ -302,13 +300,12 @@ class ProxyDeployment:
 
         # App-serviceable gate: the proxy registers its Hypha service only once
         # every sibling deployment (all deployments in this app but the proxy
-        # itself) has a RUNNING replica, read out-of-band from the Serve
-        # controller so a saturated app never blocks or fails the check.
+        # itself) is serviceable, read out-of-band from the Serve controller so
+        # a saturated app never blocks or fails the check.
         self.entry_deployment_ready = False
         self._own_deployment_name: Optional[str] = None
-        # Per-sibling "seen RUNNING at least once" latch: a deployment only
-        # fails the gate after first coming up, so a slow initial start doesn't
-        # deregister a not-yet-ready app.
+        # Per-sibling "seen serviceable at least once" latch, so a slow initial
+        # start doesn't deregister a not-yet-ready app.
         self._dep_seen_ready: Dict[str, bool] = {}
 
         # Custom ICE servers for WebRTC (None means fetch from default URL)
@@ -1375,7 +1372,7 @@ class ProxyDeployment:
         Health Check Process:
         1. Surfaces a permanent Hypha registration failure (bad config or
            rejected credentials), the one connection problem retrying cannot fix
-        2. Gates the Hypha service on every sibling deployment being RUNNING
+        2. Gates the Hypha service on every sibling deployment being serviceable
         3. Rotates WebRTC TURN credentials and sweeps abandoned peer connections
 
         Raises:
@@ -1392,13 +1389,9 @@ class ProxyDeployment:
 
         self._ensure_maintenance_task()
 
-        # Gate the Hypha service on the app being serviceable: register only
-        # while every sibling deployment (entry + any runtimes) has a RUNNING
-        # replica. Read out-of-band from the Serve controller — a saturated app
-        # neither blocks nor fails this check, and the probe never counts
-        # against any deployment's ``max_ongoing_requests``. Ray's own controller
-        # already health-checks each replica; a sibling that crashes or whose
-        # ``health_check`` raises drops out of the RUNNING count here.
+        # Read out-of-band from the Serve controller, so the probe never counts
+        # against any deployment's ``max_ongoing_requests`` and a saturated app
+        # can neither block nor fail it.
         states = await self._sibling_states()
 
         if not self.entry_deployment_ready:
@@ -1421,14 +1414,9 @@ class ProxyDeployment:
                 )
                 return
         elif states is not None:
-            # A sibling that came up and then stopped being serviceable means the
-            # app can no longer serve: deregister so the service disappears from
-            # Hypha, and re-gate. The outage stays visible in the app status via
-            # the down deployment itself, so the proxy need not fail its own
-            # health. Serviceability is not a replica count: a deployment idling
-            # at ``min_replicas: 0`` is at zero replicas on purpose, and
-            # deregistering it would be unrecoverable — waking it needs a request,
-            # and a request needs the registration this would remove.
+            # Deregister so the service disappears from Hypha, and re-gate. The
+            # outage stays visible in the app status via the down deployment
+            # itself, so the proxy need not fail its own health.
             for dep, (running, status) in states.items():
                 if _is_serviceable(running, status):
                     self._dep_seen_ready[dep] = True
