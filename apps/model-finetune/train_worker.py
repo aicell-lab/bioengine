@@ -16,13 +16,41 @@ import traceback
 import training
 
 
+def _epochs_completed(session_id: str):
+    """Actual epochs done, from torch_em's per-epoch ``latest.pt``. train_sam has
+    no per-epoch callback, but ``DefaultTrainer`` rewrites latest.pt after every
+    epoch storing ``epoch`` (incremented *after* the save), so the count is
+    ``epoch + 1``. mmap so only the pickle header is read, not the ~GB tensors.
+    None until the first epoch's checkpoint exists.
+    """
+    import torch
+
+    # Must be latest.pt, not best.pt: best.pt's ``epoch`` is best_epoch (where the
+    # best metric landed), a plausible smaller number that would silently undercount.
+    p = training.session_dir(session_id) / "checkpoints" / session_id / "latest.pt"
+    if not p.exists():
+        return None
+    try:
+        ep = torch.load(p, map_location="cpu", mmap=True, weights_only=False)["epoch"]
+        return int(ep) + 1
+    except Exception:
+        return None
+
+
 def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -> None:
     """Refresh status.json's ``updated_at`` while train_sam runs, so a long epoch
     doesn't trip the stale-window check (get_status marks TRAINING → STOPPED after
-    STATUS_STALE_SECONDS of no update). train_sam has no per-step callback here.
+    STATUS_STALE_SECONDS of no update). Also persists n_epochs_completed so a
+    killed child still leaves its last-known count. Carries no ``status``: a
+    field-only write lands even under a sticky terminal record, so ``updated_at``
+    keeps advancing while a bystander's premature terminal is standing — a live
+    orphan stays visibly live instead of reading as dead. train_sam has no
+    per-step callback here.
     """
     while not stop.wait(interval):
-        training.write_status(session_id, status="TRAINING", message="training in progress")
+        n = _epochs_completed(session_id)
+        extra = {"n_epochs_completed": n, "n_epochs_completed_basis": "measured"} if n is not None else {}
+        training.write_status(session_id, **extra)
 
 
 def main(session_id: str) -> None:
@@ -69,13 +97,16 @@ def main(session_id: str) -> None:
             session_id,
             status="COMPLETED" if ok else "FAILED",
             message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
-            end_time=time.time(),
+            end_time=time.time(), terminated_by="child",
+            n_epochs_completed=_epochs_completed(session_id),
+            n_epochs_completed_basis="measured",
         )
     except Exception as e:
         stop.set()
         training.write_status(
             session_id, status="FAILED", message=str(e)[:800],
             traceback=traceback.format_exc()[-2500:], end_time=time.time(),
+            terminated_by="child",
         )
         raise
 

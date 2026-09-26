@@ -31,7 +31,7 @@ import traceback
 import uuid
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 import bioengine
 import httpx
@@ -143,6 +143,10 @@ class EntryDeployment:
     # Workspace the model artifacts live in. Artifact URLs hardcode it, so
     # ``_normalize_model_id`` strips it back off a fully-qualified model_id.
     _MODELS_WORKSPACE = "bioimage-io"
+    _MODELS_COLLECTION = "bioimage-io/bioimage.io"
+    # Grants that authorize editing an artifact. '@' (every authenticated user)
+    # carries read/list/create/draft only and must never authorize a publish.
+    _WRITE_GRANTS = ("rw", "rw+", "*", "a")
 
     # Test outcome mapped to a numeric quality score, surfaced on the
     # published test-report artifact's manifest for ranking.
@@ -434,6 +438,14 @@ class EntryDeployment:
                 "bioimage-io/model-runner",
                 os.environ.get("HYPHA_ARTIFACT_VERSION", "unknown"),
             ),
+            # Provenance, so a verdict is not mis-triaged as a runner
+            # regression when another site disagrees. Read from the report body
+            # rather than probed here, so the value survives caching.
+            (
+                "replica_accelerator",
+                str(test_report.get("replica_accelerator") or "unknown"),
+            ),
+            ("worker", os.environ.get("BIOENGINE_WORKER_SERVICE_ID", "unknown")),
         ]
 
         env = test_report.get("env")
@@ -1232,9 +1244,22 @@ class EntryDeployment:
 
     @staticmethod
     def _model_declares_custom_env(rdf_path: str) -> bool:
-        """True iff any weight-format entry carries an explicit
-        ``dependencies.source`` (an authored ``environment.yaml`` bundled
-        with the model).
+        """True iff any weight-format entry declares an authored dependency
+        file, in either spec dialect.
+
+        The RDF is read as raw YAML rather than through ``bioimageio.spec``,
+        so both dialects appear verbatim and BOTH must be handled:
+
+        * v0.5 — ``dependencies: {source: environment.yaml, ...}``
+        * v0.4 — ``dependencies: "conda:environment.yaml"``, a
+          ``"<manager>:<path>"`` string
+
+        Matching only the v0.5 mapping silently denied every v0.4 model its
+        declared environment: 9 of the zoo's models use the string form
+        (7 ``conda:environment.yaml``, 1 ``conda:dependencies.yaml``, 1
+        ``pip:./requirements.txt``). ``stupendous-sheep`` is one, which is why
+        a ``custom_environment=True`` test on it came back stamped
+        ``test_environment=standard`` in ~90s, too fast to have solved an env.
 
         When False, ``bioimageio.spec.get_conda_env`` builds a
         framework-default env from the framework name alone. Those
@@ -1258,6 +1283,10 @@ class EntryDeployment:
                 continue
             deps = wf.get("dependencies")
             if isinstance(deps, dict) and deps.get("source"):
+                return True
+            # v0.4: "<manager>:<path>". Require a non-empty path so a bare
+            # "conda:" does not read as a declaration.
+            if isinstance(deps, str) and deps.partition(":")[2].strip():
                 return True
         return False
 
@@ -2057,7 +2086,7 @@ class EntryDeployment:
         prefix = f"{self._MODELS_WORKSPACE}/"
         return model_id[len(prefix) :] if model_id.startswith(prefix) else model_id
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def test(
         self,
         model_id: str = Field(
@@ -2083,6 +2112,7 @@ class EntryDeployment:
             "as-is with no freshness round-trip. A cached report that records a "
             "run which did not happen is re-derived regardless of this setting.",
         ),
+        context=None,
     ) -> str:
         """
         Schedule comprehensive model testing and return a run id immediately.
@@ -2166,6 +2196,12 @@ class EntryDeployment:
                 (prior_report or {}).get("test_environment") == "custom"
             )
 
+        # Publishing is authorized by the CALLER's identity; the write itself
+        # still uses the app's own bioimage-io token. Authorization and
+        # authorship stay separate, so a report can only ever be written by a
+        # run this service performed.
+        caller = dict((context or {}).get("user") or {})
+
         job = self._new_test_job(model_id, custom_environment)
 
         async def _bg_execute():
@@ -2176,6 +2212,7 @@ class EntryDeployment:
                     stage=stage,
                     custom_environment=custom_environment,
                     cache=cache,
+                    caller=caller,
                 )
                 self._update_test_job(job, state="completed", result=report)
             except Exception as exc:
@@ -2199,6 +2236,7 @@ class EntryDeployment:
         stage: bool,
         custom_environment: bool,
         cache: str,
+        caller: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """Run the full test pipeline for a scheduled run and return the report.
 
@@ -2478,6 +2516,9 @@ class EntryDeployment:
                     # failure) so eviction can reclaim them again.
                     self._release_inuse_envs(needed_envs)
 
+                # Inside ``if should_run_test`` on purpose: a cache hit must keep
+                # the provenance of the run that produced it, not be relabelled
+                # with whichever replica served the cache.
                 test_report = self._stamp_runtime_versions_in_test_env(
                     test_report, current_versions
                 )
@@ -2531,13 +2572,24 @@ class EntryDeployment:
             # The fallback report records that our own test run died, not that
             # the model is broken. Publishing it would overwrite the model's
             # durable public verdict with an artefact of our infrastructure.
-            if report_is_trustworthy:
-                await self._upload_test_report(model_id, stage, test_report)
-            else:
+            published = False
+            if not report_is_trustworthy:
                 logger.warning(
                     f"⚠️ Not publishing the fallback report for '{model_id}': "
                     "the test did not run, so it is not a verdict on the model."
                 )
+            elif not await self._caller_may_publish(model_id, caller):
+                logger.info(
+                    f"🔒 Not publishing the report for '{model_id}': caller "
+                    f"{self._caller_label(caller)} has no write grant on the "
+                    f"model or on '{self._MODELS_COLLECTION}'. The report is "
+                    "returned to the caller regardless."
+                )
+            else:
+                published = await self._upload_test_report(
+                    model_id, stage, test_report
+                )
+            test_report["published"] = published
 
         return test_report
 
@@ -2630,6 +2682,68 @@ class EntryDeployment:
             )
             return covers
 
+    @staticmethod
+    def _caller_label(caller: Optional[Dict[str, Any]]) -> str:
+        c = caller or {}
+        return repr(c.get("parent") or c.get("id") or c.get("email") or "anonymous")
+
+    @staticmethod
+    def _caller_identities(caller: Optional[Dict[str, Any]]) -> List[str]:
+        """Every identity a caller may be granted under, most stable first.
+
+        ``id`` is a per-token account (``blossom-account-33066105``) for a
+        generated token and only equals the login identity for a direct
+        browser login. ``parent`` carries the underlying login
+        (``github|49943582``) that minted the token, which is what artifact
+        permissions are keyed on — so a token-based caller such as the
+        nightly matches on ``parent`` and never on ``id``.
+        """
+        c = caller or {}
+        return [v for v in (c.get("parent"), c.get("id"), c.get("email")) if v]
+
+    async def _caller_may_publish(
+        self, model_id: str, caller: Optional[Dict[str, Any]]
+    ) -> bool:
+        """True when the caller may overwrite this model's public verdict.
+
+        Authorized by a write grant on EITHER the model artifact (uploader,
+        developer) or the models collection (bioimage.io reviewers and
+        maintainers), so a reviewer stays authorized for a model whose
+        per-model permission mirror has not synced.
+
+        Anonymous callers and callers holding only ``'*': 'r'`` or the ``'@'``
+        authenticated-user grant get their test run and their report returned;
+        only the publish is skipped.
+        """
+        identities = self._caller_identities(caller)
+        if not identities:
+            return False
+
+        # A caller with read-write on the whole workspace can edit any artifact
+        # in it, which no per-artifact permissions dict is obliged to restate.
+        workspaces = ((caller or {}).get("scope") or {}).get("workspaces") or {}
+        if workspaces.get(self._MODELS_WORKSPACE) in ("rw", "a"):
+            return True
+
+        model_alias = model_id.rsplit("/", 1)[-1]
+        for artifact_id in (
+            f"{self._MODELS_WORKSPACE}/{model_alias}",
+            self._MODELS_COLLECTION,
+        ):
+            try:
+                artifact = await self.artifact_manager.read(
+                    artifact_id, silent=True
+                )
+            except Exception:
+                continue
+            permissions = (artifact.get("config") or {}).get("permissions") or {}
+            if any(
+                permissions.get(identity) in self._WRITE_GRANTS
+                for identity in identities
+            ):
+                return True
+        return False
+
     async def _upload_test_report(
         self, model_id: str, stage: bool, test_report: dict
     ) -> None:
@@ -2645,7 +2759,7 @@ class EntryDeployment:
         swallowed — the report is already cached and returned regardless.
         """
         if not self._test_reports_writable:
-            return
+            return False
 
         model_alias = model_id.rsplit("/", 1)[-1]
         report_artifact_id = (
@@ -2684,7 +2798,7 @@ class EntryDeployment:
                                 f"ℹ️ {slot} test report for '{model_alias}' is up to "
                                 f"date; skipping upload."
                             )
-                            return
+                            return True
                     except Exception:
                         pass
 
@@ -2781,11 +2895,13 @@ class EntryDeployment:
                     f"📤 Published {slot} test report for '{model_alias}' to "
                     f"'{report_artifact_id}'."
                 )
+                return True
             except Exception as e:
                 logger.warning(
                     f"⚠️ Failed to publish test report for '{model_alias}' to "
                     f"'{report_artifact_id}': {e}"
                 )
+                return False
 
     async def _create_report_artifact(
         self, report_artifact_id: str, model_alias: str, manifest: dict
