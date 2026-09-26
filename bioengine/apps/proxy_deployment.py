@@ -573,7 +573,7 @@ class ProxyDeployment:
             if self.service_semaphore.locked():
                 # Counted, because attempted saturates at max_ongoing_requests
                 # once a deployment wedges — without this every further real
-                # call during the wedge is invisible to all three counters.
+                # call during the wedge leaves no trace at all.
                 self._record_usage(
                     method_name,
                     classify_caller(context, self.workspace, self.authorized_users),
