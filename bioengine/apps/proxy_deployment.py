@@ -360,9 +360,33 @@ class ProxyDeployment:
         self._usage_flush_lock = asyncio.Lock()
         self._usage_ledger = self._open_usage_ledger(replica_id)
 
-        # No Hypha service exists until _register_services succeeds, so seed the
+        # No Hypha service exists until _register_services succeeds, so open the
         # worker-visible record as unregistered rather than leaving it unknown.
-        self._report_service_registration(False)
+        self._claim_service_registration()
+
+    def _claim_service_registration(self) -> None:
+        """Take over the app's registration record for this replica.
+
+        A tagged ``False`` report would be dropped whenever the record still
+        belongs to a predecessor — the state a replica that was SIGKILLed or
+        lost with its node leaves behind, since Ray never ran its ``__del__``.
+        Claiming is unconditional because only a starting replica can claim.
+
+        Fire-and-forget for the same reason as ``_report_service_registration``.
+        """
+        handle = getattr(self, "_proxy_actor_handle", None)
+        if handle is None:
+            return
+        try:
+            handle.claim_service_registration.remote(
+                application_id=self.application_id,
+                replica_id=self._replica_id,
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not claim the service registration record for "
+                f"'{self.application_id}': {e}"
+            )
 
     def _report_service_registration(self, registered: bool) -> None:
         """Tell the proxy actor whether our Hypha services exist right now.

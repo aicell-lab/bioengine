@@ -10,9 +10,10 @@ at that address, with ``status`` already reading ``RUNNING``.
 
 The contract now:
 
-* The proxy pushes its registration state to the ``BioEngineProxyActor``
-  (False at replica init, True after ``_register_services`` succeeds, False on
-  deregistration), and the worker reads it before advertising.
+* The proxy pushes its registration state to the ``BioEngineProxyActor`` (a
+  claim at replica init, which opens the record as unregistered, True after
+  ``_register_services`` succeeds, False on deregistration), and the worker
+  reads it before advertising.
 * A ``False`` report withholds both ids and the ``static_site_url``.
 * *Never reported* is not ``False``. An app whose proxy started before this
   actor existed — a newer worker, or an actor recreated after eviction —
@@ -226,7 +227,7 @@ def test_the_actor_round_trips_both_registration_states() -> None:
 
 def test_clearing_an_application_forgets_its_registration() -> None:
     # Called from undeploy_app only, so this is about an app_id that is later
-    # deployed afresh — not about redeploy, which is covered by the init seed.
+    # deployed afresh — not about redeploy, which is covered by the init claim.
     actor = _bare_actor()
     actor.report_service_registration(APP_ID, True)
     actor.clear_application_replicas(APP_ID)
@@ -241,14 +242,20 @@ class _Handle:
 
     def __init__(self) -> None:
         self.reports = []
+        self.claims = []
         self.report_service_registration = MagicMock()
         self.report_service_registration.remote = self._record
+        self.claim_service_registration = MagicMock()
+        self.claim_service_registration.remote = self._record_claim
         self.register_serve_replica = MagicMock()
 
     def _record(
         self, application_id: str, registered: bool, replica_id=None
     ) -> None:
         self.reports.append((application_id, registered))
+
+    def _record_claim(self, application_id: str, replica_id=None) -> None:
+        self.claims.append((application_id, replica_id))
 
 
 def _bare_proxy(**attrs):
@@ -340,33 +347,31 @@ def _construct_proxy(monkeypatch, handle: _Handle, replica_tag: str = "replica-0
     )
 
 
-def test_the_proxy_seeds_the_record_as_unregistered_at_init(monkeypatch) -> None:
-    # Without the seed the worker sees "never reported" on a brand-new app and
+def test_the_proxy_claims_the_record_as_unregistered_at_init(monkeypatch) -> None:
+    # Without the claim the worker sees "never reported" on a brand-new app and
     # falls back to the replica-alive gate — i.e. the original bug. Constructing
-    # the real class is the point: a seed call placed where the actor handle is
-    # not set yet would silently no-op and still read fine in the source.
+    # the real class is the point: a claim placed where the actor handle is not
+    # set yet would silently no-op and still read fine in the source.
     handle = _Handle()
 
     _construct_proxy(monkeypatch, handle)
 
-    assert handle.reports == [(APP_ID, False)]
+    assert handle.claims == [(APP_ID, "replica-0")]
+    assert handle.reports == []
 
 
-def test_the_seed_carries_the_reporting_replica_tag(monkeypatch) -> None:
+def test_the_claim_carries_the_reporting_replica_tag(monkeypatch) -> None:
     handle = _Handle()
-    payloads = []
-    handle.report_service_registration.remote = (
-        lambda application_id, registered, replica_id: payloads.append(replica_id)
-    )
 
     _construct_proxy(monkeypatch, handle, replica_tag="replica-7")
 
-    assert payloads == ["replica-7"]
+    assert handle.claims == [(APP_ID, "replica-7")]
 
 
 def test_a_missing_actor_handle_never_breaks_the_replica() -> None:
     inst = _bare_proxy(_proxy_actor_handle=None)
     inst._report_service_registration(True)  # must not raise
+    inst._claim_service_registration()  # must not raise
 
 
 def test_reporting_survives_a_part_built_replica() -> None:
@@ -380,13 +385,18 @@ def test_reporting_survives_a_part_built_replica() -> None:
 
 
 def test_a_late_deregistration_from_the_old_replica_is_ignored() -> None:
-    # Rolling update: the incoming replica seeds False, registers and reports
-    # True; the outgoing replica's __del__ deregisters afterwards. Taking that
-    # last write pins a healthy app at False for good — nothing re-reports True
-    # until the next _register_services, which the running replica will not do.
+    # Rolling update: the incoming replica claims the record, registers and
+    # reports True; the outgoing replica's __del__ deregisters afterwards.
+    # Taking that last write pins a healthy app at False for good — nothing
+    # re-reports True until the next _register_services, which the running
+    # replica will not do.
     actor = _bare_actor()
     actor.report_service_registration(APP_ID, True, replica_id="old")
-    actor.report_service_registration(APP_ID, False, replica_id="new")
+    actor.claim_service_registration(APP_ID, replica_id="new")
+    # Asserted here and not only at the end: the claim has to displace the
+    # predecessor's record for the gate to bite at all, and a final-state-only
+    # assertion passes just as happily when it was silently dropped.
+    assert actor.get_service_registration(APP_ID) is False
     actor.report_service_registration(APP_ID, True, replica_id="new")
 
     actor.report_service_registration(APP_ID, False, replica_id="old")
@@ -410,10 +420,44 @@ def test_the_old_replica_leaving_first_still_leaves_the_app_registered() -> None
     actor.report_service_registration(APP_ID, True, replica_id="old")
 
     actor.report_service_registration(APP_ID, False, replica_id="old")
-    actor.report_service_registration(APP_ID, False, replica_id="new")
+    actor.claim_service_registration(APP_ID, replica_id="new")
     actor.report_service_registration(APP_ID, True, replica_id="new")
 
     assert actor.get_service_registration(APP_ID) is True
+
+
+class _ActorHandle:
+    """Routes the proxy's ``.remote(...)`` pushes into a real proxy actor.
+
+    ``register_serve_replica`` resolves an actor id through Ray's state API, so
+    it is stubbed; every other push lands on the real actor method.
+    """
+
+    def __init__(self, actor: object) -> None:
+        self._actor = actor
+        self.register_serve_replica = MagicMock()
+
+    def __getattr__(self, name: str) -> MagicMock:
+        method = getattr(self._actor, name)
+        return MagicMock(remote=lambda *args, **kwargs: method(*args, **kwargs))
+
+
+def test_a_replica_that_died_without_deregistering_loses_the_record(
+    monkeypatch,
+) -> None:
+    # SIGKILL, node loss, health-driven restart: Ray never runs __del__, so no
+    # False ever arrives from the dead replica and the record stays True under
+    # its tag. The successor's init is then the only signal left, and a plain
+    # tagged False from it is exactly what the guard drops — leaving the worker
+    # advertising an address that answers nothing for the whole startup window,
+    # which is the reported bug. Driven through the real ProxyDeployment so it
+    # pins the outcome, not the call shape that produces it.
+    actor = _bare_actor()
+    actor.report_service_registration(APP_ID, True, replica_id="old")
+
+    _construct_proxy(monkeypatch, _ActorHandle(actor), replica_tag="new")
+
+    assert actor.get_service_registration(APP_ID) is False
 
 
 def test_an_untagged_report_still_works() -> None:

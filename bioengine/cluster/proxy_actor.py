@@ -155,7 +155,8 @@ class BioEngineProxyActor:
         # entry means "never reported", which is not the same as False — an app
         # that predates this actor keeps serving without ever reporting here.
         # The replica id is kept so a departing replica cannot overwrite its
-        # successor's verdict; see report_service_registration.
+        # successor's verdict; see report_service_registration and
+        # claim_service_registration.
         # Structure: {app_id: {"replica_id": str|None, "registered": bool}}
         self.service_registrations: Dict[str, Dict[str, Any]] = {}
 
@@ -863,6 +864,33 @@ class BioEngineProxyActor:
         )
 
     @_touch_on_call
+    def claim_service_registration(
+        self, application_id: str, replica_id: Optional[str] = None
+    ) -> None:
+        """Hand an application's record to a replica that is starting right now.
+
+        Pushed from ``ProxyDeployment.__init__``, and unconditional: only a
+        starting replica can claim, so it is by construction the newest one,
+        and it has no Hypha services of its own yet.
+
+        This is what a plain ``False`` report cannot do. The tag guard in
+        ``report_service_registration`` drops a ``False`` whenever the record
+        still belongs to a predecessor — which is exactly the state a replica
+        that died without running ``__del__`` leaves behind (SIGKILL, lost
+        node, health-driven restart). The record would stay ``True`` under a
+        dead replica's tag and the worker would keep advertising an address
+        that answers nothing until the new replica finishes starting.
+        """
+        self.service_registrations[application_id] = {
+            "replica_id": replica_id,
+            "registered": False,
+        }
+        logger.info(
+            f"Replica '{replica_id}' claimed the Hypha registration record of "
+            f"application '{application_id}'; no services registered yet."
+        )
+
+    @_touch_on_call
     def report_service_registration(
         self,
         application_id: str,
@@ -871,19 +899,21 @@ class BioEngineProxyActor:
     ) -> None:
         """Record whether an application's Hypha services exist right now.
 
-        Pushed by ``ProxyDeployment``: False at replica init, True once
-        ``_register_services`` succeeds, False again on deregistration. The
-        worker reads it before advertising the app's service address, so a
-        client is never handed an id that nothing answers yet.
+        Pushed by ``ProxyDeployment``: True once ``_register_services``
+        succeeds, False again on deregistration. The worker reads it before
+        advertising the app's service address, so a client is never handed an
+        id that nothing answers yet. The record itself is opened by
+        ``claim_service_registration`` at replica init.
 
         A ``False`` is honoured only from the replica this record already
         belongs to. Across a replica generation the two reports race: the
-        incoming replica registers and reports True, and the outgoing one's
-        ``__del__`` deregisters afterwards. Taking that last write would pin a
-        healthy app at False for good, because nothing re-reports True until
-        the next ``_register_services``, which the running replica will not
-        redo. A ``True``, and any report about an app with no record, always
-        takes over — those can only come from a replica that is serving now.
+        incoming replica claims the record, registers and reports True, and the
+        outgoing one's ``__del__`` deregisters afterwards. Taking that last
+        write would pin a healthy app at False for good, because nothing
+        re-reports True until the next ``_register_services``, which the
+        running replica will not redo. A ``True``, and any report about an app
+        with no record, always takes over — those can only come from a replica
+        that is serving now.
         """
         current = self.service_registrations.get(application_id)
         if (
