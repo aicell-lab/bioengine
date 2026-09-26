@@ -252,15 +252,99 @@ async def test_cold_start_at_min_replicas_zero_registers() -> None:
 
 
 def test_serviceability_separates_idle_from_crashed() -> None:
-    """The discriminator itself, stated as a table so it cannot drift silently."""
+    """The discriminator itself, as a table over every status Serve defines.
+
+    The table is closed against ``DeploymentStatus`` so a Ray version that adds
+    a state fails here, rather than silently falling through to non-serviceable.
+    """
+    from ray.serve.schema import DeploymentStatus
+
+    serviceable_at_zero = {"HEALTHY", "UPSCALING", "DOWNSCALING"}
+    not_serviceable_at_zero = {"UPDATING", "UNHEALTHY", "DEPLOY_FAILED"}
+
+    assert {
+        status.value for status in DeploymentStatus
+    } == serviceable_at_zero | not_serviceable_at_zero, (
+        "Ray's DeploymentStatus set changed — classify the new state here and in "
+        "_SERVICEABLE_AT_ZERO_REPLICAS before this test can pass."
+    )
+
     assert pd_module._is_serviceable(1, "UNHEALTHY") is True, (
         "a deployment with a RUNNING replica can serve regardless of what Serve "
         "thinks of it overall"
     )
-    for status in ("HEALTHY", "UPSCALING", "DOWNSCALING"):
+    for status in sorted(serviceable_at_zero):
         assert pd_module._is_serviceable(0, status) is True, status
-    for status in ("UNHEALTHY", "UPDATING"):
+    for status in sorted(not_serviceable_at_zero):
         assert pd_module._is_serviceable(0, status) is False, status
+
+
+@pytest.mark.asyncio
+async def test_sibling_states_reads_real_serve_schema(monkeypatch) -> None:
+    """Drive the real ``serve.status()`` extraction, not a stub of it.
+
+    Every other test here replaces ``_sibling_states`` wholesale, so the one
+    piece of real I/O never runs. Its failure mode is fail-closed and silent: a
+    status read as ``"DeploymentStatus.HEALTHY"`` instead of ``"HEALTHY"`` makes
+    every sibling non-serviceable and no app ever registers again.
+    """
+    from ray import serve
+    from ray.serve.schema import (
+        ApplicationStatus,
+        ApplicationStatusOverview,
+        DeploymentStatus,
+        DeploymentStatusOverview,
+        ReplicaState,
+        ServeStatus,
+    )
+    from ray.serve._private.common import DeploymentStatusTrigger
+
+    def _deployment(status, replica_states):
+        return DeploymentStatusOverview(
+            status=status,
+            status_trigger=DeploymentStatusTrigger.CONFIG_UPDATE_COMPLETED,
+            replica_states=replica_states,
+            message="",
+        )
+
+    overview = ServeStatus(
+        applications={
+            "app": ApplicationStatusOverview(
+                status=ApplicationStatus.RUNNING,
+                message="",
+                last_deployed_time_s=0.0,
+                deployments={
+                    "ProxyDeployment": _deployment(
+                        DeploymentStatus.HEALTHY, {ReplicaState.RUNNING: 1}
+                    ),
+                    "EntryDeployment": _deployment(
+                        DeploymentStatus.HEALTHY,
+                        {ReplicaState.RUNNING: 2, ReplicaState.STARTING: 1},
+                    ),
+                    "IdleDeployment": _deployment(DeploymentStatus.HEALTHY, {}),
+                    "BrokenDeployment": _deployment(DeploymentStatus.UNHEALTHY, {}),
+                },
+            )
+        }
+    )
+    monkeypatch.setattr(serve, "status", lambda: overview)
+
+    inst = _bare_proxy()
+    assert await inst._sibling_states() == {
+        "EntryDeployment": (2, "HEALTHY"),
+        "IdleDeployment": (0, "HEALTHY"),
+        "BrokenDeployment": (0, "UNHEALTHY"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_sibling_states_unknown_app_is_none(monkeypatch) -> None:
+    """An app missing from the controller's view reads "unknown", not "down"."""
+    from ray import serve
+    from ray.serve.schema import ServeStatus
+
+    monkeypatch.setattr(serve, "status", lambda: ServeStatus())
+    assert await _bare_proxy()._sibling_states() is None
 
 
 def test_probe_is_off_the_data_plane() -> None:
