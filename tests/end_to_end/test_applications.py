@@ -30,9 +30,8 @@ def top_level_name(file: Dict) -> str:
 async def resolve_service(lookup, timeout: int = 60):
     """Retry a Hypha service lookup until the registration shows up.
 
-    `get_app_status` derives `service_ids` from the worker's client id and only
-    gates on a live ProxyDeployment replica, so an id is reported before that
-    replica has finished registering it with Hypha.
+    `get_app_status` reports an id only once the proxy has registered it, but
+    the lookup still races the registration's propagation through Hypha.
     """
     start_time = time.time()
     while True:
@@ -344,7 +343,10 @@ async def test_startup_application(
     while time.time() - start_time < application_check_timeout:
         apps_status = await bioengine_worker_service.get_app_status()
         running = [
-            app for app in apps_status.values() if app["status"] == "RUNNING"
+            app
+            for app in apps_status.values()
+            if app["status"] == "RUNNING"
+            and (app["service_ids"] or {}).get("websocket_service_id")
         ]
         if len(running) >= expected_app_count:
             break

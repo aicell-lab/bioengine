@@ -67,6 +67,7 @@ def _make_manager(app_id: str, app_info: dict) -> AppsManager:
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test")
     manager._deployed_applications = {app_id: app_info}
+    manager.startup_applications = []
 
     ray_cluster = MagicMock()
     # No ProxyDeployment replicas exist once the head wiped Serve state;

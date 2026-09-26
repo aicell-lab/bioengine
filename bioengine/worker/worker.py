@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import time
@@ -309,6 +310,9 @@ class BioEngineWorker:
             f"Initializing {self.__class__.__name__} v{__version__} with mode '{mode}'"
         )
 
+        self._admin_users_file = self.workspace_dir / "admin_users.json"
+        self._load_persisted_admin_users()
+
         # Hypha server configuration
         self.server_url = server_url
         self.server: Optional[RemoteService] = None
@@ -318,6 +322,7 @@ class BioEngineWorker:
         self.client_id = client_id
         self.service_id = "bioengine-worker"
         self.worker_name = worker_name
+        self._worker_user_email = None
 
         # Worker state management
         self.start_time = None
@@ -486,6 +491,56 @@ class BioEngineWorker:
                 self.geo_location.update(coordinates)
             except Exception as e:
                 self.logger.warning(f"Failed to fetch geo coordinates: {e}")
+
+    def _load_persisted_admin_users(self) -> None:
+        """Overlay the persisted admin users on the ``admin_users`` startup seed.
+
+        The seed is replayed verbatim on every restart, so without this a user
+        added at runtime disappears on the next pod roll and a removed one comes
+        back — the silent rollback that startup flags plus out-of-band runtime
+        state always produce. The overlay wins and the divergence is logged.
+        """
+        if not self._admin_users_file.exists():
+            return
+
+        try:
+            persisted = json.loads(self._admin_users_file.read_text())
+            if not isinstance(persisted, list) or not all(
+                isinstance(user, str) for user in persisted
+            ):
+                raise ValueError("expected a list of strings")
+        except Exception as e:
+            self.logger.error(
+                f"Ignoring unreadable admin users file '{self._admin_users_file}': {e}. "
+                f"Falling back to the startup admin users: {self.admin_users}"
+            )
+            return
+
+        added = [user for user in persisted if user not in self.admin_users]
+        removed = [user for user in self.admin_users if user not in persisted]
+        if added or removed:
+            self.logger.info(
+                f"Admin users from '{self._admin_users_file}' override the startup list "
+                f"— added at runtime: {added or 'none'}, removed at runtime: {removed or 'none'}."
+            )
+        self.admin_users[:] = persisted
+
+    def _persist_admin_users(self, admin_users: List[str]) -> None:
+        """Write the admin users so the next restart overlays them on the seed.
+
+        Called before the in-memory list changes: a granted permission that only
+        exists in memory would revert on the next restart without ever failing.
+        """
+        try:
+            self._admin_users_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self._admin_users_file.with_suffix(".json.tmp")
+            tmp_file.write_text(json.dumps(admin_users, indent=2))
+            os.replace(tmp_file, self._admin_users_file)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to persist admin users to '{self._admin_users_file}': {e}. "
+                "Admin users are unchanged."
+            )
 
     async def _ping_data_server(self) -> None:
         """Ping the dataset server with retries to verify connectivity."""
@@ -658,6 +713,7 @@ class BioEngineWorker:
         if user_email in self.admin_users:
             self.admin_users.remove(user_email)
         self.admin_users.insert(0, user_email)
+        self._worker_user_email = user_email
 
         # Create admin context for internal operations
         self._admin_context = create_context(user_id, user_email)
@@ -690,6 +746,9 @@ class BioEngineWorker:
             "stop_worker": self.stop,  # Requires admin permissions
             "check_access": self.check_access,
             "get_logs": self.get_logs,  # Requires admin permissions
+            "list_admin_users": self.list_admin_users,  # Requires admin permissions
+            "add_admin_user": self.add_admin_user,  # Requires admin permissions
+            "remove_admin_user": self.remove_admin_user,  # Requires admin permissions
             # 📦 Dataset management
             "list_datasets": self.list_datasets,
             # 🧮 Code execution
@@ -1393,6 +1452,162 @@ class BioEngineWorker:
                 return lines[-tail:]
         except Exception as e:
             raise RuntimeError(f"Failed to read log file {self.log_file}: {e}")
+
+    @schema_method
+    async def list_admin_users(
+        self,
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> List[str]:
+        """List the users with admin permissions on this BioEngine worker.
+
+        Requires admin permissions.
+
+        Returns:
+            List[str]: The current admin users, most recently connected first.
+        """
+        check_permissions(
+            context=context,
+            authorized_users=self.admin_users,
+            resource_name="listing BioEngine Worker admin users",
+        )
+        return list(self.admin_users)
+
+    @schema_method
+    async def add_admin_user(
+        self,
+        user: str = Field(
+            ...,
+            description="User ID or email address to grant admin permissions on this worker.",
+        ),
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> List[str]:
+        """Grant a user admin permissions on this BioEngine worker.
+
+        Takes effect immediately for every worker method — permissions are checked
+        per call — and survives a restart. Already-running applications keep the
+        authorized users they were deployed with; redeploy them to widen access.
+
+        Requires the caller to be a named admin user — being covered by a '*'
+        entry is not enough.
+
+        Args:
+            user: User ID or email address to grant admin permissions to.
+            context: Authentication context (automatically provided by Hypha)
+
+        Returns:
+            List[str]: The updated admin users.
+
+        Raises:
+            PermissionError: If the caller is not a named admin user.
+            ValueError: If the user identifier is empty or the wildcard '*'.
+        """
+        check_permissions(
+            context=context,
+            authorized_users=self.admin_users,
+            resource_name="adding a BioEngine Worker admin user",
+            # A caller who is only an admin through '*' must not be able to turn
+            # that into a named grant the startup flag can no longer revoke.
+            allow_wildcard=False,
+        )
+
+        user = user.strip()
+        if not user:
+            raise ValueError("Admin user identifier must not be empty.")
+        if user == "*":
+            # Only the operator starting the worker gets to make it world-writable.
+            raise ValueError(
+                "Refusing to add the wildcard '*' as an admin user. Pass "
+                "--admin-users '*' at worker startup if that is intended."
+            )
+
+        if user not in self.admin_users:
+            self._persist_admin_users(self.admin_users + [user])
+            self.admin_users.append(user)
+            self.logger.info(
+                f"Added admin user '{user}' (requested by "
+                f"'{context['user'].get('email') or context['user'].get('id')}'). "
+                f"Admin users: {', '.join(self.admin_users)}"
+            )
+
+        return list(self.admin_users)
+
+    @schema_method
+    async def remove_admin_user(
+        self,
+        user: str = Field(
+            ...,
+            description="User ID or email address to revoke admin permissions from on this worker.",
+        ),
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> List[str]:
+        """Revoke a user's admin permissions on this BioEngine worker.
+
+        Takes effect immediately and survives a restart. Removing a user who is
+        not an admin is a no-op.
+
+        Requires the caller to be a named admin user — being covered by a '*'
+        entry is not enough.
+
+        Args:
+            user: User ID or email address to revoke admin permissions from.
+            context: Authentication context (automatically provided by Hypha)
+
+        Returns:
+            List[str]: The updated admin users.
+
+        Raises:
+            PermissionError: If the caller is not a named admin user.
+            ValueError: If the removal would lock the caller out, remove the last
+                        admin, or drop the worker's own identity.
+        """
+        check_permissions(
+            context=context,
+            authorized_users=self.admin_users,
+            resource_name="removing a BioEngine Worker admin user",
+            # Revoking '*' would leave the caller as the only admin, so the same
+            # named-admin requirement as add_admin_user applies.
+            allow_wildcard=False,
+        )
+
+        user = user.strip()
+        caller = context["user"]
+        if user in self.admin_users and len(self.admin_users) == 1:
+            raise ValueError(
+                f"Refusing to remove '{user}': it is the last admin user and the "
+                "worker would be left with none."
+            )
+        if user and user in (caller.get("id"), caller.get("email")):
+            raise ValueError(
+                f"Refusing to remove '{user}': a caller cannot revoke their own "
+                "admin permissions."
+            )
+        if user == self._worker_user_email:
+            # _connect_to_server re-inserts this on every reconnect, so removing
+            # it would revert silently instead of failing here.
+            raise ValueError(
+                f"Refusing to remove '{user}': it is the identity this worker "
+                "connects to Hypha with and would be restored on the next reconnect."
+            )
+
+        if user in self.admin_users:
+            self._persist_admin_users([u for u in self.admin_users if u != user])
+            self.admin_users.remove(user)
+            self.logger.info(
+                f"Removed admin user '{user}' (requested by "
+                f"'{caller.get('email') or caller.get('id')}'). "
+                f"Admin users: {', '.join(self.admin_users)}"
+            )
+
+        return list(self.admin_users)
 
     @schema_method
     async def get_status(

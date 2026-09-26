@@ -25,6 +25,7 @@ from bioengine.utils import (
     create_logger,
     ensure_applications_collection,
     get_static_site_url,
+    latest_committed_version,
 )
 
 
@@ -246,6 +247,13 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
+# Consecutive monitor ticks an app may be missing from the Serve status report
+# before absence is acted on as a failure. Absence is not a verdict — the report
+# can be momentarily incomplete — but it must still converge: never redeploying
+# a genuinely dead app is its own outage. Three ticks ≈ 30 s at the default
+# monitor interval.
+_MISSING_FROM_STATUS_TOLERANCE = 3
+
 # Minimum gap between in-place Serve-controller-loss recovery sweeps: long
 # enough for a redeploy's serve.run to bootstrap the controller before we'd
 # consider re-firing.
@@ -384,6 +392,15 @@ class AppsManager:
         # moment an app is observed healthy again. See monitor_applications.
         self._redeploy_backoff: Dict[str, Dict[str, Any]] = {}
 
+        # Consecutive monitor ticks each app has been missing from the Serve
+        # status report. Cleared the moment the app reappears, in any state.
+        self._missing_from_status: Dict[str, int] = {}
+
+        # Apps the monitor itself deleted to force fresh replicas. Their next
+        # absence is expected, not an untrustworthy report, so it skips the
+        # tolerance above. See monitor_applications.
+        self._deleted_pending_redeploy: set = set()
+
         # Timestamp of the last in-place Serve-controller-loss recovery sweep,
         # used to rate-limit re-firing while a redeploy's serve.run is still
         # bootstrapping the controller. See _recover_from_controller_loss.
@@ -444,6 +461,56 @@ class AppsManager:
         else:
             # If artifact_id does not contain a slash, prepend the workspace
             return f"{self.server.config.workspace}/{artifact_id}"
+
+    def _get_startup_version_pin(
+        self, application_id: str, artifact_id: str
+    ) -> Optional[str]:
+        """Return the version the startup config will restore on the next restart.
+
+        None when the app is not a startup application, or is pinned without a
+        version — in that case a restart redeploys whatever is already running.
+        """
+        for app_config in self.startup_applications:
+            if not isinstance(app_config, dict):
+                continue
+            if app_config.get("application_id") != application_id:
+                continue
+            config_artifact_id = app_config.get("artifact_id")
+            if not config_artifact_id:
+                continue
+            if self._get_full_artifact_id(config_artifact_id) == artifact_id:
+                return app_config.get("version")
+        return None
+
+    def _warn_on_startup_pin_divergence(self, app_config: Dict[str, Any]) -> None:
+        """Report a startup pin that is about to move a running app to another version.
+
+        ``recover_deployed_applications()`` runs first, so both numbers are in
+        hand here. Without this the revert is indistinguishable from a clean
+        start — same RUNNING status, same healthy probes, just older code.
+        """
+        pinned_version = app_config.get("version")
+        application_id = app_config.get("application_id")
+        if not pinned_version or not application_id:
+            return
+
+        running = self._deployed_applications.get(application_id)
+        if not running or running["version"] == pinned_version:
+            return
+        if running["artifact_id"] != self._get_full_artifact_id(
+            app_config["artifact_id"]
+        ):
+            return
+
+        self.logger.warning(
+            f"Startup application '{application_id}' (artifact "
+            f"'{running['artifact_id']}') was found running version "
+            f"{running['version'] or 'latest'!r} but is pinned to "
+            f"{pinned_version!r} — deploying the pinned version. If "
+            f"{running['version'] or 'latest'!r} was rolled out over the API, "
+            f"that change is being reverted; update the worker's "
+            f"startup_applications config to keep it."
+        )
 
     async def _generate_application_id(self) -> str:
         """
@@ -664,10 +731,14 @@ class AppsManager:
             built_app = self._deployed_applications[application_id]["built_app"]
             await self.app_builder.submit(built_app, application_id)
 
-            # Track the application in the internal state
+            # ``submit`` ends in serve.run(blocking=False), so the replicas are
+            # only starting here and the Hypha service does not exist until the
+            # proxy registers it. Saying "completed" sent callers to the service
+            # address tens of seconds before anything answered it.
             self.logger.info(
-                f"Successfully completed deployment of application '{application_id}' from "
-                f"artifact '{artifact_id}', version '{version}'."
+                f"Submitted application '{application_id}' from artifact "
+                f"'{artifact_id}', version '{version}' to Ray Serve; replicas are "
+                f"starting and the Hypha service is registered once they run."
             )
 
             # Mark the application as deployed
@@ -788,6 +859,8 @@ class AppsManager:
         # first makes the app invisible to the monitor for the rest of teardown.
         self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
+        self._missing_from_status.pop(application_id, None)
+        self._deleted_pending_redeploy.discard(application_id)
 
         try:
             await self.ray_cluster.call_with_reconnect(
@@ -817,6 +890,8 @@ class AppsManager:
         # Remove from internal tracking after all cleanup operations complete
         self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
+        self._missing_from_status.pop(application_id, None)
+        self._deleted_pending_redeploy.discard(application_id)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
     def _project_replicas(
@@ -951,7 +1026,16 @@ class AppsManager:
 
     async def _get_application_service_ids(
         self, application_id: str
-    ) -> Dict[str, Optional[str]]:
+    ) -> Tuple[Dict[str, Optional[str]], Optional[bool]]:
+        """Service ids to advertise for an app, and whether its proxy has
+        registered them.
+
+        Returns ``({websocket_service_id, webrtc_service_id}, registered)``.
+        Both ids are ``None`` unless a proxy replica is alive and has not
+        reported itself unregistered; ``registered`` is ``None`` when the proxy
+        has never reported — see ``BioEngineProxyActor.get_service_registration``.
+        """
+        no_ids = {"websocket_service_id": None, "webrtc_service_id": None}
         # The proxy's Hypha client_id is derived deterministically from the
         # worker's client_id and a hash of application_id (see
         # bioengine.apps.proxy_deployment.ProxyDeployment.__init__). The URL
@@ -965,7 +1049,25 @@ class AppsManager:
             )
         )
         if not replica_ids:
-            return {"websocket_service_id": None, "webrtc_service_id": None}
+            return no_ids, None
+
+        # A live proxy replica is a precondition for registration, not proof of
+        # it: the replica reports healthy to Ray while it waits for its siblings
+        # to come up, and only registers with Hypha afterwards. Advertising the
+        # id in between hands out an address that does not resolve yet.
+        registered = None
+        try:
+            registered = (
+                await self.ray_cluster.proxy_actor_handle.get_service_registration.remote(
+                    application_id
+                )
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not read service registration for '{application_id}': {exc}"
+            )
+        if registered is False:
+            return no_ids, False
 
         workspace = self.server.config.workspace
         # For a recovered app, the ProxyDeployment is still registered
@@ -983,7 +1085,7 @@ class AppsManager:
         return {
             "websocket_service_id": f"{workspace}/{proxy_client_id}:{application_id}",
             "webrtc_service_id": f"{workspace}/{proxy_client_id}:{application_id}-rtc",
-        }
+        }, registered
 
     async def _verify_running_identities(
         self,
@@ -1106,7 +1208,9 @@ class AppsManager:
                 message = f"Application '{application_id}' has not been deployed yet."
             deployments = {}
 
-        service_ids = await self._get_application_service_ids(application_id)
+        service_ids, service_registered = await self._get_application_service_ids(
+            application_id
+        )
 
         # Report what the replicas actually loaded, not just the requested
         # version — a stale reused replica reads as "healthy" otherwise.
@@ -1120,6 +1224,13 @@ class AppsManager:
             running_version, version_verified = await self._verify_running_identities(
                 application_id, application_details, application_info["version"]
             )
+
+        # The version a worker restart would restore. Differs from ``version``
+        # only when the app was rolled out over the API without updating the
+        # worker's startup_applications config; None when it isn't pinned.
+        pinned_version = self._get_startup_version_pin(
+            application_id, application_info["artifact_id"]
+        )
 
         # Build static site URL with runtime config params so the frontend
         # knows which Hypha server and service to connect to.
@@ -1141,6 +1252,7 @@ class AppsManager:
             "version": application_info["version"] or "latest",
             "running_version": running_version,
             "version_verified": version_verified,
+            "pinned_version": pinned_version,
             "recovered_app": application_info["recovered_app"],
             "status": status,
             "message": message,
@@ -1157,6 +1269,9 @@ class AppsManager:
             "scaling": dict(application_info.get("scaling") or {}),
             "static_site_url": static_site_url,
             "service_ids": service_ids,
+            # None while the proxy has never reported, so a client can tell
+            # "not registered yet" from "this worker cannot tell".
+            "service_registered": service_registered,
             "start_time": application_info["started_at"],
             "last_updated_at": application_info["last_updated_at"],
             "last_updated_by": application_info["last_updated_by"],
@@ -1432,6 +1547,8 @@ class AppsManager:
                         f"{', '.join(sorted(invalid_keys))}. Valid keys are: {', '.join(sorted(valid_keys))}"
                     )
 
+                self._warn_on_startup_pin_divergence(app_config)
+
                 if "hypha_token" not in app_config:
                     app_config["hypha_token"] = startup_applications_token
 
@@ -1455,8 +1572,10 @@ class AppsManager:
 
         Each monitor tick walks every app whose ``deploy_app(..., auto_redeploy=True)``
         flag is set and pulls its Ray Serve status. An app is considered unhealthy
-        when ``serve.status`` reports ``DEPLOY_FAILED`` / ``UNHEALTHY`` or has
-        dropped out of the response entirely. The recovery rule:
+        when ``serve.status`` reports ``DEPLOY_FAILED`` / ``UNHEALTHY``, or when it
+        has been missing from the response for ``_MISSING_FROM_STATUS_TOLERANCE``
+        consecutive ticks — absence is treated as unknown until then, since a
+        momentarily incomplete report is not a failure verdict. The recovery rule:
 
         - On the first unhealthy observation, fire a fresh ``_deploy_application``
           task immediately and seed the backoff state (1 consecutive failure,
@@ -1524,6 +1643,9 @@ class AppsManager:
             state = application.status.value if application else None
             backoff_state = self._redeploy_backoff.get(application_id)
 
+            if application is not None:
+                self._missing_from_status.pop(application_id, None)
+
             if state == "RUNNING":
                 # Truly healthy — reset the backoff so the next failure
                 # restarts from the initial delay.
@@ -1555,17 +1677,44 @@ class AppsManager:
                         await self.ray_cluster.call_with_reconnect(
                             serve.delete, application_id
                         )
+                        self._deleted_pending_redeploy.add(application_id)
                     except Exception as del_err:
                         self.logger.error(
                             f"Error deleting stale '{application_id}': {del_err}"
                         )
+                else:
+                    self._deleted_pending_redeploy.discard(application_id)
                 continue
 
-            unhealthy = application is None or state in (
-                "DEPLOY_FAILED",
-                "UNHEALTHY",
-            )
-            if not unhealthy:
+            if application is None and application_id in self._deleted_pending_redeploy:
+                # Missing because the stale-replica branch above deleted it, so
+                # this gap is known, not unknown, and must not wait out the
+                # tolerance below.
+                self._deleted_pending_redeploy.discard(application_id)
+                reason = "deleted to force fresh replicas after a version mismatch"
+            elif application is None:
+                # Absence is not a verdict. "Ray says it is broken" is a fact;
+                # "Ray did not mention it" can just mean the report was
+                # incomplete for a tick, and redeploying on that destroys the
+                # in-flight state of a healthy app. Tolerate a few, then let it
+                # through — an unknown that never converges is its own outage.
+                missing_ticks = self._missing_from_status.get(application_id, 0) + 1
+                self._missing_from_status[application_id] = missing_ticks
+                if missing_ticks < _MISSING_FROM_STATUS_TOLERANCE:
+                    self.logger.info(
+                        f"Application '{application_id}' is absent from the Ray "
+                        f"Serve status report ({missing_ticks}/"
+                        f"{_MISSING_FROM_STATUS_TOLERANCE}); treating as unknown "
+                        f"rather than unhealthy."
+                    )
+                    continue
+                reason = (
+                    f"absent from the Ray Serve status report for "
+                    f"{missing_ticks} consecutive checks"
+                )
+            elif state in ("DEPLOY_FAILED", "UNHEALTHY"):
+                reason = f"Ray Serve reports status {state}"
+            else:
                 # Transitional state (NOT_STARTED, DEPLOYING, DELETING) —
                 # keep any existing backoff state but wait for the in-flight
                 # transition to settle before deciding to retry.
@@ -1573,7 +1722,9 @@ class AppsManager:
 
             if backoff_state is None:
                 # First failure observation — fire immediately, seed backoff.
-                self._fire_redeploy(application_id, application_info, attempt=1)
+                self._fire_redeploy(
+                    application_id, application_info, attempt=1, reason=reason
+                )
                 self._redeploy_backoff[application_id] = {
                     "consecutive_failures": 1,
                     "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
@@ -1585,7 +1736,9 @@ class AppsManager:
                 continue
 
             attempt = backoff_state["consecutive_failures"] + 1
-            self._fire_redeploy(application_id, application_info, attempt=attempt)
+            self._fire_redeploy(
+                application_id, application_info, attempt=attempt, reason=reason
+            )
             delay = min(
                 _REDEPLOY_BACKOFF_MAX_SECONDS,
                 _REDEPLOY_BACKOFF_INITIAL_SECONDS * (2 ** (attempt - 1)),
@@ -1620,19 +1773,30 @@ class AppsManager:
                 f"Ray Serve controller lost (Ray head restart?); "
                 f"re-establishing application '{application_id}' in-place."
             )
-            self._fire_redeploy(application_id, info, attempt=1)
+            self._fire_redeploy(
+                application_id,
+                info,
+                attempt=1,
+                reason="the Ray Serve controller was lost",
+            )
 
     def _fire_redeploy(
         self,
         application_id: str,
         application_info: Dict[str, Any],
         attempt: int,
+        reason: str,
     ) -> None:
-        """Schedule a redeploy task and log the attempt number."""
+        """Schedule a redeploy task, logging what triggered it.
+
+        ``reason`` is what makes an incident readable afterwards: an explicit
+        UNHEALTHY verdict and a missing status entry are different failures and
+        used to produce the same line.
+        """
         self.logger.warning(
             f"Application '{application_id}' for artifact "
-            f"'{application_info['artifact_id']}' is unhealthy; triggering "
-            f"redeployment (attempt #{attempt})."
+            f"'{application_info['artifact_id']}' is unhealthy ({reason}); "
+            f"triggering redeployment (attempt #{attempt})."
         )
         deployment_task = asyncio.create_task(
             self._deploy_application(application_id=application_id),
@@ -2275,6 +2439,48 @@ class AppsManager:
             f"Successfully deleted version '{version}' of artifact '{artifact_id}'."
         )
 
+    async def _get_latest_artifact_version(self, artifact_id: str) -> Optional[str]:
+        """The artifact's newest committed version, or None if it can't be read.
+
+        Only used to report a stale inherited version, so a failure here must
+        never block the deploy that is asking.
+        """
+        try:
+            artifact = await self.artifact_manager.read(artifact_id)
+            return latest_committed_version(artifact)
+        except Exception as e:
+            self.logger.debug(
+                f"Could not read versions of artifact '{artifact_id}': {e}"
+            )
+            return None
+
+    async def _warn_if_inherited_version_is_stale(
+        self, application_id: str, artifact_id: str, version: Optional[str]
+    ) -> None:
+        """Warn when an update inherited a version the artifact has already moved past.
+
+        An update without an explicit ``version`` redeploys whatever is already
+        running, so a caller who has just uploaded newer code gets a successful
+        deploy of the old one and nothing anywhere that says so. Pinning to an
+        older version stays legal — it just stops being silent. The resolved
+        version itself is already logged by the update branch below; only the
+        mismatch is new signal.
+        """
+        if version is None:
+            # The running app was itself deployed as "latest", so this update
+            # resolves latest again and does roll forward.
+            return
+
+        latest_version = await self._get_latest_artifact_version(artifact_id)
+        if latest_version and latest_version != version:
+            self.logger.warning(
+                f"Updating application '{application_id}' without a version: "
+                f"keeping the running version {version!r}, but artifact "
+                f"'{artifact_id}' now has {latest_version!r}. This redeploys the "
+                f"code that is already running — pass version='{latest_version}' "
+                f"to roll forward."
+            )
+
     @schema_method
     async def deploy_app(
         self,
@@ -2442,6 +2648,7 @@ class AppsManager:
                 last_updated_at = time.time()  # Update time for updates
 
                 # Inherit previous parameters if not specified
+                version_inherited = version is None
                 if version is None:
                     version = existing_app["version"]
                 if application_kwargs is None:
@@ -2468,6 +2675,11 @@ class AppsManager:
                 # (same pattern as the other update-inheritance fields above).
                 if scaling is None:
                     scaling = dict(existing_app.get("scaling") or {})
+
+                if version_inherited:
+                    await self._warn_if_inherited_version_is_stale(
+                        application_id, artifact_id, version
+                    )
             else:
                 # For new applications, set creation time and default values
                 started_at = time.time()
