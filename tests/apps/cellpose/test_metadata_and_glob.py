@@ -35,8 +35,8 @@ def test_match_image_annotation_pairs_with_nested_globs() -> None:
     )
 
     assert pairs == [
-        ("images/a/t0001.tif", "annotations/a/t0001_mask.ome.tif"),
-        ("images/b/t0002.tif", "annotations/b/t0002_mask.ome.tif"),
+        ("images/a/t0001.tif", ["annotations/a/t0001_mask.ome.tif"]),
+        ("images/b/t0002.tif", ["annotations/b/t0002_mask.ome.tif"]),
     ]
 
 
@@ -60,11 +60,11 @@ def test_match_image_annotation_pairs_with_mixed_ome_suffix_convention() -> None
     assert pairs == [
         (
             "images/108bb69d-2e52-4382-8100-e96173db24ee/t0000.ome.tif",
-            "annotations/108bb69d-2e52-4382-8100-e96173db24ee/t0000_mask.ome.tif",
+            ["annotations/108bb69d-2e52-4382-8100-e96173db24ee/t0000_mask.ome.tif"],
         ),
         (
             "images/108bb69d-2e52-4382-8100-e96173db24ee/t0001.ome.tif",
-            "annotations/108bb69d-2e52-4382-8100-e96173db24ee/t0001_mask.ome.tif",
+            ["annotations/108bb69d-2e52-4382-8100-e96173db24ee/t0001_mask.ome.tif"],
         ),
     ]
 
