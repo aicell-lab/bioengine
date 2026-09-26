@@ -14,6 +14,13 @@ from ray.exceptions import RayTaskError
 from ray.serve import deployment, get_replica_context
 from ray.serve.handle import DeploymentHandle
 
+from bioengine.apps.usage_ledger import (
+    UsageLedger,
+    classify_caller,
+    ledger_dir_for_app,
+    read_usage,
+)
+
 # The Ray Serve controller imports this module to register the
 # deployment, but runs in the base Python env Ray was started with —
 # which may not have hypha_rpc. Replicas re-import in their own venv
@@ -332,9 +339,71 @@ class ProxyDeployment:
         # Lock for service registration
         self._registration_lock = asyncio.Lock()
 
+        self._usage_ledger = self._open_usage_ledger(replica_id)
+
     async def get_app_data(self) -> Dict[str, Any]:
         """Return non-secret application metadata used for worker recovery."""
         return self.app_data
+
+    # ===== Usage Accounting =====
+    # The proxy is the only place every Hypha-exposed call to every app passes
+    # through, and the only one holding the caller context, so it is where a
+    # count that outlives the Ray session can be taken. See
+    # :mod:`bioengine.apps.usage_ledger`.
+
+    def _open_usage_ledger(self, replica_id: Optional[str]) -> Optional[UsageLedger]:
+        app_dir = os.environ.get("BIOENGINE_APP_DIR")
+        if not app_dir:
+            logger.info(
+                f"ℹ️ BIOENGINE_APP_DIR is unset; usage for '{self.application_id}' "
+                f"will not be counted."
+            )
+            return None
+        try:
+            return UsageLedger(
+                directory=ledger_dir_for_app(app_dir),
+                writer_id=replica_id or f"pid{os.getpid()}-{uuid.uuid4().hex[:8]}",
+                metadata={
+                    "application_id": self.application_id,
+                    "workspace": self.workspace,
+                    "artifact_id": self.app_data.get("artifact_id"),
+                    "app_version": self.app_data.get("version"),
+                    "worker_service_id": os.environ.get(
+                        "BIOENGINE_WORKER_SERVICE_ID"
+                    ),
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not open the usage ledger for '{self.application_id}': {e}"
+            )
+            return None
+
+    def _record_usage(self, method_name: str, caller_class: str, event: str) -> None:
+        if self._usage_ledger is None:
+            return
+        try:
+            self._usage_ledger.record(method_name, caller_class, event)
+        except Exception as e:
+            logger.warning(f"⚠️ Could not record '{event}' usage: {e}")
+
+    async def _flush_usage(self) -> None:
+        """Persist pending counts without touching the event loop's thread.
+
+        Shards live on cluster storage that can stall; a synchronous write here
+        would put that stall on the request path.
+        """
+        if self._usage_ledger is None or not self._usage_ledger.dirty:
+            return
+        try:
+            revision, payload = self._usage_ledger.serialize()
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._usage_ledger.write, revision, payload
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not flush the usage ledger for '{self.application_id}': {e}"
+            )
 
     async def update_authorized_users(
         self, authorized_users: Dict[str, List[str]]
@@ -512,17 +581,30 @@ class ProxyDeployment:
                     if wants_context:
                         kwargs = {**kwargs, "context": _context_to_plain_dict(context)}
 
+                    caller_class = classify_caller(
+                        context, self.workspace, self.authorized_users
+                    )
+                    # Recorded before dispatch, so a call the entry deployment
+                    # never returns still shows up as attempted — the gap
+                    # between attempted and answered is the signal a wedged
+                    # deployment leaves behind.
+                    self._record_usage(method_name, caller_class, "attempted")
                     try:
                         result = await method.remote(*args, **kwargs)
-                        logger.info(
-                            f"✅ Successfully executed method '{method_name}' for user {user_id}"
-                        )
-                        return result
                     except RayTaskError as e:
+                        self._record_usage(method_name, caller_class, "failed")
                         logger.error(
                             f"❌ Ray task error in method '{method_name}': {e}"
                         )
                         raise
+                    except BaseException:
+                        self._record_usage(method_name, caller_class, "failed")
+                        raise
+                    self._record_usage(method_name, caller_class, "answered")
+                    logger.info(
+                        f"✅ Successfully executed method '{method_name}' for user {user_id}"
+                    )
+                    return result
 
                 except PermissionError as e:
                     logger.warning(
@@ -932,6 +1014,53 @@ class ProxyDeployment:
         """
         return self.rtc_service_id
 
+    @schema_method
+    async def get_usage_stats(
+        self,
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> Dict[str, Any]:
+        """
+        Returns this application's cumulative call counts since it was first deployed on this site.
+
+        The counts outlive replica restarts, pod rolls and version bumps — unlike Ray Serve
+        replica logs, which are destroyed whenever the Ray session restarts. They are read from
+        durable per-writer shards on the cluster's application storage and summed on every call.
+
+        Three counters are kept per method and per caller class:
+        - attempted: the call was authorized and dispatched to the application
+        - answered: the application returned a result
+        - failed: the application raised, or the call was cancelled
+
+        attempted minus answered minus failed is the number of calls that were dispatched and
+        never came back — the signature of a deployment that wedged mid-request.
+
+        Caller classes are coarse by design, and no caller identity is ever recorded:
+        - internal: the caller can operate this deployment (write access to the hosting
+          workspace, or a named entry in the application's authorized users)
+        - external: any other authenticated caller
+        - anonymous: the caller was not authenticated by Hypha
+
+        Counts are per site. A deployment of the same application on another cluster keeps its
+        own independent counters; a cross-site total means asking each site and adding them up.
+
+        Returns:
+            Dict[str, Any]: Cumulative totals, the same figures split by caller class and by
+                            method, the application versions observed, and how many shards
+                            were read.
+        """
+        await self._check_permissions(context, method_name="get_usage_stats")
+        if self._usage_ledger is None:
+            return {"available": False, "reason": "no durable application storage"}
+        await self._flush_usage()
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(
+            None, read_usage, self._usage_ledger.directory
+        )
+        return {"available": True, "application_id": self.application_id, **stats}
+
     async def _deregister_services(self) -> None:
         """Unregister all Hypha services and reset connection state.
 
@@ -1087,6 +1216,9 @@ class ProxyDeployment:
             # Add RTC service ID function - for WebRTC service ID retrieval
             service_functions["get_rtc_service_id"] = self._get_rtc_service_id
 
+            # Add cumulative usage counts - survives the Ray session
+            service_functions["get_usage_stats"] = self.get_usage_stats
+
             # Register the main service
             websocket_service_info = await self.server.register_service(
                 {
@@ -1208,6 +1340,10 @@ class ProxyDeployment:
 
         Kept separate from the sleeping loop so it can be driven directly.
         """
+        # Ahead of the readiness gate: counts taken before a sibling dropped out
+        # must still reach disk.
+        await self._flush_usage()
+
         if not self.entry_deployment_ready:
             # Not serviceable yet, or deregistered because a sibling went
             # down. check_health owns that gate; nothing to maintain.
@@ -1461,6 +1597,7 @@ class ProxyDeployment:
         if self._maintenance_task is not None:
             self._maintenance_task.cancel()
             self._maintenance_task = None
+        await self._flush_usage()
         try:
             await self._deregister_services()
         except Exception as e:
