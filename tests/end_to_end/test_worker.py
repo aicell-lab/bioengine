@@ -166,6 +166,8 @@ async def test_get_status(
         "used_cpu",
         "total_gpu",
         "used_gpu",
+        "total_vram_mb",
+        "used_vram_mb",
     ]
 
     for field in expected_cluster_fields:
@@ -196,6 +198,8 @@ async def test_get_status(
             "used_cpu",
             "total_gpu",
             "used_gpu",
+            "total_vram_mb",
+            "used_vram_mb",
             "total_gpu_memory",
             "used_gpu_memory",
             "total_memory",
