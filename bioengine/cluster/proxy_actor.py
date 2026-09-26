@@ -532,6 +532,8 @@ class BioEngineProxyActor:
                     "used_cpu": float,
                     "total_gpu": float,
                     "used_gpu": float,
+                    "total_vram_mb": float,
+                    "used_vram_mb": float,
                     "pending_resources": {  # if check_pending_resources=True
                         "actors": List[Dict],
                         "jobs": List[Dict],
@@ -547,6 +549,8 @@ class BioEngineProxyActor:
                         "used_cpu": float,
                         "total_gpu": float,
                         "used_gpu": float,
+                        "total_vram_mb": float,  # VRAM_MB advertised, 0 if none
+                        "used_vram_mb": float,   # VRAM_MB booked by the scheduler
                         "total_gpu_memory": Union[int, str],  # in bytes or "NA"
                         "used_gpu_memory": Union[int, str],  # in bytes or "NA"
                         "total_memory": float,
@@ -588,6 +592,8 @@ class BioEngineProxyActor:
                 "used_cpu": 0,
                 "total_gpu": 0,
                 "used_gpu": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
                 "total_memory": 0,
                 "used_memory": 0,
                 "total_gpu_memory": 0,
@@ -613,6 +619,12 @@ class BioEngineProxyActor:
             available_cpu = available_resources.get("CPU", 0)
             total_gpu = total_resources.get("GPU", 0)
             available_gpu = available_resources.get("GPU", 0)
+            # Where the node advertises VRAM_MB, that resource — not GPU — is
+            # what bounds packing: the AppBuilder books a 0.01 GPU handle per
+            # replica purely to bind a device, so used_gpu reads as near-idle on
+            # a GPU whose VRAM is fully reserved.
+            total_vram_mb = total_resources.get("VRAM_MB", 0)
+            available_vram_mb = available_resources.get("VRAM_MB", 0)
             accelerator_type = (
                 "NA" if total_gpu == 0 else self._get_accelerator_type(total_resources)
             )
@@ -658,6 +670,8 @@ class BioEngineProxyActor:
                 "used_cpu": max(0, total_cpu - available_cpu),
                 "total_gpu": total_gpu,
                 "used_gpu": max(0, total_gpu - available_gpu),
+                "total_vram_mb": total_vram_mb,
+                "used_vram_mb": max(0, total_vram_mb - available_vram_mb),
                 "total_gpu_memory": total_gpu_memory,
                 "used_gpu_memory": used_gpu_memory,
                 "total_memory": total_memory,  # in bytes
