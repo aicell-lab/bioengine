@@ -58,6 +58,20 @@ def _format_vram(used, total):
     return f"{_gib(used)}/{_gib(total)} GiB"
 
 
+def _format_gpu_label(info):
+    """Render a node's GPU as its real device name plus the schedulable label.
+
+    ``accelerator_type`` is the string ``@ray.remote(accelerator_type=...)``
+    matches on, and Ray truncates it to a single letter on consumer cards, so
+    both are shown rather than one standing in for the other.
+    """
+    accelerator_type = info.get("accelerator_type") or "?"
+    device_name = info.get("gpu_device_name")
+    if not device_name or device_name == "NA":
+        return accelerator_type
+    return f"{device_name} (accelerator_type={accelerator_type})"
+
+
 @click.group("cluster")
 def cluster_group():
     """Inspect BioEngine Ray cluster resources (GPUs, CPUs, memory)."""
@@ -136,7 +150,7 @@ def cluster_status(as_json, worker_service_id, token, server_url):
                 )
                 click.echo(
                     f"  {info.get('node_ip')} [{role}] "
-                    f"{info.get('accelerator_type', '?')} "
+                    f"{_format_gpu_label(info)} "
                     f"GPU: {info.get('used_gpu', 0):.2f}/{info.get('total_gpu', 0):.0f} "
                     f"{booked}"
                     f"VRAM: {vram}  "

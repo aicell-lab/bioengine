@@ -41,7 +41,11 @@ def _actor(total, available):
             "available_resources_per_node": staticmethod(lambda: {"n1": available}),
         },
     )()
-    actor._get_per_node_gpu_memory_usage = lambda: ({}, False)
+    # No dashboard URL and no cached snapshot, so the real GPU-info fetch
+    # returns "nothing known" instead of being stubbed out — a stub of that
+    # helper goes stale silently when it is renamed.
+    actor.dashboard_url = None
+    actor._last_per_node_gpu_info = {}
     return actor
 
 

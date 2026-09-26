@@ -224,17 +224,6 @@ model_description, skip_pre, skip_post = _apply_overrides(
     loaded_description, overrides
 )
 
-# An architecture that opens an attachment relative to its own file finds
-# nothing: core imports the architecture alone into a temporary directory.
-try:
-    from model_attachments import stage_architecture_attachments
-
-    staged = stage_architecture_attachments(model_description)
-    if staged:
-        print("staged attachments: " + ", ".join(staged), file=sys.stderr)
-except Exception as e:
-    print("could not stage attachments: " + repr(e), file=sys.stderr)
-
 # Passing ``default_blocksize_parameter=None`` explicitly would override
 # core's own default with None, and a blocked predict whose per-axis ``ns``
 # is empty (every axis fixed) then falls back to it and crashes.
@@ -493,6 +482,74 @@ class RuntimeDeployment:
             pass
         return cpu_mem, gpu_mem
 
+    def _conda_list(self, env_names, env_vars) -> str:
+        """Packages in the environment(s) the test actually ran in.
+
+        Upstream leaves ``saved_conda_list`` to a lazy property that shells
+        ``conda list`` with no target, so it reports whichever env is active in
+        the serializing process — for us the replica's base anaconda, which
+        contains none of the model's dependencies.
+
+        ``test_description`` builds one env per weight format, so a multi-format
+        model legitimately has several; all are listed rather than picking one.
+        """
+        import subprocess
+        import sys
+
+        def _run(cmd):
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, env=env_vars, check=False
+            )
+            if proc.returncode != 0:
+                return f"`{' '.join(cmd)}` exited with {proc.returncode}"
+            return proc.stdout
+
+        try:
+            if env_names:
+                # Each ``conda list`` already opens with its own
+                # "# packages in environment at <path>:" line, so that doubles as
+                # the section delimiter — nothing needs inventing.
+                return "\n\n".join(
+                    _run(["mamba", "list", "-n", name]) for name in sorted(env_names)
+                )
+            return _run([sys.executable, "-m", "pip", "list", "--format=freeze"])
+        except Exception as e:
+            return f"Failed to list packages: {e}"
+
+    def _get_accelerator_name(self) -> str:
+        """Name of the accelerator visible to THIS replica, or ``cpu``.
+
+        Reads CUDA_VISIBLE_DEVICES before touching NVML: NVML enumerates every
+        device injected into the container, so a CPU-only replica would
+        otherwise name a GPU it cannot use. Deliberately not torch —
+        ``get_device_name`` calls ``_lazy_init`` and leaves a primary CUDA
+        context in a process whose whole design is to keep CUDA in child
+        processes.
+        """
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if not visible:
+            return "cpu"
+        # Resolve the FIRST VISIBLE device, not physical index 0: Ray writes
+        # this var from its own NVML enumeration, so reading it back through
+        # NVML recovers the device Ray actually assigned.
+        first = visible.split(",")[0].strip()
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            try:
+                if first.startswith(("GPU-", "MIG-")):
+                    handle = pynvml.nvmlDeviceGetHandleByUUID(first.encode())
+                else:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(int(first))
+                raw = pynvml.nvmlDeviceGetName(handle)
+                return raw.decode() if isinstance(raw, bytes) else str(raw)
+            finally:
+                pynvml.nvmlShutdown()
+        except Exception as e:
+            logger.warning(f"⚠️ Could not resolve accelerator name: {e}")
+            return "unknown"
+
     # === Subprocess env hardening ===
 
     _SENSITIVE_ENV_NEEDLES = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
@@ -584,7 +641,15 @@ class RuntimeDeployment:
 
         try:
             if not custom_environment:
-                return self._run_bioimageio_test_subprocess(rdf_path)
+                report = self._run_bioimageio_test_subprocess(rdf_path)
+                if isinstance(report, dict):
+                    # Overwritten post-hoc rather than assigned pre-dump: the
+                    # summary is serialized in the child process, so the lazy
+                    # property has already fired by the time we see the dict.
+                    report["saved_conda_list"] = self._conda_list(
+                        None, self._safe_subprocess_env()
+                    )
+                return report
 
             # custom_environment=True: run inside the model's declared
             # conda env via mamba. Env creation is now owned by the
@@ -605,10 +670,16 @@ class RuntimeDeployment:
 
             mamba_env_vars = self._mamba_env_vars()
 
+            solved_env_names = set()
+
             def mamba_run_command(args):
                 args = list(args)
                 if args and args[0] == "conda":
                     args[0] = "mamba"
+                # core passes its own "conda run -n <hash> ..." through here, so
+                # this is the only place the solved env's name is visible to us.
+                if "-n" in args and args.index("-n") + 1 < len(args):
+                    solved_env_names.add(args[args.index("-n") + 1])
                 logger.info(f"🐍 [conda] running: {' '.join(args)}")
                 proc = subprocess.run(
                     args, capture_output=True, text=True, env=mamba_env_vars
@@ -672,6 +743,14 @@ class RuntimeDeployment:
                 )
             finally:
                 _rt.get_conda_env = _orig_get_conda_env
+
+            # Assign BEFORE model_dump so the lazy ``conda_list`` property never
+            # fires; overwriting afterwards would let it run first.
+            validation_summary.saved_conda_list = (
+                self._conda_list(solved_env_names, mamba_env_vars)
+                if solved_env_names
+                else "could not determine the model's environment"
+            )
             return validation_summary.model_dump(mode="json")
         except Exception as e:
             logger.error(f"❌ Model test failed: {str(e)}")
@@ -699,13 +778,8 @@ class RuntimeDeployment:
         script = (
             "import json, sys\n"
             f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
-            "from bioimageio.core import load_model_description, test_description\n"
-            "from model_attachments import stage_architecture_attachments\n"
+            "from bioimageio.core import test_description\n"
             "rdf_path, out_path = sys.argv[1], sys.argv[2]\n"
-            "try:\n"
-            "    stage_architecture_attachments(load_model_description(rdf_path))\n"
-            "except Exception as e:\n"
-            "    print('could not stage attachments:', repr(e))\n"
             "summary = test_description(\n"
             "    rdf_path, expected_type='model', runtime_env='currently-active'\n"
             ")\n"
@@ -804,17 +878,33 @@ class RuntimeDeployment:
             # to confirm it actually runs where infer() will serve it.
             # Fully guarded — any failure is recorded as a report field,
             # never propagated, so it cannot fail the test itself.
-            try:
-                inference_check = await asyncio.to_thread(
-                    self._run_inference_smoke_test, rdf_path
-                )
-            except Exception as e:  # pragma: no cover - defensive backstop
+            # A model that declares its own environment does so because the
+            # runner venv lacks its dependencies, so this check would fail on an
+            # import every time and report nothing about the model (#0079).
+            if custom_environment:
+                # ``error`` rather than a new key because that is the field the
+                # website renders in its failure dialog; leaving it null blanks
+                # the message the user sees.
                 inference_check = {
-                    "status": "failed",
-                    "error": f"inference smoke-test harness error: {e}",
+                    "status": "skipped",
+                    "error": (
+                        "model declares its own environment; the "
+                        "default-environment check does not apply"
+                    ),
                 }
+            else:
+                try:
+                    inference_check = await asyncio.to_thread(
+                        self._run_inference_smoke_test, rdf_path
+                    )
+                except Exception as e:  # pragma: no cover - defensive backstop
+                    inference_check = {
+                        "status": "failed",
+                        "error": f"inference smoke-test harness error: {e}",
+                    }
             if isinstance(test_report, dict):
                 test_report["inference_check"] = inference_check
+                test_report["replica_accelerator"] = self._get_accelerator_name()
 
             cpu_after, gpu_after = self._get_memory_usage()
             logger.info(
@@ -843,12 +933,7 @@ class RuntimeDeployment:
             f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
             "from bioimageio.core import load_model_description, create_prediction_pipeline\n"
             "from bioimageio.core.digest_spec import get_test_inputs\n"
-            "from model_attachments import stage_architecture_attachments\n"
             "descr = load_model_description(sys.argv[1])\n"
-            "try:\n"
-            "    stage_architecture_attachments(descr)\n"
-            "except Exception as e:\n"
-            "    print('could not stage attachments:', repr(e))\n"
             "pipeline = create_prediction_pipeline(descr)\n"
             "pipeline.load()\n"
             "sample = get_test_inputs(descr)\n"

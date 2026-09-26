@@ -168,7 +168,7 @@ launch instead of OOMing mid-train.
   `resume_checkpoint_file`. This closes the train → export → refine loop with a
   replica-independent checkpoint. `resume_session_id` and `init_checkpoint` are
   mutually exclusive, and `model_type` must match the checkpoint's architecture.
-- **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`.
+- **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, n_epochs_completed, n_epochs_completed_basis, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`. `n_epochs` is the requested count; `n_epochs_completed` is how many actually ran (updated live during training) — for micro-SAM this can be below `n_epochs` when early stopping fires, so a COMPLETED run with `n_epochs_completed < n_epochs` is expected, not a truncation. **`n_epochs_completed_basis` tells you which kind of number that is**, because the two backends produce different kinds under one name: `measured` (micro-SAM — read from torch_em's per-epoch `latest.pt`, an observation that can disagree with the request) versus `floor_if_completed` (cellpose — `train_seg` has no early stopping and only checkpoints after the full loop, so on COMPLETED the count *equals* `n_epochs` and is a guaranteed lower bound, **not** a measurement that the epochs ran; cellpose exposes no per-epoch counter). Do not read a `floor_if_completed` value as evidence of how long the run ran — it can only ever equal the request. A terminal status carries `terminated_by` (`child` | `supervisor` | `user_stop` | `entry`) recording who wrote it; the child's outcome overrides a bystander's premature terminal, while a user stop is never overwritten by a late completion. For runs that predate this field, retrospective recovery starts by matching an absent `end_time`. Recovering the *epoch count* from there is **micro-SAM only** — read the host-mount `train.log` for its "Finished training after N epochs" line; cellpose's `train_seg` emits no such line. Recovering only the *yes/no* — did the trainer outlive its terminal record — is backend-independent and needs no log parsing: a newest-checkpoint mtime (`latest.pt`/`best.pt`) later than the last `status.json` write means the run kept training past a bystander's premature terminal. Both signals read host-mount files, so neither is reachable through an RPC handle — which is why `n_epochs_completed` is surfaced in status going forward.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).
 - **`export_model(session_id, name, description="", authors=None, license="CC-BY-4.0", provenance=None)`**
@@ -232,17 +232,49 @@ so it must be deployed with the token injected:
 ```python
 await worker.deploy_app(
     artifact_id="bioimage-io/model-finetune",
-    version="0.13.0",
+    version="0.17.0",
     application_id="model-finetune",
     hypha_token=HYPHA_TOKEN,
 )
 ```
 
+### Selecting backends (`MODEL_FINETUNE_BACKENDS`)
+
+The two GPU runtimes are independent and **each reserves a whole GPU**, so
+running both backends costs **two GPUs** — even to serve one request — and the
+app silently *pends* on a one-GPU worker. Set the `MODEL_FINETUNE_BACKENDS`
+environment variable at deploy time to run only the backend you need:
+
+- unset (default) → **both** backends (`microsam` + `cellpose`) → two GPUs;
+- `cellpose` → only the Cellpose runtime (cpsam / cpdino / cpdino-vitb) → **one GPU**;
+- `microsam` → only the micro-sam runtime (all `vit_*`) → **one GPU**.
+
+A disabled backend is dropped from the app's composition graph, so it reserves no
+GPU and never builds its (multi-GB) pip env. Its model types are reported
+`trainable: false` (reason "backend not deployed on this worker") by
+`get_training_capabilities()` and rejected by `infer` / `start_training` with a
+clear error. Enabling both backends is a two-GPU deployment by design.
+
+Pass it as a deployment env var — the guaranteed vector, since it must be visible
+when the app is introspected (an `application_env_vars` entry, or baked into a
+purpose-built worker image):
+
+```python
+await worker.deploy_app(
+    artifact_id="bioimage-io/model-finetune",
+    version="0.17.0",
+    application_id="model-finetune",
+    hypha_token=HYPHA_TOKEN,
+    application_env_vars={"*": {"MODEL_FINETUNE_BACKENDS": "cellpose"}},
+)
+```
+
 Notes:
-- First deploy is slow — **two** GPU runtime envs pip-install in parallel: the
-  micro-sam env (`micro-sam` + `torch-em`, `segment-anything`, `bioimage-cpp`,
-  `onnxruntime`) and the Cellpose env (`cellpose==4.2.1.1`, `numpy==1.26.4`, plus
-  `dinov3` for the cpdino backbone).
+- First deploy is slow — with **both** backends the two GPU runtime envs
+  pip-install in parallel: the micro-sam env (`micro-sam` + `torch-em`,
+  `segment-anything`, `bioimage-cpp`, `onnxruntime`) and the Cellpose env
+  (`cellpose==4.2.1.1`, `numpy==1.26.4`, plus `dinov3` for the cpdino backbone).
+  Selecting a single backend builds only that one env.
 - Requires a GPU replica; SAM ViT encoders are large. `vit_l_lm` (default) needs ~5 GB; `vit_b_lm` is lighter
   in a few GB of VRAM.
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the

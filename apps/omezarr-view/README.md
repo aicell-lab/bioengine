@@ -91,6 +91,11 @@ the metadata, the chunks, the thumbnail, and the catalog entry, which is
 reduced to a stub — image dimensions, pixel sizes and channel names are
 themselves sensitive.
 
+**The dataset id is public even when the dataset is not.** Every route needs it,
+so redaction cannot withhold it — and `local_dir` / `remote_prefix` derive ids
+from filenames, so `patient_042_HER2_biopsy.czi` becomes the public id
+`patient-042-her2-biopsy`. Set an explicit `id:` for anything sensitive.
+
 Tokens travel three ways: `Authorization: Bearer …`, `?token=…`, or a
 `/t/{token}/zarr/…` path prefix. **Use the path form for viewers.** A Zarr
 client builds chunk URLs by appending the key to the store root, so a
@@ -135,3 +140,57 @@ WebGL, so deck.gl fails at init and Vizarr renders nothing even when the data
 arrives correctly. It records every network request Vizarr made alongside the
 screenshot, because a black canvas and a working render are not distinguishable
 from the image alone.
+
+## Derived views — computed, not re-addressed
+
+A raw view re-addresses the original's own pixels. A **derived view** computes
+new ones and serves them the same lazy way: rescaled to a target physical
+spacing, channel-selected, dtype-normalised — a "training view" shaped to what
+a model wants to be fed.
+
+```yaml
+  - type: derived
+    views:
+      - id: my-training-view
+        from: my-raw-dataset       # any dataset id above
+        target_spacing_um: 10.0    # or target_scale: 0.5
+        channels: [DAPI, GFP]      # names or indices; omit to keep all
+        dtype: uint8               # uint8 | uint16 | float32
+        normalise: percentile      # percentile | none
+```
+
+**The honesty line.** The original file is still never migrated or rewritten,
+so "no conversion" still holds. But these pixels are *computed*, so a derived
+view is **never zero-copy**, and it says so itself: every one reports its
+`transform_chain`, sets `computed_product: true`, and carries a caption stating
+that its output is a computed product.
+
+What it does under the hood, and what that costs:
+
+- **It reads the coarsest source level that still holds the detail requested**,
+  per output level. A 10 µm/px view of a 3.22 µm/px source reads pyramid level
+  1, not level 0 — four times fewer bytes.
+- **Level 0 is exactly the target you asked for.** Coarser levels are added
+  only when the target is big enough that a viewer could not otherwise draw it
+  (with nothing coarser available, a viewer has to fetch every tile of the full
+  grid before it can show anything — measured: 353 requests and a blank canvas
+  before, 50 requests and a correct render after). Those extra levels are
+  navigation aids, not part of the request.
+- **A derived chunk costs several source chunks.** One output tile overlaps
+  ~4 source tiles, each a separate read. On the remote demo a derived tile is
+  roughly 2–4× the cold latency of a raw tile. A chunk-keyed LRU sits in front
+  of the source (hit rates around 50% in normal viewing) — note it must be keyed
+  on the *source chunk*, not the requested region, since no two output tiles ask
+  for the same rectangle.
+- **Only y/x are resampled.** z spacing carries over from the source unchanged,
+  and the mapping report says so.
+- **Normalisation bounds are measured, not declared** — the 1–99.8 percentiles
+  the base view sampled. Absolute intensities are therefore not preserved, which
+  the mapping report also states.
+
+## Agent-facing guide
+
+The recipes, the claim boundary, the metadata-report rules, the verified
+consumers and the gotchas are published as part of the BioEngine skill at
+<https://bioimage.io/skills/bioengine/apps/omezarr-view.md>. Edit it there;
+this repo no longer carries a second copy.

@@ -1,7 +1,9 @@
 """Drive a federated segmentation experiment across N BioEngine clients.
 
-Every arm consumes the same number of optimiser steps, so the comparison
-measures federation rather than compute:
+Every arm consumes the same number of optimiser steps PER MODEL. The federated
+arms train N models per round and average them, so at the system level they
+spend N times the gradient computation of a single-instance arm; compute is
+matched per model and is not matched overall.
 
   <client>-only    trained only on that client's images, one arm per client
   fedavg           R rounds of local training, sample-count-weighted state_dict average
@@ -9,6 +11,9 @@ measures federation rather than compute:
   loso-<client>    federate everyone except <client>, then score on <client> (--loso)
   pooled           an extra instance holding every client's data — the deliberate
                    premise violation, used as the upper bound
+  pooled-balanced  pooled, drawing a domain uniformly and then an image within it,
+                   so its per-domain training weight matches the evaluation's
+                   instead of the shard fraction (--balanced-arm)
 
 Every arm is scored the same way: the checkpoint is pushed to each client and
 evaluated there against that client's held-out test split. Test images never
@@ -256,19 +261,36 @@ def convergence_round(curve: List[float], window: int = 5, tolerance: float = 0.
     return None
 
 
-async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str]]:
-    """Mean validation Dice per dataset, plus the weights each site scored with."""
+async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """Mean validation Dice per dataset, the weights each site scored with, and
+    the site each dataset's score came from.
+
+    ``scores`` is keyed by dataset and ``scored_with`` by site — two key spaces
+    that look like one only because each consortium client happens to hold a
+    dataset named after it. ``scored_by`` carries the attribution as data, so no
+    consumer has to recover it from that coincidence, and the pooled arm (six
+    datasets, one scoring site) says so rather than reading as six sites.
+    """
     scores: Dict[str, float] = {}
     scored_with: Dict[str, str] = {}
+    scored_by: Dict[str, str] = {}
     for name in names:
         for dataset, result in (await apps[name].evaluate(split="val")).items():
+            if dataset in scored_by:
+                raise RuntimeError(
+                    f"dataset {dataset!r} was scored by both {scored_by[dataset]} and "
+                    f"{result['site']}; a dataset-keyed score map cannot hold both, and "
+                    f"silently keeping the last would attribute it to the wrong site"
+                )
             scores[dataset] = float(result["dice_mean"])
+            scored_by[dataset] = result["site"]
             scored_with[name] = result["weights_sha256"]
-    return scores, scored_with
+    return scores, scored_with, scored_by
 
 
 async def train_arm(
-    app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str
+    app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str,
+    domain_balanced: bool = False,
 ) -> List[Dict]:
     """Run rounds x steps of purely local training, scoring validation each round.
 
@@ -277,8 +299,11 @@ async def train_arm(
     """
     history = []
     for r in range(rounds):
-        record = await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}")
-        record["val_dice"], _ = await val_dice(apps, [instance])
+        record = await app.train(
+            steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}",
+            domain_balanced=domain_balanced,
+        )
+        record["val_dice"], _, record["scored_by"] = await val_dice(apps, [instance])
         history.append(record)
     return history
 
@@ -340,7 +365,7 @@ async def federated_arm(
         for name in dict.fromkeys([*participants, *eval_on]):
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
         # Scored after the merge and pull, so this is the aggregate's curve.
-        merged_val, scored_with = await val_dice(apps, eval_on)
+        merged_val, scored_with, scored_by = await val_dice(apps, eval_on)
         # A site whose weights did not move while the aggregate did was scored on
         # stale weights. That failure produces plausible numbers instead of an
         # error — a LOSO fold's held-out client trains on nothing, so a missed
@@ -361,6 +386,7 @@ async def federated_arm(
                 "val_dice": merged_val,
                 "global_sha256": aggregate["sha256"],
                 "scored_with": scored_with,
+                "scored_by": scored_by,
             }
         )
         print(
@@ -481,6 +507,12 @@ async def main() -> None:
         help="Add a second FedAvg arm weighting every client equally instead of by sample count",
     )
     parser.add_argument(
+        "--balanced-arm",
+        action="store_true",
+        help="Add a second pooled arm that draws a domain uniformly and then an image within it, "
+             "matching the pooled arm's per-domain training weight to the evaluation's",
+    )
+    parser.add_argument(
         "--pre-registration",
         default=None,
         help="Path to a design file whose predictions must already be committed",
@@ -523,7 +555,7 @@ async def main() -> None:
         servers[name] = await connect_to_server({"server_url": SERVER_URL, "token": env[spec["token_key"]]})
         apps[name] = SiteHandle(servers[name], spec["worker"], spec["application_id"])
         app_records[name] = await apps[name].connect()
-        print(f"{name}: resolved {spec['application_id']}", flush=True)
+        print(f"{name}: resolved {spec['application_id']} at {app_records[name].get('version')}", flush=True)
 
     site_status = {name: await app.get_status() for name, app in apps.items()}
     if not args.skip_prepare:
@@ -626,8 +658,11 @@ async def main() -> None:
                 )
 
         # --- Arms: single-site and pooled ----------------------------------
-        single_site_arms = [(f"{name}-only", name) for name in clients]
-        for arm, instance in single_site_arms + [("pooled", "pooled")]:
+        single_site_arms = [(f"{name}-only", name, False) for name in clients]
+        pooled_arms = [("pooled", "pooled", False)]
+        if args.balanced_arm:
+            pooled_arms.append(("pooled-balanced", "pooled", True))
+        for arm, instance, domain_balanced in single_site_arms + pooled_arms:
             if arm in arms:
                 print(f"  {arm}: kept from {metrics_path}", flush=True)
                 continue
@@ -635,7 +670,7 @@ async def main() -> None:
             await apps[instance].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
             history = await train_arm(
                 apps[instance], apps, instance, args.rounds, args.steps, args.lr, seed,
-                f"{prefix}/{arm}",
+                f"{prefix}/{arm}", domain_balanced,
             )
             await apps[instance].push_weights(
                 run_artifact_id=run_artifact_id, path=f"{prefix}/arms/{arm}.pt", note=f"{arm} final"
@@ -681,6 +716,7 @@ async def main() -> None:
     transport = {name: await app.get_transport_log() for name, app in apps.items()}
     transport["driver"] = driver_log.dump()
 
+    app_versions = {name: record.get("version") for name, record in app_records.items()}
     provenance = {
         "run_id": args.run_id,
         "generated_at": time.time(),
@@ -688,7 +724,14 @@ async def main() -> None:
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True
         ).stdout.strip(),
         "app_artifact": app_records[clients[0]].get("artifact_id"),
-        "app_version": app_records[clients[0]].get("version"),
+        # Seven instances are seven separate deployments and a run can mix their
+        # versions — the instance an arm trains on is not one of the clients, so
+        # clients[0]'s version would be attributed to all seven. Scalar only when
+        # they agree; null otherwise, which reads as "look at the map".
+        "app_version": (
+            app_versions[clients[0]] if len(set(app_versions.values())) == 1 else None
+        ),
+        "app_version_per_instance": app_versions,
         "run_artifact_id": run_artifact_id,
         "aggregation_rule": "sample-count-weighted FedAvg over the full state_dict",
         "arm_structure": {
@@ -700,6 +743,13 @@ async def main() -> None:
             ) if args.loso else None,
             "<client>-only": "that client's own data alone, the baseline LOSO is compared against",
             "pooled": "one instance holding every client's data — the premise violation, an upper bound",
+            "pooled-balanced": (
+                "pooled, but drawing a domain uniformly and then an image within it, so its "
+                "per-domain training weight is 1/6 each instead of the shard fraction. Isolates the "
+                "SAMPLER axis only: it still differs from the federated arms in whether updates are "
+                "exchanged and in system-level local-step budget (6:1; per-model steps are matched), "
+                "and those two are not separable in this design"
+            ) if args.balanced_arm else None,
         },
         "train_sizes": "natural" if LAYOUTS[args.layout]["n_train"] is None else LAYOUTS[args.layout]["n_train"],
         "normalisation": "GroupNorm (no running statistics, so the merge averages weights only)",

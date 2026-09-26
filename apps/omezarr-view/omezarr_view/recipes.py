@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numcodecs
 import numpy as np
 
+from .czi_meta import read_czi_extras
 from .ngff import SourceMetadata, build_ngff_attrs, from_ome_xml
 
 # Every Zarr client has zlib; blosc/zstd coverage in the browser is patchier.
@@ -65,6 +67,15 @@ class BaseView:
     def zarr_key(self, key: str) -> Optional[bytes]:
         raise NotImplementedError
 
+    def contains(self, key: str) -> bool:
+        """Does this key exist, WITHOUT fetching its bytes?
+
+        zarr asks `key in store` before reading it. Answering that by doing the
+        read and throwing it away doubles every chunk fetch on the build path —
+        measured at exactly 2.0x. Recipes that can answer from their index must.
+        """
+        return self.zarr_key(key) is not None
+
     def report(self) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -85,7 +96,25 @@ class BaseView:
             return
         t0 = time.perf_counter()
         try:
-            sample = self.thumbnail_array()
+            # Bounded sample, NOT the thumbnail: on a single-scale source the
+            # thumbnail path reads a whole plane per channel, which is the
+            # entire file.
+            level, n_chunks, affordable = _display_sample_plan(self)
+            if not affordable:
+                self.display_sample_note = (
+                    f"NOT measured: full coverage of level {level} would need "
+                    f"{n_chunks} chunk reads, over the budget of "
+                    f"{FULL_COVERAGE_CHUNK_BUDGET}. A partial sample of a tissue "
+                    "section is spatially biased at any pixel count, so no "
+                    "window is published and the range shown is the declared "
+                    "bit depth. Raise OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS to measure it.")
+                self.mapping.unmapped = [m for m in self.mapping.unmapped
+                                         if not m.startswith("display windows")]
+                self.mapping.miss("display windows (contrast limits)",
+                                  self.display_sample_note)
+                self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
+                return
+            sample = _sample_for_display(self, level)
         except Exception:
             return
         for i, channel in enumerate(channels):
@@ -104,15 +133,27 @@ class BaseView:
             if axis in axes:
                 size = self.level_shapes[0][axes.index(axis)]
                 self.attrs["omero"].setdefault("rdefs", {})[key] = size // 2
+        # Say what was DONE without asserting anything about the source: the
+        # builder already recorded whether the file declared windows, and
+        # overwriting that line with a hardcoded "not declared" is how a false
+        # claim survived even after the extractor learned to read them.
+        declared = bool(self.mapping.mapped.get("declared_display_windows"))
         self.mapping.unmapped = [
             m for m in self.mapping.unmapped if not m.startswith("display windows")
         ]
         self.mapping.miss(
             "display windows (contrast limits)",
-            "not declared in the source; view computes 1-99.8 percentiles from "
-            "a coarse level",
-        )
+            ("the source declares them; this view publishes windows measured "
+             "from the pixels instead (1-99.8 percentiles of a coarse level), "
+             "and the declared values are recorded but not applied")
+            if declared else
+            ("not declared in the source; view computes 1-99.8 percentiles "
+             "from a coarse level"))
         self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
+        self.display_sample_note = (
+            f"every chunk of level {level} ({n_chunks} chunk reads, in "
+            "parallel) — full spatial coverage, because a partial sample of a "
+            "tissue section is biased at any pixel count")
 
 
 # ---------------------------------------------------------------------------
@@ -172,15 +213,23 @@ class ReferenceView(BaseView):
         self.level_shapes = [list(lv.shape) for lv in s.levels]
         self.axes = s.axes.lower()
         self.dtype = np.dtype(s.dtype)
+        self.n_series = len(tf.series)
 
         t0 = time.perf_counter()
-        attrs, self.mapping = build_ngff_attrs(from_ome_xml(
+        source_md = from_ome_xml(
             ome_xml=tf.ome_metadata,
             axes=s.axes,
             level_shapes=self.level_shapes,
             dtype=str(self.dtype.str),
             name=self.title,
-        ))
+        )
+        # A multi-series file serves ONE series; silently picking the first and
+        # saying nothing would hide the rest from the reader entirely.
+        source_md.mark("scenes")
+        source_md.scenes = [getattr(x, "name", None) or f"series {i}"
+                            for i, x in enumerate(tf.series)]
+        source_md.served_scene = source_md.scenes[series]
+        attrs, self.mapping = build_ngff_attrs(source_md)
         self.build_timings["synthesise_metadata_s"] = time.perf_counter() - t0
 
         if ".zgroup" not in refs:
@@ -236,6 +285,9 @@ class ReferenceView(BaseView):
         level = key.split("/", 1)[0]
         return OUT_COMPRESSOR.encode(self._decode_source_chunk(level, raw))
 
+    def contains(self, key: str) -> bool:
+        return normalise_chunk_key(key) in self.refs
+
     def raw_reference(self) -> Dict[str, Any]:
         """The index as the client would use it to bypass the server entirely.
 
@@ -279,8 +331,10 @@ class ReferenceView(BaseView):
             "source_pages_indexed": self.n_pages,
             "index_keys": len(self.refs),
             "build_reads": (
-                "file headers only to build the index; then one coarse level "
-                "sampled to set display range"),
+                "file headers only to build the index; then a bounded pixel "
+                "sample to set display range — " + getattr(
+                    self, "display_sample_note",
+                    "a few small windows per channel, not a whole level")),
             "index_copies_pixel_data": False,
             "build_timings_s": {k: round(v, 3) for k, v in self.build_timings.items()},
             "direct_client_access": True,
@@ -371,7 +425,8 @@ class BioIOView(BaseView):
         names: Optional[List[Optional[str]]] = None
         if self.img.channel_names:
             names = [str(n) for n in self.img.channel_names]
-        return SourceMetadata(
+
+        md = SourceMetadata(
             axes=self.axes,
             level_shapes=[list(self.shape)],
             dtype=self.dtype.str,
@@ -379,14 +434,35 @@ class BioIOView(BaseView):
             physical_sizes=sizes,
             channel_names=names,
         )
+        md.mark("physical pixel sizes", "channel names")
+
+        # BioIO's accessors stop at names and pixel sizes. Anything beyond them
+        # has to be read from the raw metadata, or the view must say it did not
+        # look — claiming "not declared" for a field nobody inspected is how
+        # three false statements got into published captions.
+        try:
+            extras, inspected = read_czi_extras(self.img.metadata)
+        except Exception:
+            extras, inspected = {}, []
+        md.mark(*inspected)
+        for attr, value in extras.items():
+            setattr(md, attr, value)
+
+        # BioIO's scene list is what is actually REACHABLE through this view, so
+        # it wins over the names in the raw metadata, which may be spelled
+        # differently and would otherwise disagree with served_scene.
+        scenes = [str(x) for x in (self.img.scenes or [])]
+        if scenes:
+            md.mark("scenes")
+            md.scenes = scenes
+            md.served_scene = str(self.img.current_scene)
+        return md
 
     def _plane(self, index: Tuple[int, ...]) -> np.ndarray:
         sel = tuple(slice(i, i + 1) for i in index[:-2])
         return np.ascontiguousarray(self.img.dask_data[sel].compute())
 
-    def zarr_key(self, key: str) -> Optional[bytes]:
-        if key in self._meta:
-            return self._meta[key]
+    def _chunk_index(self, key: str) -> Optional[Tuple[int, ...]]:
         key = normalise_chunk_key(key)
         if not key.startswith("0/"):
             return None
@@ -397,6 +473,17 @@ class BioIOView(BaseView):
         if len(index) != len(self.shape):
             return None
         if any(i < 0 or i * c >= s for i, c, s in zip(index, self.chunks, self.shape)):
+            return None
+        return index
+
+    def contains(self, key: str) -> bool:
+        return key in self._meta or self._chunk_index(key) is not None
+
+    def zarr_key(self, key: str) -> Optional[bytes]:
+        if key in self._meta:
+            return self._meta[key]
+        index = self._chunk_index(key)
+        if index is None:
             return None
         return OUT_COMPRESSOR.encode(self._plane(index))
 
@@ -439,30 +526,44 @@ class BioIOView(BaseView):
 # ---------------------------------------------------------------------------
 
 
-def _default_fetcher(attempts: int = 4):
+def _default_fetcher(attempts: int = 5, max_inflight: int = 8):
     """Range-read bytes from a URL or a local path.
 
-    Object stores drop pooled connections freely, and a viewer opening a
-    pyramid fires dozens of range requests at once — without a retry the first
-    dropped connection surfaces to the browser as a 500 and the tile renders
-    black. Retries rebuild the client, since a torn-down HTTP/2 connection
-    stays broken.
+    Two things this has to survive, both learned the hard way against Google
+    Cloud Storage. Object stores drop pooled connections freely, so a dropped
+    connection must be retried rather than surfaced as a 500 that renders a
+    black tile. And HTTP/2 multiplexes every range read onto ONE connection,
+    so a single reset takes out all of them at once; under a viewer's or a
+    training loader's parallel reads that happened often enough to fail whole
+    requests. Pooled HTTP/1.1 with bounded concurrency isolates the failures
+    to one read, which the retry then absorbs.
     """
     import httpx
 
-    state = {"client": httpx.Client(http2=True, timeout=120, follow_redirects=True)}
+    def _new() -> "httpx.Client":
+        return httpx.Client(
+            http2=False,
+            timeout=120,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=max_inflight * 2,
+                                max_keepalive_connections=max_inflight),
+        )
+
+    state = {"client": _new()}
     lock = threading.Lock()
+    inflight = threading.Semaphore(max_inflight)
 
     def _reset(dead) -> None:
+        """Swap in a fresh client. Deliberately does NOT close the old one.
+
+        httpx.Client is safe to share across threads, but closing one is not:
+        a sibling thread mid-request on the same client gets "Cannot send a
+        request, as the client has been closed". Dropping the reference lets
+        it be collected once its in-flight requests finish.
+        """
         with lock:
             if state["client"] is dead:
-                try:
-                    dead.close()
-                except Exception:
-                    pass
-                state["client"] = httpx.Client(
-                    http2=True, timeout=120, follow_redirects=True
-                )
+                state["client"] = _new()
 
     def fetch(url: str, offset: int, length: int) -> bytes:
         if "://" not in url or url.startswith("file://"):
@@ -475,33 +576,67 @@ def _default_fetcher(attempts: int = 4):
         for attempt in range(attempts):
             client = state["client"]
             try:
-                r = client.get(url, headers=headers)
+                with inflight:
+                    r = client.get(url, headers=headers)
                 r.raise_for_status()
                 return r.content
-            except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            except (httpx.TransportError, httpx.HTTPStatusError, RuntimeError) as e:
                 last = e
                 if isinstance(e, httpx.HTTPStatusError) and \
                         e.response.status_code not in (429, 500, 502, 503, 504):
                     raise
+                if isinstance(e, RuntimeError) and "closed" not in str(e):
+                    raise
                 _reset(client)
-                time.sleep(0.2 * (2 ** attempt))
+                time.sleep(0.25 * (2 ** attempt))
         raise RuntimeError(f"range read failed after {attempts} attempts: {last}")
 
     return fetch
 
 
-def _read_level(view: BaseView, level: int) -> np.ndarray:
-    """Read the middle plane of each channel at ``level``, as (C, Y, X)."""
+# A display-range sample must never scale with the file. On a SINGLE-SCALE
+# source the "coarsest level" IS level 0, so reading a whole plane per channel
+# read the entire image: 529 s of a 634 s first request on a 116 MB file, and
+# an eleven-minute first click for whoever opens a cold view. The sample only
+# needs enough pixels for a percentile, so it is bounded by construction.
+# An UNBIASED percentile needs spatial COVERAGE, not pixel count. An
+# independent sweep found a 2-chunk diagonal sample (131,072 px) was 33x less
+# accurate than striding across every chunk (82,628 px) — fewer pixels, more
+# coverage, better answer — because intensity in a tissue section is structured
+# in space, so any partial sample stays biased however many pixels it draws.
+# So: read a level in FULL when that is affordable, and when it is not, say the
+# window is unmeasured rather than publish one that is wrong on most channels.
+FULL_COVERAGE_CHUNK_BUDGET = int(os.environ.get(
+    "OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS", "512"))
+SAMPLE_FETCH_WORKERS = 12
+
+
+def _level_array(view: BaseView, level: int):
     import zarr
 
     store = _ViewStore(view)
-    arr = zarr.open_group(zarr.storage.KVStore(store), mode="r")[str(level)]
+    return zarr.open_group(zarr.storage.KVStore(store), mode="r")[str(level)]
+
+
+def _read_level(view: BaseView, level: int, max_side: int = 4096) -> np.ndarray:
+    """Read the middle plane of each channel at ``level``, as (C, Y, X).
+
+    Bounded: past ``max_side`` this returns a centred crop rather than the whole
+    plane, because the caller wants something to look at, not the whole file.
+    """
+    arr = _level_array(view, level)
     axes = view.axes
     shape = arr.shape
+    yi, xi = len(axes) - 2, len(axes) - 1
     sel: List[Any] = []
     for i, a in enumerate(axes):
-        if a in "yx":
-            sel.append(slice(None))
+        if i in (yi, xi):
+            extent = shape[i]
+            if extent > max_side:
+                start = (extent - max_side) // 2
+                sel.append(slice(start, start + max_side))
+            else:
+                sel.append(slice(None))
         elif a == "c":
             sel.append(slice(None))
         else:
@@ -510,6 +645,66 @@ def _read_level(view: BaseView, level: int) -> np.ndarray:
     if "c" not in axes:
         out = out[None]
     return out
+
+
+def _display_sample_plan(view: "BaseView"):
+    """Pick a level to sample and say whether full coverage is affordable."""
+    level = len(view.level_shapes) - 1
+    while level > 0 and max(view.level_shapes[level][-2:]) < 256:
+        level -= 1
+    arr = _level_array(view, level)
+    axes = view.axes
+    yi, xi = len(axes) - 2, len(axes) - 1
+    grid_y = max(1, -(-arr.shape[yi] // arr.chunks[yi]))
+    grid_x = max(1, -(-arr.shape[xi] // arr.chunks[xi]))
+    n_c = arr.shape[axes.index("c")] if "c" in axes else 1
+    total = grid_y * grid_x * n_c
+    return level, total, total <= FULL_COVERAGE_CHUNK_BUDGET
+
+
+def _sample_for_display(view: "BaseView", level: int) -> np.ndarray:
+    """Read EVERY chunk of one plane per channel at ``level``, in parallel.
+
+    Full spatial coverage is what makes the percentile unbiased. Cost is bounded
+    by CHOOSING the level, never by skipping parts of it.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    arr = _level_array(view, level)
+    axes = view.axes
+    shape, chunks = arr.shape, arr.chunks
+    yi, xi = len(axes) - 2, len(axes) - 1
+    n_c = shape[axes.index("c")] if "c" in axes else 1
+    grid_y = max(1, -(-shape[yi] // chunks[yi]))
+    grid_x = max(1, -(-shape[xi] // chunks[xi]))
+
+    jobs = []
+    for c in range(n_c):
+        for gy in range(grid_y):
+            for gx in range(grid_x):
+                sel = []
+                for i, a in enumerate(axes):
+                    if i == yi:
+                        sel.append(slice(gy * chunks[yi],
+                                         min((gy + 1) * chunks[yi], shape[yi])))
+                    elif i == xi:
+                        sel.append(slice(gx * chunks[xi],
+                                         min((gx + 1) * chunks[xi], shape[xi])))
+                    elif a == "c":
+                        sel.append(c)
+                    else:
+                        sel.append(shape[i] // 2)
+                jobs.append((c, tuple(sel)))
+
+    def fetch(job):
+        c, sel = job
+        return c, np.asarray(arr[sel]).reshape(-1)
+
+    per_channel = {c: [] for c in range(n_c)}
+    with ThreadPoolExecutor(max_workers=SAMPLE_FETCH_WORKERS) as pool:
+        for c, values in pool.map(fetch, jobs):
+            per_channel[c].append(values)
+    return np.stack([np.concatenate(per_channel[c]) for c in range(n_c)])
 
 
 class _ViewStore(dict):
@@ -526,13 +721,9 @@ class _ViewStore(dict):
         return value
 
     def __contains__(self, key: object) -> bool:
-        if not isinstance(key, str):
-            return False
-        try:
-            self[key]
-        except KeyError:
-            return False
-        return True
+        # Ask, do not fetch: reading the chunk to answer an existence question
+        # made every build-path chunk arrive twice.
+        return isinstance(key, str) and self._view.contains(key)
 
     def __iter__(self):
         return iter(())

@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import json
-import urllib.error
+import http.client
 import urllib.request
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -152,13 +152,14 @@ class BioEngineProxyActor:
 
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
-        # Last successful per-node GPU memory read from the Ray dashboard. The
-        # dashboard sits behind a KubeRay auth proxy where a cold one-shot fetch
-        # can time out; a single miss must not erase the cluster's (static) GPU
-        # capacity, which get_gpu_memory_sizing() needs at deploy time. The
+        # Last successful per-node GPU read (memory and device names) from the
+        # Ray dashboard. The dashboard sits behind a KubeRay auth proxy where a
+        # cold one-shot fetch can time out; a single miss must not erase the
+        # cluster's (static) GPU capacity, which get_gpu_memory_sizing() needs
+        # at deploy time. The
         # frequently-polled status path keeps this warm, so a deploy-time sizing
         # read reuses the last good snapshot instead of a fresh cold fetch.
-        self._last_per_node_gpu_memory: Dict[str, Dict[str, int]] = {}
+        self._last_per_node_gpu_info: Dict[str, Dict[str, Any]] = {}
 
         # Real device-wide VRAM usage pushed by GPU app replicas via
         # report_gpu_memory (cuMemGetInfo, truthful on vGPU where NVML is
@@ -334,6 +335,13 @@ class BioEngineProxyActor:
     def _get_accelerator_type(self, resources: Dict[str, float]) -> Optional[str]:
         """Extract the GPU/accelerator type from a node's resource dictionary.
 
+        Ray derives this label from the NVML device name with a regex that keeps
+        only uppercase letters and digits, so consumer cards truncate ("NVIDIA
+        GeForce RTX 3090" becomes "G"). It is still the exact value
+        ``@ray.remote(accelerator_type=...)`` matches on, so it is reported
+        verbatim; the untruncated device name is reported separately as
+        ``gpu_device_name``.
+
         Args:
             resources: Node resource dictionary with resource names as keys.
 
@@ -342,7 +350,7 @@ class BioEngineProxyActor:
         """
         for resource_name in resources:
             if resource_name.startswith("accelerator_type:"):
-                return resource_name.lstrip("accelerator_type:")
+                return resource_name.removeprefix("accelerator_type:")
 
     def _get_slurm_job_id(self, resources: Dict[str, float]) -> Optional[str]:
         """Extract the SLURM job ID from a node's resource dictionary.
@@ -376,19 +384,19 @@ class BioEngineProxyActor:
             webui_url = f"http://{webui_url}"
         return webui_url
 
-    def _get_per_node_gpu_memory_usage(
+    def _get_per_node_gpu_info(
         self,
-    ) -> Tuple[Dict[str, Dict[str, int]], bool]:
-        """Fetch per-node GPU memory usage from Ray dashboard node summary.
+    ) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+        """Fetch per-node GPU memory usage and device names from the Ray dashboard.
 
         Returns:
-            Mapping {node_id: {"total_gpu_memory": int, "used_gpu_memory": int}}
-            with values in bytes, and a bool indicating if dashboard data is
-            currently available.
+            Mapping {node_id: {"total_gpu_memory": int, "used_gpu_memory": int,
+            "gpu_device_name": Optional[str]}} with memory values in bytes, and
+            a bool indicating if dashboard data is currently available.
         """
         webui_url = self._get_dashboard_webui_url()
         if not webui_url:
-            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
+            return self._last_per_node_gpu_info, bool(self._last_per_node_gpu_info)
 
         url = f"{webui_url}/nodes?view=summary"
         # KubeRay (and some other managed Ray distributions) put the dashboard
@@ -404,19 +412,22 @@ class BioEngineProxyActor:
         try:
             with urllib.request.urlopen(request, timeout=2.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        # OSError covers URLError, TimeoutError and the raw socket errors urllib
+        # leaves unwrapped; HTTPException covers the ones it does not, which
+        # getresponse() re-raises unwrapped.
+        except (OSError, http.client.HTTPException, json.JSONDecodeError, ValueError):
             logger.debug(
                 "Failed to fetch Ray node summary from dashboard endpoint %s",
                 url,
                 exc_info=True,
             )
-            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
+            return self._last_per_node_gpu_info, bool(self._last_per_node_gpu_info)
 
         if not payload.get("result"):
-            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
+            return self._last_per_node_gpu_info, bool(self._last_per_node_gpu_info)
 
         summary = payload.get("data", {}).get("summary", [])
-        per_node_gpu_memory: Dict[str, Dict[str, int]] = {}
+        per_node_gpu_info: Dict[str, Dict[str, Any]] = {}
         for node in summary:
             node_id = node.get("raylet", {}).get("nodeId")
             if not node_id:
@@ -424,17 +435,22 @@ class BioEngineProxyActor:
 
             total_gpu_memory_mb = 0
             used_gpu_memory_mb = 0
+            device_names: List[str] = []
             for gpu in node.get("gpus") or []:
                 total_gpu_memory_mb += int(gpu.get("memoryTotal", 0) or 0)
                 used_gpu_memory_mb += int(gpu.get("memoryUsed", 0) or 0)
+                device_name = gpu.get("name")
+                if device_name and device_name not in device_names:
+                    device_names.append(device_name)
 
-            per_node_gpu_memory[node_id] = {
+            per_node_gpu_info[node_id] = {
                 "total_gpu_memory": total_gpu_memory_mb * 1024 * 1024,
                 "used_gpu_memory": used_gpu_memory_mb * 1024 * 1024,
+                "gpu_device_name": ", ".join(device_names) or None,
             }
 
-        self._last_per_node_gpu_memory = per_node_gpu_memory
-        return per_node_gpu_memory, True
+        self._last_per_node_gpu_info = per_node_gpu_info
+        return per_node_gpu_info, True
 
     def get_gpu_memory_sizing(self) -> Dict[str, Any]:
         """GPU sizing hints for VRAM-based deployment (used by AppBuilder).
@@ -451,7 +467,7 @@ class BioEngineProxyActor:
         """
         vram_advertised = float(ray.cluster_resources().get("VRAM_MB", 0) or 0) > 0
 
-        per_node, dashboard_available = self._get_per_node_gpu_memory_usage()
+        per_node, dashboard_available = self._get_per_node_gpu_info()
         min_gpu_total_mb: Optional[int] = None
         if dashboard_available:
             totals = self.global_state.total_resources_per_node()
@@ -531,7 +547,8 @@ class BioEngineProxyActor:
                         "used_memory": float,
                         "total_object_store_memory": float,
                         "used_object_store_memory": float,
-                        "accelerator_type": Optional[str],
+                        "accelerator_type": Optional[str],  # schedulable label
+                        "gpu_device_name": Optional[str],  # display only
                         "slurm_job_id": Optional[str]
                     }
                 }
@@ -556,7 +573,7 @@ class BioEngineProxyActor:
                 exc_info=True,
             )
             available_resources_per_node = {}
-        gpu_memory_per_node, dashboard_available = self._get_per_node_gpu_memory_usage()
+        gpu_info_per_node, dashboard_available = self._get_per_node_gpu_info()
         now = time.time()
 
         cluster_state = {
@@ -601,6 +618,11 @@ class BioEngineProxyActor:
             accelerator_type = (
                 "NA" if total_gpu == 0 else self._get_accelerator_type(total_resources)
             )
+            gpu_device_name = (
+                "NA"
+                if total_gpu == 0
+                else gpu_info_per_node.get(node_id, {}).get("gpu_device_name")
+            )
             total_memory = total_resources.get("memory", 0)
             available_memory = available_resources.get("memory", 0)
             total_object_store_memory = total_resources.get("object_store_memory", 0)
@@ -617,7 +639,7 @@ class BioEngineProxyActor:
                 # fresh cuMemGetInfo sample pushed by a live GPU replica, else
                 # "NA" (idle node / no live reporter).
                 if dashboard_available:
-                    total_gpu_memory = gpu_memory_per_node.get(
+                    total_gpu_memory = gpu_info_per_node.get(
                         node_id, {"total_gpu_memory": 0}
                     )["total_gpu_memory"]
                 else:
@@ -649,6 +671,7 @@ class BioEngineProxyActor:
                     0, total_object_store_memory - available_object_store_memory
                 ),  # in bytes
                 "accelerator_type": accelerator_type,
+                "gpu_device_name": gpu_device_name,
                 "slurm_job_id": self._get_slurm_job_id(total_resources),
             }
 
