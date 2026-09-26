@@ -31,6 +31,7 @@ def check_permissions(
     context: Optional[Dict[str, Any]],
     authorized_users: Union[List[str], str, None],
     resource_name: str,
+    allow_wildcard: bool = True,
 ) -> None:
     """
     Check if the user in the context is authorized to access a resource.
@@ -47,6 +48,10 @@ def check_permissions(
                          - ["*"] or "*": Allows all users (wildcard access)
                          - None or []: Denies all access
         resource_name: Name of the resource being accessed for error messaging
+        allow_wildcard: Whether a "*" entry authorizes every caller. Pass False for
+                        operations that widen the authorized set itself — a caller
+                        who is only covered by "*" must not be able to make that
+                        grant permanent or revoke it for everyone else.
 
     Raises:
         PermissionError: If user is not authorized to access the resource with
@@ -88,7 +93,10 @@ def check_permissions(
 
     # Check for wildcard access
     if "*" in authorized_users:
-        return  # Wildcard access - all users allowed
+        if allow_wildcard:
+            return  # Wildcard access - all users allowed
+        # Fall through on the named entries only, so the denial reports them.
+        authorized_users = [user for user in authorized_users if user != "*"]
 
     # Check specific user authorization
     if user_id and user_id in authorized_users:
