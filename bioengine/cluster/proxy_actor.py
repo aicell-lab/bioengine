@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import json
-import urllib.error
+import http.client
 import urllib.request
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -412,7 +412,9 @@ class BioEngineProxyActor:
         try:
             with urllib.request.urlopen(request, timeout=2.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        # OSError covers URLError, TimeoutError and the raw socket errors urllib
+        # leaves unwrapped; IncompleteRead is an HTTPException, not an OSError.
+        except (OSError, http.client.IncompleteRead, json.JSONDecodeError, ValueError):
             logger.debug(
                 "Failed to fetch Ray node summary from dashboard endpoint %s",
                 url,
