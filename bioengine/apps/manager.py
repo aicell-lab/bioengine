@@ -104,6 +104,8 @@ class _ReconnectingArtifactManager:
         self._logger = logger
         self._generation = 0
         self._lock = asyncio.Lock()
+        self._resolved = asyncio.Event()
+        self._resolved.set()
 
     async def _re_resolve(self, seen_generation: int) -> None:
         async with self._lock:
@@ -111,12 +113,23 @@ class _ReconnectingArtifactManager:
             # first needs to replace it.
             if self._generation != seen_generation:
                 return
-            self._proxy = await self._server.get_service("public/artifact-manager")
-            self._generation += 1
+            self._resolved.clear()
+            try:
+                self._proxy = await self._server.get_service("public/artifact-manager")
+                self._generation += 1
+            finally:
+                self._resolved.set()
             self._logger.info("Re-resolved the artifact manager service proxy.")
 
     def __getattr__(self, name: str):
+        attribute = getattr(self._proxy, name)
+        if not callable(attribute):
+            return attribute
+
         async def call(*args, **kwargs):
+            # Dispatching while a replacement is being fetched would spend a
+            # full method timeout on the handle already known to be dead.
+            await self._resolved.wait()
             seen_generation = self._generation
             try:
                 return await getattr(self._proxy, name)(*args, **kwargs)
@@ -131,9 +144,15 @@ class _ReconnectingArtifactManager:
                 await self._re_resolve(seen_generation)
                 if kind != "never_sent" and name not in _RETRY_SAFE_READS:
                     raise
-                if kind == "maybe_sent" and name in _SILENCEABLE_READS:
-                    # The first attempt may already have counted this view.
-                    kwargs = {**kwargs, "silent": True}
+                if (
+                    kind == "maybe_sent"
+                    and name in _SILENCEABLE_READS
+                    and len(args) <= 1
+                ):
+                    # Beyond the artifact id, a positional may already be
+                    # ``silent`` itself, and an explicit keyword wins over the
+                    # view-count suppression.
+                    kwargs.setdefault("silent", True)
                 return await getattr(self._proxy, name)(*args, **kwargs)
 
         return call

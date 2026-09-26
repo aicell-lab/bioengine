@@ -36,7 +36,13 @@ logger = logging.getLogger("test-artifact-manager")
 
 
 class _Proxy:
-    """One resolved client instance of the artifact manager."""
+    """One resolved client instance of the artifact manager.
+
+    The signatures mirror the real service: ``read``/``list``/``get_file`` take
+    ``silent``, ``read_file``/``list_files`` do not.
+    """
+
+    id = "public/artifact-manager"
 
     def __init__(self, name: str, fails_with: BaseException | None = None):
         self.name = name
@@ -44,21 +50,44 @@ class _Proxy:
         self.calls: list[tuple] = []
         self.kwargs_seen: list[dict] = []
 
-    def _answer(self, method, artifact_id, kwargs):
+    async def _answer(self, method, artifact_id, kwargs):
+        await asyncio.sleep(0)
         self.calls.append((method, artifact_id))
         self.kwargs_seen.append(kwargs)
         if self._fails_with is not None:
             raise self._fails_with
         return {"id": artifact_id, "served_by": self.name}
 
-    async def read(self, artifact_id, **kwargs):
-        return self._answer("read", artifact_id, kwargs)
+    async def read(self, artifact_id, silent=False, version=None):
+        return await self._answer(
+            "read", artifact_id, {"silent": silent, "version": version}
+        )
 
-    async def read_file(self, artifact_id, **kwargs):
-        return self._answer("read_file", artifact_id, kwargs)
+    async def list(self, parent_id=None, silent=False):
+        return await self._answer("list", parent_id, {"silent": silent})
+
+    async def read_file(self, artifact_id, file_path, version=None):
+        return await self._answer(
+            "read_file", artifact_id, {"file_path": file_path, "version": version}
+        )
+
+    async def list_files(self, artifact_id, dir_path=None):
+        return await self._answer("list_files", artifact_id, {"dir_path": dir_path})
 
     async def commit(self, artifact_id, **kwargs):
-        return self._answer("commit", artifact_id, kwargs)
+        return await self._answer("commit", artifact_id, kwargs)
+
+
+class _RecordingProxy(_Proxy):
+    """Records the exact ``(args, kwargs)`` each method was dispatched with."""
+
+    def __init__(self, name, fails_with=None):
+        super().__init__(name, fails_with)
+        self.dispatched: list[tuple] = []
+
+    async def read(self, *args, **kwargs):
+        self.dispatched.append((args, kwargs))
+        return await super().read(*args, **kwargs)
 
 
 class _Server:
@@ -70,11 +99,12 @@ class _Server:
 
     async def get_service(self, service_id):
         assert service_id == "public/artifact-manager"
+        await asyncio.sleep(0)
         self.resolutions += 1
         return self._proxies.pop(0)
 
 
-def _wrap(server: _Server, proxy: _Proxy) -> _ReconnectingArtifactManager:
+def _wrap(server, proxy: _Proxy) -> _ReconnectingArtifactManager:
     return _ReconnectingArtifactManager(server=server, proxy=proxy, logger=logger)
 
 
@@ -220,12 +250,12 @@ async def test_a_timed_out_write_refreshes_the_handle_but_is_never_replayed():
 
 @pytest.mark.asyncio
 async def test_a_timed_out_read_is_retried_against_the_fresh_proxy():
-    """#0074's own signature, end to end.
+    """The observed outage's own signature, end to end.
 
-    The call that hung in the outage was ``read`` — the ``upload_app`` write
-    before it had already succeeded, and ``deploy_app`` then failed at manifest
-    load. Repeating a read is safe however the first attempt failed, so this is
-    the case that takes the observed fault to zero failed calls rather than one.
+    The call that hung was ``read`` — the ``upload_app`` write before it had
+    already succeeded, and ``deploy_app`` then failed at manifest load. Repeating
+    a read is safe however the first attempt failed, so this is the case that
+    takes the observed fault to zero failed calls rather than one.
     """
     dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
     fresh = _Proxy("fresh")
@@ -239,6 +269,35 @@ async def test_a_timed_out_read_is_retried_against_the_fresh_proxy():
 
 
 @pytest.mark.asyncio
+async def test_a_timed_out_list_is_retried_and_silenced():
+    """``list`` is the call behind ``list_apps``, and it takes ``silent`` too."""
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    result = await am.list("ws/bioengine-apps")
+
+    assert result["served_by"] == "fresh"
+    assert fresh.kwargs_seen[-1]["silent"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_list_files_is_retried_unsilenced():
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    result = await am.list_files("ws/my-app")
+
+    assert result["served_by"] == "fresh"
+
+
+# ===== the ``silent`` injection =====
+
+
+@pytest.mark.asyncio
 async def test_a_retried_read_does_not_count_a_second_view():
     """Reads are repeatable but not side-effect-free.
 
@@ -247,13 +306,13 @@ async def test_a_retried_read_does_not_count_a_second_view():
     only the retry is silenced.
     """
     dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
-    fresh = _Proxy("fresh")
+    fresh = _RecordingProxy("fresh")
     server = _Server(fresh)
     am = _wrap(server, dead)
 
     await am.read("ws/my-app")
 
-    assert fresh.kwargs_seen[-1].get("silent") is True
+    assert fresh.dispatched[-1] == (("ws/my-app",), {"silent": True})
 
 
 @pytest.mark.asyncio
@@ -261,13 +320,13 @@ async def test_a_send_side_read_retry_is_not_silenced():
     """A call that never reached the server counted nothing, so the retry is
     the *first* real view and must be recorded as one."""
     dead = _Proxy("dead", fails_with=RuntimeError("Failed to send the request"))
-    fresh = _Proxy("fresh")
+    fresh = _RecordingProxy("fresh")
     server = _Server(fresh)
     am = _wrap(server, dead)
 
     await am.read("ws/my-app")
 
-    assert "silent" not in fresh.kwargs_seen[-1]
+    assert "silent" not in fresh.dispatched[-1][1]
 
 
 @pytest.mark.asyncio
@@ -279,9 +338,42 @@ async def test_a_read_without_a_silent_parameter_is_retried_unsilenced():
     server = _Server(fresh)
     am = _wrap(server, dead)
 
-    await am.read_file("ws/my-app", file_path="manifest.yaml")
+    result = await am.read_file("ws/my-app", file_path="manifest.yaml")
 
-    assert "silent" not in fresh.kwargs_seen[-1]
+    assert result["served_by"] == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_silent_false_is_not_overridden():
+    """The caller asked for the view to be counted; the retry is the only view
+    that will ever happen for this call, so honour it."""
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _RecordingProxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    await am.read("ws/my-app", silent=False)
+
+    assert fresh.dispatched[-1][1]["silent"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_positional_silent_does_not_collide_with_the_injected_one():
+    """``read(aid, False)`` passes ``silent`` positionally. Injecting the keyword
+    as well raises TypeError, turning a recoverable timeout into a hard failure.
+    """
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _RecordingProxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    result = await am.read("ws/my-app", False)
+
+    assert result["served_by"] == "fresh"
+    assert fresh.dispatched[-1] == (("ws/my-app", False), {})
+
+
+# ===== concurrency =====
 
 
 @pytest.mark.asyncio
@@ -305,7 +397,8 @@ async def test_concurrent_failures_re_resolve_the_service_once():
     """Every in-flight call fails against the same dead proxy.
 
     Without the generation guard each one would resolve its own replacement,
-    turning a single eviction into a burst of ``get_service`` calls.
+    turning a single eviction into a burst of ``get_service`` calls. The fakes
+    yield so the gathered coroutines genuinely interleave.
     """
     dead = _Proxy("dead", fails_with=RuntimeError("Failed to send the request"))
     fresh = _Proxy("fresh")
@@ -316,6 +409,42 @@ async def test_concurrent_failures_re_resolve_the_service_once():
 
     assert server.resolutions == 1
     assert all(r["served_by"] == "fresh" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_a_call_issued_during_a_re_resolve_waits_for_the_new_handle():
+    """A write starting mid-repair must not be sent to the handle known to be dead.
+
+    Without the gate it is dispatched to the dead proxy, burns a full method
+    timeout and is re-raised — ~30s of avoidable outage per call in the window,
+    and every write in it fails for nothing.
+    """
+    resolving = asyncio.Event()
+    release = asyncio.Event()
+
+    dead = _Proxy("dead", fails_with=asyncio.TimeoutError())
+    fresh = _Proxy("fresh")
+
+    class _SlowServer(_Server):
+        async def get_service(self, service_id):
+            resolving.set()
+            await release.wait()
+            return await super().get_service(service_id)
+
+    server = _SlowServer(fresh)
+    am = _wrap(server, dead)
+
+    read = asyncio.create_task(am.read("ws/my-app"))
+    await resolving.wait()
+
+    commit = asyncio.create_task(am.commit("ws/my-app"))
+    await asyncio.sleep(0)
+    assert dead.calls == [("read", "ws/my-app")], "the commit must not reach the dead proxy"
+
+    release.set()
+    assert (await read)["served_by"] == "fresh"
+    assert (await commit)["served_by"] == "fresh"
+    assert server.resolutions == 1
 
 
 @pytest.mark.asyncio
@@ -334,21 +463,81 @@ async def test_a_failed_re_resolve_surfaces_rather_than_being_swallowed():
     with pytest.raises(RuntimeError, match="500"):
         await am.read("ws/my-app")
 
+    fresh = _Proxy("fresh")
+    am._server = _Server(fresh)
+    assert (await am.read("ws/my-app"))["served_by"] == "fresh", (
+        "a failed re-resolve must not leave callers blocked forever"
+    )
+
+
+# ===== attribute delegation =====
+
+
+def test_a_non_callable_attribute_comes_from_the_underlying_proxy():
+    """The proxy is a dict-backed ``ObjectProxy``: ``.id`` is the service id, not
+    a method. Returning a coroutine function for it would silently corrupt any
+    caller that reads service metadata."""
+    am = _wrap(_Server(), _Proxy("first"))
+
+    assert am.id == "public/artifact-manager"
+
+
+def test_an_attribute_the_service_does_not_have_is_not_invented():
+    am = _wrap(_Server(), _Proxy("first"))
+
+    assert not hasattr(am, "totally_made_up")
+
 
 # ===== the fix reaches the cached handle =====
 
 
-def test_the_manager_wraps_the_proxy_it_caches():
+@pytest.mark.asyncio
+async def test_the_manager_wraps_the_proxy_it_caches(monkeypatch):
     """The wrapper is useless unless the manager actually installs it.
 
     This is the step that makes the fix reach ``AppBuilder`` and every
     ``artifact_utils`` helper for free, since they are all handed this object.
     """
-    import inspect
+    from hypha_rpc.rpc import RemoteService
 
+    from bioengine.apps import manager as manager_module
     from bioengine.apps.manager import AppsManager
 
-    source = inspect.getsource(AppsManager.complete_initialization)
+    class _Builder:
+        received = None
 
-    assert "_ReconnectingArtifactManager(" in source
-    assert "self.artifact_manager = _ReconnectingArtifactManager(" in source
+        def complete_initialization(self, server, artifact_manager, worker_service_id):
+            _Builder.received = artifact_manager
+
+    collection_received = []
+
+    async def ensure_collection(artifact_manager, workspace, logger):
+        collection_received.append(artifact_manager)
+
+    monkeypatch.setattr(
+        manager_module, "ensure_applications_collection", ensure_collection
+    )
+
+    async def get_service(service_id):
+        assert service_id == "public/artifact-manager"
+        return _Proxy("first")
+
+    server = RemoteService.fromDict(
+        {
+            "id": "ws/hypha:built-in",
+            "config": {"workspace": "ws"},
+            "get_service": get_service,
+        }
+    )
+
+    manager = AppsManager.__new__(AppsManager)
+    manager.logger = logger
+    manager.app_builder = _Builder()
+
+    await manager.complete_initialization(
+        server=server, admin_users=[], worker_service_id="ws/worker"
+    )
+
+    assert isinstance(manager.artifact_manager, _ReconnectingArtifactManager)
+    assert _Builder.received is manager.artifact_manager
+    assert collection_received == [manager.artifact_manager]
