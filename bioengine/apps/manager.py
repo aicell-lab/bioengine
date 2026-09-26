@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from haikunator import Haikunator
 from hypha_rpc import connect_to_server
-from hypha_rpc.rpc import RemoteService
+from hypha_rpc.rpc import RemoteException, RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
@@ -65,6 +65,11 @@ _SILENCEABLE_READS = frozenset({"read", "list", "get_file"})
 
 def _stale_proxy_kind(exc: BaseException) -> Optional[str]:
     """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
+    if isinstance(exc, RemoteException):
+        # Its message is ``"RemoteError:" + value + "\n" + remote traceback``, and
+        # the server runs hypha_rpc too, so any marker below can appear in that
+        # traceback. Arriving at all proves the remote handler ran.
+        return None
     message = str(exc).lower()
     if any(marker in message for marker in _PROXY_NEVER_SENT_MARKERS):
         return "never_sent"

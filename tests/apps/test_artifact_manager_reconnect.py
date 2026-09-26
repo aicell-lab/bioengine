@@ -25,6 +25,7 @@ import asyncio
 import logging
 
 import pytest
+from hypha_rpc.rpc import RemoteException
 
 from bioengine.apps.manager import (
     _ReconnectingArtifactManager,
@@ -77,6 +78,11 @@ def _wrap(server: _Server, proxy: _Proxy) -> _ReconnectingArtifactManager:
     return _ReconnectingArtifactManager(server=server, proxy=proxy, logger=logger)
 
 
+def _remote_exception(rvalue: str, rtrace: str) -> RemoteException:
+    """A remote failure exactly as ``hypha_rpc`` reconstructs it locally."""
+    return RemoteException("RemoteError:" + rvalue + "\n" + rtrace)
+
+
 # ===== the classifier =====
 
 
@@ -107,6 +113,25 @@ def test_ordinary_errors_are_not_stale_proxy_failures():
     assert _stale_proxy_kind(PermissionError("denied")) is None
 
 
+def test_a_remote_failure_is_never_treated_as_unsent():
+    """The remote traceback is part of the message the markers are scanned in.
+
+    ``RemoteException`` carries ``"RemoteError:" + value + "\\n" + traceback``, and
+    the hypha server runs hypha_rpc itself, so a server-side handler that fails
+    while making its *own* RPC call produces a traceback containing a send-side
+    marker verbatim. Matching it would classify a request that demonstrably
+    reached the server — and ran — as one that never left this process.
+    """
+    exc = _remote_exception(
+        "KeyError: 'manifest'",
+        'File "/hypha/rpc.py", line 641, in handle_result\n'
+        "Exception: Failed to send the request when calling method "
+        "(ws/other:services.x.notify)\n",
+    )
+
+    assert _stale_proxy_kind(exc) is None
+
+
 # ===== pass-through =====
 
 
@@ -133,6 +158,29 @@ async def test_an_application_error_propagates_without_re_resolving():
         await am.read("ws/missing")
 
     assert server.resolutions == 0
+
+
+@pytest.mark.asyncio
+async def test_a_remote_write_failure_is_not_replayed():
+    """End to end for the classifier hole: a ``commit`` that already ran.
+
+    The remote handler raised, so the version snapshot may exist. Replaying it
+    against a fresh proxy would create a second one.
+    """
+    exc = _remote_exception(
+        "RuntimeError: staging is empty",
+        "Exception: Failed to send the request when calling method (ws/x:y)\n",
+    )
+    dead = _Proxy("dead", fails_with=exc)
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    with pytest.raises(RemoteException):
+        await am.commit("ws/my-app")
+
+    assert server.resolutions == 0, "a remote error says nothing about the handle"
+    assert fresh.calls == [], "a write that reached the server must never be replayed"
 
 
 # ===== the repair =====
