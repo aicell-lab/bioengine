@@ -3,6 +3,7 @@ id: model-finetune
 id_emoji: "🔬"
 description: Serves micro-sam (μSAM) with one resident SAM encoder backing image-embedding export, automatic instance segmentation (AIS decoder), and an ONNX interactive prompt decoder for in-browser box→mask annotation — plus in-app fine-tuning of micro-sam, Cellpose-SAM (cpsam), or Cellpose-DINO (cpdino / cpdino-vitb) on annotated pairs, with a BioImage.IO export for each, serving the just-trained checkpoint.
 documentation: README.md
+tutorial: tutorial_model_finetune.ipynb
 authors:
   - {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
 maintainers: []
