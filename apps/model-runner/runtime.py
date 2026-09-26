@@ -224,17 +224,6 @@ model_description, skip_pre, skip_post = _apply_overrides(
     loaded_description, overrides
 )
 
-# An architecture that opens an attachment relative to its own file finds
-# nothing: core imports the architecture alone into a temporary directory.
-try:
-    from model_attachments import stage_architecture_attachments
-
-    staged = stage_architecture_attachments(model_description)
-    if staged:
-        print("staged attachments: " + ", ".join(staged), file=sys.stderr)
-except Exception as e:
-    print("could not stage attachments: " + repr(e), file=sys.stderr)
-
 # Passing ``default_blocksize_parameter=None`` explicitly would override
 # core's own default with None, and a blocked predict whose per-axis ``ns``
 # is empty (every axis fixed) then falls back to it and crashes.
@@ -493,6 +482,40 @@ class RuntimeDeployment:
             pass
         return cpu_mem, gpu_mem
 
+    def _get_accelerator_name(self) -> str:
+        """Name of the accelerator visible to THIS replica, or ``cpu``.
+
+        Reads CUDA_VISIBLE_DEVICES before touching NVML: NVML enumerates every
+        device injected into the container, so a CPU-only replica would
+        otherwise name a GPU it cannot use. Deliberately not torch —
+        ``get_device_name`` calls ``_lazy_init`` and leaves a primary CUDA
+        context in a process whose whole design is to keep CUDA in child
+        processes.
+        """
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if not visible:
+            return "cpu"
+        # Resolve the FIRST VISIBLE device, not physical index 0: Ray writes
+        # this var from its own NVML enumeration, so reading it back through
+        # NVML recovers the device Ray actually assigned.
+        first = visible.split(",")[0].strip()
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            try:
+                if first.startswith(("GPU-", "MIG-")):
+                    handle = pynvml.nvmlDeviceGetHandleByUUID(first.encode())
+                else:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(int(first))
+                raw = pynvml.nvmlDeviceGetName(handle)
+                return raw.decode() if isinstance(raw, bytes) else str(raw)
+            finally:
+                pynvml.nvmlShutdown()
+        except Exception as e:
+            logger.warning(f"⚠️ Could not resolve accelerator name: {e}")
+            return "unknown"
+
     # === Subprocess env hardening ===
 
     _SENSITIVE_ENV_NEEDLES = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
@@ -699,13 +722,8 @@ class RuntimeDeployment:
         script = (
             "import json, sys\n"
             f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
-            "from bioimageio.core import load_model_description, test_description\n"
-            "from model_attachments import stage_architecture_attachments\n"
+            "from bioimageio.core import test_description\n"
             "rdf_path, out_path = sys.argv[1], sys.argv[2]\n"
-            "try:\n"
-            "    stage_architecture_attachments(load_model_description(rdf_path))\n"
-            "except Exception as e:\n"
-            "    print('could not stage attachments:', repr(e))\n"
             "summary = test_description(\n"
             "    rdf_path, expected_type='model', runtime_env='currently-active'\n"
             ")\n"
@@ -804,17 +822,33 @@ class RuntimeDeployment:
             # to confirm it actually runs where infer() will serve it.
             # Fully guarded — any failure is recorded as a report field,
             # never propagated, so it cannot fail the test itself.
-            try:
-                inference_check = await asyncio.to_thread(
-                    self._run_inference_smoke_test, rdf_path
-                )
-            except Exception as e:  # pragma: no cover - defensive backstop
+            # A model that declares its own environment does so because the
+            # runner venv lacks its dependencies, so this check would fail on an
+            # import every time and report nothing about the model (#0079).
+            if custom_environment:
+                # ``error`` rather than a new key because that is the field the
+                # website renders in its failure dialog; leaving it null blanks
+                # the message the user sees.
                 inference_check = {
-                    "status": "failed",
-                    "error": f"inference smoke-test harness error: {e}",
+                    "status": "skipped",
+                    "error": (
+                        "model declares its own environment; the "
+                        "default-environment check does not apply"
+                    ),
                 }
+            else:
+                try:
+                    inference_check = await asyncio.to_thread(
+                        self._run_inference_smoke_test, rdf_path
+                    )
+                except Exception as e:  # pragma: no cover - defensive backstop
+                    inference_check = {
+                        "status": "failed",
+                        "error": f"inference smoke-test harness error: {e}",
+                    }
             if isinstance(test_report, dict):
                 test_report["inference_check"] = inference_check
+                test_report["replica_accelerator"] = self._get_accelerator_name()
 
             cpu_after, gpu_after = self._get_memory_usage()
             logger.info(
@@ -843,12 +877,7 @@ class RuntimeDeployment:
             f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
             "from bioimageio.core import load_model_description, create_prediction_pipeline\n"
             "from bioimageio.core.digest_spec import get_test_inputs\n"
-            "from model_attachments import stage_architecture_attachments\n"
             "descr = load_model_description(sys.argv[1])\n"
-            "try:\n"
-            "    stage_architecture_attachments(descr)\n"
-            "except Exception as e:\n"
-            "    print('could not stage attachments:', repr(e))\n"
             "pipeline = create_prediction_pipeline(descr)\n"
             "pipeline.load()\n"
             "sample = get_test_inputs(descr)\n"

@@ -10,6 +10,7 @@ Run:
     pytest tests/apps/model-runner/ -v -m "not requires_gpu"   # CPU tests only
 """
 
+import asyncio
 import io
 
 import httpx
@@ -17,6 +18,8 @@ import numpy as np
 import pytest
 
 TEST_MODEL_ID = "ambitious-ant"
+# Declares its own conda env (v0.4 ``conda:environment.yaml``).
+CUSTOM_ENV_MODEL_ID = "stupendous-sheep"
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -25,6 +28,26 @@ GPU_UNAVAILABLE_MSG = "GPU runtime deployment is not available"
 
 def _is_gpu_error(exc: Exception) -> bool:
     return GPU_UNAVAILABLE_MSG in str(exc)
+
+
+
+async def _run_test(model_runner, **kwargs) -> dict:
+    """Submit a test run and return its report.
+
+    ``test()`` is asynchronous — it returns a run id, not a report — so an
+    assertion against its return value tests nothing about the model.
+    """
+    run_id = await model_runner.test(**kwargs)
+    assert isinstance(run_id, str), f"test() should return a run id, got {run_id!r}"
+    for _ in range(180):
+        status = await model_runner.get_test_status(test_run_id=run_id)
+        state = (status or {}).get("state")
+        if state in ("completed", "failed", "cancelled"):
+            result = (status or {}).get("result")
+            assert isinstance(result, dict), f"state={state} result={result!r}"
+            return dict(result)
+        await asyncio.sleep(10)
+    raise AssertionError(f"test run {run_id} did not finish within 30 minutes")
 
 
 # ─── search_models ─────────────────────────────────────────────────────────────
@@ -181,17 +204,53 @@ async def test_upload_npy_and_verify(model_runner):
 @pytest.mark.asyncio
 @pytest.mark.requires_gpu
 async def test_model_test_passes(model_runner):
-    result = await model_runner.test(model_id=TEST_MODEL_ID, stage=False)
-    assert isinstance(result, dict)
+    result = await _run_test(model_runner, model_id=TEST_MODEL_ID, stage=False)
     assert result.get("status") == "passed"
 
 
 @pytest.mark.asyncio
 @pytest.mark.requires_gpu
 async def test_model_test_cache_skip(model_runner):
-    result = await model_runner.test(model_id=TEST_MODEL_ID, stage=False, cache="skip")
-    assert isinstance(result, dict)
+    result = await _run_test(
+        model_runner, model_id=TEST_MODEL_ID, stage=False, cache="skip"
+    )
     assert result.get("status") == "passed"
+
+    # A verdict must name the hardware and the worker that produced it (#0042).
+    env = {str(r[0]): str(r[1]) for r in result.get("env") or [] if len(r) >= 2}
+    assert env.get("replica_accelerator") not in (None, "", "unknown")
+    # Must be the worker service id, not a per-connection client id: the latter
+    # is regenerated every replica restart and maps back to nothing.
+    assert "bioengine-worker" in env.get("worker", ""), env.get("worker")
+
+
+@pytest.mark.asyncio
+@pytest.mark.requires_gpu
+async def test_custom_env_model_skips_the_default_env_inference_check(model_runner):
+    """A custom-environment model must not be recorded as FAILING a check that
+    runs in an environment it never claimed to work in (#0079).
+
+    Uses CUSTOM_ENV_MODEL_ID, not TEST_MODEL_ID: ``custom_environment=True`` is a
+    request, not a guarantee — a model that declares no environment is silently
+    downgraded to standard, which would make this assert on the wrong path.
+    Assumes the declared env is already cached on the cluster PVC; on a cold
+    cache this model took ~1900 s to solve. ``cache="skip"`` also forces a full
+    re-download of the package, which is not small for this model.
+    """
+    result = await _run_test(
+        model_runner,
+        model_id=CUSTOM_ENV_MODEL_ID,
+        stage=False,
+        cache="skip",
+        custom_environment=True,
+    )
+    assert result.get("test_environment") == "custom", result.get("test_environment")
+
+    check = result.get("inference_check") or {}
+    assert check.get("status") == "skipped", check
+    # Populated, not null: the website renders this field, and a null blanks the
+    # message in its dialog.
+    assert check.get("error"), check
 
 
 @pytest.mark.asyncio

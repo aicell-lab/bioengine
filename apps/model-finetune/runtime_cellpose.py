@@ -22,6 +22,8 @@ import os
 import subprocess
 import sys
 import time
+import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -76,6 +78,10 @@ class CellposeRuntime:
         self._loaded_key: Optional[str] = None
         self._device_cached: Optional[str] = None
         self._gpu_mem_cached: Optional[Dict[str, Any]] = None
+        # Model-soup member state_dicts, keyed by their immutable pool weights_path
+        # (content-addressed → no staleness); populated on demand during aggregate.
+        self._soup_cache: Dict[str, Dict[str, Any]] = {}
+        self._soup_dl_bytes = 0
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""
@@ -212,6 +218,108 @@ class CellposeRuntime:
                 results.append({"output": self._nd(labels)})
         return results
 
+    # === model-soup aggregation compute (torch + cellpose live here, not the CPU
+    # EntryApp; member weights are fetched from the pool's presigned URLs, so no
+    # cross-actor local file is ever shared) ===
+
+    def _soup_dir(self) -> Path:
+        d = Path.home() / ".bioengine" / "pool_soup"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _unwrap_sd(obj):
+        if isinstance(obj, dict) and "model_state_dict" in obj:
+            return obj["model_state_dict"]
+        if isinstance(obj, dict) and "model_state" in obj:
+            return obj["model_state"]
+        return obj
+
+    def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
+        """Download + cache a member state_dict by its immutable pool weights_path."""
+        import torch
+        from urllib.request import urlopen
+
+        if key not in self._soup_cache:
+            with urlopen(url, timeout=600) as resp:
+                content = resp.read()
+            self._soup_dl_bytes += len(content)
+            self._soup_cache[key] = self._unwrap_sd(
+                torch.load(BytesIO(content), map_location="cpu", weights_only=False)
+            )
+        return self._soup_cache[key]
+
+    def _build_soup(self, members: List[Dict[str, str]]):
+        """Uniform mean of member state_dicts; None when empty (= stock base)."""
+        import pool
+
+        if not members:
+            return None
+        sds = [self._fetch_member(m["key"], m["url"]) for m in members]
+        return pool.uniform_soup(sds)
+
+    async def score_soup(
+        self, members: List[Dict[str, str]], images: List[np.ndarray],
+        labels: List[np.ndarray], diam_mean: float = 30.0,
+    ) -> float:
+        """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split.
+        ``members`` is a list of ``{"key": weights_path, "url": presigned_get}``;
+        empty scores the stock cpsam base. Downloads happen off-lock; segmentation
+        holds the shared GPU lock."""
+        import pool
+
+        soup = await asyncio.to_thread(self._build_soup, members)
+        ckpt = None
+        async with self._gpu_lock:
+            if soup is not None:
+                import torch
+
+                ckpt = self._soup_dir() / f"soup-{uuid.uuid4().hex}.pt"
+                await asyncio.to_thread(lambda: torch.save(soup, str(ckpt)))
+            try:
+                gk = {"diameter": diam_mean}
+                masks = []
+                for image in images:
+                    masks.append(await asyncio.to_thread(
+                        self._segment, image, gk, str(ckpt) if ckpt else None, "cpsam"))
+            finally:
+                if ckpt and ckpt.exists():
+                    ckpt.unlink()
+        return pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels])
+
+    async def materialize_soup(self, members: List[Dict[str, str]], put_url: str) -> Dict[str, Any]:
+        """Build the uniform soup of ``members``, PUT it to the pool's presigned URL,
+        and return its sha256 + byte size — so the head weights never traverse the
+        CPU entry. ``members`` must be non-empty (a published head always has one)."""
+        import torch
+        from urllib.request import Request, urlopen
+
+        import pool
+
+        soup = await asyncio.to_thread(self._build_soup, members)
+        path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
+        await asyncio.to_thread(lambda: torch.save(soup, str(path)))
+        sha = await asyncio.to_thread(pool.sha256_file, str(path))
+        n_bytes = path.stat().st_size
+
+        def _put():
+            data = path.read_bytes()
+            with urlopen(Request(put_url, data=data, method="PUT"), timeout=600) as r:
+                r.read()
+
+        try:
+            await asyncio.to_thread(_put)
+        finally:
+            path.unlink()
+        return {"sha256": sha, "n_bytes": n_bytes}
+
+    def pop_soup_dl_bytes(self) -> int:
+        """Return + zero the bytes downloaded for soup members since the last call,
+        so the entry can fold pool traffic into its durable transport counter."""
+        b = self._soup_dl_bytes
+        self._soup_dl_bytes = 0
+        return b
+
     def _subprocess_env(self) -> Dict[str, str]:
         return {
             k: v for k, v in os.environ.items()
@@ -274,7 +382,8 @@ class CellposeRuntime:
 
         if stopped:
             training.write_status(
-                session_id, status="STOPPED", message="stopped by user", end_time=time.time()
+                session_id, status="STOPPED", message="stopped by user",
+                end_time=time.time(), terminated_by="user_stop",
             )
         else:
             st = training.read_status(session_id)
@@ -282,6 +391,6 @@ class CellposeRuntime:
                 training.write_status(
                     session_id, status="FAILED",
                     message=f"training subprocess exited rc={rc}: {tail}",
-                    end_time=time.time(),
+                    end_time=time.time(), terminated_by="supervisor",
                 )
         return {"session_id": session_id, "returncode": rc}

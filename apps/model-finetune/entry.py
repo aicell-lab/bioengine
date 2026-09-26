@@ -29,8 +29,32 @@ import yaml
 from hypha_rpc import connect_to_server
 from pydantic import Field
 
-from runtime import RuntimeApp
-from runtime_cellpose import CellposeRuntime
+
+def _parse_backends(raw: Optional[str]) -> set:
+    """Backends this worker deploys, from ``MODEL_FINETUNE_BACKENDS`` (comma list
+    over ``microsam``/``cellpose``); unset or empty → both. A disabled backend's
+    runtime class is left ``None`` so its ``EntryApp.__init__`` annotation resolves
+    to ``None`` at introspection — the composition graph drops it, so it reserves
+    no GPU and never builds its pip env."""
+    if not raw or not raw.strip():
+        return {"microsam", "cellpose"}
+    picked = {b.strip().lower() for b in raw.split(",") if b.strip()}
+    unknown = picked - {"microsam", "cellpose"}
+    if unknown:
+        raise ValueError(
+            f"MODEL_FINETUNE_BACKENDS: unknown backend(s) {sorted(unknown)}; "
+            "valid values are 'microsam' and 'cellpose'."
+        )
+    return picked
+
+
+_ENABLED_BACKENDS = _parse_backends(os.getenv("MODEL_FINETUNE_BACKENDS"))
+RuntimeApp = None
+CellposeRuntime = None
+if "microsam" in _ENABLED_BACKENDS:
+    from runtime import RuntimeApp
+if "cellpose" in _ENABLED_BACKENDS:
+    from runtime_cellpose import CellposeRuntime
 
 logger = bioengine.logger
 
@@ -90,11 +114,14 @@ class EntryApp:
 
     def __init__(
         self,
-        runtime: RuntimeApp,
-        cellpose_runtime: CellposeRuntime,
+        runtime: RuntimeApp = None,
+        cellpose_runtime: CellposeRuntime = None,
         declared_gpu_memory_mb: Optional[int] = None,
         declared_gpu_device: Optional[str] = None,
     ) -> None:
+        # A backend disabled via MODEL_FINETUNE_BACKENDS is not composed, so its
+        # handle arrives as None; routing/capability methods reject it by name.
+        self._enabled_backends = set(_ENABLED_BACKENDS)
         self.runtime = runtime
         self.cellpose_runtime = cellpose_runtime
         # Deploy-time declared GPU VRAM (via deploy_app application_kwargs). When
@@ -121,6 +148,13 @@ class EntryApp:
         # training runs at a time, so autoscaled replicas stay free to serve
         # inference during a long run. Mirrors model-runner's _env_build_lock.
         self._training_lock = asyncio.Lock()
+        # Community-pool weight-transport accounting. bytes_up/down count the
+        # WEIGHT bytes this worker moved to/from the pool — the flagship's
+        # "weights travel, data stays put" evidence. Persisted under the mounted
+        # ~/.bioengine so a worker restart does not silently reset the cumulative
+        # total (the number would otherwise under-count in the unsafe direction);
+        # the final accumulation location is being settled with the campaign page.
+        self._transport = self._load_transport()
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -140,8 +174,19 @@ class EntryApp:
 
     def _runtime_for(self, model_type: Optional[str]):
         """Route to the backend that owns ``model_type`` (cpsam → CellposeRuntime,
-        vit_* / None → micro-sam RuntimeApp)."""
-        return self.cellpose_runtime if model_type in CELLPOSE_MODEL_TYPES else self.runtime
+        vit_* / None → micro-sam RuntimeApp). Raises if that backend is not
+        deployed on this worker — the single choke point every serving/training
+        path funnels through, so one guard here rejects a disabled backend
+        everywhere (all direct ``self.runtime`` uses are gated by a prior
+        ``_check_runtime_available``, which routes through here)."""
+        backend = "cellpose" if model_type in CELLPOSE_MODEL_TYPES else "microsam"
+        if backend not in self._enabled_backends:
+            raise ValueError(
+                f"The '{backend}' backend is not deployed on this worker "
+                f"(MODEL_FINETUNE_BACKENDS={','.join(sorted(self._enabled_backends))}); "
+                f"model_type '{model_type}' is unavailable here."
+            )
+        return self.cellpose_runtime if backend == "cellpose" else self.runtime
 
     async def _check_runtime_available(self, model_type: Optional[str] = None) -> None:
         runtime = self._runtime_for(model_type)
@@ -641,6 +686,8 @@ class EntryApp:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 await asyncio.to_thread(dest.write_bytes, resp.content)
                 resolved["checkpoint_path"] = str(dest)
+                if params.get("pool_provenance"):
+                    self._bump_transport(bytes_down=len(resp.content))
             training.write_training_params(session_id, {
                 **params, "model_type": model_type,
                 "patch_shape": list(data["patch_shape"]),
@@ -664,11 +711,13 @@ class EntryApp:
                     session_id=session_id, model_type=model_type, params=params
                 )
         except asyncio.CancelledError:
-            training.write_status(session_id, status="STOPPED", message="training task cancelled")
+            training.write_status(session_id, status="STOPPED",
+                                   message="training task cancelled", terminated_by="user_stop")
             raise
         except Exception as e:
             logger.error(f"Training session {session_id} failed: {e}")
-            training.write_status(session_id, status="FAILED", message=str(e)[:800])
+            training.write_status(session_id, status="FAILED",
+                                   message=str(e)[:800], terminated_by="entry")
         finally:
             self._training_tasks.pop(session_id, None)
 
@@ -679,23 +728,28 @@ class EntryApp:
         the hardware can't train. Returns VRAM per backend and, for all model
         types, ``{model_type, backend, min_gpu_memory_mb, family, size, trainable,
         reason, source}``. ``source`` is ``declared`` (deploy-time config, answered
-        CPU-side without waking a GPU), ``detected`` (live runtime probe), or
-        ``unavailable`` (backend runtime down → ``trainable`` is None)."""
+        CPU-side without waking a GPU), ``detected`` (live runtime probe),
+        ``unavailable`` (backend runtime down → ``trainable`` is None), or
+        ``disabled`` (backend not deployed on this worker → ``trainable`` is
+        False)."""
         import training
 
-        microsam = await self._gpu_view("microsam")
-        cellpose = await self._gpu_view("cellpose")
+        microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
+        cellpose = await self._gpu_view("cellpose") if "cellpose" in self._enabled_backends else {}
         models = []
         for m in ModelType.__args__:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
+            enabled = backend in self._enabled_backends
             gpu = cellpose if backend == "cellpose" else microsam
             required = training.min_training_vram_mb(m)
             rec = {
                 "model_type": m, "backend": backend, "min_gpu_memory_mb": required,
                 "family": training.model_family(m), "size": training.model_size(m),
-                "source": gpu.get("source", "unavailable") if gpu else "unavailable",
+                "source": "disabled" if not enabled else (gpu.get("source", "unavailable") if gpu else "unavailable"),
             }
-            if not gpu:
+            if not enabled:
+                rec["trainable"], rec["reason"] = False, "backend not deployed on this worker"
+            elif not gpu:
                 rec["trainable"], rec["reason"] = None, "runtime unavailable"
             elif not gpu.get("available"):
                 rec["trainable"], rec["reason"] = False, "no GPU detected on the runtime"
@@ -706,7 +760,10 @@ class EntryApp:
                 rec["trainable"], rec["reason"] = True, "fits"
             models.append(rec)
         return {
-            "gpus": {"microsam": microsam, "cellpose": cellpose},
+            "gpus": {
+                "microsam": microsam if "microsam" in self._enabled_backends else {"enabled": False},
+                "cellpose": cellpose if "cellpose" in self._enabled_backends else {"enabled": False},
+            },
             "models": models,
             "parameters": self._training_parameter_schema(),
         }
@@ -772,6 +829,15 @@ class EntryApp:
             "exported BioImage.IO draft (see get_export_status.resume_checkpoint_file) — instead "
             "of the base model. Mutually exclusive with resume_session_id; model_type must match "
             "the checkpoint's architecture."),
+        init_from_pool: Optional[str] = Field(
+            None, description="Seed this fine-tune from a community model-soup pool's CURRENT "
+            "checkpoint (artifact id, e.g. 'bioimage-io/cpsam-community-pool'). Resolves the "
+            "pool's latest community weights and trains from them — the at-your-own-pace round "
+            "start. Requires pool_token; mutually exclusive with init_checkpoint and "
+            "resume_session_id; the pool's model_type must match."),
+        pool_token: Optional[str] = Field(
+            None, description="Token with read access to init_from_pool's artifact. Scoped to "
+            "the pool, not the app's own token."),
         label: str = Field("", description="Optional human-readable tag for this session."),
     ) -> Dict[str, Any]:
         """Start a μSAM fine-tuning session (AIS decoder) and return immediately
@@ -782,10 +848,16 @@ class EntryApp:
         """
         import training
 
-        if init_checkpoint and resume_session_id:
+        if sum(x is not None and x != "" for x in (init_checkpoint, resume_session_id, init_from_pool)) > 1:
             raise ValueError(
-                "Pass either init_checkpoint or resume_session_id, not both — "
+                "Pass at most one of init_checkpoint, resume_session_id, or init_from_pool — "
                 "they select different starting checkpoints."
+            )
+
+        pool_provenance = None
+        if init_from_pool:
+            init_checkpoint, pool_provenance = await self._resolve_pool_init(
+                model_type, init_from_pool, pool_token
             )
 
         await self._check_runtime_available(model_type)
@@ -814,12 +886,14 @@ class EntryApp:
             model_type=model_type, backend=backend, label=label,
             n_train_inputs=len(train_images),
             resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
+            pool_provenance=pool_provenance,
         )
         params = dict(
             n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,
             batch_size=batch_size, learning_rate=learning_rate, diam_mean=diam_mean,
             val_fraction=val_fraction, n_samples=n_samples,
             resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
+            pool_provenance=pool_provenance,
             patch_shape=(patch_size, patch_size), num_workers=0,
         )
         task = asyncio.create_task(self._run_training(
@@ -857,7 +931,8 @@ class EntryApp:
         task = self._training_tasks.get(session_id)
         if task is not None and not task.done():
             task.cancel()
-        training.write_status(session_id, status="STOPPED", message="stop requested by user")
+        training.write_status(session_id, status="STOPPED",
+                               message="stop requested by user", terminated_by="user_stop")
         return training.get_status(session_id)
 
     @bioengine.method
@@ -985,3 +1060,550 @@ class EntryApp:
             resp.raise_for_status()
             pushed.append(rel)
         return {"pushed": pushed, "n_files": len(pushed)}
+
+    # === community model-soup pool (async, at-your-own-pace) ===
+    #
+    # Contributors fine-tune cpsam on their own local data and upload only the
+    # resulting weights into a shared Hypha artifact (the pool); a coordinator
+    # later averages them into a growing community checkpoint. The data never
+    # moves. All pool I/O runs through a SEPARATE artifact-manager client authed
+    # with the caller's pool_token — never this app's own HYPHA_TOKEN — so the
+    # app cannot be a confused deputy for a pool it was not granted. The
+    # weight-averaging body (aggregate) and the contribute acceptance gate
+    # (drift-bound / sample-weighting) are deliberately absent here: their family
+    # is a pending decision, and this backend only measures, it does not gate.
+
+    def _pool_transport_path(self) -> Path:
+        return Path.home() / ".bioengine" / "pool_transport.json"
+
+    def _load_transport(self) -> Dict[str, int]:
+        """Cumulative weight-bytes moved through the pool, persisted under the
+        mounted ~/.bioengine so the flagship's headline figure survives a worker
+        restart. bytes_up/bytes_down are the two numbers reported to the page —
+        never combined into a ratio."""
+        base = {"bytes_up": 0, "bytes_down": 0, "contributions": 0, "pool_reads": 0}
+        try:
+            saved = json.loads(self._pool_transport_path().read_text())
+            for k in base:
+                if isinstance(saved.get(k), int):
+                    base[k] = saved[k]
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"pool transport counter unreadable, starting from zero: {e}")
+        return base
+
+    def _persist_transport(self) -> None:
+        p = self._pool_transport_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._transport))
+            os.replace(tmp, p)
+        except Exception as e:
+            logger.warning(f"could not persist pool transport counter: {e}")
+
+    def _bump_transport(self, **deltas: int) -> None:
+        for k, v in deltas.items():
+            self._transport[k] = self._transport.get(k, 0) + int(v)
+        self._persist_transport()
+
+    async def _pool_service(self, pool_token: Optional[str]):
+        """Open a caller-scoped artifact-manager client for pool I/O. Requires a
+        pool_token — the app never touches a pool with its own credential."""
+        if not pool_token:
+            raise ValueError(
+                "pool_token is required for pool access — pass a token scoped to "
+                "the pool artifact, not the app's own token."
+            )
+        client = await connect_to_server({"server_url": SERVER_URL, "token": pool_token})
+        am = await client.get_service("public/artifact-manager")
+        return am, client
+
+    async def _read_pool_index(self, am, pool_artifact_id: str) -> Dict[str, Any]:
+        import pool
+
+        try:
+            url = await am.get_file(pool_artifact_id, file_path=pool.POOL_INDEX)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"pool '{pool_artifact_id}' has no {pool.POOL_INDEX} — it is not an "
+                f"initialized model-soup pool ({e})."
+            )
+        resp = await self._http_retry("GET", url, timeout=120.0)
+        if resp.status_code == 404:
+            raise FileNotFoundError(f"pool index missing for '{pool_artifact_id}'.")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _resolve_pool_init(self, model_type, init_from_pool, pool_token):
+        """Resolve a pool's CURRENT community checkpoint to a download URL for
+        start_training(init_from_pool=...). Returns (url, provenance); provenance
+        is persisted with the session so _run_training can count the download."""
+        import pool
+
+        am, client = await self._pool_service(pool_token)
+        try:
+            index = await self._read_pool_index(am, init_from_pool)
+            idx_model = index.get("model_type")
+            if idx_model != model_type:
+                raise ValueError(
+                    f"pool '{init_from_pool}' holds {idx_model} checkpoints, but "
+                    f"model_type is {model_type}; they must match to seed from it."
+                )
+            cc = pool.current_community(index)
+            if not cc:
+                raise ValueError(
+                    f"pool '{init_from_pool}' has no community checkpoint yet — "
+                    f"nothing to seed from (contribute + aggregate first)."
+                )
+            url = await am.get_file(init_from_pool, file_path=cc["path"])
+            provenance = {
+                "pool_artifact_id": init_from_pool,
+                "community_version": cc.get("version"),
+                "community_sha256": cc.get("sha256"),
+            }
+            return url, provenance
+        finally:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _inspect_checkpoint(ckpt_path: str, base_path: Optional[str]) -> Dict[str, Any]:
+        """Load a cellpose net state_dict and derive its architecture signature and,
+        if a base checkpoint is on disk, its L2 drift from that base."""
+        import torch
+
+        import pool as poolmod
+
+        def _state(path):
+            obj = torch.load(path, map_location="cpu", weights_only=False)
+            if isinstance(obj, dict) and "model_state_dict" in obj:
+                return obj["model_state_dict"]
+            if isinstance(obj, dict) and "model_state" in obj:
+                return obj["model_state"]
+            return obj
+
+        sd = _state(ckpt_path)
+        out: Dict[str, Any] = {
+            "architecture_signature": poolmod.architecture_signature(sd),
+            "l2_from_base": None,
+            "base_checkpoint_sha256": None,
+        }
+        if base_path and Path(base_path).exists():
+            base_sd = _state(base_path)
+            out["l2_from_base"] = poolmod.state_dict_l2_from_base(sd, base_sd)
+            out["base_checkpoint_sha256"] = poolmod.sha256_file(base_path)
+        return out
+
+    @bioengine.method
+    async def contribute(
+        self,
+        session_id: str = Field(..., description="A COMPLETED cpsam fine-tuning session to contribute."),
+        pool_artifact_id: str = Field(..., description="Community pool artifact id, e.g. 'bioimage-io/cpsam-community-pool'."),
+        pool_token: str = Field(..., description="Token with write access to pool_artifact_id. Scoped to the pool, not the app's own token."),
+        dataset_fingerprint: Optional[str] = Field(
+            None, description="Optional caller-supplied fingerprint of the local training set "
+            "(the data never moves; this only lets the pool tell contributions apart)."),
+        solo_val_metric: Optional[float] = Field(
+            None, description="Optional solo validation score for this contribution, recorded for audit."),
+    ) -> Dict[str, Any]:
+        """Upload a finished cpsam session's weights into a community model-soup
+        pool. Records weights + an auditable metadata.json (architecture
+        signature, samples_seen, L2 drift from the base it started from,
+        provenance) and appends a stub to the pool index — one commit per
+        contribution, so lineage is fully traceable. Averaging happens later, in
+        the coordinator's aggregate step; this only deposits. cpsam(cellpose)
+        sessions only for now."""
+        import time as _time
+
+        import pool
+        import training
+
+        st = training.get_status(session_id)
+        if st.get("status") != "COMPLETED":
+            raise ValueError(
+                f"session '{session_id}' is {st.get('status')}, not COMPLETED — only a "
+                f"finished fine-tune can be contributed."
+            )
+        if training.session_backend(session_id) != "cellpose":
+            raise ValueError("contribute currently accepts cpsam (cellpose) sessions only.")
+        params = training.read_training_params(session_id)
+        model_type = params.get("model_type") or st.get("model_type")
+        if model_type != "cpsam":
+            raise ValueError(f"contribute is cpsam-only for now, not '{model_type}'.")
+
+        ckpt = str(training.checkpoint_path(session_id))
+        if not Path(ckpt).exists():
+            raise FileNotFoundError(f"no servable checkpoint for session '{session_id}' at {ckpt}.")
+        base_path = str(training.session_dir(session_id) / "init_checkpoint.pt")
+        info = await asyncio.to_thread(self._inspect_checkpoint, ckpt, base_path)
+        weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)
+
+        epochs = st.get("n_epochs_completed") or params.get("n_epochs") or 0
+        n_inputs = st.get("n_train_inputs") or 0
+        samples_seen = int(n_inputs) * int(epochs)
+        provenance = params.get("pool_provenance")
+        if provenance:
+            base_checkpoint_id = f"{provenance.get('pool_artifact_id')}@{provenance.get('community_version')}"
+        elif params.get("init_checkpoint"):
+            base_checkpoint_id = str(params["init_checkpoint"])
+        else:
+            base_checkpoint_id = "stock-cpsam"
+
+        try:
+            import importlib.metadata as _im
+
+            cellpose_version = _im.version("cellpose")
+        except Exception:
+            cellpose_version = None
+
+        cid = uuid.uuid4().hex
+        uploaded_at = _time.time()
+        metadata = pool.build_contribution_metadata(
+            contribution_id=cid,
+            model_type=model_type,
+            cellpose_version=cellpose_version,
+            architecture_signature=info["architecture_signature"],
+            base_checkpoint_id=base_checkpoint_id,
+            base_checkpoint_sha256=info["base_checkpoint_sha256"],
+            samples_seen=samples_seen,
+            training_params=params,
+            l2_from_base=info["l2_from_base"],
+            dataset_fingerprint=dataset_fingerprint,
+            solo_val_metric=solo_val_metric,
+            weights_sha256=weights_sha256,
+            uploaded_at=uploaded_at,
+        )
+        paths = pool.contribution_paths(cid)
+        ckpt_size = await asyncio.to_thread(lambda: Path(ckpt).stat().st_size)
+
+        am, client = await self._pool_service(pool_token)
+        try:
+            index = await self._read_pool_index(am, pool_artifact_id)
+            pool.assert_compatible(
+                index, model_type=model_type, signature=info["architecture_signature"]
+            )
+            await am.edit(pool_artifact_id, stage=True)
+            w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
+            (await self._put_file(w_url, Path(ckpt))).raise_for_status()
+            m_url = await am.put_file(pool_artifact_id, file_path=paths["metadata"])
+            (await self._http_retry(
+                "PUT", m_url, content=json.dumps(metadata).encode("utf-8"), timeout=120.0
+            )).raise_for_status()
+            pool.append_contribution(index, {
+                "contribution_id": cid,
+                "weights_path": paths["weights"],
+                "metadata_path": paths["metadata"],
+                "weights_sha256": weights_sha256,
+                "architecture_signature": info["architecture_signature"],
+                "samples_seen": samples_seen,
+                "uploaded_at": uploaded_at,
+            })
+            i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
+            (await self._http_retry(
+                "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
+            )).raise_for_status()
+            await am.commit(pool_artifact_id)
+        finally:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except Exception:
+                pass
+
+        self._bump_transport(bytes_up=int(ckpt_size), contributions=1)
+        return {
+            "schema_version": pool.SCHEMA_VERSION,
+            "contribution_id": cid,
+            "pool_artifact_id": pool_artifact_id,
+            "architecture_signature": info["architecture_signature"],
+            "weights_sha256": weights_sha256,
+            "samples_seen": samples_seen,
+            "l2_from_base": info["l2_from_base"],
+        }
+
+    @bioengine.method
+    async def get_transport_stats(self) -> Dict[str, Any]:
+        """Cumulative weight-bytes moved through the pool since this counter was
+        first created, persisted across worker restarts. bytes_up (contributions)
+        and bytes_down (pool seeds / eval downloads) are reported as two separate
+        numbers — the flagship's 'data too big to move' headline contrasts
+        bytes-moved against data-held; it is never expressed as a ratio here."""
+        import pool
+
+        return {
+            **self._transport,
+            "schema_version": pool.SCHEMA_VERSION,
+            "since": "worker-persistent",
+        }
+
+    @bioengine.method
+    async def get_pool_state(
+        self,
+        pool_artifact_id: str = Field(..., description="Community pool artifact id."),
+        pool_token: str = Field(..., description="Token with read access to the pool. Scoped to the pool, not the app's own token."),
+    ) -> Dict[str, Any]:
+        """The pool's index: model_type, architecture signature, the current
+        community checkpoint pointer, and every contribution stub. Returns the
+        backend-owned shape verbatim (each record carries schema_version); the
+        campaign page maps it to its wire format."""
+        am, client = await self._pool_service(pool_token)
+        try:
+            index = await self._read_pool_index(am, pool_artifact_id)
+        finally:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except Exception:
+                pass
+        self._bump_transport(pool_reads=1)
+        return index
+
+    @bioengine.method
+    async def evaluate_community(
+        self,
+        pool_artifact_id: str = Field(..., description="Community pool artifact id."),
+        pool_token: str = Field(..., description="Token with read access to the pool. Scoped to the pool, not the app's own token."),
+        val_images: List[Union[np.ndarray, str]] = Field(..., description="Validation images (arrays, URLs, or get_upload_url paths)."),
+        community_version: Optional[str] = Field(
+            None, description="Which community checkpoint to evaluate; defaults to the pool's current one."),
+        diam_mean: float = Field(30.0, gt=0, description="Mean object diameter in pixels."),
+    ) -> List[Dict[str, Any]]:
+        """Run a community checkpoint over a validation set and return its
+        instance masks — the hook a scoring pass builds on. It is parameterised on
+        the val set the caller supplies; the CHOICE of the canonical, non-
+        overlapping split and the metric applied to these masks are decided with
+        the fork, so this returns masks only and does not itself score."""
+        import pool
+
+        am, client = await self._pool_service(pool_token)
+        try:
+            index = await self._read_pool_index(am, pool_artifact_id)
+            model_type = index.get("model_type", "cpsam")
+            cc = pool.current_community(index)
+            if community_version:
+                weights_rel = pool.community_paths(community_version)["weights"]
+            else:
+                if not cc:
+                    raise ValueError(f"pool '{pool_artifact_id}' has no community checkpoint to evaluate.")
+                weights_rel = cc["path"]
+            w_url = await am.get_file(pool_artifact_id, file_path=weights_rel)
+            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+        finally:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except Exception:
+                pass
+
+        dest = Path.home() / ".bioengine" / "pool_eval" / re.sub(r"[^\w.-]", "_", pool_artifact_id) / "community.pt"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(dest.write_bytes, content)
+        self._bump_transport(bytes_down=len(content))
+
+        await self._check_runtime_available(model_type)
+        images = [await self._resolve_image(src) for src in val_images]
+        return await self._runtime_for(model_type).auto_segment(
+            images=images, model_type=model_type,
+            checkpoint=str(dest), generate_kwargs={"diameter": diam_mean},
+        )
+
+    @staticmethod
+    def _decode_nd(d: Dict[str, Any]) -> np.ndarray:
+        """Decode a runtime ndarray wire-dict (auto_segment returns these unchanged
+        across the Ray hop; hypha only decodes at the RPC boundary, so an in-process
+        caller must decode itself)."""
+        return np.frombuffer(d["_rvalue"], dtype=d["_rdtype"]).reshape(d["_rshape"]).copy()
+
+    async def _resolve_val_split(self, images, labels):
+        """Resolve a (images, label-maps) split once: images to arrays, then each
+        label to an instance map sized to its image."""
+        imgs = [await self._resolve_image(src) for src in images]
+        gts = [await self._resolve_label_array(lb, im.shape) for lb, im in zip(labels, imgs)]
+        return imgs, gts
+
+    @bioengine.method
+    async def aggregate(
+        self,
+        pool_artifact_id: str = Field(..., description="Community pool artifact id."),
+        pool_token: str = Field(..., description="COORDINATOR token with WRITE access to the pool. Scoped to the pool, never the app's own HYPHA_TOKEN."),
+        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images (public benchmark, disjoint from ALL contributor training data)."),
+        gate_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Gate split A ground-truth instance label maps (0=background), one per image."),
+        witness_val_images: List[Union[np.ndarray, str]] = Field(..., description="Witness split B images — disjoint from A AND from all training data; never influences selection."),
+        witness_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Witness split B ground-truth instance label maps, one per image."),
+        gate_split: Dict[str, Any] = Field(..., description="{artifact_id, sha256} provenance of split A, recorded in every community manifest."),
+        witness_split: Dict[str, Any] = Field(..., description="{artifact_id, sha256} provenance of split B."),
+        eps: float = Field(0.0, ge=0.0, description="Pre-registered non-degradation tolerance on split A (0 = strict). Do NOT tune post-hoc to hit an inclusion rate."),
+        max_batch: int = Field(32, ge=1, description="Max newly-arrived candidates weighed at this merge; overflow is deferred (and re-scored) to the next."),
+        diam_mean: float = Field(30.0, gt=0, description="Mean object diameter in pixels for auto-segmentation."),
+    ) -> Dict[str, Any]:
+        """Coordinator-only greedy merge — grow the community soup by full-weight
+        uniform mean, gated on split A, reported on witness split B.
+
+        A candidate joins iff the mean of ``{current members} ∪ {candidate}`` does
+        not degrade mean instance F1 (IoU>=0.5, the paper's matcher) on split A
+        versus the current head, within ``eps``. Candidates within a merge are added
+        greedily best-first; across merges the order is chronological (only arrived,
+        undecided contributions are weighed; overflow defers and is re-scored later).
+        A rejected candidate is recorded "evaluated, not included" — never a failure.
+
+        Selection reads split A only; the reported improvement curve is scored on the
+        disjoint witness split B (selecting on A then reporting on A would be
+        circular). The first witness point is stock cpsam on B — the level to beat.
+
+        Crash-safe: the new ``community/<version>/`` weights + manifest are committed
+        BEFORE the index pointer is repointed, so a reader never sees the head aimed
+        at a half-written version."""
+        import pool
+
+        model_type = "cpsam"
+        await self._check_runtime_available(model_type)
+        runtime = self._runtime_for(model_type)
+        gate_imgs, gate_gts = await self._resolve_val_split(gate_val_images, gate_val_labels)
+        wit_imgs, wit_gts = await self._resolve_val_split(witness_val_images, witness_val_labels)
+
+        am, client = await self._pool_service(pool_token)
+        try:
+            index = await self._read_pool_index(am, pool_artifact_id)
+            if index.get("model_type") != model_type:
+                raise ValueError(f"aggregate() is cpsam-only; pool model_type is '{index.get('model_type')}'.")
+
+            async def _download(path: str) -> bytes:
+                url = await am.get_file(pool_artifact_id, file_path=path)
+                resp = await self._http_retry("GET", url, timeout=600.0)
+                resp.raise_for_status()
+                self._bump_transport(bytes_down=len(resp.content))
+                return resp.content
+
+            # The soup math + cpsam scoring live in the GPU runtime (the only
+            # deployment with torch + cellpose). A member is addressed to it by its
+            # pool weights_path plus a presigned GET, resolved once here; the runtime
+            # downloads + caches the tensors by path, so nothing large crosses the
+            # entry and no cross-actor local checkpoint is ever shared.
+            url_cache: Dict[str, str] = {}
+
+            async def _specs(paths: List[str]) -> List[Dict[str, str]]:
+                out = []
+                for p in paths:
+                    if p not in url_cache:
+                        url_cache[p] = await am.get_file(pool_artifact_id, file_path=p)
+                    out.append({"key": p, "url": url_cache[p]})
+                return out
+
+            async def _score(member_paths: List[str], imgs, gts) -> float:
+                return await runtime.score_soup(await _specs(member_paths), imgs, gts, diam_mean)
+
+            cc = pool.current_community(index)
+            cur_member_ids: List[str] = []
+            by_id = {c["contribution_id"]: c for c in index.get("contributions", [])}
+            if cc and cc.get("path"):
+                cur_manifest = json.loads((await _download(
+                    pool.community_paths(cc["version"])["manifest"])).decode())
+                cur_member_ids = list(cur_manifest.get("selected_contribution_ids", []))
+            cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
+
+            # Stock baseline on A and B (anchor of the witness curve — the level to beat).
+            baseline = index.get("baseline")
+            if baseline is None:
+                stock_a = await _score([], gate_imgs, gate_gts)
+                stock_b = await _score([], wit_imgs, wit_gts)
+                baseline = {"model": "stock-cpsam", "gate_metric": stock_a, "witness_metric": stock_b, "created_at": time.time()}
+
+            cur_a = await _score(cur_member_paths, gate_imgs, gate_gts) if cur_member_paths else baseline["gate_metric"]
+
+            pending = pool.undecided_contributions(index)
+            batch = pending[:max_batch]
+            deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
+            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
+
+            # Best-first ordering: individual marginal of adding each candidate to the
+            # current soup, on A. Re-scored against the CURRENT head (a stale solo
+            # score misorders once the soup has grown).
+            marg = {}
+            for c in batch:
+                cid = c["contribution_id"]
+                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_imgs, gate_gts)
+            ordered = sorted(batch, key=lambda c: marg[c["contribution_id"]], reverse=True)
+
+            s_paths = list(cur_member_paths)
+            s_ids = list(cur_member_ids)
+            s_a = cur_a
+            members_record: List[Dict[str, Any]] = []
+            admitted: List[str] = []
+            for c in ordered:
+                cid = c["contribution_id"]
+                trial_a = await _score(s_paths + [cand_path[cid]], gate_imgs, gate_gts)
+                included = trial_a >= (s_a - eps)
+                members_record.append({"contribution_id": cid, "gate_score": round(trial_a, 4), "included": bool(included)})
+                if included:
+                    s_paths.append(cand_path[cid])
+                    s_ids.append(cid)
+                    s_a = trial_a
+                    admitted.append(cid)
+
+            changed = bool(admitted)
+            baseline_version = cc["version"] if (cc and cc.get("path")) else "stock-cpsam"
+
+            if changed:
+                new_version = pool.next_community_version(index)
+                head_a = s_a
+                head_b = await _score(s_paths, wit_imgs, wit_gts)
+                paths = pool.community_paths(new_version)
+                # Crash-safe: commit weights + manifest FIRST (index still points at
+                # the old head), then repoint the index in a SECOND commit. The runtime
+                # builds the soup and PUTs it straight to the pool, so the head weights
+                # never traverse the CPU entry.
+                await am.edit(pool_artifact_id, stage=True)
+                w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
+                mat = await runtime.materialize_soup(await _specs(s_paths), w_url)
+                head_sha = mat["sha256"]
+                manifest = pool.build_community_manifest(
+                    community_version=new_version, combine="uniform",
+                    selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
+                    gate_metric=round(head_a, 4), witness_metric=round(head_b, 4),
+                    metric_name="mean_instance_f1@iou0.5", members=members_record,
+                    architecture_signature=index.get("architecture_signature"),
+                    weights_sha256=head_sha, created_at=time.time(),
+                )
+                m_url = await am.put_file(pool_artifact_id, file_path=paths["manifest"])
+                (await self._http_retry("PUT", m_url, content=json.dumps(manifest).encode("utf-8"), timeout=120.0)).raise_for_status()
+                await am.commit(pool_artifact_id)
+                self._bump_transport(bytes_up=mat["n_bytes"])
+                pool.set_current_community(index, community_version=new_version, weights_path=paths["weights"],
+                                           sha256=head_sha, gate_metric=round(head_a, 4), witness_metric=round(head_b, 4))
+            else:
+                new_version = None
+                head_a = cur_a
+                head_b = cc.get("witness_metric") if (cc and cc.get("path")) else baseline["witness_metric"]
+
+            self._bump_transport(bytes_down=await runtime.pop_soup_dl_bytes())
+
+            index["baseline"] = baseline
+            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + [c["contribution_id"] for c in batch]
+            pool.append_merge(index, {
+                "published_version": new_version, "baseline_version": baseline_version,
+                "members": members_record, "gate_metric": round(head_a, 4),
+                "witness_metric": round(head_b, 4) if head_b is not None else None,
+                "deferred": deferred_ids, "created_at": time.time(),
+            })
+            await am.edit(pool_artifact_id, stage=True)
+            i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
+            (await self._http_retry("PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0)).raise_for_status()
+            await am.commit(pool_artifact_id)
+        finally:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except Exception:
+                pass
+
+        return {
+            "schema_version": pool.SCHEMA_VERSION,
+            "published_version": new_version,
+            "admitted": admitted,
+            "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
+            "deferred": deferred_ids,
+            "gate_metric": round(head_a, 4),
+            "witness_metric": round(head_b, 4) if head_b is not None else None,
+            "baseline": baseline,
+            "n_members": len(s_ids),
+        }

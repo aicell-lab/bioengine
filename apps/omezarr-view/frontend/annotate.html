@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Annotate a lazy OME-Zarr view</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@10.3.1/ol.css" />
+<style>
+  :root {
+    --bg:#0d0e12; --panel:#15171d; --ink:#eceef4; --ink-2:#a2a8b8; --ink-3:#6f7688;
+    --line:#262932; --accent:#a5b4fc; --accent-soft:#1e2140;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; height:100vh; display:flex; background:var(--bg); color:var(--ink);
+    font:14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  }
+  #side {
+    width:320px; flex:0 0 320px; border-right:1px solid var(--line);
+    padding:20px; overflow-y:auto; background:var(--panel);
+  }
+  #map { flex:1; background:#000; }
+  h1 { font-size:16px; margin:0 0 4px; letter-spacing:-.01em; }
+  .sub { color:var(--ink-3); font:11px/1.5 var(--mono); word-break:break-all; margin-bottom:18px; }
+  h2 { font:600 11px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase;
+       color:var(--ink-3); margin:22px 0 10px; }
+  button, select {
+    font:500 13px/1 inherit; padding:8px 12px; border-radius:8px; cursor:pointer;
+    border:1px solid var(--line); background:#1b1e26; color:var(--ink); margin:0 6px 6px 0;
+  }
+  button:hover { border-color:var(--ink-3); }
+  button.on { background:var(--accent-soft); border-color:var(--accent); color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#14162b; }
+  .row { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .row label { color:var(--ink-2); font-size:12px; min-width:58px; }
+  input[type=range] { flex:1; }
+  #status { font-size:12px; color:var(--ink-2); min-height:2.6em; margin-top:10px; }
+  #status .ok { color:#5eead4; } #status .err { color:#fca5a5; }
+  ul#feats { list-style:none; padding:0; margin:8px 0 0; font:11px/1.6 var(--mono);
+             color:var(--ink-2); max-height:180px; overflow-y:auto; }
+  ul#feats li { display:flex; justify-content:space-between; border-bottom:1px solid var(--line); padding:3px 0; }
+  ul#feats button { padding:1px 6px; font-size:11px; margin:0; }
+  .note { font-size:11.5px; color:var(--ink-3); line-height:1.5; margin-top:16px;
+          border-top:1px solid var(--line); padding-top:12px; }
+</style>
+</head>
+<body>
+<div id="side">
+  <h1 id="title">Annotate</h1>
+  <div class="sub" id="src"></div>
+
+  <h2>Draw</h2>
+  <div>
+    <button data-tool="Polygon">Polygon</button>
+    <button data-tool="Circle">Box</button>
+    <button data-tool="Point">Point</button>
+    <button data-tool="none" class="on">Pan</button>
+  </div>
+
+  <h2>Plane</h2>
+  <div id="sliders"></div>
+
+  <h2>Annotations</h2>
+  <div>
+    <button class="primary" id="save">Save</button>
+    <button id="reload">Reload</button>
+    <button id="clear">Clear</button>
+  </div>
+  <ul id="feats"></ul>
+  <div id="status"></div>
+
+  <p class="note">
+    Drawn shapes are stored as GeoJSON beside the catalog, in image pixel
+    coordinates. The source file is never written to — that is the point of a
+    view. Tiles are rendered on demand from the same lazy view a Zarr client
+    reads, so nothing here is pre-generated.
+  </p>
+</div>
+<div id="map"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/ol@10.3.1/dist/ol.js"></script>
+<script>
+const qs = new URLSearchParams(location.search);
+const DATASET = qs.get("dataset");
+const TOKEN = qs.get("token");
+const auth = (u) => TOKEN ? u + (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN) : u;
+const $ = (s) => document.querySelector(s);
+let statusTimer;
+function say(msg, cls = "") {
+  $("#status").innerHTML = cls ? `<span class="${cls}">${msg}</span>` : msg;
+  clearTimeout(statusTimer);
+  if (cls === "ok") statusTimer = setTimeout(() => ($("#status").textContent = ""), 3000);
+}
+
+(async () => {
+  if (!DATASET) { say("Add ?dataset=&lt;id&gt; to the URL.", "err"); return; }
+  const grid = await (await fetch(auth(`api/datasets/${DATASET}/tilegrid.json`))).json();
+  if (grid.detail) { say(grid.detail, "err"); return; }
+  $("#title").textContent = DATASET;
+  $("#src").textContent = `${grid.width} x ${grid.height} px, ${grid.levels.length} zoom levels`;
+
+  // OpenLayers works in a y-up world; image rows run downward. Mapping the
+  // image into [0, -h] x [0, w] keeps pixel coordinates readable: a click at
+  // image (x, y) is map (x, -y), so annotations are stored in image pixels.
+  const W = grid.width, H = grid.height;
+  const extent = [0, -H, W, 0];
+  const index = {};           // z / t position
+  grid.index_axes.forEach((a) => (index[a] = Math.floor((grid.index_sizes[a] || 1) / 2)));
+
+  const tileGrid = new ol.tilegrid.TileGrid({
+    extent, origin: [0, 0], tileSize: grid.tile_size, resolutions: grid.resolutions,
+  });
+  const source = new ol.source.XYZ({
+    tileGrid,
+    projection: new ol.proj.Projection({ code: "image", units: "pixels", extent }),
+    tileUrlFunction: ([z, x, y]) => {
+      const q = new URLSearchParams(index);
+      if (TOKEN) q.set("token", TOKEN);
+      return `tiles/${DATASET}/${z}/${x}/${y}.png?${q}`;
+    },
+  });
+  const tileLayer = new ol.layer.Tile({ source });
+
+  const features = new ol.source.Vector();
+  const vector = new ol.layer.Vector({
+    source: features,
+    style: new ol.style.Style({
+      stroke: new ol.style.Stroke({ color: "#a5b4fc", width: 2 }),
+      fill: new ol.style.Fill({ color: "rgba(165,180,252,0.18)" }),
+      image: new ol.style.Circle({ radius: 5, fill: new ol.style.Fill({ color: "#a5b4fc" }) }),
+    }),
+  });
+
+  const map = new ol.Map({
+    target: "map",
+    layers: [tileLayer, vector],
+    view: new ol.View({
+      projection: new ol.proj.Projection({ code: "image", units: "pixels", extent }),
+      center: [W / 2, -H / 2],
+      resolution: grid.resolutions[0],
+      resolutions: grid.resolutions,
+      extent,
+    }),
+  });
+  map.getView().fit(extent, { size: map.getSize() });
+
+  // -- plane sliders -------------------------------------------------------
+  const sl = $("#sliders");
+  if (!grid.index_axes.length) sl.innerHTML = '<span style="color:var(--ink-3);font-size:12px">single plane</span>';
+  grid.index_axes.forEach((a) => {
+    const n = grid.index_sizes[a];
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<label>${a.toUpperCase()} <span data-v>${index[a]}</span>/${n - 1}</label>
+                     <input type="range" min="0" max="${n - 1}" value="${index[a]}" />`;
+    row.querySelector("input").oninput = (e) => {
+      index[a] = +e.target.value;
+      row.querySelector("[data-v]").textContent = index[a];
+      source.refresh();
+    };
+    sl.appendChild(row);
+  });
+
+  // -- drawing -------------------------------------------------------------
+  let draw = null;
+  const setTool = (tool, btn) => {
+    document.querySelectorAll("[data-tool]").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    if (draw) { map.removeInteraction(draw); draw = null; }
+    if (tool === "none") return;
+    draw = new ol.interaction.Draw({
+      source: features,
+      type: tool === "Circle" ? "Circle" : tool,
+      geometryFunction: tool === "Circle" ? ol.interaction.Draw.createBox() : undefined,
+    });
+    map.addInteraction(draw);
+  };
+  document.querySelectorAll("[data-tool]").forEach((b) =>
+    (b.onclick = () => setTool(b.dataset.tool, b)));
+
+  // -- persistence ---------------------------------------------------------
+  const fmt = new ol.format.GeoJSON();
+  const listFeatures = () => {
+    const items = features.getFeatures();
+    $("#feats").innerHTML = items.length
+      ? items.map((f, i) => `<li><span>${i + 1}. ${f.getGeometry().getType()}` +
+          `${f.get("z") !== undefined ? ` z=${f.get("z")}` : ""}</span>` +
+          `<button data-del="${i}">remove</button></li>`).join("")
+      : '<li style="border:0;color:var(--ink-3)">none yet</li>';
+    $("#feats").querySelectorAll("[data-del]").forEach((b) =>
+      (b.onclick = () => { features.removeFeature(items[+b.dataset.del]); listFeatures(); }));
+  };
+  features.on(["addfeature", "removefeature", "changefeature"], listFeatures);
+
+  const load = async () => {
+    const fc = await (await fetch(auth(`api/datasets/${DATASET}/annotations`))).json();
+    features.clear();
+    if (fc.features?.length) features.addFeatures(fmt.readFeatures(fc));
+    listFeatures();
+    say(`${fc.features?.length || 0} annotation(s) loaded`, "ok");
+  };
+
+  $("#save").onclick = async () => {
+    // Stamp the plane each shape was drawn on: a polygon on z=200 means
+    // nothing without it.
+    features.getFeatures().forEach((f) => {
+      Object.entries(index).forEach(([a, v]) => {
+        if (f.get(a) === undefined) f.set(a, v);
+      });
+    });
+    const fc = JSON.parse(fmt.writeFeatures(features.getFeatures()));
+    fc.properties = { dataset: DATASET, coordinate_space: "image pixels, y negated" };
+    const r = await fetch(auth(`api/datasets/${DATASET}/annotations`), {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fc),
+    });
+    const out = await r.json();
+    say(r.ok ? `Saved ${out.saved} annotation(s).` : (out.detail || "save failed"),
+        r.ok ? "ok" : "err");
+  };
+  $("#reload").onclick = load;
+  $("#clear").onclick = () => { features.clear(); listFeatures(); };
+
+  await load();
+})().catch((e) => say(e.message, "err"));
+</script>
+</body>
+</html>

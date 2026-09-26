@@ -26,9 +26,10 @@ import training
 def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -> None:
     """Refresh status.json's ``updated_at`` while train_seg runs, so a long epoch
     doesn't trip the stale-window check (get_status marks TRAINING → STOPPED after
-    STATUS_STALE_SECONDS of no update)."""
+    STATUS_STALE_SECONDS of no update). Carries no ``status`` so the refresh lands
+    even under a sticky terminal record, keeping a live orphan visibly live."""
     while not stop.wait(interval):
-        training.write_status(session_id, status="TRAINING", message="training in progress")
+        training.write_status(session_id)
 
 
 def main(session_id: str) -> None:
@@ -73,17 +74,25 @@ def main(session_id: str) -> None:
         )
         stop.set()
         ok = training.checkpoint_path(session_id).exists()
+        # train_seg has no early stopping and only checkpoints after the full
+        # range(n_epochs) loop, so a COMPLETED cellpose run ran exactly the
+        # requested epochs; a truncated run never checkpoints → never COMPLETED.
+        # Hence the count is a floor guaranteed only by COMPLETED, not a measured
+        # value (basis="floor_if_completed") — cellpose exposes no per-epoch counter.
         training.write_status(
             session_id,
             status="COMPLETED" if ok else "FAILED",
             message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
-            end_time=time.time(),
+            end_time=time.time(), terminated_by="child",
+            n_epochs_completed=p["n_epochs"] if ok else None,
+            n_epochs_completed_basis="floor_if_completed" if ok else None,
         )
     except Exception as e:
         stop.set()
         training.write_status(
             session_id, status="FAILED", message=str(e)[:800],
             traceback=traceback.format_exc()[-2500:], end_time=time.time(),
+            terminated_by="child",
         )
         raise
 
