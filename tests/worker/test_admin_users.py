@@ -2,10 +2,10 @@
 
 Permissions are checked per call against ``self.admin_users``, so the list is
 editable at runtime without re-registering the service — the only thing that
-was missing is an API. Two properties have to hold for that API to be safe:
-nobody can lock the worker (or themselves) out, and a runtime change must not
-silently revert on the next restart, when the ``--admin-users`` startup flag is
-replayed verbatim.
+was missing is an API. Three properties have to hold for that API to be safe:
+only a named admin can change who the admins are, nobody can lock the worker
+(or themselves) out, and a runtime change must not silently revert on the next
+restart, when the ``--admin-users`` startup flag is replayed verbatim.
 """
 
 import json
@@ -93,14 +93,46 @@ async def test_a_caller_cannot_revoke_themselves_by_user_id(tmp_path):
 
 
 async def test_the_last_admin_cannot_be_removed(tmp_path):
-    """Reachable on a worker started with ``--admin-users '*'``: every caller is
-    an admin, so nothing else stops one of them from revoking the only entry."""
-    worker = _bare_worker(tmp_path, ["*"])
+    worker = _bare_worker(tmp_path, ["admin@example.org"])
 
     with pytest.raises(ValueError, match="last admin user"):
+        await worker.remove_admin_user(user="admin@example.org", context=ADMIN)
+
+    assert worker.admin_users == ["admin@example.org"]
+
+
+async def test_wildcard_access_does_not_confer_the_right_to_edit_the_admin_list(
+    tmp_path,
+):
+    """``--admin-users '*'`` makes every caller an admin over the worker's
+    operations. It must not also make every caller able to rewrite who the
+    admins are: a wildcard caller who could grant themselves a named entry and
+    then revoke the wildcard would end up the only admin, on a list that
+    overrides the startup flag the operator would use to take it back."""
+    worker = _bare_worker(tmp_path, ["worker@service.internal", "*"])
+
+    with pytest.raises(PermissionError):
+        await worker.add_admin_user(user="outsider@example.org", context=OUTSIDER)
+    with pytest.raises(PermissionError):
         await worker.remove_admin_user(user="*", context=OUTSIDER)
 
-    assert worker.admin_users == ["*"]
+    assert worker.admin_users == ["worker@service.internal", "*"]
+    assert not (tmp_path / "admin_users.json").exists()
+
+
+async def test_a_named_admin_still_edits_the_list_on_a_wildcard_worker(tmp_path):
+    worker = _bare_worker(tmp_path, ["admin@example.org", "*"])
+
+    await worker.add_admin_user(user="new@example.org", context=ADMIN)
+
+    assert await worker.remove_admin_user(user="*", context=ADMIN) == [
+        "admin@example.org",
+        "new@example.org",
+    ]
+    assert json.loads((tmp_path / "admin_users.json").read_text()) == [
+        "admin@example.org",
+        "new@example.org",
+    ]
 
 
 async def test_the_workers_own_identity_cannot_be_removed(tmp_path):

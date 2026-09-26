@@ -1267,7 +1267,8 @@ class BioEngineWorker:
         per call — and survives a restart. Already-running applications keep the
         authorized users they were deployed with; redeploy them to widen access.
 
-        Requires admin permissions.
+        Requires the caller to be a named admin user — being covered by a '*'
+        entry is not enough.
 
         Args:
             user: User ID or email address to grant admin permissions to.
@@ -1277,13 +1278,16 @@ class BioEngineWorker:
             List[str]: The updated admin users.
 
         Raises:
-            PermissionError: If the caller is not an admin.
+            PermissionError: If the caller is not a named admin user.
             ValueError: If the user identifier is empty or the wildcard '*'.
         """
         check_permissions(
             context=context,
             authorized_users=self.admin_users,
             resource_name="adding a BioEngine Worker admin user",
+            # A caller who is only an admin through '*' must not be able to turn
+            # that into a named grant the startup flag can no longer revoke.
+            allow_wildcard=False,
         )
 
         user = user.strip()
@@ -1324,7 +1328,8 @@ class BioEngineWorker:
         Takes effect immediately and survives a restart. Removing a user who is
         not an admin is a no-op.
 
-        Requires admin permissions.
+        Requires the caller to be a named admin user — being covered by a '*'
+        entry is not enough.
 
         Args:
             user: User ID or email address to revoke admin permissions from.
@@ -1334,7 +1339,7 @@ class BioEngineWorker:
             List[str]: The updated admin users.
 
         Raises:
-            PermissionError: If the caller is not an admin.
+            PermissionError: If the caller is not a named admin user.
             ValueError: If the removal would lock the caller out, remove the last
                         admin, or drop the worker's own identity.
         """
@@ -1342,10 +1347,18 @@ class BioEngineWorker:
             context=context,
             authorized_users=self.admin_users,
             resource_name="removing a BioEngine Worker admin user",
+            # Revoking '*' would leave the caller as the only admin, so the same
+            # named-admin requirement as add_admin_user applies.
+            allow_wildcard=False,
         )
 
         user = user.strip()
         caller = context["user"]
+        if user in self.admin_users and len(self.admin_users) == 1:
+            raise ValueError(
+                f"Refusing to remove '{user}': it is the last admin user and the "
+                "worker would be left with none."
+            )
         if user and user in (caller.get("id"), caller.get("email")):
             raise ValueError(
                 f"Refusing to remove '{user}': a caller cannot revoke their own "
@@ -1357,11 +1370,6 @@ class BioEngineWorker:
             raise ValueError(
                 f"Refusing to remove '{user}': it is the identity this worker "
                 "connects to Hypha with and would be restored on the next reconnect."
-            )
-        if user in self.admin_users and len(self.admin_users) == 1:
-            raise ValueError(
-                f"Refusing to remove '{user}': it is the last admin user and the "
-                "worker would be left with none."
             )
 
         if user in self.admin_users:
