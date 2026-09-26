@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from haikunator import Haikunator
 from hypha_rpc import connect_to_server
-from hypha_rpc.rpc import RemoteService
+from hypha_rpc.rpc import RemoteException, RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
@@ -26,6 +26,143 @@ from bioengine.utils import (
     ensure_applications_collection,
     get_static_site_url,
 )
+
+
+# A hypha_rpc service proxy is pinned to ONE client instance of the remote
+# service. That instance can change client id at any time — the artifact manager
+# re-registered under a new one with nothing restarted — and hypha_rpc's own
+# websocket reconnect does not re-resolve cached proxies, so every later call
+# addresses a client that no longer exists and hangs to timeout. Split by whether
+# the call can have reached the server: a send-side failure provably did not, so
+# retrying it is safe even for a write; a timeout or a mid-call disconnect may
+# already have landed, so retrying those could double-execute a create or commit.
+#
+# hypha_rpc 0.21.40 does ship a stale-service retry, but it is installed by
+# ``RPC.get_remote_service`` and so reaches only the workspace-manager proxy and
+# services fetched by ``client_id:service_id`` URI. A service resolved by name
+# through ``server.get_service`` arrives off the ordinary decode path as a plain
+# ObjectProxy with no retry on it — this handle included.
+_PROXY_NEVER_SENT_MARKERS = (
+    "failed to send the request",
+    "websocket reconnection timed out",
+)
+_PROXY_MAYBE_SENT_MARKERS = (
+    "client disconnected",
+    "method call timed out",
+    "service not found",
+)
+
+# Reads are safe to repeat even when the first attempt may already have run, so
+# they are retried on either failure kind. This matters because the call that
+# hung in the observed outage was a read — the write before it had already
+# succeeded — so without this a stale handle still costs one failed deploy.
+# Everything not listed (create, commit, edit, delete, publish, discard,
+# put_file, vector and PR operations) re-raises instead.
+_RETRY_SAFE_READS = frozenset(
+    {"read", "list", "search", "get_file", "read_file", "list_files"}
+)
+# ...but reads are not side-effect-free: ``silent`` defaults to False and
+# ``read`` increments a view count. Only these three accept the parameter, so
+# only these three can be silenced, and only on the retry — the first attempt
+# should still count as a real view.
+_SILENCEABLE_READS = frozenset({"read", "list", "get_file"})
+
+
+def _stale_proxy_kind(exc: BaseException) -> Optional[str]:
+    """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
+    if isinstance(exc, RemoteException):
+        # Its message is ``"RemoteError:" + value + "\n" + remote traceback``, and
+        # the server runs hypha_rpc too, so any marker below can appear in that
+        # traceback. Arriving at all proves the remote handler ran.
+        return None
+    message = str(exc).lower()
+    if any(marker in message for marker in _PROXY_NEVER_SENT_MARKERS):
+        return "never_sent"
+    if isinstance(exc, asyncio.TimeoutError) or any(
+        marker in message for marker in _PROXY_MAYBE_SENT_MARKERS
+    ):
+        return "maybe_sent"
+    return None
+
+
+class _ReconnectingArtifactManager:
+    """The artifact-manager proxy, re-resolved when its client id goes stale.
+
+    Wrapping at the point of resolution rather than at each call site is
+    deliberate: this object is handed to ``AppBuilder`` and to every
+    ``artifact_utils`` helper, so none of them has to remember the retry rule.
+    The one artifact-manager proxy this does not cover is the user-mode
+    ``upload_app`` handle, which is resolved per call on a connection closed in
+    the same ``finally`` and so cannot outlive the client it is pinned to.
+
+    Two axes decide whether the call is repeated against the fresh proxy:
+
+    * a call that provably never left the process is always safe to repeat;
+    * a call that may already have executed is repeated only if it is a read,
+      because replaying a ``create`` or ``commit`` would double-execute it.
+
+    Anything else re-raises, so the caller sees one failure rather than an
+    indefinite outage and the next call uses the refreshed handle.
+    """
+
+    def __init__(self, server: RemoteService, proxy: Any, logger: logging.Logger):
+        self._server = server
+        self._proxy = proxy
+        self._logger = logger
+        self._generation = 0
+        self._lock = asyncio.Lock()
+        self._resolved = asyncio.Event()
+        self._resolved.set()
+
+    async def _re_resolve(self, seen_generation: int) -> None:
+        async with self._lock:
+            # Concurrent callers all fail against the same dead proxy; only the
+            # first needs to replace it.
+            if self._generation != seen_generation:
+                return
+            self._resolved.clear()
+            try:
+                self._proxy = await self._server.get_service("public/artifact-manager")
+                self._generation += 1
+            finally:
+                self._resolved.set()
+            self._logger.info("Re-resolved the artifact manager service proxy.")
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._proxy, name)
+        if not callable(attribute):
+            return attribute
+
+        async def call(*args, **kwargs):
+            # Dispatching while a replacement is being fetched would spend a
+            # full method timeout on the handle already known to be dead.
+            await self._resolved.wait()
+            seen_generation = self._generation
+            try:
+                return await getattr(self._proxy, name)(*args, **kwargs)
+            except Exception as exc:
+                kind = _stale_proxy_kind(exc)
+                if kind is None:
+                    raise
+                self._logger.warning(
+                    f"Artifact manager call '{name}' failed against a stale "
+                    f"service proxy: {exc}"
+                )
+                await self._re_resolve(seen_generation)
+                if kind != "never_sent" and name not in _RETRY_SAFE_READS:
+                    raise
+                if (
+                    kind == "maybe_sent"
+                    and name in _SILENCEABLE_READS
+                    and len(args) <= 1
+                ):
+                    # Beyond the artifact id, a positional may already be
+                    # ``silent`` itself, and an explicit keyword wins over the
+                    # view-count suppression.
+                    kwargs.setdefault("silent", True)
+                return await getattr(self._proxy, name)(*args, **kwargs)
+
+        return call
 
 
 def _is_serve_controller_gone(exc: BaseException) -> bool:
@@ -1074,9 +1211,13 @@ class AppsManager:
         self.admin_users = admin_users
 
         try:
-            # Get artifact manager service
-            self.artifact_manager = await self.server.get_service(
-                "public/artifact-manager"
+            # Get artifact manager service. Wrapped because the proxy is cached
+            # for the process lifetime and the remote service can change client
+            # id without anything restarting.
+            self.artifact_manager = _ReconnectingArtifactManager(
+                server=self.server,
+                proxy=await self.server.get_service("public/artifact-manager"),
+                logger=self.logger,
             )
             self.logger.info("Successfully connected to artifact manager.")
         except Exception as e:
