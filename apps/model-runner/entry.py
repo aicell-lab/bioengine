@@ -438,6 +438,14 @@ class EntryDeployment:
                 "bioimage-io/model-runner",
                 os.environ.get("HYPHA_ARTIFACT_VERSION", "unknown"),
             ),
+            # Provenance, so a verdict is not mis-triaged as a runner
+            # regression when another site disagrees. Read from the report body
+            # rather than probed here, so the value survives caching.
+            (
+                "replica_accelerator",
+                str(test_report.get("replica_accelerator") or "unknown"),
+            ),
+            ("worker", os.environ.get("BIOENGINE_WORKER_SERVICE_ID", "unknown")),
         ]
 
         env = test_report.get("env")
@@ -2508,6 +2516,9 @@ class EntryDeployment:
                     # failure) so eviction can reclaim them again.
                     self._release_inuse_envs(needed_envs)
 
+                # Inside ``if should_run_test`` on purpose: a cache hit must keep
+                # the provenance of the run that produced it, not be relabelled
+                # with whichever replica served the cache.
                 test_report = self._stamp_runtime_versions_in_test_env(
                     test_report, current_versions
                 )
