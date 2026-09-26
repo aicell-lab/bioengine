@@ -731,10 +731,14 @@ class AppsManager:
             built_app = self._deployed_applications[application_id]["built_app"]
             await self.app_builder.submit(built_app, application_id)
 
-            # Track the application in the internal state
+            # ``submit`` ends in serve.run(blocking=False), so the replicas are
+            # only starting here and the Hypha service does not exist until the
+            # proxy registers it. Saying "completed" sent callers to the service
+            # address tens of seconds before anything answered it.
             self.logger.info(
-                f"Successfully completed deployment of application '{application_id}' from "
-                f"artifact '{artifact_id}', version '{version}'."
+                f"Submitted application '{application_id}' from artifact "
+                f"'{artifact_id}', version '{version}' to Ray Serve; replicas are "
+                f"starting and the Hypha service is registered once they run."
             )
 
             # Mark the application as deployed
@@ -1022,7 +1026,16 @@ class AppsManager:
 
     async def _get_application_service_ids(
         self, application_id: str
-    ) -> Dict[str, Optional[str]]:
+    ) -> Tuple[Dict[str, Optional[str]], Optional[bool]]:
+        """Service ids to advertise for an app, and whether its proxy has
+        registered them.
+
+        Returns ``({websocket_service_id, webrtc_service_id}, registered)``.
+        Both ids are ``None`` unless a proxy replica is alive and has not
+        reported itself unregistered; ``registered`` is ``None`` when the proxy
+        has never reported — see ``BioEngineProxyActor.get_service_registration``.
+        """
+        no_ids = {"websocket_service_id": None, "webrtc_service_id": None}
         # The proxy's Hypha client_id is derived deterministically from the
         # worker's client_id and a hash of application_id (see
         # bioengine.apps.proxy_deployment.ProxyDeployment.__init__). The URL
@@ -1036,7 +1049,25 @@ class AppsManager:
             )
         )
         if not replica_ids:
-            return {"websocket_service_id": None, "webrtc_service_id": None}
+            return no_ids, None
+
+        # A live proxy replica is a precondition for registration, not proof of
+        # it: the replica reports healthy to Ray while it waits for its siblings
+        # to come up, and only registers with Hypha afterwards. Advertising the
+        # id in between hands out an address that does not resolve yet.
+        registered = None
+        try:
+            registered = (
+                await self.ray_cluster.proxy_actor_handle.get_service_registration.remote(
+                    application_id
+                )
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not read service registration for '{application_id}': {exc}"
+            )
+        if registered is False:
+            return no_ids, False
 
         workspace = self.server.config.workspace
         # For a recovered app, the ProxyDeployment is still registered
@@ -1054,7 +1085,7 @@ class AppsManager:
         return {
             "websocket_service_id": f"{workspace}/{proxy_client_id}:{application_id}",
             "webrtc_service_id": f"{workspace}/{proxy_client_id}:{application_id}-rtc",
-        }
+        }, registered
 
     async def _verify_running_identities(
         self,
@@ -1177,7 +1208,9 @@ class AppsManager:
                 message = f"Application '{application_id}' has not been deployed yet."
             deployments = {}
 
-        service_ids = await self._get_application_service_ids(application_id)
+        service_ids, service_registered = await self._get_application_service_ids(
+            application_id
+        )
 
         # Report what the replicas actually loaded, not just the requested
         # version — a stale reused replica reads as "healthy" otherwise.
@@ -1236,6 +1269,9 @@ class AppsManager:
             "scaling": dict(application_info.get("scaling") or {}),
             "static_site_url": static_site_url,
             "service_ids": service_ids,
+            # None while the proxy has never reported, so a client can tell
+            # "not registered yet" from "this worker cannot tell".
+            "service_registered": service_registered,
             "start_time": application_info["started_at"],
             "last_updated_at": application_info["last_updated_at"],
             "last_updated_by": application_info["last_updated_by"],

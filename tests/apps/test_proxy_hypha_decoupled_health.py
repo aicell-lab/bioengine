@@ -48,6 +48,7 @@ def _bare_proxy(**attrs):
     inst._usage_ledger = None
     inst._probe_due_at = 0.0
     inst._next_register_at = 0.0
+    inst._proxy_actor_handle = None
     for key, value in attrs.items():
         setattr(inst, key, value)
     return inst

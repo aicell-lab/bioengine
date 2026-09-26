@@ -60,16 +60,18 @@ Fully qualified handle for a service. Grammar:
 **Two BioEngine service patterns:**
 
 - **Worker service** — one per worker. ID = `<workspace>/<client_id>:bioengine-worker`. The literal `bioengine-worker` is hardcoded; it exposes the worker's admin API (`get_status`, `deploy_app`, etc.).
-- **Application services** — one **ProxyDeployment replica per application** (fixed). ID = `<workspace>/<worker_client_id>-<replica_id>:<application_id>` (plus `<application_id>-rtc` for WebRTC). The `<replica_id>` is appended to the worker's `client_id`. An app's internal deployments may have their own Ray Serve replicas, but only the single ProxyDeployment in front of them yields Hypha services; internal deployments are addressed through Ray Serve handles inside the worker.
+- **Application services** — one **ProxyDeployment replica per application** (fixed). ID = `<workspace>/<worker_client_id>-<app_hash>:<application_id>` (plus `<application_id>-rtc` for WebRTC). The `<app_hash>` is the first 8 hex digits of `sha1(application_id)`, appended to the worker's `client_id` — so the id is stable across ProxyDeployment restarts and does **not** change on redeploy. An app's internal deployments may have their own Ray Serve replicas, but only the single ProxyDeployment in front of them yields Hypha services; internal deployments are addressed through Ray Serve handles inside the worker.
 
 **Calling an application.** `get_app_status()` returns a `service_ids` block of shape:
 
 ```python
 {
-    "websocket_service_id": "<workspace>/<worker_client_id>-<replica_id>:<application_id>",
-    "webrtc_service_id":    "<workspace>/<worker_client_id>-<replica_id>:<application_id>-rtc",
+    "websocket_service_id": "<workspace>/<worker_client_id>-<app_hash>:<application_id>",
+    "webrtc_service_id":    "<workspace>/<worker_client_id>-<app_hash>:<application_id>-rtc",
 }
 ```
+
+Both are `None` until the proxy has actually registered the services with Hypha, which happens after every deployment of the app has a running replica — so an app can read `RUNNING` while its ids are still `None`. Poll for a non-`None` `websocket_service_id` rather than for `status == "RUNNING"`; the companion `service_registered` field says whether the proxy has reported registering (`None` if it has never reported, e.g. an app recovered under a newer worker).
 
 - **WebSocket** — `get_service(service_ids["websocket_service_id"])`. No selection mode needed; one concrete client.
 - **WebRTC** — `get_rtc_service(hypha_client, service_ids["webrtc_service_id"])`. Same concrete replica; peer-connection handshake addresses it directly.

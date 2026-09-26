@@ -77,6 +77,7 @@ def _bare_proxy(**attrs):
     inst._probe_due_at = 0.0
     inst._next_register_at = 0.0
     inst._maintenance_task = None
+    inst._proxy_actor_handle = None
     # The maintenance loop is exercised in test_proxy_hypha_decoupled_health;
     # here it would only spawn a background task the gate tests never await.
     inst._ensure_maintenance_task = lambda: None
