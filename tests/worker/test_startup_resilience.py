@@ -418,3 +418,14 @@ async def test_cleanup_cancels_a_pending_startup_retry():
     await asyncio.sleep(0)
 
     assert task.cancelled()
+
+
+def test_the_startup_budget_outlasts_the_restart_window_it_exists_for():
+    """The startup budget is pinned by value, not only by which symbol is passed.
+
+    The call-site tests above compare against the imported constant, so they
+    stay green however it is tuned. The hypha-server restart gap that produced
+    the crash-loop was 20-45 s; a budget under that puts the worker straight
+    back into it.
+    """
+    assert STARTUP_CONNECT_BUDGET_S >= 45.0

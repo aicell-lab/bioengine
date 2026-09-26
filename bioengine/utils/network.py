@@ -53,11 +53,14 @@ def is_transient_connect_error(error: BaseException) -> bool:
 
 
 # Retry budgets for connect_with_retry, split by call site. At startup nothing
-# is watching the worker yet, so it can wait out a server restart. A reconnect
-# runs inside one monitoring pass, and that pass — registration probe,
-# disconnect, retries and everything after — must still finish inside the
-# liveness heartbeat's staleness deadline (see bioengine.heartbeat; 120 s at
-# the default monitoring interval).
+# is watching the worker yet, so it can wait out a server restart.
+# The startup budget must stay above the observed 20-45 s hypha-server restart
+# window: under it the worker crash-loops through the restart rather than
+# waiting it out.
+# A reconnect runs inside one monitoring pass, and that pass — registration
+# probe, disconnect, retries and everything after — must still finish inside
+# the liveness heartbeat's staleness deadline (see bioengine.heartbeat; 120 s
+# at the default monitoring interval).
 STARTUP_CONNECT_BUDGET_S = 120.0
 RECONNECT_BUDGET_S = 15.0
 
