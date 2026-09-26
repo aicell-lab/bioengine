@@ -310,6 +310,15 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         "If not specified, Ray will auto-detect available memory.",
     )
     ray_cluster_group.add_argument(
+        "--head-memory-budget-fraction",
+        type=float,
+        metavar="FRACTION",
+        help="Fraction of the host's total memory that --head-memory-in-gb plus the "
+        "memory already held by other tenants of the same host may occupy before a "
+        "warning is logged at startup. Default 0.9. Set to 0 to disable. The check "
+        "only warns and never prevents the worker from starting.",
+    )
+    ray_cluster_group.add_argument(
         "--runtime-env-pip-cache-size-gb",
         type=int,
         metavar="GB",
