@@ -1,11 +1,13 @@
 """Unit tests for how a node's GPU identity is reported in the cluster state.
 
-Covers Ray's schedulable ``accelerator_type`` label and the separate,
-untruncated ``gpu_device_name`` read from the Ray dashboard node summary.
+Covers Ray's schedulable ``accelerator_type`` label, the separate, untruncated
+``gpu_device_name`` read from the Ray dashboard node summary, and how a failing
+dashboard fetch degrades that reading without failing the status call.
 Everything is exercised against plain dicts and a stubbed dashboard payload, so
 no Ray cluster and no NVIDIA hardware are needed.
 """
 
+import http.client
 import json
 import urllib.error
 
@@ -46,7 +48,13 @@ class _FakeGlobalState:
         return {node_id: dict(res) for node_id, res in self._totals.items()}
 
 
-def _actor(totals, dashboard_payload=None, dashboard_error=None, monkeypatch=None):
+def _actor(
+    totals,
+    dashboard_payload=None,
+    dashboard_error=None,
+    dashboard_read_error=None,
+    monkeypatch=None,
+):
     actor = object.__new__(_ProxyActor)
     actor.global_state = _FakeGlobalState(totals)
     actor.exclude_head_node = False
@@ -63,6 +71,9 @@ def _actor(totals, dashboard_payload=None, dashboard_error=None, monkeypatch=Non
             return False
 
         def read(self):
+            # A truncated or reset response surfaces here, not from urlopen.
+            if dashboard_read_error is not None:
+                raise dashboard_read_error
             return json.dumps(dashboard_payload).encode("utf-8")
 
     def _urlopen(request, timeout=None):
@@ -176,6 +187,101 @@ def test_unreachable_dashboard_still_reports_status(monkeypatch):
 
     assert node["gpu_device_name"] is None
     assert node["accelerator_type"] == "G"
+
+
+def _break_fetch(monkeypatch, error):
+    def _urlopen(request, timeout=None):
+        raise error
+
+    monkeypatch.setattr(proxy_actor_module.urllib.request, "urlopen", _urlopen)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.URLError("refused"),
+        TimeoutError("timed out"),
+        json.JSONDecodeError("Expecting value", "", 0),
+        ValueError("unparseable"),
+        ConnectionResetError(104, "Connection reset by peer"),
+        http.client.IncompleteRead(b'{"result": tr'),
+    ],
+    ids=[
+        "url_error",
+        "timeout",
+        "json_decode_error",
+        "value_error",
+        "connection_reset",
+        "incomplete_read",
+    ],
+)
+def test_a_failing_dashboard_fetch_still_reports_status(error, monkeypatch):
+    totals = {"n1": {"CPU": 8.0, "GPU": 1.0, "accelerator_type:G": 1.0}}
+    actor = _actor(totals, dashboard_error=error, monkeypatch=monkeypatch)
+
+    node = actor.get_cluster_state()["nodes"]["n1"]
+
+    assert node["accelerator_type"] == "G"
+    assert node["gpu_device_name"] is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http.client.IncompleteRead(b'{"result": tr'),
+        ConnectionResetError(104, "Connection reset by peer"),
+        http.client.BadStatusLine("garbage"),
+    ],
+    ids=["incomplete_read", "connection_reset", "bad_status_line"],
+)
+def test_a_failure_raised_while_reading_the_body_still_reports_status(
+    error, monkeypatch
+):
+    """These surface from response.read(), not from urlopen — the guard has to
+    cover both call sites, and injecting only at urlopen would not show it."""
+    totals = {"n1": {"CPU": 8.0, "GPU": 1.0, "accelerator_type:G": 1.0}}
+    actor = _actor(totals, dashboard_read_error=error, monkeypatch=monkeypatch)
+
+    node = actor.get_cluster_state()["nodes"]["n1"]
+
+    assert node["accelerator_type"] == "G"
+    assert node["gpu_device_name"] is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        http.client.IncompleteRead(b'{"result": tr'),
+    ],
+    ids=["connection_reset", "incomplete_read"],
+)
+def test_a_dropped_dashboard_connection_serves_the_last_good_snapshot(
+    error, monkeypatch
+):
+    totals = {"n1": {"CPU": 8.0, "GPU": 1.0, "accelerator_type:A40": 1.0}}
+    actor = _actor(
+        totals,
+        dashboard_payload=_payload("n1", [_gpu("NVIDIA A40", memory_total=46068)]),
+        monkeypatch=monkeypatch,
+    )
+    assert actor.get_cluster_state()["nodes"]["n1"]["gpu_device_name"] == "NVIDIA A40"
+
+    _break_fetch(monkeypatch, error)
+    node = actor.get_cluster_state()["nodes"]["n1"]
+
+    assert node["gpu_device_name"] == "NVIDIA A40"
+    assert node["total_gpu_memory"] == 46068 * 1024 * 1024
+
+
+def test_an_unexpected_fetch_error_is_not_swallowed(monkeypatch):
+    totals = {"n1": {"CPU": 8.0, "GPU": 1.0, "accelerator_type:G": 1.0}}
+    actor = _actor(
+        totals, dashboard_error=RuntimeError("bug"), monkeypatch=monkeypatch
+    )
+
+    with pytest.raises(RuntimeError, match="bug"):
+        actor.get_cluster_state()
 
 
 @pytest.mark.parametrize(

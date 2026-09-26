@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import json
-import urllib.error
+import http.client
 import urllib.request
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -412,7 +412,10 @@ class BioEngineProxyActor:
         try:
             with urllib.request.urlopen(request, timeout=2.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        # OSError covers URLError, TimeoutError and the raw socket errors urllib
+        # leaves unwrapped; HTTPException covers the ones it does not, which
+        # getresponse() re-raises unwrapped.
+        except (OSError, http.client.HTTPException, json.JSONDecodeError, ValueError):
             logger.debug(
                 "Failed to fetch Ray node summary from dashboard endpoint %s",
                 url,
