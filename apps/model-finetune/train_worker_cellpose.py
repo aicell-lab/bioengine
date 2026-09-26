@@ -23,6 +23,30 @@ import traceback
 import training
 
 
+def _measure_diameters(label_files):
+    """Min/max/median cell diameter over the training label masks, using cellpose's
+    own per-ROI definition (equivalent-circle diameter 2*sqrt(area/pi), area = pixel
+    count) — so the median equals what ``cellpose.utils.diameters`` would report and
+    is the right value to rescale inference to. Returns None if no labelled objects
+    are found. Rescaling stays OFF during training (Cellpose-SAM paper); this only
+    records the size the model was trained at."""
+    import numpy as np
+    from cellpose import io as cpio
+
+    diams = []
+    for lf in label_files:
+        lbl = np.squeeze(np.asarray(cpio.imread(lf)))
+        if lbl.ndim != 2:
+            continue
+        _ids, counts = np.unique(lbl[lbl > 0], return_counts=True)
+        if counts.size:
+            diams.extend((2.0 * np.sqrt(counts / np.pi)).tolist())
+    if not diams:
+        return None
+    a = np.asarray(diams, dtype=float)
+    return {"min": float(a.min()), "max": float(a.max()), "median": float(np.median(a))}
+
+
 def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -> None:
     """Refresh status.json's ``updated_at`` while train_seg runs, so a long epoch
     doesn't trip the stale-window check (get_status marks TRAINING → STOPPED after
@@ -32,10 +56,29 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
         training.write_status(session_id)
 
 
+def _surface_cellpose_logs() -> None:
+    """Route cellpose's per-epoch train/test-loss trace to stdout so the subprocess
+    redirect captures it (into train.log / the session record). cellpose attaches a
+    NullHandler and its loggers sit at NOTSET, so the effective level resolves to root
+    WARNING and its INFO per-epoch records are never emitted; because a handler IS
+    present, logging.lastResort never fires either, so even WARNING/ERROR are swallowed.
+    Setting the level + adding an explicit stdout handler is immune to root-handler
+    state (unlike basicConfig) and has no filesystem side effect (unlike
+    cellpose.io.logger_setup, which mkdirs ~/.cellpose and clears handlers)."""
+    import logging
+
+    lg = logging.getLogger("cellpose")
+    lg.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.StreamHandler) for h in lg.handlers):
+        lg.addHandler(logging.StreamHandler(sys.stdout))
+
+
 def main(session_id: str) -> None:
     import torch
     from cellpose import models as cpmodels
     from cellpose.train import train_seg
+
+    _surface_cellpose_logs()
 
     p = training.read_training_params(session_id)
     sdir = training.session_dir(session_id)
@@ -74,6 +117,12 @@ def main(session_id: str) -> None:
         )
         stop.set()
         ok = training.checkpoint_path(session_id).exists()
+        cell_diameters = None
+        if ok:
+            try:
+                cell_diameters = _measure_diameters(p.get("train_labels") or [])
+            except Exception:
+                cell_diameters = None
         # train_seg has no early stopping and only checkpoints after the full
         # range(n_epochs) loop, so a COMPLETED cellpose run ran exactly the
         # requested epochs; a truncated run never checkpoints → never COMPLETED.
@@ -86,6 +135,7 @@ def main(session_id: str) -> None:
             end_time=time.time(), terminated_by="child",
             n_epochs_completed=p["n_epochs"] if ok else None,
             n_epochs_completed_basis="floor_if_completed" if ok else None,
+            cell_diameters=cell_diameters,
         )
     except Exception as e:
         stop.set()

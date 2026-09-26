@@ -239,6 +239,20 @@ def stop_requested(session_id: str) -> bool:
     return _stop_path(session_id).exists()
 
 
+def _set_pdeathsig() -> None:
+    """preexec_fn: ask the kernel to SIGKILL this child when its parent (the runtime
+    replica) dies, so a training subprocess cannot outlive an OOM-killed supervisor
+    and orphan-hold the GPU (#0063). Linux-only (prctl PR_SET_PDEATHSIG=1); a no-op
+    elsewhere. Runs in the forked child before exec."""
+    try:
+        import ctypes
+        import signal as _signal
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, _signal.SIGKILL)
+    except Exception:
+        pass
+
+
 def run_cancellable_subprocess(
     argv: List[str], session_id: str, cwd: Optional[str] = None,
     env: Optional[Dict[str, str]] = None, poll: float = 2.0, grace: float = 10.0,
@@ -257,7 +271,8 @@ def run_cancellable_subprocess(
     stopped = False
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
-            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True
+            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+            preexec_fn=_set_pdeathsig,
         )
         while True:
             try:
