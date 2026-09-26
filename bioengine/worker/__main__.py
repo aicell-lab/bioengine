@@ -168,6 +168,17 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         "If not specified (None), a log file will be created in '<workspace_dir>/logs'. ",
     )
     core_group.add_argument(
+        "--heartbeat-file",
+        type=str,
+        metavar="PATH",
+        help="Path of the liveness heartbeat file the monitoring loop rewrites after "
+        "every completed pass. Check it with 'python -m bioengine.heartbeat PATH', "
+        "which exits non-zero once the loop has stopped completing passes and needs "
+        "no network access. Defaults to '<workspace_dir>/worker_heartbeat.json'; "
+        "point it at node-local storage when the workspace directory is on a network "
+        "filesystem.",
+    )
+    core_group.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug-level logging for detailed troubleshooting and development. "
