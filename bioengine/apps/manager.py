@@ -37,10 +37,11 @@ from bioengine.utils import (
 # retrying it is safe even for a write; a timeout or a mid-call disconnect may
 # already have landed, so retrying those could double-execute a create or commit.
 #
-# hypha_rpc 0.21.40 wraps every resolved service method in its own re-resolve
-# retry, but only for ``_STALE_SERVICE_ERROR_PATTERNS`` — a disjoint set that
-# does not include the ``_method_timeout`` expiry below. Keep these markers
-# disjoint from that tuple so the two layers never both retry one failure.
+# hypha_rpc 0.21.40 does ship a stale-service retry, but it is installed by
+# ``RPC.get_remote_service`` and so reaches only the workspace-manager proxy and
+# services fetched by ``client_id:service_id`` URI. A service resolved by name
+# through ``server.get_service`` arrives off the ordinary decode path as a plain
+# ObjectProxy with no retry on it — this handle included.
 _PROXY_NEVER_SENT_MARKERS = (
     "failed to send the request",
     "websocket reconnection timed out",
@@ -101,9 +102,7 @@ class _ReconnectingArtifactManager:
       because replaying a ``create`` or ``commit`` would double-execute it.
 
     Anything else re-raises, so the caller sees one failure rather than an
-    indefinite outage and the next call uses the refreshed handle. That is a
-    property of this layer only: hypha_rpc's own retry wrapper sits underneath
-    and does replay writes, on its own disjoint set of error patterns.
+    indefinite outage and the next call uses the refreshed handle.
     """
 
     def __init__(self, server: RemoteService, proxy: Any, logger: logging.Logger):

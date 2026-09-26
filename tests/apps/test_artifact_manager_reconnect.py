@@ -11,9 +11,10 @@ Nothing recovered it: ``auto_redeploy`` needs the artifact read that is broken,
 and ``run_code`` executes in Ray tasks so it cannot reach the in-process handle.
 model-runner was down ~62 minutes and only a pod restart cleared it.
 
-hypha_rpc ships its own re-resolve retry for a *disjoint* set of error patterns
-(``_STALE_SERVICE_ERROR_PATTERNS``); the ``_method_timeout`` expiry that produced
-the outage is not one of them. These tests cover this layer only.
+hypha_rpc's own stale-service retry does not reach this handle: it is installed by
+``RPC.get_remote_service``, and a service resolved by name through
+``server.get_service`` never goes through that path. This wrapper is the only
+retry layer these calls have.
 
 The retry rule is the delicate part, and it is not "retry transport errors":
 
