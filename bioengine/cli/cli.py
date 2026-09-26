@@ -6,6 +6,7 @@ Usage:
   bioengine apps deploy ./my-app/
   bioengine apps status
   bioengine cluster status
+  bioengine worker start -- --mode single-machine
 
 Environment variables:
   BIOENGINE_SERVER_URL          Hypha server URL (default: https://hypha.aicell.io)
@@ -18,6 +19,7 @@ from bioengine import __version__
 from bioengine.cli.call import call_command
 from bioengine.cli.cluster import cluster_group
 from bioengine.cli.apps import apps_group
+from bioengine.cli.worker import worker_group
 
 
 @click.group()
@@ -44,6 +46,12 @@ def main():
       bioengine cluster status
 
     \b
+    Run a worker:
+      bioengine worker start -- --mode single-machine --head-num-cpus 4
+      bioengine worker logs -f
+      bioengine worker stop
+
+    \b
     Environment variables:
       BIOENGINE_SERVER_URL          Server URL (default: https://hypha.aicell.io)
       BIOENGINE_WORKER_SERVICE_ID   Worker service ID (for apps + cluster)
@@ -56,6 +64,7 @@ def main():
 main.add_command(call_command)
 main.add_command(apps_group)
 main.add_command(cluster_group)
+main.add_command(worker_group)
 
 
 if __name__ == "__main__":

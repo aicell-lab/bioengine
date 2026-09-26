@@ -286,6 +286,9 @@ class ProxyDeployment:
                     exc_info=True,
                 )
 
+        self._proxy_actor_handle = proxy_actor_handle
+        self._replica_id = replica_id
+
         # BioEngine application metadata
         self.application_id = application_id
         self.application_name = application_name
@@ -356,6 +359,60 @@ class ProxyDeployment:
 
         self._usage_flush_lock = asyncio.Lock()
         self._usage_ledger = self._open_usage_ledger(replica_id)
+
+        # No Hypha service exists until _register_services succeeds, so open the
+        # worker-visible record as unregistered rather than leaving it unknown.
+        self._claim_service_registration()
+
+    def _claim_service_registration(self) -> None:
+        """Take over the app's registration record for this replica.
+
+        A tagged ``False`` report would be dropped whenever the record still
+        belongs to a predecessor — the state a replica that was SIGKILLed or
+        lost with its node leaves behind, since Ray never ran its ``__del__``.
+        Claiming is unconditional because only a starting replica can claim.
+
+        Fire-and-forget for the same reason as ``_report_service_registration``.
+        """
+        handle = getattr(self, "_proxy_actor_handle", None)
+        if handle is None:
+            return
+        try:
+            handle.claim_service_registration.remote(
+                application_id=self.application_id,
+                replica_id=self._replica_id,
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not claim the service registration record for "
+                f"'{self.application_id}': {e}"
+            )
+
+    def _report_service_registration(self, registered: bool) -> None:
+        """Tell the proxy actor whether our Hypha services exist right now.
+
+        Tagged with our replica id so the actor can drop a departing replica's
+        deregistration that lands after its successor has already registered.
+
+        Fire-and-forget: the worker reads this to decide whether to advertise
+        this app's service address, and a failed report must never affect the
+        replica. Reachable from ``__del__`` after a part-built ``__init__``,
+        hence the tolerant attribute read.
+        """
+        handle = getattr(self, "_proxy_actor_handle", None)
+        if handle is None:
+            return
+        try:
+            handle.report_service_registration.remote(
+                application_id=self.application_id,
+                registered=registered,
+                replica_id=self._replica_id,
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not report service registration state for "
+                f"'{self.application_id}': {e}"
+            )
 
     async def get_app_data(self) -> Dict[str, Any]:
         """Return non-secret application metadata used for worker recovery."""
@@ -1129,6 +1186,7 @@ class ProxyDeployment:
         self._ice_expires_at = None
         # Reset so the next successful entry health check triggers re-registration
         self.entry_deployment_ready = False
+        self._report_service_registration(False)
 
     async def _reset_server_connection(self) -> None:
         """Cleanly disconnect ``self.server`` before we forget about it.
@@ -1399,6 +1457,7 @@ class ProxyDeployment:
                     self._connection_lost = False
                     self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
                     self._next_register_at = 0.0
+                    self._report_service_registration(True)
                 except Exception as e:
                     if self._is_permanent_registration_error(e):
                         logger.error(

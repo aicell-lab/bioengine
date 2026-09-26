@@ -1048,6 +1048,8 @@ websocket_service_id = app_status["service_ids"]["websocket_service_id"]
 webrtc_service_id = app_status["service_ids"]["webrtc_service_id"]
 ```
 
+Both ids are `None` until the proxy has registered the services with Hypha, which happens after every deployment of the app has a running replica. `status` reaches `RUNNING` before that, so poll for a non-`None` `websocket_service_id` rather than for `RUNNING`.
+
 #### WebSocket Connection
 
 Websocket connections send and receive their data through the connected Hypha server.

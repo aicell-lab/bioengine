@@ -1,4 +1,4 @@
-"""Lazy process-local singletons exposed as ``bioengine.datasets`` / ``bioengine.logger``.
+"""Lazy accessors exposed as ``bioengine.datasets`` / ``bioengine.logger``.
 
 These are reached via the PEP 562 ``__getattr__`` on the ``bioengine`` package.
 Each Ray Serve replica is its own process, so a process-global cache is the
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from bioengine._app.errors import MissingDataServerError
 
@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 
 
 _datasets_singleton: Optional["BioEngineDatasets"] = None
-_logger_singleton: Optional[logging.Logger] = None
 
 
 def _get_datasets() -> "BioEngineDatasets":
@@ -65,25 +64,57 @@ def _get_datasets() -> "BioEngineDatasets":
 
 
 def _get_logger() -> logging.Logger:
-    """Return the process-local logger.
+    """Return the logger for the current process.
 
     Inside a Ray Serve replica the appropriate logger is ``ray.serve`` —
     Ray installs handlers that route logs into the replica log files.
-    Elsewhere we fall back to a plain ``bioengine.app`` logger.
-    """
-    global _logger_singleton
-    if _logger_singleton is not None:
-        return _logger_singleton
+    Elsewhere (notably the worker's introspection Ray task) we fall back to
+    ``bioengine.app``, configured on first use so the fallback is merely
+    degraded rather than silent: unconfigured, it inherits the root level of
+    ``WARNING`` and has no handler, so ``INFO`` records are dropped outright.
 
+    Deliberately not cached. ``BIOENGINE_REPLICA`` is only true once the
+    replica's environment is in place, and a cached fallback would outlive it.
+    """
     if os.environ.get("BIOENGINE_REPLICA") == "1":
-        _logger_singleton = logging.getLogger("ray.serve")
-    else:
-        _logger_singleton = logging.getLogger("bioengine.app")
-    return _logger_singleton
+        return logging.getLogger("ray.serve")
+
+    logger = logging.getLogger("bioengine.app")
+    if not logger.handlers:
+        from bioengine.utils import create_logger
+
+        logger = create_logger("bioengine.app")
+    return logger
+
+
+class _LazyLogger:
+    """Forwards every attribute to ``_get_logger()`` at the moment it is used.
+
+    ``bioengine.logger`` cannot hand out a concrete ``Logger``: Ray ships a
+    deployment class to its replica *by value*, so the user's module is imported
+    in the build task and the replica never re-imports it. A module-scope
+    ``logger = bioengine.logger`` would therefore keep the build task's logger,
+    whose handler writes into a process that is gone by the time the replica
+    logs — the records vanish. Resolving per call makes the placement of that
+    assignment irrelevant.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(_get_logger(), name)
+
+    def __reduce__(self):
+        # Must pickle as the proxy; resolving here would re-freeze the logger.
+        return (_LazyLogger, ())
+
+    def __repr__(self) -> str:
+        return f"<bioengine.logger → {_get_logger().name}>"
 
 
 def _reset_for_tests() -> None:
-    """Drop cached singletons so tests can re-init under different env vars."""
-    global _datasets_singleton, _logger_singleton
+    """Drop the cached datasets so tests can re-init under different env vars."""
+    global _datasets_singleton
     _datasets_singleton = None
-    _logger_singleton = None

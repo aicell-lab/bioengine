@@ -6,6 +6,7 @@ try:
         create_file_list_from_directory,
         ensure_applications_collection,
         get_static_site_url,
+        latest_committed_version,
         validate_manifest,
     )
 except ImportError:

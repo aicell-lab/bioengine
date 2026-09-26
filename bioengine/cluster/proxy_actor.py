@@ -150,6 +150,16 @@ class BioEngineProxyActor:
             str, Dict[str, Dict[str, Dict[str, Optional[str]]]]
         ] = {}
 
+        # Whether each application's ProxyDeployment currently has its Hypha
+        # services registered, pushed by the proxy replica itself. A missing
+        # entry means "never reported", which is not the same as False — an app
+        # that predates this actor keeps serving without ever reporting here.
+        # The replica id is kept so a departing replica cannot overwrite its
+        # successor's verdict; see report_service_registration and
+        # claim_service_registration.
+        # Structure: {app_id: {"replica_id": str|None, "registered": bool}}
+        self.service_registrations: Dict[str, Dict[str, Any]] = {}
+
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
         # Last successful per-node GPU read (memory and device names) from the
@@ -522,6 +532,8 @@ class BioEngineProxyActor:
                     "used_cpu": float,
                     "total_gpu": float,
                     "used_gpu": float,
+                    "total_vram_mb": float,
+                    "used_vram_mb": float,
                     "pending_resources": {  # if check_pending_resources=True
                         "actors": List[Dict],
                         "jobs": List[Dict],
@@ -537,6 +549,8 @@ class BioEngineProxyActor:
                         "used_cpu": float,
                         "total_gpu": float,
                         "used_gpu": float,
+                        "total_vram_mb": float,  # VRAM_MB advertised, 0 if none
+                        "used_vram_mb": float,   # VRAM_MB booked by the scheduler
                         "total_gpu_memory": Union[int, str],  # in bytes or "NA"
                         "used_gpu_memory": Union[int, str],  # in bytes or "NA"
                         "total_memory": float,
@@ -578,6 +592,8 @@ class BioEngineProxyActor:
                 "used_cpu": 0,
                 "total_gpu": 0,
                 "used_gpu": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
                 "total_memory": 0,
                 "used_memory": 0,
                 "total_gpu_memory": 0,
@@ -603,6 +619,12 @@ class BioEngineProxyActor:
             available_cpu = available_resources.get("CPU", 0)
             total_gpu = total_resources.get("GPU", 0)
             available_gpu = available_resources.get("GPU", 0)
+            # Where the node advertises VRAM_MB, that resource — not GPU — is
+            # what bounds packing: the AppBuilder books a 0.01 GPU handle per
+            # replica purely to bind a device, so used_gpu reads as near-idle on
+            # a GPU whose VRAM is fully reserved.
+            total_vram_mb = total_resources.get("VRAM_MB", 0)
+            available_vram_mb = available_resources.get("VRAM_MB", 0)
             accelerator_type = (
                 "NA" if total_gpu == 0 else self._get_accelerator_type(total_resources)
             )
@@ -648,6 +670,8 @@ class BioEngineProxyActor:
                 "used_cpu": max(0, total_cpu - available_cpu),
                 "total_gpu": total_gpu,
                 "used_gpu": max(0, total_gpu - available_gpu),
+                "total_vram_mb": total_vram_mb,
+                "used_vram_mb": max(0, total_vram_mb - available_vram_mb),
                 "total_gpu_memory": total_gpu_memory,
                 "used_gpu_memory": used_gpu_memory,
                 "total_memory": total_memory,  # in bytes
@@ -848,9 +872,96 @@ class BioEngineProxyActor:
         """
         self.application_replicas.pop(application_id, None)
         self.replica_identities.pop(application_id, None)
+        self.service_registrations.pop(application_id, None)
         logger.info(
             f"Cleared all registered replicas for application '{application_id}'."
         )
+
+    @_touch_on_call
+    def claim_service_registration(
+        self, application_id: str, replica_id: Optional[str] = None
+    ) -> None:
+        """Hand an application's record to a replica that is starting right now.
+
+        Pushed from ``ProxyDeployment.__init__``, and unconditional: only a
+        starting replica can claim, so it is by construction the newest one,
+        and it has no Hypha services of its own yet.
+
+        This is what a plain ``False`` report cannot do. The tag guard in
+        ``report_service_registration`` drops a ``False`` whenever the record
+        still belongs to a predecessor — which is exactly the state a replica
+        that died without running ``__del__`` leaves behind (SIGKILL, lost
+        node, health-driven restart). The record would stay ``True`` under a
+        dead replica's tag and the worker would keep advertising an address
+        that answers nothing until the new replica finishes starting.
+        """
+        self.service_registrations[application_id] = {
+            "replica_id": replica_id,
+            "registered": False,
+        }
+        logger.info(
+            f"Replica '{replica_id}' claimed the Hypha registration record of "
+            f"application '{application_id}'; no services registered yet."
+        )
+
+    @_touch_on_call
+    def report_service_registration(
+        self,
+        application_id: str,
+        registered: bool,
+        replica_id: Optional[str] = None,
+    ) -> None:
+        """Record whether an application's Hypha services exist right now.
+
+        Pushed by ``ProxyDeployment``: True once ``_register_services``
+        succeeds, False again on deregistration. The worker reads it before
+        advertising the app's service address, so a client is never handed an
+        id that nothing answers yet. The record itself is opened by
+        ``claim_service_registration`` at replica init.
+
+        A ``False`` is honoured only from the replica this record already
+        belongs to. Across a replica generation the two reports race: the
+        incoming replica claims the record, registers and reports True, and the
+        outgoing one's ``__del__`` deregisters afterwards. Taking that last
+        write would pin a healthy app at False for good, because nothing
+        re-reports True until the next ``_register_services``, which the
+        running replica will not redo. A ``True``, and any report about an app
+        with no record, always takes over — those can only come from a replica
+        that is serving now.
+        """
+        current = self.service_registrations.get(application_id)
+        if (
+            current is not None
+            and not registered
+            and replica_id != current["replica_id"]
+        ):
+            logger.info(
+                f"Ignoring deregistration of '{application_id}' from replica "
+                f"'{replica_id}': the record belongs to replica "
+                f"'{current['replica_id']}'."
+            )
+            return
+
+        self.service_registrations[application_id] = {
+            "replica_id": replica_id,
+            "registered": registered,
+        }
+        logger.info(
+            f"Application '{application_id}' reported its Hypha services as "
+            f"{'registered' if registered else 'not registered'} "
+            f"(replica '{replica_id}')."
+        )
+
+    @_touch_on_call
+    def get_service_registration(self, application_id: str) -> Optional[bool]:
+        """Last reported Hypha registration state, or None if never reported.
+
+        None is not False: an app whose proxy replica started before this actor
+        existed — a different BioEngine version, or an actor recreated after
+        eviction — serves perfectly well without ever reporting here.
+        """
+        record = self.service_registrations.get(application_id)
+        return None if record is None else record["registered"]
 
     @_touch_on_call
     def get_replica_identities(
