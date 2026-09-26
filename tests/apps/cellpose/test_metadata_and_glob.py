@@ -70,17 +70,19 @@ def test_match_image_annotation_pairs_with_mixed_ome_suffix_convention() -> None
 
 
 class _FakeArtifact:
-    async def ls(self, folder_path: str):
+    async def ls(self, folder_path: str, detail: bool = False):
         await asyncio.sleep(0)
         folder = folder_path.rstrip("/") + "/"
         if folder == "metadata/":
-            return [{"path": "metadata/sample.json", "type": "file"}]
-        if folder == "images/train/":
-            return [
+            entries = [{"path": "metadata/sample.json", "type": "file"}]
+        elif folder == "images/train/":
+            entries = [
                 {"path": "images/train/t0001.tif", "type": "file"},
                 {"path": "images/train/t0002.tif", "type": "file"},
             ]
-        return []
+        else:
+            entries = []
+        return entries if detail else [e["path"].rsplit("/", 1)[-1] for e in entries]
 
     async def get(self, remote_paths, local_paths, on_error="ignore"):
         await asyncio.sleep(0)
@@ -103,12 +105,16 @@ class _FakeArtifact:
 
 
 class _FakeArtifactNestedMetadata:
-        async def ls(self, folder_path: str):
+        async def ls(self, folder_path: str, detail: bool = False):
                 await asyncio.sleep(0)
                 folder = folder_path.rstrip("/") + "/"
                 if folder == "metadata/":
-                        return [{"path": "metadata/records.json", "type": "file"}]
-                return []
+                        entries = [{"path": "metadata/records.json", "type": "file"}]
+                else:
+                        entries = []
+                return entries if detail else [
+                        e["path"].rsplit("/", 1)[-1] for e in entries
+                ]
 
         async def get(self, remote_paths, local_paths, on_error="ignore"):
                 await asyncio.sleep(0)
