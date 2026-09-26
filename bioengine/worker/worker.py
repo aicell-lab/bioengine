@@ -16,6 +16,12 @@ from pydantic import Field
 from bioengine import __version__
 from bioengine.apps.manager import AppsManager
 from bioengine.datasets import BioEngineDatasets
+from bioengine.heartbeat import (
+    DEFAULT_HEARTBEAT_PATH,
+    STARTUP_STALE_AFTER_SECONDS,
+    heartbeat_stale_after_seconds,
+    write_heartbeat,
+)
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.utils import (
     fetch_centroid_coordinates,
@@ -120,6 +126,7 @@ class BioEngineWorker:
           dashboard_url (str): URL of the BioEngine dashboard for worker management
           monitoring_interval_seconds (int): Interval for status monitoring and health checks
           log_file (Optional[str]): Path to log file for structured logging output
+          heartbeat_file (Path): File rewritten after every completed monitoring pass
           graceful_shutdown_timeout (int): Timeout in seconds for graceful shutdown operations
           server_url (str): URL of the Hypha server for service registration
           workspace (str): Hypha workspace name for service isolation
@@ -189,6 +196,8 @@ class BioEngineWorker:
         # Logger configuration
         log_file: Optional[Union[str, Path]] = None,
         debug: bool = False,
+        # Liveness heartbeat file
+        heartbeat_file: Optional[Union[str, Path]] = None,
         # Graceful shutdown timeout
         graceful_shutdown_timeout: int = 60,
     ):
@@ -249,6 +258,12 @@ class BioEngineWorker:
             log_file: File path for structured logging output. Auto-generated timestamp-based
                      filename if not specified.
             debug: Enable debug-level logging for detailed troubleshooting and development.
+            heartbeat_file: File the monitoring loop rewrites after every completed
+                     pass, for a purely local liveness probe to read with
+                     `python -m bioengine.heartbeat <path>`. Defaults to
+                     'bioengine_worker_heartbeat.json' in the system temporary
+                     directory ($TMPDIR), which is node-local; the probe and the
+                     writing event loop must never wait on a network filesystem.
             graceful_shutdown_timeout: Timeout in seconds for graceful shutdown operations.
 
         Raises:
@@ -281,6 +296,10 @@ class BioEngineWorker:
         else:
             self.log_file = Path(log_file)
 
+        self.heartbeat_file = (
+            Path(heartbeat_file) if heartbeat_file else DEFAULT_HEARTBEAT_PATH
+        )
+
         self.logger = create_logger(
             name=self.__class__.__name__,
             level=logging.DEBUG if debug else logging.INFO,
@@ -310,14 +329,11 @@ class BioEngineWorker:
         self._registration_window_start = self._registration_ok_at
         self._registration_window_failures = 0
 
-        # Backstop for the in-place Serve recovery in
-        # ``AppsManager.monitor_applications``: after this many consecutive
-        # monitoring-loop failures the worker reports not-ready (get_status)
-        # so the k8s liveness probe cycles the pod. In-place recovery handles
-        # the common Ray-head-restart case (redeploy bootstraps a fresh Serve
-        # controller); this covers the residue it can't — e.g. an app with no
-        # cached built_app, or a redeploy that keeps failing — where a fresh
-        # pod is the only way out.
+        # After this many consecutive monitoring-loop failures get_status
+        # reports the worker not-ready, so dashboards and callers can see a
+        # degraded worker. The loop keeps running and usually recovers; a
+        # loop that has stopped running entirely is caught by the heartbeat
+        # file instead, since a frozen loop never reaches this counter.
         self._monitor_consecutive_errors = 0
         self._monitor_degraded_threshold = 5
 
@@ -979,6 +995,17 @@ class BioEngineWorker:
         # Signal that the worker has completed cleanup
         self._shutdown_event.set()
 
+    def _touch_heartbeat(self, stale_after_seconds: float) -> None:
+        """Write the liveness heartbeat, overwriting any previous run's."""
+        try:
+            write_heartbeat(self.heartbeat_file, stale_after_seconds)
+        except Exception as e:
+            self.logger.error(
+                f"Failed to write heartbeat file {self.heartbeat_file}: {e}. "
+                f"The liveness probe reads this file, so it will report this "
+                f"worker dead until the path is writable."
+            )
+
     async def _create_monitoring_task(
         self,
         backoff_initial_seconds: float = 2.0,
@@ -1001,7 +1028,9 @@ class BioEngineWorker:
                 the first error (doubles each subsequent consecutive error
                 until ``backoff_max_seconds``).
             backoff_max_seconds: Cap on the per-error sleep so a stuck
-                worker still polls roughly once a minute.
+                worker still polls roughly once a minute. Also widens the
+                heartbeat deadline, so a loop that is failing but still
+                cycling is never mistaken for a frozen one.
 
         Raises:
             Exception: Only on unexpected errors outside the monitoring
@@ -1021,6 +1050,13 @@ class BioEngineWorker:
             self.logger.debug(
                 "Starting monitoring task with interval "
                 f"{self.monitoring_interval_seconds} seconds..."
+            )
+            stale_after_seconds = heartbeat_stale_after_seconds(
+                self.monitoring_interval_seconds, backoff_max_seconds
+            )
+            self.logger.info(
+                f"Writing liveness heartbeat to {self.heartbeat_file} after every "
+                f"completed monitoring pass (stale after {stale_after_seconds:.0f}s)"
             )
             self._monitor_consecutive_errors = 0
             while self.is_ready.is_set():
@@ -1084,6 +1120,12 @@ class BioEngineWorker:
                         self.apps_manager.monitor_applications(),
                     )
 
+                    # Every step has returned control to the loop, so the loop
+                    # is alive even if some of them failed. Deliberately
+                    # outside the _step try/except and before the re-raise
+                    # below: a step that never returns must stop the beat.
+                    self._touch_heartbeat(stale_after_seconds)
+
                     if step_errors:
                         names = ", ".join(name for name, _ in step_errors)
                         raise RuntimeError(
@@ -1123,18 +1165,15 @@ class BioEngineWorker:
                         f"(#{self._monitor_consecutive_errors} consecutive, "
                         f"sleeping {backoff:.0f}s before retry): {e}"
                     )
-                    # At the degraded threshold, get_status flips to not-ready
-                    # so the k8s liveness probe cycles the pod — the backstop
-                    # for when in-place Serve recovery can't clear the wedge.
                     if (
                         self._monitor_consecutive_errors
                         == self._monitor_degraded_threshold
                     ):
                         self.logger.error(
-                            f"Monitoring wedged for "
+                            f"Monitoring degraded for "
                             f"{self._monitor_consecutive_errors} consecutive ticks — "
-                            f"reporting worker not-ready so the liveness probe "
-                            f"restarts the pod."
+                            f"get_status now reports the worker not-ready. The loop "
+                            f"keeps retrying; nothing restarts it automatically."
                         )
                     await asyncio.sleep(backoff)
 
@@ -1206,6 +1245,10 @@ class BioEngineWorker:
         try:
             # Reset the shutdown event to allow starting the worker
             self._shutdown_event.clear()
+
+            # Claim the file before startup begins: a previous run's heartbeat
+            # must not read as fresh, and a missing file reads as dead.
+            self._touch_heartbeat(STARTUP_STALE_AFTER_SECONDS)
 
             # Set the start time for monitoring and uptime tracking
             self.start_time = time.time()
