@@ -16,7 +16,12 @@ from pydantic import Field
 from bioengine import __version__
 from bioengine.apps.manager import AppsManager
 from bioengine.datasets import BioEngineDatasets
-from bioengine.heartbeat import heartbeat_stale_after_seconds, write_heartbeat
+from bioengine.heartbeat import (
+    DEFAULT_HEARTBEAT_PATH,
+    STARTUP_STALE_AFTER_SECONDS,
+    heartbeat_stale_after_seconds,
+    write_heartbeat,
+)
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.utils import (
     fetch_centroid_coordinates,
@@ -228,8 +233,9 @@ class BioEngineWorker:
             heartbeat_file: File the monitoring loop rewrites after every completed
                      pass, for a purely local liveness probe to read with
                      `python -m bioengine.heartbeat <path>`. Defaults to
-                     '<workspace_dir>/worker_heartbeat.json'. Point it at node-local
-                     storage when workspace_dir is on a network filesystem.
+                     'bioengine_worker_heartbeat.json' in the system temporary
+                     directory ($TMPDIR), which is node-local; the probe and the
+                     writing event loop must never wait on a network filesystem.
             graceful_shutdown_timeout: Timeout in seconds for graceful shutdown operations.
 
         Raises:
@@ -263,9 +269,7 @@ class BioEngineWorker:
             self.log_file = Path(log_file)
 
         self.heartbeat_file = (
-            Path(heartbeat_file)
-            if heartbeat_file
-            else self.workspace_dir / "worker_heartbeat.json"
+            Path(heartbeat_file) if heartbeat_file else DEFAULT_HEARTBEAT_PATH
         )
 
         self.logger = create_logger(
@@ -816,27 +820,15 @@ class BioEngineWorker:
         # Signal that the worker has completed cleanup
         self._shutdown_event.set()
 
-    def _clear_heartbeat(self) -> None:
-        """Drop a heartbeat left behind by a previous run.
-
-        On persistent storage it would otherwise still read as fresh while
-        this process is only just starting up, and the monitoring loop that
-        writes it does not run until the very end of ``start()``.
-        """
-        try:
-            self.heartbeat_file.unlink(missing_ok=True)
-        except Exception as e:
-            self.logger.warning(
-                f"Failed to remove stale heartbeat file {self.heartbeat_file}: {e}"
-            )
-
     def _touch_heartbeat(self, stale_after_seconds: float) -> None:
-        """Record that the monitoring loop just completed a full pass."""
+        """Write the liveness heartbeat, overwriting any previous run's."""
         try:
             write_heartbeat(self.heartbeat_file, stale_after_seconds)
         except Exception as e:
-            self.logger.warning(
-                f"Failed to write heartbeat file {self.heartbeat_file}: {e}"
+            self.logger.error(
+                f"Failed to write heartbeat file {self.heartbeat_file}: {e}. "
+                f"The liveness probe reads this file, so it will report this "
+                f"worker dead until the path is writable."
             )
 
     async def _create_monitoring_task(
@@ -1071,7 +1063,9 @@ class BioEngineWorker:
             # Reset the shutdown event to allow starting the worker
             self._shutdown_event.clear()
 
-            self._clear_heartbeat()
+            # Claim the file before startup begins: a previous run's heartbeat
+            # must not read as fresh, and a missing file reads as dead.
+            self._touch_heartbeat(STARTUP_STALE_AFTER_SECONDS)
 
             # Set the start time for monitoring and uptime tracking
             self.start_time = time.time()

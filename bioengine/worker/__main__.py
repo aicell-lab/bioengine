@@ -174,9 +174,9 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         help="Path of the liveness heartbeat file the monitoring loop rewrites after "
         "every completed pass. Check it with 'python -m bioengine.heartbeat PATH', "
         "which exits non-zero once the loop has stopped completing passes and needs "
-        "no network access. Defaults to '<workspace_dir>/worker_heartbeat.json'; "
-        "point it at node-local storage when the workspace directory is on a network "
-        "filesystem.",
+        "no network access. Defaults to 'bioengine_worker_heartbeat.json' in the "
+        "system temporary directory, which is node-local; keep it off any network "
+        "filesystem, including the workspace directory.",
     )
     core_group.add_argument(
         "--debug",

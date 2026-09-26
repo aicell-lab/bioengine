@@ -16,11 +16,22 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
 MISSED_PASSES_BEFORE_STALE = 6
+
+# Node-local by default: a heartbeat on a network filesystem makes the write
+# (on the event loop) and the probe's read hostage to that filesystem, and two
+# pods sharing one RWX volume would write the same file.
+DEFAULT_HEARTBEAT_PATH = Path(tempfile.gettempdir()) / "bioengine_worker_heartbeat.json"
+
+# Deadline carried by the heartbeat written before the monitoring loop exists.
+# Starting a Ray cluster and deploying startup applications has no useful upper
+# bound, so this only rules out a worker that never got anywhere at all.
+STARTUP_STALE_AFTER_SECONDS = 1800.0
 
 
 def heartbeat_stale_after_seconds(
@@ -29,13 +40,15 @@ def heartbeat_stale_after_seconds(
 ) -> float:
     """Longest gap between two monitoring passes that still counts as alive.
 
-    A loop whose steps keep failing is alive but slow: it sleeps up to
-    ``backoff_max_seconds`` between passes, so the deadline has to clear that
-    too or a degraded-but-recovering worker would be killed.
+    A loop whose steps keep failing is alive but slow: between two beats it
+    sleeps up to ``backoff_max_seconds``, waits out its own one-second tick and
+    then runs a whole pass. A pass has no bounded duration of its own — the
+    Hypha check alone allows ten seconds, and reconnecting is untimed — so the
+    backoff is cleared exactly and the missed-pass budget on top of it is what
+    a slow pass is spent out of.
     """
-    return max(
-        MISSED_PASSES_BEFORE_STALE * monitoring_interval_seconds,
-        backoff_max_seconds + monitoring_interval_seconds,
+    return (
+        backoff_max_seconds + MISSED_PASSES_BEFORE_STALE * monitoring_interval_seconds
     )
 
 
