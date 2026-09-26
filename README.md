@@ -71,7 +71,13 @@ Facility managers and system administrators can deploy a private worker on any h
 | **Kubernetes** | Production deployment with KubeRay |
 
 ```bash
-# Docker — single machine quickstart
+# Single machine quickstart — runs the worker image in a container
+pip install "bioengine[cli]"
+bioengine worker start -- --mode single-machine --head-num-cpus 4
+```
+
+```bash
+# Or from a clone, with docker compose
 git clone https://github.com/aicell-lab/bioengine.git
 cd bioengine
 mkdir -p .bioengine data
@@ -131,6 +137,7 @@ pip install "bioengine[cli] @ git+https://github.com/aicell-lab/bioengine.git"
 
 bioengine call bioimage-io/bioengine-worker get_status
 bioengine apps list --worker bioimage-io/bioengine-worker
+bioengine worker start -- --mode single-machine
 ```
 
 ### Worker service API

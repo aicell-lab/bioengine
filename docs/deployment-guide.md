@@ -15,7 +15,42 @@ BioEngine supports three deployment modes. The easiest way to generate deploymen
 
 Runs a local Ray cluster on one machine. Good for workstations, development, and small-scale analysis.
 
-### Docker (recommended)
+### The `bioengine` CLI (recommended)
+
+```bash
+pip install "bioengine[cli]"
+
+bioengine worker start -- \
+  --mode single-machine \
+  --head-num-cpus 4 \
+  --head-num-gpus 1
+```
+
+This runs the worker image in a container. It picks the first of `docker`, `podman` and `apptainer` on your `PATH`, mounts `~/.bioengine` as the workspace, passes `HYPHA_TOKEN` through the environment, and pins the image tag to the installed `bioengine` version. Everything after `--` is forwarded verbatim to `python -m bioengine.worker` inside the container — see `bioengine worker start -- --help` for the full list.
+
+```bash
+bioengine worker start --dry-run -- --mode single-machine  # print the command, run nothing
+bioengine worker start -d -- --mode single-machine          # run in the background
+bioengine worker logs -f
+bioengine worker stop
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--runtime` | `auto` | `docker`, `podman`, `apptainer`, or `native` to run the worker in the current environment instead of a container |
+| `--image` | `ghcr.io/aicell-lab/bioengine-worker:<version>` | Worker image |
+| `--workspace-dir` | `~/.bioengine` | Host directory mounted at `/.bioengine` |
+| `--name` | `bioengine-worker` | Container name. Starting a second worker while this name is taken is refused — give it a different `--name` |
+| `--gpus` / `--no-gpus` | on when `nvidia-smi` is present | Whether to give the container GPUs |
+| `--shm-size` | `8g` | Shared memory size |
+| `--detach` / `-d` | off | Run in the background |
+| `--dry-run` | off | Print the command instead of running it |
+
+`--gpus` only decides whether the *container* sees GPUs; tell Ray to use them with `--head-num-gpus` after the `--`.
+
+### Running the container directly
+
+The CLI is a thin wrapper — the underlying commands work on their own:
 
 ```bash
 docker run --rm -it \
