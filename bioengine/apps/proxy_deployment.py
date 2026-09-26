@@ -6,13 +6,20 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ray
 from pydantic import Field
 from ray.exceptions import RayTaskError
 from ray.serve import deployment, get_replica_context
 from ray.serve.handle import DeploymentHandle
+
+from bioengine.apps.usage_ledger import (
+    UsageLedger,
+    classify_caller,
+    ledger_dir_for_app,
+    read_usage,
+)
 
 # The Ray Serve controller imports this module to register the
 # deployment, but runs in the base Python env Ray was started with —
@@ -58,6 +65,10 @@ _REACHABILITY_PROBE_INTERVAL_S = 60
 # doesn't answer, so 'Client already exists and is active' means the old client
 # is genuinely still alive and no amount of backoff will clear it.
 _REREGISTER_BACKOFF_S = 30
+# Ceiling on a usage-shard write. The maintenance loop flushes before it does
+# anything else, so a wedged PVC must cost it two tick periods, not the rest of
+# the replica's life.
+_USAGE_FLUSH_TIMEOUT_S = 10
 # How long a dropped socket is left to hypha-rpc before we probe it. The
 # library reconnects and re-registers on its own; rebuilding our client while
 # it is mid-reconnect abandons the connection it is repairing and starts a
@@ -72,6 +83,18 @@ _PERMANENT_ERROR_MARKERS = ("wrong workspace",)
 
 class _PermanentRegistrationError(RuntimeError):
     """Registration failed for a reason no amount of retrying will fix."""
+
+
+# Zero replicas is the correct idle state under ``min_replicas: 0``, so a replica
+# count alone cannot tell a crash from a deliberate scale-down. UPSCALING is the
+# state a scaled-to-zero deployment enters when a request wakes it; deregistering
+# there would remove the service during the very wake-up it is meant to allow.
+_SERVICEABLE_AT_ZERO_REPLICAS = ("HEALTHY", "UPSCALING", "DOWNSCALING")
+
+
+def _is_serviceable(running: int, status: str) -> bool:
+    """Whether a sibling deployment can serve a request, now or after an upscale."""
+    return running > 0 or status in _SERVICEABLE_AT_ZERO_REPLICAS
 
 
 # ``ray_actor_options`` is intentionally minimal here. The proxy needs a
@@ -288,13 +311,12 @@ class ProxyDeployment:
 
         # App-serviceable gate: the proxy registers its Hypha service only once
         # every sibling deployment (all deployments in this app but the proxy
-        # itself) has a RUNNING replica, read out-of-band from the Serve
-        # controller so a saturated app never blocks or fails the check.
+        # itself) is serviceable, read out-of-band from the Serve controller so
+        # a saturated app never blocks or fails the check.
         self.entry_deployment_ready = False
         self._own_deployment_name: Optional[str] = None
-        # Per-sibling "seen RUNNING at least once" latch: a deployment only
-        # fails the gate after first coming up, so a slow initial start doesn't
-        # deregister a not-yet-ready app.
+        # Per-sibling "seen serviceable at least once" latch, so a slow initial
+        # start doesn't deregister a not-yet-ready app.
         self._dep_seen_ready: Dict[str, bool] = {}
 
         # Custom ICE servers for WebRTC (None means fetch from default URL)
@@ -332,9 +354,78 @@ class ProxyDeployment:
         # Lock for service registration
         self._registration_lock = asyncio.Lock()
 
+        self._usage_flush_lock = asyncio.Lock()
+        self._usage_ledger = self._open_usage_ledger(replica_id)
+
     async def get_app_data(self) -> Dict[str, Any]:
         """Return non-secret application metadata used for worker recovery."""
         return self.app_data
+
+    # ===== Usage Accounting =====
+    # The proxy is the only place every Hypha-exposed call to every app passes
+    # through, and the only one holding the caller context, so it is where a
+    # count that outlives the Ray session can be taken. See
+    # :mod:`bioengine.apps.usage_ledger`.
+
+    def _open_usage_ledger(self, replica_id: Optional[str]) -> Optional[UsageLedger]:
+        app_dir = os.environ.get("BIOENGINE_APP_DIR")
+        if not app_dir:
+            logger.info(
+                f"ℹ️ BIOENGINE_APP_DIR is unset; usage for '{self.application_id}' "
+                f"will not be counted."
+            )
+            return None
+        try:
+            return UsageLedger(
+                directory=ledger_dir_for_app(app_dir),
+                writer_id=replica_id or f"pid{os.getpid()}-{uuid.uuid4().hex[:8]}",
+                metadata={
+                    "application_id": self.application_id,
+                    "workspace": self.workspace,
+                    "artifact_id": self.app_data.get("artifact_id"),
+                    "app_version": self.app_data.get("version"),
+                    "worker_service_id": os.environ.get(
+                        "BIOENGINE_WORKER_SERVICE_ID"
+                    ),
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not open the usage ledger for '{self.application_id}': {e}"
+            )
+            return None
+
+    def _record_usage(self, method_name: str, caller_class: str, event: str) -> None:
+        if self._usage_ledger is None:
+            return
+        try:
+            self._usage_ledger.record(method_name, caller_class, event)
+        except Exception as e:
+            logger.warning(f"⚠️ Could not record '{event}' usage: {e}")
+
+    async def _flush_usage(self) -> None:
+        """Persist pending counts without touching the event loop's thread.
+
+        Shards live on cluster storage that can stall; a synchronous write here
+        would put that stall on the request path, and an unbounded wait for the
+        executor would put it on the maintenance loop instead — which calls this
+        first and is the only thing that re-registers a dropped Hypha client.
+        """
+        if self._usage_ledger is None or not self._usage_ledger.dirty:
+            return
+        try:
+            async with self._usage_flush_lock:
+                revision, payload = self._usage_ledger.serialize()
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, self._usage_ledger.write, revision, payload
+                    ),
+                    timeout=_USAGE_FLUSH_TIMEOUT_S,
+                )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not flush the usage ledger for '{self.application_id}': {e}"
+            )
 
     async def update_authorized_users(
         self, authorized_users: Dict[str, List[str]]
@@ -480,6 +571,14 @@ class ProxyDeployment:
             # between this check and the acquire below, making the decision
             # race-free.
             if self.service_semaphore.locked():
+                # Counted, because attempted saturates at max_ongoing_requests
+                # once a deployment wedges — without this every further real
+                # call during the wedge leaves no trace at all.
+                self._record_usage(
+                    method_name,
+                    classify_caller(context, self.workspace, self.authorized_users),
+                    "rejected",
+                )
                 logger.warning(
                     f"⚠️ '{self.application_id}' at capacity "
                     f"({self.max_ongoing_requests} concurrent requests); "
@@ -512,17 +611,30 @@ class ProxyDeployment:
                     if wants_context:
                         kwargs = {**kwargs, "context": _context_to_plain_dict(context)}
 
+                    caller_class = classify_caller(
+                        context, self.workspace, self.authorized_users
+                    )
+                    # Recorded before dispatch, so a call the entry deployment
+                    # never returns still shows up as attempted — the gap
+                    # between attempted and answered is the signal a wedged
+                    # deployment leaves behind.
+                    self._record_usage(method_name, caller_class, "attempted")
                     try:
                         result = await method.remote(*args, **kwargs)
-                        logger.info(
-                            f"✅ Successfully executed method '{method_name}' for user {user_id}"
-                        )
-                        return result
                     except RayTaskError as e:
+                        self._record_usage(method_name, caller_class, "failed")
                         logger.error(
                             f"❌ Ray task error in method '{method_name}': {e}"
                         )
                         raise
+                    except BaseException:
+                        self._record_usage(method_name, caller_class, "failed")
+                        raise
+                    self._record_usage(method_name, caller_class, "answered")
+                    logger.info(
+                        f"✅ Successfully executed method '{method_name}' for user {user_id}"
+                    )
+                    return result
 
                 except PermissionError as e:
                     logger.warning(
@@ -932,6 +1044,58 @@ class ProxyDeployment:
         """
         return self.rtc_service_id
 
+    @schema_method
+    async def get_usage_stats(
+        self,
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> Dict[str, Any]:
+        """
+        Returns this application's cumulative call counts since it was first deployed on this site.
+
+        The counts outlive replica restarts, pod rolls and version bumps — unlike Ray Serve
+        replica logs, which are destroyed whenever the Ray session restarts. They are read from
+        durable per-writer shards on the cluster's application storage and summed on every call.
+
+        Four counters are kept per method and per caller class:
+        - attempted: the call was authorized and dispatched to the application
+        - answered: the application returned a result. This is application completion, not
+          client receipt — a caller whose own RPC timed out still increments it.
+        - failed: the application raised, or the call was cancelled
+        - rejected: the call was turned away at the concurrency limit and never dispatched
+
+        attempted minus answered minus failed is the number of calls that were dispatched and
+        never came back — the signature of a deployment that wedged mid-request. attempted
+        stops rising at max_ongoing_requests once that happens, so rejected is what carries
+        the size of the demand the wedge is refusing.
+
+        Caller classes are coarse by design, and no caller identity is ever recorded:
+        - internal: the caller holds a grant on the workspace hosting the application, or is
+          named in a non-public authorized-users rule. Read access counts, so the external
+          figure is a floor rather than an estimate.
+        - external: any other authenticated caller
+        - anonymous: the caller was not authenticated by Hypha
+
+        Counts are per site. A deployment of the same application on another cluster keeps its
+        own independent counters; a cross-site total means asking each site and adding them up.
+
+        Returns:
+            Dict[str, Any]: Cumulative totals, the same figures split by caller class and by
+                            method, the application versions observed, and how many shards
+                            were read.
+        """
+        await self._check_permissions(context, method_name="get_usage_stats")
+        if self._usage_ledger is None:
+            return {"available": False, "reason": "no durable application storage"}
+        await self._flush_usage()
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(
+            None, read_usage, self._usage_ledger.directory
+        )
+        return {"available": True, "application_id": self.application_id, **stats}
+
     async def _deregister_services(self) -> None:
         """Unregister all Hypha services and reset connection state.
 
@@ -1087,6 +1251,9 @@ class ProxyDeployment:
             # Add RTC service ID function - for WebRTC service ID retrieval
             service_functions["get_rtc_service_id"] = self._get_rtc_service_id
 
+            # Add cumulative usage counts - survives the Ray session
+            service_functions["get_usage_stats"] = self.get_usage_stats
+
             # Register the main service
             websocket_service_info = await self.server.register_service(
                 {
@@ -1208,6 +1375,10 @@ class ProxyDeployment:
 
         Kept separate from the sleeping loop so it can be driven directly.
         """
+        # Ahead of the readiness gate: counts taken before a sibling dropped out
+        # must still reach disk.
+        await self._flush_usage()
+
         if not self.entry_deployment_ready:
             # Not serviceable yet, or deregistered because a sibling went
             # down. check_health owns that gate; nothing to maintain.
@@ -1285,10 +1456,10 @@ class ProxyDeployment:
     # ===== Ray Serve Health Check =====
     # Implements periodic health checks for Ray Serve.
 
-    async def _sibling_running_counts(self) -> Optional[Dict[str, int]]:
-        """RUNNING replica count of every sibling deployment (all deployments in
-        this app but the proxy itself), read out-of-band from the Serve
-        controller.
+    async def _sibling_states(self) -> Optional[Dict[str, Tuple[int, str]]]:
+        """``(RUNNING replica count, deployment status)`` for every sibling
+        deployment (all deployments in this app but the proxy itself), read
+        out-of-band from the Serve controller.
 
         The controller already health-checks every replica; this reads that
         collected state and never issues an in-band request, so a saturated app
@@ -1296,6 +1467,9 @@ class ProxyDeployment:
         Returns ``None`` when the status can't be determined (controller
         mid-restart, app not yet in the view) — the caller treats ``None`` as
         "unknown" and never deregisters on it.
+
+        The status is carried because the replica count alone cannot separate a
+        deployment idling at ``min_replicas: 0`` from one that crashed to zero.
         """
         from ray import serve as _serve
 
@@ -1305,22 +1479,24 @@ class ProxyDeployment:
             except Exception:
                 self._own_deployment_name = None
 
-        def _query() -> Optional[Dict[str, int]]:
+        def _query() -> Optional[Dict[str, Tuple[int, str]]]:
             app = _serve.status().applications.get(self.application_id)
             if app is None:
                 return None
-            counts: Dict[str, int] = {}
+            states: Dict[str, Tuple[int, str]] = {}
             for name, deployment in app.deployments.items():
                 if name == self._own_deployment_name:
                     continue
-                counts[name] = sum(
+                running = sum(
                     count
                     for state, count in deployment.replica_states.items()
                     if str(getattr(state, "value", state)) == "RUNNING"
                 )
-            return counts
+                status = str(getattr(deployment.status, "value", deployment.status))
+                states[name] = (running, status)
+            return states
 
-        def _read() -> Optional[Dict[str, int]]:
+        def _read() -> Optional[Dict[str, Tuple[int, str]]]:
             try:
                 return _query()
             except Exception:
@@ -1356,7 +1532,7 @@ class ProxyDeployment:
         Health Check Process:
         1. Surfaces a permanent Hypha registration failure (bad config or
            rejected credentials), the one connection problem retrying cannot fix
-        2. Gates the Hypha service on every sibling deployment being RUNNING
+        2. Gates the Hypha service on every sibling deployment being serviceable
         3. Rotates WebRTC TURN credentials and sweeps abandoned peer connections
 
         Raises:
@@ -1373,27 +1549,23 @@ class ProxyDeployment:
 
         self._ensure_maintenance_task()
 
-        # Gate the Hypha service on the app being serviceable: register only
-        # while every sibling deployment (entry + any runtimes) has a RUNNING
-        # replica. Read out-of-band from the Serve controller — a saturated app
-        # neither blocks nor fails this check, and the probe never counts
-        # against any deployment's ``max_ongoing_requests``. Ray's own controller
-        # already health-checks each replica; a sibling that crashes or whose
-        # ``health_check`` raises drops out of the RUNNING count here.
-        counts = await self._sibling_running_counts()
+        # Read out-of-band from the Serve controller, so the probe never counts
+        # against any deployment's ``max_ongoing_requests`` and a saturated app
+        # can neither block nor fail it.
+        states = await self._sibling_states()
 
         if not self.entry_deployment_ready:
-            if counts and all(running > 0 for running in counts.values()):
+            if states and all(_is_serviceable(*s) for s in states.values()):
                 self.entry_deployment_ready = True
-                for dep in counts:
+                for dep in states:
                     self._dep_seen_ready[dep] = True
                 logger.info(
-                    f"✅ All deployments of app '{self.application_id}' are RUNNING."
+                    f"✅ All deployments of app '{self.application_id}' are serviceable."
                 )
             else:
                 pending = (
-                    [dep for dep, running in counts.items() if running == 0]
-                    if counts
+                    [dep for dep, s in states.items() if not _is_serviceable(*s)]
+                    if states
                     else "unknown"
                 )
                 logger.info(
@@ -1401,19 +1573,18 @@ class ProxyDeployment:
                     f"(pending: {pending})."
                 )
                 return
-        elif counts is not None:
-            # A sibling that came up and then dropped to zero means the app can
-            # no longer serve: deregister so the service disappears from Hypha,
-            # and re-gate. The outage stays visible in the app status via the
-            # down deployment itself, so the proxy need not fail its own health.
-            for dep, running in counts.items():
-                if running > 0:
+        elif states is not None:
+            # Deregister so the service disappears from Hypha, and re-gate. The
+            # outage stays visible in the app status via the down deployment
+            # itself, so the proxy need not fail its own health.
+            for dep, (running, status) in states.items():
+                if _is_serviceable(running, status):
                     self._dep_seen_ready[dep] = True
-                elif running == 0 and self._dep_seen_ready.get(dep):
+                elif self._dep_seen_ready.get(dep):
                     logger.error(
                         f"❌ Deployment '{dep}' of app '{self.application_id}' has "
-                        f"no RUNNING replica. Deregistering Hypha service until it "
-                        f"recovers."
+                        f"no RUNNING replica and is not serviceable (status: "
+                        f"{status}). Deregistering Hypha service until it recovers."
                     )
                     await self._deregister_services()
                     return
@@ -1461,6 +1632,7 @@ class ProxyDeployment:
         if self._maintenance_task is not None:
             self._maintenance_task.cancel()
             self._maintenance_task = None
+        await self._flush_usage()
         try:
             await self._deregister_services()
         except Exception as e:

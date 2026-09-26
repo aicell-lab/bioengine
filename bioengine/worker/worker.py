@@ -16,6 +16,12 @@ from pydantic import Field
 from bioengine import __version__
 from bioengine.apps.manager import AppsManager
 from bioengine.datasets import BioEngineDatasets
+from bioengine.heartbeat import (
+    DEFAULT_HEARTBEAT_PATH,
+    STARTUP_STALE_AFTER_SECONDS,
+    heartbeat_stale_after_seconds,
+    write_heartbeat,
+)
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.utils import (
     fetch_centroid_coordinates,
@@ -25,6 +31,34 @@ from bioengine.utils import (
     create_logger,
 )
 from bioengine.worker.code_executor import CodeExecutor
+
+# How often the worker asks Hypha whether it still serves the worker's own
+# service. hypha-rpc keeps the socket alive and re-registers on reconnect, so
+# this exists only for the case the library cannot signal: Hypha dropped this
+# client while the socket stayed open from our side, so echo("ping") keeps
+# answering against a server that has stopped serving us.
+_REGISTRATION_PROBE_INTERVAL_S = 60
+# Bound on the probe itself: an unanswered round trip must not hold up the rest
+# of the monitoring tick.
+_REGISTRATION_PROBE_TIMEOUT_S = 10
+# How long the worker's own service may stay unreachable before the check
+# escalates. Hypha routinely serves nothing for a minute or two and recovers by
+# itself, and reporting a worker degraded through that costs more than waiting;
+# five minutes of failed re-registration is a real fault. Once past this the
+# check raises every tick, so the degraded threshold (5 ticks) is reached one
+# monitoring interval at a time.
+_REGISTRATION_GRACE_S = 300
+# The grace above resets on any successful probe, so a registration that answers
+# intermittently never escalates and never logs. These bound a second, purely
+# observational window that does NOT reset on success: enough failure episodes
+# inside it and the worker says so once.
+_REGISTRATION_FLAP_WINDOW_S = 3600
+_REGISTRATION_FLAP_THRESHOLD = 5
+# Bound on disconnect() while rebuilding the connection. The transport being
+# closed there is the one already suspected of being wedged, so an unbounded
+# close can stall the monitoring loop on exactly the socket that prompted the
+# rebuild.
+_DISCONNECT_TIMEOUT_S = 5.0
 
 
 class BioEngineWorker:
@@ -92,6 +126,7 @@ class BioEngineWorker:
           dashboard_url (str): URL of the BioEngine dashboard for worker management
           monitoring_interval_seconds (int): Interval for status monitoring and health checks
           log_file (Optional[str]): Path to log file for structured logging output
+          heartbeat_file (Path): File rewritten after every completed monitoring pass
           graceful_shutdown_timeout (int): Timeout in seconds for graceful shutdown operations
           server_url (str): URL of the Hypha server for service registration
           workspace (str): Hypha workspace name for service isolation
@@ -161,6 +196,8 @@ class BioEngineWorker:
         # Logger configuration
         log_file: Optional[Union[str, Path]] = None,
         debug: bool = False,
+        # Liveness heartbeat file
+        heartbeat_file: Optional[Union[str, Path]] = None,
         # Graceful shutdown timeout
         graceful_shutdown_timeout: int = 60,
     ):
@@ -221,6 +258,12 @@ class BioEngineWorker:
             log_file: File path for structured logging output. Auto-generated timestamp-based
                      filename if not specified.
             debug: Enable debug-level logging for detailed troubleshooting and development.
+            heartbeat_file: File the monitoring loop rewrites after every completed
+                     pass, for a purely local liveness probe to read with
+                     `python -m bioengine.heartbeat <path>`. Defaults to
+                     'bioengine_worker_heartbeat.json' in the system temporary
+                     directory ($TMPDIR), which is node-local; the probe and the
+                     writing event loop must never wait on a network filesystem.
             graceful_shutdown_timeout: Timeout in seconds for graceful shutdown operations.
 
         Raises:
@@ -253,6 +296,10 @@ class BioEngineWorker:
         else:
             self.log_file = Path(log_file)
 
+        self.heartbeat_file = (
+            Path(heartbeat_file) if heartbeat_file else DEFAULT_HEARTBEAT_PATH
+        )
+
         self.logger = create_logger(
             name=self.__class__.__name__,
             level=logging.DEBUG if debug else logging.INFO,
@@ -275,15 +322,18 @@ class BioEngineWorker:
         # Worker state management
         self.start_time = None
         self._last_monitoring = 0
+        self._registration_probe_due_at = 0.0
+        self._registration_failing = False
+        self._registration_ok_at = time.time()
+        # Flap detection, on a clock that deliberately never resets on success.
+        self._registration_window_start = self._registration_ok_at
+        self._registration_window_failures = 0
 
-        # Backstop for the in-place Serve recovery in
-        # ``AppsManager.monitor_applications``: after this many consecutive
-        # monitoring-loop failures the worker reports not-ready (get_status)
-        # so the k8s liveness probe cycles the pod. In-place recovery handles
-        # the common Ray-head-restart case (redeploy bootstraps a fresh Serve
-        # controller); this covers the residue it can't — e.g. an app with no
-        # cached built_app, or a redeploy that keeps failing — where a fresh
-        # pod is the only way out.
+        # After this many consecutive monitoring-loop failures get_status
+        # reports the worker not-ready, so dashboards and callers can see a
+        # degraded worker. The loop keeps running and usually recovers; a
+        # loop that has stopped running entirely is caught by the heartbeat
+        # file instead, since a frozen loop never reaches this counter.
         self._monitor_consecutive_errors = 0
         self._monitor_degraded_threshold = 5
 
@@ -554,7 +604,9 @@ class BioEngineWorker:
         if self.server:
             self.logger.debug("Closing existing Hypha server connection")
             try:
-                await self.server.disconnect()
+                await asyncio.wait_for(
+                    self.server.disconnect(), timeout=_DISCONNECT_TIMEOUT_S
+                )
             except Exception as e:
                 self.logger.error(f"Error closing Hypha server connection: {e}")
 
@@ -675,18 +727,157 @@ class BioEngineWorker:
                 f"Service ID mismatch: {self.full_service_id} (expected) vs {service_info.id} (registered)"
             )
 
-    async def _check_hypha_connection(self, reconnect: bool = True) -> None:
+    async def _probe_service_registration(self) -> Optional[Exception]:
+        """Ask Hypha whether it still serves this worker's own service id.
+
+        Returns the failure instead of raising it: both callers below decide
+        what a failure means from where they are in the repair, not from the
+        exception.
+        """
         try:
-            await asyncio.wait_for(self.server.echo("ping"), timeout=10)
-        except Exception as e:
-            if reconnect:
+            await asyncio.wait_for(
+                self.server.get_service_info(self.full_service_id),
+                timeout=_REGISTRATION_PROBE_TIMEOUT_S,
+            )
+            return None
+        except Exception as exc:
+            return exc
+
+    def _absorb_or_condemn_registration(self, error: Exception, log) -> None:
+        unreachable_for = time.time() - self._registration_ok_at
+        if unreachable_for >= _REGISTRATION_GRACE_S:
+            raise RuntimeError(
+                f"Hypha service '{self.full_service_id}' has been unreachable "
+                f"for {unreachable_for:.0f}s and cannot be restored: {error}"
+            ) from error
+        log(
+            f"Failed to restore the Hypha service registration, retrying next "
+            f"tick: {error}"
+        )
+
+    async def _check_service_registration(self) -> None:
+        """Keep this worker's Hypha service reachable, and rebuild the client
+        when it is not.
+
+        This is the only Hypha liveness check in the monitoring loop. It
+        subsumes a plain ``echo`` probe: anything that kills the socket also
+        fails this one, while the reverse is not true. A freeze long enough for
+        Hypha to evict this client leaves the socket open from our side, so
+        ``echo`` keeps answering while
+        ``<workspace>/<client-id>:bioengine-worker`` has stopped resolving for
+        everyone else. Asking whether our own registration is still served is
+        the only signal that separates the two.
+
+        The repair is always a full rebuild — disconnect, reconnect, register.
+        Re-registering on the client we already hold looks cheaper and cannot
+        work: ``hypha_rpc`` keeps a local service registry that a server-side
+        eviction never touches, so ``register_service`` on that client fails
+        with *Service already exists* however the server feels about us. A
+        fresh client starts with an empty registry, and is also the only thing
+        that can restore an evicted *client* rather than an evicted service.
+
+        A repair counts only once the probe answers again. Reconnecting and
+        registering can both succeed locally while the service stays
+        unresolvable; believing that would refill the grace clock every tick
+        and make the escalation below unreachable.
+
+        While healthy the probe costs one round trip per
+        ``_REGISTRATION_PROBE_INTERVAL_S``. While failing the throttle is
+        dropped and it retries every tick, so a dead registration is detected
+        within one probe interval and then repaired at the monitoring interval
+        rather than once a minute.
+
+        Transient Hypha outages must not condemn the worker — Hypha can serve
+        nothing for minutes and recover on its own — so failures are absorbed
+        silently for ``_REGISTRATION_GRACE_S``. Past that this raises, which
+        feeds the monitoring loop's degraded counter; at the degraded threshold
+        ``get_status`` reports the worker not-ready.
+
+        Nothing acts on that report today. The deployed liveness probe is a
+        local PID check that never reads readiness, and ``get_status`` is
+        served by the very registration that has been evicted, so in the case
+        this check exists for there is no one left to ask. Escalating is
+        therefore a log line and a status flag, not a restart; the restart
+        needs an external consumer that does not yet exist.
+
+        The grace is a deadline, not a budget, and it measures **continuous**
+        unreachability: any successful probe resets it. A flapping connection
+        therefore never condemns the worker, which is deliberate — a probe that
+        answers means the service really was resolvable at that instant, and
+        every other check in the monitoring loop resets on a clean tick too.
+        Counting attempts instead would be strictly worse: a flap refills an
+        attempt budget faster than it can be spent, so the escalation would be
+        unreachable exactly when the connection is worst.
+
+        That leaves one thing invisible, so it is reported separately: a
+        registration that answers one probe in ten never condemns and never
+        produces a line anyone reads. The flap window below counts failure
+        *episodes* on a clock that does *not* reset on success, and only ever
+        warns.
+        """
+        if not self.server or not self.full_service_id:
+            return
+
+        now = time.time()
+        # Only throttle while healthy; a failing registration is retried on
+        # every tick, which is also what feeds the degraded counter.
+        if not self._registration_failing and now < self._registration_probe_due_at:
+            return
+        self._registration_probe_due_at = now + _REGISTRATION_PROBE_INTERVAL_S
+
+        if now - self._registration_window_start >= _REGISTRATION_FLAP_WINDOW_S:
+            if self._registration_window_failures >= _REGISTRATION_FLAP_THRESHOLD:
                 self.logger.warning(
-                    f"Hypha server connection error. Attempting to reconnect..."
+                    f"Hypha service registration for '{self.full_service_id}' "
+                    f"failed {self._registration_window_failures} times in the "
+                    f"last {(now - self._registration_window_start) / 60:.0f} "
+                    f"minutes but recovered each time. The connection is "
+                    f"flapping; this never reaches the degraded threshold "
+                    f"because every recovery resets it."
                 )
-                await self._connect_to_server()
-                await self._register_bioengine_worker_service()
-            else:
-                raise RuntimeError(f"Hypha server connection error: {e}")
+            self._registration_window_start = now
+            self._registration_window_failures = 0
+
+        probe_error = await self._probe_service_registration()
+        if probe_error is None:
+            if self._registration_failing:
+                self.logger.info(
+                    f"Hypha serves '{self.full_service_id}' again after "
+                    f"{now - self._registration_ok_at:.0f}s."
+                )
+            self._registration_failing = False
+            self._registration_ok_at = now
+            return
+
+        first_failure = not self._registration_failing
+        self._registration_failing = True
+        if first_failure:
+            self._registration_window_failures += 1
+
+        # Only the first failure of a streak is a warning. A Hypha outage is
+        # retried every tick, and logging each attempt would bury the recovery.
+        log = self.logger.warning if first_failure else self.logger.debug
+        log(
+            f"Hypha no longer serves '{self.full_service_id}' ({probe_error}). "
+            "Rebuilding the connection and re-registering..."
+        )
+        try:
+            await self._connect_to_server()
+            await self._register_bioengine_worker_service()
+        except Exception as repair_error:
+            self._absorb_or_condemn_registration(repair_error, log)
+            return
+
+        probe_error = await self._probe_service_registration()
+        if probe_error is not None:
+            self._absorb_or_condemn_registration(probe_error, log)
+            return
+
+        self._registration_failing = False
+        self._registration_ok_at = time.time()
+        self.logger.info(
+            f"Re-registered BioEngine worker service '{self.full_service_id}'."
+        )
 
     async def _check_token_expiry(self) -> None:
         if self._token_expires_at - time.time() < 3600:
@@ -804,6 +995,17 @@ class BioEngineWorker:
         # Signal that the worker has completed cleanup
         self._shutdown_event.set()
 
+    def _touch_heartbeat(self, stale_after_seconds: float) -> None:
+        """Write the liveness heartbeat, overwriting any previous run's."""
+        try:
+            write_heartbeat(self.heartbeat_file, stale_after_seconds)
+        except Exception as e:
+            self.logger.error(
+                f"Failed to write heartbeat file {self.heartbeat_file}: {e}. "
+                f"The liveness probe reads this file, so it will report this "
+                f"worker dead until the path is writable."
+            )
+
     async def _create_monitoring_task(
         self,
         backoff_initial_seconds: float = 2.0,
@@ -826,7 +1028,9 @@ class BioEngineWorker:
                 the first error (doubles each subsequent consecutive error
                 until ``backoff_max_seconds``).
             backoff_max_seconds: Cap on the per-error sleep so a stuck
-                worker still polls roughly once a minute.
+                worker still polls roughly once a minute. Also widens the
+                heartbeat deadline, so a loop that is failing but still
+                cycling is never mistaken for a frozen one.
 
         Raises:
             Exception: Only on unexpected errors outside the monitoring
@@ -834,12 +1038,25 @@ class BioEngineWorker:
                 monitoring tick are handled and retried.
         """
         try:
+            # Start the registration grace clock here rather than at
+            # construction: startup takes minutes, so a clock started before
+            # the first probe can run is already spent when it does.
+            self._registration_ok_at = time.time()
+            self._registration_window_start = self._registration_ok_at
+
             # Signal that the worker is ready
             self.is_ready.set()
 
             self.logger.debug(
                 "Starting monitoring task with interval "
                 f"{self.monitoring_interval_seconds} seconds..."
+            )
+            stale_after_seconds = heartbeat_stale_after_seconds(
+                self.monitoring_interval_seconds, backoff_max_seconds
+            )
+            self.logger.info(
+                f"Writing liveness heartbeat to {self.heartbeat_file} after every "
+                f"completed monitoring pass (stale after {stale_after_seconds:.0f}s)"
             )
             self._monitor_consecutive_errors = 0
             while self.is_ready.is_set():
@@ -879,7 +1096,9 @@ class BioEngineWorker:
                     await _step("geo_location", self._fetch_geo_location())
 
                     # ===== 1. Hypha server connection check =====
-                    await _step("hypha_connection", self._check_hypha_connection())
+                    await _step(
+                        "service_registration", self._check_service_registration()
+                    )
                     await _step("token_expiry", self._check_token_expiry())
 
                     # ===== 2. Ray cluster monitoring =====
@@ -900,6 +1119,12 @@ class BioEngineWorker:
                         "applications_monitoring",
                         self.apps_manager.monitor_applications(),
                     )
+
+                    # Every step has returned control to the loop, so the loop
+                    # is alive even if some of them failed. Deliberately
+                    # outside the _step try/except and before the re-raise
+                    # below: a step that never returns must stop the beat.
+                    self._touch_heartbeat(stale_after_seconds)
 
                     if step_errors:
                         names = ", ".join(name for name, _ in step_errors)
@@ -940,18 +1165,15 @@ class BioEngineWorker:
                         f"(#{self._monitor_consecutive_errors} consecutive, "
                         f"sleeping {backoff:.0f}s before retry): {e}"
                     )
-                    # At the degraded threshold, get_status flips to not-ready
-                    # so the k8s liveness probe cycles the pod — the backstop
-                    # for when in-place Serve recovery can't clear the wedge.
                     if (
                         self._monitor_consecutive_errors
                         == self._monitor_degraded_threshold
                     ):
                         self.logger.error(
-                            f"Monitoring wedged for "
+                            f"Monitoring degraded for "
                             f"{self._monitor_consecutive_errors} consecutive ticks — "
-                            f"reporting worker not-ready so the liveness probe "
-                            f"restarts the pod."
+                            f"get_status now reports the worker not-ready. The loop "
+                            f"keeps retrying; nothing restarts it automatically."
                         )
                     await asyncio.sleep(backoff)
 
@@ -1023,6 +1245,10 @@ class BioEngineWorker:
         try:
             # Reset the shutdown event to allow starting the worker
             self._shutdown_event.clear()
+
+            # Claim the file before startup begins: a previous run's heartbeat
+            # must not read as fresh, and a missing file reads as dead.
+            self._touch_heartbeat(STARTUP_STALE_AFTER_SECONDS)
 
             # Set the start time for monitoring and uptime tracking
             self.start_time = time.time()
