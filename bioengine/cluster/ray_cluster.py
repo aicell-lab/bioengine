@@ -23,6 +23,8 @@ from bioengine.utils import (
     create_logger,
     date_format,
     get_internal_ip,
+    head_memory_budget_warning,
+    read_meminfo,
     stream_logging_format,
 )
 
@@ -93,6 +95,7 @@ class RayCluster:
         head_num_cpus: int = 0,
         head_num_gpus: int = 0,
         head_memory_in_gb: Optional[int] = None,
+        head_memory_budget_fraction: float = 0.9,
         runtime_env_pip_cache_size_gb: int = 30,  # Ray default is 10 GB
         force_clean_up: bool = True,
         enable_container_runtime: bool = False,
@@ -136,6 +139,10 @@ class RayCluster:
             head_num_cpus: Number of CPUs for head node (single-machine mode). Default 0.
             head_num_gpus: Number of GPUs for head node (single-machine mode). Default 0.
             head_memory_in_gb: Memory limit for head node in GB. If not set, Ray will auto-detect available memory.
+            head_memory_budget_fraction: Fraction of the host's MemTotal that the head
+                memory reservation plus the memory already held by other tenants of the
+                host may occupy before a startup warning is logged. Default 0.9. Set to
+                0 to disable the check. Never blocks startup.
             runtime_env_pip_cache_size_gb: Size of pip cache for runtime environments in GB. Default 30.
             force_clean_up: Force cleanup of previous Ray cluster on start. Default True.
             enable_container_runtime: Opt-in container-as-runtime for apps
@@ -245,6 +252,7 @@ class RayCluster:
                         if head_memory_in_gb is not None
                         else None
                     ),
+                    "head_memory_budget_fraction": float(head_memory_budget_fraction),
                     "redis_password": str(redis_password or os.urandom(16).hex()),
                     "force_clean_up": bool(force_clean_up),
                 }
@@ -721,6 +729,32 @@ class RayCluster:
             return None
         return mems[0]
 
+    def _check_head_memory_budget(self) -> None:
+        """Log a warning if the head memory reservation does not fit the host.
+
+        Advisory only: any failure to read or compare is swallowed, and a
+        warning never stops the cluster from starting.
+        """
+        reserved_gb = self.ray_cluster_config["head_memory_in_gb"]
+        if reserved_gb is None:
+            return
+        try:
+            meminfo = read_meminfo()
+            warning = head_memory_budget_warning(
+                reserved_gb=reserved_gb,
+                mem_total_bytes=meminfo["MemTotal"],
+                mem_available_bytes=meminfo["MemAvailable"],
+                budget_fraction=self.ray_cluster_config[
+                    "head_memory_budget_fraction"
+                ],
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not check the head memory budget: {e}")
+            return
+
+        if warning:
+            self.logger.warning(warning)
+
     async def _start_cluster(self) -> None:
         """Start Ray cluster head node with configured ports and resources.
 
@@ -757,6 +791,8 @@ class RayCluster:
             # GPU apps can run inside their image (single-machine mode only).
             if self.enable_container_runtime:
                 await self._generate_cdi_spec()
+
+            self._check_head_memory_budget()
 
             # Start ray as the head node with the specified parameters
             args = [
