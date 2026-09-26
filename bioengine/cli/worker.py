@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -68,6 +69,7 @@ def build_command(
     shm_size: str,
     gpus: bool,
     detach: bool,
+    tty: bool,
 ) -> List[str]:
     """Build the container invocation. Secrets travel in the environment, never argv."""
     entrypoint = ["python", "-m", "bioengine.worker", *worker_args]
@@ -83,7 +85,7 @@ def build_command(
         return command + [f"docker://{image}", *entrypoint]
 
     command = [runtime, "run", "--rm"]
-    command += ["--detach"] if detach else ["-it"]
+    command += ["--detach"] if detach else ["-it" if tty else "-i"]
     command += ["--name", container_name]
     command += ["--user", f"{os.getuid()}:{os.getgid()}"]
     command += ["--shm-size", shm_size]
@@ -94,6 +96,41 @@ def build_command(
         if os.environ.get(name):
             command += ["-e", name]
     return command + [image, *entrypoint]
+
+
+_SECRET_OPTION_HINTS = ("token", "password", "secret")
+
+
+def _is_secret_option(arg: str) -> bool:
+    return arg.startswith("-") and any(hint in arg.lower() for hint in _SECRET_OPTION_HINTS)
+
+
+def redact_secrets(command: List[str]) -> List[str]:
+    """Mask credential-bearing option values so the command can be printed."""
+    redacted = []
+    mask_next = False
+    for arg in command:
+        if mask_next:
+            redacted.append("<redacted>")
+            mask_next = False
+            continue
+        name, separator, _ = arg.partition("=")
+        if separator and _is_secret_option(name):
+            redacted.append(f"{name}=<redacted>")
+            continue
+        if _is_secret_option(arg):
+            mask_next = True
+        redacted.append(arg)
+    return redacted
+
+
+def _container_exists(runtime: str, container_name: str) -> bool:
+    result = subprocess.run(
+        [runtime, "ps", "--all", "--quiet", "--filter", f"name=^{container_name}$"],
+        capture_output=True,
+        text=True,
+    )
+    return bool(result.stdout.strip())
 
 
 def _subprocess_env(runtime: str, token: Optional[str], server_url: Optional[str]) -> dict:
@@ -186,7 +223,11 @@ def worker_group():
     help="Hypha auth token (or HYPHA_TOKEN env var). Passed via the environment, not the command line.",
 )
 @click.option("--server-url", envvar="BIOENGINE_SERVER_URL", default=None, hidden=True)
-@click.option("--dry-run", is_flag=True, help="Print the command instead of running it.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the command instead of running it. Credential values are masked.",
+)
 def worker_start(
     worker_args,
     runtime,
@@ -235,11 +276,19 @@ def worker_start(
         shm_size=shm_size,
         gpus=gpus,
         detach=detach,
+        tty=sys.stdin.isatty(),
     )
 
     if dry_run:
-        click.echo(" ".join(command))
+        click.echo(" ".join(redact_secrets(command)))
         return
+
+    if runtime in ("docker", "podman") and _container_exists(runtime, container_name):
+        error_exit(
+            f"A container named '{container_name}' already exists.",
+            f"Stop it with 'bioengine worker stop --name {container_name}', "
+            f"or start this one under a different --name.",
+        )
 
     env = _subprocess_env(runtime, token, server_url)
     try:

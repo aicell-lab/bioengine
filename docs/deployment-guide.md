@@ -40,6 +40,7 @@ bioengine worker stop
 | `--runtime` | `auto` | `docker`, `podman`, `apptainer`, or `native` to run the worker in the current environment instead of a container |
 | `--image` | `ghcr.io/aicell-lab/bioengine-worker:<version>` | Worker image |
 | `--workspace-dir` | `~/.bioengine` | Host directory mounted at `/.bioengine` |
+| `--name` | `bioengine-worker` | Container name. Starting a second worker while this name is taken is refused — give it a different `--name` |
 | `--gpus` / `--no-gpus` | on when `nvidia-smi` is present | Whether to give the container GPUs |
 | `--shm-size` | `8g` | Shared memory size |
 | `--detach` / `-d` | off | Run in the background |
