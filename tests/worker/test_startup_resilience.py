@@ -5,12 +5,16 @@ exit the worker on the first refusal, and startup applications, where one
 application's failure used to abort the whole worker.
 """
 
+import asyncio
+import inspect
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from bioengine.apps import manager as manager_module
 from bioengine.apps.manager import AppsManager
+from bioengine.heartbeat import heartbeat_stale_after_seconds
 from bioengine.utils import connect_with_retry, is_transient_connect_error
 from bioengine.utils import network as network_module
 from bioengine.worker import worker as worker_module
@@ -240,3 +244,79 @@ async def test_a_failed_startup_application_is_retried(monkeypatch):
     )
 
     assert attempts == ["ws/model-runner"] * 3
+
+
+class _VirtualClock:
+    """Charges every bound the repair path waits on, without waiting."""
+
+    def __init__(self):
+        self.elapsed = 0.0
+
+    def now(self) -> float:
+        return self.elapsed
+
+    async def sleep(self, seconds: float) -> None:
+        self.elapsed += seconds
+
+
+class _UnreachableHypha:
+    """Answers nothing, charging the clock the timeouts the worker enforces."""
+
+    def __init__(self, clock: _VirtualClock):
+        self._clock = clock
+
+    async def get_service_info(self, _service_id):
+        await self._clock.sleep(worker_module._REGISTRATION_PROBE_TIMEOUT_S)
+        raise asyncio.TimeoutError("probe timed out")
+
+    async def disconnect(self):
+        await self._clock.sleep(worker_module._DISCONNECT_TIMEOUT_S)
+        raise asyncio.TimeoutError("disconnect timed out")
+
+
+def _default(func, name):
+    return inspect.signature(func).parameters[name].default
+
+
+async def test_a_reconnect_pass_fits_inside_the_heartbeat_deadline(monkeypatch):
+    """A monitoring-loop repair must finish before its own heartbeat goes stale.
+
+    The repair shares ``_connect_to_server`` with startup, so it also shares
+    whatever retry budget startup needs. Running the real probe and the real
+    reconnect against a Hypha that answers nothing, with every bound they
+    enforce charged to one clock, measures what one failing pass costs the
+    monitoring loop.
+    """
+    clock = _VirtualClock()
+    monkeypatch.setattr(network_module, "asyncio", SimpleNamespace(sleep=clock.sleep))
+    monkeypatch.setattr(network_module, "time", SimpleNamespace(monotonic=clock.now))
+
+    async def refused(_config):
+        raise ConnectionRefusedError(111, "Connect call failed")
+
+    monkeypatch.setattr(worker_module, "connect_to_server", refused)
+
+    worker = BioEngineWorker.__new__(BioEngineWorker)
+    worker.logger = _RecordingLogger()
+    worker.server = _UnreachableHypha(clock)
+    worker.server_url = "http://hypha:9520"
+    worker._token = "token"
+    worker.workspace = "ws"
+    worker.client_id = "worker"
+    worker.full_service_id = "ws/worker:bioengine-worker"
+    worker._registration_failing = False
+    worker._registration_probe_due_at = 0.0
+    worker._registration_ok_at = time.time()
+    worker._registration_window_start = time.time()
+    worker._registration_window_failures = 0
+
+    await worker._check_service_registration()
+
+    deadline = heartbeat_stale_after_seconds(
+        _default(BioEngineWorker.__init__, "monitoring_interval_seconds"),
+        _default(BioEngineWorker._create_monitoring_task, "backoff_max_seconds"),
+    )
+    assert clock.elapsed < deadline, (
+        f"one repair pass blocks the monitoring loop for {clock.elapsed:.0f}s, "
+        f"past the {deadline:.0f}s heartbeat deadline"
+    )

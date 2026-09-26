@@ -52,11 +52,21 @@ def is_transient_connect_error(error: BaseException) -> bool:
     return any(marker in message for marker in _TRANSIENT_CONNECT_MARKERS)
 
 
+# Retry budgets for connect_with_retry, split by call site. At startup nothing
+# is watching the worker yet, so it can wait out a server restart. A reconnect
+# runs inside one monitoring pass, and that pass — registration probe,
+# disconnect, retries and everything after — must still finish inside the
+# liveness heartbeat's staleness deadline (see bioengine.heartbeat; 120 s at
+# the default monitoring interval).
+STARTUP_CONNECT_BUDGET_S = 120.0
+RECONNECT_BUDGET_S = 15.0
+
+
 async def connect_with_retry(
     connect: Callable[[], Awaitable[T]],
     description: str,
     logger: logging.Logger,
-    total_seconds: float = 120.0,
+    total_seconds: float = RECONNECT_BUDGET_S,
     initial_delay: float = 2.0,
     max_delay: float = 15.0,
 ) -> T:
@@ -64,7 +74,7 @@ async def connect_with_retry(
 
     Both hypha_rpc and the Ray client reconnect an *established* connection,
     but neither retries the initial connect. A worker started inside a server's
-    restart window therefore exits on the first refusal; the default budget
+    restart window therefore exits on the first refusal; ``STARTUP_CONNECT_BUDGET_S``
     covers the observed ~45 s hypha-server restart gap with margin while
     staying well under the Kubernetes startup probe's own budget.
 
@@ -72,7 +82,9 @@ async def connect_with_retry(
         connect: Zero-argument coroutine function performing the connection.
         description: Used in the retry log line, e.g. "Connection to Hypha".
         logger: Logger for the retry messages.
-        total_seconds: Overall budget; the last attempt may start just before it expires.
+        total_seconds: Overall budget; the last attempt may start just before it
+            expires. Defaults to the reconnect budget; startup callers pass
+            ``STARTUP_CONNECT_BUDGET_S``.
         initial_delay: Delay before the second attempt, doubled thereafter.
         max_delay: Cap on the delay between attempts.
 

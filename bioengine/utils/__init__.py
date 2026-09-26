@@ -19,6 +19,8 @@ from .logger import (
     stream_logging_format,
 )
 from .network import (
+    RECONNECT_BUDGET_S,
+    STARTUP_CONNECT_BUDGET_S,
     acquire_free_port,
     connect_with_retry,
     get_internal_ip,

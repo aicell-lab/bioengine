@@ -19,6 +19,8 @@ import bioengine
 from bioengine.cluster.proxy_actor import BioEngineProxyActor
 from bioengine.cluster.slurm_workers import SlurmWorkers
 from bioengine.utils import (
+    RECONNECT_BUDGET_S,
+    STARTUP_CONNECT_BUDGET_S,
     acquire_free_port,
     connect_with_retry,
     create_logger,
@@ -915,12 +917,19 @@ class RayCluster:
         )
         self.logger.info(f"Ray Serve HTTP URL: {self.serve_http_url}")
 
-    async def _connect_to_cluster(self) -> ray.client_builder.ClientContext:
+    async def _connect_to_cluster(
+        self, retry_budget_seconds: float = RECONNECT_BUDGET_S
+    ) -> ray.client_builder.ClientContext:
         """Connect to the Ray cluster using the configured head node address.
 
         Establishes a connection to an existing Ray cluster using the head node
         address. This method is used both for connecting to external clusters
         and for verifying connections after starting a new cluster.
+
+        Args:
+            retry_budget_seconds: How long to keep retrying a connection-level
+                failure. Defaults to the reconnect budget so a reconnect from
+                the monitoring loop fits inside one pass.
 
         Returns:
             ray.client_builder.ClientContext: Ray client context for the connected cluster
@@ -944,6 +953,7 @@ class RayCluster:
                 ),
                 description=f"Connection to Ray cluster at '{self.address}'",
                 logger=self.logger,
+                total_seconds=retry_budget_seconds,
             )
 
             # Update Ray's logger formatters to use timezone-aware date format
@@ -1259,7 +1269,7 @@ class RayCluster:
             # Connect a client to the Ray cluster
             self._set_head_node_address()
             self._set_serve_http_url()
-            await self._connect_to_cluster()
+            await self._connect_to_cluster(STARTUP_CONNECT_BUDGET_S)
 
             # Do a first cluster status check
             await self.monitor_cluster()
