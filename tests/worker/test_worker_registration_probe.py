@@ -410,13 +410,15 @@ async def test_recovering_clears_the_failing_state_and_restores_the_throttle():
 
 
 @pytest.mark.asyncio
-async def test_the_monitoring_loop_starts_the_grace_clock_it_does_not_inherit_it():
+async def test_the_monitoring_loop_starts_the_grace_clock_it_does_not_inherit_it(
+    tmp_path,
+):
     """Construction is minutes before the first probe on a real worker — Ray
     start, connect, data-server discovery, dataset refresh, app recovery,
     startup apps. A grace clock started in ``__init__`` is already spent by the
     time the loop runs, so the first transient blip escalates immediately.
     """
-    worker = _loop_worker(_Server(serves=False))
+    worker = _loop_worker(_Server(serves=False), tmp_path)
     worker._register_bioengine_worker_service = _failing_registration
     # As if the worker had been constructed an hour before the loop started.
     worker._registration_ok_at = time.time() - 3600
@@ -432,7 +434,9 @@ async def test_the_monitoring_loop_starts_the_grace_clock_it_does_not_inherit_it
 
 
 @pytest.mark.asyncio
-async def test_a_condemned_registration_advances_the_degraded_counter(monkeypatch):
+async def test_a_condemned_registration_advances_the_degraded_counter(
+    monkeypatch, tmp_path
+):
     """The escalation's reachable half: the raise propagates out of the
     monitoring step and into the counter behind ``get_status``'s readiness.
     Nothing consumes that report yet — the deployed liveness probe is a local
@@ -440,7 +444,7 @@ async def test_a_condemned_registration_advances_the_degraded_counter(monkeypatc
     """
     monkeypatch.setattr(worker_module, "_REGISTRATION_GRACE_S", 0)
 
-    worker = _loop_worker(_Server(serves=False))
+    worker = _loop_worker(_Server(serves=False), tmp_path)
     worker._register_bioengine_worker_service = _failing_registration
 
     await _run_monitoring_loop(worker, lambda: worker._monitor_consecutive_errors >= 1)
@@ -549,10 +553,11 @@ async def _noop(*args, **kwargs):
     return None
 
 
-def _loop_worker(server, **attrs):
+def _loop_worker(server, tmp_path, **attrs):
     """A worker whose monitoring loop runs for real, with every step but the
     registration check stubbed out."""
     worker = _bare_worker(server, **attrs)
+    worker.heartbeat_file = tmp_path / "worker_heartbeat.json"
     worker.is_ready = asyncio.Event()
     worker.monitoring_interval_seconds = 0
     worker._last_monitoring = 0
