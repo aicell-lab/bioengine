@@ -246,10 +246,9 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
-# Minimum gap between in-place Serve-controller-loss recovery sweeps. Long
+# Minimum gap between in-place Serve-controller-loss recovery sweeps: long
 # enough for a redeploy's serve.run to bootstrap the controller before we'd
-# consider re-firing, short enough for a couple of attempts before the
-# monitor's degraded backstop cycles the pod (~62 s to 5 consecutive errors).
+# consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
 
@@ -1501,9 +1500,7 @@ class AppsManager:
                 # but there is no controller until an app is (re)deployed, so
                 # redeploy the tracked apps in-place: serve.run bootstraps a
                 # fresh controller and recreates the replicas without cycling
-                # the pod. Re-raise so, if recovery can't take within a few
-                # ticks, the monitor's degraded counter still trips the
-                # liveness backstop.
+                # the pod.
                 await self._recover_from_controller_loss(apps_to_redeploy)
             raise
 
@@ -1608,8 +1605,8 @@ class AppsManager:
         deploy task blocks alive on an event, so we can't gate on it being
         idle; instead a cooldown rate-limits sweeps so an in-flight serve.run
         isn't stomped every tick. Apps recovered from a previous worker carry
-        no cached ``built_app``; they can't be rebuilt from here and are left
-        for the liveness backstop to recover via a pod cycle.
+        no cached ``built_app``; they can't be rebuilt from here and are
+        skipped, so they stay down until something redeploys them.
         """
         now = time.time()
         if now - self._last_controller_recovery < _CONTROLLER_RECOVERY_COOLDOWN_SECONDS:
