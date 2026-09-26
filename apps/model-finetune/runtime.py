@@ -492,7 +492,8 @@ class RuntimeApp:
 
         if stopped:
             training.write_status(
-                session_id, status="STOPPED", message="stopped by user", end_time=time.time()
+                session_id, status="STOPPED", message="stopped by user",
+                end_time=time.time(), terminated_by="user_stop",
             )
         else:
             # Fallback: if the child died without writing a terminal status, record it.
@@ -501,6 +502,6 @@ class RuntimeApp:
                 training.write_status(
                     session_id, status="FAILED",
                     message=f"training subprocess exited rc={rc}: {tail}",
-                    end_time=time.time(),
+                    end_time=time.time(), terminated_by="supervisor",
                 )
         return {"session_id": session_id, "returncode": rc}

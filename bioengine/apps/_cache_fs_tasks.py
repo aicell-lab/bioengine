@@ -57,7 +57,9 @@ def list_dirs_on_node(
     running_set = set(running_ids)
     result = []
     for entry in sorted(apps_workdir.iterdir()):
-        if not entry.is_dir():
+        # Dot-directories are framework state (e.g. the usage ledger), not app
+        # caches, and must not be offered for clearing.
+        if not entry.is_dir() or entry.name.startswith("."):
             continue
         size = 0
         latest_mtime = None
