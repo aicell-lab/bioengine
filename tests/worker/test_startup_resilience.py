@@ -298,6 +298,7 @@ async def test_a_reconnect_pass_fits_inside_the_heartbeat_deadline(monkeypatch):
 
     worker = BioEngineWorker.__new__(BioEngineWorker)
     worker.logger = _RecordingLogger()
+    worker.start_time = None
     worker.server = _UnreachableHypha(clock)
     worker.server_url = "http://hypha:9520"
     worker._token = "token"
