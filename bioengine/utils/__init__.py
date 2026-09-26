@@ -12,6 +12,7 @@ try:
 except ImportError:
     pass
 from .geo_location import fetch_centroid_coordinates, fetch_geolocation
+from .host_memory import head_memory_budget_warning, read_meminfo
 from .logger import (
     create_logger,
     date_format,
