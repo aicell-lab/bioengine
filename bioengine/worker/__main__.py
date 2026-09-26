@@ -168,6 +168,17 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         "If not specified (None), a log file will be created in '<workspace_dir>/logs'. ",
     )
     core_group.add_argument(
+        "--heartbeat-file",
+        type=str,
+        metavar="PATH",
+        help="Path of the liveness heartbeat file the monitoring loop rewrites after "
+        "every completed pass. Check it with 'python -m bioengine.heartbeat PATH', "
+        "which exits non-zero once the loop has stopped completing passes and needs "
+        "no network access. Defaults to 'bioengine_worker_heartbeat.json' in the "
+        "system temporary directory, which is node-local; keep it off any network "
+        "filesystem, including the workspace directory.",
+    )
+    core_group.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug-level logging for detailed troubleshooting and development. "
@@ -276,13 +287,6 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         metavar="PORT",
         help="Port for Ray client server connections. Used by external Ray clients "
         "to connect to the cluster.",
-    )
-    ray_cluster_group.add_argument(
-        "--redis-password",
-        type=str,
-        metavar="PASSWORD",
-        help="Password for Ray cluster Redis authentication. If not specified, "
-        "a secure random password will be generated automatically.",
     )
     ray_cluster_group.add_argument(
         "--head-num-cpus",
