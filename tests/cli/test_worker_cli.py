@@ -17,6 +17,7 @@ from bioengine import __version__
 from bioengine.cli.worker import (
     CONTAINER_WORKSPACE_DIR,
     DEFAULT_IMAGE_REPO,
+    _has_gpu,
     _subprocess_env,
     build_command,
     redact_secrets,
@@ -42,12 +43,15 @@ def _build(runtime, **overrides):
         gpus=False,
         detach=False,
         tty=True,
+        token=None,
+        server_url=None,
     )
     kwargs.update(overrides)
     return build_command(**kwargs)
 
 
 def _run(args, env=None):
+    """Invoke the CLI with the credential variables cleared unless a test sets them."""
     base = {"HYPHA_TOKEN": "", "BIOENGINE_SERVER_URL": "", "BIOENGINE_TOKEN": ""}
     base.update(env or {})
     return CliRunner().invoke(worker_group, args, env=base)
@@ -129,32 +133,29 @@ def test_a_non_interactive_invocation_does_not_ask_for_a_tty():
 # ── The token must never reach argv ───────────────────────────────────────────
 
 
-def test_the_token_is_named_not_valued_in_the_container_command(monkeypatch):
-    monkeypatch.setenv("HYPHA_TOKEN", "secret-token-value")
+def test_the_token_is_named_not_valued_in_the_container_command():
     for runtime in ("docker", "podman"):
-        command = _build(runtime)
-        assert "secret-token-value" not in command
+        command = _build(runtime, token=FAKE_TOKEN)
+        assert FAKE_TOKEN not in command
         assert command[command.index("-e") + 1] == "HYPHA_TOKEN"
 
 
-def test_the_token_never_appears_in_any_runtimes_command(monkeypatch):
-    monkeypatch.setenv("HYPHA_TOKEN", "secret-token-value")
+def test_the_token_never_appears_in_any_runtimes_command():
     for runtime in ("docker", "podman", "apptainer", "native"):
-        assert "secret-token-value" not in " ".join(_build(runtime))
+        assert FAKE_TOKEN not in " ".join(_build(runtime, token=FAKE_TOKEN))
 
 
 def test_the_token_is_passed_through_the_environment():
-    env = _subprocess_env("docker", token="secret-token-value", server_url=None)
-    assert env["HYPHA_TOKEN"] == "secret-token-value"
+    env = _subprocess_env("docker", token=FAKE_TOKEN, server_url=None)
+    assert env["HYPHA_TOKEN"] == FAKE_TOKEN
 
 
 def test_apptainer_needs_the_prefixed_variable_to_forward_anything():
-    env = _subprocess_env("apptainer", token="secret-token-value", server_url=None)
-    assert env["APPTAINERENV_HYPHA_TOKEN"] == "secret-token-value"
+    env = _subprocess_env("apptainer", token=FAKE_TOKEN, server_url=None)
+    assert env["APPTAINERENV_HYPHA_TOKEN"] == FAKE_TOKEN
 
 
-def test_an_unset_variable_is_not_forwarded(monkeypatch):
-    monkeypatch.delenv("HYPHA_TOKEN", raising=False)
+def test_an_unset_variable_is_not_forwarded():
     assert "HYPHA_TOKEN" not in _build("docker")
     assert "APPTAINERENV_HYPHA_TOKEN" not in _subprocess_env("apptainer", None, None)
 
@@ -285,7 +286,7 @@ def _fake_runtime(monkeypatch, existing_container: str):
     started = []
     monkeypatch.setattr(
         "bioengine.cli.worker.subprocess.call",
-        lambda command, **kwargs: started.append(command) or 0,
+        lambda command, **kwargs: started.append((command, kwargs["env"])) or 0,
     )
     return started
 
@@ -325,4 +326,132 @@ def test_a_free_container_name_starts_the_worker(monkeypatch, tmp_path):
         ]
     )
     assert result.exit_code == 0, result.output
-    assert started and started[0][:3] == ["docker", "run", "--rm"]
+    assert started and started[0][0][:3] == ["docker", "run", "--rm"]
+
+
+# ── The token reaches the container, however it was supplied ──────────────────
+#
+# Asserting on build_command or _subprocess_env alone passes on either side of
+# the seam between them: build_command decides which variables the container is
+# told about, _subprocess_env supplies their values. These tests start the
+# worker for real — only the subprocess call is faked — with no credential in
+# the environment, and read what the container would actually receive.
+
+
+def _container_environment(runtime, command, env):
+    """What the worker process inside the container will see.
+
+    docker and podman forward a variable named by ``-e`` from the launcher's own
+    environment; apptainer forwards the ``APPTAINERENV_``-prefixed copy instead.
+    """
+    if runtime == "apptainer":
+        prefix = "APPTAINERENV_"
+        return {
+            name[len(prefix) :]: value for name, value in env.items() if name.startswith(prefix)
+        }
+    return {name: env.get(name) for flag, name in zip(command, command[1:]) if flag == "-e"}
+
+
+def _start(monkeypatch, tmp_path, runtime, extra_args=(), env=None):
+    """Start a worker with the runtime faked out; return its argv and environment."""
+    started = _fake_runtime(monkeypatch, "")
+    result = _run(
+        [
+            "start",
+            "--runtime",
+            runtime,
+            "--workspace-dir",
+            str(tmp_path / "ws"),
+            *extra_args,
+            "--",
+            "--mode",
+            "single-machine",
+        ],
+        env=env,
+    )
+    assert result.exit_code == 0, result.output
+    assert len(started) == 1
+    return started[0]
+
+
+@pytest.mark.parametrize("runtime", ["docker", "podman", "apptainer"])
+def test_the_token_option_reaches_the_container(monkeypatch, tmp_path, runtime):
+    command, env = _start(monkeypatch, tmp_path, runtime, ["--token", FAKE_TOKEN])
+    assert _container_environment(runtime, command, env)["HYPHA_TOKEN"] == FAKE_TOKEN
+    assert FAKE_TOKEN not in command
+
+
+@pytest.mark.parametrize("runtime", ["docker", "podman", "apptainer"])
+@pytest.mark.parametrize("source", ["HYPHA_TOKEN", "BIOENGINE_TOKEN"])
+def test_either_token_environment_variable_reaches_the_container(
+    monkeypatch, tmp_path, runtime, source
+):
+    command, env = _start(monkeypatch, tmp_path, runtime, env={source: FAKE_TOKEN})
+    assert _container_environment(runtime, command, env)["HYPHA_TOKEN"] == FAKE_TOKEN
+
+
+def test_the_server_url_reaches_the_container_too(monkeypatch, tmp_path):
+    command, env = _start(
+        monkeypatch, tmp_path, "docker", ["--server-url", "https://hypha.example.org"]
+    )
+    container = _container_environment("docker", command, env)
+    assert container["BIOENGINE_SERVER_URL"] == "https://hypha.example.org"
+
+
+def test_no_token_means_no_passthrough(monkeypatch, tmp_path):
+    command, env = _start(monkeypatch, tmp_path, "docker")
+    assert "HYPHA_TOKEN" not in _container_environment("docker", command, env)
+
+
+def test_the_token_is_masked_in_a_dry_run_and_delivered_in_a_real_one(monkeypatch, tmp_path):
+    printed = _run(
+        [
+            "start",
+            "--runtime",
+            "docker",
+            "--token",
+            FAKE_TOKEN,
+            "--dry-run",
+            "--",
+            "--mode",
+            "single-machine",
+        ]
+    )
+    assert printed.exit_code == 0, printed.output
+    assert FAKE_TOKEN not in printed.output
+    assert "-e HYPHA_TOKEN" in printed.output
+
+    command, env = _start(monkeypatch, tmp_path, "docker", ["--token", FAKE_TOKEN])
+    assert _container_environment("docker", command, env)["HYPHA_TOKEN"] == FAKE_TOKEN
+
+
+# ── GPUs are requested only when the host can serve them ──────────────────────
+
+
+def _fake_nvidia_smi(monkeypatch, present: bool):
+    monkeypatch.setattr(
+        "bioengine.cli.worker.shutil.which",
+        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" and present else None,
+    )
+
+
+@pytest.mark.parametrize("nvidia_smi_present", [True, False])
+def test_nvidia_smi_decides_whether_gpus_are_requested_by_default(monkeypatch, nvidia_smi_present):
+    """Neither --gpus nor --no-gpus is given, so the default consults _has_gpu()."""
+    _fake_nvidia_smi(monkeypatch, nvidia_smi_present)
+    assert _has_gpu() is nvidia_smi_present
+
+    result = _run(["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"])
+    assert result.exit_code == 0, result.output
+    assert ("--gpus=all" in result.output) is nvidia_smi_present
+
+
+@pytest.mark.parametrize("nvidia_smi_present", [True, False])
+def test_an_explicit_gpu_choice_overrides_the_host(monkeypatch, nvidia_smi_present):
+    _fake_nvidia_smi(monkeypatch, nvidia_smi_present)
+    for flag, expected in (("--gpus", True), ("--no-gpus", False)):
+        result = _run(
+            ["start", "--runtime", "docker", flag, "--dry-run", "--", "--mode", "single-machine"]
+        )
+        assert result.exit_code == 0, result.output
+        assert ("--gpus=all" in result.output) is expected

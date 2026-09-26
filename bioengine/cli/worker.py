@@ -41,7 +41,15 @@ _GPU_FLAGS = {
 
 _RUNTIME_PREFERENCE = ("docker", "podman", "apptainer")
 
-_ENV_PASSTHROUGH = ("HYPHA_TOKEN", "BIOENGINE_SERVER_URL")
+
+def _passthrough_env(token: Optional[str], server_url: Optional[str]) -> dict:
+    """The variables the container needs, keyed by name.
+
+    Built from the resolved option values, not from ``os.environ`` — ``--token``
+    only reaches the environment later, in ``_subprocess_env``.
+    """
+    resolved = (("HYPHA_TOKEN", token), ("BIOENGINE_SERVER_URL", server_url))
+    return {name: value for name, value in resolved if value}
 
 
 def _detect_runtime() -> Optional[str]:
@@ -70,6 +78,8 @@ def build_command(
     gpus: bool,
     detach: bool,
     tty: bool,
+    token: Optional[str],
+    server_url: Optional[str],
 ) -> List[str]:
     """Build the container invocation. Secrets travel in the environment, never argv."""
     entrypoint = ["python", "-m", "bioengine.worker", *worker_args]
@@ -92,9 +102,8 @@ def build_command(
     if gpus:
         command += _GPU_FLAGS[runtime]
     command += ["-v", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
-    for name in _ENV_PASSTHROUGH:
-        if os.environ.get(name):
-            command += ["-e", name]
+    for name in _passthrough_env(token, server_url):
+        command += ["-e", name]
     return command + [image, *entrypoint]
 
 
@@ -134,16 +143,12 @@ def _container_exists(runtime: str, container_name: str) -> bool:
 
 
 def _subprocess_env(runtime: str, token: Optional[str], server_url: Optional[str]) -> dict:
+    passthrough = _passthrough_env(token, server_url)
     env = dict(os.environ)
-    if token:
-        env["HYPHA_TOKEN"] = token
-    if server_url:
-        env["BIOENGINE_SERVER_URL"] = server_url
+    env.update(passthrough)
     if runtime == "apptainer":
         # Apptainer only forwards host variables it is told about explicitly.
-        for name in _ENV_PASSTHROUGH:
-            if env.get(name):
-                env[f"APPTAINERENV_{name}"] = env[name]
+        env.update({f"APPTAINERENV_{name}": value for name, value in passthrough.items()})
     return env
 
 
@@ -277,6 +282,8 @@ def worker_start(
         gpus=gpus,
         detach=detach,
         tty=sys.stdin.isatty(),
+        token=token,
+        server_url=server_url,
     )
 
     if dry_run:
