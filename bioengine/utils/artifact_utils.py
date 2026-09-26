@@ -58,6 +58,21 @@ def _enforce_version_increases(
         )
 
 
+def latest_committed_version(artifact: Dict[str, Any]) -> Optional[str]:
+    """The most recently committed version of ``artifact``, or None if it has none.
+
+    Ranks by ``created_at``, which is what "latest" means to a deploy: it is the
+    version the artifact manager serves when none is requested. Note that
+    ``_enforce_version_increases`` above ranks by PEP 440 instead, so the two
+    disagree for an artifact whose newest entry is not its highest version —
+    reachable by deleting a version and re-adding a lower one.
+    """
+    versions = artifact.get("versions") or []
+    if not versions:
+        return None
+    return max(versions, key=lambda v: v["created_at"])["version"]
+
+
 def create_file_list_from_directory(
     directory_path: Union[str, Path],
     _artifact_id_suffix: Optional[str] = None,

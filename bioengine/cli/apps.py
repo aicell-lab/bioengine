@@ -89,7 +89,7 @@ def require_worker(worker_service_id, token, server_url):
 # ── Local manifest validation ─────────────────────────────────────────────────
 
 
-def _validate_manifest_or_exit(manifest_path: Path) -> None:
+def _validate_manifest_or_exit(manifest_path: Path) -> dict:
     """Read ``manifest_path`` and run ``validate_manifest``, exit on failure."""
     import yaml
 
@@ -107,6 +107,8 @@ def _validate_manifest_or_exit(manifest_path: Path) -> None:
         validate_manifest(manifest)
     except ValueError as exc:
         error_exit(f"Invalid manifest at {manifest_path}:\n\n{exc}")
+
+    return manifest
 
 
 # ── Group ─────────────────────────────────────────────────────────────────────
@@ -649,6 +651,8 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
 
     Combines `bioengine apps upload` and `bioengine apps run` into one step.
     APP_DIR must contain a manifest.yaml and at least one Python deployment file.
+    The version from manifest.yaml is what gets deployed, so pointing --app-id at
+    an already-running application rolls it forward to the newly uploaded code.
 
     Apps that connect back to Hypha (to access artifacts, datasets, or other
     services) need HYPHA_TOKEN set inside the Ray actor. Pass --hypha-token to
@@ -674,7 +678,8 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
             "Every BioEngine app must have a manifest.yaml.",
         )
 
-    _validate_manifest_or_exit(manifest_path)
+    manifest = _validate_manifest_or_exit(manifest_path)
+    manifest_version = manifest.get("version")
 
     # Default hypha_token to the auth token unless explicitly set to empty string
     if hypha_token is None:
@@ -711,14 +716,18 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
         except Exception as exc:
             error_exit(f"Upload failed: {exc}")
 
-        click.echo(f"Uploaded. Artifact ID: {artifact_id}")
+        click.echo(f"Uploaded. Artifact ID: {artifact_id} (version {manifest_version})")
 
         # Deploy
-        click.echo(f"Deploying '{artifact_id}'...")
+        click.echo(f"Deploying '{artifact_id}' version {manifest_version}...")
         run_kwargs = {
             "artifact_id": artifact_id,
             "disable_gpu": disable_gpu,
             "hypha_token": hypha_token or None,
+            # Pin the version just uploaded. Without it, targeting a running
+            # --app-id inherits that app's version, so this command would report
+            # success while redeploying the code it just replaced.
+            "version": manifest_version,
         }
         if application_id:
             run_kwargs["application_id"] = application_id
@@ -730,7 +739,10 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
         except Exception as exc:
             error_exit(f"Deployment failed (artifact was uploaded): {exc}")
 
-        click.echo(f"Deployment started. Application ID: {deployed_id}")
+        click.echo(
+            f"Deployment started. Application ID: {deployed_id} "
+            f"(version {manifest_version})"
+        )
         click.echo(f"\nCheck status:  bioengine apps status {deployed_id}")
         click.echo(f"View logs:     bioengine apps logs {deployed_id}")
         click.echo(f"Stop:          bioengine apps stop {deployed_id}")
