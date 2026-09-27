@@ -391,9 +391,10 @@ def test_reporting_survives_a_part_built_replica() -> None:
 def test_a_late_deregistration_from_the_old_replica_is_ignored() -> None:
     # Rolling update: the incoming replica claims the record, registers and
     # reports True; the outgoing replica's __del__ deregisters afterwards.
-    # Taking that last write pins a healthy app at False for good — nothing
-    # re-reports True until the next _register_services, which the running
-    # replica will not do.
+    # Taking that last write leaves a healthy app reading False until the
+    # serving replica's next reachability probe re-asserts True — a whole probe
+    # interval of a working address being withheld. The guard avoids the window
+    # rather than relying on the re-assert to close it.
     actor = _bare_actor()
     actor.report_service_registration(APP_ID, True, replica_id="old")
     actor.claim_service_registration(APP_ID, replica_id="new")
@@ -558,6 +559,41 @@ async def test_a_failing_probe_does_not_assert_the_app_as_registered() -> None:
     await inst._maintenance_tick()
 
     assert inst._connection_lost is True
+    assert actor.get_service_registration(APP_ID) is False
+
+
+@pytest.mark.asyncio
+async def test_a_probe_answered_after_a_deregistration_does_not_re_register() -> None:
+    # check_health can deregister this replica while the probe is suspended.
+    # Reporting True on the answer to a question asked before that would leave
+    # a deregistered app advertised with no way back, since every later tick
+    # returns at the readiness gate.
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowServer:
+        async def get_service_info(self, _sid):
+            entered.set()
+            await release.wait()
+
+        async def unregister_service(self, _sid):
+            return None
+
+    actor = _bare_actor()
+    inst = _bare_proxy(
+        _replica_id="r0",
+        _proxy_actor_handle=_ActorHandle(actor),
+        server=_SlowServer(),
+        websocket_service_id="ws",
+    )
+    actor.report_service_registration(APP_ID, True, replica_id="r0")
+
+    tick = asyncio.create_task(inst._maintenance_tick())
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    await inst._deregister_services()
+    release.set()
+    await asyncio.wait_for(tick, timeout=5)
+
     assert actor.get_service_registration(APP_ID) is False
 
 

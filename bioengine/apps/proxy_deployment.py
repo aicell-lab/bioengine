@@ -1486,7 +1486,13 @@ class ProxyDeployment:
             # if that successor never registers nothing else would ever put it
             # back. Having just confirmed the address resolves, we are the
             # replica entitled to say so.
-            self._report_service_registration(True)
+            #
+            # Re-read the gate: check_health can deregister us while the probe
+            # above is in flight, and answering a question asked before that
+            # would leave a deregistered app advertised with no path back —
+            # every later tick returns at the gate.
+            if self.entry_deployment_ready:
+                self._report_service_registration(True)
         except Exception as e:
             # Not a health-check failure: flag for rebuild on the next tick.
             logger.warning(
