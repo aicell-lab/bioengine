@@ -8,7 +8,9 @@ only a named admin can change who the admins are, nobody can lock the worker
 restart, when the ``--admin-users`` startup flag is replayed verbatim.
 """
 
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,11 +38,16 @@ def _bare_worker(tmp_path, admin_users, **attrs):
 class _Logger:
     def __init__(self):
         self.records = []
+        self.warnings = []
 
     def _record(self, message):
         self.records.append(str(message))
 
-    info = warning = error = debug = _record
+    def warning(self, message):
+        self.warnings.append(str(message))
+        self._record(message)
+
+    info = error = debug = _record
 
 
 async def test_a_granted_admin_can_immediately_call_admin_methods(tmp_path):
@@ -309,3 +316,59 @@ async def test_the_admin_methods_are_exposed_on_the_worker_service(tmp_path):
     assert registered["list_admin_users"] == worker.list_admin_users
     assert registered["add_admin_user"] == worker.add_admin_user
     assert registered["remove_admin_user"] == worker.remove_admin_user
+
+
+async def test_a_wildcard_admin_list_warns_that_anyone_can_run_code(tmp_path):
+    """The wildcard reads as a permissions shortcut; it is open remote execution."""
+    worker = _bare_worker(tmp_path, ["admin@example.org", "*"])
+
+    worker._warn_if_wildcard_admin_users()
+
+    assert len(worker.logger.warnings) == 1
+    warning = worker.logger.warnings[0]
+    assert "run_code" in warning
+    assert "anonymous" in warning
+
+
+async def test_a_named_admin_list_does_not_warn(tmp_path):
+    worker = _bare_worker(tmp_path, ["admin@example.org"])
+
+    worker._warn_if_wildcard_admin_users()
+
+    assert worker.logger.warnings == []
+
+
+class _Reached(Exception):
+    """Ends a start() once the point under test has been passed."""
+
+
+async def test_the_wildcard_warning_is_emitted_during_startup(tmp_path):
+    """A warning nobody calls is the same as no warning.
+
+    Ending start() at the step after the call site is what pins it to startup:
+    production runs blocking=True, so a warning placed later in start() would
+    not reach an operator until the worker shuts down.
+    """
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _reached(*_args, **_kwargs):
+        raise _Reached
+
+    worker = _bare_worker(
+        tmp_path,
+        ["admin@example.org", "*"],
+        heartbeat_file=tmp_path / "worker_heartbeat.json",
+        _shutdown_event=asyncio.Event(),
+        ray_cluster=SimpleNamespace(start=_noop),
+        _connect_to_server=_noop,
+        _discover_data_server=_reached,
+        _stop=_noop,
+    )
+
+    with pytest.raises(_Reached):
+        await worker.start(blocking=True)
+
+    assert len(worker.logger.warnings) == 1
+    assert "run_code" in worker.logger.warnings[0]
