@@ -923,11 +923,14 @@ class BioEngineProxyActor:
         belongs to. Across a replica generation the two reports race: the
         incoming replica claims the record, registers and reports True, and the
         outgoing one's ``__del__`` deregisters afterwards. Taking that last
-        write would pin a healthy app at False for good, because nothing
-        re-reports True until the next ``_register_services``, which the
-        running replica will not redo. A ``True``, and any report about an app
-        with no record, always takes over — those can only come from a replica
-        that is serving now.
+        write would leave a healthy app reading False until the serving
+        replica's next reachability probe re-asserts True. A ``True``, and any
+        report about an app with no record, always takes over — those can only
+        come from a replica that is serving now.
+
+        That periodic re-assert, not this guard, is what makes the record
+        self-correcting: a claim from a successor that then never registers
+        would otherwise hold a serving app at False indefinitely.
         """
         current = self.service_registrations.get(application_id)
         if (

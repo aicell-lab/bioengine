@@ -19,6 +19,10 @@ The contract now:
   actor existed — a newer worker, or an actor recreated after eviction —
   serves perfectly well and must keep its id, so the worker falls back to the
   replica-alive gate.
+* The record is self-correcting, not write-once: a replica whose reachability
+  probe succeeds re-asserts ``True`` every probe interval. Otherwise a
+  successor that claims the record and then never registers withholds a
+  working address for as long as the predecessor keeps serving it.
 """
 from __future__ import annotations
 
@@ -387,9 +391,10 @@ def test_reporting_survives_a_part_built_replica() -> None:
 def test_a_late_deregistration_from_the_old_replica_is_ignored() -> None:
     # Rolling update: the incoming replica claims the record, registers and
     # reports True; the outgoing replica's __del__ deregisters afterwards.
-    # Taking that last write pins a healthy app at False for good — nothing
-    # re-reports True until the next _register_services, which the running
-    # replica will not do.
+    # Taking that last write leaves a healthy app reading False until the
+    # serving replica's next reachability probe re-asserts True — a whole probe
+    # interval of a working address being withheld. The guard avoids the window
+    # rather than relying on the re-assert to close it.
     actor = _bare_actor()
     actor.report_service_registration(APP_ID, True, replica_id="old")
     actor.claim_service_registration(APP_ID, replica_id="new")
@@ -456,6 +461,138 @@ def test_a_replica_that_died_without_deregistering_loses_the_record(
     actor.report_service_registration(APP_ID, True, replica_id="old")
 
     _construct_proxy(monkeypatch, _ActorHandle(actor), replica_tag="new")
+
+    assert actor.get_service_registration(APP_ID) is False
+
+
+class _LiveServer:
+    """A Hypha connection whose reachability probe answers."""
+
+    def __init__(self) -> None:
+        self.probes = 0
+
+    async def get_service_info(self, _sid):
+        self.probes += 1
+
+    async def unregister_service(self, _sid):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_successor_that_never_registers_cannot_pin_a_serving_app_at_false(
+    monkeypatch,
+) -> None:
+    # Redeploy: Ray Serve builds the new proxy replica while the old one is
+    # still serving, and both want the same Hypha client_id, so the successor's
+    # registration is refused for as long as the predecessor holds it. Its
+    # init-time claim has already replaced the record with False. Nothing then
+    # re-reported True — a registered replica skips the registration branch of
+    # _maintenance_tick entirely — so the worker withheld a working address
+    # indefinitely, which is the mirror image of the bug the claim fixed.
+    actor = _bare_actor()
+
+    old = _bare_proxy(_replica_id="old", _proxy_actor_handle=_ActorHandle(actor))
+    server = _LiveServer()
+
+    async def _register():
+        old.server = server
+        old.websocket_service_id = "ws"
+
+    old._register_services = _register
+    await old._maintenance_tick()
+    assert actor.get_service_registration(APP_ID) is True
+
+    _construct_proxy(monkeypatch, _ActorHandle(actor), replica_tag="new")
+    # Asserted mid-way: without the claim actually landing there is no
+    # divergence left to heal, and the final assertion would pass vacuously.
+    assert actor.get_service_registration(APP_ID) is False
+
+    # The predecessor is still serving, so its periodic probe is the only
+    # signal left that the app is reachable.
+    old._probe_due_at = 0.0
+    await old._maintenance_tick()
+
+    assert server.probes == 1
+    assert actor.get_service_registration(APP_ID) is True
+
+
+@pytest.mark.asyncio
+async def test_the_probe_does_not_re_register_an_app_that_deregistered_itself() -> None:
+    # A sibling deployment going down closes the gate via _deregister_services.
+    # The self-healing re-assert must not undo that on the next tick: this
+    # replica reports False about itself and stays that way until it re-registers.
+    actor = _bare_actor()
+    inst = _bare_proxy(
+        _replica_id="r0",
+        _proxy_actor_handle=_ActorHandle(actor),
+        server=_LiveServer(),
+        websocket_service_id="ws",
+    )
+    actor.report_service_registration(APP_ID, True, replica_id="r0")
+
+    await inst._deregister_services()
+    inst._probe_due_at = 0.0
+    await inst._maintenance_tick()
+    await inst._maintenance_tick()
+
+    assert actor.get_service_registration(APP_ID) is False
+
+
+@pytest.mark.asyncio
+async def test_a_failing_probe_does_not_assert_the_app_as_registered() -> None:
+    # The probe is what establishes the address still resolves. When it fails
+    # the replica rebuilds its client instead, and must not claim reachability
+    # it has just failed to confirm.
+    class _AmnesiacServer:
+        async def get_service_info(self, sid):
+            raise KeyError(f"Service not found: {sid}@*")
+
+    actor = _bare_actor()
+    inst = _bare_proxy(
+        _replica_id="r0",
+        _proxy_actor_handle=_ActorHandle(actor),
+        server=_AmnesiacServer(),
+        websocket_service_id="ws",
+    )
+    actor.claim_service_registration(APP_ID, replica_id="newer")
+
+    await inst._maintenance_tick()
+
+    assert inst._connection_lost is True
+    assert actor.get_service_registration(APP_ID) is False
+
+
+@pytest.mark.asyncio
+async def test_a_probe_answered_after_a_deregistration_does_not_re_register() -> None:
+    # check_health can deregister this replica while the probe is suspended.
+    # Reporting True on the answer to a question asked before that would leave
+    # a deregistered app advertised with no way back, since every later tick
+    # returns at the readiness gate.
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowServer:
+        async def get_service_info(self, _sid):
+            entered.set()
+            await release.wait()
+
+        async def unregister_service(self, _sid):
+            return None
+
+    actor = _bare_actor()
+    inst = _bare_proxy(
+        _replica_id="r0",
+        _proxy_actor_handle=_ActorHandle(actor),
+        server=_SlowServer(),
+        websocket_service_id="ws",
+    )
+    actor.report_service_registration(APP_ID, True, replica_id="r0")
+
+    tick = asyncio.create_task(inst._maintenance_tick())
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    await inst._deregister_services()
+    release.set()
+    await asyncio.wait_for(tick, timeout=5)
 
     assert actor.get_service_registration(APP_ID) is False
 
