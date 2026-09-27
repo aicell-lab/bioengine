@@ -19,6 +19,15 @@ pip install -r requirements-test.txt
 ### 3. Environment Configuration
 The `.env` file in the project root contains required environment variables including `HYPHA_TOKEN`. This is automatically loaded by the test configuration.
 
+Because that load is automatic, whether a credential resolves depends on which checkout you start pytest from — a git worktree has no `.env`, the main checkout does. Tests that act on a real Hypha cluster are therefore deselected unless you pass `--live`, and whenever a credential does resolve the run prints the server and workspace it could reach before the first test. Both are independent of the `--ignore` list; `tests/apps/model-runner/` is live even though it is not under `tests/end_to_end/`.
+
+```bash
+pytest tests/                 # offline tests only
+pytest tests/ --live          # also runs tests that deploy to and call the live cluster
+```
+
+A test counts as live if it requests `hypha_client`, `hypha_token` or `model_runner`, or is marked `@pytest.mark.live`. Anything new that reaches a cluster by some other route has to carry the marker.
+
 ## Running Tests
 
 ### All Tests

@@ -8,6 +8,8 @@ Requires HYPHA_TOKEN in environment and bioengine-worker conda environment.
 """
 
 import asyncio
+import base64
+import json
 import os
 import re
 import subprocess
@@ -15,7 +17,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Generator
+from typing import AsyncGenerator, Dict, Generator, List, Optional, Tuple
 
 import pytest
 import pytest_asyncio
@@ -27,6 +29,109 @@ from bioengine.cluster.ray_cluster import RayCluster
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Every Hypha connection in the suite is hard-coded to this deployment; no
+# environment variable redirects it.
+HYPHA_SERVER_URL = "https://hypha.aicell.io"
+
+# Requesting one of these fixtures means the test authenticates against the
+# real deployment above. Anything else that reaches a cluster has to say so
+# with @pytest.mark.live.
+LIVE_FIXTURES = frozenset({"hypha_client", "hypha_token", "model_runner"})
+
+# Credentials the suite picks up on its own, in the order a reader should
+# worry about them. `load_dotenv()` above supplies these from a repo-root
+# .env, so whether they resolve depends on which checkout pytest was run from.
+LIVE_TOKEN_VARS = ("HYPHA_TOKEN", "BIOIMAGE_IO_TOKEN")
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--live",
+        action="store_true",
+        default=False,
+        help=(
+            "Run tests that deploy to and call a real Hypha cluster. Without "
+            "this flag they are deselected even when a token is available."
+        ),
+    )
+
+
+def _token_workspace(token: str) -> str:
+    """Workspace a Hypha JWT is scoped to, or '' if it is not a readable JWT."""
+    try:
+        segment = token.split(".")[1]
+        claims = json.loads(
+            base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+        )
+    except Exception:
+        return ""
+    for part in str(claims.get("scope", "")).split():
+        if part.startswith("wid:"):
+            return part[len("wid:") :]
+    return ""
+
+
+def resolved_live_targets(
+    environ: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, str]]:
+    """(variable, workspace) for every cluster credential visible to this run."""
+    environ = os.environ if environ is None else environ
+    return [
+        (var, _token_workspace(environ[var]) or "<unreadable token>")
+        for var in LIVE_TOKEN_VARS
+        if environ.get(var)
+    ]
+
+
+def live_exposure_banner(
+    targets: List[Tuple[str, str]], live_count: int, enabled: bool
+) -> str:
+    """The text printed before the first test when a cluster credential resolves."""
+    lines = [
+        f"{live_count} collected test(s) can reach the live cluster at "
+        f"{HYPHA_SERVER_URL}, and a credential for it resolved:"
+    ]
+    lines += [f"  {var} -> workspace {workspace}" for var, workspace in targets]
+    lines.append(
+        f"THEY WILL RUN: --live was given, so {live_count} test(s) will act on "
+        "that workspace."
+        if enabled
+        else f"Deselected {live_count} test(s); pass --live to run them."
+    )
+    return "\n".join(lines)
+
+
+def _is_live(item: pytest.Item) -> bool:
+    if any(item.iter_markers("live")):
+        return True
+    return bool(LIVE_FIXTURES.intersection(getattr(item, "fixturenames", ())))
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: List[pytest.Item]
+) -> None:
+    live, offline = [], []
+    for item in items:
+        (live if _is_live(item) else offline).append(item)
+
+    enabled = config.getoption("--live")
+    if live and not enabled:
+        items[:] = offline
+        config.hook.pytest_deselected(items=live)
+
+    targets = resolved_live_targets()
+    if not targets:
+        return
+
+    banner = live_exposure_banner(targets, len(live), enabled)
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        print(banner)
+        return
+    reporter.write_sep("=", "live cluster credentials resolved", red=True)
+    reporter.write_line(banner)
+    reporter.write_sep("=", red=True)
 
 
 @pytest.fixture(
@@ -192,7 +297,7 @@ def head_node_port(ray_address: str) -> int:
 @pytest.fixture(scope="session")
 def server_url() -> str:
     """Return Hypha server URL for test connections."""
-    return "https://hypha.aicell.io"
+    return HYPHA_SERVER_URL
 
 
 @pytest.fixture(scope="session")
