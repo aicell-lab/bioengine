@@ -11,6 +11,16 @@ BioEngine supports three deployment modes. The easiest way to generate deploymen
 
 ---
 
+## Who can control the worker
+
+`--admin-users` takes a space-separated list of emails or user IDs and defaults to the account whose token started the worker. Admins can perform every admin operation on the worker, in every deployment mode.
+
+> **`--admin-users '*'` is remote code execution open to the internet.** The worker's Hypha service is registered with public visibility, and a service's authorization gates invocation, not discovery. Almost every admin operation is gated on the admin list with the wildcard honoured, so with `*` in the list **any caller that can reach the Hypha server — including an unauthenticated, anonymous one — is a full admin of your worker**. They can run arbitrary Python on the deployment through `run_code`, `deploy_app` or `upload_app`, with whatever filesystem, credentials and network access its Ray cluster is given — in single-machine mode that is the host you started the worker on, as the user who started it. They can also destroy it through `stop_worker`, `stop_all_apps` or `delete_app`. The wildcard is not "skip maintaining an admin list"; it is "this deployment runs untrusted code from strangers". Use named emails unless that is genuinely what you want. The worker logs a warning at startup whenever the wildcard is in effect.
+
+The one exception is editing the admin list itself: a caller who is only covered by `*` cannot call `add_admin_user` or `remove_admin_user`, so a stranger cannot make the grant permanent or lock you out.
+
+---
+
 ## Mode 1: Single Machine
 
 Runs a local Ray cluster on one machine. Good for workstations, development, and small-scale analysis.
@@ -93,10 +103,8 @@ apptainer exec \
 | `--workspace` | auto | Hypha workspace name (auto-detected from token) |
 | `--server-url` | `https://hypha.aicell.io` | Hypha server URL |
 | `--token` | prompt | Hypha authentication token |
-| `--admin-users` | current user | Space-separated emails, or `*` for all — see the warning below |
+| `--admin-users` | current user | Space-separated emails, or `*` for all — see [Who can control the worker](#who-can-control-the-worker) |
 | `--client-id` | auto | Unique service identifier |
-
-> **`--admin-users '*'` is remote code execution open to the internet.** The worker's Hypha service is registered with public visibility, and a service's authorization gates invocation, not discovery. `run_code` is gated on the same admin list as every other admin operation and the wildcard is honoured there, so with `*` in the list **any caller that can reach the Hypha server — including an unauthenticated, anonymous one — can execute arbitrary Python as the operating system user running the worker**, with its filesystem, its credentials and its Ray cluster. In single-machine mode that is the host you started the worker on. The wildcard is not "skip maintaining an admin list"; it is "this machine runs untrusted code from strangers". Use named emails unless that is genuinely what you want. The worker logs a warning at startup whenever the wildcard is in effect.
 
 The workspace directory defaults to `~/.bioengine` and is mounted into the container at `/.bioengine`.
 

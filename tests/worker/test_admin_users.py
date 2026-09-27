@@ -8,8 +8,9 @@ only a named admin can change who the admins are, nobody can lock the worker
 restart, when the ``--admin-users`` startup flag is replayed verbatim.
 """
 
-import inspect
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -337,8 +338,37 @@ async def test_a_named_admin_list_does_not_warn(tmp_path):
     assert worker.logger.warnings == []
 
 
-def test_the_wildcard_warning_is_wired_into_startup():
-    """A warning nobody calls is the same as no warning."""
-    assert "_warn_if_wildcard_admin_users" in inspect.getsource(
-        BioEngineWorker.start
+class _Reached(Exception):
+    """Ends a start() once the point under test has been passed."""
+
+
+async def test_the_wildcard_warning_is_emitted_during_startup(tmp_path):
+    """A warning nobody calls is the same as no warning.
+
+    Ending start() at the step after the call site is what pins it to startup:
+    production runs blocking=True, so a warning placed later in start() would
+    not reach an operator until the worker shuts down.
+    """
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _reached(*_args, **_kwargs):
+        raise _Reached
+
+    worker = _bare_worker(
+        tmp_path,
+        ["admin@example.org", "*"],
+        heartbeat_file=tmp_path / "worker_heartbeat.json",
+        _shutdown_event=asyncio.Event(),
+        ray_cluster=SimpleNamespace(start=_noop),
+        _connect_to_server=_noop,
+        _discover_data_server=_reached,
+        _stop=_noop,
     )
+
+    with pytest.raises(_Reached):
+        await worker.start(blocking=True)
+
+    assert len(worker.logger.warnings) == 1
+    assert "run_code" in worker.logger.warnings[0]

@@ -529,7 +529,7 @@ class BioEngineWorker:
         self.admin_users[:] = persisted
 
     def _warn_if_wildcard_admin_users(self) -> None:
-        """Warn that a wildcard admin list exposes ``run_code`` to anyone.
+        """Warn that a wildcard admin list exposes code execution to anyone.
 
         The deployment guide says this too, but nobody reads it at roll time.
         """
@@ -539,12 +539,15 @@ class BioEngineWorker:
         self.logger.warning(
             "SECURITY: '*' is in this worker's admin users and the worker service is "
             "registered with public visibility. Every caller that can reach the Hypha "
-            "server — including unauthenticated, anonymous ones — can therefore call "
-            "'run_code' and execute arbitrary Python as the operating system user "
-            f"running this process (uid {os.getuid()}), with this worker's filesystem, "
-            "credentials and Ray cluster. This is remote code execution open to the "
-            "internet, not merely open read access. Replace '*' with named admin "
-            "emails unless this host is genuinely meant to run untrusted code."
+            "server — including unauthenticated, anonymous ones — is therefore a full "
+            "admin of this worker. They can run arbitrary Python on this deployment "
+            "via 'run_code', 'deploy_app' or 'upload_app', with whatever filesystem, "
+            "credentials and network access its Ray cluster is given; in "
+            "single-machine mode that is this host, as the user running this process. "
+            "They can also destroy it via 'stop_worker', 'stop_all_apps' or "
+            "'delete_app'. This is remote code execution open to the internet, not "
+            "merely open read access. Replace '*' with named admin emails unless this "
+            "deployment is genuinely meant to run untrusted code."
         )
 
     def _persist_admin_users(self, admin_users: List[str]) -> None:
