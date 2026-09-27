@@ -207,13 +207,24 @@ def test_worker_arguments_are_forwarded_verbatim():
     assert _build("native", worker_args=args)[3:] == list(args)
 
 
-def test_an_option_the_cli_also_defines_still_reaches_the_worker():
-    """``--workspace-dir`` after ``--`` configures the worker, not the container."""
-    result = _run(
-        ["start", "--runtime", "native", "--dry-run", "--", "--workspace-dir", "/data/ws"]
-    )
+def test_an_option_the_cli_also_defines_still_reaches_the_worker(monkeypatch):
+    """``--workspace-dir`` after ``--`` configures the worker, not the container.
+
+    Asserted against the argv the runtime was called with rather than against
+    ``result.output``: click 8.2 dropped ``mix_stderr``, so ``output`` is stdout
+    and stderr merged, and anything else the process writes to stderr inside the
+    invoke window would land in it.
+    """
+    started = _fake_runtime(monkeypatch, "")
+    result = _run(["start", "--runtime", "native", "--", "--workspace-dir", "/data/ws"])
     assert result.exit_code == 0, result.output
-    assert result.output.strip().endswith("--workspace-dir /data/ws")
+    assert started[0][0] == [
+        "python",
+        "-m",
+        "bioengine.worker",
+        "--workspace-dir",
+        "/data/ws",
+    ]
 
 
 def test_no_worker_arguments_still_starts_the_worker_module():
