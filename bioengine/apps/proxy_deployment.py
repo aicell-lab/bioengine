@@ -1481,6 +1481,18 @@ class ProxyDeployment:
             # against a server that has dropped the registration.
             await self.server.get_service_info(self.websocket_service_id)
             self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
+            # Re-assert rather than assume the record still says what we last
+            # wrote: a successor's init-time claim replaces it with False, and
+            # if that successor never registers nothing else would ever put it
+            # back. Having just confirmed the address resolves, we are the
+            # replica entitled to say so.
+            #
+            # Re-read the gate: check_health can deregister us while the probe
+            # above is in flight, and answering a question asked before that
+            # would leave a deregistered app advertised with no path back —
+            # every later tick returns at the gate.
+            if self.entry_deployment_ready:
+                self._report_service_registration(True)
         except Exception as e:
             # Not a health-check failure: flag for rebuild on the next tick.
             logger.warning(
