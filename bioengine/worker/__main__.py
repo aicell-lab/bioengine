@@ -110,8 +110,14 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         type=str,
         nargs="+",
         metavar="EMAIL",
-        help="List of user emails/IDs with administrative privileges for worker management. "
-        "If not specified, defaults to the authenticated user from Hypha login.",
+        help="Space-separated list of user emails/IDs with administrative privileges for "
+        "worker management. If not specified, defaults to the authenticated user from "
+        "Hypha login. SECURITY: passing '*' makes every caller that can reach the Hypha "
+        "server a full admin, including unauthenticated anonymous ones, because the "
+        "worker service is public. That lets anyone run arbitrary Python on this "
+        "deployment ('run_code', 'deploy_app', 'upload_app') and destroy it "
+        "('stop_worker', 'stop_all_apps'). Use named emails unless this deployment is "
+        "meant to run untrusted code.",
     )
     core_group.add_argument(
         "--workspace-dir",
