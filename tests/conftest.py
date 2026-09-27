@@ -278,7 +278,9 @@ def pytest_warning_recorded(warning_message, nodeid, **_):
 def pytest_sessionfinish(session) -> None:
     if not _unawaited_destructor_nodeids:
         return
-    session.exitstatus = 1
+    # Only claim a passing run: INTERRUPTED and the error statuses say more.
+    if session.exitstatus == 0:
+        session.exitstatus = 1
     print(
         f"\n{len(_unawaited_destructor_nodeids)} un-awaited ProxyDeployment "
         f"destructor(s). Build test proxies from tests.apps._proxy_double."
