@@ -3,7 +3,10 @@
 Requires the model-runner app to be deployed to bioimage-io/bioengine-worker.
 Set BIOIMAGE_IO_TOKEN (or HYPHA_TOKEN) in the environment before running.
 
-    pytest tests/apps/model-runner/ -v -o "addopts="
+These call the live service, so they need --live; without it they are
+deselected and the command exits 5 with no tests collected.
+
+    pytest tests/apps/model-runner/ -v -o "addopts=" --live
 """
 
 import io

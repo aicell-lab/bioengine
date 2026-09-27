@@ -118,8 +118,15 @@ Local artifact development: `export BIOENGINE_LOCAL_ARTIFACT_PATH=/path/to/bioen
 ### Run tests
 
 ```bash
-pytest tests/end_to_end/ -v
+pytest tests/                  # offline tests only
+pytest tests/end_to_end/ -v --live   # deploys to and calls a real cluster
 ```
+
+Tests that act on a live cluster are deselected without `--live`, so the
+end-to-end command above exits 5 ("no tests collected") if you omit it.
+Whenever a credential resolves, the run prints the server, the workspace each
+token is scoped to, and how many live-reaching tests are enabled — with or
+without `--live`, so a finished run's log says what it could have touched.
 
 Test organisation:
 - `tests/end_to_end/` — integration tests for the core worker

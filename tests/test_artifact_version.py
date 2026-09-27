@@ -10,10 +10,14 @@ This file verifies four cases:
 3. Re-saving the same version → rejected (would overwrite a published release).
 4. Saving an older version → rejected.
 
+These act on ``bioimage-io/bioengine-worker`` in production: they call
+``upload_app`` and delete the artifacts again. They are the most destructive
+tests in the suite, hence the module-wide ``live`` marker.
+
 Run with:
     conda activate bioengine
     source .env
-    pytest tests/test_artifact_version.py -v
+    pytest tests/test_artifact_version.py -v --live
 """
 
 import os
@@ -25,6 +29,8 @@ from hypha_rpc import connect_to_server
 from pathlib import Path
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+
+pytestmark = pytest.mark.live
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

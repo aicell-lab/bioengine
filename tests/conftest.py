@@ -8,14 +8,17 @@ Requires HYPHA_TOKEN in environment and bioengine-worker conda environment.
 """
 
 import asyncio
+import base64
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Generator
+from typing import AsyncGenerator, Dict, Generator, List, Optional, Tuple
 
 import pytest
 import pytest_asyncio
@@ -27,6 +30,172 @@ from bioengine.cluster.ray_cluster import RayCluster
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Every Hypha connection in the suite is hard-coded to this deployment; no
+# environment variable redirects it.
+HYPHA_SERVER_URL = "https://hypha.aicell.io"
+
+# Requesting one of these fixtures means the test authenticates against the
+# real deployment above. Anything else that reaches a cluster has to say so
+# with @pytest.mark.live.
+LIVE_FIXTURES = frozenset({"hypha_client", "hypha_token", "model_runner"})
+
+# Credentials the suite picks up on its own, in the order a reader should
+# worry about them. `load_dotenv()` above supplies these from a repo-root
+# .env, so whether they resolve depends on which checkout pytest was run from.
+LIVE_TOKEN_VARS = ("HYPHA_TOKEN", "BIOIMAGE_IO_TOKEN")
+
+_START_TIME = pytest.StashKey[float]()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--live",
+        action="store_true",
+        default=False,
+        help=(
+            "Run tests that deploy to and call a real Hypha cluster. Without "
+            "this flag they are deselected even when a token is available."
+        ),
+    )
+
+
+def _token_workspace(token: str) -> str:
+    """Workspace a Hypha JWT is scoped to, or '' if it is not a readable JWT."""
+    try:
+        segment = token.split(".")[1]
+        claims = json.loads(
+            base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+        )
+        scope = str(claims.get("scope", ""))
+    except Exception:
+        # A token we cannot parse must not abort the session; the caller
+        # reports the credential as present with an unknown workspace.
+        return ""
+    for part in scope.split():
+        if part.startswith("wid:"):
+            return part[len("wid:") :]
+    return ""
+
+
+def resolved_live_targets(
+    environ: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, str]]:
+    """(variable, workspace) for every cluster credential visible to this run."""
+    environ = os.environ if environ is None else environ
+    return [
+        (var, _token_workspace(environ[var]) or "<unreadable token>")
+        for var in LIVE_TOKEN_VARS
+        if environ.get(var)
+    ]
+
+
+def live_exposure_banner(
+    targets: List[Tuple[str, str]], live_count: int, enabled: bool
+) -> str:
+    """The text printed before the first test when a cluster credential resolves.
+
+    The count is stated whether or not --live was given: the flag only stops
+    the accidental case, and once someone has opted in deliberately the count
+    in the log is the only thing that makes an after-the-fact audit possible.
+    """
+    lines = [
+        "=" * 22 + " live cluster credentials resolved " + "=" * 22,
+        f"{live_count} collected test(s) can reach the live cluster at "
+        f"{HYPHA_SERVER_URL}, and a credential for it resolved:",
+    ]
+    lines += [f"  {var} -> workspace {workspace}" for var, workspace in targets]
+    lines.append(
+        f"THEY WILL RUN: --live was given, so {live_count} test(s) will act on "
+        "that workspace."
+        if enabled
+        else f"Deselected {live_count} test(s); pass --live to run them."
+    )
+    lines.append("=" * 78)
+    return "\n".join(lines)
+
+
+def _emit(config: pytest.Config, text: str) -> None:
+    """Write where the controller will actually see it.
+
+    Under pytest-xdist -- which `addopts` turns on with `--numprocesses=1` --
+    collection runs inside a worker whose terminalreporter output is dropped
+    and whose deselection stats never reach the summary. The worker's stderr
+    is inherited by the controller, so that is the channel that survives.
+    """
+    worker = getattr(config, "workerinput", None)
+    if worker is not None:
+        if worker.get("workerid", "gw0") == "gw0":
+            sys.stderr.write(text + "\n")
+            sys.stderr.flush()
+        return
+
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        print(text)
+    else:
+        reporter.write_line(text)
+
+
+def _is_live(item: pytest.Item) -> bool:
+    if any(item.iter_markers("live")):
+        return True
+    return bool(LIVE_FIXTURES.intersection(getattr(item, "fixturenames", ())))
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: List[pytest.Item]
+) -> None:
+    # Attaching the marker is what makes `-m live` agree with `--live`: most
+    # live tests are detected from their fixture closure, so without this they
+    # are gated but unnamed and `-m live` returns a wrong subset. It has to
+    # happen before pytest's own mark filtering -- which a conftest hookimpl
+    # already does under pluggy's reverse-registration order, so tryfirst is a
+    # guarantee against a plugin registering an earlier modifyitems, not a
+    # load-bearing fix. Switching it to trylast does break the invariant.
+    live, offline = [], []
+    for item in items:
+        if _is_live(item):
+            item.add_marker(pytest.mark.live)
+            live.append(item)
+        else:
+            offline.append(item)
+
+    enabled = config.getoption("--live")
+    if live and not enabled:
+        items[:] = offline
+        config.hook.pytest_deselected(items=live)
+
+    targets = resolved_live_targets()
+    if targets:
+        _emit(config, live_exposure_banner(targets, len(live), enabled))
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.stash[_START_TIME] = time.time()
+
+
+def pytest_terminal_summary(
+    terminalreporter, exitstatus: int, config: pytest.Config
+) -> None:
+    """Restate the exposure next to the wall clock.
+
+    Runtime is the cheapest signal that live tests ran -- the same command
+    takes ~30s offline and several minutes against a cluster -- so an audit
+    needs the credential and the duration in one place.
+    """
+    targets = resolved_live_targets()
+    if not targets:
+        return
+    elapsed = time.time() - config.stash.get(_START_TIME, time.time())
+    workspaces = ", ".join(workspace for _, workspace in targets)
+    terminalreporter.write_line(
+        f"live cluster exposure: credentials for {workspaces} on "
+        f"{HYPHA_SERVER_URL} were in scope for this {elapsed:.1f}s run "
+        f"({'--live GIVEN' if config.getoption('--live') else '--live not given'}).",
+        red=True,
+    )
 
 
 @pytest.fixture(
@@ -192,7 +361,7 @@ def head_node_port(ray_address: str) -> int:
 @pytest.fixture(scope="session")
 def server_url() -> str:
     """Return Hypha server URL for test connections."""
-    return "https://hypha.aicell.io"
+    return HYPHA_SERVER_URL
 
 
 @pytest.fixture(scope="session")
