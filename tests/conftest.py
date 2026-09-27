@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator, Dict, Generator, List, Optional, Tuple
@@ -44,6 +45,8 @@ LIVE_FIXTURES = frozenset({"hypha_client", "hypha_token", "model_runner"})
 # .env, so whether they resolve depends on which checkout pytest was run from.
 LIVE_TOKEN_VARS = ("HYPHA_TOKEN", "BIOIMAGE_IO_TOKEN")
 
+_START_TIME = pytest.StashKey[float]()
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
@@ -64,9 +67,12 @@ def _token_workspace(token: str) -> str:
         claims = json.loads(
             base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
         )
+        scope = str(claims.get("scope", ""))
     except Exception:
+        # A token we cannot parse must not abort the session; the caller
+        # reports the credential as present with an unknown workspace.
         return ""
-    for part in str(claims.get("scope", "")).split():
+    for part in scope.split():
         if part.startswith("wid:"):
             return part[len("wid:") :]
     return ""
@@ -87,10 +93,16 @@ def resolved_live_targets(
 def live_exposure_banner(
     targets: List[Tuple[str, str]], live_count: int, enabled: bool
 ) -> str:
-    """The text printed before the first test when a cluster credential resolves."""
+    """The text printed before the first test when a cluster credential resolves.
+
+    The count is stated whether or not --live was given: the flag only stops
+    the accidental case, and once someone has opted in deliberately the count
+    in the log is the only thing that makes an after-the-fact audit possible.
+    """
     lines = [
+        "=" * 22 + " live cluster credentials resolved " + "=" * 22,
         f"{live_count} collected test(s) can reach the live cluster at "
-        f"{HYPHA_SERVER_URL}, and a credential for it resolved:"
+        f"{HYPHA_SERVER_URL}, and a credential for it resolved:",
     ]
     lines += [f"  {var} -> workspace {workspace}" for var, workspace in targets]
     lines.append(
@@ -99,7 +111,30 @@ def live_exposure_banner(
         if enabled
         else f"Deselected {live_count} test(s); pass --live to run them."
     )
+    lines.append("=" * 78)
     return "\n".join(lines)
+
+
+def _emit(config: pytest.Config, text: str) -> None:
+    """Write where the controller will actually see it.
+
+    Under pytest-xdist -- which `addopts` turns on with `--numprocesses=1` --
+    collection runs inside a worker whose terminalreporter output is dropped
+    and whose deselection stats never reach the summary. The worker's stderr
+    is inherited by the controller, so that is the channel that survives.
+    """
+    worker = getattr(config, "workerinput", None)
+    if worker is not None:
+        if worker.get("workerid", "gw0") == "gw0":
+            sys.stderr.write(text + "\n")
+            sys.stderr.flush()
+        return
+
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        print(text)
+    else:
+        reporter.write_line(text)
 
 
 def _is_live(item: pytest.Item) -> bool:
@@ -108,12 +143,19 @@ def _is_live(item: pytest.Item) -> bool:
     return bool(LIVE_FIXTURES.intersection(getattr(item, "fixturenames", ())))
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(
     config: pytest.Config, items: List[pytest.Item]
 ) -> None:
+    # tryfirst so the markers below land before pytest's own -m filtering,
+    # which would otherwise see only the explicitly declared ones.
     live, offline = [], []
     for item in items:
-        (live if _is_live(item) else offline).append(item)
+        if _is_live(item):
+            item.add_marker(pytest.mark.live)
+            live.append(item)
+        else:
+            offline.append(item)
 
     enabled = config.getoption("--live")
     if live and not enabled:
@@ -121,17 +163,34 @@ def pytest_collection_modifyitems(
         config.hook.pytest_deselected(items=live)
 
     targets = resolved_live_targets()
+    if targets:
+        _emit(config, live_exposure_banner(targets, len(live), enabled))
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.stash[_START_TIME] = time.time()
+
+
+def pytest_terminal_summary(
+    terminalreporter, exitstatus: int, config: pytest.Config
+) -> None:
+    """Restate the exposure next to the wall clock.
+
+    Runtime is the cheapest signal that live tests ran -- the same command
+    takes ~30s offline and several minutes against a cluster -- so an audit
+    needs the credential and the duration in one place.
+    """
+    targets = resolved_live_targets()
     if not targets:
         return
-
-    banner = live_exposure_banner(targets, len(live), enabled)
-    reporter = config.pluginmanager.get_plugin("terminalreporter")
-    if reporter is None:
-        print(banner)
-        return
-    reporter.write_sep("=", "live cluster credentials resolved", red=True)
-    reporter.write_line(banner)
-    reporter.write_sep("=", red=True)
+    elapsed = time.time() - config.stash.get(_START_TIME, time.time())
+    workspaces = ", ".join(workspace for _, workspace in targets)
+    terminalreporter.write_line(
+        f"live cluster exposure: credentials for {workspaces} on "
+        f"{HYPHA_SERVER_URL} were in scope for this {elapsed:.1f}s run "
+        f"({'--live GIVEN' if config.getoption('--live') else '--live not given'}).",
+        red=True,
+    )
 
 
 @pytest.fixture(

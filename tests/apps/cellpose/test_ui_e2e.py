@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+# Every test here drives a browser at the deployed app and injects HYPHA_TOKEN
+# into its localStorage. The `page` fixture is not in LIVE_FIXTURES, so the
+# marker is what gates them.
+pytestmark = pytest.mark.live
+
 SERVER_URL = "https://hypha.aicell.io"
 APP_WORKSPACE = os.environ.get("HYPHA_TEST_WORKSPACE", "ri-scale")
 APP_URL = f"{SERVER_URL}/{APP_WORKSPACE}/view/cellpose-finetuning"
