@@ -36,8 +36,9 @@ import pytest
 from bioengine.apps import proxy_deployment as pd_module
 from bioengine.apps.manager import AppsManager
 from bioengine.cluster.proxy_actor import BioEngineProxyActor
+from tests.apps._proxy_double import PROXY_CLS as _ProxyCls
+from tests.apps._proxy_double import ProxyDouble
 
-_ProxyCls = pd_module.ProxyDeployment.func_or_class
 _ActorCls = BioEngineProxyActor.__ray_actor_class__
 
 APP_ID = "nuclei-seg"
@@ -263,7 +264,7 @@ class _Handle:
 
 
 def _bare_proxy(**attrs):
-    inst = object.__new__(_ProxyCls)
+    inst = object.__new__(ProxyDouble)
     inst.application_id = APP_ID
     inst._replica_id = "replica-0"
     inst.entry_deployment_ready = True
@@ -324,7 +325,11 @@ async def test_deregistering_reports_the_service_as_gone() -> None:
 
 
 def _construct_proxy(monkeypatch, handle: _Handle, replica_tag: str = "replica-0"):
-    """Build a real ProxyDeployment, with only Ray's two lookups stubbed."""
+    """Build a real ProxyDeployment, with only Ray's two lookups stubbed.
+
+    ``ProxyDouble`` is that class minus Ray Serve's async destructor, which no
+    test has a replica to await; nothing on the claim path differs.
+    """
     monkeypatch.setattr(pd_module.ray, "get_actor", lambda name, namespace: handle)
     monkeypatch.setattr(
         pd_module,
@@ -333,7 +338,7 @@ def _construct_proxy(monkeypatch, handle: _Handle, replica_tag: str = "replica-0
             deployment="ProxyDeployment", replica_tag=replica_tag, app_name=APP_ID
         ),
     )
-    return _ProxyCls(
+    return ProxyDouble(
         application_id=APP_ID,
         application_name="Nuclei Segmentation",
         application_description="Segment nuclei.",
@@ -381,7 +386,7 @@ def test_a_missing_actor_handle_never_breaks_the_replica() -> None:
 def test_reporting_survives_a_part_built_replica() -> None:
     # __del__ -> _deregister_services -> here, reachable before __init__ has
     # assigned the handle at all.
-    inst = object.__new__(_ProxyCls)
+    inst = object.__new__(ProxyDouble)
     inst._report_service_registration(False)  # must not raise AttributeError
 
 

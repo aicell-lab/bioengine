@@ -43,8 +43,7 @@ from bioengine.apps.usage_ledger import (
     ledger_dir_for_app,
     read_usage,
 )
-
-_ProxyCls = pd_module.ProxyDeployment.func_or_class
+from tests.apps._proxy_double import ProxyDouble
 
 
 # ===== helpers =====
@@ -71,7 +70,7 @@ class _Handle:
 
 
 def _bare_proxy(tmp_path: Path, behaviour, *, authorized_users=None, slots=4):
-    inst = object.__new__(_ProxyCls)
+    inst = object.__new__(ProxyDouble)
     inst.application_id = "counted-app"
     inst.workspace = "host-ws"
     inst.authorized_users = authorized_users or {"*": ["*"]}
@@ -925,7 +924,7 @@ async def test_a_hypha_client_can_call_usage_stats_on_the_registered_service(
 
 def test_an_app_without_durable_storage_still_deploys(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("BIOENGINE_APP_DIR", raising=False)
-    inst = object.__new__(_ProxyCls)
+    inst = object.__new__(ProxyDouble)
     inst.application_id = "counted-app"
     inst.workspace = "host-ws"
     inst.app_data = {}
