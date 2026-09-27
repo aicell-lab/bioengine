@@ -259,5 +259,33 @@ async def artifact_manager(hypha_client: RemoteService) -> ObjectProxy:
     return artifact_manager_service
 
 
+_UNAWAITED_DESTRUCTOR = "coroutine 'ProxyDeployment.__del__' was never awaited"
+_unawaited_destructor_nodeids: list = []
+
+
+def pytest_warning_recorded(warning_message, nodeid, **_):
+    """Record proxies left for the collector to finalise.
+
+    Ray Serve awaits ``ProxyDeployment.__del__``; CPython's collector calls it,
+    gets a coroutine and discards it. The warning is charged to whichever test
+    was running when the collector tripped, not to the one that built the
+    object, so it has to be caught session-wide rather than per test.
+    """
+    if _UNAWAITED_DESTRUCTOR in str(warning_message.message):
+        _unawaited_destructor_nodeids.append(nodeid)
+
+
+def pytest_sessionfinish(session) -> None:
+    if not _unawaited_destructor_nodeids:
+        return
+    session.exitstatus = 1
+    print(
+        f"\n{len(_unawaited_destructor_nodeids)} un-awaited ProxyDeployment "
+        f"destructor(s). Build test proxies from tests.apps._proxy_double."
+        f"ProxyDouble. Charged to: "
+        f"{', '.join(sorted(set(_unawaited_destructor_nodeids)))}"
+    )
+
+
 # Configure asyncio for pytest
 pytest_plugins = ("pytest_asyncio",)
