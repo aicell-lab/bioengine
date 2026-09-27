@@ -528,6 +528,25 @@ class BioEngineWorker:
             )
         self.admin_users[:] = persisted
 
+    def _warn_if_wildcard_admin_users(self) -> None:
+        """Warn that a wildcard admin list exposes ``run_code`` to anyone.
+
+        The deployment guide says this too, but nobody reads it at roll time.
+        """
+        if "*" not in self.admin_users:
+            return
+
+        self.logger.warning(
+            "SECURITY: '*' is in this worker's admin users and the worker service is "
+            "registered with public visibility. Every caller that can reach the Hypha "
+            "server — including unauthenticated, anonymous ones — can therefore call "
+            "'run_code' and execute arbitrary Python as the operating system user "
+            f"running this process (uid {os.getuid()}), with this worker's filesystem, "
+            "credentials and Ray cluster. This is remote code execution open to the "
+            "internet, not merely open read access. Replace '*' with named admin "
+            "emails unless this host is genuinely meant to run untrusted code."
+        )
+
     def _persist_admin_users(self, admin_users: List[str]) -> None:
         """Write the admin users so the next restart overlays them on the seed.
 
@@ -1334,6 +1353,8 @@ class BioEngineWorker:
             # Connect the BioEngine worker to the Hypha server
             # Completes initialization of AppsManager and CodeExecutor
             await self._connect_to_server(STARTUP_CONNECT_BUDGET_S)
+
+            self._warn_if_wildcard_admin_users()
 
             # Check for running data server
             await self._discover_data_server()

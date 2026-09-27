@@ -93,8 +93,10 @@ apptainer exec \
 | `--workspace` | auto | Hypha workspace name (auto-detected from token) |
 | `--server-url` | `https://hypha.aicell.io` | Hypha server URL |
 | `--token` | prompt | Hypha authentication token |
-| `--admin-users` | current user | Comma-separated emails or `*` for all |
+| `--admin-users` | current user | Space-separated emails, or `*` for all — see the warning below |
 | `--client-id` | auto | Unique service identifier |
+
+> **`--admin-users '*'` is remote code execution open to the internet.** The worker's Hypha service is registered with public visibility, and a service's authorization gates invocation, not discovery. `run_code` is gated on the same admin list as every other admin operation and the wildcard is honoured there, so with `*` in the list **any caller that can reach the Hypha server — including an unauthenticated, anonymous one — can execute arbitrary Python as the operating system user running the worker**, with its filesystem, its credentials and its Ray cluster. In single-machine mode that is the host you started the worker on. The wildcard is not "skip maintaining an admin list"; it is "this machine runs untrusted code from strangers". Use named emails unless that is genuinely what you want. The worker logs a warning at startup whenever the wildcard is in effect.
 
 The workspace directory defaults to `~/.bioengine` and is mounted into the container at `/.bioengine`.
 

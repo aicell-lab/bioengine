@@ -110,8 +110,12 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         type=str,
         nargs="+",
         metavar="EMAIL",
-        help="List of user emails/IDs with administrative privileges for worker management. "
-        "If not specified, defaults to the authenticated user from Hypha login.",
+        help="Space-separated list of user emails/IDs with administrative privileges for "
+        "worker management. If not specified, defaults to the authenticated user from "
+        "Hypha login. SECURITY: passing '*' authorizes every caller, including "
+        "unauthenticated anonymous ones, and the worker service is public — that grants "
+        "the whole internet 'run_code', i.e. arbitrary Python executed as the user "
+        "running this worker. Use named emails unless the host is meant to run untrusted code.",
     )
     core_group.add_argument(
         "--workspace-dir",
