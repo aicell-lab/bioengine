@@ -22,9 +22,8 @@ import types
 
 import pytest
 
-from bioengine.apps import proxy_deployment as pd_module
-
-_ProxyDeployment = pd_module.ProxyDeployment.func_or_class
+from tests.apps._proxy_double import PROXY_CLS as _ProxyDeployment
+from tests.apps._proxy_double import ProxyDouble
 
 
 class _StubPeerConnection:
@@ -38,7 +37,7 @@ class _StubPeerConnection:
 def _make_instance() -> _ProxyDeployment:
     """Skip ``__init__`` (it wants ~15 constructor args and a Ray Serve
     context) and stamp on just the attributes the sweep touches."""
-    obj = _ProxyDeployment.__new__(_ProxyDeployment)
+    obj = ProxyDouble.__new__(ProxyDouble)
     obj.application_id = "test-app"
     obj._active_peer_connections = {}
     return obj
