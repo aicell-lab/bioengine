@@ -17,6 +17,7 @@ import functools
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -33,8 +34,15 @@ from tests.conftest import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+MODEL_RUNNER = "tests/apps/model-runner"
+
 # One live test in tests/apps/model-runner/, by node name.
 A_LIVE_TEST = "test_search_models_returns_list"
+
+# A scope holding all three kinds at once: live by fixture closure, live by
+# module marker, and offline. The marker test below needs the mix, because
+# the failure it guards is a marker set that covers only the second kind.
+MIXED_SCOPE = (MODEL_RUNNER, "tests/test_artifact_version.py", "tests/_app")
 
 # pytest.ini's addopts carries --numprocesses=1, so a sub-run that honours it
 # needs xdist. It is in requirements-test.txt; ad-hoc runners sometimes
@@ -51,11 +59,16 @@ def _fake_jwt(workspace: str) -> str:
     return f"header.{payload.rstrip('=')}.signature"
 
 
-def _collect(extra_args: List[str], env_overrides: Dict[str, str]) -> str:
+def _collect(
+    extra_args: List[str],
+    env_overrides: Dict[str, str],
+    scope: Tuple[str, ...] = (MODEL_RUNNER,),
+) -> str:
     """A sub-run with addopts neutralised -- the fast path, for selection logic."""
     return _run_cached(
         ("-o", "addopts=", "--collect-only", "-q", *extra_args),
         tuple(sorted(env_overrides.items())),
+        scope,
     )
 
 
@@ -69,14 +82,18 @@ def _run_with_default_addopts(
     `-o addopts=` -- as every other sub-run here does -- hides that entirely,
     which is why this variant exists.
     """
-    return _run_cached(tuple(extra_args), tuple(sorted(env_overrides.items())))
+    return _run_cached(
+        tuple(extra_args), tuple(sorted(env_overrides.items())), (MODEL_RUNNER,)
+    )
 
 
 @functools.lru_cache(maxsize=None)
 def _run_cached(
-    extra_args: Tuple[str, ...], overrides: Tuple[Tuple[str, str], ...]
+    extra_args: Tuple[str, ...],
+    overrides: Tuple[Tuple[str, str], ...],
+    scope: Tuple[str, ...],
 ) -> str:
-    """Run pytest over tests/apps/model-runner and return its combined output.
+    """Run pytest over `scope` and return its combined output.
 
     Both token variables are always set explicitly: python-dotenv does not
     override a variable that is already in the environment, so passing an
@@ -96,7 +113,7 @@ def _run_cached(
             "pytest",
             "-p",
             "no:cacheprovider",
-            "tests/apps/model-runner",
+            *scope,
             *extra_args,
         ],
         cwd=REPO_ROOT,
@@ -198,6 +215,46 @@ def test_the_wall_clock_summary_states_the_exposure_even_with_the_flag() -> None
     assert "25 collected test(s) can reach" in output
     assert "live cluster exposure:" in output
     assert "--live GIVEN" in output
+
+
+def _selected(output: str) -> int:
+    """Tests pytest reports as collected, from a `-q --collect-only` run."""
+    if re.search(r"^no tests collected", output, re.M):
+        return 0
+    match = re.search(r"^(\d+)(?:/\d+)? tests? collected", output, re.M)
+    assert match, output
+    return int(match.group(1))
+
+
+def _deselected(output: str) -> int:
+    match = re.search(r"\((\d+) deselected\)", output)
+    return int(match.group(1)) if match else 0
+
+
+def test_m_live_selects_exactly_what_the_gate_deselects() -> None:
+    """The `live` marker has to describe every test the gate acts on.
+
+    Most are detected from their fixture closure rather than from a marker
+    anyone wrote, so `-m live` only agrees with the gate if the hook attaches
+    the marker to them. Without that attachment `-m live --live` silently
+    returns just the modules that declare the marker themselves -- a wrong
+    subset that looks like a complete answer, which is worse than the option
+    not working at all.
+
+    Comparing the two counts rather than asserting a literal keeps this test
+    correct as live tests are added, and it is exactly the invariant that
+    breaks: registering a `live` marker in pytest.ini while `-m live` resolves
+    a different set than `--live` gates is the trap.
+    """
+    gated = _deselected(_collect([], {}, MIXED_SCOPE))
+    assert gated > 0, "scope must contain live tests for this to mean anything"
+    assert _selected(_collect(["-m", "live", "--live"], {}, MIXED_SCOPE)) == gated
+
+
+def test_m_live_without_the_flag_selects_nothing() -> None:
+    """Deselection wins over selection: naming the marker must not be a way
+    in."""
+    assert _selected(_collect(["-m", "live"], {}, MIXED_SCOPE)) == 0
 
 
 def test_the_artifact_version_tests_are_gated() -> None:

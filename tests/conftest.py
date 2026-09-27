@@ -147,8 +147,13 @@ def _is_live(item: pytest.Item) -> bool:
 def pytest_collection_modifyitems(
     config: pytest.Config, items: List[pytest.Item]
 ) -> None:
-    # tryfirst so the markers below land before pytest's own -m filtering,
-    # which would otherwise see only the explicitly declared ones.
+    # Attaching the marker is what makes `-m live` agree with `--live`: most
+    # live tests are detected from their fixture closure, so without this they
+    # are gated but unnamed and `-m live` returns a wrong subset. It has to
+    # happen before pytest's own mark filtering -- which a conftest hookimpl
+    # already does under pluggy's reverse-registration order, so tryfirst is a
+    # guarantee against a plugin registering an earlier modifyitems, not a
+    # load-bearing fix. Switching it to trylast does break the invariant.
     live, offline = [], []
     for item in items:
         if _is_live(item):
