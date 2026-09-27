@@ -31,12 +31,12 @@ import time
 import pytest
 
 from bioengine.apps import proxy_deployment as pd_module
-
-_ProxyCls = pd_module.ProxyDeployment.func_or_class
+from tests.apps._proxy_double import PROXY_CLS as _ProxyCls
+from tests.apps._proxy_double import ProxyDouble
 
 
 def _bare_proxy(**attrs):
-    inst = object.__new__(_ProxyCls)
+    inst = object.__new__(ProxyDouble)
     inst.application_id = "app"
     inst.entry_deployment_ready = True
     inst.server = None
