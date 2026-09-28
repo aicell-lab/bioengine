@@ -95,6 +95,7 @@ def _bare_worker(server, **attrs):
     worker._registration_window_start = worker._registration_ok_at
     worker._registration_window_failures = 0
     worker._monitor_consecutive_errors = 0
+    worker.enable_access_requests = False
     worker.reconnects = 0
     worker.registrations = 0
     worker.repair_steps = []
@@ -655,6 +656,7 @@ async def real_registration_worker():
     worker._registration_ok_at = time.time()
     worker._registration_window_start = worker._registration_ok_at
     worker._registration_window_failures = 0
+    worker.enable_access_requests = False
     worker.reconnects = 0
     worker.ray_cluster = SimpleNamespace(mode="single-machine")
     worker.code_executor = SimpleNamespace(run_code=_noop)

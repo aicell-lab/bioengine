@@ -240,6 +240,12 @@ The BioEngineWorker registers as a Hypha service. Key methods:
 | `delete_app` | ✓ | Delete an application artifact |
 | `run_code` | ✓ | Run Python code in Ray task |
 | `list_datasets` | | Available datasets |
+| `request_admin_access` | | Ask to become an admin. Public; only registered with `--enable-access-requests` |
+| `get_admin_access_request` | | Read your own request. Same flag |
+| `list_access_requests` | ✓ | All requests. Same flag |
+| `resolve_access_request` | ✓ | `grant` / `deny` / `clear` a request. Same flag |
+
+The worker admin list does **not** honour a `"*"` entry — it is dropped at startup, so no admin-gated worker method authorizes an anonymous caller. App manifests may still use `authorized_users: ['*']`; that is a separate list. The users named in `--admin-users` cannot be removed on a running worker.
 
 ## Dev image testing workflow
 
