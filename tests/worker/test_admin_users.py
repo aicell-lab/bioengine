@@ -8,9 +8,7 @@ only a named admin can change who the admins are, nobody can lock the worker
 restart, when the ``--admin-users`` startup flag is replayed verbatim.
 """
 
-import asyncio
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -23,13 +21,21 @@ OUTSIDER = create_context("outsider-id", "outsider@example.org")
 
 
 def _bare_worker(tmp_path, admin_users, **attrs):
-    """A worker with only the state the admin-user methods touch."""
+    """A worker with only the state the admin-user methods touch.
+
+    ``_founding_admin_users`` defaults to empty so the tests below keep
+    exercising the guard each one is about; the starting-user guard has its own
+    tests that set it explicitly.
+    """
     worker = BioEngineWorker.__new__(BioEngineWorker)
     worker.start_time = None  # silences __del__ on a half-built instance
     worker.logger = _Logger()
     worker.admin_users = list(admin_users)
     worker._admin_users_file = tmp_path / "admin_users.json"
     worker._worker_user_email = "worker@service.internal"
+    worker._founding_admin_users = ()
+    worker._wildcard_admin_users_warned = False
+    worker.enable_access_requests = False
     for key, value in attrs.items():
         setattr(worker, key, value)
     return worker
@@ -235,7 +241,16 @@ def test_the_persisted_list_overrides_the_startup_seed(tmp_path):
 
 
 def test_a_runtime_revocation_is_not_undone_by_the_seed(tmp_path):
-    worker = _bare_worker(tmp_path, ["seeded@example.org", "revoked@example.org"])
+    """Revoking a user the worker was not started with still survives a restart.
+
+    The revoked user is deliberately not a starting user: a starting user cannot
+    be revoked at all, and the store is re-checked for them on load.
+    """
+    worker = _bare_worker(
+        tmp_path,
+        ["seeded@example.org", "revoked@example.org"],
+        _founding_admin_users=("seeded@example.org",),
+    )
     (tmp_path / "admin_users.json").write_text(json.dumps(["seeded@example.org"]))
 
     worker._load_persisted_admin_users()
@@ -318,57 +333,23 @@ async def test_the_admin_methods_are_exposed_on_the_worker_service(tmp_path):
     assert registered["remove_admin_user"] == worker.remove_admin_user
 
 
-async def test_a_wildcard_admin_list_warns_that_anyone_can_run_code(tmp_path):
-    """The wildcard reads as a permissions shortcut; it is open remote execution."""
+def test_a_wildcard_admin_entry_is_dropped_and_the_exposure_named(tmp_path):
+    """The wildcard reads as a permissions shortcut; it was open remote execution."""
     worker = _bare_worker(tmp_path, ["admin@example.org", "*"])
 
-    worker._warn_if_wildcard_admin_users()
+    worker._forbid_wildcard_admin_users("the --admin-users startup flag")
 
+    assert worker.admin_users == ["admin@example.org"]
     assert len(worker.logger.warnings) == 1
     warning = worker.logger.warnings[0]
     assert "run_code" in warning
     assert "anonymous" in warning
 
 
-async def test_a_named_admin_list_does_not_warn(tmp_path):
+def test_a_named_admin_list_is_left_alone_and_does_not_warn(tmp_path):
     worker = _bare_worker(tmp_path, ["admin@example.org"])
 
-    worker._warn_if_wildcard_admin_users()
+    worker._forbid_wildcard_admin_users("the --admin-users startup flag")
 
+    assert worker.admin_users == ["admin@example.org"]
     assert worker.logger.warnings == []
-
-
-class _Reached(Exception):
-    """Ends a start() once the point under test has been passed."""
-
-
-async def test_the_wildcard_warning_is_emitted_during_startup(tmp_path):
-    """A warning nobody calls is the same as no warning.
-
-    Ending start() at the step after the call site is what pins it to startup:
-    production runs blocking=True, so a warning placed later in start() would
-    not reach an operator until the worker shuts down.
-    """
-
-    async def _noop(*_args, **_kwargs):
-        return None
-
-    async def _reached(*_args, **_kwargs):
-        raise _Reached
-
-    worker = _bare_worker(
-        tmp_path,
-        ["admin@example.org", "*"],
-        heartbeat_file=tmp_path / "worker_heartbeat.json",
-        _shutdown_event=asyncio.Event(),
-        ray_cluster=SimpleNamespace(start=_noop),
-        _connect_to_server=_noop,
-        _discover_data_server=_reached,
-        _stop=_noop,
-    )
-
-    with pytest.raises(_Reached):
-        await worker.start(blocking=True)
-
-    assert len(worker.logger.warnings) == 1
-    assert "run_code" in worker.logger.warnings[0]

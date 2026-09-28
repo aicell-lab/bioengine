@@ -15,9 +15,29 @@ BioEngine supports three deployment modes. The easiest way to generate deploymen
 
 `--admin-users` takes a space-separated list of emails or user IDs and defaults to the account whose token started the worker. Admins can perform every admin operation on the worker, in every deployment mode.
 
-> **`--admin-users '*'` is remote code execution open to the internet.** The worker's Hypha service is registered with public visibility, and a service's authorization gates invocation, not discovery. Almost every admin operation is gated on the admin list with the wildcard honoured, so with `*` in the list **any caller that can reach the Hypha server — including an unauthenticated, anonymous one — is a full admin of your worker**. They can run arbitrary Python on the deployment through `run_code`, `deploy_app` or `upload_app`, with whatever filesystem, credentials and network access its Ray cluster is given — in single-machine mode that is the host you started the worker on, as the user who started it. They can also destroy it through `stop_worker`, `stop_all_apps` or `delete_app`. The wildcard is not "skip maintaining an admin list"; it is "this deployment runs untrusted code from strangers". Use named emails unless that is genuinely what you want. The worker logs a warning at startup whenever the wildcard is in effect.
+**The users you name in `--admin-users` can never lose admin permissions on a running worker.** No other admin can remove them, and neither can they themselves. This closes a lockout that had no recovery: the runtime admin list is persisted to `<workspace-dir>/admin_users.json` and that file overrides the startup flag, so once a starting user had been removed, editing `--admin-users` and restarting did not bring them back. To demote a starting user, drop them from `--admin-users` and restart. If the persisted file is missing a starting user — because an older worker allowed the removal, or because it was edited by hand — the worker restores them at startup and logs that it did.
 
-The one exception is editing the admin list itself: a caller who is only covered by `*` cannot call `add_admin_user` or `remove_admin_user`, so a stranger cannot make the grant permanent or lock you out.
+> **`--admin-users '*'` is no longer honoured.** A `*` entry is dropped at startup with a warning, whether it came from the flag or from the persisted admin list. It used to mean remote code execution open to the internet: the worker's Hypha service is registered with public visibility, a service's authorization gates invocation rather than discovery, and almost every admin operation is gated on the admin list — so `*` made **any caller that could reach the Hypha server, including an unauthenticated anonymous one, a full admin of the worker**. They could run arbitrary Python on the deployment through `run_code`, `deploy_app` or `upload_app`, with whatever filesystem, credentials and network access its Ray cluster is given, and destroy it through `stop_worker`, `stop_all_apps` or `delete_app`.
+>
+> **Migrating off it:** the account whose token starts the worker is always an admin, so a worker that relied on `*` keeps working for its operator and stops working for everyone else. Name the others in `--admin-users`, add them on the running worker with `add_admin_user`, or turn on `--enable-access-requests` and let them ask.
+
+### Letting users ask for access
+
+`--enable-access-requests` is off by default. Turning it on adds two public methods to the worker service — `request_admin_access`, which any logged-in caller may invoke, and `get_admin_access_request`, which returns only the caller's own request — plus `list_access_requests` and `resolve_access_request` for admins. With the flag off none of the four is registered, so there is no request surface at all.
+
+A request is keyed on the caller's email address, and each account gets exactly one. A second request is refused rather than queued or replacing the first, so a decision already taken cannot be reset by asking again. Requests are persisted next to the admin list at `<workspace-dir>/access_requests.json`, so a pod restart does not silently discard them.
+
+Admins resolve a request with `resolve_access_request(user, decision)`:
+
+| Decision | Effect |
+|---|---|
+| `grant` | Adds the requester to the admin users, immediately and across restarts. A granted admin is *not* a starting user, so they can be removed again later. |
+| `deny` | Records the refusal and leaves it in place. The requester cannot re-file. |
+| `clear` | Deletes the record, so the requester may ask again. This is how a denial is lifted. |
+
+Unauthenticated callers are refused: Hypha reports no email address for them and mints a fresh random user id per anonymous connection, so an anonymous request names no account that could be granted. Note that one-request-per-account bounds requests per *account*, not per person — anyone able to register additional Hypha accounts can file additional requests. Treat the flag as a convenience for a known user community, not as a hardened public endpoint.
+
+Editing the admin list still requires a caller *named* in it: a caller covered only by a `*` entry in a deployed app's `authorized_users` cannot call `add_admin_user`, `remove_admin_user` or `resolve_access_request`.
 
 ---
 
@@ -103,7 +123,8 @@ apptainer exec \
 | `--workspace` | auto | Hypha workspace name (auto-detected from token) |
 | `--server-url` | `https://hypha.aicell.io` | Hypha server URL |
 | `--token` | prompt | Hypha authentication token |
-| `--admin-users` | current user | Space-separated emails, or `*` for all — see [Who can control the worker](#who-can-control-the-worker) |
+| `--admin-users` | current user | Space-separated emails; `*` is not honoured — see [Who can control the worker](#who-can-control-the-worker) |
+| `--enable-access-requests` | off | Let non-admins ask to become admins — see [Letting users ask for access](#letting-users-ask-for-access) |
 | `--client-id` | auto | Unique service identifier |
 
 The workspace directory defaults to `~/.bioengine` and is mounted into the container at `/.bioengine`.

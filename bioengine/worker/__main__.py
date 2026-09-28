@@ -112,12 +112,24 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         metavar="EMAIL",
         help="Space-separated list of user emails/IDs with administrative privileges for "
         "worker management. If not specified, defaults to the authenticated user from "
-        "Hypha login. SECURITY: passing '*' makes every caller that can reach the Hypha "
-        "server a full admin, including unauthenticated anonymous ones, because the "
-        "worker service is public. That lets anyone run arbitrary Python on this "
-        "deployment ('run_code', 'deploy_app', 'upload_app') and destroy it "
-        "('stop_worker', 'stop_all_apps'). Use named emails unless this deployment is "
-        "meant to run untrusted code.",
+        "Hypha login. The users named here can never lose admin permissions on a running "
+        "worker; drop them from this flag and restart to demote one. SECURITY: '*' is no "
+        "longer honoured and is dropped with a warning at startup. It used to make every "
+        "caller that can reach the Hypha server a full admin, including unauthenticated "
+        "anonymous ones, because the worker service is public — arbitrary Python on this "
+        "deployment via 'run_code', 'deploy_app' or 'upload_app', and destruction via "
+        "'stop_worker' or 'stop_all_apps'. Name the admins instead, or use "
+        "--enable-access-requests so they can ask.",
+    )
+    core_group.add_argument(
+        "--enable-access-requests",
+        action="store_true",
+        help="Let non-admins ask to become an admin of this worker. Adds "
+        "'request_admin_access' and 'get_admin_access_request' to the worker's public "
+        "Hypha service, plus 'list_access_requests' and 'resolve_access_request' for "
+        "admins. One request per account, keyed on email; a denial stays in place until "
+        "an admin clears it. Off by default: turning it on puts a method on a public "
+        "service that any logged-in caller on the Hypha server can invoke.",
     )
     core_group.add_argument(
         "--workspace-dir",

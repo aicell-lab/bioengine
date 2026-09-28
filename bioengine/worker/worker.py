@@ -64,6 +64,21 @@ _REGISTRATION_FLAP_THRESHOLD = 5
 # rebuild.
 _DISCONNECT_TIMEOUT_S = 5.0
 
+# Emails that stand for "nobody in particular", so a request keyed on one could
+# never be granted to a person. Hypha itself reports email=None for every
+# anonymous caller and flags them with is_anonymous, which is the signal to
+# trust; these are the substitutes BioEngine's own code puts in its place —
+# 'anonymous@example.com' from bioengine.utils.create_context, 'no-email' and
+# 'anonymous-user' from the dataset proxy server.
+_UNAUTHENTICATED_EMAILS = frozenset(
+    {"anonymous@example.com", "no-email", "anonymous-user"}
+)
+
+# 'deny' is terminal on purpose: a denial the requester could immediately
+# re-file would make the public request method a spam vector, so lifting one is
+# 'clear', an admin action.
+_ACCESS_REQUEST_DECISIONS = ("grant", "deny", "clear")
+
 
 class BioEngineWorker:
     """
@@ -182,6 +197,7 @@ class BioEngineWorker:
         self,
         mode: Literal["single-machine", "slurm", "external-cluster"],
         admin_users: Optional[List[str]] = None,
+        enable_access_requests: bool = False,
         workspace_dir: Union[str, Path] = f"{os.environ['HOME']}/.bioengine",
         ray_workspace_dir: Optional[Union[str, Path]] = None,
         startup_applications: Optional[List[dict]] = None,
@@ -230,7 +246,13 @@ class BioEngineWorker:
                   - 'single-machine': Local Ray cluster for development/small deployments
                   - 'external-cluster': Connect to existing Ray cluster
             admin_users: List of user IDs/emails authorized for administrative operations.
-                        Auto-includes the authenticated user from Hypha connection.
+                        Auto-includes the authenticated user from Hypha connection. A '*'
+                        entry is not honoured and is dropped with a warning; the users
+                        named here can never lose admin permissions on a running worker.
+            enable_access_requests: Expose the public access-request methods so a
+                        non-admin can ask to become an admin of this worker. Off by
+                        default — turning it on puts a method on the public worker
+                        service that an unauthenticated caller can invoke.
             workspace_dir: Directory path for temporary files, Ray data storage, and worker state.
                       Must be accessible and have sufficient space for Ray operations.
             ray_workspace_dir: Directory path for Ray cluster workspace when connecting to an external
@@ -314,7 +336,18 @@ class BioEngineWorker:
         )
 
         self._admin_users_file = self.workspace_dir / "admin_users.json"
+        self._wildcard_admin_users_warned = False
+        self._forbid_wildcard_admin_users("the --admin-users startup flag")
+        # Captured before the persisted overlay replaces the list. Derived from
+        # the post-overlay list instead, every runtime-added admin would become
+        # unremovable and anyone a previous version already removed would stay
+        # unprotected — so the lockout this guards would survive the fix.
+        self._founding_admin_users = tuple(dict.fromkeys(self.admin_users))
         self._load_persisted_admin_users()
+
+        self.enable_access_requests = enable_access_requests
+        self._access_requests_file = self.workspace_dir / "access_requests.json"
+        self._access_requests = self._load_access_requests()
 
         # Hypha server configuration
         self.server_url = server_url
@@ -527,28 +560,58 @@ class BioEngineWorker:
                 f"— added at runtime: {added or 'none'}, removed at runtime: {removed or 'none'}."
             )
         self.admin_users[:] = persisted
+        self._forbid_wildcard_admin_users(f"'{self._admin_users_file}'")
+        self._restore_founding_admin_users()
 
-    def _warn_if_wildcard_admin_users(self) -> None:
-        """Warn that a wildcard admin list exposes code execution to anyone.
+    def _forbid_wildcard_admin_users(self, source: str) -> None:
+        """Drop every '*' entry from the worker's admin users.
 
-        The deployment guide says this too, but nobody reads it at roll time.
+        A wildcard here authorized unauthenticated callers for 'run_code',
+        'deploy_app' and 'upload_app' — arbitrary execution on the Ray cluster,
+        open to the internet. Removing the entry is what makes every
+        check_permissions call site refuse it, rather than each of the twenty
+        sites having to pass allow_wildcard=False and one of them being missed.
         """
         if "*" not in self.admin_users:
             return
 
+        self.admin_users[:] = [user for user in self.admin_users if user != "*"]
+
+        if self._wildcard_admin_users_warned:
+            return
+        self._wildcard_admin_users_warned = True
         self.logger.warning(
-            "SECURITY: '*' is in this worker's admin users and the worker service is "
-            "registered with public visibility. Every caller that can reach the Hypha "
-            "server — including unauthenticated, anonymous ones — is therefore a full "
-            "admin of this worker. They can run arbitrary Python on this deployment "
-            "via 'run_code', 'deploy_app' or 'upload_app', with whatever filesystem, "
-            "credentials and network access its Ray cluster is given; in "
-            "single-machine mode that is this host, as the user running this process. "
-            "They can also destroy it via 'stop_worker', 'stop_all_apps' or "
-            "'delete_app'. This is remote code execution open to the internet, not "
-            "merely open read access. Replace '*' with named admin emails unless this "
-            "deployment is genuinely meant to run untrusted code."
+            f"SECURITY: '*' in this worker's admin users is no longer honoured and has "
+            f"been dropped from {source}. It made every caller that can reach the Hypha "
+            "server — including unauthenticated, anonymous ones — a full admin, able to "
+            "run arbitrary Python on this deployment via 'run_code', 'deploy_app' or "
+            "'upload_app' and to destroy it via 'stop_worker', 'stop_all_apps' or "
+            "'delete_app'. The account whose token started this worker remains an admin. "
+            "Name the others in --admin-users, grant them with 'add_admin_user', or set "
+            "--enable-access-requests so they can ask for access."
         )
+
+    def _restore_founding_admin_users(self) -> None:
+        """Put back any startup admin the persisted store dropped.
+
+        The users named at startup cannot be removed over RPC, so a store
+        missing one was written by a worker from before that guard or edited by
+        hand. Leaving it out would let the lockout outlive the fix for it: the
+        overlay wins over the seed, so re-rolling with the same --admin-users
+        would not bring them back.
+        """
+        missing = [
+            user for user in self._founding_admin_users if user not in self.admin_users
+        ]
+        if not missing:
+            return
+
+        self.logger.warning(
+            f"Restoring admin user(s) {missing} named at startup but absent from "
+            f"'{self._admin_users_file}'. The users a worker is started with cannot "
+            "lose admin permissions; drop them from --admin-users to demote them."
+        )
+        self.admin_users[:] = missing + self.admin_users
 
     def _persist_admin_users(self, admin_users: List[str]) -> None:
         """Write the admin users so the next restart overlays them on the seed.
@@ -566,6 +629,97 @@ class BioEngineWorker:
                 f"Failed to persist admin users to '{self._admin_users_file}': {e}. "
                 "Admin users are unchanged."
             )
+
+    def _load_access_requests(self) -> Dict[str, Dict[str, Any]]:
+        """Read the persisted access requests, keyed on requester email.
+
+        In-memory only, a pod roll would discard every pending request and the
+        requester would wait forever with no signal that anything was lost.
+        """
+        if not self._access_requests_file.exists():
+            return {}
+
+        try:
+            stored = json.loads(self._access_requests_file.read_text())
+            if not isinstance(stored, dict) or not all(
+                isinstance(key, str) and isinstance(value, dict)
+                for key, value in stored.items()
+            ):
+                raise ValueError("expected an object of email -> request")
+        except Exception as e:
+            self.logger.error(
+                f"Ignoring unreadable access requests file "
+                f"'{self._access_requests_file}': {e}. Starting with no requests on "
+                "record; pending requesters will have to ask again."
+            )
+            return {}
+
+        return stored
+
+    def _persist_access_requests(self, requests: Dict[str, Dict[str, Any]]) -> None:
+        """Write the access requests before the in-memory copy changes.
+
+        Same ordering as _persist_admin_users: a decision that only exists in
+        memory reverts on the next restart without ever failing.
+        """
+        try:
+            self._access_requests_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self._access_requests_file.with_suffix(".json.tmp")
+            tmp_file.write_text(json.dumps(requests, indent=2))
+            os.replace(tmp_file, self._access_requests_file)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to persist access requests to '{self._access_requests_file}': "
+                f"{e}. Access requests are unchanged."
+            )
+
+    def _require_access_requests_enabled(self) -> None:
+        """Refuse when the operator has not turned the request surface on.
+
+        The methods are also left out of the registered service, so this only
+        fires for an in-process caller; it is here so the feature cannot be
+        reached by wiring that forgets the registration gate.
+        """
+        if not self.enable_access_requests:
+            raise RuntimeError(
+                "Access requests are disabled on this worker. Start it with "
+                "--enable-access-requests to let non-admins ask for access."
+            )
+
+    def _requester_email(self, context: Dict[str, Any]) -> str:
+        """The stable identity an access request is keyed on.
+
+        Email, not user id: Hypha's generate_token mints a fresh client id per
+        token while inheriting the email, so an id-keyed request would let one
+        person file unlimited requests by refreshing their token.
+        """
+        if context is None or not isinstance(context, dict) or "user" not in context:
+            raise PermissionError(
+                "Invalid context for an access request: missing user information."
+            )
+        user = context["user"]
+        if not isinstance(user, dict):
+            raise PermissionError(
+                "Invalid user information in context for an access request."
+            )
+
+        email = (user.get("email") or "").strip().lower()
+        # is_anonymous is the authoritative signal and is checked first: Hypha
+        # mints a fresh random id per anonymous websocket connection, so an
+        # anonymous caller can produce unlimited distinct identities just by
+        # reconnecting, and one-request-per-user would bound nothing.
+        if (
+            user.get("is_anonymous")
+            or not email
+            or email in _UNAUTHENTICATED_EMAILS
+            or "@" not in email
+        ):
+            raise PermissionError(
+                "Log in before requesting admin access to this worker. An "
+                "unauthenticated caller carries no email address, so the request "
+                "would name no account that could be granted."
+            )
+        return email
 
     async def _ping_data_server(self) -> None:
         """Ping the dataset server with retries to verify connectivity."""
@@ -803,6 +957,20 @@ class BioEngineWorker:
             "stop_all_apps": self.apps_manager.stop_all_apps,  # Requires admin permissions
             "get_app_status": self.apps_manager.get_app_status,
         }
+
+        if self.enable_access_requests:
+            # Registered only when enabled, so with the toggle off there is no
+            # request surface to reach rather than one that answers with a
+            # refusal. 'request_admin_access' is public by design.
+            worker_services.update(
+                {
+                    "request_admin_access": self.request_admin_access,
+                    "get_admin_access_request": self.get_admin_access_request,
+                    "list_access_requests": self.list_access_requests,  # Requires admin permissions
+                    "resolve_access_request": self.resolve_access_request,  # Requires admin permissions
+                }
+            )
+
         # TODO: return more informative error messages, e.g. include traceback
         service_info = await self.server.register_service(
             {
@@ -1357,8 +1525,6 @@ class BioEngineWorker:
             # Completes initialization of AppsManager and CodeExecutor
             await self._connect_to_server(STARTUP_CONNECT_BUDGET_S)
 
-            self._warn_if_wildcard_admin_users()
-
             # Check for running data server
             await self._discover_data_server()
 
@@ -1606,8 +1772,9 @@ class BioEngineWorker:
 
         Raises:
             PermissionError: If the caller is not a named admin user.
-            ValueError: If the removal would lock the caller out, remove the last
-                        admin, or drop the worker's own identity.
+            ValueError: If the user is one the worker was started with, or if the
+                        removal would lock the caller out, remove the last admin,
+                        or drop the worker's own identity.
         """
         check_permissions(
             context=context,
@@ -1620,6 +1787,15 @@ class BioEngineWorker:
 
         user = user.strip()
         caller = context["user"]
+        if user and user in self._founding_admin_users:
+            # Checked before every other guard: this is the one removal no
+            # caller may make, and the persisted overlay wins over the startup
+            # seed, so allowing it would be a lockout no re-roll undoes.
+            raise ValueError(
+                f"Refusing to remove '{user}': the worker was started with this user "
+                "and a starting user cannot lose admin permissions. Drop it from "
+                "--admin-users and restart the worker to demote it."
+            )
         if user in self.admin_users and len(self.admin_users) == 1:
             raise ValueError(
                 f"Refusing to remove '{user}': it is the last admin user and the "
@@ -1648,6 +1824,214 @@ class BioEngineWorker:
             )
 
         return list(self.admin_users)
+
+    @schema_method
+    async def request_admin_access(
+        self,
+        reason: str = Field(
+            "",
+            description="Optional note telling the worker's admins who you are and why you need access.",
+        ),
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> Dict[str, Any]:
+        """Ask the admins of this worker to grant you admin permissions.
+
+        Deliberately public: any logged-in caller may submit, admin or not. Only
+        available when the worker was started with access requests enabled.
+
+        One request per account, keyed on the caller's email address. A second
+        request is refused rather than queued or silently replacing the first, so
+        a decision already taken cannot be reset by asking again — including a
+        denial, which only an admin can clear.
+
+        Args:
+            reason: Free-text note shown to the admins alongside the request.
+            context: Authentication context (automatically provided by Hypha)
+
+        Returns:
+            Dict: The recorded request.
+
+        Raises:
+            RuntimeError: If access requests are disabled on this worker.
+            PermissionError: If the caller is not authenticated.
+            ValueError: If the caller is already an admin or already has a request.
+        """
+        self._require_access_requests_enabled()
+        email = self._requester_email(context)
+
+        if email in self.admin_users:
+            raise ValueError(
+                f"'{email}' is already an admin of this worker; there is nothing to request."
+            )
+
+        existing = self._access_requests.get(email)
+        if existing:
+            raise ValueError(
+                f"'{email}' already has an access request on this worker with status "
+                f"'{existing.get('status')}'. Only an admin can clear it."
+            )
+
+        request = {
+            "email": email,
+            "user_id": context["user"].get("id"),
+            "status": "pending",
+            "reason": str(reason or "").strip()[:500],
+            "requested_at": time.time(),
+            "resolved_at": None,
+            "resolved_by": None,
+        }
+        self._persist_access_requests({**self._access_requests, email: request})
+        self._access_requests[email] = request
+        self.logger.info(
+            f"Access request from '{email}' is pending. Grant it with "
+            f"resolve_access_request(user='{email}', decision='grant')."
+        )
+        return dict(request)
+
+    @schema_method
+    async def get_admin_access_request(
+        self,
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> Optional[Dict[str, Any]]:
+        """Read the state of your own access request on this worker.
+
+        Public, and scoped to the caller: it reads the request belonging to the
+        caller's email and no other. A request nobody can observe is
+        indistinguishable from one that was dropped.
+
+        Returns:
+            Optional[Dict]: The caller's request, or None if they have none.
+        """
+        self._require_access_requests_enabled()
+        email = self._requester_email(context)
+        request = self._access_requests.get(email)
+        return dict(request) if request else None
+
+    @schema_method
+    async def list_access_requests(
+        self,
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> List[Dict[str, Any]]:
+        """List every access request on this worker, oldest first.
+
+        Requires the caller to be a named admin user.
+        """
+        self._require_access_requests_enabled()
+        check_permissions(
+            context=context,
+            authorized_users=self.admin_users,
+            resource_name="listing BioEngine Worker access requests",
+            allow_wildcard=False,
+        )
+        return sorted(
+            (dict(request) for request in self._access_requests.values()),
+            key=lambda request: request.get("requested_at") or 0,
+        )
+
+    @schema_method
+    async def resolve_access_request(
+        self,
+        user: str = Field(
+            ...,
+            description="Email address of the requester whose request is being decided.",
+        ),
+        decision: Literal["grant", "deny", "clear"] = Field(
+            ...,
+            description="'grant' makes the requester an admin, 'deny' refuses and blocks further requests, 'clear' deletes the record so they may ask again.",
+        ),
+        context: Dict[str, Any] = Field(
+            ...,
+            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
+        ),
+    ) -> Optional[Dict[str, Any]]:
+        """Grant, deny or clear a pending access request.
+
+        Requires the caller to be a named admin user — being covered by a '*'
+        entry is not enough, for the same reason add_admin_user requires it: a
+        caller who is only an admin through the wildcard must not be able to turn
+        that into a named grant.
+
+        'grant' adds the requester to the admin users, with immediate effect and
+        surviving a restart. 'deny' records the refusal and leaves it in place, so
+        the requester cannot re-file. 'clear' removes the record entirely, which is
+        how a denial is lifted.
+
+        Args:
+            user: Email address of the requester.
+            decision: 'grant', 'deny' or 'clear'.
+            context: Authentication context (automatically provided by Hypha)
+
+        Returns:
+            Optional[Dict]: The updated request, or None after 'clear'.
+
+        Raises:
+            PermissionError: If the caller is not a named admin user.
+            ValueError: If there is no request for that user, or the decision is unknown.
+        """
+        self._require_access_requests_enabled()
+        check_permissions(
+            context=context,
+            authorized_users=self.admin_users,
+            resource_name="resolving a BioEngine Worker access request",
+            allow_wildcard=False,
+        )
+
+        if decision not in _ACCESS_REQUEST_DECISIONS:
+            # The Literal annotation only documents the schema; a direct call
+            # would otherwise fall through to the 'deny' branch.
+            raise ValueError(
+                f"Unknown decision '{decision}'; expected one of "
+                f"{', '.join(_ACCESS_REQUEST_DECISIONS)}."
+            )
+
+        email = (user or "").strip().lower()
+        request = self._access_requests.get(email)
+        if not request:
+            raise ValueError(f"No access request on this worker for '{email}'.")
+
+        caller = context["user"]
+        resolved_by = caller.get("email") or caller.get("id")
+
+        if decision == "clear":
+            remaining = {
+                key: value
+                for key, value in self._access_requests.items()
+                if key != email
+            }
+            self._persist_access_requests(remaining)
+            self._access_requests.pop(email, None)
+            self.logger.info(
+                f"Cleared the access request for '{email}' (by '{resolved_by}'). "
+                "They may request access again."
+            )
+            return None
+
+        if decision == "grant":
+            # Reuse the guarded path rather than touching admin_users here: it is
+            # what refuses the wildcard and writes the list before it takes effect.
+            await self.add_admin_user(user=email, context=context)
+
+        updated = {
+            **request,
+            "status": "granted" if decision == "grant" else "denied",
+            "resolved_at": time.time(),
+            "resolved_by": resolved_by,
+        }
+        self._persist_access_requests({**self._access_requests, email: updated})
+        self._access_requests[email] = updated
+        self.logger.info(
+            f"Access request for '{email}' was {updated['status']} by '{resolved_by}'."
+        )
+        return dict(updated)
 
     @schema_method
     async def get_status(
