@@ -49,6 +49,11 @@ def _parse_backends(raw: Optional[str]) -> set:
 
 
 _ENABLED_BACKENDS = _parse_backends(os.getenv("MODEL_FINETUNE_BACKENDS"))
+# How many fine-tunes may run at once. Default 1 keeps the historical behaviour
+# (serialize training so autoscaled replicas stay free for inference). Set >1
+# only when there is a distinct GPU per concurrent run (one runtime replica per
+# GPU); Ray Serve then spreads the concurrent train() calls across replicas.
+_MAX_CONCURRENT_TRAINING = max(1, int(os.getenv("MODEL_FINETUNE_MAX_CONCURRENT_TRAINING", "1") or "1"))
 RuntimeApp = None
 CellposeRuntime = None
 if "microsam" in _ENABLED_BACKENDS:
@@ -144,10 +149,11 @@ class EntryApp:
         # replica restart — the frontend re-exports if a handle goes missing.
         self._exports: Dict[str, Dict[str, Any]] = {}
         self._export_tasks: Dict[str, asyncio.Task] = {}
-        # Serialize GPU fine-tuning across all runtime replicas: at most one
-        # training runs at a time, so autoscaled replicas stay free to serve
-        # inference during a long run. Mirrors model-runner's _env_build_lock.
-        self._training_lock = asyncio.Lock()
+        # Bound concurrent GPU fine-tuning. Default 1 serializes training so
+        # autoscaled replicas stay free to serve inference during a long run
+        # (mirrors model-runner's _env_build_lock); MODEL_FINETUNE_MAX_CONCURRENT_TRAINING
+        # raises it when each concurrent run has its own GPU replica.
+        self._training_sem = asyncio.Semaphore(_MAX_CONCURRENT_TRAINING)
         # Community-pool weight-transport accounting. bytes_up/down count the
         # WEIGHT bytes this worker moved to/from the pool — the flagship's
         # "weights travel, data stays put" evidence. Persisted under the mounted
@@ -707,16 +713,15 @@ class EntryApp:
             })
             # Long-running: this await holds one GPU runtime replica for the whole
             # training run, so a concurrent infer is routed to a second replica.
-            # The entry lock caps concurrency at one training regardless of how
-            # many replicas exist, leaving the rest free for inference. QUEUED is
-            # exempt from the PREPARING/TRAINING stale-window sweep, so a session
-            # waiting here is not false-flagged STOPPED.
-            if self._training_lock.locked():
+            # The semaphore caps concurrent trainings (default 1); extra runs wait
+            # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
+            # so a session waiting here is not false-flagged STOPPED.
+            if self._training_sem.locked():
                 training.write_status(
                     session_id, status="QUEUED",
                     message="waiting for GPU — another fine-tuning is in progress",
                 )
-            async with self._training_lock:
+            async with self._training_sem:
                 await self._runtime_for(model_type).train(
                     session_id=session_id, model_type=model_type, params=params
                 )
