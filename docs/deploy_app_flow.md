@@ -28,6 +28,11 @@ Metadata only — no files yet. The worker validates `format_version`
 (must be `0.6.0`) and resolves the entry class id (`entry: "main:MyApp"`
 or similar).
 
+This is also where `version=None` becomes a concrete version: the newest
+committed one for a fresh deployment, or — on an *update* — the version the
+running application was already on, resolved back in step 1. Both resolutions
+are reported to the caller in step 11's reply.
+
 If the caller did not pin a version, the manifest read also surfaces
 the latest committed version, which the worker stamps into the
 deployment record so it can be reproduced exactly on a recovery
@@ -161,6 +166,22 @@ the worker's RPC reply happens shortly after, and Ray Serve continues
 spinning up replicas asynchronously. The client knows the call
 succeeded as soon as the build task returned, not when replicas
 finished warming up.
+
+The reply is a dictionary, not a bare id:
+
+```python
+{
+    "application_id": "my-app",
+    "artifact_id": "my-workspace/my-app",
+    "version": "1.4.0",
+    "version_source": "requested" | "latest" | "inherited",
+}
+```
+
+`version` is the version resolved in step 2, and `version_source` says where it
+came from. `inherited` means the caller passed no `version` and the worker kept
+the one the running application was already on — a successful deploy of
+unchanged code, which is otherwise indistinguishable from a roll-forward.
 
 ## 12. Ray Serve schedules replicas
 

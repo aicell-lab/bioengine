@@ -349,11 +349,21 @@ def run_app(artifact_id, application_id, version, disable_gpu, env_vars, hypha_t
             if parsed_env:
                 run_kwargs["application_env_vars"] = {"*": parsed_env}
 
-            deployed_id = await worker.deploy_app(**run_kwargs)
+            deployed = await worker.deploy_app(**run_kwargs)
         except Exception as exc:
             error_exit(f"Deployment failed: {exc}")
 
-        click.echo(f"Deployment started. Application ID: {deployed_id}")
+        deployed_id = deployed["application_id"]
+        click.echo(
+            f"Deployment started. Application ID: {deployed_id} "
+            f"(version {deployed['version']})"
+        )
+        if deployed["version_source"] == "inherited":
+            click.echo(
+                f"Note: no --version was given, so this redeployed the version "
+                f"'{deployed['version']}' that application '{deployed_id}' was "
+                f"already running. Pass --version to roll forward."
+            )
         click.echo(f"\nCheck status:  bioengine apps status {deployed_id}")
         click.echo(f"View logs:     bioengine apps logs {deployed_id}")
         click.echo(f"Stop:          bioengine apps stop {deployed_id}")
@@ -716,10 +726,15 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
         except Exception as exc:
             error_exit(f"Upload failed: {exc}")
 
-        click.echo(f"Uploaded. Artifact ID: {artifact_id} (version {manifest_version})")
+        # manifest.yaml's version is optional, so it can genuinely be absent —
+        # echoing the bare None read as a value the manifest had set to "None".
+        version_label = (
+            manifest_version if manifest_version else "unset in manifest.yaml"
+        )
+        click.echo(f"Uploaded. Artifact ID: {artifact_id} (version {version_label})")
 
         # Deploy
-        click.echo(f"Deploying '{artifact_id}' version {manifest_version}...")
+        click.echo(f"Deploying '{artifact_id}' (version {version_label})...")
         run_kwargs = {
             "artifact_id": artifact_id,
             "disable_gpu": disable_gpu,
@@ -735,13 +750,30 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
             run_kwargs["application_env_vars"] = {"*": parsed_env}
 
         try:
-            deployed_id = await worker.deploy_app(**run_kwargs)
+            deployed = await worker.deploy_app(**run_kwargs)
         except Exception as exc:
             error_exit(f"Deployment failed (artifact was uploaded): {exc}")
 
+        deployed_id = deployed["application_id"]
+        # Defence-in-depth on this command's contract: it must deploy the code it
+        # just uploaded, so an inherited version is an error here rather than the
+        # provenance `apps run` treats it as. Not the common case — a version-less
+        # manifest only uploads against a brand-new artifact, since
+        # _enforce_version_increases rejects a falsy version once the artifact
+        # exists, and a brand-new artifact has nothing running to inherit from.
+        # The residual path is --app-id pointing at an app running a *different*
+        # artifact.
+        if deployed["version_source"] == "inherited":
+            error_exit(
+                f"Uploaded to '{artifact_id}', but the deployment inherited the "
+                f"version '{deployed['version']}' that '{deployed_id}' was "
+                f"already running — the code just uploaded is NOT deployed. "
+                f"The redeploy of '{deployed['version']}' is already in flight.",
+                "Set 'version' in manifest.yaml so this command can pin it.",
+            )
         click.echo(
             f"Deployment started. Application ID: {deployed_id} "
-            f"(version {manifest_version})"
+            f"(version {deployed['version']})"
         )
         click.echo(f"\nCheck status:  bioengine apps status {deployed_id}")
         click.echo(f"View logs:     bioengine apps logs {deployed_id}")

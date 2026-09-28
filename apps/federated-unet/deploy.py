@@ -167,7 +167,7 @@ async def main() -> None:
             {"server_url": SERVER_URL, "token": env[WORKERS[worker_prefix]["token_key"]]}
         )
         worker = await resolve_worker(server, worker_prefix)
-        app_id = await worker.deploy_app(
+        deployed = await worker.deploy_app(
             artifact_id=ARTIFACT,
             version=args.version,
             application_id=f"fedunet-{name}",
@@ -182,7 +182,11 @@ async def main() -> None:
             # credential that can write there regardless of which worker it is on.
             hypha_token=env["BIOIMAGE_IO_TOKEN"],
         )
-        print(f"{name}: deploying {app_id} on {worker_prefix.split('/')[-1]}", flush=True)
+        print(
+            f"{name}: deploying {deployed['application_id']} "
+            f"version {deployed['version']} on {worker_prefix.split('/')[-1]}",
+            flush=True,
+        )
         await server.disconnect()
 
     print("\nwaiting for RUNNING (env builds take a while on first deploy)", flush=True)
