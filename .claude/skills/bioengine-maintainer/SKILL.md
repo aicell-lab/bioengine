@@ -232,7 +232,7 @@ The BioEngineWorker registers as a Hypha service. Key methods:
 | `get_status` | | Overall worker status |
 | `check_access` | | Check caller permissions |
 | `list_apps` | ✓ | List deployed applications |
-| `deploy_app` | ✓ | Deploy an application from artifact |
+| `deploy_app` | ✓ | Deploy an application from artifact; returns `{application_id, artifact_id, version, version_source}` |
 | `stop_app` | ✓ | Stop a running application |
 | `get_app_status` | | Status of specific application |
 | `upload_app` | ✓ | Create/update application artifact |

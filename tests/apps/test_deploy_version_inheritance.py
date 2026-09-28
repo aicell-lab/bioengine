@@ -17,6 +17,11 @@ Two pins here:
 - ``bioengine apps deploy`` passes the version it just uploaded, so pointing it
   at a running ``--app-id`` actually rolls that app forward instead of
   redeploying what was already there.
+- ``bioengine apps run``, which has no version to pin, reports the inheritance
+  when it happens instead of printing an id and nothing else.
+
+What ``deploy_app`` itself reports back is pinned in
+``test_deploy_app_return.py``.
 """
 
 from __future__ import annotations
@@ -252,7 +257,12 @@ def deploy_cli(monkeypatch, tmp_path: Path):
 
     async def _deploy_app(**kwargs):
         recorded.update(kwargs)
-        return APP_ID
+        return {
+            "application_id": APP_ID,
+            "artifact_id": ARTIFACT_ID,
+            "version": kwargs["version"],
+            "version_source": "requested",
+        }
 
     worker.deploy_app = _deploy_app
 
@@ -279,3 +289,58 @@ def test_apps_deploy_pins_the_version_it_uploaded(deploy_cli) -> None:
 def test_apps_deploy_tells_the_user_which_version(deploy_cli) -> None:
     _, output = deploy_cli
     assert "1.0.1" in output
+
+
+# ── CLI: `bioengine apps run` must say when it inherited a version ────────────
+
+
+def _run_cli(monkeypatch, version_source: str):
+    """Run ``apps run`` against a stub worker reporting ``version_source``."""
+    from click.testing import CliRunner
+
+    from bioengine.cli import apps as apps_cli
+
+    worker = MagicMock()
+    worker.deploy_app = AsyncMock(
+        return_value={
+            "application_id": APP_ID,
+            "artifact_id": ARTIFACT_ID,
+            "version": "1.0.0",
+            "version_source": version_source,
+        }
+    )
+
+    monkeypatch.setattr(
+        apps_cli, "require_worker", lambda *a: ("https://hypha.test", "ws/w", "tok")
+    )
+    monkeypatch.setattr(apps_cli, "connect_worker", AsyncMock(return_value=worker))
+
+    result = CliRunner().invoke(
+        apps_cli.apps_group, ["run", ARTIFACT_ID, "--app-id", APP_ID]
+    )
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_apps_run_reports_an_inherited_version(monkeypatch) -> None:
+    # `apps run --app-id <running>` with no --version redeploys what is already
+    # there. The command has to say so; otherwise it looks like a roll-forward.
+    output = _run_cli(monkeypatch, "inherited")
+
+    assert "1.0.0" in output
+    assert "redeployed" in output
+    assert "--version" in output, (
+        "Naming the way out is the point — without it the note just restates "
+        "that something happened."
+    )
+
+
+def test_apps_run_stays_quiet_when_the_version_was_not_inherited(monkeypatch) -> None:
+    # A note on every deploy is a note nobody reads. Asserted on the note's own
+    # wording, not on the word "inherited" — which the note never uses, so that
+    # assertion could never have failed.
+    output = _run_cli(monkeypatch, "latest")
+
+    assert "1.0.0" in output
+    assert "redeployed" not in output
+    assert "--version" not in output

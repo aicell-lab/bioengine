@@ -24,7 +24,7 @@ async def redeploy(artifact_id: str, application_id: str):
 
         # Start the new deployment
         print("Starting new deployment with latest artifact...")
-        app_id = await worker.deploy_app(
+        deployed = await worker.deploy_app(
             artifact_id=artifact_id,
             application_id=application_id,
             hypha_token=token,
@@ -32,7 +32,17 @@ async def redeploy(artifact_id: str, application_id: str):
             disable_gpu=False,  # set True to force CPU-only
             max_ongoing_requests=1,  # keep at 1 for GPU
         )
-        print(f"App ID: {app_id}")
+        app_id = deployed["application_id"]
+        print(f"App ID: {app_id} (version {deployed['version']})")
+        # version=None on a running application_id inherits that app's version
+        # instead of resolving latest, so this script would otherwise redeploy
+        # the code it is trying to replace and report success.
+        if deployed["version_source"] == "inherited":
+            raise SystemExit(
+                f"Redeploy inherited version {deployed['version']} from the "
+                f"running '{app_id}' instead of picking up the latest. Pass an "
+                f"explicit version=."
+            )
 
         # Wait for services to become available
         print("Waiting for services to start...")

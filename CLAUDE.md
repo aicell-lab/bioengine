@@ -88,11 +88,13 @@ For deployment-side PRs (changes under `bioengine/**`, `bioengine/cluster/**`, `
 When working on a BioEngine app, **test by deploying to the live worker** at `bioimage-io/bioengine-worker` on <https://hypha.aicell.io> and calling the service directly. Do not write standalone test scripts for app behaviour. Deploy with a stable `application_id` matching the artifact alias so the service is consistently addressable:
 
 ```python
-app_id = await worker.deploy_app(
+deployed = await worker.deploy_app(
     artifact_id='bioimage-io/my-app',
     version='1.2.3',
     application_id='my-app',   # gives stable service ID, not a random name
 )
+app_id = deployed['application_id']
+assert deployed['version'] == '1.2.3'   # see below — this can differ
 svc = await client.get_service(f'bioimage-io/{app_id}')
 ```
 
@@ -123,6 +125,24 @@ await worker.deploy_app(
 ```
 
 Before deploying, always check `list_apps()` or `get_app_status(None)` to find the correct running `application_id`.
+
+## `deploy_app` returns a dict — and `version_source` is the bit that matters
+
+`deploy_app` returns `{'application_id', 'artifact_id', 'version', 'version_source'}`, **not** a bare id string. `version_source` says how the deployed version was chosen:
+
+| value | meaning |
+|---|---|
+| `requested` | you passed `version=` and got exactly that |
+| `latest` | you passed no `version` and got the artifact's newest committed version |
+| `inherited` | you passed no `version` and got the version the running `application_id` was already on |
+
+`inherited` is the trap. Omitting `version` on an already-running `application_id` redeploys the code that is already there — a deploy that reports success while shipping nothing new. If you upload and then deploy, either pass the version you uploaded or treat `inherited` as a failure:
+
+```python
+deployed = await worker.deploy_app(artifact_id='bioimage-io/my-app', application_id='my-app')
+if deployed['version_source'] == 'inherited':
+    raise RuntimeError(f"redeployed the running {deployed['version']}, not the new code")
+```
 
 ## `hypha_token` on `deploy_app` — read the parameter carefully
 

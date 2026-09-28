@@ -692,11 +692,14 @@ async def test_deploy_app_locally(
     try:
         for app_config in app_configs:
             # Deploy the application
-            application_id = await bioengine_worker_service.deploy_app(
-                **app_config
-            )
+            deployed = await bioengine_worker_service.deploy_app(**app_config)
+            application_id = deployed["application_id"]
+            assert deployed["version_source"] == "latest"
             deployed_app_ids.append(application_id)
-            print(f"Deployed application: {application_id}")
+            print(
+                f"Deployed application: {application_id} "
+                f"(version {deployed['version']})"
+            )
 
         # Wait for both applications to finish deploying
         # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
@@ -870,11 +873,13 @@ async def test_deploy_app_from_artifact(
 
         # Deploy applications from artifacts
         for app_config in app_configs:
-            application_id = await bioengine_worker_service.deploy_app(
-                **app_config
-            )
+            deployed = await bioengine_worker_service.deploy_app(**app_config)
+            application_id = deployed["application_id"]
             deployed_app_ids.append(application_id)
-            print(f"Deployed application: {application_id}")
+            print(
+                f"Deployed application: {application_id} "
+                f"(version {deployed['version']})"
+            )
 
         # Wait for both applications to finish deploying
         # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
@@ -993,9 +998,11 @@ async def test_call_demo_app_functions(
     # Deploy the demo-app with apps_manager.deploy_app from local path
     demo_artifact_id = f"{hypha_workspace}/demo-app"
 
-    app_id = await bioengine_worker_service.deploy_app(
-        artifact_id=demo_artifact_id, disable_gpu=True
-    )
+    app_id = (
+        await bioengine_worker_service.deploy_app(
+            artifact_id=demo_artifact_id, disable_gpu=True
+        )
+    )["application_id"]
 
     try:
         # Wait for deployment to complete
@@ -1147,7 +1154,9 @@ async def test_call_composition_app_functions(
         "disable_gpu": True,
     }
 
-    app_id = await bioengine_worker_service.deploy_app(**composition_app_config)
+    app_id = (
+        await bioengine_worker_service.deploy_app(**composition_app_config)
+    )["application_id"]
 
     try:
         # Wait for deployment to complete

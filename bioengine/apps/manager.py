@@ -2547,7 +2547,7 @@ class AppsManager:
         ),
         version: Optional[str] = Field(
             None,
-            description="Specific version of the artifact to deploy. If not provided, deploys the latest available version of the artifact. If not specified, uses the latest version for a new application, or preserves the previously deployed version if updating an existing application (only when application_id is specified).",
+            description="Specific version of the artifact to deploy. If not provided, deploys the latest available version of the artifact. If not specified, uses the latest version for a new application, or preserves the previously deployed version if updating an existing application (only when application_id is specified). The version actually deployed is returned as the 'version' field, and 'version_source' says whether it was 'requested', resolved to 'latest', or 'inherited' from the running application — check it if you omit this parameter and expect to roll forward.",
         ),
         application_id: Optional[str] = Field(
             None,
@@ -2631,7 +2631,7 @@ class AppsManager:
             ...,
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
-    ) -> str:
+    ) -> Dict[str, Any]:
         """
         Deploys or updates a BioEngine application from an artifact to Ray Serve with comprehensive lifecycle management.
 
@@ -2663,8 +2663,21 @@ class AppsManager:
         - Configurable request concurrency limits
 
         Returns:
-            Unique application ID for the created deployment. Use this ID to monitor,
-            update, or undeploy the application.
+            A dictionary describing what was deployed:
+
+            - ``application_id``: unique ID of the deployment. Use this ID to
+              monitor, update, or undeploy the application.
+            - ``artifact_id``: fully-qualified ``workspace/artifact-name``, which
+              may differ from the ``artifact_id`` argument if a bare name was
+              passed.
+            - ``version``: the artifact version actually deployed.
+            - ``version_source``: how that version was chosen — ``"requested"``
+              (the caller named it), ``"latest"`` (the caller named none and got
+              the artifact's newest committed version), or ``"inherited"`` (the
+              caller named none and got the version already running under this
+              ``application_id``). A caller that omits ``version`` expecting to
+              roll forward must treat ``"inherited"`` as "this did not deploy my
+              new code" — that case is otherwise indistinguishable from success.
 
         Raises:
             ValueError: If artifact doesn't exist, deployment configuration is invalid,
@@ -2698,6 +2711,12 @@ class AppsManager:
             # Check if this is an update to an existing application
             is_update = application_id in self._deployed_applications
 
+            # How the deployed version was chosen, reported back to the caller so
+            # it never has to re-derive it. "inherited" is the one that surprises:
+            # the caller named no version and got the one already running rather
+            # than the artifact's newest.
+            version_source = "requested" if version is not None else "latest"
+
             # For updates, preserve original creation time and inherit unspecified parameters
             if is_update:
                 existing_app = self._deployed_applications[application_id]
@@ -2708,6 +2727,8 @@ class AppsManager:
                 version_inherited = version is None
                 if version is None:
                     version = existing_app["version"]
+                    if version is not None:
+                        version_source = "inherited"
                 if application_kwargs is None:
                     application_kwargs = existing_app["application_kwargs"]
                 if application_env_vars is None:
@@ -2990,14 +3011,19 @@ class AppsManager:
                 "deployment_task"
             ] = deployment_task
 
-            return application_id
+            return {
+                "application_id": application_id,
+                "artifact_id": artifact_id,
+                "version": app.metadata["version"],
+                "version_source": version_source,
+            }
 
     @schema_method
     async def stop_app(
         self,
         application_id: str = Field(
             ...,
-            description="Unique identifier of the deployed application to remove. This is the application ID that was returned when the application was deployed using deploy_app().",
+            description="Unique identifier of the deployed application to remove. This is the 'application_id' field of the dictionary that deploy_app() returned.",
         ),
         context: Dict[str, Any] = Field(
             ...,

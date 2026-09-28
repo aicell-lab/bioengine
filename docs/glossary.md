@@ -8,7 +8,7 @@ A versioned bundle stored in Hypha that contains everything needed to build a Bi
 
 ## Application
 
-A single running deployment of an app package on a specific worker. Created by calling `deploy_app(artifact_id, application_id, version)` on a worker. Identified by `application_id` — either auto-generated via haikunator (e.g. `wandering-cloud-1234`) or user-supplied for stable addressing (e.g. `model-runner`). One app package can have many concurrent applications on the same worker or across workers, each with a distinct `application_id`.
+A single running deployment of an app package on a specific worker. Created by calling `deploy_app(artifact_id, application_id, version)` on a worker, which returns `{application_id, artifact_id, version, version_source}` describing what it actually deployed. Identified by `application_id` — either auto-generated via haikunator (e.g. `wandering-cloud-1234`) or user-supplied for stable addressing (e.g. `model-runner`). One app package can have many concurrent applications on the same worker or across workers, each with a distinct `application_id`.
 
 ## Worker
 

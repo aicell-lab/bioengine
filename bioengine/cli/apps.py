@@ -349,11 +349,21 @@ def run_app(artifact_id, application_id, version, disable_gpu, env_vars, hypha_t
             if parsed_env:
                 run_kwargs["application_env_vars"] = {"*": parsed_env}
 
-            deployed_id = await worker.deploy_app(**run_kwargs)
+            deployed = await worker.deploy_app(**run_kwargs)
         except Exception as exc:
             error_exit(f"Deployment failed: {exc}")
 
-        click.echo(f"Deployment started. Application ID: {deployed_id}")
+        deployed_id = deployed["application_id"]
+        click.echo(
+            f"Deployment started. Application ID: {deployed_id} "
+            f"(version {deployed['version']})"
+        )
+        if deployed["version_source"] == "inherited":
+            click.echo(
+                f"Note: no --version was given, so this redeployed the version "
+                f"'{deployed['version']}' that application '{deployed_id}' was "
+                f"already running. Pass --version to roll forward."
+            )
         click.echo(f"\nCheck status:  bioengine apps status {deployed_id}")
         click.echo(f"View logs:     bioengine apps logs {deployed_id}")
         click.echo(f"Stop:          bioengine apps stop {deployed_id}")
@@ -735,13 +745,14 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
             run_kwargs["application_env_vars"] = {"*": parsed_env}
 
         try:
-            deployed_id = await worker.deploy_app(**run_kwargs)
+            deployed = await worker.deploy_app(**run_kwargs)
         except Exception as exc:
             error_exit(f"Deployment failed (artifact was uploaded): {exc}")
 
+        deployed_id = deployed["application_id"]
         click.echo(
             f"Deployment started. Application ID: {deployed_id} "
-            f"(version {manifest_version})"
+            f"(version {deployed['version']})"
         )
         click.echo(f"\nCheck status:  bioengine apps status {deployed_id}")
         click.echo(f"View logs:     bioengine apps logs {deployed_id}")
