@@ -349,6 +349,44 @@ def _to_hwc_or_hw(image: np.ndarray) -> np.ndarray:
     return image
 
 
+def coerce_label_array(label: np.ndarray) -> np.ndarray:
+    """Coerce a loaded label mask to a 2D integer instance map.
+
+    The annotation tool saves per-user masks as RGB(A) PNGs, not single-channel
+    label images, so those masks arrive here as H×W×3(4). A 2D array passes
+    through unchanged. A single-channel array is squeezed. A multi-channel array
+    is collapsed: if every channel is identical it is a grayscale label stored in
+    RGB (take one channel); otherwise it is a colour-encoded instance map, so each
+    distinct colour becomes a distinct id in raster order with pure black treated
+    as background (0). Ids are per-image and need not match across images.
+    """
+    arr = np.asarray(label)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        return arr[..., 0]
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        chan = arr[..., :3]
+        if np.all(chan == chan[..., :1]):
+            return chan[..., 0]
+        flat = chan.reshape(-1, chan.shape[-1])
+        colours, inv = np.unique(flat, axis=0, return_inverse=True)
+        inv = np.asarray(inv).reshape(-1)
+        ids = np.zeros(len(colours), dtype=np.int64)
+        next_id = 0
+        for k, col in enumerate(colours):
+            if np.any(col):
+                next_id += 1
+                ids[k] = next_id
+        return ids[inv].reshape(chan.shape[:2])
+    raise ValueError(
+        f"Unsupported label shape {arr.shape}: expected a 2D mask or an "
+        "RGB(A) instance PNG."
+    )
+
+
 def materialize_pairs(
     session_id: str,
     train: List[Tuple[np.ndarray, np.ndarray]],
@@ -389,7 +427,7 @@ def materialize_pairs(
         imgs, lbls = [], []
         for i, (im, lb) in enumerate(pairs):
             im = _to_hwc_or_hw(np.asarray(im))
-            lb = np.asarray(lb).astype(np.uint16)
+            lb = coerce_label_array(np.asarray(lb)).astype(np.uint16)
             ip = img_dir / f"{i:04d}.tif"
             lp = lbl_dir / f"{i:04d}.tif"
             tifffile.imwrite(str(ip), im)

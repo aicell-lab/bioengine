@@ -193,6 +193,10 @@ class CellposeRuntime:
             eval_kwargs["min_size"] = generate_kwargs["min_size"]
         if generate_kwargs.get("diameter") is not None:
             eval_kwargs["diameter"] = generate_kwargs["diameter"]
+        post = generate_kwargs.get("postprocessing") or {}
+        for _k in ("flow_threshold", "cellprob_threshold", "niter"):
+            if post.get(_k) is not None:
+                eval_kwargs[_k] = post[_k]
         masks, _flows, _styles = model.eval([img], **eval_kwargs)
         mask = masks[0] if isinstance(masks, list) else masks
         return np.asarray(mask).astype(np.int32)
@@ -312,6 +316,64 @@ class CellposeRuntime:
         finally:
             path.unlink()
         return {"sha256": sha, "n_bytes": n_bytes}
+
+    async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
+        """Inspect a finished session's local cpsam checkpoint (architecture
+        signature + L2 drift from the base it started from), PUT its weights to the
+        pool's presigned URL, and return the signature, drift, sha256s, byte size and
+        cellpose version. The checkpoint is torch + a runtime-local file, neither of
+        which the torch-free CPU entry can touch, so all of it happens here."""
+        import torch
+        from urllib.request import Request, urlopen
+
+        import pool
+        import training
+
+        ckpt = str(training.checkpoint_path(session_id))
+        if not Path(ckpt).exists():
+            raise FileNotFoundError(f"no servable checkpoint for session '{session_id}' at {ckpt}.")
+        base_path = training.session_dir(session_id) / "init_checkpoint.pt"
+
+        def _inspect() -> Dict[str, Any]:
+            def _state(path):
+                return self._unwrap_sd(torch.load(path, map_location="cpu", weights_only=False))
+
+            sd = _state(ckpt)
+            out: Dict[str, Any] = {
+                "architecture_signature": pool.architecture_signature(sd),
+                "l2_from_base": None,
+                "base_checkpoint_sha256": None,
+            }
+            if base_path.exists():
+                base_sd = _state(str(base_path))
+                out["l2_from_base"] = pool.state_dict_l2_from_base(sd, base_sd)
+                out["base_checkpoint_sha256"] = pool.sha256_file(str(base_path))
+            return out
+
+        info = await asyncio.to_thread(_inspect)
+        weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)
+        n_bytes = Path(ckpt).stat().st_size
+
+        def _put():
+            data = Path(ckpt).read_bytes()
+            with urlopen(Request(weights_put_url, data=data, method="PUT"), timeout=600) as r:
+                r.read()
+
+        await asyncio.to_thread(_put)
+
+        try:
+            import importlib.metadata as _im
+
+            cellpose_version = _im.version("cellpose")
+        except Exception:
+            cellpose_version = None
+
+        return {
+            **info,
+            "weights_sha256": weights_sha256,
+            "n_bytes": int(n_bytes),
+            "cellpose_version": cellpose_version,
+        }
 
     def pop_soup_dl_bytes(self) -> int:
         """Return + zero the bytes downloaded for soup members since the last call,
