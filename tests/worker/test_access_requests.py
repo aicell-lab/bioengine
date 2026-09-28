@@ -22,6 +22,7 @@ the operator turns it on, one request per account, and a denial stands until an
 admin clears it.
 """
 
+import inspect
 import json
 import tempfile
 from pathlib import Path
@@ -360,6 +361,37 @@ async def _register(tmp_path, enabled):
     return registered
 
 
+def test_the_toggle_reaches_the_constructor_from_the_command_line(monkeypatch):
+    """A flag argparse accepts but never forwards is the same as no flag.
+
+    get_args_by_group drops None values, so a flag whose default is None would
+    silently never arrive; store_true defaults to False, which does.
+    """
+    import sys
+
+    from bioengine.worker.__main__ import create_parser, get_args_by_group
+
+    monkeypatch.setattr(
+        sys, "argv", ["bioengine.worker", "--mode", "single-machine"]
+    )
+    assert get_args_by_group(create_parser())["Core Options"][
+        "enable_access_requests"
+    ] is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["bioengine.worker", "--mode", "single-machine", "--enable-access-requests"],
+    )
+    core = get_args_by_group(create_parser())["Core Options"]
+    assert core["enable_access_requests"] is True
+
+    # __main__ splats Core Options straight into the constructor, so every key
+    # has to be a parameter it accepts — a rename on either side breaks startup.
+    accepted = set(inspect.signature(BioEngineWorker.__init__).parameters)
+    assert set(core) <= accepted, f"not constructor parameters: {set(core) - accepted}"
+
+
 # ---------------------------------------------------------------------------
 # One request per user
 # ---------------------------------------------------------------------------
@@ -537,27 +569,44 @@ async def test_a_granted_user_is_not_a_starting_user(tmp_path):
     ) == ["founder@example.org"]
 
 
-async def test_a_non_admin_cannot_resolve_or_list_requests(tmp_path):
+@pytest.mark.parametrize("decision", ["grant", "deny", "clear"])
+async def test_a_non_admin_cannot_resolve_a_request(tmp_path, decision):
+    """Every decision, not just 'grant'.
+
+    Only 'grant' reaches add_admin_user, which has a permission check of its
+    own; 'deny' and 'clear' reach nothing downstream, so they are the ones that
+    prove resolve_access_request checks permissions itself. 'deny' would let a
+    stranger permanently block someone, and 'clear' would let them wipe a
+    decision an admin had made.
+    """
     worker = _worker(tmp_path, ["admin@example.org"], founding=())
     await worker.request_admin_access(reason="please", context=REQUESTER)
 
-    for call in (
-        worker.list_access_requests(context=OTHER),
-        worker.resolve_access_request(
-            user="requester@example.org", decision="grant", context=OTHER
-        ),
-        # Nor may the requester grant their own request.
-        worker.resolve_access_request(
-            user="requester@example.org", decision="grant", context=REQUESTER
-        ),
-    ):
-        with pytest.raises(PermissionError):
-            await call
+    with pytest.raises(PermissionError):
+        await worker.resolve_access_request(
+            user="requester@example.org", decision=decision, context=OTHER
+        )
+
+    # Nor may the requester decide their own request.
+    with pytest.raises(PermissionError):
+        await worker.resolve_access_request(
+            user="requester@example.org", decision=decision, context=REQUESTER
+        )
 
     assert worker.admin_users == ["admin@example.org"]
+    assert worker._access_requests["requester@example.org"]["status"] == "pending"
 
 
-async def test_a_wildcard_covered_caller_cannot_resolve_a_request(tmp_path):
+async def test_a_non_admin_cannot_list_requests(tmp_path):
+    worker = _worker(tmp_path, ["admin@example.org"], founding=())
+    await worker.request_admin_access(reason="please", context=REQUESTER)
+
+    with pytest.raises(PermissionError):
+        await worker.list_access_requests(context=OTHER)
+
+
+@pytest.mark.parametrize("decision", ["grant", "deny", "clear"])
+async def test_a_wildcard_covered_caller_cannot_resolve_a_request(tmp_path, decision):
     """Same reason add_admin_user requires a named admin: a wildcard caller
     turning the wildcard into a named grant ends up the only admin."""
     worker = _worker(tmp_path, ["admin@example.org", "*"], founding=())
@@ -571,8 +620,16 @@ async def test_a_wildcard_covered_caller_cannot_resolve_a_request(tmp_path):
 
     with pytest.raises(PermissionError):
         await worker.resolve_access_request(
-            user="requester@example.org", decision="grant", context=OTHER
+            user="requester@example.org", decision=decision, context=OTHER
         )
+
+    assert worker._access_requests["requester@example.org"]["status"] == "pending"
+    assert worker.admin_users == ["admin@example.org", "*"]
+
+
+async def test_a_wildcard_covered_caller_cannot_list_requests(tmp_path):
+    worker = _worker(tmp_path, ["admin@example.org", "*"], founding=())
+
     with pytest.raises(PermissionError):
         await worker.list_access_requests(context=OTHER)
 
