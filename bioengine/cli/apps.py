@@ -755,10 +755,14 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
             error_exit(f"Deployment failed (artifact was uploaded): {exc}")
 
         deployed_id = deployed["application_id"]
-        # This command exists to roll an app forward, so an inherited version is
-        # an error here rather than provenance: it means the manifest carried no
-        # version, deploy_app fell back to whatever was running, and the code
-        # just uploaded is not the code now serving.
+        # Defence-in-depth on this command's contract: it must deploy the code it
+        # just uploaded, so an inherited version is an error here rather than the
+        # provenance `apps run` treats it as. Not the common case — a version-less
+        # manifest only uploads against a brand-new artifact, since
+        # _enforce_version_increases rejects a falsy version once the artifact
+        # exists, and a brand-new artifact has nothing running to inherit from.
+        # The residual path is --app-id pointing at an app running a *different*
+        # artifact.
         if deployed["version_source"] == "inherited":
             error_exit(
                 f"Uploaded to '{artifact_id}', but the deployment inherited the "

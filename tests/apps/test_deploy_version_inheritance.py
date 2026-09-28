@@ -320,10 +320,14 @@ def test_apps_deploy_tells_the_user_which_version(deploy_cli) -> None:
 def test_apps_deploy_fails_when_the_deploy_inherited_a_version(
     monkeypatch, tmp_path: Path
 ) -> None:
-    # A version-less manifest passes version=None, so targeting a running app
-    # inherits its version. This command's whole purpose is to roll forward, so
-    # that is an error — and the pre-existing failure mode is the nastiest kind:
-    # it reported the inherited version as if it were the uploaded one.
+    # Pins the contract, not a live scenario: this command must deploy what it
+    # uploaded, so it has to refuse an inherited version however it got one.
+    # Reaching the guard needs a version-less manifest (a pinned one reports
+    # "requested"), and _enforce_version_increases rejects that against any
+    # existing artifact — so in practice only --app-id cross-pointed at an app
+    # running a different artifact gets here. The stub is what makes the case
+    # testable: it returns a version the manifest never carried, so the assertion
+    # is on the command's handling of the worker's answer.
     _, result = _invoke_deploy(
         monkeypatch,
         tmp_path,
@@ -348,10 +352,13 @@ def test_apps_deploy_fails_when_the_deploy_inherited_a_version(
 def test_apps_deploy_reports_the_workers_version_not_the_manifests(
     monkeypatch, tmp_path: Path
 ) -> None:
-    # A version-less manifest on a *fresh* application_id resolves to the
-    # artifact's newest version: nothing is inherited, so this succeeds — and it
-    # is the one success path where the deployed version is not the string the
-    # manifest carried. Echoing manifest_version here printed "(version None)".
+    # The echo has to report the worker's answer, not the string read out of the
+    # manifest, because the two can differ on a success path. This models one:
+    # a version-less manifest on a fresh application_id, where nothing is
+    # inherited and the artifact's version is resolved (echoing manifest_version
+    # printed "(version None)"). It is not the only one — `version: latest` in a
+    # manifest reaches the same divergence, since nothing validates the version's
+    # format.
     _, result = _invoke_deploy(
         monkeypatch,
         tmp_path,

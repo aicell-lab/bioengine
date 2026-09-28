@@ -879,6 +879,12 @@ async def test_deploy_app_from_artifact(
         for app_config in app_configs:
             deployed = await bioengine_worker_service.deploy_app(**app_config)
             application_id = deployed["application_id"]
+            # The honest home for this assertion: BIOENGINE_LOCAL_ARTIFACT_PATH is
+            # deleted above so the version really is resolved from the artifact,
+            # no config passes a version, and `test_id` is function-scoped so both
+            # application ids are fresh and have nothing to inherit.
+            assert deployed["version_source"] == "latest", deployed
+            assert deployed["version"] is not None, deployed
             deployed_app_ids.append(application_id)
             print(
                 f"Deployed application: {application_id} "
