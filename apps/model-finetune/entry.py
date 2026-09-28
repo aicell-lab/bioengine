@@ -1151,6 +1151,23 @@ class EntryApp:
         resp.raise_for_status()
         return resp.json()
 
+    async def _commit_with_retry(self, am, artifact_id: str, tries: int = 6, base: float = 2.0) -> None:
+        """Commit a staged artifact, retrying the transient read-after-write 404 the
+        deNBI/isilon S3 raises when a just-PUT object is not yet visible to commit's
+        HeadObject check. The uploads themselves already succeeded (their PUT raises
+        on failure), so a bounded backoff clears the visibility lag; anything else,
+        or exhausting the retries, re-raises."""
+        for i in range(tries):
+            try:
+                await am.commit(artifact_id)
+                return
+            except Exception as e:
+                msg = str(e)
+                transient = any(s in msg for s in ("HeadObject", "does not exist", "Not Found", "404"))
+                if not transient or i == tries - 1:
+                    raise
+                await asyncio.sleep(base * (2 ** i))
+
     async def _resolve_pool_init(self, model_type, init_from_pool, pool_token):
         """Resolve a pool's CURRENT community checkpoint to a download URL for
         start_training(init_from_pool=...). Returns (url, provenance); provenance
@@ -1298,7 +1315,7 @@ class EntryApp:
             (await self._http_retry(
                 "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
             )).raise_for_status()
-            await am.commit(pool_artifact_id)
+            await self._commit_with_retry(am, pool_artifact_id)
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
@@ -1574,7 +1591,7 @@ class EntryApp:
                 )
                 m_url = await am.put_file(pool_artifact_id, file_path=paths["manifest"])
                 (await self._http_retry("PUT", m_url, content=json.dumps(manifest).encode("utf-8"), timeout=120.0)).raise_for_status()
-                await am.commit(pool_artifact_id)
+                await self._commit_with_retry(am, pool_artifact_id)
                 self._bump_transport(bytes_up=head_bytes_out)
                 pool.set_current_community(index, community_version=new_version, weights_path=paths["weights"],
                                            sha256=head_sha, selection_metric=sel_metric, witness_metric=wit_metric)
@@ -1619,7 +1636,7 @@ class EntryApp:
             await am.edit(pool_artifact_id, stage=True)
             i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
             (await self._http_retry("PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0)).raise_for_status()
-            await am.commit(pool_artifact_id)
+            await self._commit_with_retry(am, pool_artifact_id)
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
