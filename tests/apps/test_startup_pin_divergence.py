@@ -89,7 +89,14 @@ def _make_manager(
     # deploy_app is the thing under observation, not under test: replace it but
     # keep the real __schema__, which deploy_startup_applications reads to
     # validate config keys.
-    deploy_app = AsyncMock(return_value=APP_ID)
+    deploy_app = AsyncMock(
+        return_value={
+            "application_id": APP_ID,
+            "artifact_id": ARTIFACT_ID,
+            "version": PINNED_VERSION,
+            "version_source": "requested",
+        }
+    )
     deploy_app.__schema__ = AppsManager.deploy_app.__schema__
     manager.deploy_app = deploy_app
 

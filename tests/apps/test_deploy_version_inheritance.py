@@ -17,6 +17,11 @@ Two pins here:
 - ``bioengine apps deploy`` passes the version it just uploaded, so pointing it
   at a running ``--app-id`` actually rolls that app forward instead of
   redeploying what was already there.
+- ``bioengine apps run``, which has no version to pin, reports the inheritance
+  when it happens instead of printing an id and nothing else.
+
+What ``deploy_app`` itself reports back is pinned in
+``test_deploy_app_return.py``.
 """
 
 from __future__ import annotations
@@ -221,28 +226,46 @@ async def test_deploy_app_stays_quiet_when_the_caller_named_the_version(
 
 # ── CLI: `bioengine apps deploy` must deploy what it just uploaded ────────────
 
-MANIFEST = """\
-format_version: 0.6.0
-name: Nuclei Seg
-id: nuclei-seg
-id_emoji: "🔬"
-description: Segment nuclei.
-type: ray-serve
-version: 1.0.1
-entry: nuclei_seg.deployment:NucleiSeg
-"""
+def _manifest(version: str | None) -> str:
+    # `version` is an optional manifest field, so a version-less manifest is a
+    # real input, not a malformed one.
+    version_line = f"version: {version}\n" if version is not None else ""
+    return (
+        "format_version: 0.6.0\n"
+        "name: Nuclei Seg\n"
+        "id: nuclei-seg\n"
+        'id_emoji: "🔬"\n'
+        "description: Segment nuclei.\n"
+        "type: ray-serve\n"
+        f"{version_line}"
+        "entry: nuclei_seg.deployment:NucleiSeg\n"
+    )
 
 
-@pytest.fixture
-def deploy_cli(monkeypatch, tmp_path: Path):
-    """Run ``apps deploy`` against a stub worker; yield the recorded kwargs."""
+MANIFEST = _manifest("1.0.1")
+
+
+def _invoke_deploy(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    manifest: str = MANIFEST,
+    deployed_version=None,
+    version_source: str = "requested",
+):
+    """Run ``apps deploy`` against a stub worker; return (kwargs, click result).
+
+    ``deployed_version`` defaults to echoing back whatever version the command
+    passed — the honest stub for the pinned path. Pass it explicitly to model a
+    worker that deployed something *other* than what the manifest named.
+    """
     from click.testing import CliRunner
 
     from bioengine.cli import apps as apps_cli
 
     app_dir = tmp_path / "nuclei-seg"
     app_dir.mkdir()
-    (app_dir / "manifest.yaml").write_text(MANIFEST)
+    (app_dir / "manifest.yaml").write_text(manifest)
     (app_dir / "deployment.py").write_text("class NucleiSeg:\n    pass\n")
 
     recorded: dict = {}
@@ -252,7 +275,14 @@ def deploy_cli(monkeypatch, tmp_path: Path):
 
     async def _deploy_app(**kwargs):
         recorded.update(kwargs)
-        return APP_ID
+        return {
+            "application_id": APP_ID,
+            "artifact_id": ARTIFACT_ID,
+            "version": (
+                kwargs["version"] if deployed_version is None else deployed_version
+            ),
+            "version_source": version_source,
+        }
 
     worker.deploy_app = _deploy_app
 
@@ -264,6 +294,12 @@ def deploy_cli(monkeypatch, tmp_path: Path):
     result = CliRunner().invoke(
         apps_cli.apps_group, ["deploy", str(app_dir), "--app-id", APP_ID]
     )
+    return recorded, result
+
+
+@pytest.fixture
+def deploy_cli(monkeypatch, tmp_path: Path):
+    recorded, result = _invoke_deploy(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
     return recorded, result.output
 
@@ -279,3 +315,113 @@ def test_apps_deploy_pins_the_version_it_uploaded(deploy_cli) -> None:
 def test_apps_deploy_tells_the_user_which_version(deploy_cli) -> None:
     _, output = deploy_cli
     assert "1.0.1" in output
+
+
+def test_apps_deploy_fails_when_the_deploy_inherited_a_version(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # Pins the contract, not a live scenario: this command must deploy what it
+    # uploaded, so it has to refuse an inherited version however it got one.
+    # Reaching the guard needs a version-less manifest (a pinned one reports
+    # "requested"), and _enforce_version_increases rejects that against any
+    # existing artifact — so in practice only --app-id cross-pointed at an app
+    # running a different artifact gets here. The stub is what makes the case
+    # testable: it returns a version the manifest never carried, so the assertion
+    # is on the command's handling of the worker's answer.
+    _, result = _invoke_deploy(
+        monkeypatch,
+        tmp_path,
+        manifest=_manifest(None),
+        deployed_version="0.0.9",
+        version_source="inherited",
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "0.0.9" in result.output
+    assert "NOT deployed" in result.output, (
+        "The whole point is that the upload succeeded and the deploy did not "
+        "ship it — saying only 'inherited' buries that."
+    )
+    assert "in flight" in result.output, (
+        "deploy_app has already started the redeploy before returning, so "
+        "exiting here does not stop it."
+    )
+    assert "manifest.yaml" in result.output
+
+
+def test_apps_deploy_reports_the_workers_version_not_the_manifests(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # The echo has to report the worker's answer, not the string read out of the
+    # manifest, because the two can differ on a success path. This models one:
+    # a version-less manifest on a fresh application_id, where nothing is
+    # inherited and the artifact's version is resolved (echoing manifest_version
+    # printed "(version None)"). It is not the only one — `version: latest` in a
+    # manifest reaches the same divergence, since nothing validates the version's
+    # format.
+    _, result = _invoke_deploy(
+        monkeypatch,
+        tmp_path,
+        manifest=_manifest(None),
+        deployed_version="1.0.2",
+        version_source="latest",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Application ID: nuclei-seg (version 1.0.2)" in result.output
+    assert "(version None)" not in result.output
+
+
+# ── CLI: `bioengine apps run` must say when it inherited a version ────────────
+
+
+def _run_cli(monkeypatch, version_source: str):
+    """Run ``apps run`` against a stub worker reporting ``version_source``."""
+    from click.testing import CliRunner
+
+    from bioengine.cli import apps as apps_cli
+
+    worker = MagicMock()
+    worker.deploy_app = AsyncMock(
+        return_value={
+            "application_id": APP_ID,
+            "artifact_id": ARTIFACT_ID,
+            "version": "1.0.0",
+            "version_source": version_source,
+        }
+    )
+
+    monkeypatch.setattr(
+        apps_cli, "require_worker", lambda *a: ("https://hypha.test", "ws/w", "tok")
+    )
+    monkeypatch.setattr(apps_cli, "connect_worker", AsyncMock(return_value=worker))
+
+    result = CliRunner().invoke(
+        apps_cli.apps_group, ["run", ARTIFACT_ID, "--app-id", APP_ID]
+    )
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_apps_run_reports_an_inherited_version(monkeypatch) -> None:
+    # `apps run --app-id <running>` with no --version redeploys what is already
+    # there. The command has to say so; otherwise it looks like a roll-forward.
+    output = _run_cli(monkeypatch, "inherited")
+
+    assert "1.0.0" in output
+    assert "redeployed" in output
+    assert "--version" in output, (
+        "Naming the way out is the point — without it the note just restates "
+        "that something happened."
+    )
+
+
+def test_apps_run_stays_quiet_when_the_version_was_not_inherited(monkeypatch) -> None:
+    # A note on every deploy is a note nobody reads. Asserted on the note's own
+    # wording, not on the word "inherited" — which the note never uses, so that
+    # assertion could never have failed.
+    output = _run_cli(monkeypatch, "latest")
+
+    assert "1.0.0" in output
+    assert "redeployed" not in output
+    assert "--version" not in output

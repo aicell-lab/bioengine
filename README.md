@@ -124,11 +124,19 @@ server = await connect_to_server({"server_url": "https://hypha.aicell.io", "toke
 worker = await server.get_service("bioimage-io/bioengine-worker")
 
 status = await worker.get_status()
-app_id = await worker.deploy_app(
+deployed = await worker.deploy_app(
     artifact_id="bioimage-io/cellpose-finetuning",
     application_id="cellpose-finetuning",
+    version="0.0.28",
 )
+app_id = deployed["application_id"]
 ```
+
+`deploy_app` returns a dictionary describing what it deployed —
+`application_id`, `artifact_id`, `version` and `version_source`. Omitting
+`version` for an application that is already running redeploys *that* version
+rather than the artifact's newest, and `version_source == "inherited"` is the
+only signal that this happened.
 
 ### CLI
 
@@ -145,7 +153,7 @@ bioengine worker start -- --mode single-machine
 | Method | Admin | Description |
 |--------|:-----:|-------------|
 | `get_status()` | | Worker and cluster status |
-| `deploy_app(artifact_id, ...)` | ✓ | Deploy an application |
+| `deploy_app(artifact_id, ...)` | ✓ | Deploy an application; returns `{application_id, artifact_id, version, version_source}` |
 | `stop_app(application_id)` | ✓ | Stop a running application |
 | `get_app_status(application_ids)` | | Status of specific applications |
 | `list_apps()` | ✓ | All deployed applications |

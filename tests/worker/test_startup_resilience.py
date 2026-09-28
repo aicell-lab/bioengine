@@ -216,7 +216,12 @@ async def test_one_failing_startup_application_does_not_abort_the_others(monkeyp
         if artifact_id == "ws/model-runner":
             raise OSError(37, "No locks available")
         deployed.append(artifact_id)
-        return artifact_id.split("/")[-1]
+        return {
+            "application_id": artifact_id.split("/")[-1],
+            "artifact_id": artifact_id,
+            "version": "1.0.0",
+            "version_source": "latest",
+        }
 
     manager = _startup_manager(
         [
@@ -242,7 +247,12 @@ async def test_a_failed_startup_application_is_retried(monkeypatch):
         attempts.append(kwargs["artifact_id"])
         if len(attempts) < 3:
             raise OSError(37, "No locks available")
-        return "model-runner"
+        return {
+            "application_id": "model-runner",
+            "artifact_id": kwargs["artifact_id"],
+            "version": "1.0.0",
+            "version_source": "latest",
+        }
 
     manager = _startup_manager([], deploy_app)
 
