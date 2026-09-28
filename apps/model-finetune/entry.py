@@ -1238,7 +1238,10 @@ class EntryApp:
 
         am, client = await self._pool_service(pool_token)
         try:
-            index = await self._read_pool_index(am, pool_artifact_id)
+            try:
+                index = await self._read_pool_index(am, pool_artifact_id)
+            except FileNotFoundError:
+                index = None  # uninitialized pool: the first contribution bootstraps it
             await am.edit(pool_artifact_id, stage=True)
             w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
             # The checkpoint is torch + a runtime-local file, neither reachable from
@@ -1247,7 +1250,14 @@ class EntryApp:
             # large or torch-dependent crosses the entry.
             info = await runtime.prepare_contribution(session_id, w_url)
             signature = info["architecture_signature"]
-            pool.assert_compatible(index, model_type=model_type, signature=signature)
+            if index is None:
+                # A fine-tune preserves the parameter layout, so the first
+                # contribution's signature is the pool's reference signature
+                # (equals stock cpsam). The pool artifact itself must already
+                # exist (created out-of-band with the pool_token's scope).
+                index = pool.empty_index(model_type, signature)
+            else:
+                pool.assert_compatible(index, model_type=model_type, signature=signature)
 
             metadata = pool.build_contribution_metadata(
                 contribution_id=cid,
