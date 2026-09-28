@@ -245,6 +245,15 @@ def test_a_runtime_revocation_is_not_undone_by_the_seed(tmp_path):
 
     The revoked user is deliberately not a starting user: a starting user cannot
     be revoked at all, and the store is re-checked for them on load.
+
+    DO NOT DELETE THIS AS DEAD. The fixture state is synthetic on purpose — a
+    real worker's ``_founding_admin_users`` always equals its deduped pre-overlay
+    list, so a non-founder cannot appear there in production. The test exists to
+    pin the *limit* of ``_restore_founding_admin_users``, not its behaviour: it is
+    the only test that reds if the repair is widened to restore anyone missing
+    from the store rather than only starting users. Without it, that
+    simplification ships silently and every legitimately revoked admin comes back
+    on the next restart.
     """
     worker = _bare_worker(
         tmp_path,

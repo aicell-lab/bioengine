@@ -248,7 +248,9 @@ class BioEngineWorker:
             admin_users: List of user IDs/emails authorized for administrative operations.
                         Auto-includes the authenticated user from Hypha connection. A '*'
                         entry is not honoured and is dropped with a warning; the users
-                        named here can never lose admin permissions on a running worker.
+                        named here can never lose admin permissions on a running worker
+                        (to demote one, drop it from this list, restart, then call
+                        remove_admin_user — the restart alone does not revoke it).
             enable_access_requests: Expose the public access-request methods so a
                         non-admin can ask to become an admin of this worker. Off by
                         default — turning it on puts a method on the public worker
@@ -609,7 +611,8 @@ class BioEngineWorker:
         self.logger.warning(
             f"Restoring admin user(s) {missing} named at startup but absent from "
             f"'{self._admin_users_file}'. The users a worker is started with cannot "
-            "lose admin permissions; drop them from --admin-users to demote them."
+            "lose admin permissions; to demote one, drop it from --admin-users, restart, "
+            "and then call remove_admin_user for it."
         )
         self.admin_users[:] = missing + self.admin_users
 
@@ -686,12 +689,18 @@ class BioEngineWorker:
                 "--enable-access-requests to let non-admins ask for access."
             )
 
-    def _requester_email(self, context: Dict[str, Any]) -> str:
-        """The stable identity an access request is keyed on.
+    def _requester_identity(self, context: Dict[str, Any]) -> tuple:
+        """``(key, email)`` for the caller: the dedup key and what to grant.
 
         Email, not user id: Hypha's generate_token mints a fresh client id per
         token while inheriting the email, so an id-keyed request would let one
         person file unlimited requests by refreshing their token.
+
+        The two differ by case on purpose. The key is lowercased so one account
+        cannot hold several requests by varying capitalisation, but the email
+        granted has to be the string Hypha will report on the caller's next call,
+        because check_permissions compares it case-sensitively — store the
+        lowercased form and the grant would never match the caller it was for.
         """
         if context is None or not isinstance(context, dict) or "user" not in context:
             raise PermissionError(
@@ -703,7 +712,7 @@ class BioEngineWorker:
                 "Invalid user information in context for an access request."
             )
 
-        email = (user.get("email") or "").strip().lower()
+        email = (user.get("email") or "").strip()
         # is_anonymous is the authoritative signal and is checked first: Hypha
         # mints a fresh random id per anonymous websocket connection, so an
         # anonymous caller can produce unlimited distinct identities just by
@@ -711,7 +720,7 @@ class BioEngineWorker:
         if (
             user.get("is_anonymous")
             or not email
-            or email in _UNAUTHENTICATED_EMAILS
+            or email.lower() in _UNAUTHENTICATED_EMAILS
             or "@" not in email
         ):
             raise PermissionError(
@@ -719,7 +728,12 @@ class BioEngineWorker:
                 "unauthenticated caller carries no email address, so the request "
                 "would name no account that could be granted."
             )
-        return email
+        return email.lower(), email
+
+    def _is_admin_user(self, email: str) -> bool:
+        """Whether this email is already in the admin list, ignoring case."""
+        lowered = email.lower()
+        return any(user.lower() == lowered for user in self.admin_users)
 
     async def _ping_data_server(self) -> None:
         """Ping the dataset server with retries to verify connectivity."""
@@ -1793,8 +1807,11 @@ class BioEngineWorker:
             # seed, so allowing it would be a lockout no re-roll undoes.
             raise ValueError(
                 f"Refusing to remove '{user}': the worker was started with this user "
-                "and a starting user cannot lose admin permissions. Drop it from "
-                "--admin-users and restart the worker to demote it."
+                "and a starting user cannot lose admin permissions. Demoting it takes "
+                "two steps: drop it from --admin-users and restart, which stops it "
+                f"being a starting user, then call remove_admin_user('{user}') again — "
+                "the restart alone does not revoke it, because the persisted admin list "
+                "overrides the startup flag and still carries it."
             )
         if user in self.admin_users and len(self.admin_users) == 1:
             raise ValueError(
@@ -1860,14 +1877,14 @@ class BioEngineWorker:
             ValueError: If the caller is already an admin or already has a request.
         """
         self._require_access_requests_enabled()
-        email = self._requester_email(context)
+        key, email = self._requester_identity(context)
 
-        if email in self.admin_users:
+        if self._is_admin_user(email):
             raise ValueError(
                 f"'{email}' is already an admin of this worker; there is nothing to request."
             )
 
-        existing = self._access_requests.get(email)
+        existing = self._access_requests.get(key)
         if existing:
             raise ValueError(
                 f"'{email}' already has an access request on this worker with status "
@@ -1875,6 +1892,8 @@ class BioEngineWorker:
             )
 
         request = {
+            # The email as Hypha reports it, which is what a grant has to add to
+            # the admin list; the dict key is its lowercased form.
             "email": email,
             "user_id": context["user"].get("id"),
             "status": "pending",
@@ -1883,8 +1902,8 @@ class BioEngineWorker:
             "resolved_at": None,
             "resolved_by": None,
         }
-        self._persist_access_requests({**self._access_requests, email: request})
-        self._access_requests[email] = request
+        self._persist_access_requests({**self._access_requests, key: request})
+        self._access_requests[key] = request
         self.logger.info(
             f"Access request from '{email}' is pending. Grant it with "
             f"resolve_access_request(user='{email}', decision='grant')."
@@ -1909,8 +1928,8 @@ class BioEngineWorker:
             Optional[Dict]: The caller's request, or None if they have none.
         """
         self._require_access_requests_enabled()
-        email = self._requester_email(context)
-        request = self._access_requests.get(email)
+        key, _email = self._requester_identity(context)
+        request = self._access_requests.get(key)
         return dict(request) if request else None
 
     @schema_method
@@ -1993,32 +2012,37 @@ class BioEngineWorker:
                 f"{', '.join(_ACCESS_REQUEST_DECISIONS)}."
             )
 
-        email = (user or "").strip().lower()
-        request = self._access_requests.get(email)
+        # Requests are keyed on the lowercased email, so an admin may name the
+        # requester in any case and still reach the record.
+        key = (user or "").strip().lower()
+        request = self._access_requests.get(key)
         if not request:
-            raise ValueError(f"No access request on this worker for '{email}'.")
+            raise ValueError(f"No access request on this worker for '{key}'.")
 
         caller = context["user"]
         resolved_by = caller.get("email") or caller.get("id")
 
         if decision == "clear":
             remaining = {
-                key: value
-                for key, value in self._access_requests.items()
-                if key != email
+                stored_key: value
+                for stored_key, value in self._access_requests.items()
+                if stored_key != key
             }
             self._persist_access_requests(remaining)
-            self._access_requests.pop(email, None)
+            self._access_requests.pop(key, None)
             self.logger.info(
-                f"Cleared the access request for '{email}' (by '{resolved_by}'). "
+                f"Cleared the access request for '{key}' (by '{resolved_by}'). "
                 "They may request access again."
             )
             return None
 
         if decision == "grant":
+            # The stored email, not the key: check_permissions compares emails
+            # case-sensitively, so granting the lowercased form would add an
+            # entry the caller's own context never matches.
             # Reuse the guarded path rather than touching admin_users here: it is
             # what refuses the wildcard and writes the list before it takes effect.
-            await self.add_admin_user(user=email, context=context)
+            await self.add_admin_user(user=request["email"], context=context)
 
         updated = {
             **request,
@@ -2026,10 +2050,11 @@ class BioEngineWorker:
             "resolved_at": time.time(),
             "resolved_by": resolved_by,
         }
-        self._persist_access_requests({**self._access_requests, email: updated})
-        self._access_requests[email] = updated
+        self._persist_access_requests({**self._access_requests, key: updated})
+        self._access_requests[key] = updated
         self.logger.info(
-            f"Access request for '{email}' was {updated['status']} by '{resolved_by}'."
+            f"Access request for '{request['email']}' was {updated['status']} "
+            f"by '{resolved_by}'."
         )
         return dict(updated)
 

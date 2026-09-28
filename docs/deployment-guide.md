@@ -15,11 +15,15 @@ BioEngine supports three deployment modes. The easiest way to generate deploymen
 
 `--admin-users` takes a space-separated list of emails or user IDs and defaults to the account whose token started the worker. Admins can perform every admin operation on the worker, in every deployment mode.
 
-**The users you name in `--admin-users` can never lose admin permissions on a running worker.** No other admin can remove them, and neither can they themselves. This closes a lockout that had no recovery: the runtime admin list is persisted to `<workspace-dir>/admin_users.json` and that file overrides the startup flag, so once a starting user had been removed, editing `--admin-users` and restarting did not bring them back. To demote a starting user, drop them from `--admin-users` and restart. If the persisted file is missing a starting user — because an older worker allowed the removal, or because it was edited by hand — the worker restores them at startup and logs that it did.
+**The users you name in `--admin-users` can never lose admin permissions on a running worker.** No other admin can remove them, and neither can they themselves. This closes a lockout that had no recovery: the runtime admin list is persisted to `<workspace-dir>/admin_users.json` and that file overrides the startup flag, so once a starting user had been removed, editing `--admin-users` and restarting did not bring them back. If the persisted file is missing a starting user — because an older worker allowed the removal, or because it was edited by hand — the worker restores them at startup and logs that it did.
+
+> **Demoting a starting user takes two steps, and the first one alone looks like it worked.** Drop them from `--admin-users` and restart: that stops them being a starting user, but does **not** revoke their access, because the persisted admin list overrides the startup flag and still lists them. Then call `remove_admin_user` for them, which now succeeds. If you stop after the restart they remain a full admin.
 
 > **`--admin-users '*'` is no longer honoured.** A `*` entry is dropped at startup with a warning, whether it came from the flag or from the persisted admin list. It used to mean remote code execution open to the internet: the worker's Hypha service is registered with public visibility, a service's authorization gates invocation rather than discovery, and almost every admin operation is gated on the admin list — so `*` made **any caller that could reach the Hypha server, including an unauthenticated anonymous one, a full admin of the worker**. They could run arbitrary Python on the deployment through `run_code`, `deploy_app` or `upload_app`, with whatever filesystem, credentials and network access its Ray cluster is given, and destroy it through `stop_worker`, `stop_all_apps` or `delete_app`.
 >
 > **Migrating off it:** the account whose token starts the worker is always an admin, so a worker that relied on `*` keeps working for its operator and stops working for everyone else. Name the others in `--admin-users`, add them on the running worker with `add_admin_user`, or turn on `--enable-access-requests` and let them ask.
+>
+> **Redeploy any app that was deployed while the wildcard was in effect.** The admin list is injected into each app's `authorized_users` once, at deploy time, so an app deployed under a wildcard admin list has `*` baked into its own rules — and a rule that already contains `*` is left alone by later injection, including the re-injection that happens when the worker recovers running apps after a restart. Those apps therefore stay callable by anyone after this upgrade, even though the worker itself no longer honours the wildcard. Upgrading the worker does not fix them; redeploying them does.
 
 ### Letting users ask for access
 
@@ -37,7 +41,7 @@ Admins resolve a request with `resolve_access_request(user, decision)`:
 
 Unauthenticated callers are refused: Hypha reports no email address for them and mints a fresh random user id per anonymous connection, so an anonymous request names no account that could be granted. Note that one-request-per-account bounds requests per *account*, not per person — anyone able to register additional Hypha accounts can file additional requests. Treat the flag as a convenience for a known user community, not as a hardened public endpoint.
 
-Editing the admin list still requires a caller *named* in it: a caller covered only by a `*` entry in a deployed app's `authorized_users` cannot call `add_admin_user`, `remove_admin_user` or `resolve_access_request`.
+Editing the admin list still requires a caller *named* in it. `add_admin_user`, `remove_admin_user` and `resolve_access_request` are checked with the wildcard refused, so a `*` entry in the admin list would not authorize them even before it was dropped — they are the methods that widen or narrow the authorized set itself, and a caller who is only an admin by wildcard must not be able to make that permanent.
 
 ---
 

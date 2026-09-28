@@ -163,21 +163,6 @@ async def test_every_user_named_at_startup_is_protected_not_just_the_first(tmp_p
     ) == ["first@example.org", "second@example.org"]
 
 
-async def test_the_starting_user_guard_outranks_the_wildcard_caller(tmp_path):
-    worker = _worker(
-        tmp_path,
-        ["founder@example.org", "*"],
-        founding=("founder@example.org",),
-    )
-
-    with pytest.raises(PermissionError):
-        await worker.remove_admin_user(
-            user="founder@example.org", context=create_context("x", "x@example.org")
-        )
-
-    assert "founder@example.org" in worker.admin_users
-
-
 def test_the_starting_users_are_captured_before_the_overlay_is_loaded(
     short_workspace_dir,
 ):
@@ -479,6 +464,94 @@ async def test_the_request_key_is_the_email_not_the_client_id(tmp_path):
 
     with pytest.raises(ValueError, match="already has an access request"):
         await worker.request_admin_access(reason="second", context=refreshed_token)
+
+
+async def test_a_grant_for_a_mixed_case_email_actually_grants_access(tmp_path):
+    """check_permissions compares emails case-sensitively.
+
+    Storing the lowercased key in the admin list would add an entry the caller's
+    own context never matches, so the grant would silently do nothing and the
+    user would keep being refused with no indication why.
+    """
+    from bioengine.utils import check_permissions
+
+    mixed = create_context("mixed-id", "Alice.Smith@Example.ORG")
+    worker = _worker(tmp_path, ["admin@example.org"], founding=())
+
+    await worker.request_admin_access(reason="please", context=mixed)
+    await worker.resolve_access_request(
+        user="Alice.Smith@Example.ORG", decision="grant", context=ADMIN
+    )
+
+    # The list carries the email exactly as Hypha reports it...
+    assert "Alice.Smith@Example.ORG" in worker.admin_users
+    # ...so the shared permission check every admin method uses now passes.
+    check_permissions(
+        context=mixed,
+        authorized_users=worker.admin_users,
+        resource_name="running code",
+    )
+    assert await worker.check_access(context=mixed) is True
+
+
+async def test_case_variation_does_not_buy_a_second_request(tmp_path):
+    """The dedup key is lowercased, so capitalisation is not a fresh identity."""
+    worker = _worker(tmp_path, ["admin@example.org"], founding=())
+    await worker.request_admin_access(
+        reason="first", context=create_context("id-1", "Alice@Example.org")
+    )
+
+    with pytest.raises(ValueError, match="already has an access request"):
+        await worker.request_admin_access(
+            reason="second", context=create_context("id-2", "alice@example.org")
+        )
+
+    assert len(worker._access_requests) == 1
+
+
+async def test_an_admin_may_resolve_naming_the_requester_in_any_case(tmp_path):
+    worker = _worker(tmp_path, ["admin@example.org"], founding=())
+    await worker.request_admin_access(
+        reason="please", context=create_context("id-1", "Alice@Example.org")
+    )
+
+    resolved = await worker.resolve_access_request(
+        user="ALICE@EXAMPLE.ORG", decision="deny", context=ADMIN
+    )
+
+    assert resolved["status"] == "denied"
+    assert resolved["email"] == "Alice@Example.org"
+
+
+async def test_a_mixed_case_admin_already_on_the_list_has_nothing_to_request(tmp_path):
+    worker = _worker(tmp_path, ["Alice@Example.org"], founding=())
+
+    with pytest.raises(ValueError, match="already an admin"):
+        await worker.request_admin_access(
+            reason="", context=create_context("id-1", "alice@example.org")
+        )
+
+
+async def test_a_caller_flagged_anonymous_is_refused_even_carrying_an_email(tmp_path):
+    """is_anonymous is the authoritative signal, so it is checked on its own.
+
+    Hypha reports email=None alongside the flag today, which the falsy-email limb
+    would also catch; this pins the flag limb so a provider that supplies both a
+    flag and a placeholder address cannot slip through.
+    """
+    worker = _worker(tmp_path, ["admin@example.org"], founding=())
+    flagged = {
+        "user": {
+            "id": "anonymouz-torpid-lobster-52790260",
+            "email": "someone@example.org",
+            "is_anonymous": True,
+        }
+    }
+
+    with pytest.raises(PermissionError, match="Log in before requesting"):
+        await worker.request_admin_access(reason="let me in", context=flagged)
+
+    assert worker._access_requests == {}
 
 
 async def test_an_existing_admin_has_nothing_to_request(tmp_path):
