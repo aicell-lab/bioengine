@@ -726,10 +726,15 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
         except Exception as exc:
             error_exit(f"Upload failed: {exc}")
 
-        click.echo(f"Uploaded. Artifact ID: {artifact_id} (version {manifest_version})")
+        # manifest.yaml's version is optional, so it can genuinely be absent —
+        # echoing the bare None read as a value the manifest had set to "None".
+        version_label = (
+            manifest_version if manifest_version else "unset in manifest.yaml"
+        )
+        click.echo(f"Uploaded. Artifact ID: {artifact_id} (version {version_label})")
 
         # Deploy
-        click.echo(f"Deploying '{artifact_id}' version {manifest_version}...")
+        click.echo(f"Deploying '{artifact_id}' (version {version_label})...")
         run_kwargs = {
             "artifact_id": artifact_id,
             "disable_gpu": disable_gpu,
@@ -750,6 +755,18 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
             error_exit(f"Deployment failed (artifact was uploaded): {exc}")
 
         deployed_id = deployed["application_id"]
+        # This command exists to roll an app forward, so an inherited version is
+        # an error here rather than provenance: it means the manifest carried no
+        # version, deploy_app fell back to whatever was running, and the code
+        # just uploaded is not the code now serving.
+        if deployed["version_source"] == "inherited":
+            error_exit(
+                f"Uploaded to '{artifact_id}', but the deployment inherited the "
+                f"version '{deployed['version']}' that '{deployed_id}' was "
+                f"already running — the code just uploaded is NOT deployed. "
+                f"The redeploy of '{deployed['version']}' is already in flight.",
+                "Set 'version' in manifest.yaml so this command can pin it.",
+            )
         click.echo(
             f"Deployment started. Application ID: {deployed_id} "
             f"(version {deployed['version']})"

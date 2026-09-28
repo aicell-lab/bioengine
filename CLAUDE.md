@@ -94,7 +94,6 @@ deployed = await worker.deploy_app(
     application_id='my-app',   # gives stable service ID, not a random name
 )
 app_id = deployed['application_id']
-assert deployed['version'] == '1.2.3'   # see below — this can differ
 svc = await client.get_service(f'bioimage-io/{app_id}')
 ```
 
@@ -143,6 +142,8 @@ deployed = await worker.deploy_app(artifact_id='bioimage-io/my-app', application
 if deployed['version_source'] == 'inherited':
     raise RuntimeError(f"redeployed the running {deployed['version']}, not the new code")
 ```
+
+**Don't guard on `version_source != 'requested'` after passing an explicit `version`.** That branch is unreachable: an explicit version either yields `requested` or raises. `requested` echoes your own argument back — it is not independent confirmation that the artifact served that version.
 
 ## `hypha_token` on `deploy_app` — read the parameter carefully
 

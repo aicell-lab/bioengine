@@ -2670,7 +2670,8 @@ class AppsManager:
             - ``artifact_id``: fully-qualified ``workspace/artifact-name``, which
               may differ from the ``artifact_id`` argument if a bare name was
               passed.
-            - ``version``: the artifact version actually deployed.
+            - ``version``: the artifact version actually deployed. ``None`` if
+              the artifact has no committed versions at all.
             - ``version_source``: how that version was chosen — ``"requested"``
               (the caller named it), ``"latest"`` (the caller named none and got
               the artifact's newest committed version), or ``"inherited"`` (the
@@ -2678,6 +2679,13 @@ class AppsManager:
               ``application_id``). A caller that omits ``version`` expecting to
               roll forward must treat ``"inherited"`` as "this did not deploy my
               new code" — that case is otherwise indistinguishable from success.
+
+            ``"requested"`` is the argument echoed back, not an independent
+            confirmation: an explicit ``version`` either resolves to itself or
+            raises, so there is no reachable "asked for X, got Y" state to test
+            for. Under ``BIOENGINE_LOCAL_ARTIFACT_PATH`` there is no artifact
+            history, so ``"latest"`` there means the local manifest's version (or
+            the literal ``"local"``), not the newest committed one.
 
         Raises:
             ValueError: If artifact doesn't exist, deployment configuration is invalid,

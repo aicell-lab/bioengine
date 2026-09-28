@@ -226,28 +226,46 @@ async def test_deploy_app_stays_quiet_when_the_caller_named_the_version(
 
 # ── CLI: `bioengine apps deploy` must deploy what it just uploaded ────────────
 
-MANIFEST = """\
-format_version: 0.6.0
-name: Nuclei Seg
-id: nuclei-seg
-id_emoji: "🔬"
-description: Segment nuclei.
-type: ray-serve
-version: 1.0.1
-entry: nuclei_seg.deployment:NucleiSeg
-"""
+def _manifest(version: str | None) -> str:
+    # `version` is an optional manifest field, so a version-less manifest is a
+    # real input, not a malformed one.
+    version_line = f"version: {version}\n" if version is not None else ""
+    return (
+        "format_version: 0.6.0\n"
+        "name: Nuclei Seg\n"
+        "id: nuclei-seg\n"
+        'id_emoji: "🔬"\n'
+        "description: Segment nuclei.\n"
+        "type: ray-serve\n"
+        f"{version_line}"
+        "entry: nuclei_seg.deployment:NucleiSeg\n"
+    )
 
 
-@pytest.fixture
-def deploy_cli(monkeypatch, tmp_path: Path):
-    """Run ``apps deploy`` against a stub worker; yield the recorded kwargs."""
+MANIFEST = _manifest("1.0.1")
+
+
+def _invoke_deploy(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    manifest: str = MANIFEST,
+    deployed_version=None,
+    version_source: str = "requested",
+):
+    """Run ``apps deploy`` against a stub worker; return (kwargs, click result).
+
+    ``deployed_version`` defaults to echoing back whatever version the command
+    passed — the honest stub for the pinned path. Pass it explicitly to model a
+    worker that deployed something *other* than what the manifest named.
+    """
     from click.testing import CliRunner
 
     from bioengine.cli import apps as apps_cli
 
     app_dir = tmp_path / "nuclei-seg"
     app_dir.mkdir()
-    (app_dir / "manifest.yaml").write_text(MANIFEST)
+    (app_dir / "manifest.yaml").write_text(manifest)
     (app_dir / "deployment.py").write_text("class NucleiSeg:\n    pass\n")
 
     recorded: dict = {}
@@ -260,8 +278,10 @@ def deploy_cli(monkeypatch, tmp_path: Path):
         return {
             "application_id": APP_ID,
             "artifact_id": ARTIFACT_ID,
-            "version": kwargs["version"],
-            "version_source": "requested",
+            "version": (
+                kwargs["version"] if deployed_version is None else deployed_version
+            ),
+            "version_source": version_source,
         }
 
     worker.deploy_app = _deploy_app
@@ -274,6 +294,12 @@ def deploy_cli(monkeypatch, tmp_path: Path):
     result = CliRunner().invoke(
         apps_cli.apps_group, ["deploy", str(app_dir), "--app-id", APP_ID]
     )
+    return recorded, result
+
+
+@pytest.fixture
+def deploy_cli(monkeypatch, tmp_path: Path):
+    recorded, result = _invoke_deploy(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
     return recorded, result.output
 
@@ -289,6 +315,54 @@ def test_apps_deploy_pins_the_version_it_uploaded(deploy_cli) -> None:
 def test_apps_deploy_tells_the_user_which_version(deploy_cli) -> None:
     _, output = deploy_cli
     assert "1.0.1" in output
+
+
+def test_apps_deploy_fails_when_the_deploy_inherited_a_version(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # A version-less manifest passes version=None, so targeting a running app
+    # inherits its version. This command's whole purpose is to roll forward, so
+    # that is an error — and the pre-existing failure mode is the nastiest kind:
+    # it reported the inherited version as if it were the uploaded one.
+    _, result = _invoke_deploy(
+        monkeypatch,
+        tmp_path,
+        manifest=_manifest(None),
+        deployed_version="0.0.9",
+        version_source="inherited",
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "0.0.9" in result.output
+    assert "NOT deployed" in result.output, (
+        "The whole point is that the upload succeeded and the deploy did not "
+        "ship it — saying only 'inherited' buries that."
+    )
+    assert "in flight" in result.output, (
+        "deploy_app has already started the redeploy before returning, so "
+        "exiting here does not stop it."
+    )
+    assert "manifest.yaml" in result.output
+
+
+def test_apps_deploy_reports_the_workers_version_not_the_manifests(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # A version-less manifest on a *fresh* application_id resolves to the
+    # artifact's newest version: nothing is inherited, so this succeeds — and it
+    # is the one success path where the deployed version is not the string the
+    # manifest carried. Echoing manifest_version here printed "(version None)".
+    _, result = _invoke_deploy(
+        monkeypatch,
+        tmp_path,
+        manifest=_manifest(None),
+        deployed_version="1.0.2",
+        version_source="latest",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Application ID: nuclei-seg (version 1.0.2)" in result.output
+    assert "(version None)" not in result.output
 
 
 # ── CLI: `bioengine apps run` must say when it inherited a version ────────────

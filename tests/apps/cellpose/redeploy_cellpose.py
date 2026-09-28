@@ -8,7 +8,13 @@ from hypha_rpc import connect_to_server
 
 
 async def redeploy(artifact_id: str, application_id: str):
-    """Stop the old deployment and start a new one with the latest artifact."""
+    """Redeploy ``application_id`` in place, then wait for it to serve again.
+
+    Deploying an application_id that is already running *is* the update — there
+    is no stop_app step, and believing there was one is what made the
+    ``version=None`` below look safe: it reads as "start fresh from latest" but
+    actually inherits the running version.
+    """
     server_url = "https://hypha.aicell.io"
     token = os.environ.get("HYPHA_TOKEN")
     if not token:
@@ -41,7 +47,9 @@ async def redeploy(artifact_id: str, application_id: str):
             raise SystemExit(
                 f"Redeploy inherited version {deployed['version']} from the "
                 f"running '{app_id}' instead of picking up the latest. Pass an "
-                f"explicit version=."
+                f"explicit version=. Note the redeploy of {deployed['version']} "
+                f"is already in flight — deploy_app starts it before returning, "
+                f"so exiting here does not call it back."
             )
 
         # Wait for services to become available

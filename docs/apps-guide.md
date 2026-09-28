@@ -900,7 +900,8 @@ deployed = await bioengine_worker_service.deploy_app(
 # Advanced deployment with full configuration
 deployed = await bioengine_worker_service.deploy_app(
     artifact_id="workspace/my-app",
-    version=None,                       # Latest version
+    version=None,                       # Latest — unless "custom-id" is already
+                                        # running, then its version; see below
     application_id="custom-id",         # Custom instance ID
     hypha_token="your_token_here",      # User authentication
     disable_gpu=False,                  # Enable GPU usage
