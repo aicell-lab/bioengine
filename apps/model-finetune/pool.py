@@ -3,10 +3,12 @@
 The community pool is a Hypha artifact (one per model family; cpsam first) that
 holds contributed weights, per-contribution metadata, and versioned community
 checkpoints. Contributors fine-tune on their own local data at their own pace and
-upload only weights — the data never moves. A coordinator periodically averages
-selected contributions into a new community checkpoint (the ``aggregate`` step,
-which lives in the entry because it does torch + artifact I/O; the pure combine
-math — ``uniform_soup`` — and the community schema live here).
+upload only weights — the data never moves. A coordinator averages selected
+contributions into a new community checkpoint when the ``aggregate`` step is
+invoked. That call comes from outside this module, through the skill; there is
+no trigger in this module. ``aggregate`` lives in the entry because it does
+torch + artifact I/O; the pure combine math — ``uniform_soup`` — and the
+community schema live here.
 
 This module owns the STORAGE layout and the record SEMANTICS — what fills each
 field. The campaign page owns the wire format it renders; every record here
@@ -20,15 +22,97 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
-# Bumped when the shape of pool_index.json / metadata.json / manifest.json
-# changes. Echoed on every record and every read method so the page can flag a
-# contract mismatch instead of silently mis-rendering.
-SCHEMA_VERSION = "1"
+# Tracks the campaign-page wire contract this backend maps onto. Echoed on every
+# record and every read method so the page can flag a backend/page mismatch
+# instead of silently mis-rendering. Bump in lock-step with the page's fixtures.
+SCHEMA_VERSION = "0.13.0-draft"
 
 POOL_INDEX = "pool_index.json"
 WEIGHTS_NAME = "weights.pt"
 METADATA_NAME = "metadata.json"
 MANIFEST_NAME = "manifest.json"
+
+# The gate and the witness curve are scored with the SAME metric+matcher
+# (instance_f1 below), differing only in which split they run on — so the metric
+# NAME is identical on both role-tagged records; only aggregate_basis names the
+# split. A holdout-scoped metric turns off the participant-pool floor/completeness
+# gate on the page, which is correct: these splits are curated holdouts, not a
+# pooled per-site average.
+METRIC_NAME = "mean instance F1 at IoU 0.5"
+_HOLDOUT = "campaign_holdout"
+SELECTION_BASIS = (
+    "the score the greedy gate admitted contributions against, on split A, a public "
+    "benchmark disjoint from every contributor's training data"
+)
+WITNESS_BASIS = (
+    "scored on the disjoint witness split B, held back from the selection split and "
+    "from every contributor, the only number the improvement curve plots"
+)
+EMPTY_SELECTION_BASIS = (
+    "the score the greedy gate required a contribution to beat on split A, which none "
+    "of the assessed contributions did"
+)
+BASELINE_BASIS = (
+    "Cellpose-SAM 0.2.0 as published (cpsam_v2, pytorch_state_dict sha256 "
+    "0f1cc3f7ecdd8a037a57c6c48d9d8921391be4cbce3fa9f13c3e3a2e1253c667), "
+    "scored on the witness split before the first merge"
+)
+
+
+def round_metric(
+    *,
+    role: str,
+    aggregate: Optional[float],
+    aggregate_basis: Optional[str],
+    name: str = METRIC_NAME,
+    aggregate_scope: Optional[str] = _HOLDOUT,
+    higher_is_better: bool = True,
+    n_sites_scored: Optional[int] = None,
+    n_datasets_scored: Optional[int] = None,
+    per_site: Optional[Any] = None,
+    per_site_basis: Optional[str] = None,
+    aggregate_withheld: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """One role-tagged metric record — the page's RoundMetric (11 fields).
+
+    ``role`` is the load-bearing tag: the page refuses to plot anything whose
+    ``role != 'witness'`` on the improvement curve, EVEN if it arrived through the
+    ``witness_metric`` field. The field NAME and this tag are two carriers that must
+    agree; keeping both makes a selection/witness swap detectable rather than silent.
+    A ``campaign_holdout`` scope must not carry a ``per_site`` map (the page refuses
+    that combination), so both stay null for our curated splits."""
+    if role not in ("witness", "selection"):
+        raise ValueError(f"role must be 'witness' or 'selection', not {role!r}")
+    if aggregate_scope == _HOLDOUT and per_site is not None:
+        raise ValueError("a campaign_holdout metric must not carry a per_site map")
+    return {
+        "role": role,
+        "name": name,
+        "aggregate": aggregate,
+        "aggregate_basis": aggregate_basis,
+        "aggregate_scope": aggregate_scope,
+        "higher_is_better": higher_is_better,
+        "n_sites_scored": n_sites_scored,
+        "n_datasets_scored": n_datasets_scored,
+        "per_site": per_site,
+        "per_site_basis": per_site_basis,
+        "aggregate_withheld": aggregate_withheld,
+    }
+
+
+def merge_trigger() -> Dict[str, Any]:
+    """The campaign's merge-cadence policy record (5 fields). All null: no
+    merge-cadence policy is declared here and the merge provenance is unpopulated,
+    pending the campaign's trigger ruling. A merge-on-N-contributions policy would
+    set ``kind`` and ``contributions_per_merge``; a named decider would set
+    ``decided_by``/``agent``."""
+    return {
+        "kind": None,
+        "contributions_per_merge": None,
+        "next_merge_at": None,
+        "decided_by": None,
+        "agent": None,
+    }
 
 
 def contribution_paths(contribution_id: str) -> Dict[str, str]:
@@ -268,8 +352,12 @@ def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
 def append_merge(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append one merge event to the timeline. ``entry`` carries
     ``{published_version|None, baseline_version, members[{contribution_id,
-    gate_score, included}], gate_metric, witness_metric, deferred[], created_at}``.
-    Append-only: past merge records are immutable."""
+    gate_score, included}], selection_metric (RoundMetric role=selection),
+    witness_metric (RoundMetric role=witness, or None when nothing was admitted),
+    global_sha256|None, transport, deferred[], created_at}``. A merge with
+    ``published_version=None`` admitted nothing and projects to an empty_merge
+    (selection bar only, no witness — nothing was re-measured). Append-only: past
+    merge records are immutable."""
     index.setdefault("merges", []).append(entry)
     return index
 
@@ -313,9 +401,8 @@ def build_community_manifest(
     selected_contribution_ids: List[str],
     gate_split: Dict[str, Any],
     witness_split: Dict[str, Any],
-    gate_metric: Optional[float],
-    witness_metric: Optional[float],
-    metric_name: str,
+    selection_metric: Dict[str, Any],
+    witness_metric: Dict[str, Any],
     members: List[Dict[str, Any]],
     architecture_signature: str,
     weights_sha256: str,
@@ -323,22 +410,24 @@ def build_community_manifest(
 ) -> Dict[str, Any]:
     """A community checkpoint's manifest.json (one per ``community/<version>/``).
 
-    ``gate_metric`` is the score on split A that admitted this soup (internal /
-    selection); ``witness_metric`` is the score on the disjoint split B and is the
-    only number the paper's improvement curve plots — reporting the gate metric as
-    the curve would be circular. ``members`` records every candidate weighed at this
-    merge as ``{contribution_id, gate_score, included}`` so a rejected contribution
-    reads as "evaluated, not included" rather than a failure. ``combine`` is
-    "uniform" unless sample-weighting was empirically justified for this version."""
+    ``selection_metric`` (role=selection) is the score on split A that admitted this
+    soup; ``witness_metric`` (role=witness) is the score on the disjoint split B and
+    is the only number the improvement curve plots — reporting the selection metric
+    as the curve would be circular. Both are role-tagged RoundMetric records, so the
+    role is a property of the stored artifact, not an assignment the page makes.
+    ``members`` records every candidate weighed as ``{contribution_id, gate_score,
+    included}`` for internal audit (a rejected candidate reads "evaluated, not
+    included", never a failure); the per-member gate_score is audit-only and is
+    stripped from the wire projection. ``combine`` is "uniform" unless sample-
+    weighting was empirically justified for this version."""
     return {
         "schema_version": SCHEMA_VERSION,
         "community_version": community_version,
         "combine": combine,
-        "metric_name": metric_name,
         "selected_contribution_ids": selected_contribution_ids,
         "gate_split": gate_split,
         "witness_split": witness_split,
-        "gate_metric": gate_metric,
+        "selection_metric": selection_metric,
         "witness_metric": witness_metric,
         "members": members,
         "architecture_signature": architecture_signature,
@@ -353,19 +442,20 @@ def set_current_community(
     community_version: str,
     weights_path: str,
     sha256: str,
-    gate_metric: Optional[float] = None,
-    witness_metric: Optional[float] = None,
+    selection_metric: Optional[Dict[str, Any]] = None,
+    witness_metric: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Point the index at a newly published community checkpoint. Written LAST by
     the aggregate step (after the version's weights + manifest are committed) so a
     reader never sees the pointer aimed at a half-written version. Carries both
-    metrics so the page reads the reportable (witness) curve without opening each
-    manifest; ``witness_metric`` is the plotted number, ``gate_metric`` is internal."""
+    role-tagged metrics so the page reads the reportable (witness) curve without
+    opening each manifest; ``witness_metric`` is the plotted number, ``selection_metric``
+    is internal."""
     index["current_community"] = {
         "version": community_version,
         "path": weights_path,
         "sha256": sha256,
-        "gate_metric": gate_metric,
+        "selection_metric": selection_metric,
         "witness_metric": witness_metric,
     }
     return index
@@ -391,3 +481,116 @@ def assert_compatible(index: Dict[str, Any], *, model_type: str, signature: str)
             f"({signature[:12]}…) differs from the pool's ({idx_sig[:12]}…); "
             "averaging is only defined over an identical layout."
         )
+
+
+# ── wire projection ──────────────────────────────────────────────────────────
+# The backend stores pool_index.json in its own shape; the campaign page reads the
+# subset below. This projection is where the page's data model is produced: it
+# partitions the merge timeline into published soups and empty merges, strips the
+# audit-only per-member gate_score (a per-candidate score in the wire payload is a
+# contract violation — assessed is IDs only), and surfaces the role-tagged metrics
+# straight from storage. Pure and torch-free so the contract is unit-testable.
+
+def _iso(ts: Optional[float]) -> Optional[str]:
+    """Epoch seconds → the page's ISO-8601 UTC millisecond format, or None."""
+    import datetime
+
+    if ts is None:
+        return None
+    dt = datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _assessed_ids(merge: Dict[str, Any]) -> List[str]:
+    return [m["contribution_id"] for m in merge.get("members", [])]
+
+
+def _taken_ids(merge: Dict[str, Any]) -> List[str]:
+    return [m["contribution_id"] for m in merge.get("members", []) if m.get("included")]
+
+
+def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str, Any]:
+    """Project a stored pool_index.json onto the campaign-page wire contract.
+
+    Returns the subset this backend owns — ``merge_trigger``, ``baseline_metric``
+    (role=witness), ``soups[]`` (published merges), ``empty_merges[]`` (merges that
+    admitted nothing: selection bar only, no witness), and enriched
+    ``contributions[]`` stubs (disposition + which soup they merged into). Campaign-
+    registry metadata the page owns (contributor demographics, licences, stewards,
+    description) is composed on the page, not here."""
+    alias = pool_artifact_id.split("/")[-1]
+    merges = index.get("merges", [])
+
+    soups: List[Dict[str, Any]] = []
+    empty_merges: List[Dict[str, Any]] = []
+    merged_into: Dict[str, str] = {}
+    cumulative = 0
+    for merge in merges:
+        transport = merge.get("transport") or {
+            "bytes_in": 0, "bytes_out": 0, "n_transfers": 0, "sources_complete": True,
+        }
+        if merge.get("published_version"):
+            soup_id = f"soup-{len(soups)}"
+            taken = _taken_ids(merge)
+            cumulative += len(taken)
+            for cid in taken:
+                merged_into[cid] = soup_id
+            version = merge["published_version"]
+            soups.append({
+                "soup_id": soup_id,
+                "index": len(soups),
+                "merged_at": _iso(merge.get("created_at")),
+                "assessed": _assessed_ids(merge),
+                "contributions": taken,
+                "selection_metric": merge.get("selection_metric"),
+                "witness_metric": merge.get("witness_metric"),
+                "global_sha256": merge.get("global_sha256"),
+                "weights": None,
+                "transport": transport,
+                "community_model": {
+                    "artifact_id": pool_artifact_id,
+                    "version": version,
+                    "url": f"#/models/{alias}?version={version}",
+                    "n_contributions_cumulative": cumulative,
+                },
+            })
+        else:
+            empty_merges.append({
+                "merged_at": _iso(merge.get("created_at")),
+                "assessed": _assessed_ids(merge),
+                "selection_metric": merge.get("selection_metric"),
+                "transport": transport,
+            })
+
+    decided = set(index.get("decided_contribution_ids", []))
+    contributions = []
+    for c in index.get("contributions", []):
+        cid = c.get("contribution_id")
+        if cid in merged_into:
+            disposition = "included"
+        elif cid in decided:
+            disposition = "excluded"
+        else:
+            disposition = "pending"
+        contributions.append({
+            "contribution_id": cid,
+            "received_at": _iso(c.get("uploaded_at")),
+            "bytes_out": c.get("n_bytes"),
+            "n_train_images": c.get("n_train_images"),
+            "samples_seen": c.get("samples_seen"),
+            "disposition": disposition,
+            "merged_into": merged_into.get(cid),
+        })
+
+    baseline = index.get("baseline") or {}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "model_type": index.get("model_type"),
+        "architecture_signature": index.get("architecture_signature"),
+        "current_community": index.get("current_community"),
+        "merge_trigger": merge_trigger(),
+        "baseline_metric": baseline.get("witness_metric"),
+        "soups": soups,
+        "empty_merges": empty_merges,
+        "contributions": contributions,
+    }
