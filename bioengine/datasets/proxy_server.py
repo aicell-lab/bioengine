@@ -40,7 +40,11 @@ from hypha_rpc import connect_to_server
 from uvicorn.logging import AccessFormatter
 
 from bioengine import __version__
-from bioengine.datasets.access_requests import AccessRequestStore, requester_identity
+from bioengine.datasets.access_requests import (
+    AccessRequestStore,
+    is_worker_admin,
+    requester_identity,
+)
 from bioengine.utils import (
     acquire_free_port,
     create_logger,
@@ -695,24 +699,29 @@ def _add_access_request_routes(
     async def _require_approver(
         authorization: Optional[str], token: Optional[str], action: str
     ) -> str:
-        """Refuse anyone not entitled to decide; return who they are.
+        """Refuse anyone the worker does not call an admin; return who they are.
 
         This is the only gate on all three decisions — a grant writes the
         overlay directly, and deny and clear touch nothing downstream that
         would refuse an unauthorized caller a second time.
+
+        The caller's own token is what goes to the worker, so this server never
+        asserts an identity on anyone's behalf and holds no admin list of its own.
         """
-        user_info = await parse_token(
-            resolve_token(authorization, token), cached_user_info
-        )
-        try:
-            check_permissions(
-                context={"user": user_info},
-                authorized_users=access_requests.approvers,
-                resource_name=action,
-                allow_wildcard=False,
+        resolved = resolve_token(authorization, token)
+        user_info = await parse_token(resolved, cached_user_info)
+        if not await is_worker_admin(
+            resolved,
+            access_requests.worker_service_id,
+            AUTHENTICATION_SERVER_URL,
+            logger,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not authorized for {action}: the BioEngine worker at "
+                f"'{access_requests.worker_service_id}' does not report this "
+                "caller as one of its admin users, or could not be reached.",
             )
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=str(e))
         return user_info.get("email") or user_info.get("id")
 
     def _require_dataset(dataset_id: str) -> None:
@@ -814,7 +823,7 @@ def start_proxy_server(
     authentication_server_url: str = "https://hypha.aicell.io",
     log_file: Optional[Union[str, Path]] = None,
     enable_access_requests: bool = False,
-    access_request_admins: Optional[List[str]] = None,
+    worker_service_id: Optional[str] = None,
 ) -> None:
     """
     Start the BioEngine Datasets proxy server.
@@ -846,8 +855,10 @@ def start_proxy_server(
                   so a user who is not in a dataset's authorized_users can ask
                   for access. Off by default, and independent of the worker's
                   flag of the same name — they govern different processes.
-        access_request_admins: Identities allowed to list and resolve those
-                  requests. With none named the endpoints stay off entirely.
+        worker_service_id: Full Hypha service id of the BioEngine worker whose
+                  admin users may decide those requests, e.g.
+                  "my-workspace/my-worker:bioengine-worker". Required by
+                  --enable-access-requests; without it the endpoints stay off.
     """
     global AUTHENTICATION_SERVER_URL
 
@@ -913,14 +924,14 @@ def start_proxy_server(
         # place a grant can reliably be written is here.
         access_requests = AccessRequestStore(
             store_file=Path.home() / ".bioengine" / "datasets" / "access_requests.json",
-            approvers=access_request_admins,
+            worker_service_id=worker_service_id,
             enabled=enable_access_requests,
             logger=logger,
         )
         if access_requests.enabled:
             logger.info(
-                "Dataset access requests are enabled; decisions accepted from: "
-                f"{', '.join(access_requests.approvers)}"
+                "Dataset access requests are enabled; decisions are authorized by "
+                f"the admin users of '{access_requests.worker_service_id}'"
             )
 
         app = _build_app(

@@ -662,7 +662,11 @@ class BioEngineDatasets:
         self,
         token: Optional[str] = None,
     ) -> List[dict]:
-        """List every access request on the server, oldest first. Approvers only."""
+        """List every access request on the server, oldest first.
+
+        Restricted to the admin users of the worker the data server was pointed
+        at; the token is passed on to that worker to establish this.
+        """
         self._require_service_url()
         response = await self.http_client.get(
             url=f"{self.service_url}/access-requests",
@@ -678,7 +682,7 @@ class BioEngineDatasets:
         decision: str,
         token: Optional[str] = None,
     ) -> Optional[dict]:
-        """Grant, deny or clear an access request. Approvers only.
+        """Grant, deny or clear an access request. Worker admins only.
 
         Args:
             dataset_id: Dataset the request is about.

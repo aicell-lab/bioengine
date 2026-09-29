@@ -8,6 +8,7 @@ Deliberately imports only ``proxy_server`` and ``access_requests`` — not
 image and has no ``zarr``.
 """
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -19,7 +20,11 @@ from fastapi.testclient import TestClient
 # goes through the package's __getattr__ delegation and raises MissingDependency
 # instead of importing the submodule.
 import bioengine.datasets.proxy_server as proxy_server
-from bioengine.datasets.access_requests import AccessRequestStore, requester_identity
+from bioengine.datasets.access_requests import (
+    AccessRequestStore,
+    is_worker_admin,
+    requester_identity,
+)
 from bioengine.datasets.proxy_server import _build_app, load_datasets
 
 OWNER = "owner@lab.org"
@@ -36,6 +41,13 @@ USERS = {
 }
 
 
+# Which fake tokens the fake worker calls admins. Mutated mid-test to stand in
+# for add_admin_user / remove_admin_user on a live worker.
+WORKER_ADMINS = {"tok-owner"}
+WORKER_REACHABLE = {"value": True}
+ADMIN_CHECKS = []
+
+
 @pytest.fixture(autouse=True)
 def stub_token_parsing(monkeypatch):
     """Resolve fake bearer tokens locally instead of calling Hypha."""
@@ -50,6 +62,29 @@ def stub_token_parsing(monkeypatch):
         return dict(USERS[token])
 
     monkeypatch.setattr(proxy_server, "parse_token", fake_parse_token)
+
+
+@pytest.fixture(autouse=True)
+def stub_worker_admin_check(monkeypatch):
+    """Stand in for the worker's public check_access over Hypha RPC.
+
+    The real call carries the caller's own token and asks the worker about
+    whoever is calling; this mirrors that by answering from the token alone.
+    """
+    WORKER_ADMINS.clear()
+    WORKER_ADMINS.add("tok-owner")
+    WORKER_REACHABLE["value"] = True
+    ADMIN_CHECKS.clear()
+
+    async def fake_is_worker_admin(token, worker_service_id, server_url, logger=None):
+        ADMIN_CHECKS.append((token, worker_service_id))
+        if not token:
+            return False
+        if not WORKER_REACHABLE["value"]:
+            return False
+        return token in WORKER_ADMINS
+
+    monkeypatch.setattr(proxy_server, "is_worker_admin", fake_is_worker_admin)
 
 
 def auth(token):
@@ -78,7 +113,7 @@ def build(
     tmp_path: Path,
     authorized_users=None,
     enabled=True,
-    approvers=(OWNER,),
+    worker_service_id="ws/worker:bioengine-worker",
     store_file=None,
 ):
     data_dir = make_data_dir(
@@ -86,7 +121,7 @@ def build(
     )
     store = AccessRequestStore(
         store_file=store_file or (tmp_path / "state" / "access_requests.json"),
-        approvers=list(approvers),
+        worker_service_id=worker_service_id,
         enabled=enabled,
     )
     app = _build_app(
@@ -125,9 +160,11 @@ def test_disabled_store_refuses_a_direct_call(tmp_path):
         store.submit("blood-atlas", STRANGER, STRANGER, "user:stranger", "")
 
 
-def test_enabled_without_approvers_stays_off(tmp_path):
-    """A public write to disk that nobody can drain is worse than no surface."""
-    client, store = build(tmp_path, enabled=True, approvers=())
+@pytest.mark.parametrize("worker_service_id", [None, "", "   "])
+def test_enabled_without_a_worker_stays_off(tmp_path, worker_service_id):
+    """Nobody could authorize a decision, and a public write to disk that
+    nobody can drain is worse than no surface at all."""
+    client, store = build(tmp_path, enabled=True, worker_service_id=worker_service_id)
     assert store.enabled is False
     assert (
         client.post(
@@ -135,18 +172,6 @@ def test_enabled_without_approvers_stays_off(tmp_path):
         ).status_code
         == 404
     )
-
-
-def test_wildcard_approver_is_dropped(tmp_path):
-    """An approver decides who else may read; '*' must not confer that."""
-    _, store = build(tmp_path, approvers=("*", OWNER))
-    assert store.approvers == [OWNER]
-
-
-def test_wildcard_only_approvers_leave_the_feature_off(tmp_path):
-    _, store = build(tmp_path, approvers=("*",))
-    assert store.approvers == []
-    assert store.enabled is False
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +349,190 @@ def test_non_approver_cannot_list_requests(tmp_path):
     assert (
         client.get("/access-requests", headers=auth("tok-member")).status_code == 403
     )
+
+
+# ---------------------------------------------------------------------------
+# The approver gate is the worker's live admin list, asked per call
+# ---------------------------------------------------------------------------
+
+
+def test_the_caller_is_asked_about_as_themselves(tmp_path):
+    """The caller's own token goes to the worker — this server asserts no
+    identity on anyone's behalf, and cannot ask about a third party."""
+    client, _ = build(tmp_path)
+    client.get("/access-requests", headers=auth("tok-owner"))
+    assert ADMIN_CHECKS[-1] == ("tok-owner", "ws/worker:bioengine-worker")
+
+
+def test_an_admin_added_at_runtime_can_decide_immediately(tmp_path):
+    """The gate (A) failed: a list snapshotted at startup would still refuse."""
+    client, _ = build(tmp_path)
+    client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
+    assert (
+        client.get("/access-requests", headers=auth("tok-member")).status_code == 403
+    )
+
+    WORKER_ADMINS.add("tok-member")  # stands in for the worker's add_admin_user
+
+    assert (
+        client.get("/access-requests", headers=auth("tok-member")).status_code == 200
+    )
+    assert (
+        client.post(
+            "/access-requests/blood-atlas/resolve",
+            params={"user": STRANGER, "decision": "grant"},
+            headers=auth("tok-member"),
+        ).status_code
+        == 200
+    )
+
+
+def test_an_admin_removed_at_runtime_stops_deciding_immediately(tmp_path):
+    """A cached answer would let a revoked admin keep deciding."""
+    client, _ = build(tmp_path)
+    assert client.get("/access-requests", headers=auth("tok-owner")).status_code == 200
+
+    WORKER_ADMINS.discard("tok-owner")  # stands in for remove_admin_user
+
+    assert client.get("/access-requests", headers=auth("tok-owner")).status_code == 403
+
+
+def test_every_decision_re_asks_the_worker(tmp_path):
+    """No caching: the answer must track the worker's list, not a snapshot."""
+    client, _ = build(tmp_path)
+    ADMIN_CHECKS.clear()
+    client.get("/access-requests", headers=auth("tok-owner"))
+    client.get("/access-requests", headers=auth("tok-owner"))
+    assert len(ADMIN_CHECKS) == 2
+
+
+@pytest.mark.parametrize("decision", ["grant", "deny", "clear"])
+def test_an_unreachable_worker_refuses_decisions(tmp_path, decision):
+    """Fail closed: an outage must not wave decisions through."""
+    client, store = build(tmp_path)
+    client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
+
+    WORKER_REACHABLE["value"] = False
+
+    response = client.post(
+        "/access-requests/blood-atlas/resolve",
+        params={"user": STRANGER, "decision": decision},
+        headers=auth("tok-owner"),
+    )
+    assert response.status_code == 403
+    assert store._requests["blood-atlas"][STRANGER]["status"] == "pending"
+
+
+def test_an_unreachable_worker_leaves_the_public_half_up(tmp_path):
+    """Filing and reading your own request never touch the worker."""
+    client, _ = build(tmp_path)
+    WORKER_REACHABLE["value"] = False
+
+    assert (
+        client.post(
+            "/datasets/blood-atlas/access-request", headers=auth("tok-stranger")
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/datasets/blood-atlas/access-request", headers=auth("tok-stranger")
+        ).json()["status"]
+        == "pending"
+    )
+
+
+def test_an_unreachable_worker_does_not_revoke_dataset_access(tmp_path):
+    """The overlay is a local file; a worker outage must not lock readers out."""
+    client, _ = build(tmp_path)
+    client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
+    client.post(
+        "/access-requests/blood-atlas/resolve",
+        params={"user": STRANGER, "decision": "grant"},
+        headers=auth("tok-owner"),
+    )
+
+    WORKER_REACHABLE["value"] = False
+
+    assert (
+        client.get(
+            "/datasets/blood-atlas/files", headers=auth("tok-stranger")
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get("/datasets/blood-atlas/files", headers=auth("tok-member")).status_code
+        == 200
+    )
+
+
+def test_an_unauthenticated_caller_cannot_list(tmp_path):
+    client, _ = build(tmp_path)
+    assert client.get("/access-requests").status_code == 403
+
+
+# --- the real is_worker_admin, with the Hypha connection stubbed out ---
+
+
+def connect_recorder(monkeypatch, check_access_returns=True, raises=None):
+    """Replace hypha_rpc.connect_to_server and record whether it was used."""
+    import hypha_rpc
+
+    calls = []
+
+    class FakeWorker:
+        async def check_access(self):
+            return check_access_returns
+
+    class FakeClient:
+        async def get_service(self, service_id):
+            calls.append(("get_service", service_id))
+            if raises:
+                raise raises
+            return FakeWorker()
+
+    class FakeConnect:
+        def __init__(self, config):
+            calls.append(("connect", config.get("token")))
+
+        async def __aenter__(self):
+            return FakeClient()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(hypha_rpc, "connect_to_server", FakeConnect)
+    return calls
+
+
+def test_is_worker_admin_skips_the_connection_without_a_token(monkeypatch):
+    """An anonymous caller is never an admin, so don't spend a websocket on it."""
+    calls = connect_recorder(monkeypatch)
+    assert asyncio.run(is_worker_admin(None, "ws/w:bioengine-worker", "http://h")) is False
+    assert calls == []
+
+
+def test_is_worker_admin_sends_the_callers_own_token(monkeypatch):
+    calls = connect_recorder(monkeypatch, check_access_returns=True)
+    assert asyncio.run(
+        is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h")
+    ) is True
+    assert ("connect", "tok-caller") in calls
+    assert ("get_service", "ws/w:bioengine-worker") in calls
+
+
+def test_is_worker_admin_relays_a_negative_verdict(monkeypatch):
+    connect_recorder(monkeypatch, check_access_returns=False)
+    assert asyncio.run(
+        is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h")
+    ) is False
+
+
+def test_is_worker_admin_fails_closed_when_the_worker_is_unreachable(monkeypatch):
+    connect_recorder(monkeypatch, raises=RuntimeError("Service not found"))
+    assert asyncio.run(
+        is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h")
+    ) is False
 
 
 def test_approver_lists_every_request_oldest_first(tmp_path):

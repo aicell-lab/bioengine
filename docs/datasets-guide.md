@@ -116,8 +116,22 @@ Listing available datasets (`GET /datasets`) never requires authentication — a
 ### Access requests
 
 A server started with `--enable-access-requests` lets a logged-in user who is
-*not* in a dataset's `authorized_users` ask for access, and lets a named
-approver grant, deny or clear that request without editing any manifest.
+*not* in a dataset's `authorized_users` ask for access, and lets a BioEngine
+worker's admin users grant, deny or clear that request without editing any
+manifest.
+
+**Who may decide is the worker's live admin list.** This server keeps no admin
+list of its own. When someone tries to list or resolve requests, it opens a
+connection to Hypha *carrying that caller's own token* and calls `check_access`
+on the worker named by `--worker-service-id`. The worker's service is public
+and `check_access` takes no arguments — it reports on whoever called it — so
+this server never asserts an identity on anyone's behalf and has no way to ask
+about a third party. The answer is not cached, so `add_admin_user` and
+`remove_admin_user` on the worker take effect on the next decision.
+
+If the worker is unreachable, decisions are refused rather than waved through.
+Filing a request, reading your own, and reading dataset files never contact the
+worker, so they keep working through a worker outage.
 
 A grant is held in the server's own state file,
 `~/.bioengine/datasets/access_requests.json`, and read as an **additive overlay**
@@ -130,10 +144,10 @@ mount this server cannot write.
 |------|-----------|
 | Who may ask | Any caller with a Hypha account. Unauthenticated and anonymous callers are refused — Hypha mints a fresh random identity per anonymous connection and reports no email, so "one request per user" would bound nothing for them |
 | How many | One per account per dataset, keyed on the lowercased email. A second is refused, not queued, and does not replace the first |
-| Denial | Terminal. The requester cannot re-file until an approver clears the record |
+| Denial | Terminal. The requester cannot re-file until a worker admin clears the record |
 | Clearing | `clear` deletes the record: it lifts a denial *and* revokes a grant |
 | Turning the feature off | Also stops the overlay being honoured. An overlay grant is invisible in the manifest, so a server whose request surface is off must not keep opening the door with one |
-| No approvers named | The endpoints stay off. A public write to this server's disk that nobody can drain is worse than no request surface at all |
+| No `--worker-service-id` | The endpoints stay off. Nobody could authorize a decision, and a public write to this server's disk that nobody can drain is worse than no request surface at all |
 
 ---
 
@@ -157,7 +171,7 @@ The server scans `--data-dir` at startup, registers the found datasets, and begi
 | `--authentication-server-url URL` | `https://hypha.aicell.io` | Hypha server used for token validation |
 | `--log-file PATH` | `~/.bioengine/logs/` | Log file. Pass `off` for console-only logging |
 | `--enable-access-requests` | off | Expose the per-dataset access-request endpoints |
-| `--access-request-admins USER…` | *(none)* | Identities allowed to list and resolve those requests |
+| `--worker-service-id ID` | *(none)* | Hypha service id of the worker whose admin users may decide those requests, e.g. `my-workspace/my-worker:bioengine-worker`. Required by the flag above |
 
 > The worker has a flag of the same name for *its own* admin-access requests.
 > The two processes carry separate request surfaces, and setting one does not
@@ -346,22 +360,22 @@ Each subfolder is created automatically on first save with a `manifest.yaml` who
 ### Access-request endpoints
 
 Registered only when the server was started with `--enable-access-requests` and
-at least one `--access-request-admins` entry; otherwise they return `404`.
+a `--worker-service-id`; otherwise they return `404`.
 
 | Endpoint | Who | Purpose |
 |----------|-----|---------|
 | `POST /datasets/{id}/access-request?reason=…` | any logged-in caller | File a request |
 | `GET /datasets/{id}/access-request` | any logged-in caller | Read *your own* request, or `null` |
-| `GET /access-requests` | approvers | Every request across every dataset, oldest first |
-| `POST /access-requests/{id}/resolve?user=…&decision=…` | approvers | `grant`, `deny` or `clear` |
+| `GET /access-requests` | worker admins | Every request across every dataset, oldest first |
+| `POST /access-requests/{id}/resolve?user=…&decision=…` | worker admins | `grant`, `deny` or `clear` |
 
 ```bash
 # Ask for access
 curl -X POST -H "Authorization: Bearer $HYPHA_TOKEN" \
   "http://localhost:39527/datasets/blood-atlas/access-request?reason=joining+the+atlas+project"
 
-# Approver grants it
-curl -X POST -H "Authorization: Bearer $APPROVER_TOKEN" \
+# A worker admin grants it, with their own token
+curl -X POST -H "Authorization: Bearer $WORKER_ADMIN_TOKEN" \
   "http://localhost:39527/access-requests/blood-atlas/resolve?user=researcher@university.edu&decision=grant"
 ```
 
@@ -557,7 +571,7 @@ await client.request_dataset_access("blood-atlas", reason="joining the atlas pro
 # Check where your request got to
 request = await client.get_dataset_access_request("blood-atlas")   # None if you have none
 
-# Approvers only
+# Worker admins only — the call carries your own token to the worker
 requests = await client.list_dataset_access_requests()
 await client.resolve_dataset_access_request(
     "blood-atlas", user="researcher@university.edu", decision="grant"

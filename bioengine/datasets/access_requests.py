@@ -11,6 +11,11 @@ That makes this store an additive overlay on the manifest, in the same shape as
 the worker's ``admin_users.json`` overlay on ``--admin-users``: the manifest is
 the seed, granted records widen it, and nothing here can take away what the
 manifest grants.
+
+Who may decide a request is *not* recorded here. This server keeps no admin
+list; it asks the worker, on a connection carrying the approver's own token, so
+the worker's live admin list stays the single source of truth. See
+``is_worker_admin``.
 """
 
 import json
@@ -26,6 +31,51 @@ from typing import Any, Dict, List, Optional, Tuple
 UNAUTHENTICATED_EMAILS = frozenset({"anonymous@example.com", "no-email", "anonymous-user"})
 
 DECISIONS = ("grant", "deny", "clear")
+
+
+async def is_worker_admin(
+    token: Optional[str],
+    worker_service_id: str,
+    server_url: str,
+    logger: logging.Logger = logging.getLogger("AccessRequestStore"),
+) -> bool:
+    """Ask the worker whether the holder of ``token`` is one of its admins.
+
+    The question is asked *as the caller*: the connection carries the caller's
+    own token, the worker's service is registered with ``require_context``, and
+    ``check_access`` takes no arguments — it reports on whoever called it. So
+    nothing here asserts an identity on someone else's behalf, and there is no
+    way to ask about a third party, which would be an oracle for enumerating
+    the worker's admin list.
+
+    It is deliberately not cached. The worker's admin list is editable at
+    runtime through ``add_admin_user`` / ``remove_admin_user``, and a cached
+    answer would mean a revoked admin kept deciding requests. Approving is a
+    low-frequency action, so the round trip costs nothing that matters.
+
+    Any failure — worker down, wrong service id, network — returns False, so an
+    unreachable worker refuses decisions rather than waving them through.
+    """
+    if not token:
+        # Refuse before opening an outbound connection: an unauthenticated
+        # caller is never an admin, and each attempt would otherwise cost a
+        # websocket to Hypha.
+        return False
+
+    from hypha_rpc import connect_to_server
+
+    try:
+        async with connect_to_server(
+            {"server_url": server_url, "token": token}
+        ) as client:
+            worker = await client.get_service(worker_service_id)
+            return bool(await worker.check_access())
+    except Exception as e:
+        logger.warning(
+            f"Could not confirm worker admin status against "
+            f"'{worker_service_id}': {type(e).__name__}: {e}. Refusing the decision."
+        )
+        return False
 
 
 def requester_identity(user_info: Dict[str, Any]) -> Tuple[str, str]:
@@ -76,26 +126,24 @@ class AccessRequestStore:
     def __init__(
         self,
         store_file: Path,
-        approvers: Optional[List[str]] = None,
+        worker_service_id: Optional[str] = None,
         enabled: bool = False,
         logger: logging.Logger = logging.getLogger("AccessRequestStore"),
     ):
         self.store_file = Path(store_file)
-        # Who may decide a request. This server holds no admin list of its own
-        # and cannot see the worker's, so the identities are named at startup.
-        # A '*' entry is dropped where the list is built, as it is for the
-        # worker's admin users: an approver decides who else may read a dataset,
-        # and a caller covered only by the wildcard must not make that grant.
-        self.approvers = [user for user in (approvers or []) if user.strip() != "*"]
+        # Who may decide a request is not a list this server keeps. It asks the
+        # worker, whose admin list is the single source of truth and changes at
+        # runtime via add_admin_user / remove_admin_user.
+        self.worker_service_id = (worker_service_id or "").strip() or None
         self.logger = logger
-        if enabled and not self.approvers:
+        if enabled and not self.worker_service_id:
             # Requesting is a public write to this server's disk; with nobody
             # able to drain the queue it is an unbounded one, and a request that
             # can never be decided is worse than no request surface at all.
             self.logger.warning(
-                "Access requests were enabled but no approver was named. The "
-                "request endpoints stay off — name approvers with "
-                "--access-request-admins to turn them on."
+                "Access requests were enabled but no worker service id was given, "
+                "so no decision could ever be authorized. The request endpoints "
+                "stay off — set --worker-service-id to turn them on."
             )
             enabled = False
         self.enabled = enabled
