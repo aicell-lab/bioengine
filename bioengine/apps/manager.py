@@ -226,6 +226,19 @@ def _belongs_to_worker_workspace(
     return True
 
 
+def _entry_deployment_name(entry_id: Optional[str]) -> Optional[str]:
+    """Ray Serve deployment name of an app's entry class.
+
+    Serve names each deployment after the tail of the class qualname, so the
+    entry id ``module:Outer.Entry`` runs as deployment ``Entry``. Derived from
+    the id rather than the built app's spec because a recovered app has no
+    spec — it only carries the entry id in its ``app_data``.
+    """
+    if not entry_id or ":" not in entry_id:
+        return None
+    return entry_id.split(":", 1)[1].split(".")[-1] or None
+
+
 # Ray-task helpers for the app cache API live in a stdlib-only sibling
 # module: the Ray Client server unpickles ``ray.remote(fn)`` references by
 # re-importing the function's module, and the manager namespace pulls in
@@ -1114,17 +1127,9 @@ class AppsManager:
         identity yet, so the caller never acts on partial data.
         """
         info = self._deployed_applications.get(application_id)
-        built_app = info.get("built_app") if info else None
-        spec = getattr(built_app, "spec", None)
-        if not spec:
+        if not info:
             return None, None
-        entry_cid = spec.get("entry_id")
-        classes = spec.get("classes") or {}
-        entry_name = (
-            classes[entry_cid]["qualname"].split(".")[-1]
-            if entry_cid in classes
-            else None
-        )
+        entry_name = info.get("entry_deployment_name")
         try:
             identities = (
                 await self.ray_cluster.proxy_actor_handle.get_replica_identities.remote(
@@ -1414,6 +1419,7 @@ class AppsManager:
                     "description",
                     "artifact_id",
                     "version",
+                    "entry",
                     "application_kwargs",
                     "application_env_vars",
                     "disable_gpu",
@@ -1461,6 +1467,9 @@ class AppsManager:
                     "version": app_data["version"],
                     "application_kwargs": app_data["application_kwargs"],
                     "application_env_vars": app_data["application_env_vars"],
+                    # Stays None: the builder strips secrets from app_data, so
+                    # an adopting worker cannot recover the token. Updating a
+                    # recovered app therefore has to pass hypha_token again.
                     "hypha_token": None,
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
@@ -1482,8 +1491,18 @@ class AppsManager:
                     "proxy_service_token_ttl_seconds": app_data.get(
                         "proxy_service_token_ttl_seconds"
                     ),
+                    "entry_deployment_name": _entry_deployment_name(
+                        app_data["entry"]
+                    ),
+                    # Stays None: an adopted app cannot be rebuilt from here,
+                    # so auto-redeploy skips it (_recover_from_controller_loss).
                     "built_app": None,
                     "auto_redeploy": app_data["auto_redeploy"],
+                    # Stays None: ice_servers is a ProxyDeployment constructor
+                    # argument, not part of app_data, and a stored TURN
+                    # credential would be expired by now anyway. None means
+                    # "fetch a fresh list", which is what a redeploy wants.
+                    "ice_servers": None,
                     "debug": app_data["debug"],
                     "deployment_task": None,
                     "is_deployed": is_deployed,
@@ -1724,6 +1743,20 @@ class AppsManager:
                     application_id, application_details, application_info["version"]
                 )
                 if version_verified is False:
+                    if application_info.get("built_app") is None:
+                        # Adopted from a previous worker: deleting it would
+                        # free the replicas but the redeploy that should
+                        # follow cannot build anything, so the app would just
+                        # stay down. Report the drift and leave it serving.
+                        self.logger.warning(
+                            f"Application '{application_id}' reports RUNNING "
+                            f"but a live replica loaded a version != "
+                            f"{application_info['version']!r}. It was adopted "
+                            f"from a previous worker and cannot be rebuilt "
+                            f"here — redeploy it explicitly to refresh the "
+                            f"replicas."
+                        )
+                        continue
                     self.logger.warning(
                         f"Application '{application_id}' reports RUNNING but a "
                         f"live replica loaded a version != requested "
@@ -3001,9 +3034,13 @@ class AppsManager:
                 "proxy_service_token_ttl_seconds": app.metadata[
                     "proxy_service_token_ttl_seconds"
                 ],
+                "entry_deployment_name": _entry_deployment_name(
+                    app.spec.get("entry_id")
+                ),
                 "built_app": app,
                 "auto_redeploy": auto_redeploy,
                 "ice_servers": ice_servers,
+                "debug": debug,
                 "deployment_task": None,  # Control task for app deployment
                 "is_deployed": asyncio.Event(),  # Track the deployment process
                 "undeployment_task": None,  # Control task for app undeployment

@@ -59,8 +59,9 @@ def _make_manager() -> AppsManager:
             "artifact_id": "bioimage-io/model-runner",
             "version": VERSION,
             "auto_redeploy": True,
+            "entry_deployment_name": ENTRY,
             "built_app": SimpleNamespace(
-                spec={"entry_id": "cid0", "classes": {"cid0": {"qualname": ENTRY}}}
+                spec={"entry_id": f"deployment:{ENTRY}", "classes": {}}
             ),
             "deployment_task": None,
         }
@@ -228,6 +229,30 @@ async def test_a_deliberate_delete_skips_the_tolerance(caplog) -> None:
     manager._deploy_application.assert_awaited_once()
     assert any("version mismatch" in line for line in _warnings(caplog))
     assert manager._missing_from_status == {}
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_app_is_reported_stale_but_not_deleted(caplog) -> None:
+    # An app adopted from a previous worker carries no built application, so
+    # the redeploy that is supposed to follow the delete cannot build anything.
+    # Deleting it would turn a stale-but-serving app into a down one.
+    manager = _make_manager()
+    manager._deployed_applications[APP_ID]["built_app"] = None
+    details, identities = _replica_running("2.7.0")
+    manager.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote.return_value = (
+        details
+    )
+    manager.ray_cluster.proxy_actor_handle.get_replica_identities.remote.return_value = (
+        identities
+    )
+
+    with caplog.at_level(logging.WARNING, logger="test.monitor"):
+        await _tick(manager, "RUNNING")
+        await _tick(manager, "RUNNING")
+
+    assert manager._deleted_pending_redeploy == set()
+    manager._deploy_application.assert_not_awaited()
+    assert any("cannot be rebuilt here" in line for line in _warnings(caplog))
 
 
 @pytest.mark.asyncio
