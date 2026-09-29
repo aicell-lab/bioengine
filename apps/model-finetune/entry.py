@@ -1408,7 +1408,13 @@ class EntryApp:
             except Exception:
                 pass
 
-        dest = Path.home() / ".bioengine" / "pool_eval" / re.sub(r"[^\w.-]", "_", pool_artifact_id) / "community.pt"
+        # Per-version dest path: the GPU runtime caches its resident model by
+        # checkpoint PATH (_ensure_model keys on it), so a fixed "community.pt"
+        # made every version reuse the first-loaded (current) model. Tagging the
+        # path with the version gives each community checkpoint a distinct cache
+        # key, so a requested historical version actually loads.
+        version_tag = re.sub(r"[^\w.-]", "_", str(community_version or (cc or {}).get("version") or "current"))
+        dest = Path.home() / ".bioengine" / "pool_eval" / re.sub(r"[^\w.-]", "_", pool_artifact_id) / f"community_{version_tag}.pt"
         dest.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(dest.write_bytes, content)
         self._bump_transport(bytes_down=len(content))

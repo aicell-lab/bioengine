@@ -253,13 +253,18 @@ class BioEngineDatasets:
             self.logger.error(f"Connection to data server failed: {e}")
             raise RuntimeError("Connection to data server failed")
 
-    async def list_datasets(self) -> Dict[str, dict]:
+    async def list_datasets(self, token: Optional[str] = None) -> Dict[str, dict]:
         """
         Retrieve a dictionary of available datasets from the service.
 
         Queries the dataset service for all datasets that are available to the current
         user. This is typically the first step in the dataset access workflow and
         provides the names needed for subsequent operations.
+
+        Args:
+            token: Optional authentication token. The catalog is public, but a
+                dataset's ``authorized_users`` is only returned to a caller
+                named in it. Falls back to the default token.
 
         Returns:
             Dictionary of dataset names and their manifest available to the current user.
@@ -275,10 +280,12 @@ class BioEngineDatasets:
         from bioengine.datasets.utils import get_url_with_retry
 
         start_time = asyncio.get_event_loop().time()
+        token = token or self.default_token
 
         async def _list():
             return await get_url_with_retry(
                 url=f"{self.service_url}/datasets",
+                headers=self._auth_headers(token),
                 raise_for_status=True,
                 http_client=self.http_client,
                 logger=self.logger,
