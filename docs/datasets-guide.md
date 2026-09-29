@@ -133,6 +133,21 @@ If the worker is unreachable, decisions are refused rather than waved through.
 Filing a request, reading your own, and reading dataset files never contact the
 worker, so they keep working through a worker outage.
 
+> **On Kubernetes, pick a worker with a stable `--client-id`.** A worker's
+> Hypha service id is derived from its client id, and a worker that does not
+> set one gets a generated id containing the pod name — for example
+> `bioengine-worker-kth-77dc978fcd-49nhd:bioengine-worker`, which embeds the
+> ReplicaSet hash and pod suffix and therefore **changes on every roll**. Once
+> the configured id is stale, `get_service` fails with "Service not found",
+> `is_worker_admin` returns False, and every decision is refused with `403`
+> until this server is reconfigured and restarted.
+>
+> The failure is in the safe direction — existing grants and all dataset reads
+> keep working, and only the list/decide surface goes dark — but it is silent
+> from the requester's side. Point `--worker-service-id` at a worker started
+> with an explicit, stable `--client-id`, or accept that decisions pause after
+> every worker roll.
+
 A grant is held in the server's own state file,
 `~/.bioengine/datasets/access_requests.json`, and read as an **additive overlay**
 on the manifest: granted addresses widen `authorized_users`, and nothing in the
@@ -171,7 +186,7 @@ The server scans `--data-dir` at startup, registers the found datasets, and begi
 | `--authentication-server-url URL` | `https://hypha.aicell.io` | Hypha server used for token validation |
 | `--log-file PATH` | `~/.bioengine/logs/` | Log file. Pass `off` for console-only logging |
 | `--enable-access-requests` | off | Expose the per-dataset access-request endpoints |
-| `--worker-service-id ID` | *(none)* | Hypha service id of the worker whose admin users may decide those requests, e.g. `my-workspace/my-worker:bioengine-worker`. Required by the flag above |
+| `--worker-service-id ID` | *(none)* | Hypha service id of the worker whose admin users may decide those requests, e.g. `my-workspace/my-worker:bioengine-worker`. Required by the flag above. **On Kubernetes this id embeds the pod name and changes on every roll** — see the warning under [Access requests](#access-requests) |
 
 > The worker has a flag of the same name for *its own* admin-access requests.
 > The two processes carry separate request surfaces, and setting one does not

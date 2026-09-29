@@ -148,6 +148,33 @@ class AccessRequestStore:
             enabled = False
         self.enabled = enabled
         self._requests = self._load()
+        if not self.enabled:
+            self._warn_about_dropped_grants()
+
+    def _warn_about_dropped_grants(self) -> None:
+        """Say out loud how much access the disabled overlay is withholding.
+
+        Switching the feature off revokes every granted address, which is the
+        safe direction but is otherwise invisible: the grants live only here,
+        so nothing in any manifest explains why those users stopped having
+        access. Counting them turns a silent revoke into a visible one.
+        """
+        dropped = [
+            record
+            for records in self._requests.values()
+            for record in records.values()
+            if record.get("status") == "granted"
+        ]
+        if not dropped:
+            return
+        datasets = {record.get("dataset_id") for record in dropped}
+        self.logger.warning(
+            f"Access requests are disabled, so {len(dropped)} existing grant(s) "
+            f"across {len(datasets)} dataset(s) in '{self.store_file}' are NOT "
+            "being honoured; those users lose the access they were granted. "
+            "Re-enable access requests to restore it, or add them to the "
+            "dataset's authorized_users to make it permanent."
+        )
 
     def _load(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
         if not self.store_file.exists():

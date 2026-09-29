@@ -10,6 +10,7 @@ image and has no ``zarr``.
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -858,6 +859,107 @@ def test_a_store_of_the_wrong_shape_is_ignored(tmp_path):
     store_file.write_text(json.dumps({"blood-atlas": ["not", "a", "mapping"]}))
     _, store = build(tmp_path, store_file=store_file)
     assert store.list_all() == []
+
+
+def grant_two_across_two_datasets(client):
+    client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
+    client.post(
+        "/access-requests/blood-atlas/resolve",
+        params={"user": STRANGER, "decision": "grant"},
+        headers=auth("tok-owner"),
+    )
+    client.post("/datasets/other-set/access-request", headers=auth("tok-mixedcase"))
+    client.post(
+        "/access-requests/other-set/resolve",
+        params={"user": "Mixed.Case@Lab.org", "decision": "grant"},
+        headers=auth("tok-owner"),
+    )
+
+
+def test_disabling_the_feature_says_how_many_grants_it_drops(tmp_path, caplog):
+    """A silent revoke is a system presenting a plausible state it does not have:
+    the grants live only in the overlay, so no manifest explains the loss."""
+    store_file = tmp_path / "state" / "access_requests.json"
+    client, _ = build(tmp_path, store_file=store_file)
+    grant_two_across_two_datasets(client)
+
+    with caplog.at_level(logging.WARNING, logger="AccessRequestStore"):
+        _, off_store = build(tmp_path / "second", store_file=store_file, enabled=False)
+
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "2 existing grant(s)" in message
+    assert "2 dataset(s)" in message
+    assert off_store.granted_users("blood-atlas") == []
+
+
+def test_the_dataset_count_covers_only_datasets_holding_a_grant(tmp_path, caplog):
+    """A dataset with nothing but a pending request loses nobody any access, so
+    counting it would overstate what the disable took away."""
+    store_file = tmp_path / "state" / "access_requests.json"
+    client, _ = build(tmp_path, store_file=store_file)
+    client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
+    client.post(
+        "/access-requests/blood-atlas/resolve",
+        params={"user": STRANGER, "decision": "grant"},
+        headers=auth("tok-owner"),
+    )
+    client.post("/datasets/other-set/access-request", headers=auth("tok-mixedcase"))
+
+    with caplog.at_level(logging.WARNING, logger="AccessRequestStore"):
+        build(tmp_path / "second", store_file=store_file, enabled=False)
+
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "1 existing grant(s)" in message
+    assert "1 dataset(s)" in message
+
+
+def test_a_disabled_store_with_no_grants_stays_quiet(tmp_path, caplog):
+    """Don't cry wolf: a pending or denied record loses nobody any access."""
+    store_file = tmp_path / "state" / "access_requests.json"
+    client, _ = build(tmp_path, store_file=store_file)
+    client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
+    client.post(
+        "/access-requests/blood-atlas/resolve",
+        params={"user": STRANGER, "decision": "deny"},
+        headers=auth("tok-owner"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="AccessRequestStore"):
+        build(tmp_path / "second", store_file=store_file, enabled=False)
+
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "grant(s)" not in message
+
+
+def test_an_enabled_store_does_not_warn_about_grants_it_is_honouring(tmp_path, caplog):
+    store_file = tmp_path / "state" / "access_requests.json"
+    client, _ = build(tmp_path, store_file=store_file)
+    grant_two_across_two_datasets(client)
+
+    with caplog.at_level(logging.WARNING, logger="AccessRequestStore"):
+        build(tmp_path / "second", store_file=store_file, enabled=True)
+
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "grant(s)" not in message
+
+
+def test_a_missing_worker_service_id_also_reports_the_dropped_grants(tmp_path, caplog):
+    """The other way the feature ends up off must be just as loud."""
+    store_file = tmp_path / "state" / "access_requests.json"
+    client, _ = build(tmp_path, store_file=store_file)
+    grant_two_across_two_datasets(client)
+
+    with caplog.at_level(logging.WARNING, logger="AccessRequestStore"):
+        build(
+            tmp_path / "second",
+            store_file=store_file,
+            enabled=True,
+            worker_service_id=None,
+        )
+
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "no worker service id" in message
+    assert "2 existing grant(s)" in message
 
 
 def test_turning_the_feature_off_stops_honouring_its_grants(tmp_path):
