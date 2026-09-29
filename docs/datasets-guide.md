@@ -111,7 +111,17 @@ The `authorized_users` field in `manifest.yaml` controls who can list files and 
 | `["user:abc123"]` | Only the user whose Hypha user ID matches |
 | `[]` or absent | No access granted to anyone |
 
-Listing available datasets (`GET /datasets`) never requires authentication — anyone can see what datasets exist and read their manifests. Access control applies only to file listing and file downloads.
+Listing available datasets (`GET /datasets`) never requires authentication — anyone can see what datasets exist and read their descriptive metadata. Access control applies to file listing and file downloads.
+
+**`authorized_users` is not part of that public view.** Its entries are the email addresses of third parties, and a dataset's collaborator roster is often itself the sensitive thing — it names who is working on what. The unauthenticated listing returns only the fields below; every other manifest key, including any the data owner invented, is withheld.
+
+| Returned to anyone | Returned only to a user named in the manifest's `authorized_users` |
+|---|---|
+| `id`, `name`, `description`, `version`, `license`, `authors`, `tags`, `documentation`, `git_repo` | the whole manifest, including `authorized_users` and any custom fields |
+
+Pass a token to `GET /datasets` to get the fuller view of the datasets you are named on. A `"*"` entry does **not** earn the roster: it authorizes reading the data, not reading who else may read it, so a dataset listing both `"*"` and named addresses does not hand those addresses to everyone.
+
+On this route a token only ever *widens* the response, so an unusable one — expired, malformed, or unverifiable because the auth server is briefly unreachable — returns the public view rather than an error. Listing a public dataset therefore keeps working without a usable credential, as it did before any of this existed. The file and byte routes behave the opposite way, because there a credential grants access rather than widening a view: a bad token is refused.
 
 ---
 
@@ -182,10 +192,14 @@ Returns `"pong"`. Simple connectivity check.
 
 ### `GET /datasets`
 
-Returns metadata for all datasets. No authentication required.
+Returns metadata for all datasets. No authentication required, but a token widens what each manifest contains — see [Access Control](#access-control).
 
 ```bash
+# Public view: descriptive metadata only
 curl http://localhost:39527/datasets
+
+# Adds authorized_users and any custom fields, for the datasets you are named on
+curl -H "Authorization: Bearer $HYPHA_TOKEN" http://localhost:39527/datasets
 ```
 
 ### Authentication
@@ -208,7 +222,7 @@ curl -H "Authorization: Bearer $HYPHA_TOKEN" http://localhost:39527/datasets/blo
     "id": "blood-atlas",
     "name": "Blood Cell Atlas",
     "description": "...",
-    "authorized_users": ["*"]
+    "license": "CC-BY-4.0"
   }
 }
 ```
@@ -311,7 +325,7 @@ data_dir/
         └── result.npy
 ```
 
-Each subfolder is created automatically on first save with a `manifest.yaml` whose `authorized_users` matches the access level. The `saved/` subdirectories appear in `GET /datasets` and are hot-reloaded by the background watcher.
+Each subfolder is created automatically on first save with a `manifest.yaml` whose `authorized_users` matches the access level. These subfolders do **not** appear in `GET /datasets`: the catalog scan walks one directory level, and they sit two levels down under `saved/`. Reach them through `GET /saved/` instead. (Were they listed, the per-user directory name and manifest would publish the owner's Hypha user id.)
 
 ---
 
