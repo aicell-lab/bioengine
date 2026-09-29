@@ -137,10 +137,18 @@ def make_manager(
                             "message": "",
                             "deployment_config": {
                                 "runtime_env": {
-                                    "env_vars": controller_env_vars
-                                    or {
-                                        "_BIOENGINE_SECRET_HYPHA_TOKEN": SECRET_VALUE,
-                                    }
+                                    # ``is not None``, not ``or``: an empty dict
+                                    # is how a caller says "plant nothing here",
+                                    # and falling through to the default would
+                                    # plant the secret on both barriers at once
+                                    # — exactly the test this file must not be.
+                                    "env_vars": (
+                                        controller_env_vars
+                                        if controller_env_vars is not None
+                                        else {
+                                            "_BIOENGINE_SECRET_HYPHA_TOKEN": SECRET_VALUE
+                                        }
+                                    )
                                 }
                             },
                             "replicas": [
