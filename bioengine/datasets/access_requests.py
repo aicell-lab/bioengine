@@ -159,15 +159,18 @@ class AccessRequestStore:
         so nothing in any manifest explains why those users stopped having
         access. Counting them turns a silent revoke into a visible one.
         """
+        # Keyed off the store's own dataset key, not the record's copy of it:
+        # a record missing the field would otherwise collapse into a None bucket
+        # and undercount the datasets affected.
         dropped = [
-            record
-            for records in self._requests.values()
+            (dataset_id, record)
+            for dataset_id, records in self._requests.items()
             for record in records.values()
             if record.get("status") == "granted"
         ]
         if not dropped:
             return
-        datasets = {record.get("dataset_id") for record in dropped}
+        datasets = {dataset_id for dataset_id, _record in dropped}
         self.logger.warning(
             f"Access requests are disabled, so {len(dropped)} existing grant(s) "
             f"across {len(datasets)} dataset(s) in '{self.store_file}' are NOT "

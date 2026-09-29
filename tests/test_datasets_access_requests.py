@@ -1,7 +1,10 @@
 """Unit tests for per-dataset access requests on the data server.
 
 Every token in this file is a fake string matched by a stubbed ``parse_token``;
-no Hypha server is contacted and no real credential appears anywhere.
+no Hypha server is contacted and no real credential appears anywhere. Every
+address is at ``example.invalid``, which RFC 2606 reserves so that it can never
+be a real domain — a fixture in a file about not disclosing third-party
+identities should not name someone else's deliverable mailbox.
 
 Deliberately imports only ``proxy_server`` and ``access_requests`` — not
 ``HttpZarrStore`` — so these run in the standard suite, which uses the worker
@@ -28,16 +31,16 @@ from bioengine.datasets.access_requests import (
 )
 from bioengine.datasets.proxy_server import _build_app, load_datasets
 
-OWNER = "owner@lab.org"
-STRANGER = "stranger@elsewhere.org"
-MEMBER = "member@lab.org"
+OWNER = "owner@example.invalid"
+STRANGER = "stranger@example.invalid"
+MEMBER = "member@example.invalid"
 
 # Fake bearer tokens; the stub below is the only thing that reads them.
 USERS = {
     "tok-owner": {"id": "user:owner", "email": OWNER},
     "tok-stranger": {"id": "user:stranger", "email": STRANGER},
     "tok-member": {"id": "user:member", "email": MEMBER},
-    "tok-mixedcase": {"id": "user:mixed", "email": "Mixed.Case@Lab.org"},
+    "tok-mixedcase": {"id": "user:mixed", "email": "Mixed.Case@Example.invalid"},
     "tok-anonymous": {"id": "anonymouz-abc", "email": None, "is_anonymous": True},
 }
 
@@ -203,7 +206,7 @@ def test_anonymous_hypha_identity_is_refused(tmp_path):
         {"id": "x", "email": "no-email"},
         {"id": "x", "email": "anonymous@example.com"},
         {"id": "x", "email": "not-an-address"},
-        {"id": "x", "email": "real@lab.org", "is_anonymous": True},
+        {"id": "x", "email": "real@example.invalid", "is_anonymous": True},
     ],
 )
 def test_requester_identity_refuses_unusable_identities(user_info):
@@ -213,9 +216,9 @@ def test_requester_identity_refuses_unusable_identities(user_info):
 
 def test_requester_identity_splits_key_from_stored_email():
     """Lowercased key for dedup, verbatim address for what a grant must match."""
-    assert requester_identity({"email": "Mixed.Case@Lab.org"}) == (
-        "mixed.case@lab.org",
-        "Mixed.Case@Lab.org",
+    assert requester_identity({"email": "Mixed.Case@Example.invalid"}) == (
+        "mixed.case@example.invalid",
+        "Mixed.Case@Example.invalid",
     )
 
 
@@ -292,7 +295,7 @@ def test_case_variants_cannot_hold_two_requests(tmp_path):
         "/datasets/blood-atlas/access-request", headers=auth("tok-mixedcase")
     )
     assert response.status_code == 409
-    assert list(store._requests["blood-atlas"]) == ["mixed.case@lab.org"]
+    assert list(store._requests["blood-atlas"]) == ["mixed.case@example.invalid"]
 
 
 def test_requester_reads_only_their_own_request(tmp_path):
@@ -630,11 +633,11 @@ def test_grant_stores_the_address_hypha_reports_not_the_key(tmp_path):
     client.post(
         "/access-requests/blood-atlas/resolve",
         # The approver names the requester in a third casing on purpose.
-        params={"user": "MIXED.CASE@lab.ORG", "decision": "grant"},
+        params={"user": "MIXED.CASE@example.INVALID", "decision": "grant"},
         headers=auth("tok-owner"),
     )
 
-    assert store.granted_users("blood-atlas") == ["Mixed.Case@Lab.org"]
+    assert store.granted_users("blood-atlas") == ["Mixed.Case@Example.invalid"]
     assert (
         client.get(
             "/datasets/blood-atlas/files", headers=auth("tok-mixedcase")
@@ -778,7 +781,7 @@ def test_clear_leaves_other_requests_in_place(tmp_path):
         params={"user": STRANGER, "decision": "clear"},
         headers=auth("tok-owner"),
     )
-    assert list(store._requests["blood-atlas"]) == ["mixed.case@lab.org"]
+    assert list(store._requests["blood-atlas"]) == ["mixed.case@example.invalid"]
 
 
 # ---------------------------------------------------------------------------
@@ -792,14 +795,14 @@ def test_a_grant_survives_a_restart(tmp_path):
     client.post("/datasets/blood-atlas/access-request", headers=auth("tok-mixedcase"))
     client.post(
         "/access-requests/blood-atlas/resolve",
-        params={"user": "Mixed.Case@Lab.org", "decision": "grant"},
+        params={"user": "Mixed.Case@Example.invalid", "decision": "grant"},
         headers=auth("tok-owner"),
     )
 
     fresh_client, fresh_store = build(
         tmp_path / "second", store_file=store_file
     )
-    assert fresh_store.granted_users("blood-atlas") == ["Mixed.Case@Lab.org"]
+    assert fresh_store.granted_users("blood-atlas") == ["Mixed.Case@Example.invalid"]
     assert (
         fresh_client.get(
             "/datasets/blood-atlas/files", headers=auth("tok-mixedcase")
@@ -871,7 +874,7 @@ def grant_two_across_two_datasets(client):
     client.post("/datasets/other-set/access-request", headers=auth("tok-mixedcase"))
     client.post(
         "/access-requests/other-set/resolve",
-        params={"user": "Mixed.Case@Lab.org", "decision": "grant"},
+        params={"user": "Mixed.Case@Example.invalid", "decision": "grant"},
         headers=auth("tok-owner"),
     )
 

@@ -94,8 +94,8 @@ tags:
 documentation: https://example.com/blood-atlas-docs
 git_repo: https://github.com/aicell-lab/blood-atlas
 authorized_users:
-  - researcher@university.edu
-  - collaborator@institute.org
+  - researcher@example.invalid
+  - collaborator@example.invalid
 ```
 
 ---
@@ -107,7 +107,7 @@ The `authorized_users` field in `manifest.yaml` controls who can list files and 
 | Value | Effect |
 |-------|--------|
 | `["*"]` | Any authenticated user can access the dataset |
-| `["user@example.com"]` | Only the user whose Hypha email matches |
+| `["user@example.invalid"]` | Only the user whose Hypha email matches |
 | `["user:abc123"]` | Only the user whose Hypha user ID matches |
 | `[]` or absent | No access granted to anyone |
 
@@ -133,20 +133,29 @@ If the worker is unreachable, decisions are refused rather than waved through.
 Filing a request, reading your own, and reading dataset files never contact the
 worker, so they keep working through a worker outage.
 
-> **On Kubernetes, pick a worker with a stable `--client-id`.** A worker's
-> Hypha service id is derived from its client id, and a worker that does not
-> set one gets a generated id containing the pod name — for example
-> `bioengine-worker-kth-77dc978fcd-49nhd:bioengine-worker`, which embeds the
-> ReplicaSet hash and pod suffix and therefore **changes on every roll**. Once
-> the configured id is stale, `get_service` fails with "Service not found",
-> `is_worker_admin` returns False, and every decision is refused with `403`
-> until this server is reconfigured and restarted.
+> **Point this at a worker started with a fixed literal `--client-id`.** A
+> worker's Hypha service id is `{workspace}/{client_id}:bioengine-worker`, so
+> whatever makes the client id change makes the configured id stale. Two common
+> setups both do:
+>
+> - **No `--client-id` at all.** `hypha_rpc` then generates a fresh random
+>   `shortuuid` per connection, so the id changes every time the worker process
+>   starts — more often than a pod roll, not less.
+> - **A `--client-id` derived from the pod.** The KTH chart maps `POD_NAME`
+>   from `metadata.name` into `--client-id`, which is why that worker's id
+>   looks like `bioengine-worker-kth-77dc978fcd-49nhd:bioengine-worker` — the
+>   ReplicaSet hash and pod suffix come from the chart, not from BioEngine, and
+>   they change on **every roll**. An explicit client id is not automatically a
+>   stable one.
+>
+> Once the configured id is stale, `get_service` fails with "Service not
+> found", `is_worker_admin` returns False, and every decision is refused with
+> `403` until this server is reconfigured and restarted.
 >
 > The failure is in the safe direction — existing grants and all dataset reads
 > keep working, and only the list/decide surface goes dark — but it is silent
-> from the requester's side. Point `--worker-service-id` at a worker started
-> with an explicit, stable `--client-id`, or accept that decisions pause after
-> every worker roll.
+> from the requester's side. So either give the worker a fixed literal client
+> id, or accept that decisions pause after every worker restart.
 
 A grant is held in the server's own state file,
 `~/.bioengine/datasets/access_requests.json`, and read as an **additive overlay**
@@ -186,7 +195,7 @@ The server scans `--data-dir` at startup, registers the found datasets, and begi
 | `--authentication-server-url URL` | `https://hypha.aicell.io` | Hypha server used for token validation |
 | `--log-file PATH` | `~/.bioengine/logs/` | Log file. Pass `off` for console-only logging |
 | `--enable-access-requests` | off | Expose the per-dataset access-request endpoints |
-| `--worker-service-id ID` | *(none)* | Hypha service id of the worker whose admin users may decide those requests, e.g. `my-workspace/my-worker:bioengine-worker`. Required by the flag above. **On Kubernetes this id embeds the pod name and changes on every roll** — see the warning under [Access requests](#access-requests) |
+| `--worker-service-id ID` | *(none)* | Hypha service id of the worker whose admin users may decide those requests, e.g. `my-workspace/my-worker:bioengine-worker`. Required by the flag above. **Goes stale whenever the worker's client id changes**, which is every process start unless the worker sets a fixed literal `--client-id` — see the warning under [Access requests](#access-requests) |
 
 > The worker has a flag of the same name for *its own* admin-access requests.
 > The two processes carry separate request surfaces, and setting one does not
@@ -391,19 +400,19 @@ curl -X POST -H "Authorization: Bearer $HYPHA_TOKEN" \
 
 # A worker admin grants it, with their own token
 curl -X POST -H "Authorization: Bearer $WORKER_ADMIN_TOKEN" \
-  "http://localhost:39527/access-requests/blood-atlas/resolve?user=researcher@university.edu&decision=grant"
+  "http://localhost:39527/access-requests/blood-atlas/resolve?user=researcher@example.invalid&decision=grant"
 ```
 
 ```json
 {
   "dataset_id": "blood-atlas",
-  "email": "researcher@university.edu",
+  "email": "researcher@example.invalid",
   "user_id": "user:github|123",
   "status": "granted",
   "reason": "joining the atlas project",
   "requested_at": 1759100000.0,
   "resolved_at": 1759100600.0,
-  "resolved_by": "owner@lab.org"
+  "resolved_by": "owner@example.invalid"
 }
 ```
 
@@ -589,7 +598,7 @@ request = await client.get_dataset_access_request("blood-atlas")   # None if you
 # Worker admins only — the call carries your own token to the worker
 requests = await client.list_dataset_access_requests()
 await client.resolve_dataset_access_request(
-    "blood-atlas", user="researcher@university.edu", decision="grant"
+    "blood-atlas", user="researcher@example.invalid", decision="grant"
 )
 ```
 
