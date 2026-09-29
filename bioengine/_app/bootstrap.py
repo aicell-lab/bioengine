@@ -28,6 +28,7 @@ from bioengine._app.errors import (
     BioEngineUserError,
     CompositionCycleError,
 )
+from bioengine.utils.requirements import requirement_name
 
 #: Manifest format the worker and bootstrap agree on. Bumped together
 #: whenever the spec shape changes.
@@ -422,22 +423,6 @@ def _safe_default(default: Any) -> Any:
 # ───────────────────────── application builder ───────────────────────────
 
 
-_REQ_NAME_SPLIT = ("==", ">=", "<=", "~=", ">", "<", "[")
-
-
-def _requirement_name(req: str) -> str:
-    """Extract the package name from a pip requirement string.
-
-    ``pandas==2.2.0`` → ``pandas``; ``hypha-rpc>=0.21`` → ``hypha-rpc``;
-    ``httpx[http2]==0.28.1`` → ``httpx``.
-    """
-    out = req.strip()
-    for sep in _REQ_NAME_SPLIT:
-        if sep in out:
-            out = out.split(sep, 1)[0]
-    return out.strip().lower()
-
-
 def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
     """Merge the framework's pip entries (``to_add``) into the user's
     (``base``), with the framework winning on package-name collision.
@@ -450,17 +435,23 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
     The replaced entry keeps the user's position in the list; everything the
     user declared that the framework does not own is untouched.
 
+    Collision is decided on the PEP 503 normalised name, so the spelling an
+    author happens to use cannot dodge the override: ``hypha_rpc`` (the
+    *import* name, and the one most likely typed from memory) is the same
+    package as ``hypha-rpc``, and letting both through put two versions of
+    it in one replica venv.
+
     Every override is logged with both the requested and the enforced
     string. An app author who reads their own requirements file and gets a
     different version has to be able to find out why."""
     import logging
 
     logger = logging.getLogger("ray.serve")
-    framework = {_requirement_name(r): r for r in to_add}
+    framework = {requirement_name(r): r for r in to_add}
     merged = []
     overridden = set()
     for req in base:
-        name = _requirement_name(req)
+        name = requirement_name(req)
         if name in framework:
             if framework[name] != req:
                 logger.warning(
@@ -473,9 +464,9 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
         else:
             merged.append(req)
     for req in to_add:
-        if _requirement_name(req) not in overridden:
+        if requirement_name(req) not in overridden:
             merged.append(req)
-            overridden.add(_requirement_name(req))
+            overridden.add(requirement_name(req))
     return merged
 
 
