@@ -57,6 +57,34 @@ from bioengine.utils import (
     validate_manifest,
 )
 
+#: Packages the worker dictates for every user replica venv, pinned to the
+#: worker's *installed* distribution by :func:`get_pip_requirements`.
+#:
+#: Membership turns on one measured property of the Ray node image, because
+#: Ray builds runtime_env venvs with ``--system-site-packages``. Measured on
+#: ``rayproject/ray:2.55.1-py311-cpu``: ``pydantic`` and ``h2`` present,
+#: ``httpx`` and ``httpcore`` absent.
+#:
+#: ``pydantic`` is therefore inherited, and pinning it would install a
+#: venv-local copy shadowing the inherited one — fighting the inheritance
+#: rather than complementing it. It stays out.
+#:
+#: ``httpx`` is the opposite case. ``hypha-rpc`` declares it *bare*, so the
+#: hypha-rpc pin alone already pip-installs an unpinned httpx into every
+#: replica, re-resolved against PyPI on each build (#0020's mechanism), and
+#: ``import hypha_rpc`` loads it eagerly on the cloudpickle-load path. Naming
+#: it here changes which version lands, not whether it lands: with and without
+#: ``httpx[http2]==…`` the venv holds the same eight distributions, ``h2``
+#: resolving from system site-packages.
+#:
+#: Open, and not fixable in this list: the inherited ``pydantic`` is only
+#: *observed* inside bioengine's declared ``pydantic~=2.12.0`` band (node
+#: 2.12.4 vs worker 2.12.0), never constrained to it, so a Ray base-image bump
+#: can move it out with no signal. That check belongs at cluster connect — a
+#: replica cannot read the band, bioengine reaching it as raw source with no
+#: dist-info — and must warn, never refuse.
+_USER_REPLICA_FRAMEWORK_PACKAGES = ["httpx", "hypha-rpc"]
+
 #: TTL of the read-only token the worker mints per deploy and hands replicas
 #: for their per-file Hypha source sync. Unlike the old ~10 min introspect-only
 #: token, replicas now pull source at *every* start (autoscale, crash-restart,
@@ -836,12 +864,10 @@ class AppBuilder:
         # named 'hypha_rpc'``. Same story as Fix #7, just one layer
         # deeper. Injected at bind time.
         #
-        # ``pydantic`` is deliberately absent. Ray builds runtime_env venvs
-        # with ``--system-site-packages``, so a replica already sees the Ray
-        # node image's copy; pinning one here would fight that inheritance
-        # rather than complement it.
+        # See ``_USER_REPLICA_FRAMEWORK_PACKAGES`` for why ``httpx`` is in
+        # this list and ``pydantic`` is not.
         user_replica_framework_pip = get_pip_requirements(
-            select=["hypha-rpc"],
+            select=_USER_REPLICA_FRAMEWORK_PACKAGES,
             extras=[],
         )
         # The env_vars dict the worker assembled above (HYPHA_SERVER_URL,

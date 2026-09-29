@@ -443,10 +443,11 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
     (``base``), with the framework winning on package-name collision.
 
     ``to_add`` carries the versions the *worker* has installed, for the
-    packages whose objects cross the cloudpickle boundary between worker
-    and replica — today that is ``hypha-rpc`` and nothing else. The worker
-    dictates those and an app cannot pin its way onto a different one. The
-    replaced entry keeps the user's position in the list; everything the
+    packages the worker dictates on every replica venv — today ``hypha-rpc``
+    and its transitive ``httpx``; see
+    ``bioengine.apps.builder._USER_REPLICA_FRAMEWORK_PACKAGES`` for what puts
+    a package on that list. An app cannot pin its way onto a different one.
+    The replaced entry keeps the user's position in the list; everything the
     user declared that the framework does not own is untouched.
 
     Every override is logged with both the requested and the enforced

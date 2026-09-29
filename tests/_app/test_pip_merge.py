@@ -4,15 +4,15 @@
 The merge runs at bind time inside ``build_and_run_application`` and is
 how the framework's required deps make it onto every user replica's venv
 alongside whatever the user declared via ``@bioengine.app(pip=…)``. In
-production that list is ``hypha-rpc`` alone; the two-element lists below
+production that list is ``hypha-rpc`` and ``httpx`` (see
+``bioengine.apps.builder._USER_REPLICA_FRAMEWORK_PACKAGES``); the lists below
 are test data, chosen so ordering and collision are exercised separately.
 Two invariants matter:
 
 * A framework dep is added if it's not already present.
-* A framework dep *replaces* a user entry on the same package name. Those
-  packages cross the cloudpickle boundary, so the worker's version is the
-  only one that works; an app pinning its own is how two hypha-rpc
-  versions ended up running on one node.
+* A framework dep *replaces* a user entry on the same package name. The
+  worker dictates those versions; an app pinning its own is how two
+  hypha-rpc versions ended up running on one node.
 """
 from __future__ import annotations
 
