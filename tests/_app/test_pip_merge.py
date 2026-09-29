@@ -195,12 +195,13 @@ def test_every_spelling_of_hypha_rpc_is_overridden_by_the_workers_pin(
     with caplog.at_level(logging.WARNING, logger="ray.serve"):
         merged = _merge_pip_lists([f"{spelling}==0.0.1", "pandas==2.2.0"], framework_pip)
 
-    assert merged == [f"hypha-rpc=={INSTALLED_HYPHA_RPC}", "pandas==2.2.0"]
-    # Counted without the normaliser under test, so a broken one cannot hide
-    # a second entry from this assertion.
+    # Asserted first, and counted without the normaliser under test, so a
+    # broken one cannot hide a second entry and the failure output names the
+    # defect — both spellings in one list — rather than a list mismatch.
     assert [req for req in merged if "rpc" in req.lower()] == [
         f"hypha-rpc=={INSTALLED_HYPHA_RPC}"
     ]
+    assert merged == [f"hypha-rpc=={INSTALLED_HYPHA_RPC}", "pandas==2.2.0"]
 
     logged = "\n".join(record.message for record in caplog.records)
     assert f"{spelling}==0.0.1" in logged
