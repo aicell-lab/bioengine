@@ -432,7 +432,7 @@ def list_apps(as_json, worker_service_id, token, server_url):
 @click.argument("app_ids", nargs=-1, metavar="APP_ID...")
 @click.option(
     "--logs", "logs_tail",
-    default=30,
+    default=10,
     show_default=True,
     metavar="N",
     help="Number of log lines to show per replica. Use -1 for all.",

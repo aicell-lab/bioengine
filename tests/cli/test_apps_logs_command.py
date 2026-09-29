@@ -24,7 +24,8 @@ from a caller who is not on the application's roster.
 One case is pinned here specifically to stop a plausible tidy-up: the log map
 keys recently dead replicas too, and the deployment's ``replicas`` list does
 not, so iterating that list instead would drop the output of exactly the
-crashed replica an operator came looking for.
+crashed replica an operator came looking for. That one guards a refactor rather
+than a shipped path — see its docstring.
 """
 
 from __future__ import annotations
@@ -200,13 +201,20 @@ def test_apps_status_prints_the_log_text(invoke):
 
 
 def test_a_dead_replicas_logs_are_printed_though_it_is_not_in_the_replica_list(invoke):
-    """The whole reason the log map is what gets iterated.
+    """The reason the log map is what gets iterated.
 
     ``get_deployment_logs`` merges the most recent dead replicas into the map it
     returns; the deployment's ``replicas`` list is the live set and contains
     none of them. Iterating that list instead would look tidier and would drop
     exactly the output of the crashed replica an operator is looking for — this
     defect returning by another route.
+
+    This pins *producer* behaviour that the CLI cannot currently provoke: neither
+    command passes ``n_previous_replica``, and its default of 0 makes
+    ``get_deployment_logs`` return before it looks at dead replicas at all. So
+    there is no live path to reproduce this against today, and the test is here
+    for the refactor rather than for a bug in the shipped commands. Don't go
+    looking for the live case and conclude the fixture is wrong.
     """
     status = _status(proxy_logs=PROXY_LOGS_WITH_DEAD_REPLICA)
     live_ids = [r["replica_id"] for r in status["deployments"][DEPLOYMENT]["replicas"]]
@@ -243,6 +251,17 @@ def test_the_requested_line_count_reaches_the_worker(invoke):
 
     invoke(["status", APP_ID, "--logs", "7"], _status())
     assert invoke.worker.get_app_status.await_args.kwargs["logs_tail"] == 7
+
+
+def test_the_default_tails_are_the_ones_the_commands_advertise(invoke):
+    """The fetch defaults are the only thing bounding output volume now that
+    nothing is capped on the way out: ``status`` summarises many applications
+    at once, ``logs`` exists to show one application's logs."""
+    invoke(["status", APP_ID], _status())
+    assert invoke.worker.get_app_status.await_args.kwargs["logs_tail"] == 10
+
+    invoke(["logs", APP_ID], _status())
+    assert invoke.worker.get_app_status.await_args.kwargs["logs_tail"] == 100
 
 
 # ── State 2: entitled, nothing logged yet ─────────────────────────────────────
