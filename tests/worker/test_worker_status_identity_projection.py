@@ -2,10 +2,10 @@
 
 The worker's Hypha service is registered ``"visibility": "public"`` and
 ``get_status`` carries no permission check — deliberately, because it is the
-health surface: the Kubernetes startup and liveness probes curl it
-unauthenticated and grep ``is_ready``, the website's worker list renders
-``geo_location`` and ``bioengine_version`` on each card, and the CLI's cluster
-view reads ``ray_cluster``. But the payload also carried ``admin_users``, the
+health surface: the deployed Kubernetes *startup* probe curls it unauthenticated
+and greps ``is_ready``, the website's worker list renders ``geo_location`` and
+``bioengine_version`` on each card, and the CLI's cluster view and the KTH
+gpu-cuda-watch script read ``ray_cluster``. But the payload also carried ``admin_users``, the
 worker's admin allowlist, to every anonymous caller — the same list
 ``list_admin_users`` requires admin to return, and the same one permission
 denials were changed to stop naming.
@@ -153,10 +153,11 @@ async def test_every_public_field_reaches_an_anonymous_caller():
     assert not missing, f"withheld {sorted(missing)}"
 
 
-async def test_the_kubernetes_probe_still_reads_readiness_unauthenticated():
-    """The startup and liveness probes are a plain ``curl | grep '"is_ready":
-    true'`` with no token. Asserted on the serialized bytes because that is
-    what the probe actually matches."""
+async def test_the_kubernetes_startup_probe_still_reads_readiness_unauthenticated():
+    """The deployed startup probe is a plain ``curl | grep '"is_ready": true'``
+    with no token, and it is the one probe that calls this method — the
+    deployed liveness probe is a local ``kill -0 1``. Asserted on the serialized
+    bytes because that is what the probe actually matches."""
     status = await bare_worker().get_status(context=ANONYMOUS)
     assert '"is_ready": true' in json.dumps(status)
 
@@ -177,7 +178,13 @@ async def test_ray_cluster_and_geo_location_stay_public():
     advertisement of where the worker runs and is what the website's worker
     list draws on the map; ``ray_cluster`` carries cluster-internal addresses
     and a resource inventory that the CLI's ``cluster status``, the custom
-    dashboard template and the federated-run scripts all read."""
+    dashboard template, the federated-run scripts and the KTH gpu-cuda-watch
+    script all read.
+
+    ``ray_cluster`` is published *whole*. The allowlist is top level only, so
+    anything nested under it is public the day it lands — deliberately, and
+    stated in PUBLIC_WORKER_STATUS_FIELDS so the next reader does not assume
+    the guarantee reaches further than it does."""
     status = await bare_worker().get_status(context=ANONYMOUS)
     assert status["geo_location"]["country_name"] == "Sweden"
     assert status["ray_cluster"]["head_address"] == "10.0.0.7:6379"

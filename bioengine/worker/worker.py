@@ -83,12 +83,15 @@ _ACCESS_REQUEST_DECISIONS = ("grant", "deny", "clear")
 
 # What ``get_status`` tells a caller who is not a worker admin.
 #
-# The worker service is registered public and this is its health surface: the
-# Kubernetes startup and liveness probes curl it unauthenticated and grep
-# ``is_ready``, the worker list renders ``geo_location`` and
-# ``bioengine_version`` on each card, and the CLI's cluster view reads
-# ``ray_cluster``. So everything describing *this worker* — its versions, its
-# mode, its readiness, where it runs and what hardware it has — stays anonymous.
+# The worker service is registered public and this is its health surface, so it
+# has to keep answering without a token. The deployed Kubernetes *startup*
+# probe curls it and greps ``is_ready``: gating the method fails every worker's
+# startup for 18 x 30 s and then crash-loops it permanently. Only the startup
+# probe — the deployed liveness probe is a local ``kill -0 1``, for the reason
+# recorded on _check_service_registration below; the manifests the website's
+# worker guide generates do curl ``get_status`` from both. Beyond the probes:
+# the worker-list cards read ``geo_location`` and ``bioengine_version``, and the
+# CLI's cluster view and the KTH gpu-cuda-watch script read ``ray_cluster``.
 #
 # Held back is ``admin_users``, the only field naming people. It is the same
 # list PR #208 stopped permission denials from disclosing, and ``list_admin_users``
@@ -97,6 +100,14 @@ _ACCESS_REQUEST_DECISIONS = ("grant", "deny", "clear")
 # An allowlist rather than a denylist, for the same reason ``get_app_status``
 # uses one: a field added to the status payload later must not become public by
 # nobody having thought about it. Adding a name here is the decision to publish it.
+#
+# Top level only, deliberately: ``ray_cluster`` passes through whole, so a new
+# sub-key of it — or a new ``slurm_jobs`` column — is public the day it lands.
+# Nothing under it names a third party (the squeue query is scoped
+# ``-u $USER -n <job_name>``, so it can only return this worker's own jobs), but
+# that is where this guarantee stops. ``get_app_status`` guards its second level
+# with PUBLIC_DEPLOYMENT_FIELDS because replica logs live there; nothing here
+# needs the same.
 PUBLIC_WORKER_STATUS_FIELDS = (
     "service_start_time",
     "service_uptime",
