@@ -25,6 +25,13 @@ Usage:
     python -m bioengine.worker --mode single-machine --debug
     python -m bioengine.worker --mode external-cluster --server-url https://custom.hypha.io
 
+Authentication:
+    The Hypha token is taken from --token-file, then --token, then the
+    HYPHA_TOKEN environment variable; with none of them the worker prompts for
+    an interactive login. Unattended deployments should use --token-file or
+    HYPHA_TOKEN — a token given with --token is world-readable in
+    /proc/<pid>/cmdline for as long as the worker runs.
+
 Example Deployment:
     # SLURM HPC environment with custom configuration
     python -m bioengine.worker \\
@@ -52,6 +59,7 @@ import os
 import shlex
 import signal
 import sys
+from pathlib import Path
 from typing import Any, Dict
 
 from bioengine.worker import BioEngineWorker
@@ -88,6 +96,9 @@ Examples:
 
   # Connect to existing Ray cluster
   %(prog)s --mode external-cluster --head-node-address 10.0.0.100
+
+  # Authenticate from a mounted secret instead of the command line
+  %(prog)s --mode external-cluster --token-file /var/run/secrets/hypha/token
 
 For detailed documentation, visit: https://github.com/aicell-lab/bioengine
 """,
@@ -233,11 +244,21 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         "If not specified, uses the workspace associated with the authentication token.",
     )
     hypha_group.add_argument(
+        "--token-file",
+        type=str,
+        metavar="PATH",
+        help="Path to a file holding the Hypha authentication token. Preferred over "
+        "--token for any unattended deployment: the value never reaches the process "
+        "table, and it pairs directly with a mounted Kubernetes Secret.",
+    )
+    hypha_group.add_argument(
         "--token",
         type=str,
         metavar="TOKEN",
-        help="Authentication token for Hypha server access. If not provided, will use "
-        "the HYPHA_TOKEN environment variable or prompt for interactive login. "
+        help="Authentication token for Hypha server access. SECURITY: the value is "
+        "world-readable in /proc/<pid>/cmdline for the lifetime of the process, so "
+        "prefer --token-file or the HYPHA_TOKEN environment variable. Token sources "
+        "in precedence order: --token-file, --token, HYPHA_TOKEN, interactive login. "
         "Recommend using a long-lived token for production deployments.",
     )
     hypha_group.add_argument(
@@ -531,6 +552,52 @@ def get_args_by_group(parser: argparse.ArgumentParser) -> Dict[str, Dict[str, an
     return group_configs
 
 
+def resolve_token(
+    group_configs: Dict[str, Dict[str, any]],
+) -> Dict[str, Dict[str, any]]:
+    """Collapse the three token sources into ``Hypha Options["token"]``.
+
+    Precedence, highest first: ``--token-file``, ``--token``, ``HYPHA_TOKEN``.
+    Falling through all three leaves no token, and BioEngineWorker prompts for
+    an interactive login.
+
+    ``--token`` is ranked below the file because ``/proc/<pid>/cmdline`` is
+    mode 0444: an argv-supplied token is readable by every uid that can run a
+    process alongside the worker, and any routine "what is this running with?"
+    diagnostic copies it into its own output.
+    """
+    hypha_options = group_configs.get("Hypha Options", {})
+    token_file = hypha_options.pop("token_file", None)
+    token = hypha_options.pop("token", None)
+
+    if token_file:
+        if token:
+            print(
+                "Both --token-file and --token given; --token is ignored.",
+                file=sys.stderr,
+            )
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise ValueError(f"Could not read --token-file '{token_file}': {e}")
+        if not token:
+            raise ValueError(f"--token-file '{token_file}' is empty")
+    elif token:
+        print(
+            "SECURITY WARNING: --token places the token in /proc/<pid>/cmdline, "
+            "which is world-readable. Use --token-file or the HYPHA_TOKEN "
+            "environment variable instead.",
+            file=sys.stderr,
+        )
+    else:
+        token = os.environ.get("HYPHA_TOKEN")
+
+    if token:
+        hypha_options["token"] = token
+
+    return group_configs
+
+
 def _expand_env_in_config(value: Any) -> Any:
     """Recursively expand ``${VAR}`` / ``$VAR`` from the worker's own
     environment in every string within a startup-application config.
@@ -684,6 +751,8 @@ if __name__ == "__main__":
     try:
         parser = create_parser()
         group_configs = get_args_by_group(parser)
+
+        group_configs = resolve_token(group_configs)
 
         # Process startup applications if provided
         group_configs = read_startup_applications(group_configs)

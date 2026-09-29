@@ -11,6 +11,40 @@ BioEngine supports three deployment modes. The easiest way to generate deploymen
 
 ---
 
+## Supplying the token
+
+The worker takes its Hypha token from the first of these that is set:
+
+1. `--token-file PATH` — the file's contents, whitespace-stripped
+2. `--token VALUE`
+3. the `HYPHA_TOKEN` environment variable
+
+With none of them set the worker prompts for an interactive login, which is fine on a workstation and useless in a container.
+
+**Prefer `--token-file` or `HYPHA_TOKEN` for anything unattended.** A token passed with `--token` lands in `/proc/<pid>/cmdline`, which is world-readable: any user who can run a process next to the worker can read it, and any routine "what is this running with?" diagnostic copies it into its own output. `/proc/<pid>/environ` is readable only by the process owner, and a mounted file is readable only by whoever the mount permits. The worker prints a warning to stderr when `--token` is used.
+
+On Kubernetes, mount the Secret and point `--token-file` at it rather than expanding it into an argument:
+
+```yaml
+args:
+  - "--token-file=/var/run/secrets/hypha/token"
+volumeMounts:
+  - name: hypha-token
+    mountPath: /var/run/secrets/hypha
+    readOnly: true
+volumes:
+  - name: hypha-token
+    secret:
+      secretName: bioengine-worker
+      items:
+        - key: token
+          path: token
+```
+
+`--token=$(HYPHA_TOKEN)` is the shape to avoid: Kubernetes expands it at render time, so the Deployment spec keeps only the placeholder and looks clean under `kubectl get deploy -o yaml` while the live process carries the value.
+
+---
+
 ## Who can control the worker
 
 `--admin-users` takes a space-separated list of emails or user IDs and defaults to the account whose token started the worker. Admins can perform every admin operation on the worker, in every deployment mode.
@@ -126,7 +160,8 @@ apptainer exec \
 | `--head-num-gpus` | 0 | GPUs for the Ray head node |
 | `--workspace` | auto | Hypha workspace name (auto-detected from token) |
 | `--server-url` | `https://hypha.aicell.io` | Hypha server URL |
-| `--token` | prompt | Hypha authentication token |
+| `--token-file` | — | File holding the Hypha authentication token — see [Supplying the token](#supplying-the-token) |
+| `--token` | prompt | Hypha authentication token, visible in the process table — see [Supplying the token](#supplying-the-token) |
 | `--admin-users` | current user | Space-separated emails; `*` is not honoured — see [Who can control the worker](#who-can-control-the-worker) |
 | `--enable-access-requests` | off | Let non-admins ask to become admins — see [Letting users ask for access](#letting-users-ask-for-access) |
 | `--client-id` | auto | Unique service identifier |
@@ -174,17 +209,29 @@ spec:
             - bioengine.worker
             - --mode=external-cluster
             - --connection-address=ray://raycluster-head-svc:10001
+            - --token-file=/var/run/secrets/hypha/token
           resources:
             requests: { memory: "2Gi", cpu: "1" }
             limits:   { memory: "4Gi", cpu: "2" }
           volumeMounts:
             - name: bioengine-storage
               mountPath: /.bioengine
+            - name: hypha-token
+              mountPath: /var/run/secrets/hypha
+              readOnly: true
       volumes:
         - name: bioengine-storage
           persistentVolumeClaim:
             claimName: bioengine-pvc  # 10Gi PVC
+        - name: hypha-token
+          secret:
+            secretName: bioengine-worker
+            items:
+              - key: token
+                path: token
 ```
+
+See [Supplying the token](#supplying-the-token) for why the token is mounted rather than passed as `--token=$(HYPHA_TOKEN)`.
 
 ### Key parameters
 
@@ -196,7 +243,8 @@ spec:
 | `--serve-port` | 8000 | Ray Serve HTTP endpoint port |
 | `--workspace` | auto | Hypha workspace name |
 | `--server-url` | `https://hypha.aicell.io` | Hypha server URL |
-| `--token` | prompt | Hypha authentication token |
+| `--token-file` | — | File holding the Hypha authentication token — see [Supplying the token](#supplying-the-token) |
+| `--token` | prompt | Hypha authentication token, visible in the process table — see [Supplying the token](#supplying-the-token) |
 
 ---
 
