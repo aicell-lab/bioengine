@@ -511,7 +511,7 @@ def _print_single_status(app_id: str, info: dict) -> None:
         click.echo(f"\n  Recent logs:")
         for dep_name, dep_info in deployments.items():
             click.echo(f"    [{dep_name}]")
-            _echo_deployment_logs(dep_info, indent="      ", max_lines=10)
+            _echo_deployment_logs(dep_info, indent="      ")
 
 
 # ── logs ──────────────────────────────────────────────────────────────────────
@@ -577,12 +577,17 @@ def _print_logs(app_id: str, info: dict) -> None:
         _echo_deployment_logs(dep_info)
 
 
-def _echo_deployment_logs(dep_info: dict, indent: str = "", max_lines: int = -1) -> None:
+def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
     """Print one deployment's replica logs from ``deployments.<name>.logs``.
 
-    That field is a mapping of replica id to its ``stdout``/``stderr`` lines, and
-    it is *absent* rather than empty when the caller may not read it — so the
-    withheld case must not print the same thing as "nothing logged yet".
+    That field is a mapping of replica id to its ``stdout``/``stderr`` lines,
+    already tailed to the requested number by the worker — so everything fetched
+    is printed, and the caller's line count means what it says. Iterating it
+    rather than the deployment's ``replicas`` is deliberate: the map also keys
+    recently dead replicas, which the live replica list does not contain.
+
+    The field is *absent* rather than empty when the caller may not read it, so
+    the withheld case must not print the same thing as "nothing logged yet".
     """
     if "logs" not in dep_info:
         click.echo(
@@ -602,8 +607,6 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "", max_lines: int = -1)
             lines = streams.get(stream) or []
             if isinstance(lines, str):
                 lines = lines.splitlines()
-            if max_lines >= 0:
-                lines = lines[len(lines) - max_lines :]
             if not lines:
                 continue
             click.echo(f"{indent}[{replica_id}] {stream}")

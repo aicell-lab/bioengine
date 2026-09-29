@@ -20,6 +20,11 @@ CLI and disagree with the worker.
 Three states have to stay distinguishable in the output, because collapsing
 them is how the defect survived: logs present, no logs yet, and logs withheld
 from a caller who is not on the application's roster.
+
+One case is pinned here specifically to stop a plausible tidy-up: the log map
+keys recently dead replicas too, and the deployment's ``replicas`` list does
+not, so iterating that list instead would drop the output of exactly the
+crashed replica an operator came looking for.
 """
 
 from __future__ import annotations
@@ -86,6 +91,28 @@ PROXY_LOGS = {
 
 EMPTY_PROXY_LOGS: dict = {}
 
+# A replica that has already died. ``get_deployment_logs`` merges the n most
+# recent dead replicas into the same map, but the deployment's ``replicas``
+# list is the Serve controller's *live* set and never mentions it — which is
+# why the log map, not that list, is what the CLI iterates.
+DEAD_REPLICA_ID = "CellposeApp#0zXk9q"
+CRASH_LINE = "PLANTED-CRASHED-REPLICA-LINE"
+PROXY_LOGS_WITH_DEAD_REPLICA = {
+    **PROXY_LOGS,
+    DEAD_REPLICA_ID: {
+        "creation_timestamp": 1_699_999_000.0,
+        "timezone": "Europe/Stockholm",
+        "stdout": ["booting…"],
+        "stderr": [CRASH_LINE],
+    },
+}
+
+# Twenty-five lines, as a worker asked for a tail of thirty would return them.
+LONG_STDOUT = [f"L{n}" for n in range(25)]
+LONG_PROXY_LOGS = {
+    REPLICA_ID: {"stdout": LONG_STDOUT, "stderr": []},
+}
+
 
 def _deployments(proxy_logs: dict, replicas: list) -> dict:
     """``deployments`` as the worker really builds it, for the given proxy logs."""
@@ -137,6 +164,7 @@ def invoke(monkeypatch):
             catch_exceptions=False,
         )
         assert result.exit_code == 0, result.output
+        _invoke.worker = worker
         return result.output
 
     return _invoke
@@ -169,6 +197,52 @@ def test_apps_status_prints_the_log_text(invoke):
     it read ``logs`` off the application, where the field never lives either."""
     output = invoke(["status", APP_ID], _status())
     assert STDOUT_LINE in output
+
+
+def test_a_dead_replicas_logs_are_printed_though_it_is_not_in_the_replica_list(invoke):
+    """The whole reason the log map is what gets iterated.
+
+    ``get_deployment_logs`` merges the most recent dead replicas into the map it
+    returns; the deployment's ``replicas`` list is the live set and contains
+    none of them. Iterating that list instead would look tidier and would drop
+    exactly the output of the crashed replica an operator is looking for — this
+    defect returning by another route.
+    """
+    status = _status(proxy_logs=PROXY_LOGS_WITH_DEAD_REPLICA)
+    live_ids = [r["replica_id"] for r in status["deployments"][DEPLOYMENT]["replicas"]]
+    assert DEAD_REPLICA_ID not in live_ids
+    assert DEAD_REPLICA_ID in status["deployments"][DEPLOYMENT]["logs"]
+
+    output = invoke(["logs", APP_ID], status)
+    assert CRASH_LINE in output
+    assert DEAD_REPLICA_ID in output
+
+
+# ── The line count the caller asked for is the line count printed ─────────────
+
+
+def test_both_commands_print_every_line_the_worker_returned(invoke):
+    """``--tail``/``--logs`` is applied worker-side, per replica and per stream,
+    so whatever comes back is already the requested tail. A second cap here
+    would silently show fewer lines than the number the user typed."""
+    status = _status(proxy_logs=LONG_PROXY_LOGS)
+
+    logs_output = invoke(["logs", APP_ID, "--tail", "30"], status)
+    status_output = invoke(["status", APP_ID, "--logs", "30"], status)
+
+    for line in LONG_STDOUT:
+        assert f"  {line}\n" in logs_output
+        assert f"  {line}\n" in status_output
+
+
+def test_the_requested_line_count_reaches_the_worker(invoke):
+    """The other half of the same promise: the flag has to be forwarded, not
+    just respected on the way out."""
+    invoke(["logs", APP_ID, "--tail", "7"], _status())
+    assert invoke.worker.get_app_status.await_args.kwargs["logs_tail"] == 7
+
+    invoke(["status", APP_ID, "--logs", "7"], _status())
+    assert invoke.worker.get_app_status.await_args.kwargs["logs_tail"] == 7
 
 
 # ── State 2: entitled, nothing logged yet ─────────────────────────────────────
