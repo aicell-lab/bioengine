@@ -49,6 +49,10 @@ from bioengine.utils.permissions import check_permissions
 
 AUTHENTICATION_SERVER_URL: str = "https://hypha.aicell.io"
 
+# The identity of a caller who sent no usable credential. Matches no entry in
+# any authorized_users list, so it is authorized for nothing.
+ANONYMOUS_USER_INFO = {"id": "anonymous-user", "email": "no-email"}
+
 logger = logging.getLogger("ProxyServer")
 
 
@@ -147,6 +151,37 @@ def _scan_dir_for_datasets(scan_dir: Path, datasets: Dict[str, dict]) -> None:
             "authorized_users": authorized_users,
         }
         logger.debug(f"Loaded dataset '{dataset_id}' from {subdir}")
+
+
+# What a caller who is not named on a dataset's roster may see of its manifest.
+#
+# An allowlist rather than a denylist, because manifest.yaml is unschema'd: it is
+# whatever yaml.safe_load returns, so a data owner may add any key they like —
+# an internal contact, a grant number, a cohort note. Denying the fields we
+# happen to know are sensitive would publish every field nobody thought of.
+PUBLIC_MANIFEST_FIELDS = (
+    "id",
+    "name",
+    "description",
+    "version",
+    "license",
+    "authors",
+    "tags",
+    "documentation",
+    "git_repo",
+)
+
+
+def public_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """The manifest as an unauthorized caller may see it.
+
+    Keeps what discovery needs — the dataset exists, what it is, who published
+    it — and drops ``authorized_users``, whose entries are the email addresses
+    of third parties who never interacted with this server.
+    """
+    return {
+        field: manifest[field] for field in PUBLIC_MANIFEST_FIELDS if field in manifest
+    }
 
 
 def load_datasets(data_dir: Path) -> Dict[str, dict]:
@@ -248,7 +283,7 @@ async def parse_token(
         if len(cached_user_info) > 1000:
             cached_user_info.pop(next(iter(cached_user_info)))
     else:
-        user_info = {"id": "anonymous-user", "email": "no-email"}
+        user_info = dict(ANONYMOUS_USER_INFO)
 
     return user_info
 
@@ -376,11 +411,60 @@ def _build_app(
         return "pong"
 
     @app.get("/datasets")
-    async def list_datasets_route():
-        return {
-            dataset_id: info["manifest"]
-            for dataset_id, info in datasets.items()
-        }
+    async def list_datasets_route(
+        token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
+    ):
+        """List every dataset. Authentication is optional and widens the view.
+
+        The catalog itself stays public — a user has to be able to see that a
+        dataset exists before asking for access to it. What is not public is
+        each dataset's roster: ``authorized_users`` is returned only to a caller
+        named in it.
+
+        A '*' entry does not earn the roster. It authorizes reading the data,
+        not reading who else may read it, and a dataset listing both '*' and
+        named addresses would otherwise hand those addresses to everyone.
+
+        An unusable credential degrades to the public view rather than being
+        refused. On this route a token only ever *widens* what comes back, so
+        failing closed on one would take away something the caller could have
+        had by sending nothing at all — and it would break the tokenless
+        listing of a public dataset whenever a token happened to be expired or
+        the auth server was briefly unreachable. The file and byte routes,
+        where a credential grants rather than widens, still refuse.
+        """
+        try:
+            user_info = await parse_token(
+                resolve_token(authorization, token), cached_user_info
+            )
+        except Exception as e:
+            # Warned, not debugged: the fallback is meant for an expired token
+            # or an unreachable auth server, but it will just as happily
+            # swallow a genuine bug in resolve_token or parse_token, and a
+            # silently public listing is not something to find out about later.
+            logger.warning(
+                f"Ignoring an unusable token on the dataset listing and "
+                f"returning the public view ({type(e).__name__}: {e})."
+            )
+            # A plain dict, not parse_token(None, ...): this runs inside an
+            # except block, where an await that raises surfaces during handling
+            # of the first error. Building the identity cannot fail.
+            user_info = dict(ANONYMOUS_USER_INFO)
+        listing = {}
+        for dataset_id, info in datasets.items():
+            try:
+                check_permissions(
+                    context={"user": user_info},
+                    authorized_users=info["authorized_users"],
+                    resource_name=f"the collaborator list of dataset '{dataset_id}'",
+                    allow_wildcard=False,
+                )
+            except PermissionError:
+                listing[dataset_id] = public_manifest(info["manifest"])
+            else:
+                listing[dataset_id] = dict(info["manifest"])
+        return listing
 
     @app.get("/datasets/{dataset_id}/files")
     async def list_files_route(
