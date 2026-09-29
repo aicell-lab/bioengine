@@ -16,11 +16,15 @@ Two invariants matter:
 """
 from __future__ import annotations
 
+import importlib.metadata as md
 import logging
 
 import pytest
 
-from bioengine._app.bootstrap import _merge_pip_lists, _requirement_name
+from bioengine._app.bootstrap import _merge_pip_lists
+from bioengine.utils.requirements import get_pip_requirements, requirement_name
+
+INSTALLED_HYPHA_RPC = md.version("hypha-rpc")
 
 
 @pytest.mark.parametrize(
@@ -36,10 +40,17 @@ from bioengine._app.bootstrap import _merge_pip_lists, _requirement_name
         ("httpx[http2]==0.28.1", "httpx"),
         ("Pandas==2.2.0", "pandas"),
         ("  spaces==1.0  ", "spaces"),
+        ("hypha_rpc==0.21.40", "hypha-rpc"),
+        ("hypha.rpc==0.21.40", "hypha-rpc"),
+        ("HYPHA-RPC==0.21.40", "hypha-rpc"),
     ],
 )
 def test_requirement_name_extracts_package(req: str, expected: str) -> None:
-    assert _requirement_name(req) == expected
+    """The comparison the merge below is built on. It is
+    :func:`bioengine.utils.requirements.requirement_name` — the repo's single
+    normaliser — not a private copy in ``bootstrap``; the copy did not fold
+    ``_``/``.`` to ``-``, so every underscore spelling escaped the override."""
+    assert requirement_name(req) == expected
 
 
 def test_appends_missing_framework_deps() -> None:
@@ -151,10 +162,46 @@ def test_no_log_when_the_app_already_asked_for_the_enforced_version(caplog) -> N
 
 
 def test_case_insensitive_name_match() -> None:
-    """PEP 503-style name normalization is conservative; we lowercase to
-    avoid duplicate-but-different-cased entries on the replica."""
+    """PEP 503 folds case, so ``Pydantic`` and ``pydantic`` are one package
+    and must not both reach the replica."""
     merged = _merge_pip_lists(
         ["Pydantic==2.12.0"],
         ["pydantic==2.10.0"],
     )
     assert merged == ["pydantic==2.10.0"]
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["hypha_rpc", "hypha.rpc", "HYPHA-RPC", "hypha-rpc"],
+)
+def test_every_spelling_of_hypha_rpc_is_overridden_by_the_workers_pin(
+    spelling: str, caplog
+) -> None:
+    """PEP 503 says these four strings name one distribution, and pip agrees.
+    The override is a name match, so a spelling it failed to recognise did not
+    merely go un-normalised — it let the app's pin through *and* appended the
+    worker's, so the replica venv received two entries for one package and
+    whichever pip resolved was outside the worker's control. ``hypha_rpc`` is
+    the import name, so it is the spelling an author types from memory.
+
+    The framework list is built exactly as ``bioengine.apps.builder`` builds
+    it, off the installed distribution's metadata rather than a literal, so
+    the assertion tracks whatever the worker actually carries.
+    """
+    framework_pip = get_pip_requirements(select=["hypha-rpc"], extras=[])
+    assert framework_pip == [f"hypha-rpc=={INSTALLED_HYPHA_RPC}"]
+
+    with caplog.at_level(logging.WARNING, logger="ray.serve"):
+        merged = _merge_pip_lists([f"{spelling}==0.0.1", "pandas==2.2.0"], framework_pip)
+
+    assert merged == [f"hypha-rpc=={INSTALLED_HYPHA_RPC}", "pandas==2.2.0"]
+    # Counted without the normaliser under test, so a broken one cannot hide
+    # a second entry from this assertion.
+    assert [req for req in merged if "rpc" in req.lower()] == [
+        f"hypha-rpc=={INSTALLED_HYPHA_RPC}"
+    ]
+
+    logged = "\n".join(record.message for record in caplog.records)
+    assert f"{spelling}==0.0.1" in logged
+    assert f"hypha-rpc=={INSTALLED_HYPHA_RPC}" in logged
