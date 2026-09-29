@@ -8,6 +8,12 @@ string, so ``httpx``, declared as ``httpx[http2]>=0.28.1``, never matched and
 was dropped from the proxy list — for years, with nothing logged. A replica
 venv that is missing a package the worker believes it put there is the same
 failure shape either way; the difference is whether anybody finds out.
+
+These tests read the real installed ``bioengine`` distribution on purpose — that
+table is their subject, so faking it would reduce them to comparing a fixture
+against itself. With no installed distribution (``pip uninstall bioengine`` over
+a checkout, the usual way to stop an image's own copy shadowing the source) they
+fail with ``PackageNotFoundError``: a broken measurement setup, not a regression.
 """
 
 from __future__ import annotations

@@ -87,10 +87,10 @@ def test_empty_requirement_passes_through() -> None:
     assert normalize_requirement("") == ""
 
 
-# bioengine's own dependency table, shaped exactly as ``Requires-Dist`` spells
-# it, but owned by the test. The ``ray[client,serve]`` entry is here because
-# ``get_pip_requirements`` drops it by name, and dropping it is what keeps the
-# only comma-bearing specifier out of a runtime_env.
+# A deliberate subset of bioengine's dependency table in ``Requires-Dist``'s
+# shape, owned by the test — not a mirror of it, so a newly added real
+# dependency does not belong here. The ``ray[client,serve]`` entry is present
+# because ``get_pip_requirements`` drops it by name; no test asserts that drop.
 _REQUIRES_DIST = [
     "httpx[http2]>=0.28.1",
     "hypha-rpc>=0.21.40",
