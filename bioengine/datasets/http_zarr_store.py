@@ -6,14 +6,20 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Iterable, Optional
 
 import httpx
+from packaging.version import Version
+
+MINIMUM_ZARR_VERSION = "3.0.8"
 
 try:
     import zarr
 except ImportError as e:
-    raise ImportError("zarr>=3.0.8 is required") from e
+    raise ImportError(f"zarr>={MINIMUM_ZARR_VERSION} is required") from e
 
-if zarr.__version__ < "3.0.8":
-    raise ImportError(f"zarr>=3.0.8 is required but found {zarr.__version__}")
+# Parsed, not lexicographic: "3.0.10" < "3.0.8" as strings.
+if Version(zarr.__version__) < Version(MINIMUM_ZARR_VERSION):
+    raise ImportError(
+        f"zarr>={MINIMUM_ZARR_VERSION} is required but found {zarr.__version__}"
+    )
 
 from zarr.abc.store import (
     ByteRequest,
