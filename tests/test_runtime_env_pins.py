@@ -26,10 +26,10 @@ import pytest
 from bioengine.utils.requirements import get_pip_requirements, normalize_requirement
 from bioengine.worker.worker import BioEngineWorker
 
-# Every distribution these tests pin against is a hard bioengine dependency,
-# so it is importable wherever the suite runs.
+# hypha-rpc is a hard bioengine dependency, so it is importable wherever the
+# suite runs. The tests that assert on what ``get_pip_requirements`` emits do
+# not use it — they control their own environment via ``pinned_environment``.
 INSTALLED_HYPHA_RPC = md.version("hypha-rpc")
-INSTALLED_NUMPY = md.version("numpy")
 
 
 def test_floor_resolves_to_the_installed_version_not_the_floor() -> None:
@@ -87,15 +87,75 @@ def test_empty_requirement_passes_through() -> None:
     assert normalize_requirement("") == ""
 
 
-def test_injected_baseline_pins_the_loaded_hypha_rpc() -> None:
+# bioengine's own dependency table, shaped exactly as ``Requires-Dist`` spells
+# it, but owned by the test. The ``ray[client,serve]`` entry is here because
+# ``get_pip_requirements`` drops it by name, and dropping it is what keeps the
+# only comma-bearing specifier out of a runtime_env.
+_REQUIRES_DIST = [
+    "httpx[http2]>=0.28.1",
+    "hypha-rpc>=0.21.40",
+    "numpy==1.26.4",
+    "packaging>=21.0",
+    "aiortc==1.14.0; extra == 'worker'",
+    "pydantic~=2.12.0; extra == 'worker'",
+    "ray[client,serve]>=2.53.0,<3.0.0; extra == 'worker'",
+    "zarr>=3.0.8; extra == 'datasets'",
+]
+
+# Deliberately unlike any version an image resolves, and deliberately not
+# covering every name above: ``aiortc`` and ``pydantic`` are absent so the
+# specifier-fallback branch is exercised alongside the installed-distribution
+# one.
+_INSTALLED = {
+    "httpx": "9.9.1-probe",
+    "hypha-rpc": "9.9.2-probe",
+    "numpy": "9.9.3-probe",
+}
+
+
+@pytest.fixture
+def pinned_environment(monkeypatch) -> None:
+    """Hand ``get_pip_requirements`` a dependency table and an installed-version
+    table this file owns.
+
+    Both halves are needed. ``md.version`` is where the pin is read from, and
+    faking only that leaves the test asserting against whichever ``bioengine``
+    distribution the runner happens to have — with none at all (``pip uninstall
+    bioengine`` over a checkout, the usual way to stop an image's own copy
+    shadowing the source) ``md.metadata`` raises ``PackageNotFoundError`` and
+    the test reports on the environment instead of on the code.
+    """
+
+    class _Metadata:
+        def get_all(self, key, failobj=None):
+            return _REQUIRES_DIST if key == "Requires-Dist" else failobj
+
+    def fake_version(name: str) -> str:
+        try:
+            return _INSTALLED[name]
+        except KeyError:
+            raise md.PackageNotFoundError(name) from None
+
+    monkeypatch.setattr(md, "metadata", lambda name: _Metadata())
+    monkeypatch.setattr(md, "version", fake_version)
+
+
+def test_injected_baseline_pins_the_loaded_hypha_rpc(pinned_environment) -> None:
     """End of the path the worker actually walks: what
-    ``bioengine.apps.builder`` injects into a replica's runtime_env."""
+    ``bioengine.apps.builder`` injects into a replica's runtime_env.
+
+    Reading the versions off the fixture rather than off the image is also
+    what gives the assertion content. In a real worker image the declared
+    ``hypha-rpc>=0.21.40`` floor and the resolved install are the same string,
+    so the old form held whether the pin came from the specifier or from the
+    distribution — the exact ambiguity #204 existed to remove. ``numpy`` is
+    declared with an ``==`` here and still has to move to the installed
+    version."""
     baseline = get_pip_requirements(select=["hypha-rpc", "numpy"], extras=[])
-    assert f"hypha-rpc=={INSTALLED_HYPHA_RPC}" in baseline
-    assert f"numpy=={INSTALLED_NUMPY}" in baseline
+    assert baseline == ["hypha-rpc==9.9.2-probe", "numpy==9.9.3-probe"]
 
 
-def test_no_injected_baseline_entry_is_left_unpinned() -> None:
+def test_no_injected_baseline_entry_is_left_unpinned(pinned_environment) -> None:
     """A floor anywhere in this list is resolved by Ray against PyPI on
     every runtime_env build — that is the drift vector, so assert against
     the whole list rather than the one package the incident named."""
@@ -103,6 +163,10 @@ def test_no_injected_baseline_entry_is_left_unpinned() -> None:
         select=["aiortc", "httpx", "hypha-rpc", "pydantic"], extras=["worker"]
     )
     assert baseline, "baseline must not be empty or the assertion is vacuous"
+    # Both resolution branches are represented, so the loop below is not just
+    # walking four entries that took the same path.
+    assert "httpx[http2]==9.9.1-probe" in baseline, baseline
+    assert "aiortc==1.14.0" in baseline, baseline
     for requirement in baseline:
         assert "==" in requirement, requirement
         for floating in (">=", "<=", "~=", ">", "<", ","):
