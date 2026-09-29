@@ -97,7 +97,11 @@ def _replica_identities() -> dict:
 def _base_manager() -> AppsManager:
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test.field_parity")
-    manager.admin_users = ["*"]
+    # A named admin, not "*": get_app_status projects its identity-carrying
+    # fields away for a caller it cannot authorize, and a wildcard authorizes
+    # nobody there. With "*" the parity assertion would still pass while
+    # silently comparing five fields fewer.
+    manager.admin_users = [CONTEXT["user"]["email"]]
     manager.startup_applications = []
 
     server = MagicMock()
