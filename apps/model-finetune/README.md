@@ -279,3 +279,26 @@ Notes:
   in a few GB of VRAM.
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the
   C++ pieces `python-elf` used to need from conda-forge.
+
+### Prebuilt Cellpose-only worker image
+
+For a site that only ever fine-tunes Cellpose models (cpsam / cpdino / Cellpose
+v4) and never micro-sam, a prebuilt worker image removes both costs above: the
+Cellpose runtime's deps are baked in (no deploy-time env build) and
+`MODEL_FINETUNE_BACKENDS=cellpose` is set in the image, so the micro-sam runtime
+is never composed and the worker fits on **one GPU** with no network access to
+install packages.
+
+- Dockerfile: `docker/model-finetune-cellpose.Dockerfile` (mirrors
+  `docker/model-runner.Dockerfile`: bakes `requirements-entry.txt` +
+  `requirements-runtime-cellpose.txt`, then worker deps + bioengine + Ray).
+- Build + publish (separate GHCR package, tag = app version; not built by CI):
+  ```bash
+  scripts/build_model_finetune_cellpose.sh --push
+  # → ghcr.io/aicell-lab/model-finetune-cellpose:<manifest version>
+  ```
+- Run a worker from it and deploy the app with **no** backend override needed
+  (the image already sets `MODEL_FINETUNE_BACKENDS=cellpose`); the Cellpose
+  runtime cold-starts without a pip env build. Rebuild the image whenever
+  `requirements-{entry,runtime-cellpose}.txt`, the baked bioengine code, or the
+  Ray pin change (the build script's push guard requires a fresh app version).
