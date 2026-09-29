@@ -284,6 +284,33 @@ def validate_environment(workspace_folder) -> str:
                 pytest.exit(f"Invalid requirement format: {req}")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def no_leaked_working_directory() -> Generator[None, None, None]:
+    """Fail the session if a test left the process in another directory.
+
+    An unrestored ``os.chdir`` is silent until some later test opens a
+    relative path or spawns a child that inherits the cwd, and the failure is
+    then charged to that later test -- which passes again when run alone.
+
+    A test that needs to run elsewhere should use ``monkeypatch.chdir``;
+    anything else lands here as a teardown error charged to whichever test
+    happened to run last.
+    """
+    entry = os.getcwd()
+    yield
+    try:
+        final = os.getcwd()
+    except OSError as e:
+        # A deleted cwd is the same defect; without this it surfaces as a bare
+        # FileNotFoundError from the fixture and names nothing.
+        final = f"a directory that no longer exists ({e})"
+    if final != entry:
+        pytest.fail(
+            f"a test left the process in {final}; the session started in "
+            f"{entry}. Use monkeypatch.chdir, or restore it where it changes."
+        )
+
+
 @pytest.fixture(scope="session")
 def data_dir(workspace_folder: Path) -> Path:
     """Create and return BioEngine Worker data directory."""
