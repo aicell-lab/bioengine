@@ -20,10 +20,14 @@ from bioengine.utils import check_permissions, create_context
 
 # Stand-ins for the real maintainer addresses. The local parts are checked
 # separately so a partial leak ("authorized: alice, bob") still fails.
-ALLOWLIST = ["alice.admin@lab.example", "bob.admin@other.example", "user-id-42"]
+ALLOWLIST = [
+    "alice.admin@lab.example.invalid",
+    "bob.admin@other.example.invalid",
+    "user-id-42",
+]
 
 ANONYMOUS = create_context("anonymouz-http", None)
-NAMED_OUTSIDER = create_context("carol-id", "carol@elsewhere.example")
+NAMED_OUTSIDER = create_context("carol-id", "carol@elsewhere.example.invalid")
 
 
 def _fragments(allowlist):
@@ -68,7 +72,7 @@ def test_denial_still_says_who_was_refused_and_what_was_refused():
     message = _denial_message(NAMED_OUTSIDER, ALLOWLIST)
 
     assert "carol-id" in message
-    assert "carol@elsewhere.example" in message
+    assert "carol@elsewhere.example.invalid" in message
     assert "listing BioEngine Worker admin users" in message
 
 
@@ -106,7 +110,11 @@ def test_no_permission_denial_in_the_package_interpolates_an_identity_list():
                 or getattr(call.func, "id", None) != "PermissionError"
             ):
                 continue
-            for name in (n.id for n in ast.walk(call) if isinstance(n, ast.Name)):
+            # Attributes too: inside a class the idiomatic reintroduction is
+            # `self.authorized_users`, which is not an ast.Name.
+            names = [n.id for n in ast.walk(call) if isinstance(n, ast.Name)]
+            names += [n.attr for n in ast.walk(call) if isinstance(n, ast.Attribute)]
+            for name in names:
                 if any(
                     word in name.lower()
                     for word in ("users", "admins", "allowed", "allowlist")
