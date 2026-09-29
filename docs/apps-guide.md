@@ -1032,9 +1032,36 @@ The `deploy_app` method supports these parameters:
 - **`application_id`** *(optional)*: Custom instance ID for deployment
 - **`application_kwargs`** *(optional)*: Initialization parameters per deployment
 - **`application_env_vars`** *(optional)*: Environment variables per deployment  
-- **`hypha_token`** *(optional)*: Authentication token for user permissions. Use this to run the application with specific user credentials, which determines access to datasets and other resources. Can be obtained from `await login()` or from the [Hypha dashboard](https://hypha.aicell.io/) (Login → Profile Picture → My Workspace → Development tab → Generate Token).
+- **`hypha_token`** *(optional)*: Authentication token for user permissions. Use this to run the application with specific user credentials, which determines access to datasets and other resources. Can be obtained from `await login()` or from the [Hypha dashboard](https://hypha.aicell.io/) (Login → Profile Picture → My Workspace → Development tab → Generate Token). See [Per-deployment credentials](#per-deployment-credentials) below.
 - **`disable_gpu`** *(optional)*: Force CPU-only execution (default: False)
 - **`max_ongoing_requests`** *(optional)*: Concurrent request limit (default: 10)
+
+#### Per-deployment credentials
+
+`hypha_token` is per *deployment*, not per worker. Every `deploy_app` call carries its own token, so one worker can run the same artifact many times with a different credential in each instance — and each of those tokens can be revoked on its own without touching the others. If several instances of an app write into one shared artifact, give each instance a token belonging to its own account rather than passing the same workspace-admin token to all of them; then losing one site means revoking one token.
+
+```python
+# Two instances of the same artifact, each with its own credential.
+await bioengine_worker_service.deploy_app(
+    artifact_id="workspace/my-app",
+    application_id="site-a",
+    hypha_token=site_a_token,
+)
+await bioengine_worker_service.deploy_app(
+    artifact_id="workspace/my-app",
+    application_id="site-b",
+    hypha_token=site_b_token,
+)
+```
+
+```bash
+bioengine apps run workspace/my-app --app-id site-a --hypha-token "$SITE_A_TOKEN"
+bioengine apps run workspace/my-app --app-id site-b --hypha-token "$SITE_B_TOKEN"
+```
+
+**Setting `HYPHA_TOKEN` as a plain environment variable does not work, and fails silently.** Neither `--env HYPHA_TOKEN=…` on the CLI nor `application_env_vars={"...": {"HYPHA_TOKEN": "…"}}` is a supported way to deliver the token: `hypha_token` — which the CLI defaults to your own `--token` — is injected into the replica *after* the plain environment variables and overwrites whatever they set, and the plain value is additionally stripped from the state the worker persists to recover running applications, so it would not survive a worker restart even where it appeared to work. Nothing raises and nothing is logged; the app just runs as the wrong identity. Always use the `hypha_token` parameter / `--hypha-token` flag.
+
+**What per-deployment tokens do not give you is a narrower token.** They solve blast radius on revocation, not least privilege. A Hypha token's permissions come from its workspace scope, so any token that can write a shared artifact in workspace `W` can also do everything else its permission level allows anywhere in `W` — including to artifacts the app never touches. Narrowing below workspace scope is not available: Hypha's `extra_scopes` accepts an `artifact:<ws>/<alias>:rw` string and records it in the JWT, but it is additive rather than restrictive, grants nothing on its own, and marks the token as specialized so it can no longer be used for general workspace access at all — a token carrying it cannot open the RPC connection an app makes at startup. Until Hypha gains a credential primitive an app can connect with, assume a compromised replica has the reach of its whole workspace, and size the token's `permission` and `expires_in` accordingly when minting it.
 
 #### Secret Environment Variables
 

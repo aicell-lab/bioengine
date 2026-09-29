@@ -149,6 +149,8 @@ if deployed['version_source'] == 'inherited':
 
 Apps whose code reads `HYPHA_TOKEN` at startup need it injected into the Ray actor; this is done via the `hypha_token` parameter on `deploy_app` (CLI: `--hypha-token $HYPHA_TOKEN`). When `application_id` matches an existing running instance, omitting `hypha_token` is safe — the previously stored token is reused. **On a fresh instance (no prior running app with that `application_id`), omitting it injects nothing and the app's `__init__` raises `RuntimeError: HYPHA_TOKEN environment variable is not set`** (or similar). Cross-check the app source before deploying — if `HYPHA_TOKEN` is referenced, pass the parameter. The `--env HYPHA_TOKEN=...` flag is silently ignored by the app builder.
 
+**It is per deployment, not per worker.** Each `deploy_app` call carries its own token and each is independently revocable, so many instances of one artifact can hold distinct credentials — deploying several sites with one shared workspace-admin token is a provisioning choice, not a platform limit. What this does *not* buy is a narrower token: Hypha permissions come from workspace scope, so any token that can write a shared artifact in workspace `W` carries `W`'s reach, and scope narrowing is blocked in Hypha (`extra_scopes` is additive, grants nothing, and makes the token unusable for the RPC connection an app opens at startup) rather than in BioEngine. Details and examples: `docs/apps-guide.md` → Per-deployment credentials.
+
 ## Cleanup after testing
 
 After testing is complete, **stop and delete temporary apps** on the live worker:
