@@ -113,6 +113,28 @@ The `authorized_users` field in `manifest.yaml` controls who can list files and 
 
 Listing available datasets (`GET /datasets`) never requires authentication — anyone can see what datasets exist and read their manifests. Access control applies only to file listing and file downloads.
 
+### Access requests
+
+A server started with `--enable-access-requests` lets a logged-in user who is
+*not* in a dataset's `authorized_users` ask for access, and lets a named
+approver grant, deny or clear that request without editing any manifest.
+
+A grant is held in the server's own state file,
+`~/.bioengine/datasets/access_requests.json`, and read as an **additive overlay**
+on the manifest: granted addresses widen `authorized_users`, and nothing in the
+overlay can take away what the manifest already grants. Grants are not written
+back into `manifest.yaml`, because a dataset is served in place and may sit on a
+mount this server cannot write.
+
+| Rule | Behaviour |
+|------|-----------|
+| Who may ask | Any caller with a Hypha account. Unauthenticated and anonymous callers are refused — Hypha mints a fresh random identity per anonymous connection and reports no email, so "one request per user" would bound nothing for them |
+| How many | One per account per dataset, keyed on the lowercased email. A second is refused, not queued, and does not replace the first |
+| Denial | Terminal. The requester cannot re-file until an approver clears the record |
+| Clearing | `clear` deletes the record: it lifts a denial *and* revokes a grant |
+| Turning the feature off | Also stops the overlay being honoured. An overlay grant is invisible in the manifest, so a server whose request surface is off must not keep opening the door with one |
+| No approvers named | The endpoints stay off. A public write to this server's disk that nobody can drain is worse than no request surface at all |
+
 ---
 
 ## Starting the Server
@@ -134,6 +156,12 @@ The server scans `--data-dir` at startup, registers the found datasets, and begi
 | `--server-port PORT` | auto (39527+) | Port. Scans upward from 39527 if not set |
 | `--authentication-server-url URL` | `https://hypha.aicell.io` | Hypha server used for token validation |
 | `--log-file PATH` | `~/.bioengine/logs/` | Log file. Pass `off` for console-only logging |
+| `--enable-access-requests` | off | Expose the per-dataset access-request endpoints |
+| `--access-request-admins USER…` | *(none)* | Identities allowed to list and resolve those requests |
+
+> The worker has a flag of the same name for *its own* admin-access requests.
+> The two processes carry separate request surfaces, and setting one does not
+> set the other.
 
 ### Environment variables
 
@@ -315,6 +343,43 @@ Each subfolder is created automatically on first save with a `manifest.yaml` who
 
 ---
 
+### Access-request endpoints
+
+Registered only when the server was started with `--enable-access-requests` and
+at least one `--access-request-admins` entry; otherwise they return `404`.
+
+| Endpoint | Who | Purpose |
+|----------|-----|---------|
+| `POST /datasets/{id}/access-request?reason=…` | any logged-in caller | File a request |
+| `GET /datasets/{id}/access-request` | any logged-in caller | Read *your own* request, or `null` |
+| `GET /access-requests` | approvers | Every request across every dataset, oldest first |
+| `POST /access-requests/{id}/resolve?user=…&decision=…` | approvers | `grant`, `deny` or `clear` |
+
+```bash
+# Ask for access
+curl -X POST -H "Authorization: Bearer $HYPHA_TOKEN" \
+  "http://localhost:39527/datasets/blood-atlas/access-request?reason=joining+the+atlas+project"
+
+# Approver grants it
+curl -X POST -H "Authorization: Bearer $APPROVER_TOKEN" \
+  "http://localhost:39527/access-requests/blood-atlas/resolve?user=researcher@university.edu&decision=grant"
+```
+
+```json
+{
+  "dataset_id": "blood-atlas",
+  "email": "researcher@university.edu",
+  "user_id": "user:github|123",
+  "status": "granted",
+  "reason": "joining the atlas project",
+  "requested_at": 1759100000.0,
+  "resolved_at": 1759100600.0,
+  "resolved_by": "owner@lab.org"
+}
+```
+
+---
+
 ### `GET /data/{dataset_id}/{path}`
 
 Serves raw file bytes. Supports HTTP Range requests for partial content, which zarr clients use to fetch individual chunks efficiently.
@@ -481,6 +546,22 @@ print(adata)           # AnnData object summary
 
 # Access a slice — fetches only the required zarr chunks
 counts = adata.layers["X_binned"][0:10, :].compute()
+```
+
+### Request access to a dataset
+
+```python
+# Ask for access to a dataset you cannot read
+await client.request_dataset_access("blood-atlas", reason="joining the atlas project")
+
+# Check where your request got to
+request = await client.get_dataset_access_request("blood-atlas")   # None if you have none
+
+# Approvers only
+requests = await client.list_dataset_access_requests()
+await client.resolve_dataset_access_request(
+    "blood-atlas", user="researcher@university.edu", decision="grant"
+)
 ```
 
 ### Chunk cache

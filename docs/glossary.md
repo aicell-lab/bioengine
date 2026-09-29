@@ -43,6 +43,8 @@ Access to a BioEngine worker and its apps is granted by **any** of three indepen
 
 Identity for layers 2 and 3 is established by the caller's Hypha token (which carries `user_id` and `user_email`) — anonymous callers can only reach methods with `authorized_users: "*"`, which layer 2 no longer accepts. Hypha reports no email for an anonymous caller and mints a fresh random user id per anonymous connection, so an anonymous caller is not a stable identity and cannot be named in either layer.
 
+**Datasets are a fourth, separate layer, enforced by a different process.** A dataset's `authorized_users` lives in its own `manifest.yaml` and is checked by the datasets server, which registers nothing with Hypha and shares no state with the worker — none of the three layers above reaches it, and a worker admin is not automatically a dataset reader. A datasets server started with `--enable-access-requests` accepts per-dataset access requests and holds granted addresses in an additive overlay at `~/.bioengine/datasets/access_requests.json`; see the datasets guide. That flag is the datasets server's own, and is not the worker flag of the same name.
+
 ## Service
 
 A callable RPC endpoint registered in a Hypha workspace. In BioEngine, services are how external callers reach a worker and the applications running on it.

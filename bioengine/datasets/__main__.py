@@ -76,6 +76,24 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         help="Path to the log file. Pass 'off' to log to console only. "
         "Defaults to a timestamped file in ~/.bioengine/logs/.",
     )
+    parser.add_argument(
+        "--enable-access-requests",
+        action="store_true",
+        help="Expose the per-dataset access-request endpoints so a user who is "
+        "not in a dataset's authorized_users can ask for access. Requires "
+        "--access-request-admins. This is separate from the worker's flag of "
+        "the same name — the two processes carry their own request surfaces.",
+    )
+    parser.add_argument(
+        "--access-request-admins",
+        type=str,
+        nargs="*",
+        metavar="USER",
+        help="User IDs or email addresses allowed to list and resolve dataset "
+        "access requests. They may grant access to any dataset this server "
+        "holds, which is no new power: the operator of this process can "
+        "already read every file it serves.",
+    )
 
     return parser
 

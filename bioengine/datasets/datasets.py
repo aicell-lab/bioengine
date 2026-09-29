@@ -610,6 +610,95 @@ class BioEngineDatasets:
         )
         return response.content
 
+    def _require_service_url(self) -> None:
+        self._resolve_service_url()
+        if self.service_url is None:
+            raise ValueError("No connection to data server.")
+
+    async def request_dataset_access(
+        self,
+        dataset_id: str,
+        reason: str = "",
+        token: Optional[str] = None,
+    ) -> dict:
+        """Ask the data server's approvers for access to a dataset.
+
+        One request per account per dataset. A second is refused rather than
+        queued or silently replacing the first, so asking again cannot reset a
+        decision already taken — including a denial, which only an approver clears.
+
+        Args:
+            dataset_id: Dataset to request access to.
+            reason: Free-text note shown to the approvers.
+            token: Hypha authentication token. Falls back to the default token.
+
+        Returns:
+            The recorded request.
+        """
+        self._require_service_url()
+        response = await self.http_client.post(
+            url=f"{self.service_url}/datasets/{dataset_id}/access-request",
+            params={"reason": reason},
+            headers=self._auth_headers(token or self.default_token),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_dataset_access_request(
+        self,
+        dataset_id: str,
+        token: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Read the state of your own access request on a dataset, or None."""
+        self._require_service_url()
+        response = await self.http_client.get(
+            url=f"{self.service_url}/datasets/{dataset_id}/access-request",
+            headers=self._auth_headers(token or self.default_token),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def list_dataset_access_requests(
+        self,
+        token: Optional[str] = None,
+    ) -> List[dict]:
+        """List every access request on the server, oldest first. Approvers only."""
+        self._require_service_url()
+        response = await self.http_client.get(
+            url=f"{self.service_url}/access-requests",
+            headers=self._auth_headers(token or self.default_token),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def resolve_dataset_access_request(
+        self,
+        dataset_id: str,
+        user: str,
+        decision: str,
+        token: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Grant, deny or clear an access request. Approvers only.
+
+        Args:
+            dataset_id: Dataset the request is about.
+            user: Email address of the requester.
+            decision: 'grant', 'deny' or 'clear'. 'clear' both lifts a denial
+                and revokes a grant.
+            token: Hypha authentication token. Falls back to the default token.
+
+        Returns:
+            The updated request, or None after 'clear'.
+        """
+        self._require_service_url()
+        response = await self.http_client.post(
+            url=f"{self.service_url}/access-requests/{dataset_id}/resolve",
+            params={"user": user, "decision": decision},
+            headers=self._auth_headers(token or self.default_token),
+        )
+        response.raise_for_status()
+        return response.json()
+
 
 if __name__ == "__main__":
     """
