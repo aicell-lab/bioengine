@@ -149,6 +149,37 @@ def _scan_dir_for_datasets(scan_dir: Path, datasets: Dict[str, dict]) -> None:
         logger.debug(f"Loaded dataset '{dataset_id}' from {subdir}")
 
 
+# What a caller who is not named on a dataset's roster may see of its manifest.
+#
+# An allowlist rather than a denylist, because manifest.yaml is unschema'd: it is
+# whatever yaml.safe_load returns, so a data owner may add any key they like —
+# an internal contact, a grant number, a cohort note. Denying the fields we
+# happen to know are sensitive would publish every field nobody thought of.
+PUBLIC_MANIFEST_FIELDS = (
+    "id",
+    "name",
+    "description",
+    "version",
+    "license",
+    "authors",
+    "tags",
+    "documentation",
+    "git_repo",
+)
+
+
+def public_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """The manifest as an unauthorized caller may see it.
+
+    Keeps what discovery needs — the dataset exists, what it is, who published
+    it — and drops ``authorized_users``, whose entries are the email addresses
+    of third parties who never interacted with this server.
+    """
+    return {
+        field: manifest[field] for field in PUBLIC_MANIFEST_FIELDS if field in manifest
+    }
+
+
 def load_datasets(data_dir: Path) -> Dict[str, dict]:
     """Scan data_dir for datasets (excludes data_dir/saved/ — user-saved files).
 
@@ -376,11 +407,38 @@ def _build_app(
         return "pong"
 
     @app.get("/datasets")
-    async def list_datasets_route():
-        return {
-            dataset_id: info["manifest"]
-            for dataset_id, info in datasets.items()
-        }
+    async def list_datasets_route(
+        token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
+    ):
+        """List every dataset. Authentication is optional and widens the view.
+
+        The catalog itself stays public — a user has to be able to see that a
+        dataset exists before asking for access to it. What is not public is
+        each dataset's roster: ``authorized_users`` is returned only to a caller
+        named in it.
+
+        A '*' entry does not earn the roster. It authorizes reading the data,
+        not reading who else may read it, and a dataset listing both '*' and
+        named addresses would otherwise hand those addresses to everyone.
+        """
+        user_info = await parse_token(
+            resolve_token(authorization, token), cached_user_info
+        )
+        listing = {}
+        for dataset_id, info in datasets.items():
+            try:
+                check_permissions(
+                    context={"user": user_info},
+                    authorized_users=info["authorized_users"],
+                    resource_name=f"the collaborator list of dataset '{dataset_id}'",
+                    allow_wildcard=False,
+                )
+            except PermissionError:
+                listing[dataset_id] = public_manifest(info["manifest"])
+            else:
+                listing[dataset_id] = dict(info["manifest"])
+        return listing
 
     @app.get("/datasets/{dataset_id}/files")
     async def list_files_route(
