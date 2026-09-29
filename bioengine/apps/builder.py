@@ -808,8 +808,7 @@ class AppBuilder:
         # reference into ``hypha_rpc``. When Ray Serve cold-starts a
         # replica it ``cloudpickle.loads`` the deployment definition,
         # which re-imports any module the references point at —
-        # so without ``hypha-rpc`` (and the ``pydantic`` it pulls in
-        # via ``schema_method``) on the replica's venv, the replica
+        # so without ``hypha-rpc`` on the replica's venv, the replica
         # crashes at ``__init__`` with ``ModuleNotFoundError: No module
         # named 'hypha_rpc'``. Same story as Fix #7, just one layer
         # deeper. Injected at bind time.
