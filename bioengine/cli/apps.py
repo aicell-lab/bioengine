@@ -284,7 +284,8 @@ def upload(app_dir, public, worker_service_id, token, server_url):
         "Environment variable to pass to the deployment "
         "(e.g. --env DEBUG=true). Repeat for multiple variables. "
         "Prefix with _ to mark as secret (hidden in status output). "
-        "Note: use --hypha-token to pass HYPHA_TOKEN — --env HYPHA_TOKEN=... is silently ignored."
+        "Note: use --hypha-token to pass HYPHA_TOKEN — --env HYPHA_TOKEN=... is overwritten "
+        "by --hypha-token, which defaults to --token."
     ),
 )
 @click.option(
@@ -639,7 +640,8 @@ def stop(app_id, yes, worker_service_id, token, server_url):
     metavar="KEY=VALUE",
     help=(
         "Environment variable for the deployment (repeat for multiple). "
-        "Note: use --hypha-token to pass HYPHA_TOKEN — --env HYPHA_TOKEN=... is silently ignored."
+        "Note: use --hypha-token to pass HYPHA_TOKEN — --env HYPHA_TOKEN=... is overwritten "
+        "by --hypha-token, which defaults to --token."
     ),
 )
 @click.option(

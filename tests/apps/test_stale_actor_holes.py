@@ -59,7 +59,12 @@ def _details(*replicas: tuple[str, str, str]) -> dict:
     return {"deployments": deployments}
 
 
-def _make_manager(*, built_app=_built_app(), source_signature=SIGNATURE) -> AppsManager:
+def _make_manager(
+    *,
+    built_app=_built_app(),
+    source_signature=SIGNATURE,
+    entry_deployment_name: str | None = "ModelRunner",
+) -> AppsManager:
     is_deployed = asyncio.Event()
     is_deployed.set()
 
@@ -78,6 +83,9 @@ def _make_manager(*, built_app=_built_app(), source_signature=SIGNATURE) -> Apps
             "version": VERSION,
             "source_signature": source_signature,
             "auto_redeploy": True,
+            # Both the deploy and the adoption path store this, so the entry
+            # deployment is nameable without a spec.
+            "entry_deployment_name": entry_deployment_name,
             "built_app": built_app,
             "deployment_task": None,
         }
@@ -122,9 +130,9 @@ async def test_a_recovered_app_is_verified_even_without_a_built_app() -> None:
         "A recovered app running the wrong version must be detectable; "
         "returning None here is what let it serve stale code unnoticed."
     )
-    # No spec means the entry deployment cannot be named, so this stays unknown
-    # rather than guessing — but that does not block the verdict above.
-    assert running_version is None
+    # The entry deployment is named from the stored entry_deployment_name, not
+    # from the absent spec, so a recovered app reports its running version too.
+    assert running_version == "2.7.0"
 
 
 @pytest.mark.asyncio
