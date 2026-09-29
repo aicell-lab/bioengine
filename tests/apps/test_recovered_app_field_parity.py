@@ -15,6 +15,12 @@ noticed. Fields an adopting worker genuinely cannot know are listed in
 ``LEGITIMATELY_NULL_AFTER_ADOPTION`` with the reason; they are still *present*,
 so the set-equality assertion keeps holding and a newly missing field fails.
 
+What set-equality cannot see is a key that is present on both paths but whose
+*value* adoption only partly reconstructs: the builder strips secrets from the
+blob, so ``application_env_vars`` comes back without the author's ``_``-prefixed
+entries and every assertion here still passes. Closing that needs a value-level
+check, not this one.
+
 The adoption path is only reachable in external-cluster mode — single-machine
 and SLURM workers tear down the Ray head on cleanup, so nothing survives to be
 adopted. A unit test over the path is therefore the only coverage available.
@@ -344,6 +350,10 @@ async def test_a_stale_replica_is_still_detected_on_an_adopted_app(
 async def test_an_adopted_app_keeps_its_static_site_link(monkeypatch) -> None:
     # Same class again: whether the app has a frontend was not in the recovery
     # blob, so an adopted app lost the URL the dashboard links its UI from.
+    # Read this with the AST test below, not alone: ``_app_data()`` hardcodes
+    # ``frontend_entry``, so this covers only the read side and still passes
+    # against a builder that never writes the key. The AST test is what fails
+    # on the write side.
     recovered = await _recovered_manager(monkeypatch)
 
     status = (
