@@ -194,7 +194,9 @@ class AppBuilder:
         for key, value in secret_env_vars.items():
             env_vars[f"_BIOENGINE_SECRET_{key}"] = value
 
-        if hypha_token is not None:
+        # Empty string is the caller's explicit "deploy without a token" — it
+        # must leave HYPHA_TOKEN genuinely absent, not present and empty.
+        if hypha_token:
             env_vars["_BIOENGINE_SECRET_HYPHA_TOKEN"] = hypha_token
 
         worker_workspace = (
