@@ -17,6 +17,12 @@ ways for an actor running old code to be reported as healthy:
 The counterpart constraint: a content mismatch is reported, never acted on. If
 the two hashes ever disagreed systematically, deleting on it would turn the
 monitor into a redeploy loop against a healthy app.
+
+Closing hole 1 also moves *when* the pre-redeploy ``serve.delete`` happens: only
+the build knows the content hash of the files it synced, so the delete has to
+run after it. That reorder crosses an error boundary — a deploy whose build
+fails now leaves the previously-healthy app untouched instead of deleted — so
+the ordering is pinned here too.
 """
 
 from __future__ import annotations
@@ -187,9 +193,9 @@ async def test_matching_content_verifies() -> None:
 
 @pytest.mark.asyncio
 async def test_an_app_from_an_older_worker_has_no_signature_to_compare() -> None:
-    # Apps recovered from a pre-0.16.6 worker carry no source_signature. That
-    # must read as unknown, not as a mismatch, or every one of them would warn
-    # on the first tick after an upgrade.
+    # An app recovered from a worker released before source signatures existed
+    # carries none. That must read as unknown, not as a mismatch, or every one
+    # of them would warn on the first tick after an upgrade.
     manager = _make_manager(built_app=None, source_signature=None)
     manager.ray_cluster.proxy_actor_handle.get_replica_identities.remote.return_value = {
         "ModelRunner": {"r1": {"version": VERSION, "code_hash": "deadbeefdeadbeef"}}
@@ -332,6 +338,120 @@ async def test_undeploying_clears_the_warning_marker() -> None:
     await manager.monitor_applications()
 
     assert APP_ID not in manager._identity_warned
+
+
+# ───────────────────── the delete must happen after the build ─────────────────────
+
+
+class _StopAfterDelete(Exception):
+    """Sentinel: deploy_app got past the delete decision, stop it going further."""
+
+
+def _make_deploy_manager(build_fails: bool) -> tuple[AppsManager, list]:
+    """Drive ``deploy_app``'s update branch and record build/delete order."""
+    events: list = []
+
+    is_deployed = asyncio.Event()
+    is_deployed.set()
+
+    manager = object.__new__(AppsManager)
+    manager.logger = logging.getLogger("test.holes")
+    manager.server = MagicMock()
+    manager.admin_users = ["u-1"]
+    manager._deployment_lock = asyncio.Lock()
+    manager._check_initialized = lambda: None
+    manager._deployed_applications = {
+        APP_ID: {
+            "started_at": 0.0,
+            "is_deployed": is_deployed,
+            "version": VERSION,
+            "source_signature": SIGNATURE,
+            "artifact_id": "bioimage-io/model-runner",
+            "application_kwargs": {},
+            "application_env_vars": {},
+            "hypha_token": "tok",
+            "disable_gpu": False,
+            "max_ongoing_requests": 10,
+            "proxy_memory_in_gb": 0.5,
+            "auto_redeploy": False,
+            "debug": False,
+            "scaling": {},
+        }
+    }
+
+    async def call_with_reconnect(fn, *args):
+        if getattr(fn, "__name__", "") == "delete":
+            events.append(("delete", args[0]))
+        return None
+
+    manager.ray_cluster = MagicMock()
+    manager.ray_cluster.check_connection = AsyncMock()
+    manager.ray_cluster.call_with_reconnect = AsyncMock(side_effect=call_with_reconnect)
+    manager._cancel_deployment_process = AsyncMock()
+
+    async def build(**_kwargs):
+        events.append(("build", None))
+        if build_fails:
+            raise RuntimeError("artifact 2.9.0 does not import")
+        return SimpleNamespace(
+            spec={"classes": {"cid0": {"qualname": "ModelRunner"}}},
+            metadata={
+                "version": "2.9.0",
+                "source_signature": "fedcba9876543210",
+                "resources": {},
+            },
+        )
+
+    manager.app_builder = MagicMock()
+    manager.app_builder.build = AsyncMock(side_effect=build)
+
+    async def _check_resources(**_kwargs):
+        raise _StopAfterDelete
+
+    manager._check_resources = _check_resources
+
+    return manager, events
+
+
+DEPLOY_CONTEXT = {"user": {"id": "u-1", "email": "u@lab.test"}}
+
+
+@pytest.mark.asyncio
+async def test_a_version_bump_deletes_the_old_app_only_after_the_build() -> None:
+    manager, events = _make_deploy_manager(build_fails=False)
+
+    with pytest.raises(_StopAfterDelete):
+        await manager.deploy_app(
+            artifact_id="bioimage-io/model-runner",
+            application_id=APP_ID,
+            version="2.9.0",
+            context=DEPLOY_CONTEXT,
+        )
+
+    assert events == [("build", None), ("delete", APP_ID)], (
+        "The delete still has to happen — it is what frees the replica slot — "
+        "but only once the build has produced the signature it is keyed on."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_leaves_the_running_app_alone() -> None:
+    # Deleting first meant a version bump whose build then failed took the
+    # previously-healthy app down with it, and nothing redeployed the old one.
+    manager, events = _make_deploy_manager(build_fails=True)
+
+    with pytest.raises(RuntimeError, match="does not import"):
+        await manager.deploy_app(
+            artifact_id="bioimage-io/model-runner",
+            application_id=APP_ID,
+            version="2.9.0",
+            context=DEPLOY_CONTEXT,
+        )
+
+    assert events == [("build", None)]
+    assert manager._deployed_applications[APP_ID]["is_deployed"].is_set(), (
+        "The old app is still serving, so it must still read as deployed."
+    )
 
 
 # ───────────────────── the fingerprint both sides must agree on ─────────────────────

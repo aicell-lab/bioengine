@@ -3036,8 +3036,8 @@ class AppsManager:
                     # Both known and different: files changed under one version.
                     # Either unknown: fall back to the identity check above
                     # rather than restarting a healthy app on a config-only
-                    # update (apps recovered from a pre-0.16.6 worker carry no
-                    # signature).
+                    # update (an app recovered from a worker released before
+                    # source signatures existed carries none).
                     or (
                         new_signature is not None
                         and old_signature is not None
