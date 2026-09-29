@@ -630,8 +630,8 @@ def build_and_run_application(
         # modules like ``main`` (cellpose) or ``entry`` (model-runner)
         # without by-value vs by-ref pickling tricks.
         runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
-        # Merge the framework-required pip deps (hypha-rpc, pydantic)
-        # into whatever the user declared via ``@bioengine.app(pip=…)``.
+        # Merge the framework-required pip deps (``hypha-rpc``) into
+        # whatever the user declared via ``@bioengine.app(pip=…)``.
         # The replica needs them at cloudpickle.loads time to resolve
         # references that the ``@bioengine.method`` wrapping created
         # via ``hypha_rpc.utils.schema.schema_method``, at the worker's

@@ -68,12 +68,15 @@ def test_extras_are_kept_while_the_version_is_resolved() -> None:
 def test_unknown_distribution_falls_back_to_the_specifier() -> None:
     """Only bioengine's own ``Requires-Dist`` entries reach this function —
     an app's ``@bioengine.app(pip=…)`` list goes straight into
-    ``runtime_env["pip"]`` without passing through it. So in a worker image
-    every input is installed and this branch does not fire. It fires where
-    the environment lacks an extra it is asked for (``extras=["worker"]``
-    on a CLI-only install), and it keeps the function total: the
-    alternative to a fallback is ``PackageNotFoundError`` out of a pure
-    string helper."""
+    ``runtime_env["pip"]`` without passing through it. So on the worker
+    path every input is installed and this branch does not fire.
+
+    It fires when an extra is asked for that the environment does not have:
+    ``get_pip_requirements(extras=["cli"])`` in the worker image collapses
+    ``rich``, ``tifffile`` and ``Pillow`` to their floors, while ``click``
+    (installed) resolves past its. Without the fallback a missing extra
+    would raise ``PackageNotFoundError`` out of a requirement-rewriting
+    helper instead of returning a usable pin."""
     assert (
         normalize_requirement("definitely-not-installed-xyz>=1.2.3")
         == "definitely-not-installed-xyz==1.2.3"

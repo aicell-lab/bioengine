@@ -2,9 +2,11 @@
 :func:`bioengine._app.bootstrap._merge_pip_lists`.
 
 The merge runs at bind time inside ``build_and_run_application`` and is
-how the framework's required deps (``hypha-rpc``, ``pydantic``) make it
-onto every user replica's venv alongside whatever the user declared via
-``@bioengine.app(pip=…)``. Two invariants matter:
+how the framework's required deps make it onto every user replica's venv
+alongside whatever the user declared via ``@bioengine.app(pip=…)``. In
+production that list is ``hypha-rpc`` alone; the two-element lists below
+are test data, chosen so ordering and collision are exercised separately.
+Two invariants matter:
 
 * A framework dep is added if it's not already present.
 * A framework dep *replaces* a user entry on the same package name. Those
