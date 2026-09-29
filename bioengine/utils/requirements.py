@@ -9,24 +9,40 @@ split_re = re.compile(r"(==|>=|<=|~=|>|<)")
 
 def normalize_requirement(requirement: str) -> str:
     """
-    Normalize a requirement by replacing >=, <=, and ~= with == for better reproducibility.
+    Pin a requirement to the version this process actually has installed.
 
+    Everything this module emits ends up in an app's ``runtime_env.pip``,
+    which Ray resolves against PyPI on every environment build. Reading the
+    pin off the *specifier* rather than off the installed distribution is
+    what let a worker carrying one ``hypha-rpc`` hand its apps another: a
+    ``>=`` floor in the metadata was rewritten to ``==<floor>`` while the
+    image had resolved that same floor to something newer. The version the
+    worker imports is the one that has to cross the cloudpickle boundary,
+    so that is the version to pin.
+
+    Falls back to collapsing the specifier's lower bound when the
+    distribution is not importable here (``>=``/``<=``/``~=`` → ``==``).
     ~= is PEP 440's compatible-release operator: ``pkg~=2.12.0`` is
-    equivalent to ``>=2.12.0, <2.13``. Like >=, we collapse it to the
-    explicit lower bound (``==2.12.0``) so the runtime_env install
-    resolves deterministically to the same version the driver has, even
-    when the app's transitive deps would otherwise widen it.
+    equivalent to ``>=2.12.0, <2.13``.
 
     Args:
         requirement: A pip requirement string (e.g., "numpy>=1.21.0",
             "pydantic~=2.12.0")
 
     Returns:
-        Normalized requirement with == instead of >= / <= / ~=
-        (e.g., "numpy==1.21.0", "pydantic==2.12.0")
+        Requirement pinned with == (e.g., "numpy==1.26.4",
+        "httpx[http2]==0.28.1")
     """
     if not requirement:
         return requirement
+
+    name = split_re.split(requirement, maxsplit=1)[0].strip()
+    base = name.split("[", 1)[0].strip()
+    if base:
+        try:
+            return f"{name}=={md.version(base)}"
+        except md.PackageNotFoundError:
+            pass
 
     # Replace >=, <=, ~= with == for reproducibility
     requirement = requirement.replace(">=", "==")

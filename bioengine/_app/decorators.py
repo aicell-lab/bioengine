@@ -234,8 +234,8 @@ def app(
         memory_mb: Soft memory cap in megabytes. Converted to Ray's bytes
             convention internally.
         pip: Additional pip requirements for the replica's runtime_env on
-            top of BioEngine's baseline (``hypha-rpc``, ``pydantic``,
-            ``httpx``, and the ``bioengine[worker]`` package). Mutually
+            top of BioEngine's baseline (``hypha-rpc``, plus the bioengine
+            source itself via ``py_modules`` rather than pip). Mutually
             exclusive with ``container_image``.
         container_image: Opt-in alternative to pip: run the replica inside
             this prebuilt container image instead of installing deps
