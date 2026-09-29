@@ -47,8 +47,6 @@ ROLE_LIST_KEYS: Dict[str, str] = {
     "annotator": "annotators",
 }
 
-_ANONYMOUS_IDS = {"", "anonymous", "http-anonymous"}
-
 
 def role_at_least(role: str, minimum: str) -> bool:
     """True if *role* meets or exceeds *minimum* in the role hierarchy."""
@@ -76,7 +74,11 @@ def _user_matches(
 
 
 def _is_logged_in(user_id: Optional[str]) -> bool:
-    return bool(user_id) and str(user_id).strip().lower() not in _ANONYMOUS_IDS
+    # Anonymous callers are mapped to id=None upstream in BrokerApp._ctx_user
+    # (keyed on Hypha's is_anonymous flag, which covers every anonymous id form —
+    # e.g. anonymouz-http and anonymouz-<random>), so any truthy id reaching here
+    # is a real, logged-in identity.
+    return bool(user_id)
 
 
 def resolve_role(

@@ -48,6 +48,7 @@ ARTIFACT_ID = f"{WORKSPACE}/{APP_ID}"
 VERSION = "0.2.4"
 ENTRY_ID = "deployment:NucleiSeg"
 ENTRY = "NucleiSeg"
+SOURCE_SIGNATURE = "0123456789abcdef"
 WORKER_CLIENT_ID = "worker-1"
 CONTEXT = {"user": {"id": "u-1", "email": "u@lab.test"}}
 
@@ -129,6 +130,7 @@ def _built_app() -> SimpleNamespace:
             "name": "Nuclei Seg",
             "description": "Segment nuclei.",
             "version": VERSION,
+            "source_signature": SOURCE_SIGNATURE,
             "application_kwargs": {},
             "application_env_vars": {},
             "resources": {"num_cpus": 1},
@@ -184,6 +186,7 @@ def _app_data() -> dict:
         "proxy_service_token_ttl_seconds": 3600,
         "entry": ENTRY_ID,
         "spec_hash": "abc123",
+        "source_signature": SOURCE_SIGNATURE,
         "display_name": "Nuclei Seg",
         "description": "Segment nuclei.",
         "frontend_entry": "frontend/index.html",
