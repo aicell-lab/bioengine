@@ -118,8 +118,15 @@ Local artifact development: `export BIOENGINE_LOCAL_ARTIFACT_PATH=/path/to/bioen
 ### Run tests
 
 ```bash
-pytest tests/end_to_end/ -v
+pytest tests/                  # offline tests only
+pytest tests/end_to_end/ -v --live   # deploys to and calls a real cluster
 ```
+
+Tests that act on a live cluster are deselected without `--live`, so the
+end-to-end command above exits 5 ("no tests collected") if you omit it.
+Whenever a credential resolves, the run prints the server, the workspace each
+token is scoped to, and how many live-reaching tests are enabled — with or
+without `--live`, so a finished run's log says what it could have touched.
 
 Test organisation:
 - `tests/end_to_end/` — integration tests for the core worker
@@ -225,7 +232,7 @@ The BioEngineWorker registers as a Hypha service. Key methods:
 | `get_status` | | Overall worker status |
 | `check_access` | | Check caller permissions |
 | `list_apps` | ✓ | List deployed applications |
-| `deploy_app` | ✓ | Deploy an application from artifact |
+| `deploy_app` | ✓ | Deploy an application from artifact; returns `{application_id, artifact_id, version, version_source}` |
 | `stop_app` | ✓ | Stop a running application |
 | `get_app_status` | | Status of specific application |
 | `upload_app` | ✓ | Create/update application artifact |
@@ -233,6 +240,12 @@ The BioEngineWorker registers as a Hypha service. Key methods:
 | `delete_app` | ✓ | Delete an application artifact |
 | `run_code` | ✓ | Run Python code in Ray task |
 | `list_datasets` | | Available datasets |
+| `request_admin_access` | | Ask to become an admin. Public; only registered with `--enable-access-requests` |
+| `get_admin_access_request` | | Read your own request. Same flag |
+| `list_access_requests` | ✓ | All requests. Same flag |
+| `resolve_access_request` | ✓ | `grant` / `deny` / `clear` a request. Same flag |
+
+The worker admin list does **not** honour a `"*"` entry — it is dropped at startup, so no admin-gated worker method authorizes an anonymous caller. App manifests may still use `authorized_users: ['*']`; that is a separate list. The users named in `--admin-users` cannot be removed on a running worker.
 
 ## Dev image testing workflow
 

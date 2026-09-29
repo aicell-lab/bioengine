@@ -30,9 +30,8 @@ def top_level_name(file: Dict) -> str:
 async def resolve_service(lookup, timeout: int = 60):
     """Retry a Hypha service lookup until the registration shows up.
 
-    `get_app_status` derives `service_ids` from the worker's client id and only
-    gates on a live ProxyDeployment replica, so an id is reported before that
-    replica has finished registering it with Hypha.
+    `get_app_status` reports an id only once the proxy has registered it, but
+    the lookup still races the registration's propagation through Hypha.
     """
     start_time = time.time()
     while True:
@@ -344,7 +343,10 @@ async def test_startup_application(
     while time.time() - start_time < application_check_timeout:
         apps_status = await bioengine_worker_service.get_app_status()
         running = [
-            app for app in apps_status.values() if app["status"] == "RUNNING"
+            app
+            for app in apps_status.values()
+            if app["status"] == "RUNNING"
+            and (app["service_ids"] or {}).get("websocket_service_id")
         ]
         if len(running) >= expected_app_count:
             break
@@ -690,11 +692,18 @@ async def test_deploy_app_locally(
     try:
         for app_config in app_configs:
             # Deploy the application
-            application_id = await bioengine_worker_service.deploy_app(
-                **app_config
-            )
+            deployed = await bioengine_worker_service.deploy_app(**app_config)
+            application_id = deployed["application_id"]
+            # No version_source assertion here: under
+            # BIOENGINE_LOCAL_ARTIFACT_PATH there is no artifact history, so
+            # "latest" is reported for a version that came from the local
+            # manifest (or the literal "local"). Asserting it would pin the
+            # misnomer rather than the behaviour.
             deployed_app_ids.append(application_id)
-            print(f"Deployed application: {application_id}")
+            print(
+                f"Deployed application: {application_id} "
+                f"(version {deployed['version']})"
+            )
 
         # Wait for both applications to finish deploying
         # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
@@ -868,11 +877,19 @@ async def test_deploy_app_from_artifact(
 
         # Deploy applications from artifacts
         for app_config in app_configs:
-            application_id = await bioengine_worker_service.deploy_app(
-                **app_config
-            )
+            deployed = await bioengine_worker_service.deploy_app(**app_config)
+            application_id = deployed["application_id"]
+            # The honest home for this assertion: BIOENGINE_LOCAL_ARTIFACT_PATH is
+            # deleted above so the version really is resolved from the artifact,
+            # no config passes a version, and `test_id` is function-scoped so both
+            # application ids are fresh and have nothing to inherit.
+            assert deployed["version_source"] == "latest", deployed
+            assert deployed["version"] is not None, deployed
             deployed_app_ids.append(application_id)
-            print(f"Deployed application: {application_id}")
+            print(
+                f"Deployed application: {application_id} "
+                f"(version {deployed['version']})"
+            )
 
         # Wait for both applications to finish deploying
         # Generous: each replica builds a pip runtime_env before it turns HEALTHY.
@@ -991,9 +1008,11 @@ async def test_call_demo_app_functions(
     # Deploy the demo-app with apps_manager.deploy_app from local path
     demo_artifact_id = f"{hypha_workspace}/demo-app"
 
-    app_id = await bioengine_worker_service.deploy_app(
-        artifact_id=demo_artifact_id, disable_gpu=True
-    )
+    app_id = (
+        await bioengine_worker_service.deploy_app(
+            artifact_id=demo_artifact_id, disable_gpu=True
+        )
+    )["application_id"]
 
     try:
         # Wait for deployment to complete
@@ -1145,7 +1164,9 @@ async def test_call_composition_app_functions(
         "disable_gpu": True,
     }
 
-    app_id = await bioengine_worker_service.deploy_app(**composition_app_config)
+    app_id = (
+        await bioengine_worker_service.deploy_app(**composition_app_config)
+    )["application_id"]
 
     try:
         # Wait for deployment to complete

@@ -8,7 +8,7 @@ A versioned bundle stored in Hypha that contains everything needed to build a Bi
 
 ## Application
 
-A single running deployment of an app package on a specific worker. Created by calling `deploy_app(artifact_id, application_id, version)` on a worker. Identified by `application_id` — either auto-generated via haikunator (e.g. `wandering-cloud-1234`) or user-supplied for stable addressing (e.g. `model-runner`). One app package can have many concurrent applications on the same worker or across workers, each with a distinct `application_id`.
+A single running deployment of an app package on a specific worker. Created by calling `deploy_app(artifact_id, application_id, version)` on a worker, which returns `{application_id, artifact_id, version, version_source}` describing what it actually deployed. Identified by `application_id` — either auto-generated via haikunator (e.g. `wandering-cloud-1234`) or user-supplied for stable addressing (e.g. `model-runner`). One app package can have many concurrent applications on the same worker or across workers, each with a distinct `application_id`.
 
 ## Worker
 
@@ -38,10 +38,10 @@ See **Permission model** for the full access-control picture; workspace membersh
 Access to a BioEngine worker and its apps is granted by **any** of three independent layers — they are not nested, and any single layer alone is sufficient.
 
 1. **Workspace membership.** Holding a Hypha token for the worker's workspace (either a user token where the user is a member, or a workspace-scoped token) grants full access to every operation on the worker and every method of every app within it. This is the broadest layer.
-2. **Worker `admin_users`.** A list of user IDs / email addresses passed at worker startup via `--admin-users`. These users can perform every admin operation on the worker (`deploy_app`, `stop_app`, `upload_app`, `delete_app`, `run_code`, etc.) **even without** a token for the worker's workspace. They are also auto-injected into every app's `authorized_users` on deploy, so admins can always call any method of any app on this worker.
+2. **Worker `admin_users`.** A list of user IDs / email addresses seeded at worker startup via `--admin-users` and editable on a live worker via `list_admin_users` / `add_admin_user` / `remove_admin_user` (only a user *named* in the list may edit it; the runtime list is persisted and overrides the startup seed after a restart). A `*` entry is **not** honoured here — it is dropped at startup, so the worker admin list never authorizes an anonymous caller. The users named at startup can never be removed from the list; demoting one takes two steps — drop it from `--admin-users` and restart, which stops it being a starting user, then call `remove_admin_user` for it, since the restart alone leaves it in the persisted list that overrides the flag. These users can perform every admin operation on the worker (`deploy_app`, `stop_app`, `upload_app`, `delete_app`, `run_code`, etc.) **even without** a token for the worker's workspace. They are also auto-injected into every app's `authorized_users` on deploy — that injection happens once, at deploy time, so an admin added later reaches the worker API immediately but not the apps already running; redeploy those to widen access. A worker started with `--enable-access-requests` also exposes `request_admin_access`, the one public method a non-admin may call to ask to be added.
 3. **App `authorized_users`.** Set per app package in `manifest.yaml`, per-method. Each method's `authorized_users` is either `"*"` (public — anyone, including anonymous) or a list of specific user IDs / emails. This grants method-level access to users who have **neither** workspace membership nor worker-admin status.
 
-Identity for layers 2 and 3 is established by the caller's Hypha token (which carries `user_id` and `user_email`) — anonymous callers can only reach methods with `authorized_users: "*"`.
+Identity for layers 2 and 3 is established by the caller's Hypha token (which carries `user_id` and `user_email`) — anonymous callers can only reach methods with `authorized_users: "*"`, which layer 2 no longer accepts. Hypha reports no email for an anonymous caller and mints a fresh random user id per anonymous connection, so an anonymous caller is not a stable identity and cannot be named in either layer.
 
 ## Service
 
@@ -60,16 +60,18 @@ Fully qualified handle for a service. Grammar:
 **Two BioEngine service patterns:**
 
 - **Worker service** — one per worker. ID = `<workspace>/<client_id>:bioengine-worker`. The literal `bioengine-worker` is hardcoded; it exposes the worker's admin API (`get_status`, `deploy_app`, etc.).
-- **Application services** — one **ProxyDeployment replica per application** (fixed). ID = `<workspace>/<worker_client_id>-<replica_id>:<application_id>` (plus `<application_id>-rtc` for WebRTC). The `<replica_id>` is appended to the worker's `client_id`. An app's internal deployments may have their own Ray Serve replicas, but only the single ProxyDeployment in front of them yields Hypha services; internal deployments are addressed through Ray Serve handles inside the worker.
+- **Application services** — one **ProxyDeployment replica per application** (fixed). ID = `<workspace>/<worker_client_id>-<app_hash>:<application_id>` (plus `<application_id>-rtc` for WebRTC). The `<app_hash>` is the first 8 hex digits of `sha1(application_id)`, appended to the worker's `client_id` — so the id is stable across ProxyDeployment restarts and does **not** change on redeploy. An app's internal deployments may have their own Ray Serve replicas, but only the single ProxyDeployment in front of them yields Hypha services; internal deployments are addressed through Ray Serve handles inside the worker.
 
 **Calling an application.** `get_app_status()` returns a `service_ids` block of shape:
 
 ```python
 {
-    "websocket_service_id": "<workspace>/<worker_client_id>-<replica_id>:<application_id>",
-    "webrtc_service_id":    "<workspace>/<worker_client_id>-<replica_id>:<application_id>-rtc",
+    "websocket_service_id": "<workspace>/<worker_client_id>-<app_hash>:<application_id>",
+    "webrtc_service_id":    "<workspace>/<worker_client_id>-<app_hash>:<application_id>-rtc",
 }
 ```
+
+Both are `None` until the proxy has actually registered the services with Hypha, which happens after every deployment of the app has a running replica — so an app can read `RUNNING` while its ids are still `None`. Poll for a non-`None` `websocket_service_id` rather than for `status == "RUNNING"`; the companion `service_registered` field says whether the proxy has reported registering (`None` if it has never reported, e.g. an app recovered under a newer worker).
 
 - **WebSocket** — `get_service(service_ids["websocket_service_id"])`. No selection mode needed; one concrete client.
 - **WebRTC** — `get_rtc_service(hypha_client, service_ids["webrtc_service_id"])`. Same concrete replica; peer-connection handshake addresses it directly.

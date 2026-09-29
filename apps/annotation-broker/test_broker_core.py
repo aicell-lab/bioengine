@@ -57,9 +57,11 @@ class TestResolveRole:
         assert bc.resolve_role(meta, "some-user-id", None) == "annotator"
 
     def test_public_dataset_anonymous_user_is_public(self):
+        # Anonymous callers reach resolve_role as id=None (mapped upstream in
+        # BrokerApp._ctx_user from Hypha's is_anonymous flag), so None is the
+        # anonymous case here — not an "anonymous" string Hypha never emits.
         meta = _meta(public=True)
         assert bc.resolve_role(meta, None, None) == "public"
-        assert bc.resolve_role(meta, "anonymous", None) == "public"
 
     def test_private_dataset_anonymous_user_is_none(self):
         assert bc.resolve_role(_meta(), None, None) == "none"
@@ -712,12 +714,13 @@ class TestCallerMatchesArtifactOwner:
         assert not bc.caller_matches_artifact_owner({}, None, "u1", None)
 
 
-def test_resolve_role_http_anonymous_is_public_on_public_dataset():
+def test_resolve_role_anonymous_is_public_on_public_dataset():
     import broker_core as core
     meta = core.new_metadata("bioimage-io/x", owner={"id": "u1"})
     meta["public"] = True
-    assert core.resolve_role(meta, "http-anonymous", None) == "public"
-    assert core.resolve_role(meta, "anonymous", None) == "public"
+    # Anonymous callers arrive as id=None (BrokerApp._ctx_user maps Hypha's
+    # is_anonymous flag to None, covering anonymouz-http / anonymouz-<random>);
+    # a real id is logged-in and gets annotator on a public dataset.
     assert core.resolve_role(meta, None, None) == "public"
     assert core.resolve_role(meta, "real-user", None) == "annotator"
 

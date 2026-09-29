@@ -1,7 +1,9 @@
 """Drive a federated segmentation experiment across N BioEngine clients.
 
-Every arm consumes the same number of optimiser steps, so the comparison
-measures federation rather than compute:
+Every arm consumes the same number of optimiser steps PER MODEL. The federated
+arms train N models per round and average them, so at the system level they
+spend N times the gradient computation of a single-instance arm; compute is
+matched per model and is not matched overall.
 
   <client>-only    trained only on that client's images, one arm per client
   fedavg           R rounds of local training, sample-count-weighted state_dict average
@@ -9,6 +11,9 @@ measures federation rather than compute:
   loso-<client>    federate everyone except <client>, then score on <client> (--loso)
   pooled           an extra instance holding every client's data — the deliberate
                    premise violation, used as the upper bound
+  pooled-balanced  pooled, drawing a domain uniformly and then an image within it,
+                   so its per-domain training weight matches the evaluation's
+                   instead of the shard fraction (--balanced-arm)
 
 Every arm is scored the same way: the checkpoint is pushed to each client and
 evaluated there against that client's held-out test split. Test images never
@@ -74,6 +79,103 @@ async def resolve(server, worker_prefix: str, application_id: str):
     if record["status"] != "RUNNING":
         raise RuntimeError(f"{application_id} is {record['status']}: {record.get('message')}")
     return await server.get_service(record["service_ids"]["websocket_service_id"]), record
+
+
+DISCONNECTED = ("client disconnected", "connection closed", "connection is closed",
+                "connection lost", "service not found")
+
+
+def is_disconnect(error: Exception) -> bool:
+    # TimeoutError is not a disconnect but is the same problem for a caller: the
+    # reply never arrived and the handle has to be re-resolved to find out why.
+    message = str(error).lower()
+    return isinstance(error, (ConnectionError, TimeoutError)) or any(m in message for m in DISCONNECTED)
+
+
+class SiteHandle:
+    """An app handle that survives its replica's Hypha client being recycled.
+
+    A Hypha service proxy is pinned to the client id it was resolved against, so
+    once that client goes away the handle is dead for good even though the app
+    itself is fine. On 2026-09-06 a replica's websocket was recycled for thirteen
+    seconds and the run died three hours in, because every handle was resolved
+    once at startup and held for the next twenty-three hours. Re-resolving is the
+    only recovery, so it happens here rather than being left to the caller.
+
+    The same day it also died on a plain TimeoutError, during a websocket storm
+    that closed and reopened the connection fifty-six times in a minute. The
+    handle treats a reply that never arrived the same way however it failed to
+    arrive, because from here the two are indistinguishable.
+    """
+
+    def __init__(self, server, worker_prefix: str, application_id: str, attempts: int = 5) -> None:
+        self._server = server
+        self._worker_prefix = worker_prefix
+        self._application_id = application_id
+        self._service = None
+        self._floor = 0
+        self.attempts = attempts
+
+    async def connect(self) -> Dict[str, Any]:
+        self._service, record = await resolve(self._server, self._worker_prefix, self._application_id)
+        return record
+
+    async def _already_trained(self, tag: str, wait: float = 120.0):
+        """The site's own record for ``tag``, waiting out a call that may still be running.
+
+        A timeout cancels nothing at the far end, and the site serialises train
+        behind a lock — so a retry issued while the first call is still going
+        does not race it, it queues behind it and the round runs twice. Rounds
+        take seconds and the timeout is far longer, so anything still running
+        lands well inside this window; a call that really did die never appears.
+        """
+        deadline = time.monotonic() + wait
+        while True:
+            for record in reversed((await self.get_history())[self._floor:]):
+                if record.get("tag") == tag:
+                    return record
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(5.0)
+
+    def __getattr__(self, method: str):
+        if method.startswith("__"):
+            raise AttributeError(method)
+
+        async def call(*args, **kwargs):
+            for attempt in range(self.attempts):
+                try:
+                    result = await getattr(self._service, method)(*args, **kwargs)
+                    if method == "pull_weights":
+                        # Every arm starts by pulling weights, and the site keeps
+                        # its history across arms and across driver processes — so
+                        # a resumed run re-uses tags that are already in it. Only
+                        # rounds recorded after this point belong to this arm.
+                        self._floor = (await self.get_status())["history_entries"]
+                    return result
+                except Exception as error:
+                    if attempt == self.attempts - 1 or not is_disconnect(error):
+                        raise
+                    delay = 5.0 * 3**attempt
+                    print(
+                        f"{self._application_id}.{method} never got its reply "
+                        f"({type(error).__name__}: {error}), re-resolving in {delay:.0f}s "
+                        f"[{attempt + 1}/{self.attempts - 1}]",
+                        flush=True,
+                    )
+                    await asyncio.sleep(delay)
+                    await self.connect()
+                    # train is the only call whose blind retry would double a
+                    # site's optimiser steps, and equal compute per arm is what
+                    # the whole comparison rests on. The site's history says
+                    # whether the call landed before the response was lost.
+                    if method == "train":
+                        done = await self._already_trained(kwargs.get("tag", ""))
+                        if done is not None:
+                            print(f"  {self._application_id}: {done['tag']} had already run", flush=True)
+                            return done
+
+        return call
 
 
 def load_state_dict(payload: bytes) -> Dict[str, torch.Tensor]:
@@ -159,25 +261,49 @@ def convergence_round(curve: List[float], window: int = 5, tolerance: float = 0.
     return None
 
 
-async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str]]:
-    """Mean validation Dice per dataset, plus the weights each site scored with."""
+async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """Mean validation Dice per dataset, the weights each site scored with, and
+    the site each dataset's score came from.
+
+    ``scores`` is keyed by dataset and ``scored_with`` by site — two key spaces
+    that look like one only because each consortium client happens to hold a
+    dataset named after it. ``scored_by`` carries the attribution as data, so no
+    consumer has to recover it from that coincidence, and the pooled arm (six
+    datasets, one scoring site) says so rather than reading as six sites.
+    """
     scores: Dict[str, float] = {}
     scored_with: Dict[str, str] = {}
+    scored_by: Dict[str, str] = {}
     for name in names:
         for dataset, result in (await apps[name].evaluate(split="val")).items():
+            if dataset in scored_by:
+                raise RuntimeError(
+                    f"dataset {dataset!r} was scored by both {scored_by[dataset]} and "
+                    f"{result['site']}; a dataset-keyed score map cannot hold both, and "
+                    f"silently keeping the last would attribute it to the wrong site"
+                )
             scores[dataset] = float(result["dice_mean"])
+            scored_by[dataset] = result["site"]
             scored_with[name] = result["weights_sha256"]
-    return scores, scored_with
+    return scores, scored_with, scored_by
 
 
 async def train_arm(
-    app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str
+    app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str,
+    domain_balanced: bool = False,
 ) -> List[Dict]:
-    """Run rounds x steps of purely local training, scoring validation each round."""
+    """Run rounds x steps of purely local training, scoring validation each round.
+
+    ``tag`` must be unique within a run: a reconnecting handle uses it to tell a
+    round that already ran from one that has to be repeated.
+    """
     history = []
     for r in range(rounds):
-        record = await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}")
-        record["val_dice"], _ = await val_dice(apps, [instance])
+        record = await app.train(
+            steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}",
+            domain_balanced=domain_balanced,
+        )
+        record["val_dice"], _, record["scored_by"] = await val_dice(apps, [instance])
         history.append(record)
     return history
 
@@ -211,7 +337,8 @@ async def federated_arm(
         local = await asyncio.gather(
             *(
                 apps[name].train(
-                    steps=args.steps, lr=args.lr, seed=seed * 1000 + r, tag=f"{arm}/r{r:02d}"
+                    steps=args.steps, lr=args.lr, seed=seed * 1000 + r,
+                    tag=f"{prefix}/{arm}/r{r:02d}",
                 )
                 for name in participants
             )
@@ -238,7 +365,7 @@ async def federated_arm(
         for name in dict.fromkeys([*participants, *eval_on]):
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
         # Scored after the merge and pull, so this is the aggregate's curve.
-        merged_val, scored_with = await val_dice(apps, eval_on)
+        merged_val, scored_with, scored_by = await val_dice(apps, eval_on)
         # A site whose weights did not move while the aggregate did was scored on
         # stale weights. That failure produces plausible numbers instead of an
         # error — a LOSO fold's held-out client trains on nothing, so a missed
@@ -259,6 +386,7 @@ async def federated_arm(
                 "val_dice": merged_val,
                 "global_sha256": aggregate["sha256"],
                 "scored_with": scored_with,
+                "scored_by": scored_by,
             }
         )
         print(
@@ -287,6 +415,44 @@ async def federated_arm(
         ),
         "wall_time_s": time.time() - started,
         "total_steps_per_model": args.rounds * args.steps,
+    }
+
+
+PRELIMINARY = (
+    "PRELIMINARY: one seed of a multi-seed run, written the moment the arm finished. "
+    "The pre-registered verdicts are defined over all seeds and none of them can be "
+    "read off this file."
+)
+
+
+async def score_arm(
+    apps, run_artifact_id: str, eval_sites, out_dir: Path, prefix: str, arm: str,
+    record: Dict[str, Any], previews: bool,
+) -> Dict[str, float]:
+    """Score one finished arm on every domain's held-out test split and write it out.
+
+    Written per arm rather than per seed so a reader has figure-usable material
+    while the run is still going. Per-image scores are kept, not just the mean,
+    and the file says in its first field that one seed decides nothing.
+    """
+    record["evaluation"] = {}
+    for name in sorted(set(eval_sites.values())):
+        await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=record["checkpoint"])
+        record["evaluation"][name] = await apps[name].evaluate(split="test")
+        if previews:
+            status = await apps[name].get_status()
+            for dataset in status["datasets_loaded"]:
+                preview = await apps[name].preview(dataset=dataset, split="test", n=3)
+                (out_dir / f"preview_{prefix}_{arm}_{name}_{dataset}.png").write_bytes(
+                    base64.b64decode(preview["png_base64"])
+                )
+    (out_dir / f"arm_{prefix}_{arm}.json").write_text(
+        json.dumps({"status": PRELIMINARY, "seed": prefix, "arm": arm, **record}, indent=2)
+    )
+    return {
+        dataset: round(scores["dice_mean"], 4)
+        for site in record["evaluation"].values()
+        for dataset, scores in site.items()
     }
 
 
@@ -341,9 +507,21 @@ async def main() -> None:
         help="Add a second FedAvg arm weighting every client equally instead of by sample count",
     )
     parser.add_argument(
+        "--balanced-arm",
+        action="store_true",
+        help="Add a second pooled arm that draws a domain uniformly and then an image within it, "
+             "matching the pooled arm's per-domain training weight to the evaluation's",
+    )
+    parser.add_argument(
         "--pre-registration",
         default=None,
         help="Path to a design file whose predictions must already be committed",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep the arms already in the output metrics.json and run only the missing ones "
+             "(pass the same --run-id, so the round checkpoints are still reachable)",
     )
     args = parser.parse_args()
 
@@ -375,8 +553,9 @@ async def main() -> None:
     servers, apps, app_records = {}, {}, {}
     for name, spec in sites.items():
         servers[name] = await connect_to_server({"server_url": SERVER_URL, "token": env[spec["token_key"]]})
-        apps[name], app_records[name] = await resolve(servers[name], spec["worker"], spec["application_id"])
-        print(f"{name}: resolved {spec['application_id']}", flush=True)
+        apps[name] = SiteHandle(servers[name], spec["worker"], spec["application_id"])
+        app_records[name] = await apps[name].connect()
+        print(f"{name}: resolved {spec['application_id']} at {app_records[name].get('version')}", flush=True)
 
     site_status = {name: await app.get_status() for name, app in apps.items()}
     if not args.skip_prepare:
@@ -417,7 +596,15 @@ async def main() -> None:
     eval_sites = {dataset: names[0] for dataset, names in holders.items()}
     print(f"scoring each domain on: {eval_sites}", flush=True)
 
-    results: Dict[str, Any] = {}
+    metrics_path = out_dir / "metrics.json"
+    # Flushed per arm rather than per seed: the run that motivated this lost
+    # five completed arms because it died in the sixth, and an arm is the
+    # largest unit that is worth nothing until it finishes.
+    results: Dict[str, Any] = json.loads(metrics_path.read_text()) if args.resume and metrics_path.exists() else {}
+
+    def flush() -> None:
+        metrics_path.write_text(json.dumps(results, indent=2))
+
     for seed in args.seeds:
         print(f"\n=== seed {seed} ===", flush=True)
         prefix = f"seed_{seed}"
@@ -433,14 +620,22 @@ async def main() -> None:
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
         print(f"init: {init['n_parameters']} params, sha256 {init_entry['sha256'][:12]}", flush=True)
 
-        arms: Dict[str, Dict[str, Any]] = {}
+        arms: Dict[str, Dict[str, Any]] = results.setdefault(prefix, {})
         scored_on = sorted(set(eval_sites.values()))
 
         async def fed(arm: str, participants: List[str], weighting: str) -> None:
+            if arm in arms:
+                print(f"  {arm}: kept from {metrics_path}", flush=True)
+                return
             arms[arm] = await federated_arm(
                 apps, store, run_artifact_id, participants,
                 scored_on, prefix, arm, args, seed, weighting,
             )
+            summary = await score_arm(
+                apps, run_artifact_id, eval_sites, out_dir, prefix, arm, arms[arm], args.previews
+            )
+            print(f"  {arm} test dice: {summary}", flush=True)
+            flush()
 
         # --- Arm: federated, every client -----------------------------------
         await fed("fedavg", clients, "sample-count")
@@ -463,12 +658,19 @@ async def main() -> None:
                 )
 
         # --- Arms: single-site and pooled ----------------------------------
-        single_site_arms = [(f"{name}-only", name) for name in clients]
-        for arm, instance in single_site_arms + [("pooled", "pooled")]:
+        single_site_arms = [(f"{name}-only", name, False) for name in clients]
+        pooled_arms = [("pooled", "pooled", False)]
+        if args.balanced_arm:
+            pooled_arms.append(("pooled-balanced", "pooled", True))
+        for arm, instance, domain_balanced in single_site_arms + pooled_arms:
+            if arm in arms:
+                print(f"  {arm}: kept from {metrics_path}", flush=True)
+                continue
             started = time.time()
             await apps[instance].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
             history = await train_arm(
-                apps[instance], apps, instance, args.rounds, args.steps, args.lr, seed, arm
+                apps[instance], apps, instance, args.rounds, args.steps, args.lr, seed,
+                f"{prefix}/{arm}", domain_balanced,
             )
             await apps[instance].push_weights(
                 run_artifact_id=run_artifact_id, path=f"{prefix}/arms/{arm}.pt", note=f"{arm} final"
@@ -494,39 +696,27 @@ async def main() -> None:
                 f"{arms[arm]['convergence_round']}",
                 flush=True,
             )
-
-        # --- Evaluation: every arm, on both sites' held-out test splits -----
-        for arm, record in arms.items():
-            record["evaluation"] = {}
-            for name in sorted(set(eval_sites.values())):
-                await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=record["checkpoint"])
-                record["evaluation"][name] = await apps[name].evaluate(split="test")
-            summary = {
-                dataset: round(scores["dice_mean"], 4)
-                for site in record["evaluation"].values()
-                for dataset, scores in site.items()
-            }
+            summary = await score_arm(
+                apps, run_artifact_id, eval_sites, out_dir, prefix, arm, arms[arm], args.previews
+            )
             print(f"  {arm} test dice: {summary}", flush=True)
+            flush()
 
-        results[f"seed_{seed}"] = arms
-        # Flushed per seed: a transient transport failure on seed 4 should cost
-        # one seed, not the four that already finished.
-        (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
+        # Arms restored from a run that predates per-arm scoring.
+        for arm, record in arms.items():
+            if "evaluation" in record:
+                continue
+            summary = await score_arm(
+                apps, run_artifact_id, eval_sites, out_dir, prefix, arm, record, args.previews
+            )
+            print(f"  {arm} test dice: {summary}", flush=True)
+            flush()
 
-        if args.previews:
-            for name in sorted(set(eval_sites.values())):
-                for arm in arms:
-                    await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=arms[arm]["checkpoint"])
-                    status = await apps[name].get_status()
-                    for dataset in status["datasets_loaded"]:
-                        preview = await apps[name].preview(dataset=dataset, split="test", n=3)
-                        (out_dir / f"preview_{prefix}_{arm}_{name}_{dataset}.png").write_bytes(
-                            base64.b64decode(preview["png_base64"])
-                        )
 
     transport = {name: await app.get_transport_log() for name, app in apps.items()}
     transport["driver"] = driver_log.dump()
 
+    app_versions = {name: record.get("version") for name, record in app_records.items()}
     provenance = {
         "run_id": args.run_id,
         "generated_at": time.time(),
@@ -534,7 +724,14 @@ async def main() -> None:
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True
         ).stdout.strip(),
         "app_artifact": app_records[clients[0]].get("artifact_id"),
-        "app_version": app_records[clients[0]].get("version"),
+        # Seven instances are seven separate deployments and a run can mix their
+        # versions — the instance an arm trains on is not one of the clients, so
+        # clients[0]'s version would be attributed to all seven. Scalar only when
+        # they agree; null otherwise, which reads as "look at the map".
+        "app_version": (
+            app_versions[clients[0]] if len(set(app_versions.values())) == 1 else None
+        ),
+        "app_version_per_instance": app_versions,
         "run_artifact_id": run_artifact_id,
         "aggregation_rule": "sample-count-weighted FedAvg over the full state_dict",
         "arm_structure": {
@@ -546,6 +743,13 @@ async def main() -> None:
             ) if args.loso else None,
             "<client>-only": "that client's own data alone, the baseline LOSO is compared against",
             "pooled": "one instance holding every client's data — the premise violation, an upper bound",
+            "pooled-balanced": (
+                "pooled, but drawing a domain uniformly and then an image within it, so its "
+                "per-domain training weight is 1/6 each instead of the shard fraction. Isolates the "
+                "SAMPLER axis only: it still differs from the federated arms in whether updates are "
+                "exchanged and in system-level local-step budget (6:1; per-model steps are matched), "
+                "and those two are not separable in this design"
+            ) if args.balanced_arm else None,
         },
         "train_sizes": "natural" if LAYOUTS[args.layout]["n_train"] is None else LAYOUTS[args.layout]["n_train"],
         "normalisation": "GroupNorm (no running statistics, so the merge averages weights only)",
@@ -591,7 +795,7 @@ async def main() -> None:
         ),
     }
 
-    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
+    flush()
     (out_dir / "provenance.json").write_text(json.dumps(provenance, indent=2, default=str))
     (out_dir / "transport_audit.json").write_text(json.dumps(transport, indent=2, default=str))
     print(f"\nwrote {out_dir}", flush=True)

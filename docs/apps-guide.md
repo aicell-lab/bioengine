@@ -886,20 +886,22 @@ Deploy your application using the BioEngine worker service:
 
 ```python
 # Basic deployment - creates a new application with auto-generated ID
-application_id = await bioengine_worker_service.deploy_app(
+deployed = await bioengine_worker_service.deploy_app(
     artifact_id="workspace/my-app"
 )
+application_id = deployed["application_id"]
 
 # Deployment with custom application ID
-application_id = await bioengine_worker_service.deploy_app(
+deployed = await bioengine_worker_service.deploy_app(
     artifact_id="workspace/my-app",
     application_id="my-custom-id",      # Specify your own ID
 )
 
 # Advanced deployment with full configuration
-application_id = await bioengine_worker_service.deploy_app(
+deployed = await bioengine_worker_service.deploy_app(
     artifact_id="workspace/my-app",
-    version=None,                       # Latest version
+    version=None,                       # Latest — unless "custom-id" is already
+                                        # running, then its version; see below
     application_id="custom-id",         # Custom instance ID
     hypha_token="your_token_here",      # User authentication
     disable_gpu=False,                  # Enable GPU usage
@@ -917,6 +919,46 @@ application_id = await bioengine_worker_service.deploy_app(
 )
 ```
 
+#### What `deploy_app` returns
+
+`deploy_app` returns a dictionary describing what was deployed:
+
+```python
+{
+    "application_id": "custom-id",             # deployment identity
+    "artifact_id": "workspace/my-app",         # fully qualified
+    "version": "1.4.0",                        # version actually deployed
+    "version_source": "latest",                # how that version was chosen
+}
+```
+
+`version_source` has three values, and it is the only thing that tells you
+whether you got the version you meant:
+
+| `version_source` | Meaning |
+|---|---|
+| `requested` | You passed `version=`, and that is what was deployed. |
+| `latest` | You passed no `version`, and the artifact's newest committed version was deployed. |
+| `inherited` | You passed no `version`, and the version the running `application_id` was **already on** was redeployed. |
+
+`inherited` is the case that surprises people. Omitting `version` when updating
+a running application does *not* roll it forward — it redeploys the code that is
+already there, and every other field reports success. A caller that uploads a
+new version and then deploys must either pass that version explicitly or reject
+`inherited`:
+
+```python
+deployed = await bioengine_worker_service.deploy_app(
+    artifact_id="workspace/my-app",
+    application_id="my-app",
+)
+if deployed["version_source"] == "inherited":
+    raise RuntimeError(
+        f"Redeployed the running version {deployed['version']} instead of "
+        f"rolling forward. Pass version= explicitly."
+    )
+```
+
 #### Updating Existing Applications
 
 You can update a running application by calling `deploy_app` with the **same `application_id`** but a **different `artifact_id`** (or version). This allows you to:
@@ -930,15 +972,16 @@ You can update a running application by calling `deploy_app` with the **same `ap
 - **Parameters**: Any unspecified parameters are inherited from the currently running application
 - **Specified parameters**: Override the current values
 - **Timestamps**: Original creation time (`started_at`) is preserved, `last_updated_at` is updated
+- **`version` is one of the inherited parameters**: omitting it keeps the running version instead of resolving the latest, and the returned `version_source` is `inherited` when that happens
 
 ```python
 # Initial deployment
-app_id = await bioengine_worker_service.deploy_app(
+app_id = (await bioengine_worker_service.deploy_app(
     artifact_id="workspace/my-app-v1",
     application_id="my-app",
     disable_gpu=False,
     max_ongoing_requests=10,
-)
+))["application_id"]
 
 # Update to a newer artifact version - keeps all other settings
 await bioengine_worker_service.deploy_app(
@@ -985,7 +1028,7 @@ await bioengine_worker_service.deploy_app(
 The `deploy_app` method supports these parameters:
 
 - **`artifact_id`** *(required)*: Application artifact identifier
-- **`version`** *(optional)*: Specific artifact version to deploy
+- **`version`** *(optional)*: Specific artifact version to deploy. Omitting it resolves the latest committed version for a new application, but **inherits the running version** when updating an existing `application_id` — check the returned `version_source`.
 - **`application_id`** *(optional)*: Custom instance ID for deployment
 - **`application_kwargs`** *(optional)*: Initialization parameters per deployment
 - **`application_env_vars`** *(optional)*: Environment variables per deployment  
@@ -1048,6 +1091,8 @@ websocket_service_id = app_status["service_ids"]["websocket_service_id"]
 webrtc_service_id = app_status["service_ids"]["webrtc_service_id"]
 ```
 
+Both ids are `None` until the proxy has registered the services with Hypha, which happens after every deployment of the app has a running replica. `status` reaches `RUNNING` before that, so poll for a non-`None` `websocket_service_id` rather than for `RUNNING`.
+
 #### WebSocket Connection
 
 Websocket connections send and receive their data through the connected Hypha server.
@@ -1088,7 +1133,9 @@ result = await webrtc_service.process_data(
 
 ```python
 # Start application
-app_id = await bioengine_worker_service.deploy_app("workspace/my-app")
+app_id = (
+    await bioengine_worker_service.deploy_app("workspace/my-app")
+)["application_id"]
 
 # Monitor application status (basic)
 app_status = await bioengine_worker_service.get_app_status(

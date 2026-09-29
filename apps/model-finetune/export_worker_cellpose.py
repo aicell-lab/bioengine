@@ -96,7 +96,7 @@ def _authors(raw):
 
 
 def _build_rdf(name, description, authors, license_id, diam_mean, provenance,
-               input_shape, output_shape, model_type="cpsam"):
+               input_shape, output_shape, model_type="cpsam", cell_diameters=None):
     import torch
 
     family = "Cellpose-DINO" if model_type in ("cpdino", "cpdino-vitb") else "Cellpose-SAM"
@@ -170,6 +170,14 @@ def _build_rdf(name, description, authors, license_id, diam_mean, provenance,
     }
     if provenance:
         rdf["config"]["cellpose_provenance"] = provenance
+    if cell_diameters:
+        rdf["config"]["cellpose_training_diameters"] = {
+            "min": round(float(cell_diameters["min"]), 2),
+            "max": round(float(cell_diameters["max"]), 2),
+            "median": round(float(cell_diameters["median"]), 2),
+            "units": "pixels",
+            "basis": "equivalent-circle diameter, 2*sqrt(area/pi), over training-label ROIs",
+        }
     return rdf
 
 
@@ -261,10 +269,11 @@ def main(session_id: str, export_dir: str) -> None:
     np.save(pkg_dir / "input_sample.npy", input_sample)
     np.save(pkg_dir / "output_sample.npy", output_sample)
 
+    cell_diameters = (training.read_status(session_id) or {}).get("cell_diameters")
     rdf = _build_rdf(
         name, request.get("description", ""), request.get("authors"), license_id,
         diam_mean, provenance, input_sample.shape[1:], output_sample.shape[1:],
-        model_type=model_type,
+        model_type=model_type, cell_diameters=cell_diameters,
     )
     (pkg_dir / "rdf.yaml").write_text(yaml.safe_dump(rdf, sort_keys=False))
     (pkg_dir / "documentation.md").write_text(_doc(name, session_id, diam_mean))

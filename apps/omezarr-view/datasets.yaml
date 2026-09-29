@@ -1,0 +1,54 @@
+title: OME-Zarr views over existing files
+
+# Deployed configuration. Local files are commented out because a worker
+# replica has no demo folder; point local_dir at a path on the cluster's shared
+# storage to serve an existing archive in place.
+sources:
+
+  # - type: local_dir
+  #   path: /mnt/archive/imaging
+
+  # REMOTE, explicit URLs — the Viv demo bucket serves range reads but denies
+  # listing (403 on ?list-type=2), so its contents must be named.
+  - type: remote_files
+    files:
+      - id: idr0106
+        url: https://viv-demo.storage.googleapis.com/idr0106.pyramid.ome.tif
+        title: idr0106 — human lung, 3-channel pyramid (42 GB)
+        licence: CC-BY-4.0
+        attribution: >-
+          IDR study idr0106; hosted as Viv demo data by HMS DBMI. Licence from
+          the IDR site-wide policy; the mirror exposes no per-dataset field.
+        source_page: https://idr.openmicroscopy.org/
+      - id: spraggins-kidney
+        url: https://viv-demo.storage.googleapis.com/Vanderbilt-Spraggins-Kidney-MxIF.ome.tif
+        title: Human kidney, multiplexed immunofluorescence
+        licence: CC-BY-4.0
+        attribution: >-
+          HuBMAP / Vanderbilt BIOMIC (Spraggins lab), mirrored as Viv demo data.
+          Licence from the HuBMAP portal-wide policy; this mirror exposes no
+          per-dataset licence field and no HBM id.
+        source_page: https://portal.hubmapconsortium.org/
+
+  # REMOTE, listed from a bucket prefix. Works where the bucket allows listing.
+  # - type: remote_prefix
+  #   url: s3://my-bucket/imaging/
+  #   anonymous: true
+
+  # DERIVED views — computed per request from a view above. The original file is
+  # still never rewritten, but these pixels are COMPUTED, not the source's own.
+  - type: derived
+    views:
+      - id: idr0106-training-10um
+        from: idr0106
+        title: idr0106 — training view, 10 µm/px, 2 channels, uint8
+        target_spacing_um: 10.0
+        channels: [alpha-SMA-FITC, A549-mCherry]
+        dtype: uint8
+        normalise: percentile
+      - id: kidney-training-4um
+        from: spraggins-kidney
+        title: Human kidney — training view, 4 µm/px, uint8
+        target_spacing_um: 4.0
+        dtype: uint8
+        normalise: percentile

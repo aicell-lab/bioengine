@@ -169,22 +169,33 @@ def read_status(session_id: str) -> Dict[str, Any]:
 
 _TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
 
+# A terminal status may only be changed by an equal-or-higher-ranked writer.
+# user stop must outrank a late child COMPLETED (the user asked it to stop); the
+# child (the training outcome) outranks the supervisor (which only sees the
+# subprocess rc) and the entry bare-except (which cannot see the child at all).
+_TERMINATED_BY = {"entry": 1, "supervisor": 2, "child": 3, "user_stop": 4}
+
 
 def write_status(session_id: str, **fields) -> Dict[str, Any]:
     """Atomically merge fields into the session's status.json.
 
-    A terminal status is sticky: once COMPLETED/FAILED/STOPPED is recorded, a
-    write that would change it to a *different* status is dropped. This blocks
-    both a late TRAINING heartbeat resurrecting a stopped session and a late
-    COMPLETED from a not-yet-reaped child overwriting the user's STOPPED. A
-    same-status write still lands, so the stop path can refine STOPPED with
-    end_time."""
+    A terminal status is provenance-ranked, not blanket-sticky: once
+    COMPLETED/FAILED/STOPPED is recorded, a write to a *different* status is
+    dropped only when its writer (``terminated_by``) ranks equal-or-lower than
+    the incumbent's. This lets the child's authoritative COMPLETED correct a
+    bystander's premature terminal (e.g. the entry bare-except FAILED) while a
+    user's STOPPED still survives a late child COMPLETED. A same-status write or
+    a field-only write (no ``status``) always lands, so heartbeats and end_time
+    refinements are unaffected. An unknown/absent ``terminated_by`` ranks 0."""
     p = _status_path(session_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     cur = read_status(session_id)
     cur_status, new_status = cur.get("status"), fields.get("status")
     if cur_status in _TERMINAL and new_status is not None and new_status != cur_status:
-        return cur
+        cur_prec = _TERMINATED_BY.get(cur.get("terminated_by"), 0)
+        new_prec = _TERMINATED_BY.get(fields.get("terminated_by"), 0)
+        if new_prec <= cur_prec:
+            return cur
     cur.update(fields)
     cur["updated_at"] = time.time()
     tmp = p.with_suffix(".json.tmp")
@@ -228,6 +239,20 @@ def stop_requested(session_id: str) -> bool:
     return _stop_path(session_id).exists()
 
 
+def _set_pdeathsig() -> None:
+    """preexec_fn: ask the kernel to SIGKILL this child when its parent (the runtime
+    replica) dies, so a training subprocess cannot outlive an OOM-killed supervisor
+    and orphan-hold the GPU (#0063). Linux-only (prctl PR_SET_PDEATHSIG=1); a no-op
+    elsewhere. Runs in the forked child before exec."""
+    try:
+        import ctypes
+        import signal as _signal
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, _signal.SIGKILL)
+    except Exception:
+        pass
+
+
 def run_cancellable_subprocess(
     argv: List[str], session_id: str, cwd: Optional[str] = None,
     env: Optional[Dict[str, str]] = None, poll: float = 2.0, grace: float = 10.0,
@@ -246,7 +271,8 @@ def run_cancellable_subprocess(
     stopped = False
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
-            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True
+            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+            preexec_fn=_set_pdeathsig,
         )
         while True:
             try:
@@ -323,6 +349,44 @@ def _to_hwc_or_hw(image: np.ndarray) -> np.ndarray:
     return image
 
 
+def coerce_label_array(label: np.ndarray) -> np.ndarray:
+    """Coerce a loaded label mask to a 2D integer instance map.
+
+    The annotation tool saves per-user masks as RGB(A) PNGs, not single-channel
+    label images, so those masks arrive here as H×W×3(4). A 2D array passes
+    through unchanged. A single-channel array is squeezed. A multi-channel array
+    is collapsed: if every channel is identical it is a grayscale label stored in
+    RGB (take one channel); otherwise it is a colour-encoded instance map, so each
+    distinct colour becomes a distinct id in raster order with pure black treated
+    as background (0). Ids are per-image and need not match across images.
+    """
+    arr = np.asarray(label)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        return arr[..., 0]
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        chan = arr[..., :3]
+        if np.all(chan == chan[..., :1]):
+            return chan[..., 0]
+        flat = chan.reshape(-1, chan.shape[-1])
+        colours, inv = np.unique(flat, axis=0, return_inverse=True)
+        inv = np.asarray(inv).reshape(-1)
+        ids = np.zeros(len(colours), dtype=np.int64)
+        next_id = 0
+        for k, col in enumerate(colours):
+            if np.any(col):
+                next_id += 1
+                ids[k] = next_id
+        return ids[inv].reshape(chan.shape[:2])
+    raise ValueError(
+        f"Unsupported label shape {arr.shape}: expected a 2D mask or an "
+        "RGB(A) instance PNG."
+    )
+
+
 def materialize_pairs(
     session_id: str,
     train: List[Tuple[np.ndarray, np.ndarray]],
@@ -363,7 +427,7 @@ def materialize_pairs(
         imgs, lbls = [], []
         for i, (im, lb) in enumerate(pairs):
             im = _to_hwc_or_hw(np.asarray(im))
-            lb = np.asarray(lb).astype(np.uint16)
+            lb = coerce_label_array(np.asarray(lb)).astype(np.uint16)
             ip = img_dir / f"{i:04d}.tif"
             lp = lbl_dir / f"{i:04d}.tif"
             tifffile.imwrite(str(ip), im)

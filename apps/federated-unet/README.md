@@ -213,6 +213,41 @@ that trains are different sets, and only the second one is obviously wrong when
 you forget it.** Anything derived from a sync should be checkable against the
 sync having happened, not assumed from the call having been made.
 
+### Failure mode: a handle that outlives the client it points at
+
+A multi-hour run meets roughly one transport event per night at this scale, and
+this campaign has now hit two with unrelated mechanisms.
+
+The first was a payload failure: on 2026-09-05 an S3 chunked read was cut
+mid-body and killed a run 42 rounds in. `CheckpointStore._retry` re-presigns and
+retries with exponential backoff, which covers it.
+
+The second was a session failure, and the first fix did not cover it because it
+hardened the checkpoint path and not the control path. On 2026-09-06 at
+22:02:24 UTC one replica's Hypha websocket was recycled; a replacement was
+serving thirteen seconds later. But a Hypha service proxy is pinned to the
+client id it was resolved against, and the driver resolved every app handle once
+at startup and then held it for twenty-three hours. The handle was permanently
+dead while the app behind it was healthy. The run died three hours into seed 0
+with `ConnectionError: Client disconnected`, and because results were flushed
+per seed, five completed arms went with it.
+
+Two guards, matching the two halves of that sentence:
+
+- `SiteHandle` re-resolves the app service and retries when a call fails with a
+  disconnect, instead of assuming a handle stays valid for the life of the run.
+- Results flush per **arm**, not per seed, and `--resume` keeps the arms already
+  in `metrics.json` and runs only the missing ones. An arm is the largest unit
+  that is worth nothing until it finishes.
+
+The retry has one thing to be careful about, worth stating because it is the
+part that is easy to get quietly wrong: `train` is not idempotent, and a blind
+retry of a call whose response was lost *after* it landed would double that
+site's optimiser steps — breaking the equal-compute invariant every arm
+comparison rests on, silently. So the retry does not assume; it asks the site
+for its own history and reuses the existing record if the round's `tag` is
+already there. Tags are unique within a run for exactly this reason.
+
 ## Data
 
 All CC0. `deploy.py --layout` picks which one the instances hold:
@@ -334,6 +369,23 @@ python run_federated.py --layout acquisition-4site \
 
 which writes `metrics.json`, `provenance.json` and `transport_audit.json` into
 `../bioengine-paper/analysis/results/federated-unet-<run-id>/`.
+
+Each arm is scored on the held-out test splits and written out the moment it
+finishes, rather than at the end of its seed: `arm_seed_<n>_<arm>.json` (per-image
+test scores, the validation curve, the round records) and, with `--previews`, the
+`preview_seed_<n>_<arm>_*.png` panels. Those files are written once and never
+rewritten, and each one opens with a `status` field saying it is a single seed —
+a reader watching the directory gets usable material while the run is still
+going, without any of it being mistakable for a pre-registered verdict, which is
+defined over all five seeds.
+
+`metrics.json` accumulates the same records and is rewritten after every arm, so
+a run that dies keeps everything that finished. To carry on, repeat the command with the *same* `--run-id` — the
+round checkpoints have to still be reachable — and add `--resume`:
+
+```bash
+python run_federated.py --run-id 20260906-0912 --resume --layout consortium ...
+```
 
 This is a development app. It is deployed private
 (`authorized_users: [nils.mech@gmail.com]`) and is not intended for general use.

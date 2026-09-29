@@ -289,10 +289,12 @@ class CodeExecutor:
                 "data-scientist@company.com",
                 "system-admin@company.com"
             ])
-
-            # For development/testing only - allow anyone
-            await executor.initialize(admin_users=["*"])
             ```
+
+            There is no wildcard form. The worker drops a '*' entry from its
+            admin users before this is called, because run_code on a wildcard
+            list is arbitrary code execution open to every caller that can
+            reach the Hypha server, anonymous ones included.
 
         Note:
             This method must be called before any run_code() attempts,

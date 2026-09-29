@@ -58,6 +58,20 @@ def _format_vram(used, total):
     return f"{_gib(used)}/{_gib(total)} GiB"
 
 
+def _format_gpu_label(info):
+    """Render a node's GPU as its real device name plus the schedulable label.
+
+    ``accelerator_type`` is the string ``@ray.remote(accelerator_type=...)``
+    matches on, and Ray truncates it to a single letter on consumer cards, so
+    both are shown rather than one standing in for the other.
+    """
+    accelerator_type = info.get("accelerator_type") or "?"
+    device_name = info.get("gpu_device_name")
+    if not device_name or device_name == "NA":
+        return accelerator_type
+    return f"{device_name} (accelerator_type={accelerator_type})"
+
+
 @click.group("cluster")
 def cluster_group():
     """Inspect BioEngine Ray cluster resources (GPUs, CPUs, memory)."""
@@ -125,10 +139,20 @@ def cluster_status(as_json, worker_service_id, token, server_url):
                     info.get("used_gpu_memory", 0), info.get("total_gpu_memory", 0)
                 )
                 role = "HEAD" if info.get("head") else "worker"
+                # On a VRAM_MB node the GPU fraction is a count of 0.01 device
+                # handles, so it reads as idle at full reservation; show what
+                # actually bounds packing next to it.
+                total_vram_mb = info.get("total_vram_mb", 0)
+                booked = (
+                    f"booked: {info.get('used_vram_mb', 0):.0f}/{total_vram_mb:.0f} MB  "
+                    if total_vram_mb
+                    else ""
+                )
                 click.echo(
                     f"  {info.get('node_ip')} [{role}] "
-                    f"{info.get('accelerator_type', '?')} "
-                    f"GPU: {info.get('used_gpu', 0):.1f}/{info.get('total_gpu', 0):.0f} "
+                    f"{_format_gpu_label(info)} "
+                    f"GPU: {info.get('used_gpu', 0):.2f}/{info.get('total_gpu', 0):.0f} "
+                    f"{booked}"
                     f"VRAM: {vram}  "
                     f"CPU: {info.get('used_cpu', 0):.0f}/{info.get('total_cpu', 0):.0f}"
                 )

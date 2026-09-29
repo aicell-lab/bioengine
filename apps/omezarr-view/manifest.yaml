@@ -1,0 +1,18 @@
+name: OME-Zarr View
+id: omezarr-view
+id_emoji: '🔎'
+covers: []
+description: Serve existing image files (OME-TIFF, CZI, ...) as lazy OME-Zarr views, local or remote, without converting them
+documentation: README.md
+authors:
+- {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
+maintainers: [nilsmechtel]
+license: MIT
+format_version: 0.6.0
+git_repo: https://github.com/aicell-lab/bioengine
+links: []
+tags: [ome-zarr, ngff, data-access, bioio, kerchunk, vizarr]
+type: ray-serve
+version: 0.2.4
+entry: deployment:OmeZarrViewApp
+frontend_entry: "frontend/index.html"

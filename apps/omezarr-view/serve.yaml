@@ -1,0 +1,9 @@
+name: omezarr-view
+process:
+  command: ./serve.sh
+  port: 8842
+  workdir: /data/nmechtel/bioengine/apps/omezarr-view
+  warmup_path: /health
+  idle_timeout_sec: 900
+  wake_on_request: true
+access: link

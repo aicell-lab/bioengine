@@ -1594,6 +1594,7 @@
     <li><strong>3D spatial relationships.</strong> "On top of" / "under" / "behind" are routinely mis-judged, especially when reference images push the wrong way (a well-known anchor-bias failure).</li>
     <li><strong>Domain-specific patterns it wasn't trained on.</strong> Zero-shot detection on novel medical / microscopy categories is below 7 % mAP — references carry most of the signal.</li>
     <li><strong>Hallucination under ambiguity.</strong> When visual evidence is weak the model falls back on language priors and can invent details that aren't there.</li>
+    <li><strong>Saying "I cannot tell".</strong> A verdict can be <em>unsure</em>, but across 4 479 recorded calls on two model sizes and five criteria it never once was — the model does not elect to abstain, and offering it a fresh "equally good" option in a separate test left it unused on 57 of 72 images where it was the only correct answer. Every result you get back will be a decision. Don't read the absence of <em>unsure</em> as confidence.</li>
     <li><strong>The yes/no itself, more than the seeing.</strong> Ask a question and its negation about the same image and the answers agree only 31 % of the time (1932 calls) — the model leans affirmative whichever way the question points. This survives even where perception is perfect: on an easy natural-image control it was right 60 times out of 60, yet swapping PASS and FAIL in the criterion still failed to move the verdict. Ask both ways and treat disagreement as unsure, or read the reason and decide yourself.</li>
   </ul>
 

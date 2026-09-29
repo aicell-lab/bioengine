@@ -52,6 +52,7 @@ from bioengine.apps.proxy_deployment import ProxyDeployment
 from bioengine.utils import (
     create_logger,
     get_pip_requirements,
+    latest_committed_version,
     update_requirements,
     validate_manifest,
 )
@@ -160,10 +161,7 @@ class AppBuilder:
             if manifest is None:
                 raise ValueError(f"Manifest not found in artifact {artifact_id}.")
             if version is None:
-                versions = artifact.get("versions") or []
-                if versions:
-                    latest = max(versions, key=lambda v: v["created_at"])
-                    resolved_version = latest["version"]
+                resolved_version = latest_committed_version(artifact)
 
         validate_manifest(manifest)
         return manifest, resolved_version

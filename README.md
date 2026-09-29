@@ -71,7 +71,13 @@ Facility managers and system administrators can deploy a private worker on any h
 | **Kubernetes** | Production deployment with KubeRay |
 
 ```bash
-# Docker — single machine quickstart
+# Single machine quickstart — runs the worker image in a container
+pip install "bioengine[cli]"
+bioengine worker start -- --mode single-machine --head-num-cpus 4
+```
+
+```bash
+# Or from a clone, with docker compose
 git clone https://github.com/aicell-lab/bioengine.git
 cd bioengine
 mkdir -p .bioengine data
@@ -118,11 +124,19 @@ server = await connect_to_server({"server_url": "https://hypha.aicell.io", "toke
 worker = await server.get_service("bioimage-io/bioengine-worker")
 
 status = await worker.get_status()
-app_id = await worker.deploy_app(
+deployed = await worker.deploy_app(
     artifact_id="bioimage-io/cellpose-finetuning",
     application_id="cellpose-finetuning",
+    version="0.0.28",
 )
+app_id = deployed["application_id"]
 ```
+
+`deploy_app` returns a dictionary describing what it deployed —
+`application_id`, `artifact_id`, `version` and `version_source`. Omitting
+`version` for an application that is already running redeploys *that* version
+rather than the artifact's newest, and `version_source == "inherited"` is the
+only signal that this happened.
 
 ### CLI
 
@@ -131,6 +145,7 @@ pip install "bioengine[cli] @ git+https://github.com/aicell-lab/bioengine.git"
 
 bioengine call bioimage-io/bioengine-worker get_status
 bioengine apps list --worker bioimage-io/bioengine-worker
+bioengine worker start -- --mode single-machine
 ```
 
 ### Worker service API
@@ -138,7 +153,7 @@ bioengine apps list --worker bioimage-io/bioengine-worker
 | Method | Admin | Description |
 |--------|:-----:|-------------|
 | `get_status()` | | Worker and cluster status |
-| `deploy_app(artifact_id, ...)` | ✓ | Deploy an application |
+| `deploy_app(artifact_id, ...)` | ✓ | Deploy an application; returns `{application_id, artifact_id, version, version_source}` |
 | `stop_app(application_id)` | ✓ | Stop a running application |
 | `get_app_status(application_ids)` | | Status of specific applications |
 | `list_apps()` | ✓ | All deployed applications |

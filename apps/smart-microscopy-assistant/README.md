@@ -125,7 +125,9 @@ Define a visual test once with `create_visual_test(...)`, then call `inspect(ima
 }
 ```
 
-`verdict` is one of `"passed"`, `"failed"`, or `"unsure"`. The model returns `unsure` when the visible evidence is genuinely ambiguous or insufficient; the parser also defaults to `unsure` when the output doesn't follow the `VERDICT: …` schema (the raw text is always in `description`).
+`verdict` is one of `"passed"`, `"failed"`, or `"unsure"`. The contract offers `unsure` on two routes — the model may elect it when the visible evidence is genuinely ambiguous, and the parser falls back to it when the output doesn't follow the `VERDICT: …` schema (the raw text is always in `description`).
+
+**Neither route has ever fired.** In a census of 4,479 recorded calls across two model backbones and five criteria, `unsure` was never returned — not elected by the model, not reached by the parser fallback, and the word never appeared in a raw generation before parsing. The observed value space was exactly `passed` and `failed`. This is a census of those runs rather than a guarantee about all inputs, but treat it as the expected behaviour: **do not build a workflow that waits on `unsure`**, and do not read its absence as confidence. If you need an "I cannot tell", you have to derive it yourself — for example by asking the criterion both ways and treating disagreement as unresolved.
 
 `downscaled_from` and `downscale_note` may be present in either mode when the server resized the inspected image.
 

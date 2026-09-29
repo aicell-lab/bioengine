@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import json
-import urllib.error
+import http.client
 import urllib.request
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -150,15 +150,26 @@ class BioEngineProxyActor:
             str, Dict[str, Dict[str, Dict[str, Optional[str]]]]
         ] = {}
 
+        # Whether each application's ProxyDeployment currently has its Hypha
+        # services registered, pushed by the proxy replica itself. A missing
+        # entry means "never reported", which is not the same as False — an app
+        # that predates this actor keeps serving without ever reporting here.
+        # The replica id is kept so a departing replica cannot overwrite its
+        # successor's verdict; see report_service_registration and
+        # claim_service_registration.
+        # Structure: {app_id: {"replica_id": str|None, "registered": bool}}
+        self.service_registrations: Dict[str, Dict[str, Any]] = {}
+
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
-        # Last successful per-node GPU memory read from the Ray dashboard. The
-        # dashboard sits behind a KubeRay auth proxy where a cold one-shot fetch
-        # can time out; a single miss must not erase the cluster's (static) GPU
-        # capacity, which get_gpu_memory_sizing() needs at deploy time. The
+        # Last successful per-node GPU read (memory and device names) from the
+        # Ray dashboard. The dashboard sits behind a KubeRay auth proxy where a
+        # cold one-shot fetch can time out; a single miss must not erase the
+        # cluster's (static) GPU capacity, which get_gpu_memory_sizing() needs
+        # at deploy time. The
         # frequently-polled status path keeps this warm, so a deploy-time sizing
         # read reuses the last good snapshot instead of a fresh cold fetch.
-        self._last_per_node_gpu_memory: Dict[str, Dict[str, int]] = {}
+        self._last_per_node_gpu_info: Dict[str, Dict[str, Any]] = {}
 
         # Real device-wide VRAM usage pushed by GPU app replicas via
         # report_gpu_memory (cuMemGetInfo, truthful on vGPU where NVML is
@@ -334,6 +345,13 @@ class BioEngineProxyActor:
     def _get_accelerator_type(self, resources: Dict[str, float]) -> Optional[str]:
         """Extract the GPU/accelerator type from a node's resource dictionary.
 
+        Ray derives this label from the NVML device name with a regex that keeps
+        only uppercase letters and digits, so consumer cards truncate ("NVIDIA
+        GeForce RTX 3090" becomes "G"). It is still the exact value
+        ``@ray.remote(accelerator_type=...)`` matches on, so it is reported
+        verbatim; the untruncated device name is reported separately as
+        ``gpu_device_name``.
+
         Args:
             resources: Node resource dictionary with resource names as keys.
 
@@ -342,7 +360,7 @@ class BioEngineProxyActor:
         """
         for resource_name in resources:
             if resource_name.startswith("accelerator_type:"):
-                return resource_name.lstrip("accelerator_type:")
+                return resource_name.removeprefix("accelerator_type:")
 
     def _get_slurm_job_id(self, resources: Dict[str, float]) -> Optional[str]:
         """Extract the SLURM job ID from a node's resource dictionary.
@@ -376,19 +394,19 @@ class BioEngineProxyActor:
             webui_url = f"http://{webui_url}"
         return webui_url
 
-    def _get_per_node_gpu_memory_usage(
+    def _get_per_node_gpu_info(
         self,
-    ) -> Tuple[Dict[str, Dict[str, int]], bool]:
-        """Fetch per-node GPU memory usage from Ray dashboard node summary.
+    ) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+        """Fetch per-node GPU memory usage and device names from the Ray dashboard.
 
         Returns:
-            Mapping {node_id: {"total_gpu_memory": int, "used_gpu_memory": int}}
-            with values in bytes, and a bool indicating if dashboard data is
-            currently available.
+            Mapping {node_id: {"total_gpu_memory": int, "used_gpu_memory": int,
+            "gpu_device_name": Optional[str]}} with memory values in bytes, and
+            a bool indicating if dashboard data is currently available.
         """
         webui_url = self._get_dashboard_webui_url()
         if not webui_url:
-            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
+            return self._last_per_node_gpu_info, bool(self._last_per_node_gpu_info)
 
         url = f"{webui_url}/nodes?view=summary"
         # KubeRay (and some other managed Ray distributions) put the dashboard
@@ -404,19 +422,22 @@ class BioEngineProxyActor:
         try:
             with urllib.request.urlopen(request, timeout=2.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        # OSError covers URLError, TimeoutError and the raw socket errors urllib
+        # leaves unwrapped; HTTPException covers the ones it does not, which
+        # getresponse() re-raises unwrapped.
+        except (OSError, http.client.HTTPException, json.JSONDecodeError, ValueError):
             logger.debug(
                 "Failed to fetch Ray node summary from dashboard endpoint %s",
                 url,
                 exc_info=True,
             )
-            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
+            return self._last_per_node_gpu_info, bool(self._last_per_node_gpu_info)
 
         if not payload.get("result"):
-            return self._last_per_node_gpu_memory, bool(self._last_per_node_gpu_memory)
+            return self._last_per_node_gpu_info, bool(self._last_per_node_gpu_info)
 
         summary = payload.get("data", {}).get("summary", [])
-        per_node_gpu_memory: Dict[str, Dict[str, int]] = {}
+        per_node_gpu_info: Dict[str, Dict[str, Any]] = {}
         for node in summary:
             node_id = node.get("raylet", {}).get("nodeId")
             if not node_id:
@@ -424,17 +445,22 @@ class BioEngineProxyActor:
 
             total_gpu_memory_mb = 0
             used_gpu_memory_mb = 0
+            device_names: List[str] = []
             for gpu in node.get("gpus") or []:
                 total_gpu_memory_mb += int(gpu.get("memoryTotal", 0) or 0)
                 used_gpu_memory_mb += int(gpu.get("memoryUsed", 0) or 0)
+                device_name = gpu.get("name")
+                if device_name and device_name not in device_names:
+                    device_names.append(device_name)
 
-            per_node_gpu_memory[node_id] = {
+            per_node_gpu_info[node_id] = {
                 "total_gpu_memory": total_gpu_memory_mb * 1024 * 1024,
                 "used_gpu_memory": used_gpu_memory_mb * 1024 * 1024,
+                "gpu_device_name": ", ".join(device_names) or None,
             }
 
-        self._last_per_node_gpu_memory = per_node_gpu_memory
-        return per_node_gpu_memory, True
+        self._last_per_node_gpu_info = per_node_gpu_info
+        return per_node_gpu_info, True
 
     def get_gpu_memory_sizing(self) -> Dict[str, Any]:
         """GPU sizing hints for VRAM-based deployment (used by AppBuilder).
@@ -451,7 +477,7 @@ class BioEngineProxyActor:
         """
         vram_advertised = float(ray.cluster_resources().get("VRAM_MB", 0) or 0) > 0
 
-        per_node, dashboard_available = self._get_per_node_gpu_memory_usage()
+        per_node, dashboard_available = self._get_per_node_gpu_info()
         min_gpu_total_mb: Optional[int] = None
         if dashboard_available:
             totals = self.global_state.total_resources_per_node()
@@ -506,6 +532,8 @@ class BioEngineProxyActor:
                     "used_cpu": float,
                     "total_gpu": float,
                     "used_gpu": float,
+                    "total_vram_mb": float,
+                    "used_vram_mb": float,
                     "pending_resources": {  # if check_pending_resources=True
                         "actors": List[Dict],
                         "jobs": List[Dict],
@@ -521,13 +549,16 @@ class BioEngineProxyActor:
                         "used_cpu": float,
                         "total_gpu": float,
                         "used_gpu": float,
+                        "total_vram_mb": float,  # VRAM_MB advertised, 0 if none
+                        "used_vram_mb": float,   # VRAM_MB booked by the scheduler
                         "total_gpu_memory": Union[int, str],  # in bytes or "NA"
                         "used_gpu_memory": Union[int, str],  # in bytes or "NA"
                         "total_memory": float,
                         "used_memory": float,
                         "total_object_store_memory": float,
                         "used_object_store_memory": float,
-                        "accelerator_type": Optional[str],
+                        "accelerator_type": Optional[str],  # schedulable label
+                        "gpu_device_name": Optional[str],  # display only
                         "slurm_job_id": Optional[str]
                     }
                 }
@@ -552,7 +583,7 @@ class BioEngineProxyActor:
                 exc_info=True,
             )
             available_resources_per_node = {}
-        gpu_memory_per_node, dashboard_available = self._get_per_node_gpu_memory_usage()
+        gpu_info_per_node, dashboard_available = self._get_per_node_gpu_info()
         now = time.time()
 
         cluster_state = {
@@ -561,6 +592,8 @@ class BioEngineProxyActor:
                 "used_cpu": 0,
                 "total_gpu": 0,
                 "used_gpu": 0,
+                "total_vram_mb": 0,
+                "used_vram_mb": 0,
                 "total_memory": 0,
                 "used_memory": 0,
                 "total_gpu_memory": 0,
@@ -586,8 +619,19 @@ class BioEngineProxyActor:
             available_cpu = available_resources.get("CPU", 0)
             total_gpu = total_resources.get("GPU", 0)
             available_gpu = available_resources.get("GPU", 0)
+            # Where the node advertises VRAM_MB, that resource — not GPU — is
+            # what bounds packing: the AppBuilder books a 0.01 GPU handle per
+            # replica purely to bind a device, so used_gpu reads as near-idle on
+            # a GPU whose VRAM is fully reserved.
+            total_vram_mb = total_resources.get("VRAM_MB", 0)
+            available_vram_mb = available_resources.get("VRAM_MB", 0)
             accelerator_type = (
                 "NA" if total_gpu == 0 else self._get_accelerator_type(total_resources)
+            )
+            gpu_device_name = (
+                "NA"
+                if total_gpu == 0
+                else gpu_info_per_node.get(node_id, {}).get("gpu_device_name")
             )
             total_memory = total_resources.get("memory", 0)
             available_memory = available_resources.get("memory", 0)
@@ -605,7 +649,7 @@ class BioEngineProxyActor:
                 # fresh cuMemGetInfo sample pushed by a live GPU replica, else
                 # "NA" (idle node / no live reporter).
                 if dashboard_available:
-                    total_gpu_memory = gpu_memory_per_node.get(
+                    total_gpu_memory = gpu_info_per_node.get(
                         node_id, {"total_gpu_memory": 0}
                     )["total_gpu_memory"]
                 else:
@@ -626,6 +670,8 @@ class BioEngineProxyActor:
                 "used_cpu": max(0, total_cpu - available_cpu),
                 "total_gpu": total_gpu,
                 "used_gpu": max(0, total_gpu - available_gpu),
+                "total_vram_mb": total_vram_mb,
+                "used_vram_mb": max(0, total_vram_mb - available_vram_mb),
                 "total_gpu_memory": total_gpu_memory,
                 "used_gpu_memory": used_gpu_memory,
                 "total_memory": total_memory,  # in bytes
@@ -635,6 +681,7 @@ class BioEngineProxyActor:
                     0, total_object_store_memory - available_object_store_memory
                 ),  # in bytes
                 "accelerator_type": accelerator_type,
+                "gpu_device_name": gpu_device_name,
                 "slurm_job_id": self._get_slurm_job_id(total_resources),
             }
 
@@ -825,9 +872,99 @@ class BioEngineProxyActor:
         """
         self.application_replicas.pop(application_id, None)
         self.replica_identities.pop(application_id, None)
+        self.service_registrations.pop(application_id, None)
         logger.info(
             f"Cleared all registered replicas for application '{application_id}'."
         )
+
+    @_touch_on_call
+    def claim_service_registration(
+        self, application_id: str, replica_id: Optional[str] = None
+    ) -> None:
+        """Hand an application's record to a replica that is starting right now.
+
+        Pushed from ``ProxyDeployment.__init__``, and unconditional: only a
+        starting replica can claim, so it is by construction the newest one,
+        and it has no Hypha services of its own yet.
+
+        This is what a plain ``False`` report cannot do. The tag guard in
+        ``report_service_registration`` drops a ``False`` whenever the record
+        still belongs to a predecessor — which is exactly the state a replica
+        that died without running ``__del__`` leaves behind (SIGKILL, lost
+        node, health-driven restart). The record would stay ``True`` under a
+        dead replica's tag and the worker would keep advertising an address
+        that answers nothing until the new replica finishes starting.
+        """
+        self.service_registrations[application_id] = {
+            "replica_id": replica_id,
+            "registered": False,
+        }
+        logger.info(
+            f"Replica '{replica_id}' claimed the Hypha registration record of "
+            f"application '{application_id}'; no services registered yet."
+        )
+
+    @_touch_on_call
+    def report_service_registration(
+        self,
+        application_id: str,
+        registered: bool,
+        replica_id: Optional[str] = None,
+    ) -> None:
+        """Record whether an application's Hypha services exist right now.
+
+        Pushed by ``ProxyDeployment``: True once ``_register_services``
+        succeeds, False again on deregistration. The worker reads it before
+        advertising the app's service address, so a client is never handed an
+        id that nothing answers yet. The record itself is opened by
+        ``claim_service_registration`` at replica init.
+
+        A ``False`` is honoured only from the replica this record already
+        belongs to. Across a replica generation the two reports race: the
+        incoming replica claims the record, registers and reports True, and the
+        outgoing one's ``__del__`` deregisters afterwards. Taking that last
+        write would leave a healthy app reading False until the serving
+        replica's next reachability probe re-asserts True. A ``True``, and any
+        report about an app with no record, always takes over — those can only
+        come from a replica that is serving now.
+
+        That periodic re-assert, not this guard, is what makes the record
+        self-correcting: a claim from a successor that then never registers
+        would otherwise hold a serving app at False indefinitely.
+        """
+        current = self.service_registrations.get(application_id)
+        if (
+            current is not None
+            and not registered
+            and replica_id != current["replica_id"]
+        ):
+            logger.info(
+                f"Ignoring deregistration of '{application_id}' from replica "
+                f"'{replica_id}': the record belongs to replica "
+                f"'{current['replica_id']}'."
+            )
+            return
+
+        self.service_registrations[application_id] = {
+            "replica_id": replica_id,
+            "registered": registered,
+        }
+        logger.info(
+            f"Application '{application_id}' reported its Hypha services as "
+            f"{'registered' if registered else 'not registered'} "
+            f"(replica '{replica_id}')."
+        )
+
+    @_touch_on_call
+    def get_service_registration(self, application_id: str) -> Optional[bool]:
+        """Last reported Hypha registration state, or None if never reported.
+
+        None is not False: an app whose proxy replica started before this actor
+        existed — a different BioEngine version, or an actor recreated after
+        eviction — serves perfectly well without ever reporting here.
+        """
+        record = self.service_registrations.get(application_id)
+        return None if record is None else record["registered"]
 
     @_touch_on_call
     def get_replica_identities(

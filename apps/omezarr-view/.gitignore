@@ -1,0 +1,11 @@
+data/
+server.log
+served_measurements.json
+.demo-token
+.svamp/
+__pycache__/
+*.pyc
+served_derived.json
+.training_demo/
+annotations/
+training_run.log
