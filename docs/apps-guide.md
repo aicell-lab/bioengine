@@ -1209,6 +1209,28 @@ The `get_app_status()` method provides comprehensive information about your depl
 - Deployment details and replica states
 - **Logs from active and previous replicas**
 
+**Authentication widens the response.** The worker service is public and anyone
+may read an application's health, version and service ids — that is how you
+watch a deployment come up and how a user checks whether an app is answering.
+These come back only to a worker admin or to a caller named in the
+application's own `authorized_users`:
+
+| Field | Why it is held back |
+|---|---|
+| `authorized_users` | The addresses of people who never interacted with this worker |
+| `last_updated_by` | The identity of whoever last deployed it |
+| `application_env_vars` | Values are masked either way, but the *names* say which third-party services the app talks to |
+| `application_kwargs` | Free-form text somebody typed at deploy time |
+| `deployments.<name>.logs` | Unfiltered replica stdout/stderr |
+
+A `"*"` entry in `authorized_users` does not earn them: the wildcard authorizes
+calling the application, not reading who else may call it.
+
+Treat the log field accordingly — **anything a replica prints is readable by
+everyone entitled to that application**, which is why a token must never be
+logged (`tests/apps/test_download_token_log_hygiene.py` pins this for the one
+place it nearly was).
+
 **Example: Debugging a Failed Deployment**
 
 ```python
