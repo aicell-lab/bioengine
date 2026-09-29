@@ -507,12 +507,11 @@ def _print_single_status(app_id: str, info: dict) -> None:
             dep_status = dep_info.get("status", "?") if isinstance(dep_info, dict) else dep_info
             click.echo(f"    [{dep_name}]  {dep_status}")
 
-    logs = info.get("logs", "")
-    if logs:
+    if deployments:
         click.echo(f"\n  Recent logs:")
-        for line in str(logs).split("\n")[-10:]:
-            if line.strip():
-                click.echo(f"    {line}")
+        for dep_name, dep_info in deployments.items():
+            click.echo(f"    [{dep_name}]")
+            _echo_deployment_logs(dep_info, indent="      ", max_lines=10)
 
 
 # ── logs ──────────────────────────────────────────────────────────────────────
@@ -569,18 +568,51 @@ def logs(app_id, tail, as_json, worker_service_id, token, server_url):
 def _print_logs(app_id: str, info: dict) -> None:
     click.echo(f"Logs for '{app_id}':")
     deployments = info.get("deployments", {})
-    if deployments:
-        for dep_name, dep_info in deployments.items():
-            click.echo(f"\n--- {dep_name} ---")
-            if isinstance(dep_info, dict):
-                replicas = dep_info.get("replicas", [dep_info])
-                for replica in replicas:
-                    logs = replica.get("logs", "") if isinstance(replica, dict) else ""
-                    if logs:
-                        click.echo(logs)
-    else:
-        logs = info.get("logs", "No logs available.")
-        click.echo(logs)
+    if not deployments:
+        click.echo(info.get("message") or "No deployments to show logs for.")
+        return
+
+    for dep_name, dep_info in deployments.items():
+        click.echo(f"\n--- {dep_name} ---")
+        _echo_deployment_logs(dep_info)
+
+
+def _echo_deployment_logs(dep_info: dict, indent: str = "", max_lines: int = -1) -> None:
+    """Print one deployment's replica logs from ``deployments.<name>.logs``.
+
+    That field is a mapping of replica id to its ``stdout``/``stderr`` lines, and
+    it is *absent* rather than empty when the caller may not read it — so the
+    withheld case must not print the same thing as "nothing logged yet".
+    """
+    if "logs" not in dep_info:
+        click.echo(
+            f"{indent}Logs withheld: reading replica logs requires worker admin "
+            "rights or membership of this application's authorized_users."
+        )
+        return
+
+    logs = dep_info["logs"] or {}
+    if "error" in logs:
+        click.echo(f"{indent}Log retrieval failed: {logs['error']}")
+        return
+
+    printed = False
+    for replica_id, streams in logs.items():
+        for stream in ("stdout", "stderr"):
+            lines = streams.get(stream) or []
+            if isinstance(lines, str):
+                lines = lines.splitlines()
+            if max_lines >= 0:
+                lines = lines[len(lines) - max_lines :]
+            if not lines:
+                continue
+            click.echo(f"{indent}[{replica_id}] {stream}")
+            for line in lines:
+                click.echo(f"{indent}  {line}")
+            printed = True
+
+    if not printed:
+        click.echo(f"{indent}No logs recorded yet.")
 
 
 # ── stop ──────────────────────────────────────────────────────────────────────
