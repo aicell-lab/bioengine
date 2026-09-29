@@ -26,25 +26,41 @@ With none of them set the worker prompts for an interactive login, which is fine
 On Kubernetes, mount the Secret and point `--token-file` at it rather than expanding it into an argument:
 
 ```yaml
-args:
-  - "--token-file=/var/run/secrets/hypha/token"
-volumeMounts:
-  - name: hypha-token
-    mountPath: /var/run/secrets/hypha
-    readOnly: true
-volumes:
-  - name: hypha-token
-    secret:
-      secretName: bioengine-worker
-      defaultMode: 0400
-      items:
-        - key: token
-          path: token
+spec:
+  securityContext:
+    fsGroup: 65534            # must match the container's runAsGroup
+  containers:
+    - name: bioengine-worker
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+      args:
+        - "--token-file=/var/run/secrets/hypha/token"
+      volumeMounts:
+        - name: hypha-token
+          mountPath: /var/run/secrets/hypha
+          readOnly: true
+  volumes:
+    - name: hypha-token
+      secret:
+        secretName: bioengine-worker
+        defaultMode: 0440
+        items:
+          - key: token
+            path: token
 ```
 
-**`defaultMode: 0400` is not optional.** A Secret volume is mounted `0644` by default — world-readable inside the container, which is the same exposure this is meant to remove. `0400` limits the file to the uid the worker runs as.
+**Set the mode and `fsGroup` together, or the worker will not start.** A Secret volume is mounted `0644` by default — world-readable inside the container, which is the same exposure this is meant to remove. But kubelet writes those files as `root:root` unless `fsGroup` is set, so tightening the mode without it locks out the very process that needs to read the file, and the worker then exits with `Could not read --token-file`. Two working combinations:
 
-Substitute your own secret name and key. `items` maps a key in the Secret to a filename in the mount, so a Secret holding the token under `HYPHA_TOKEN` needs `- key: HYPHA_TOKEN` — a mismatched key mounts nothing and the worker falls through to an interactive login it cannot complete.
+| Container runs as | Mode | `fsGroup` | Who can read |
+|---|---|---|---|
+| non-root (`runAsUser: 65534`) | `0440` | `65534` | root and the worker's group |
+| root | `0400` | — | root only |
+
+The worker image sets no `USER`, so a plain `docker run` is root and `0400` works. Production Kubernetes deployments generally are not root — the KTH chart runs `runAsNonRoot: true, runAsUser: 65534` — which is why `0400` alone is the wrong default to copy.
+
+Substitute your own secret name and key. `items` maps a key in the Secret to a filename in the mount, so a Secret holding the token under `HYPHA_TOKEN` needs `- key: HYPHA_TOKEN`. Get it wrong and kubelet refuses to set the volume up at all (`FailedMount`, `references non-existent secret key`) and the container never starts; mark the volume `optional: true` and the file is simply absent, at which point the worker exits at startup with `Could not read --token-file`.
 
 `--token=$(HYPHA_TOKEN)` is the shape to avoid: Kubernetes expands it at render time, so the Deployment spec keeps only the placeholder and looks clean under `kubectl get deploy -o yaml` while the live process carries the value.
 
@@ -205,9 +221,15 @@ spec:
   replicas: 1
   template:
     spec:
+      securityContext:
+        fsGroup: 65534           # lets runAsGroup read the mounted Secret
       containers:
         - name: bioengine-worker
           image: ghcr.io/aicell-lab/bioengine-worker:latest
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
           args:
             - python
             - -m
@@ -231,7 +253,7 @@ spec:
         - name: hypha-token
           secret:
             secretName: bioengine-worker
-            defaultMode: 0400
+            defaultMode: 0440
             items:
               - key: token
                 path: token

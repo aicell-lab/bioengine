@@ -84,7 +84,8 @@ def _launch(tmp_path, worker_args, env_token=None):
     resolved = json.loads(probe_out.read_text())
 
     # The probe must have exercised this checkout, not an installed bioengine.
-    assert resolved.pop("_bioengine_file").startswith(str(CHECKOUT_ROOT))
+    # Trailing separator: a sibling directory sharing the prefix is not this one.
+    assert resolved.pop("_bioengine_file").startswith(str(CHECKOUT_ROOT) + os.sep)
 
     return resolved, cmdline
 
