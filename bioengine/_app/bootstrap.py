@@ -417,10 +417,10 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
     """Merge the framework's pip entries (``to_add``) into the user's
     (``base``), with the framework winning on package-name collision.
 
-    ``to_add`` carries the versions the *worker* has installed. Those
-    packages (``hypha-rpc``, ``pydantic``) are the ones whose objects cross
-    the cloudpickle boundary between worker and replica, so the worker
-    dictates them and an app cannot pin its way onto a different one. The
+    ``to_add`` carries the versions the *worker* has installed, for the
+    packages whose objects cross the cloudpickle boundary between worker
+    and replica — today that is ``hypha-rpc`` and nothing else. The worker
+    dictates those and an app cannot pin its way onto a different one. The
     replaced entry keeps the user's position in the list; everything the
     user declared that the framework does not own is untouched.
 
