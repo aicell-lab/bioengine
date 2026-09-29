@@ -16,6 +16,7 @@ machinery, so the delegation only fires for ``BioEngineDatasets`` instance
 methods that aren't already module attributes.
 """
 
+from bioengine._app.errors import DataServerError
 from bioengine.datasets.datasets import BioEngineDatasets
 
 
@@ -36,4 +37,4 @@ def __getattr__(name: str):
         ) from exc
 
 
-__all__ = ["BioEngineDatasets"]
+__all__ = ["BioEngineDatasets", "DataServerError"]
