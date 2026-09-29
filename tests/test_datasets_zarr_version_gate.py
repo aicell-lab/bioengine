@@ -12,7 +12,11 @@ import importlib.util
 import pytest
 import zarr
 
-from bioengine.datasets import http_zarr_store
+# Imported by full path on purpose: ``from bioengine.datasets import http_zarr_store``
+# goes through the package's __getattr__ delegation and raises
+# MissingDataServerError instead of importing the submodule — which would mask
+# the gate's own ImportError in exactly the case this file exists to check.
+import bioengine.datasets.http_zarr_store as http_zarr_store
 
 SOURCE = http_zarr_store.__file__
 
