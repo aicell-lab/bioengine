@@ -40,6 +40,11 @@ from hypha_rpc import connect_to_server
 from uvicorn.logging import AccessFormatter
 
 from bioengine import __version__
+from bioengine.datasets.access_requests import (
+    AccessRequestStore,
+    is_worker_admin,
+    requester_identity,
+)
 from bioengine.utils import (
     acquire_free_port,
     create_logger,
@@ -372,6 +377,7 @@ def _build_app(
     datasets: Dict[str, dict],
     cached_user_info: Dict[str, dict],
     watch_interval: int = 30,
+    access_requests: Optional[AccessRequestStore] = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -401,6 +407,13 @@ def _build_app(
         allow_headers=["Authorization", "Range"],
         expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
     )
+
+    def authorized_users_for(dataset_id: str) -> List[str]:
+        """The dataset's manifest allowlist widened by any granted requests."""
+        allowed = list(datasets[dataset_id]["authorized_users"])
+        if access_requests is not None:
+            allowed += access_requests.granted_users(dataset_id)
+        return allowed
 
     @app.get("/health/liveness")
     async def liveness():
@@ -486,7 +499,7 @@ def _build_app(
             )
             check_permissions(
                 context={"user": user_info},
-                authorized_users=datasets[dataset_id]["authorized_users"],
+                authorized_users=authorized_users_for(dataset_id),
                 resource_name=f"list files in dataset '{dataset_id}'",
             )
         except PermissionError as e:
@@ -536,7 +549,7 @@ def _build_app(
             )
             check_permissions(
                 context={"user": user_info},
-                authorized_users=datasets[dataset_id]["authorized_users"],
+                authorized_users=authorized_users_for(dataset_id),
                 resource_name=f"access '{path}' in dataset '{dataset_id}'",
             )
         except PermissionError as e:
@@ -722,7 +735,164 @@ def _build_app(
 
         return await _serve_file_response(full_path, request)
 
+    if access_requests is not None and access_requests.enabled:
+        _add_access_request_routes(
+            app, datasets, cached_user_info, access_requests, authorized_users_for
+        )
+
     return app
+
+
+# ---------------------------------------------------------------------------
+# Access requests
+# ---------------------------------------------------------------------------
+
+
+def _add_access_request_routes(
+    app: FastAPI,
+    datasets: Dict[str, dict],
+    cached_user_info: Dict[str, dict],
+    access_requests: AccessRequestStore,
+    authorized_users_for,
+) -> None:
+    """Register the per-dataset access-request endpoints.
+
+    Only called when the server was started with the feature on, so a server
+    without it exposes no request surface at all rather than one that refuses.
+
+    The two halves have different trust requirements. Filing and reading your
+    own request needs nothing new: the caller authenticates to this server with
+    their own Hypha token, exactly as they already do to read dataset bytes.
+    Deciding a request needs an authority this process does not hold — see
+    ``AccessRequestStore.approvers``.
+    """
+
+    async def _requester(
+        authorization: Optional[str], token: Optional[str]
+    ) -> tuple:
+        """``(key, email, user_id)`` for a caller who may file a request."""
+        user_info = await parse_token(
+            resolve_token(authorization, token), cached_user_info
+        )
+        try:
+            key, email = requester_identity(user_info)
+        except PermissionError as e:
+            raise HTTPException(status_code=401, detail=str(e))
+        return key, email, user_info.get("id")
+
+    async def _require_approver(
+        authorization: Optional[str], token: Optional[str], action: str
+    ) -> str:
+        """Refuse anyone the worker does not call an admin; return who they are.
+
+        This is the only gate on all three decisions — a grant writes the
+        overlay directly, and deny and clear touch nothing downstream that
+        would refuse an unauthorized caller a second time.
+
+        The caller's own token is what goes to the worker, so this server never
+        asserts an identity on anyone's behalf and holds no admin list of its own.
+        """
+        resolved = resolve_token(authorization, token)
+        user_info = await parse_token(resolved, cached_user_info)
+        if not await is_worker_admin(
+            resolved,
+            access_requests.worker_service_id,
+            AUTHENTICATION_SERVER_URL,
+            logger,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not authorized for {action}: the BioEngine worker at "
+                f"'{access_requests.worker_service_id}' does not report this "
+                "caller as one of its admin users, or could not be reached.",
+            )
+        return user_info.get("email") or user_info.get("id")
+
+    def _require_dataset(dataset_id: str) -> None:
+        if dataset_id not in datasets:
+            raise HTTPException(
+                status_code=404, detail=f"Dataset '{dataset_id}' not found"
+            )
+
+    @app.post("/datasets/{dataset_id}/access-request")
+    async def request_dataset_access(
+        dataset_id: str,
+        reason: str = "",
+        token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
+    ):
+        """Ask for access to a dataset.
+
+        Open to any logged-in caller, authorized or not. One request per account
+        per dataset.
+        """
+        _require_dataset(dataset_id)
+        key, email, user_id = await _requester(authorization, token)
+
+        try:
+            check_permissions(
+                context={"user": {"id": user_id, "email": email}},
+                authorized_users=authorized_users_for(dataset_id),
+                resource_name=f"access dataset '{dataset_id}'",
+            )
+        except PermissionError:
+            pass
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=f"'{email}' can already access dataset '{dataset_id}'; "
+                "there is nothing to request.",
+            )
+
+        try:
+            return access_requests.submit(dataset_id, key, email, user_id, reason)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    @app.get("/datasets/{dataset_id}/access-request")
+    async def get_dataset_access_request(
+        dataset_id: str,
+        token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
+    ):
+        """Read the state of your own request on one dataset.
+
+        Scoped to the caller: it reads the request belonging to the caller's
+        email and no other. A request nobody can observe is indistinguishable
+        from one that was dropped.
+        """
+        _require_dataset(dataset_id)
+        key, _email, _user_id = await _requester(authorization, token)
+        return access_requests.get(dataset_id, key)
+
+    @app.get("/access-requests")
+    async def list_dataset_access_requests(
+        token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
+    ):
+        """List every request across every dataset, oldest first."""
+        await _require_approver(
+            authorization, token, "listing dataset access requests"
+        )
+        return access_requests.list_all()
+
+    @app.post("/access-requests/{dataset_id}/resolve")
+    async def resolve_dataset_access_request(
+        dataset_id: str,
+        user: str,
+        decision: str,
+        token: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
+    ):
+        """Grant, deny or clear one request."""
+        _require_dataset(dataset_id)
+        resolved_by = await _require_approver(
+            authorization, token, f"resolving an access request for '{dataset_id}'"
+        )
+        try:
+            return access_requests.resolve(dataset_id, user, decision, resolved_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +906,8 @@ def start_proxy_server(
     server_port: Optional[int] = None,
     authentication_server_url: str = "https://hypha.aicell.io",
     log_file: Optional[Union[str, Path]] = None,
+    enable_access_requests: bool = False,
+    worker_service_id: Optional[str] = None,
 ) -> None:
     """
     Start the BioEngine Datasets proxy server.
@@ -763,6 +935,14 @@ def start_proxy_server(
                                    (default: https://hypha.aicell.io).
         log_file: Path to log file. Pass "off" for console-only logging.
                   Defaults to a timestamped file in ~/.bioengine/logs/.
+        enable_access_requests: Expose the per-dataset access-request endpoints
+                  so a user who is not in a dataset's authorized_users can ask
+                  for access. Off by default, and independent of the worker's
+                  flag of the same name — they govern different processes.
+        worker_service_id: Full Hypha service id of the BioEngine worker whose
+                  admin users may decide those requests, e.g.
+                  "my-workspace/my-worker:bioengine-worker". Required by
+                  --enable-access-requests; without it the endpoints stay off.
     """
     global AUTHENTICATION_SERVER_URL
 
@@ -823,10 +1003,26 @@ def start_proxy_server(
 
         cached_user_info: Dict[str, dict] = {}
 
+        # Next to the discovery file, in the server's own state directory: a
+        # dataset directory is served in place and may be read-only, so the one
+        # place a grant can reliably be written is here.
+        access_requests = AccessRequestStore(
+            store_file=Path.home() / ".bioengine" / "datasets" / "access_requests.json",
+            worker_service_id=worker_service_id,
+            enabled=enable_access_requests,
+            logger=logger,
+        )
+        if access_requests.enabled:
+            logger.info(
+                "Dataset access requests are enabled; decisions are authorized by "
+                f"the admin users of '{access_requests.worker_service_id}'"
+            )
+
         app = _build_app(
             data_dir=data_dir,
             datasets=datasets,
             cached_user_info=cached_user_info,
+            access_requests=access_requests,
         )
 
         uvicorn.run(
