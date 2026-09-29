@@ -89,12 +89,21 @@ def test_an_empty_allowlist_denial_names_nobody():
 
 
 def test_no_permission_denial_in_the_package_interpolates_an_identity_list():
-    """Close the class: no ``raise PermissionError`` anywhere may name a list.
+    """A tripwire for the obvious regression, not a proof that it cannot happen.
 
     A behavioural test on the helper only protects the helper. Any module that
     grows its own denial path — ``proxy_deployment._check_permissions`` already
-    has one — can reintroduce the same disclosure without touching
-    ``permissions.py``.
+    has one — can reintroduce the disclosure without touching ``permissions.py``.
+    This catches the two forms a reviewer would plausibly type at such a raise:
+    a bare local and ``self.<attr>``.
+
+    It does not close the class, and widening it to try is a losing game against
+    the AST. Known blind spots: a constant subscript (``self.app_data['authorized_users']``,
+    a live expression at ``proxy_deployment.py:496``), building the message into
+    a local first, a qualified ``raise builtins.PermissionError``, and any
+    disclosure raised as a different exception type — including the
+    ``HTTPException`` the datasets proxy raises. The behavioural tests above are
+    the real guarantee.
     """
     package = Path(__file__).resolve().parent.parent / "bioengine"
     leaky = []
