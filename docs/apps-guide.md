@@ -534,6 +534,8 @@ worker_service_id = os.environ["BIOENGINE_WORKER_SERVICE_ID"]  # Worker service 
 token = os.environ.get("HYPHA_TOKEN")            # User authentication token
 ```
 
+`HYPHA_TOKEN` is the one variable you cannot set yourself — it is delivered by the `hypha_token` parameter on `deploy_app` (`--hypha-token` on the CLI), not by `--env` or `application_env_vars`. See [Per-deployment credentials](#per-deployment-credentials).
+
 ### Built-in Dataset Access
 
 Every deployment automatically has access to the BioEngine datasets manager:
@@ -1059,7 +1061,9 @@ bioengine apps run workspace/my-app --app-id site-a --hypha-token "$SITE_A_TOKEN
 bioengine apps run workspace/my-app --app-id site-b --hypha-token "$SITE_B_TOKEN"
 ```
 
-**Setting `HYPHA_TOKEN` as a plain environment variable does not work, and fails silently.** Neither `--env HYPHA_TOKEN=…` on the CLI nor `application_env_vars={"...": {"HYPHA_TOKEN": "…"}}` is a supported way to deliver the token: `hypha_token` — which the CLI defaults to your own `--token` — is injected into the replica *after* the plain environment variables and overwrites whatever they set, and the plain value is additionally stripped from the state the worker persists to recover running applications, so it would not survive a worker restart even where it appeared to work. Nothing raises and nothing is logged; the app just runs as the wrong identity. Always use the `hypha_token` parameter / `--hypha-token` flag.
+**Setting `HYPHA_TOKEN` as a plain environment variable does not work, and fails silently.** Neither `--env HYPHA_TOKEN=…` on the CLI nor `application_env_vars={"...": {"HYPHA_TOKEN": "…"}}` is a supported way to deliver the token: `hypha_token` — which the CLI defaults to your own `--token` — is unmasked into the replica environment *after* the plain variables and overwrites whatever they set. The plain value therefore only ever reaches a replica when `hypha_token` is omitted entirely, which the CLI never does; and on that one path the worker strips it from the state it persists to recover applications, so a later redeploy loses it. Nothing raises and nothing is logged; the app just runs as the wrong identity. Always use the `hypha_token` parameter / `--hypha-token` flag.
+
+Note that neither route survives into a redeploy that follows a worker restart. A restart does not disturb a *running* replica — the worker adopts live Ray Serve applications rather than rebinding them, so the environment they were started with is untouched — but the worker's recovered record of the application keeps no token either way: the plain value was stripped from the persisted env vars, and `hypha_token` is recovered as `None`. What is lost is the value the worker would re-inject on the next deployment, so after a restart pass `hypha_token` explicitly rather than relying on it being inherited.
 
 **What per-deployment tokens do not give you is a narrower token.** They solve blast radius on revocation, not least privilege. A Hypha token's permissions come from its workspace scope, so any token that can write a shared artifact in workspace `W` can also do everything else its permission level allows anywhere in `W` — including to artifacts the app never touches. Narrowing below workspace scope is not available: Hypha's `extra_scopes` accepts an `artifact:<ws>/<alias>:rw` string and records it in the JWT, but it is additive rather than restrictive, grants nothing on its own, and marks the token as specialized so it can no longer be used for general workspace access at all — a token carrying it cannot open the RPC connection an app makes at startup. Until Hypha gains a credential primitive an app can connect with, assume a compromised replica has the reach of its whole workspace, and size the token's `permission` and `expires_in` accordingly when minting it.
 
