@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from bioengine._app.errors import (
         BioEngineUserError,
         CompositionCycleError,
+        DataServerError,
         MissingDataServerError,
         ReservedMethodNameError,
     )
@@ -143,6 +144,7 @@ _LAZY_FROM_APP = {
     "BioEngineRuntimeHandle",
     "BioEngineUserError",
     "CompositionCycleError",
+    "DataServerError",
     "MissingDataServerError",
     "ReservedMethodNameError",
 }

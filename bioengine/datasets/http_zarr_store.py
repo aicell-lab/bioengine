@@ -31,7 +31,7 @@ from zarr.abc.store import (
 from zarr.core.buffer import Buffer, BufferPrototype
 
 from bioengine.datasets.chunk_cache import ChunkCache, default_cache
-from bioengine.datasets.utils import get_url_with_retry
+from bioengine.datasets.utils import get_url_with_retry, raise_for_data_server_status
 
 
 @dataclass
@@ -215,7 +215,7 @@ class HttpZarrStore(Store):
                 )
                 if response.status_code == 404:
                     return None
-                response.raise_for_status()
+                raise_for_data_server_status(response)
                 content = response.content
                 self.logger.debug(
                     f"Fetched {len(content)} bytes for {key} "
