@@ -297,7 +297,10 @@ def upload(app_dir, public, worker_service_id, token, server_url):
         "Hypha token to inject into the deployment as the HYPHA_TOKEN environment variable. "
         "Required for apps that connect back to Hypha (artifact access, dataset streaming, etc.). "
         "Defaults to the value of --token / HYPHA_TOKEN if not set. "
-        "Pass --hypha-token '' to explicitly deploy without a token."
+        "Pass --hypha-token '' to deploy without one: no token is injected, and "
+        "updating a running app clears the token it currently holds instead of "
+        "reusing it. A plain --env HYPHA_TOKEN=... does reach the deployment in "
+        "that case, since nothing overwrites it."
     ),
 )
 @add_worker_options
@@ -341,7 +344,7 @@ def run_app(artifact_id, application_id, version, disable_gpu, env_vars, hypha_t
             run_kwargs = {
                 "artifact_id": artifact_id,
                 "disable_gpu": disable_gpu,
-                "hypha_token": hypha_token or None,
+                "hypha_token": hypha_token,
             }
             if application_id:
                 run_kwargs["application_id"] = application_id
@@ -653,7 +656,10 @@ def stop(app_id, yes, worker_service_id, token, server_url):
         "Hypha token to inject into the deployment as the HYPHA_TOKEN environment variable. "
         "Required for apps that connect back to Hypha (artifact access, dataset streaming, etc.). "
         "Defaults to the value of --token / HYPHA_TOKEN if not set. "
-        "Pass --hypha-token '' to explicitly deploy without a token."
+        "Pass --hypha-token '' to deploy without one: no token is injected, and "
+        "updating a running app clears the token it currently holds instead of "
+        "reusing it. A plain --env HYPHA_TOKEN=... does reach the deployment in "
+        "that case, since nothing overwrites it."
     ),
 )
 @add_worker_options
@@ -740,7 +746,7 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
         run_kwargs = {
             "artifact_id": artifact_id,
             "disable_gpu": disable_gpu,
-            "hypha_token": hypha_token or None,
+            "hypha_token": hypha_token,
             # Pin the version just uploaded. Without it, targeting a running
             # --app-id inherits that app's version, so this command would report
             # success while redeploying the code it just replaced.
