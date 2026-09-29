@@ -439,13 +439,17 @@ def _build_app(
                 resolve_token(authorization, token), cached_user_info
             )
         except Exception as e:
-            logger.debug(
+            # Warned, not debugged: the fallback is meant for an expired token
+            # or an unreachable auth server, but it will just as happily
+            # swallow a genuine bug in resolve_token or parse_token, and a
+            # silently public listing is not something to find out about later.
+            logger.warning(
                 f"Ignoring an unusable token on the dataset listing and "
                 f"returning the public view ({type(e).__name__}: {e})."
             )
-            # Not via parse_token: whatever just failed is very likely to fail
-            # again, and the auth server being unreachable is the case this
-            # fallback exists for.
+            # A plain dict, not parse_token(None, ...): this runs inside an
+            # except block, where an await that raises surfaces during handling
+            # of the first error. Building the identity cannot fail.
             user_info = dict(ANONYMOUS_USER_INFO)
         listing = {}
         for dataset_id, info in datasets.items():
