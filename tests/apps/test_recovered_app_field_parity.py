@@ -59,12 +59,13 @@ LEGITIMATELY_NULL_AFTER_ADOPTION = {
     # was deployed with is simply not retrievable from the running app.
     "hypha_token",
     # The built Ray Serve application object lives in the worker process that
-    # deployed it; an adopting worker cannot reconstruct it, which is why
-    # auto-redeploy skips adopted apps.
+    # deployed it; an adopting worker cannot reconstruct it, which is what
+    # _fire_redeploy and _recover_from_controller_loss both gate on.
     "built_app",
     # A ProxyDeployment constructor argument rather than part of the recovery
-    # blob, and any TURN credential in it would have expired. None means
-    # "fetch a fresh list", which is what a later redeploy wants anyway.
+    # blob. None means "fetch a fresh list", which is what a later redeploy
+    # wants — lossy only for a custom static list passed at deploy time, which
+    # is not recoverable here either way.
     "ice_servers",
 }
 

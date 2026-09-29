@@ -229,10 +229,10 @@ def _belongs_to_worker_workspace(
 def _entry_deployment_name(entry_id: Optional[str]) -> Optional[str]:
     """Ray Serve deployment name of an app's entry class.
 
-    Serve names each deployment after the tail of the class qualname, so the
-    entry id ``module:Outer.Entry`` runs as deployment ``Entry``. Derived from
-    the id rather than the built app's spec because a recovered app has no
-    spec — it only carries the entry id in its ``app_data``.
+    Serve names the deployment after the entry class, so ``deployment:NucleiSeg``
+    runs as deployment ``NucleiSeg``. Derived from the id rather than the built
+    app's spec because a recovered app has no spec — it only carries the entry
+    id in its ``app_data``.
     """
     if not entry_id or ":" not in entry_id:
         return None
@@ -1141,10 +1141,8 @@ class AppsManager:
 
         A recovered app carries no ``built_app``, but the entry deployment is
         named from ``entry_deployment_name``, which the deploy and the adoption
-        paths both store, so ``running_version`` is available there too. Bailing
-        out early on a missing spec would leave apps that survived a worker
-        restart permanently unverified, which is exactly when a warm replica is
-        most likely to be running code the version pin no longer describes.
+        paths both store — so an app that survived a worker restart is verified
+        and reports its running version like any other.
         """
         info = self._deployed_applications.get(application_id) or {}
         expected_signature = info.get("source_signature")

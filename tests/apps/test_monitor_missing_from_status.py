@@ -252,7 +252,9 @@ async def test_an_adopted_app_is_reported_stale_but_not_deleted(caplog) -> None:
 
     assert manager._deleted_pending_redeploy == set()
     manager._deploy_application.assert_not_awaited()
-    assert any("cannot be rebuilt here" in line for line in _warnings(caplog))
+    # The warning's wording belongs to #171, so assert only that the app was
+    # reported; grepping its prose would break on a reword that changes nothing.
+    assert any(APP_ID in line for line in _warnings(caplog))
 
 
 @pytest.mark.asyncio
