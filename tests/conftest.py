@@ -291,14 +291,23 @@ def no_leaked_working_directory() -> Generator[None, None, None]:
     An unrestored ``os.chdir`` is silent until some later test opens a
     relative path or spawns a child that inherits the cwd, and the failure is
     then charged to that later test -- which passes again when run alone.
+
+    A test that needs to run elsewhere should use ``monkeypatch.chdir``;
+    anything else lands here as a teardown error charged to whichever test
+    happened to run last.
     """
     entry = os.getcwd()
     yield
-    final = os.getcwd()
+    try:
+        final = os.getcwd()
+    except OSError as e:
+        # A deleted cwd is the same defect; without this it surfaces as a bare
+        # FileNotFoundError from the fixture and names nothing.
+        final = f"a directory that no longer exists ({e})"
     if final != entry:
         pytest.fail(
             f"a test left the process in {final}; the session started in "
-            f"{entry}. Restore the working directory where it is changed."
+            f"{entry}. Use monkeypatch.chdir, or restore it where it changes."
         )
 
 

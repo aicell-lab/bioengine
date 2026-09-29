@@ -1,11 +1,7 @@
-"""Replica setup chdirs the process, and that must not outlive the test.
+"""Replica setup moves the process, and that must not outlive the test.
 
-``_ensure_working_directory`` anchors a replica at its app directory for the
-replica's whole life, so the first test below asserts the process really did
-move. The second asserts the process is back where this module was imported,
-which is the property the rest of the suite depends on: a leaked cwd makes a
-later test resolve relative paths -- or a child process resolve ``import
-bioengine`` -- against ``$HOME`` instead of the checkout.
+The restoration test below is the contract. The one above it is a tripwire
+over current behaviour and deliberately not a contract -- see its docstring.
 """
 
 import os
@@ -16,7 +12,16 @@ import bioengine
 _IMPORT_CWD = os.getcwd()
 
 
-def test_replica_setup_chdirs_the_process(tmp_path, monkeypatch):
+def test_the_process_is_still_moved_after_user_init_returns(tmp_path, monkeypatch):
+    """Tripwire over current behaviour, NOT a requirement. Retarget it freely.
+
+    Nothing in this repository reads the working directory after replica
+    setup, so this asserts more than anything in-tree needs: it fails for a
+    restore inside ``_ensure_working_directory`` and equally for one in a
+    ``finally`` in ``wrap_init``, which would hold the directory across the
+    user's ``__init__`` and leak nothing. If a change makes this red, decide
+    whether the new behaviour is wrong -- do not assume it is.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
 
     @bioengine.app(num_cpus=0)

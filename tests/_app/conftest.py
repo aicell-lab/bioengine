@@ -15,12 +15,10 @@ import pytest
 def restore_working_directory() -> Generator[None, None, None]:
     """Confine the replica-setup ``os.chdir`` to the test that triggered it.
 
-    ``bioengine._app.mixin._ensure_working_directory`` anchors a replica
-    process at its app directory and the change has to outlive the call —
-    user code resolves relative paths against it for the replica's whole
-    life — so the production code cannot restore it. Constructing a
-    decorated class here runs that in the pytest process, which the rest of
-    the suite shares.
+    ``bioengine._app.mixin._ensure_working_directory`` moves the process to
+    the app directory, and constructing a decorated class here runs that in
+    the pytest process the rest of the suite shares. Runtime behaviour is
+    deliberately left unchanged; the containment is on this side.
     """
     entry = os.getcwd()
     yield
