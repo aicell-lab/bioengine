@@ -226,6 +226,19 @@ def _belongs_to_worker_workspace(
     return True
 
 
+def _entry_deployment_name(entry_id: Optional[str]) -> Optional[str]:
+    """Ray Serve deployment name of an app's entry class.
+
+    Serve names the deployment after the entry class, so ``deployment:NucleiSeg``
+    runs as deployment ``NucleiSeg``. Derived from the id rather than the built
+    app's spec because a recovered app has no spec — it only carries the entry
+    id in its ``app_data``.
+    """
+    if not entry_id or ":" not in entry_id:
+        return None
+    return entry_id.split(":", 1)[1].split(".")[-1] or None
+
+
 # Ray-task helpers for the app cache API live in a stdlib-only sibling
 # module: the Ray Client server unpickles ``ray.remote(fn)`` references by
 # re-importing the function's module, and the manager namespace pulls in
@@ -1126,24 +1139,14 @@ class AppsManager:
         value never triggers a delete, because a systematic hash disagreement
         would turn the monitor's self-heal into a redeploy loop on a healthy app.
 
-        A recovered app carries no ``built_app``, so the entry deployment can't
-        be named and ``running_version`` stays ``None`` — but the verification
-        itself covers every deployment and does not need the spec. Bailing out
-        early on a missing spec would leave apps that survived a worker restart
-        permanently unverified, which is exactly when a warm replica is most
-        likely to be running code the version pin no longer describes.
+        A recovered app carries no ``built_app``, but the entry deployment is
+        named from ``entry_deployment_name``, which the deploy and the adoption
+        paths both store — so an app that survived a worker restart is verified
+        and reports its running version like any other.
         """
         info = self._deployed_applications.get(application_id) or {}
-        built_app = info.get("built_app")
         expected_signature = info.get("source_signature")
-        spec = getattr(built_app, "spec", None) or {}
-        entry_cid = spec.get("entry_id")
-        classes = spec.get("classes") or {}
-        entry_name = (
-            classes[entry_cid]["qualname"].split(".")[-1]
-            if entry_cid in classes
-            else None
-        )
+        entry_name = info.get("entry_deployment_name")
         try:
             identities = (
                 await self.ray_cluster.proxy_actor_handle.get_replica_identities.remote(
@@ -1447,6 +1450,7 @@ class AppsManager:
                     "description",
                     "artifact_id",
                     "version",
+                    "entry",
                     "application_kwargs",
                     "application_env_vars",
                     "disable_gpu",
@@ -1495,6 +1499,9 @@ class AppsManager:
                     "source_signature": app_data.get("source_signature"),
                     "application_kwargs": app_data["application_kwargs"],
                     "application_env_vars": app_data["application_env_vars"],
+                    # Stays None: the builder strips secrets from app_data, so
+                    # an adopting worker cannot recover the token. Updating a
+                    # recovered app therefore has to pass hypha_token again.
                     "hypha_token": None,
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
@@ -1516,8 +1523,20 @@ class AppsManager:
                     "proxy_service_token_ttl_seconds": app_data.get(
                         "proxy_service_token_ttl_seconds"
                     ),
+                    "entry_deployment_name": _entry_deployment_name(
+                        app_data["entry"]
+                    ),
+                    # Stays None: an adopted app cannot be rebuilt from here,
+                    # which is what _fire_redeploy and
+                    # _recover_from_controller_loss both gate on.
                     "built_app": None,
                     "auto_redeploy": app_data["auto_redeploy"],
+                    # Stays None: ice_servers is a ProxyDeployment constructor
+                    # argument, not part of app_data. None means "fetch a fresh
+                    # list", which is what a redeploy wants — lossy only for a
+                    # custom static list passed at deploy time, which is not
+                    # recoverable here either way.
+                    "ice_servers": None,
                     "debug": app_data["debug"],
                     "deployment_task": None,
                     "is_deployed": is_deployed,
@@ -2661,7 +2680,7 @@ class AppsManager:
         ),
         hypha_token: str = Field(
             None,
-            description="Hypha connection token to set as environment variable 'HYPHA_TOKEN' inside the application's Ray actor. Required for apps whose code reads HYPHA_TOKEN at startup (e.g. apps that authenticate to BioEngine datasets, read private artifacts, or call back to Hypha as the logged-in user). Pass the deploying user's token unless you are certain the app does not need it. If omitted: when redeploying an existing instance (matching application_id), the previously stored token is preserved; on a fresh instance the actor receives no token and any app reading HYPHA_TOKEN at __init__ will fail. The '--env HYPHA_TOKEN=...' flag is silently ignored by the app builder; always use this parameter.",
+            description="Hypha connection token to set as environment variable 'HYPHA_TOKEN' inside the application's Ray actor. Required for apps whose code reads HYPHA_TOKEN at startup (e.g. apps that authenticate to BioEngine datasets, read private artifacts, or call back to Hypha as the logged-in user). Pass the deploying user's token unless you are certain the app does not need it. If omitted: when redeploying an instance this worker deployed (matching application_id), the previously stored token is preserved. An app the worker adopted rather than deployed holds no stored token, so an omitted hypha_token injects nothing and the update fails like a fresh instance; adoption is what happens after a worker restart, or when the worker attaches to a Ray cluster already running apps. Pass this parameter on every update that needs a token rather than inferring that you can omit it: get_app_status reports 'recovered_app': true for an adopted app, which guarantees no token is stored, but 'recovered_app': false does not guarantee one is. On a fresh instance the actor receives no token and any app reading HYPHA_TOKEN at __init__ will fail. Do not deliver the token through application_env_vars (or the CLI's '--env HYPHA_TOKEN=...' flag) instead: when this parameter is set it is unmasked into the replica environment after the plain variables and overwrites them, and when it is omitted the plain value does reach the replica but is stripped from the state the worker persists to recover applications, so a redeploy of an adopted app loses it. Nothing raises either way. Always use this parameter. This token is per deployment, not per worker: each deploy_app call can carry a different token and each is independently revocable, so instances writing to one shared artifact should each get their own account's token rather than sharing one admin token. It cannot be narrowed below workspace scope, however — Hypha has no artifact-scoped credential an app can connect with — so a token able to write an artifact in workspace W carries W's full reach.",
         ),
         disable_gpu: bool = Field(
             None,
@@ -3106,9 +3125,13 @@ class AppsManager:
                 "proxy_service_token_ttl_seconds": app.metadata[
                     "proxy_service_token_ttl_seconds"
                 ],
+                "entry_deployment_name": _entry_deployment_name(
+                    app.spec.get("entry_id")
+                ),
                 "built_app": app,
                 "auto_redeploy": auto_redeploy,
                 "ice_servers": ice_servers,
+                "debug": debug,
                 "deployment_task": None,  # Control task for app deployment
                 "is_deployed": asyncio.Event(),  # Track the deployment process
                 "undeployment_task": None,  # Control task for app undeployment

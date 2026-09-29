@@ -54,8 +54,9 @@ def check_permissions(
                         grant permanent or revoke it for everyone else.
 
     Raises:
-        PermissionError: If user is not authorized to access the resource with
-                        detailed error message explaining the specific failure
+        PermissionError: If user is not authorized to access the resource. The
+                        message names the caller and the operation but never the
+                        authorized users — it is returned to the refused caller.
     """
     # Validate context structure
     if context is None or not isinstance(context, dict) or "user" not in context:
@@ -95,7 +96,8 @@ def check_permissions(
     if "*" in authorized_users:
         if allow_wildcard:
             return  # Wildcard access - all users allowed
-        # Fall through on the named entries only, so the denial reports them.
+        # Fall through on the named entries only: a caller covered solely by
+        # "*" must not pass a check that widens the authorized set itself.
         authorized_users = [user for user in authorized_users if user != "*"]
 
     # Check specific user authorization
@@ -105,8 +107,9 @@ def check_permissions(
     if user_email and user_email in authorized_users:
         return  # Email match
 
-    # Access denied - provide detailed error message
+    # Never name the authorized users here: this message reaches the caller that
+    # was just refused, over a publicly registered service.
     raise PermissionError(
         f"User '{user_id or 'no id'}' ({user_email or 'no-email'}) is not authorized for {resource_name}. "
-        f"Authorized users: {authorized_users}"
+        "Contact an administrator of this BioEngine worker to request access."
     )
