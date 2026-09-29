@@ -3,8 +3,27 @@ import re
 from typing import List, Optional
 
 split_re = re.compile(r"(==|>=|<=|~=|>|<)")
+name_sep_re = re.compile(r"[-_.]+")
 
 # TODO: Use lock files instead of modified version ranges
+
+
+def requirement_name(requirement: str) -> str:
+    """
+    Reduce a requirement string to its PEP 503 normalized distribution name.
+
+    Strips the version specifier and any extras, so the name that
+    ``bioengine``'s metadata declares (``httpx[http2]>=0.28.1``) compares
+    equal to the plain name a caller selects by (``httpx``).
+
+    Args:
+        requirement: A pip requirement string (e.g. "httpx[http2]>=0.28.1")
+
+    Returns:
+        The normalized name (e.g. "httpx")
+    """
+    name = split_re.split(requirement, maxsplit=1)[0]
+    return name_sep_re.sub("-", name.split("[", 1)[0].strip()).lower()
 
 
 def normalize_requirement(requirement: str) -> str:
@@ -64,6 +83,12 @@ def get_pip_requirements(
 
     Returns:
         List of pip requirements
+
+    Raises:
+        ValueError: If a name in ``select`` matches no requirement. A
+            selector is written against bioengine's own metadata, so a miss
+            is a repo-level mistake — most often a package that only exists
+            in an extra the caller did not ask for.
     """
     if extras is None:
         extras = []
@@ -91,14 +116,25 @@ def get_pip_requirements(
             if requirement and not requirement.startswith("ray")
         ]
     else:
-        # Otherwise, filter based on the select list
-        filtered_requirements = [
-            normalize_requirement(requirement)
-            for requirement in requirements
-            if requirement
-            and not requirement.startswith("ray")
-            and split_re.split(requirement, maxsplit=1)[0] in select
-        ]
+        wanted = {requirement_name(name) for name in select}
+        matched = set()
+        filtered_requirements = []
+        for requirement in requirements:
+            if not requirement or requirement.startswith("ray"):
+                continue
+            name = requirement_name(requirement)
+            if name in wanted:
+                matched.add(name)
+                filtered_requirements.append(normalize_requirement(requirement))
+
+        unmatched = sorted(wanted - matched)
+        if unmatched:
+            raise ValueError(
+                f"No bioengine requirement matches {unmatched} "
+                f"(extras={sorted(extras)}). Every selected name must resolve, "
+                "or the package silently never reaches the environment this "
+                "list builds."
+            )
 
     return filtered_requirements
 
@@ -127,10 +163,7 @@ def update_requirements(
     for bioengine_requirement in bioengine_requirements:
         exists = False
         for requirement in requirements:
-            if (
-                split_re.split(bioengine_requirement, maxsplit=1)[0]
-                == split_re.split(requirement, maxsplit=1)[0]
-            ):
+            if requirement_name(bioengine_requirement) == requirement_name(requirement):
                 exists = True
                 break
 

@@ -836,15 +836,12 @@ class AppBuilder:
         # named 'hypha_rpc'``. Same story as Fix #7, just one layer
         # deeper. Injected at bind time.
         #
-        # Only ``hypha-rpc`` actually comes back: ``pydantic`` is declared
-        # in the ``worker`` extra, so ``extras=[]`` filters it out and no
-        # pin for it reaches the replica. Replicas get the Ray node image's
-        # copy instead — Ray builds runtime_env venvs with
-        # ``--system-site-packages``. Pinning it here would newly constrain
-        # every replica venv, so it is left alone deliberately rather than
-        # by oversight.
+        # ``pydantic`` is deliberately absent. Ray builds runtime_env venvs
+        # with ``--system-site-packages``, so a replica already sees the Ray
+        # node image's copy; pinning one here would fight that inheritance
+        # rather than complement it.
         user_replica_framework_pip = get_pip_requirements(
-            select=["hypha-rpc", "pydantic"],
+            select=["hypha-rpc"],
             extras=[],
         )
         # The env_vars dict the worker assembled above (HYPHA_SERVER_URL,
