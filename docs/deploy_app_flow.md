@@ -51,8 +51,11 @@ they don't need a Hypha credential at all.
 The worker submits `bioengine._app.bootstrap.introspect_app_in_ray_task`
 as a short Ray task. The task's `runtime_env` carries:
 
-- `pip` — the framework baseline (hypha-rpc, pydantic, …) plus the app's
-  declared `@bioengine.app(pip=…)` dependencies
+- `pip` — the framework baseline (hypha-rpc, pydantic) and nothing else.
+  The app's `@bioengine.app(pip=…)` dependencies are **not** installed
+  here: every module containing `@bioengine.app`, and anything it imports
+  at top level, must be importable with just `bioengine[worker]` and the
+  standard library
 - `env_vars` — `BIOENGINE_APP_DIR`, `BIOENGINE_ARTIFACT_DOWNLOAD_URL`
   (Hypha `create-zip-file` URL), `BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`,
   `BIOENGINE_ARTIFACT_VERSION`
