@@ -36,10 +36,15 @@ volumes:
   - name: hypha-token
     secret:
       secretName: bioengine-worker
+      defaultMode: 0400
       items:
         - key: token
           path: token
 ```
+
+**`defaultMode: 0400` is not optional.** A Secret volume is mounted `0644` by default — world-readable inside the container, which is the same exposure this is meant to remove. `0400` limits the file to the uid the worker runs as.
+
+Substitute your own secret name and key. `items` maps a key in the Secret to a filename in the mount, so a Secret holding the token under `HYPHA_TOKEN` needs `- key: HYPHA_TOKEN` — a mismatched key mounts nothing and the worker falls through to an interactive login it cannot complete.
 
 `--token=$(HYPHA_TOKEN)` is the shape to avoid: Kubernetes expands it at render time, so the Deployment spec keeps only the placeholder and looks clean under `kubectl get deploy -o yaml` while the live process carries the value.
 
@@ -226,6 +231,7 @@ spec:
         - name: hypha-token
           secret:
             secretName: bioengine-worker
+            defaultMode: 0400
             items:
               - key: token
                 path: token

@@ -570,10 +570,15 @@ def resolve_token(
     token_file = hypha_options.pop("token_file", None)
     token = hypha_options.pop("token", None)
 
-    if token_file:
+    if token_file is not None:
+        # An unset Helm value renders as --token-file= rather than omitting it,
+        # so an empty path is a misconfiguration, not a request to fall back.
+        if not token_file:
+            raise ValueError("--token-file was given an empty path")
         if token:
             print(
-                "Both --token-file and --token given; --token is ignored.",
+                "Both --token-file and --token given; --token is ignored, but its "
+                "value is still world-readable in /proc/<pid>/cmdline. Drop it.",
                 file=sys.stderr,
             )
         try:

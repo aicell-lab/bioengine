@@ -22,6 +22,8 @@ import pytest
 
 from bioengine.worker.__main__ import resolve_token
 
+CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
+
 # Placeholders, not credentials. Distinct per source so precedence is provable.
 FILE_TOKEN = "PLACEHOLDER-FROM-FILE-NOT-A-CREDENTIAL"
 FLAG_TOKEN = "PLACEHOLDER-FROM-FLAG-NOT-A-CREDENTIAL"
@@ -31,9 +33,11 @@ ENV_TOKEN = "PLACEHOLDER-FROM-ENV-NOT-A-CREDENTIAL"
 # the result, then stays alive so the parent can read its /proc entry.
 _PROBE = """
 import json, os, sys, time
+import bioengine
 from bioengine.worker.__main__ import create_parser, get_args_by_group, resolve_token
 
 configs = resolve_token(get_args_by_group(create_parser()))
+configs["Hypha Options"]["_bioengine_file"] = bioengine.__file__
 with open(os.environ["PROBE_OUT"], "w") as fh:
     json.dump(configs["Hypha Options"], fh)
 time.sleep(120)
@@ -43,22 +47,31 @@ time.sleep(120)
 def _launch(tmp_path, worker_args, env_token=None):
     """Run the probe as a real process; return (resolved Hypha Options, its cmdline)."""
     probe_out = tmp_path / "resolved.json"
+    probe_err = tmp_path / "probe.err"
     env = {k: v for k, v in os.environ.items() if k != "HYPHA_TOKEN"}
     env["PROBE_OUT"] = str(probe_out)
     if env_token is not None:
         env["HYPHA_TOKEN"] = env_token
 
-    process = subprocess.Popen(
-        [sys.executable, "-c", _PROBE, "--mode", "single-machine", *worker_args],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    with probe_err.open("wb") as err:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _PROBE, "--mode", "single-machine", *worker_args],
+            env=env,
+            # Pinned, not inherited: other tests chdir the pytest process out of
+            # the checkout for good, and the probe would then import an installed
+            # bioengine instead of this one.
+            cwd=str(CHECKOUT_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+        )
     try:
         deadline = time.time() + 60
         while not probe_out.exists():
             if process.poll() is not None:
-                pytest.fail(f"probe exited early with code {process.returncode}")
+                pytest.fail(
+                    f"probe exited early with code {process.returncode}:\n"
+                    f"{probe_err.read_text()}"
+                )
             if time.time() > deadline:
                 pytest.fail("probe did not resolve a token within 60s")
             time.sleep(0.05)
@@ -68,7 +81,12 @@ def _launch(tmp_path, worker_args, env_token=None):
         process.terminate()
         process.wait(timeout=30)
 
-    return json.loads(probe_out.read_text()), cmdline
+    resolved = json.loads(probe_out.read_text())
+
+    # The probe must have exercised this checkout, not an installed bioengine.
+    assert resolved.pop("_bioengine_file").startswith(str(CHECKOUT_ROOT))
+
+    return resolved, cmdline
 
 
 def _token_file(tmp_path, value):
@@ -166,6 +184,14 @@ def test_empty_token_file_is_rejected(tmp_path):
         _resolve({"token_file": str(path)})
 
 
+def test_empty_token_file_path_is_rejected(monkeypatch):
+    """``--token-file=`` is what an unset Helm value renders; it must not fall back."""
+    monkeypatch.setenv("HYPHA_TOKEN", ENV_TOKEN)
+
+    with pytest.raises(ValueError, match="empty path"):
+        _resolve({"token_file": "", "token": FLAG_TOKEN})
+
+
 def test_token_flag_warns_about_the_process_table(capsys):
     _resolve({"token": FLAG_TOKEN})
 
@@ -181,6 +207,8 @@ def test_token_file_warns_that_it_overrides_the_flag(tmp_path, capsys):
 
     stderr = capsys.readouterr().err
     assert "--token is ignored" in stderr
+    # Ignoring the flag does not un-expose it — the value is still in argv.
+    assert "/proc/<pid>/cmdline" in stderr
     assert FLAG_TOKEN not in stderr
     assert FILE_TOKEN not in stderr
 
