@@ -30,7 +30,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ray
 import yaml
@@ -310,8 +310,9 @@ class AppBuilder:
         """Submit :func:`introspect_app_in_ray_task` as a Ray task.
 
         The task syncs the user package from Hypha (token in ``env_vars``),
-        walks the type-hint composition graph, and returns the ``{spec}``
-        payload. We never touch the worker's filesystem.
+        walks the type-hint composition graph, and returns the
+        ``{spec, source_signature}`` payload. We never touch the worker's
+        filesystem.
 
         Strips the ``_BIOENGINE_SECRET_*`` keys from ``env_vars`` before
         passing into the task to keep secrets out of Ray's logs; the
@@ -557,16 +558,25 @@ class AppBuilder:
     @staticmethod
     def _sanitize_recovery_env_vars(
         application_env_vars: Dict[str, Dict[str, str]]
-    ) -> Dict[str, Dict[str, str]]:
-        """Strip secret-like keys so they don't end up in proxy app_data."""
-        out: Dict[str, Dict[str, str]] = {}
+    ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, List[str]]]:
+        """Strip secret-like keys from proxy app_data, and name what was stripped.
+
+        The names ride along so an adopting worker can tell a complete env var
+        dict from a reduced one; without them the reduced copy is
+        indistinguishable from an app that declared no secrets.
+        """
+        kept: Dict[str, Dict[str, str]] = {}
+        redacted: Dict[str, List[str]] = {}
         for cls_key, env in application_env_vars.items():
-            out[cls_key] = {
+            kept[cls_key] = {
                 k: v
                 for k, v in env.items()
                 if not k.startswith("_") and k != "HYPHA_TOKEN"
             }
-        return out
+            dropped = sorted(set(env) - set(kept[cls_key]))
+            if dropped:
+                redacted[cls_key] = dropped
+        return kept, redacted
 
     # ────────────────────────────── build ────────────────────────────────
 
@@ -667,11 +677,13 @@ class AppBuilder:
 
         # 3. Introspect the user package via a Ray task — the task syncs the
         # source from Hypha and walks the @bioengine.app composition. Returns
-        # spec only; replicas sync their own source per file from Hypha.
+        # the spec plus a content hash of the synced source; replicas sync their
+        # own source per file from Hypha.
         introspect_result = await self._introspect_via_ray_task(
             entry_id, env_vars, runtime_env
         )
         spec = introspect_result["spec"]
+        source_signature = introspect_result.get("source_signature")
         self.logger.info(f"Introspect task returned for '{application_id}'")
 
         # Sanity check: format_version round-trip.
@@ -709,6 +721,10 @@ class AppBuilder:
         )
 
         # 8. Build the proxy_args; submit happens later in AppBuilder.submit().
+        recovery_env_vars, redacted_env_var_keys = self._sanitize_recovery_env_vars(
+            application_env_vars
+        )
+
         method_schemas = spec["classes"][spec["entry_id"]]["method_schemas"]
         available_methods = [m["name"] for m in method_schemas]
         spec_hash = hashlib.sha256(
@@ -729,14 +745,18 @@ class AppBuilder:
             "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
             "entry": entry_id,
             "spec_hash": spec_hash,
+            "source_signature": source_signature,
             "display_name": manifest["name"],
             "description": manifest["description"],
+            # Carried so a worker adopting this app can tell it has a frontend
+            # and rebuild the static site URL; there is no manifest read on the
+            # recovery path.
+            "frontend_entry": manifest.get("frontend_entry"),
             "artifact_id": artifact_id,
             "version": version,
             "application_kwargs": application_kwargs,
-            "application_env_vars": self._sanitize_recovery_env_vars(
-                application_env_vars
-            ),
+            "application_env_vars": recovery_env_vars,
+            "redacted_env_var_keys": redacted_env_var_keys,
             "disable_gpu": disable_gpu,
             "max_ongoing_requests": max_ongoing_requests,
             "proxy_memory_in_gb": proxy_memory_in_gb,
@@ -777,6 +797,7 @@ class AppBuilder:
             "name": manifest["name"],
             "description": manifest["description"],
             "version": version,
+            "source_signature": source_signature,
             "resources": required_resources,
             "authorized_users": effective_authorized_users,
             "available_methods": available_methods,
@@ -808,11 +829,18 @@ class AppBuilder:
         # reference into ``hypha_rpc``. When Ray Serve cold-starts a
         # replica it ``cloudpickle.loads`` the deployment definition,
         # which re-imports any module the references point at —
-        # so without ``hypha-rpc`` (and the ``pydantic`` it pulls in
-        # via ``schema_method``) on the replica's venv, the replica
+        # so without ``hypha-rpc`` on the replica's venv, the replica
         # crashes at ``__init__`` with ``ModuleNotFoundError: No module
         # named 'hypha_rpc'``. Same story as Fix #7, just one layer
-        # deeper. Inject both at bind time.
+        # deeper. Injected at bind time.
+        #
+        # Only ``hypha-rpc`` actually comes back: ``pydantic`` is declared
+        # in the ``worker`` extra, so ``extras=[]`` filters it out and no
+        # pin for it reaches the replica. Replicas get the Ray node image's
+        # copy instead — Ray builds runtime_env venvs with
+        # ``--system-site-packages``. Pinning it here would newly constrain
+        # every replica venv, so it is left alone deliberately rather than
+        # by oversight.
         user_replica_framework_pip = get_pip_requirements(
             select=["hypha-rpc", "pydantic"],
             extras=[],

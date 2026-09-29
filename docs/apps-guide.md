@@ -534,6 +534,8 @@ worker_service_id = os.environ["BIOENGINE_WORKER_SERVICE_ID"]  # Worker service 
 token = os.environ.get("HYPHA_TOKEN")            # User authentication token
 ```
 
+Do not try to set `HYPHA_TOKEN` yourself through `--env` or `application_env_vars` — it is delivered by the `hypha_token` parameter on `deploy_app` (`--hypha-token` on the CLI), which overwrites whatever the plain variables set. See [Per-deployment credentials](#per-deployment-credentials).
+
 ### Built-in Dataset Access
 
 Every deployment automatically has access to the BioEngine datasets manager:
@@ -1032,9 +1034,38 @@ The `deploy_app` method supports these parameters:
 - **`application_id`** *(optional)*: Custom instance ID for deployment
 - **`application_kwargs`** *(optional)*: Initialization parameters per deployment
 - **`application_env_vars`** *(optional)*: Environment variables per deployment  
-- **`hypha_token`** *(optional)*: Authentication token for user permissions. Use this to run the application with specific user credentials, which determines access to datasets and other resources. Can be obtained from `await login()` or from the [Hypha dashboard](https://hypha.aicell.io/) (Login → Profile Picture → My Workspace → Development tab → Generate Token).
+- **`hypha_token`** *(optional)*: Authentication token for user permissions. Use this to run the application with specific user credentials, which determines access to datasets and other resources. Can be obtained from `await login()` or from the [Hypha dashboard](https://hypha.aicell.io/) (Login → Profile Picture → My Workspace → Development tab → Generate Token). See [Per-deployment credentials](#per-deployment-credentials) below.
 - **`disable_gpu`** *(optional)*: Force CPU-only execution (default: False)
 - **`max_ongoing_requests`** *(optional)*: Concurrent request limit (default: 10)
+
+#### Per-deployment credentials
+
+`hypha_token` is per *deployment*, not per worker. Every `deploy_app` call carries its own token, so one worker can run the same artifact many times with a different credential in each instance — and each of those tokens can be revoked on its own without touching the others. If several instances of an app write into one shared artifact, give each instance a token belonging to its own account rather than passing the same workspace-admin token to all of them; then losing one site means revoking one token.
+
+```python
+# Two instances of the same artifact, each with its own credential.
+await bioengine_worker_service.deploy_app(
+    artifact_id="workspace/my-app",
+    application_id="site-a",
+    hypha_token=site_a_token,
+)
+await bioengine_worker_service.deploy_app(
+    artifact_id="workspace/my-app",
+    application_id="site-b",
+    hypha_token=site_b_token,
+)
+```
+
+```bash
+bioengine apps run workspace/my-app --app-id site-a --hypha-token "$SITE_A_TOKEN"
+bioengine apps run workspace/my-app --app-id site-b --hypha-token "$SITE_B_TOKEN"
+```
+
+**Setting `HYPHA_TOKEN` as a plain environment variable does not work, and fails silently.** Neither `--env HYPHA_TOKEN=…` on the CLI nor `application_env_vars={"...": {"HYPHA_TOKEN": "…"}}` is a supported way to deliver the token: `hypha_token` — which the CLI defaults to your own `--token` — is unmasked into the replica environment *after* the plain variables and overwrites whatever they set. The plain value therefore only reaches a replica when `hypha_token` is omitted entirely — over RPC that means not passing it, and on the CLI it means `--hypha-token ''`, which is sent as `hypha_token=None` and treated exactly like omitting the parameter over RPC. On that one path a fresh application really does start up holding the plain value, and the worker then strips it from the state it persists to recover applications, so it does not survive into a redeploy of an adopted application (below). Nothing raises and nothing is logged; the app just runs as the wrong identity. Always use the `hypha_token` parameter / `--hypha-token` flag with a real token.
+
+Note that neither route survives into a redeploy of an **adopted** application. A worker adopts live Ray Serve applications rather than rebinding them — which is what happens after a worker restart, or when a worker attaches to a Ray cluster already running apps — so the replicas themselves keep the environment they started with and go on working. What the worker does not recover is the credential: the plain value was stripped from the persisted env vars, and `hypha_token` comes back as `None`. So an update to an adopted app that omits `hypha_token` injects nothing and fails like a fresh deployment. `get_app_status` reports `recovered_app: true` for an adopted app, and adoption is the only path that sets the flag, so `true` is a guarantee that no token is stored. The converse does not hold: `false` means the app was not adopted, not that a token is waiting for you — an app deployed over RPC without `hypha_token`, or an adopted app already redeployed once while omitting it, both report `false` with nothing stored. Treat the flag as diagnostic, not as a decision input: pass `hypha_token` on every update that needs one, rather than inferring from the flag that you can omit it.
+
+**What per-deployment tokens do not give you is a narrower token.** They solve blast radius on revocation, not least privilege. A Hypha token's permissions come from its workspace scope, so any token that can write a shared artifact in workspace `W` can also do everything else its permission level allows anywhere in `W` — including to artifacts the app never touches. Narrowing below workspace scope is not available: Hypha's `extra_scopes` accepts an `artifact:<ws>/<alias>:rw` string and records it in the JWT, but it is additive rather than restrictive, grants nothing on its own, and marks the token as specialized so it can no longer be used for general workspace access at all — a token carrying it cannot open the RPC connection an app makes at startup. Until Hypha gains a credential primitive an app can connect with, assume a compromised replica has the reach of its whole workspace, and size the token's `permission` and `expires_in` accordingly when minting it.
 
 #### Secret Environment Variables
 

@@ -1,4 +1,5 @@
 import asyncio
+import importlib.metadata
 import json
 import logging
 import os
@@ -2097,6 +2098,7 @@ class BioEngineWorker:
             "service_uptime": 3600.456,
             "bioengine_version": "0.9.1",
             "ray_version": "2.55.1",
+            "hypha_rpc_version": "0.21.40",
             "worker_mode": "slurm",
             "workspace": "my-workspace",
             "client_id": "client-abc123",
@@ -2119,6 +2121,10 @@ class BioEngineWorker:
             "service_uptime": current_time - self.start_time if self.start_time else 0,
             "bioengine_version": __version__,
             "ray_version": ray.__version__,
+            # Read from the installed distribution, not from a requirements
+            # file: those record what an image was built from, while apps now
+            # inherit whatever this process actually loaded.
+            "hypha_rpc_version": importlib.metadata.version("hypha-rpc"),
             "worker_mode": self.ray_cluster.mode,
             "workspace": self.workspace,
             "client_id": self.client_id,

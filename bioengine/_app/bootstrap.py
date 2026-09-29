@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from bioengine._app.errors import (
@@ -74,6 +75,25 @@ def _purge_stale_source_modules(source_root: str) -> None:
         ):
             del sys.modules[name]
     importlib.invalidate_caches()
+
+
+def hash_source_tree(source: Path) -> str:
+    """Content hash of a materialised app source tree (bytecode caches excluded).
+
+    A version string can't distinguish same-version-different-content; this can.
+    The submit task bakes it onto each user class as ``code_hash`` so a running
+    replica reports the code it actually loaded, and the introspect task returns
+    it so the worker can tell a real content change from an unchanged redeploy.
+    Both must hash the same way for those two values to be comparable.
+    """
+    import hashlib
+
+    hasher = hashlib.md5()
+    for path in sorted(source.rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts:
+            hasher.update(path.relative_to(source).as_posix().encode())
+            hasher.update(path.read_bytes())
+    return hasher.hexdigest()[:16]
 
 
 # ───────────────────────────── introspection ─────────────────────────────
@@ -139,7 +159,7 @@ def introspect_app_in_ray_task(
 ) -> Dict[str, Any]:
     """Phase-1 Ray task: download user source and introspect it.
 
-    Returns ``{"spec": …}``.
+    Returns ``{"spec": …, "source_signature": …}``.
 
     The download uses the Hypha ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional
     ``_DOWNLOAD_TOKEN``) env vars via ``_ensure_source``. Replicas materialise
@@ -177,7 +197,12 @@ def introspect_app_in_ray_task(
     _purge_stale_source_modules(src_str)
 
     spec = introspect_app(entry_id)
-    return {"spec": spec}
+
+    # Fingerprint what was actually synced, so the worker can tell a real
+    # content change from a version string that stayed the same (a re-staged
+    # version, or a redeploy at "latest"). The spec alone can't: a changed
+    # method body leaves qualnames and schemas identical.
+    return {"spec": spec, "source_signature": hash_source_tree(source)}
 
 
 def _walk(
@@ -414,16 +439,42 @@ def _requirement_name(req: str) -> str:
 
 
 def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
-    """Append entries from ``to_add`` to ``base`` unless an entry with the
-    same package name already exists. User-declared entries (in ``base``)
-    win on name collision so the framework never silently rewrites a
-    pinned version the user set."""
-    existing_names = {_requirement_name(r) for r in base}
-    merged = list(base)
-    for req in to_add:
-        if _requirement_name(req) not in existing_names:
+    """Merge the framework's pip entries (``to_add``) into the user's
+    (``base``), with the framework winning on package-name collision.
+
+    ``to_add`` carries the versions the *worker* has installed, for the
+    packages whose objects cross the cloudpickle boundary between worker
+    and replica — today that is ``hypha-rpc`` and nothing else. The worker
+    dictates those and an app cannot pin its way onto a different one. The
+    replaced entry keeps the user's position in the list; everything the
+    user declared that the framework does not own is untouched.
+
+    Every override is logged with both the requested and the enforced
+    string. An app author who reads their own requirements file and gets a
+    different version has to be able to find out why."""
+    import logging
+
+    logger = logging.getLogger("ray.serve")
+    framework = {_requirement_name(r): r for r in to_add}
+    merged = []
+    overridden = set()
+    for req in base:
+        name = _requirement_name(req)
+        if name in framework:
+            if framework[name] != req:
+                logger.warning(
+                    f"Overriding app requirement '{req}' with "
+                    f"'{framework[name]}': BioEngine dictates the version of "
+                    "the packages it shares with the replica."
+                )
+            merged.append(framework[name])
+            overridden.add(name)
+        else:
             merged.append(req)
-            existing_names.add(_requirement_name(req))
+    for req in to_add:
+        if _requirement_name(req) not in overridden:
+            merged.append(req)
+            overridden.add(_requirement_name(req))
     return merged
 
 
@@ -513,18 +564,7 @@ def build_and_run_application(
         sys.path.insert(0, src_str)
     _purge_stale_source_modules(src_str)
 
-    # Content hash of the materialised source — the code identity we bake into
-    # each user class below so a running replica reports what it *actually*
-    # loaded (a version string can't distinguish same-version-different-content;
-    # a content hash can). Excludes bytecode caches.
-    import hashlib as _hashlib
-
-    _src_hasher = _hashlib.md5()
-    for _p in sorted(Path(src_str).rglob("*")):
-        if _p.is_file() and "__pycache__" not in _p.parts:
-            _src_hasher.update(_p.relative_to(src_str).as_posix().encode())
-            _src_hasher.update(_p.read_bytes())
-    source_hash = _src_hasher.hexdigest()[:16]
+    source_hash = hash_source_tree(head_source)
     head_artifact_id = replica_env_vars.get("BIOENGINE_ARTIFACT_ID")
 
     handles: Dict[str, Any] = {}
@@ -604,12 +644,13 @@ def build_and_run_application(
         # modules like ``main`` (cellpose) or ``entry`` (model-runner)
         # without by-value vs by-ref pickling tricks.
         runtime_env["worker_process_setup_hook"] = _REPLICA_SETUP_HOOK
-        # Merge the framework-required pip deps (hypha-rpc, pydantic)
-        # into whatever the user declared via ``@bioengine.app(pip=…)``.
+        # Merge the framework-required pip deps (``hypha-rpc``) into
+        # whatever the user declared via ``@bioengine.app(pip=…)``.
         # The replica needs them at cloudpickle.loads time to resolve
         # references that the ``@bioengine.method`` wrapping created
-        # via ``hypha_rpc.utils.schema.schema_method``. User-declared
-        # entries take precedence on package name.
+        # via ``hypha_rpc.utils.schema.schema_method``, at the worker's
+        # own version — so the framework entries take precedence on
+        # package name.
         runtime_env["pip"] = _merge_pip_lists(
             list(runtime_env.get("pip") or []),
             user_replica_framework_pip,

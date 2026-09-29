@@ -226,6 +226,19 @@ def _belongs_to_worker_workspace(
     return True
 
 
+def _entry_deployment_name(entry_id: Optional[str]) -> Optional[str]:
+    """Ray Serve deployment name of an app's entry class.
+
+    Serve names the deployment after the entry class, so ``deployment:NucleiSeg``
+    runs as deployment ``NucleiSeg``. Derived from the id rather than the built
+    app's spec because a recovered app has no spec — it only carries the entry
+    id in its ``app_data``.
+    """
+    if not entry_id or ":" not in entry_id:
+        return None
+    return entry_id.split(":", 1)[1].split(".")[-1] or None
+
+
 # Ray-task helpers for the app cache API live in a stdlib-only sibling
 # module: the Ray Client server unpickles ``ray.remote(fn)`` references by
 # re-importing the function's module, and the manager namespace pulls in
@@ -391,6 +404,12 @@ class AppsManager:
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
         # moment an app is observed healthy again. See monitor_applications.
         self._redeploy_backoff: Dict[str, Dict[str, Any]] = {}
+
+        # Application ids already warned about an identity mismatch the monitor
+        # cannot self-heal. Both such conditions persist until a human
+        # redeploys, and the monitor ticks every ~10s — without this the log
+        # fills with the same line for as long as the worker lives.
+        self._identity_warned: set = set()
 
         # Consecutive monitor ticks each app has been missing from the Serve
         # status report. Cleared the moment the app reappears, in any state.
@@ -894,6 +913,7 @@ class AppsManager:
         # Remove from internal tracking after all cleanup operations complete
         self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
+        self._identity_warned.discard(application_id)
         self._missing_from_status.pop(application_id, None)
         self._deleted_pending_redeploy.discard(application_id)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
@@ -1096,7 +1116,7 @@ class AppsManager:
         application_id: str,
         application_details: Dict[str, Any],
         expected_version: str,
-    ) -> Tuple[Optional[str], Optional[bool]]:
+    ) -> Tuple[Optional[str], Optional[bool], Optional[bool]]:
         """Cross-reference each live replica's baked identity against the
         deployed version, entirely off the data plane.
 
@@ -1108,23 +1128,25 @@ class AppsManager:
         deployment reports its *baked* stale version here, so the worker can
         detect and force a real restart without ever issuing an in-band request.
 
-        Returns ``(running_version, version_verified)``: the entry deployment's
-        running replica version, and whether every live replica booted the
-        expected version. Either is ``None`` when no live replica has a known
-        identity yet, so the caller never acts on partial data.
+        Returns ``(running_version, version_verified, code_verified)``: the entry
+        deployment's running replica version, whether every live replica booted
+        the expected version, and whether every live replica booted the expected
+        source content. Each is ``None`` when it can't be determined, so the
+        caller never acts on partial data.
+
+        ``code_verified`` catches the case a version string cannot: the same
+        version re-staged with different files. It is reported only — a false
+        value never triggers a delete, because a systematic hash disagreement
+        would turn the monitor's self-heal into a redeploy loop on a healthy app.
+
+        A recovered app carries no ``built_app``, but the entry deployment is
+        named from ``entry_deployment_name``, which the deploy and the adoption
+        paths both store — so an app that survived a worker restart is verified
+        and reports its running version like any other.
         """
-        info = self._deployed_applications.get(application_id)
-        built_app = info.get("built_app") if info else None
-        spec = getattr(built_app, "spec", None)
-        if not spec:
-            return None, None
-        entry_cid = spec.get("entry_id")
-        classes = spec.get("classes") or {}
-        entry_name = (
-            classes[entry_cid]["qualname"].split(".")[-1]
-            if entry_cid in classes
-            else None
-        )
+        info = self._deployed_applications.get(application_id) or {}
+        expected_signature = info.get("source_signature")
+        entry_name = info.get("entry_deployment_name")
         try:
             identities = (
                 await self.ray_cluster.proxy_actor_handle.get_replica_identities.remote(
@@ -1135,10 +1157,11 @@ class AppsManager:
             self.logger.debug(
                 f"Could not read replica identities for '{application_id}': {exc}"
             )
-            return None, None
+            return None, None, None
 
         running_version = None
         verified = True
+        code_verified = None
         checked = 0
         for deployment_name, deployment_info in (
             application_details.get("deployments") or {}
@@ -1153,11 +1176,16 @@ class AppsManager:
                 checked += 1
                 if ident.get("version") != expected_version:
                     verified = False
+                running_hash = ident.get("code_hash")
+                if expected_signature is not None and running_hash is not None:
+                    code_verified = (running_hash == expected_signature) and (
+                        code_verified is not False
+                    )
                 if deployment_name == entry_name and running_version is None:
                     running_version = ident.get("version")
         if not checked:
-            return running_version, None
-        return running_version, verified
+            return running_version, None, None
+        return running_version, verified, code_verified
 
     async def _get_app_status(
         self,
@@ -1220,12 +1248,19 @@ class AppsManager:
         # version — a stale reused replica reads as "healthy" otherwise.
         # ``running_version`` shows the entry replica's baked version;
         # ``version_verified`` reflects EVERY live replica (a reused replica of
-        # any deployment, not just the entry, counts as unverified). Both are
-        # None when they can't be determined.
+        # any deployment, not just the entry, counts as unverified), and
+        # ``code_verified`` does the same for the source content, catching a
+        # re-staged version the version string alone cannot. All are None when
+        # they can't be determined.
         running_version = None
         version_verified = None
+        code_verified = None
         if status == "RUNNING":
-            running_version, version_verified = await self._verify_running_identities(
+            (
+                running_version,
+                version_verified,
+                code_verified,
+            ) = await self._verify_running_identities(
                 application_id, application_details, application_info["version"]
             )
 
@@ -1256,6 +1291,7 @@ class AppsManager:
             "version": application_info["version"] or "latest",
             "running_version": running_version,
             "version_verified": version_verified,
+            "code_verified": code_verified,
             "pinned_version": pinned_version,
             "recovered_app": application_info["recovered_app"],
             "status": status,
@@ -1414,6 +1450,7 @@ class AppsManager:
                     "description",
                     "artifact_id",
                     "version",
+                    "entry",
                     "application_kwargs",
                     "application_env_vars",
                     "disable_gpu",
@@ -1459,8 +1496,18 @@ class AppsManager:
                     "description": app_data["description"],
                     "artifact_id": app_data["artifact_id"],
                     "version": app_data["version"],
+                    "source_signature": app_data.get("source_signature"),
                     "application_kwargs": app_data["application_kwargs"],
                     "application_env_vars": app_data["application_env_vars"],
+                    # Names the builder stripped out of application_env_vars
+                    # above. Without it the reduced dict is indistinguishable
+                    # from an app that declared no secrets.
+                    "redacted_env_var_keys": dict(
+                        app_data.get("redacted_env_var_keys") or {}
+                    ),
+                    # Stays None: the builder keeps secrets out of app_data, so
+                    # the token is not in the blob. Updating a recovered app
+                    # therefore has to pass hypha_token again.
                     "hypha_token": None,
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
@@ -1482,8 +1529,20 @@ class AppsManager:
                     "proxy_service_token_ttl_seconds": app_data.get(
                         "proxy_service_token_ttl_seconds"
                     ),
+                    "entry_deployment_name": _entry_deployment_name(
+                        app_data["entry"]
+                    ),
+                    # Stays None: an adopted app cannot be rebuilt from here,
+                    # which is what _fire_redeploy and
+                    # _recover_from_controller_loss both gate on.
                     "built_app": None,
                     "auto_redeploy": app_data["auto_redeploy"],
+                    # Stays None: ice_servers is a ProxyDeployment constructor
+                    # argument, not part of app_data. None means "fetch a fresh
+                    # list", which is what a redeploy wants — lossy only for a
+                    # custom static list passed at deploy time, which is not
+                    # recoverable here either way.
+                    "ice_servers": None,
                     "debug": app_data["debug"],
                     "deployment_task": None,
                     "is_deployed": is_deployed,
@@ -1720,10 +1779,47 @@ class AppsManager:
                 application_details = (instance_details.get("applications") or {}).get(
                     application_id, {}
                 )
-                _, version_verified = await self._verify_running_identities(
+                (
+                    _,
+                    version_verified,
+                    code_verified,
+                ) = await self._verify_running_identities(
                     application_id, application_details, application_info["version"]
                 )
+                if version_verified is not False and code_verified is not False:
+                    self._identity_warned.discard(application_id)
+                if code_verified is False and version_verified is not False:
+                    # Same version, different files. Report only: acting on this
+                    # would delete on every tick if the two hashes ever disagree
+                    # systematically. Redeploy explicitly to clear it.
+                    if application_id not in self._identity_warned:
+                        self._identity_warned.add(application_id)
+                        self.logger.warning(
+                            f"Application '{application_id}' reports RUNNING at "
+                            f"the expected version "
+                            f"{application_info['version']!r}, but a live "
+                            f"replica loaded different source content than the "
+                            f"deployed bundle. Redeploy it to load the current "
+                            f"source."
+                        )
                 if version_verified is False:
+                    if application_info.get("built_app") is None:
+                        # Recovered app: deleting it would strand it, since the
+                        # redeploy path has no built application to resubmit.
+                        # Report the mismatch and leave it serving —
+                        # get_app_status carries version_verified=False so the
+                        # split-brain is visible instead of silent.
+                        if application_id not in self._identity_warned:
+                            self._identity_warned.add(application_id)
+                            self.logger.warning(
+                                f"Application '{application_id}' reports RUNNING "
+                                f"but a live replica loaded a version != "
+                                f"{application_info['version']!r}. It was "
+                                f"recovered from a previous worker, so it cannot "
+                                f"be rebuilt here — redeploy it explicitly to "
+                                f"load the pinned version."
+                            )
+                        continue
                     self.logger.warning(
                         f"Application '{application_id}' reports RUNNING but a "
                         f"live replica loaded a version != requested "
@@ -1850,6 +1946,19 @@ class AppsManager:
         UNHEALTHY verdict and a missing status entry are different failures and
         used to produce the same line.
         """
+        if application_info.get("built_app") is None:
+            # Recovered from a previous worker: there is nothing to resubmit,
+            # and _deploy_application would only raise on the None built_app.
+            # Say so once per attempt instead; recovery is the liveness
+            # backstop's pod cycle, or an explicit deploy_app by a user.
+            self.logger.warning(
+                f"Application '{application_id}' for artifact "
+                f"'{application_info['artifact_id']}' is unhealthy ({reason}) "
+                f"but was recovered from a previous worker and carries no built "
+                f"application; skipping auto-redeploy (attempt #{attempt}). "
+                f"Redeploy it explicitly to bring it back under this worker."
+            )
+            return
         self.logger.warning(
             f"Application '{application_id}' for artifact "
             f"'{application_info['artifact_id']}' is unhealthy ({reason}); "
@@ -2577,7 +2686,7 @@ class AppsManager:
         ),
         hypha_token: str = Field(
             None,
-            description="Hypha connection token to set as environment variable 'HYPHA_TOKEN' inside the application's Ray actor. Required for apps whose code reads HYPHA_TOKEN at startup (e.g. apps that authenticate to BioEngine datasets, read private artifacts, or call back to Hypha as the logged-in user). Pass the deploying user's token unless you are certain the app does not need it. If omitted: when redeploying an existing instance (matching application_id), the previously stored token is preserved; on a fresh instance the actor receives no token and any app reading HYPHA_TOKEN at __init__ will fail. The '--env HYPHA_TOKEN=...' flag is silently ignored by the app builder; always use this parameter.",
+            description="Hypha connection token to set as environment variable 'HYPHA_TOKEN' inside the application's Ray actor. Required for apps whose code reads HYPHA_TOKEN at startup (e.g. apps that authenticate to BioEngine datasets, read private artifacts, or call back to Hypha as the logged-in user). Pass the deploying user's token unless you are certain the app does not need it. If omitted: when redeploying an instance this worker deployed (matching application_id), the previously stored token is preserved. An app the worker adopted rather than deployed holds no stored token, so an omitted hypha_token injects nothing and the update fails like a fresh instance; adoption is what happens after a worker restart, or when the worker attaches to a Ray cluster already running apps. Pass this parameter on every update that needs a token rather than inferring that you can omit it: get_app_status reports 'recovered_app': true for an adopted app, which guarantees no token is stored, but 'recovered_app': false does not guarantee one is. On a fresh instance the actor receives no token and any app reading HYPHA_TOKEN at __init__ will fail. Do not deliver the token through application_env_vars (or the CLI's '--env HYPHA_TOKEN=...' flag) instead: when this parameter is set it is unmasked into the replica environment after the plain variables and overwrites them, and when it is omitted the plain value does reach the replica but is stripped from the state the worker persists to recover applications, so a redeploy of an adopted app loses it. Nothing raises either way. Always use this parameter. This token is per deployment, not per worker: each deploy_app call can carry a different token and each is independently revocable, so instances writing to one shared artifact should each get their own account's token rather than sharing one admin token. It cannot be narrowed below workspace scope, however — Hypha has no artifact-scoped credential an app can connect with — so a token able to write an artifact in workspace W carries W's full reach.",
         ),
         disable_gpu: bool = Field(
             None,
@@ -2740,6 +2849,21 @@ class AppsManager:
                 if application_kwargs is None:
                     application_kwargs = existing_app["application_kwargs"]
                 if application_env_vars is None:
+                    redacted = existing_app.get("redacted_env_var_keys") or {}
+                    if redacted:
+                        lost = ", ".join(
+                            f"{cls}: {', '.join(keys)}"
+                            for cls, keys in sorted(redacted.items())
+                        )
+                        raise ValueError(
+                            f"Application '{application_id}' was adopted from a "
+                            f"running Ray Serve application, and the secrets it "
+                            f"was deployed with are deliberately not part of the "
+                            f"recovery blob ({lost}). Redeploying without "
+                            f"application_env_vars would start it with fewer "
+                            f"environment variables than the running replicas "
+                            f"have. Pass application_env_vars explicitly."
+                        )
                     application_env_vars = existing_app["application_env_vars"]
                 if hypha_token is None:
                     hypha_token = existing_app["hypha_token"]
@@ -2861,35 +2985,6 @@ class AppsManager:
                     f"version '{version}'; kwargs: {kwargs_str}; env_vars: {env_vars_str}"
                 )
                 await self._cancel_deployment_process(application_id=application_id)
-
-                # A content change (new version, or a different artifact under
-                # this application_id) must reach every replica. serve.run's
-                # in-place update can silently reuse replicas — at
-                # num_replicas=1 with no surge headroom (e.g. a single GPU)
-                # the old replica keeps serving stale in-memory code. Delete
-                # first so the slot frees and fresh replicas load the new
-                # source. Clear is_deployed so the monitor loop doesn't fire a
-                # redundant redeploy during the delete→rebuild window.
-                content_changed = (
-                    version != existing_app["version"]
-                    or artifact_id != existing_app["artifact_id"]
-                )
-                if content_changed:
-                    existing_app["is_deployed"].clear()
-                    try:
-                        await self.ray_cluster.call_with_reconnect(
-                            serve.delete, application_id
-                        )
-                        self.logger.info(
-                            f"Deleted Ray Serve application '{application_id}' "
-                            f"before redeploy so replicas are recreated with "
-                            f"the new source."
-                        )
-                    except Exception as delete_err:
-                        self.logger.error(
-                            f"Error deleting Ray Serve application "
-                            f"'{application_id}' before redeploy: {delete_err}"
-                        )
             else:
                 # Create a new application
                 self.logger.info(
@@ -2957,6 +3052,55 @@ class AppsManager:
                         f"{nr}; must be >= 0."
                     )
 
+            # A content change (new version, different artifact, or the same
+            # version string re-staged with different files) must reach every
+            # replica. serve.run's in-place update can silently reuse replicas —
+            # at num_replicas=1 with no surge headroom (e.g. a single GPU) the
+            # old replica keeps serving the module it imported at first start.
+            # Delete first so the slot frees and fresh replicas load the new
+            # source. Clear is_deployed so the monitor loop doesn't fire a
+            # redundant redeploy during the delete→rebuild window.
+            #
+            # This runs AFTER the build because only the build fingerprints the
+            # files it actually synced. A version string cannot see content that
+            # changed underneath it, so a re-staged version took the in-place
+            # serve.run path while _ensure_source had already refreshed the
+            # source on disk. It stays BEFORE _check_resources so the old app's
+            # reservation is already released when free capacity is measured.
+            if is_update:
+                new_signature = app.metadata.get("source_signature")
+                old_signature = existing_app.get("source_signature")
+                content_changed = (
+                    artifact_id != existing_app["artifact_id"]
+                    or app.metadata["version"] != existing_app["version"]
+                    # Both known and different: files changed under one version.
+                    # Either unknown: fall back to the identity check above
+                    # rather than restarting a healthy app on a config-only
+                    # update (an app recovered from a worker released before
+                    # source signatures existed carries none).
+                    or (
+                        new_signature is not None
+                        and old_signature is not None
+                        and new_signature != old_signature
+                    )
+                )
+                if content_changed:
+                    existing_app["is_deployed"].clear()
+                    try:
+                        await self.ray_cluster.call_with_reconnect(
+                            serve.delete, application_id
+                        )
+                        self.logger.info(
+                            f"Deleted Ray Serve application '{application_id}' "
+                            f"before redeploy so replicas are recreated with "
+                            f"the new source."
+                        )
+                    except Exception as delete_err:
+                        self.logger.error(
+                            f"Error deleting Ray Serve application "
+                            f"'{application_id}' before redeploy: {delete_err}"
+                        )
+
             # Check resources before creating deployment task
             await self._check_resources(
                 application_id=application_id,
@@ -2978,8 +3122,10 @@ class AppsManager:
                 "description": app.metadata["description"],
                 "artifact_id": artifact_id,
                 "version": app.metadata["version"],
+                "source_signature": app.metadata.get("source_signature"),
                 "application_kwargs": app.metadata["application_kwargs"],
                 "application_env_vars": app.metadata["application_env_vars"],
+                "redacted_env_var_keys": {},
                 "hypha_token": hypha_token,
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,
@@ -3001,9 +3147,13 @@ class AppsManager:
                 "proxy_service_token_ttl_seconds": app.metadata[
                     "proxy_service_token_ttl_seconds"
                 ],
+                "entry_deployment_name": _entry_deployment_name(
+                    app.spec.get("entry_id")
+                ),
                 "built_app": app,
                 "auto_redeploy": auto_redeploy,
                 "ice_servers": ice_servers,
+                "debug": debug,
                 "deployment_task": None,  # Control task for app deployment
                 "is_deployed": asyncio.Event(),  # Track the deployment process
                 "undeployment_task": None,  # Control task for app undeployment
