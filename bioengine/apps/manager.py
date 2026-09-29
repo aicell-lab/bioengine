@@ -1499,9 +1499,15 @@ class AppsManager:
                     "source_signature": app_data.get("source_signature"),
                     "application_kwargs": app_data["application_kwargs"],
                     "application_env_vars": app_data["application_env_vars"],
-                    # Stays None: the builder strips secrets from app_data, so
-                    # an adopting worker cannot recover the token. Updating a
-                    # recovered app therefore has to pass hypha_token again.
+                    # Names the builder stripped out of application_env_vars
+                    # above. Without it the reduced dict is indistinguishable
+                    # from an app that declared no secrets.
+                    "redacted_env_var_keys": dict(
+                        app_data.get("redacted_env_var_keys") or {}
+                    ),
+                    # Stays None: the builder keeps secrets out of app_data, so
+                    # the token is not in the blob. Updating a recovered app
+                    # therefore has to pass hypha_token again.
                     "hypha_token": None,
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
@@ -2843,6 +2849,21 @@ class AppsManager:
                 if application_kwargs is None:
                     application_kwargs = existing_app["application_kwargs"]
                 if application_env_vars is None:
+                    redacted = existing_app.get("redacted_env_var_keys") or {}
+                    if redacted:
+                        lost = ", ".join(
+                            f"{cls}: {', '.join(keys)}"
+                            for cls, keys in sorted(redacted.items())
+                        )
+                        raise ValueError(
+                            f"Application '{application_id}' was adopted from a "
+                            f"running Ray Serve application, and the secrets it "
+                            f"was deployed with are deliberately not part of the "
+                            f"recovery blob ({lost}). Redeploying without "
+                            f"application_env_vars would start it with fewer "
+                            f"environment variables than the running replicas "
+                            f"have. Pass application_env_vars explicitly."
+                        )
                     application_env_vars = existing_app["application_env_vars"]
                 if hypha_token is None:
                     hypha_token = existing_app["hypha_token"]
@@ -3104,6 +3125,7 @@ class AppsManager:
                 "source_signature": app.metadata.get("source_signature"),
                 "application_kwargs": app.metadata["application_kwargs"],
                 "application_env_vars": app.metadata["application_env_vars"],
+                "redacted_env_var_keys": {},
                 "hypha_token": hypha_token,
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,

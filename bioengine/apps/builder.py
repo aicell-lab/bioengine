@@ -30,7 +30,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ray
 import yaml
@@ -558,16 +558,25 @@ class AppBuilder:
     @staticmethod
     def _sanitize_recovery_env_vars(
         application_env_vars: Dict[str, Dict[str, str]]
-    ) -> Dict[str, Dict[str, str]]:
-        """Strip secret-like keys so they don't end up in proxy app_data."""
-        out: Dict[str, Dict[str, str]] = {}
+    ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, List[str]]]:
+        """Strip secret-like keys from proxy app_data, and name what was stripped.
+
+        The names ride along so an adopting worker can tell a complete env var
+        dict from a reduced one; without them the reduced copy is
+        indistinguishable from an app that declared no secrets.
+        """
+        kept: Dict[str, Dict[str, str]] = {}
+        redacted: Dict[str, List[str]] = {}
         for cls_key, env in application_env_vars.items():
-            out[cls_key] = {
+            kept[cls_key] = {
                 k: v
                 for k, v in env.items()
                 if not k.startswith("_") and k != "HYPHA_TOKEN"
             }
-        return out
+            dropped = sorted(set(env) - set(kept[cls_key]))
+            if dropped:
+                redacted[cls_key] = dropped
+        return kept, redacted
 
     # ────────────────────────────── build ────────────────────────────────
 
@@ -712,6 +721,10 @@ class AppBuilder:
         )
 
         # 8. Build the proxy_args; submit happens later in AppBuilder.submit().
+        recovery_env_vars, redacted_env_var_keys = self._sanitize_recovery_env_vars(
+            application_env_vars
+        )
+
         method_schemas = spec["classes"][spec["entry_id"]]["method_schemas"]
         available_methods = [m["name"] for m in method_schemas]
         spec_hash = hashlib.sha256(
@@ -742,9 +755,8 @@ class AppBuilder:
             "artifact_id": artifact_id,
             "version": version,
             "application_kwargs": application_kwargs,
-            "application_env_vars": self._sanitize_recovery_env_vars(
-                application_env_vars
-            ),
+            "application_env_vars": recovery_env_vars,
+            "redacted_env_var_keys": redacted_env_var_keys,
             "disable_gpu": disable_gpu,
             "max_ongoing_requests": max_ongoing_requests,
             "proxy_memory_in_gb": proxy_memory_in_gb,
