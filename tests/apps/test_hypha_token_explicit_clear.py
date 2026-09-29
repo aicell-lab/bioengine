@@ -178,14 +178,19 @@ def _invoke(monkeypatch, state: str, extra_args: list) -> dict:
 
 
 def _replica_env(env_vars: Dict[str, str], monkeypatch) -> Dict[str, str]:
-    """What the replica's ``os.environ`` holds after the setup hook unmasks."""
-    for key, value in env_vars.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.delenv("HYPHA_TOKEN", raising=False)
-    _unmask_secret_env_vars()
+    """What the replica's ``os.environ`` holds after the setup hook unmasks.
+
+    ``env_vars`` stands in for the real environment rather than being merged
+    into it. Merging meant the ambient HYPHA_TOKEN had to be cleared to keep
+    the run honest, and clearing it also deleted any plain HYPHA_TOKEN that
+    came in through --env — the one value some of these tests are about.
+    """
     import os
 
-    return dict(os.environ)
+    replica_environ = dict(env_vars)
+    monkeypatch.setattr(os, "environ", replica_environ)
+    _unmask_secret_env_vars()
+    return replica_environ
 
 
 # ── The empty string survives the trip to deploy_app ──────────────────────────
@@ -310,6 +315,77 @@ def test_a_cleared_token_is_what_a_later_omitted_redeploy_inherits() -> None:
     assert "_BIOENGINE_SECRET_HYPHA_TOKEN" not in recorder["env_vars"]
 
 
+# ── The clear has to be visible in the worker log ─────────────────────────────
+
+
+def test_clearing_a_stored_token_is_logged(monkeypatch, caplog) -> None:
+    # The destructive case, and the only one reachable by accident: a blank
+    # variable expands to an empty flag against a stable application_id. It
+    # used to be absorbed by the inherit, so it now has to leave a trace.
+    with caplog.at_level(logging.INFO, logger="test.hypha_token"):
+        _invoke(monkeypatch, "running", ["--hypha-token", ""])
+
+    messages = [r.getMessage() for r in caplog.records]
+    clearing = [m for m in messages if "clearing the token" in m]
+    assert len(clearing) == 1, messages
+    assert APP_ID in clearing[0]
+    assert STORED_TOKEN not in clearing[0], "the log line must not print the token"
+
+
+@pytest.mark.parametrize("state", ["fresh", "adopted"])
+def test_nothing_is_logged_when_there_was_no_token_to_clear(
+    monkeypatch, caplog, state
+) -> None:
+    # Neither state holds a token, so nothing is being taken away. A line on
+    # every empty-token deploy is a line nobody reads.
+    with caplog.at_level(logging.INFO, logger="test.hypha_token"):
+        _invoke(monkeypatch, state, ["--hypha-token", ""])
+
+    assert not [m for m in caplog.messages if "clearing the token" in m]
+
+
+def test_nothing_is_logged_when_the_token_is_being_replaced(
+    monkeypatch, caplog
+) -> None:
+    with caplog.at_level(logging.INFO, logger="test.hypha_token"):
+        _invoke(monkeypatch, "running", ["--hypha-token", "replacement-placeholder"])
+
+    assert not [m for m in caplog.messages if "clearing the token" in m]
+
+
+# ── A plain --env HYPHA_TOKEN is the one value an empty flag does not remove ──
+
+
+@pytest.mark.parametrize("state", list(STATES))
+def test_a_plain_env_hypha_token_survives_an_empty_flag(monkeypatch, state) -> None:
+    # What the help screen claims, exercised rather than grepped. The flag
+    # stops BioEngine injecting a token; it does not reach into a variable the
+    # user set themselves, and on this path nothing overwrites that variable.
+    recorder = _invoke(
+        monkeypatch, state, ["--hypha-token", "", "--env", "HYPHA_TOKEN=plain-value"]
+    )
+
+    replica_env = _replica_env(recorder["env_vars"], monkeypatch)
+    assert replica_env["HYPHA_TOKEN"] == "plain-value"
+    assert "_BIOENGINE_SECRET_HYPHA_TOKEN" not in recorder["env_vars"]
+
+
+@pytest.mark.parametrize("state", list(STATES))
+def test_an_explicit_token_still_overwrites_a_plain_env_hypha_token(
+    monkeypatch, state
+) -> None:
+    # The other half of the same help screen, and the reason the first half
+    # needs saying: with a real token the plain variable loses.
+    recorder = _invoke(
+        monkeypatch,
+        state,
+        ["--hypha-token", "explicit-placeholder", "--env", "HYPHA_TOKEN=plain-value"],
+    )
+
+    replica_env = _replica_env(recorder["env_vars"], monkeypatch)
+    assert replica_env["HYPHA_TOKEN"] == "explicit-placeholder"
+
+
 # ── The help screens have to describe what the flag now does ──────────────────
 
 
@@ -335,14 +411,15 @@ def test_the_help_describes_the_empty_token_truthfully(command) -> None:
 
 
 @pytest.mark.parametrize("command", ["run", "deploy"])
-def test_the_help_does_not_contradict_the_env_note(command) -> None:
+def test_the_help_carries_both_halves_of_the_env_note(command) -> None:
+    # A wording check, and only that: it pins that the screen says both halves,
+    # not that either is true. The --env half is unverified here; the
+    # --hypha-token half is verified by the --env test above it.
     text = _help(command)
 
-    # --env's note says a plain HYPHA_TOKEN is overwritten by --hypha-token.
     assert "--env HYPHA_TOKEN=... is overwritten by --hypha-token" in text
-    # So "deploy without a token" is only true if the flag also says what
-    # happens to a plain --env HYPHA_TOKEN — otherwise the two notes disagree
-    # about the same deployment on the same screen.
+    # Without this second sentence "deploy without a token" and the --env note
+    # read as disagreeing about the same deployment on the same screen.
     assert "A plain --env HYPHA_TOKEN=... does reach the deployment" in text
 
 

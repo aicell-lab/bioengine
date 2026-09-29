@@ -2870,6 +2870,13 @@ class AppsManager:
                 # would silently hand the app back the token it asked to drop.
                 if hypha_token is None:
                     hypha_token = existing_app["hypha_token"]
+                elif hypha_token == "" and existing_app["hypha_token"]:
+                    self.logger.info(
+                        f"Update to application '{application_id}' carries an "
+                        f"empty hypha_token: clearing the token it was deployed "
+                        f"with, replicas will start with no HYPHA_TOKEN. Pass a "
+                        f"token to keep one."
+                    )
                 if disable_gpu is None:
                     disable_gpu = existing_app["disable_gpu"]
                 if max_ongoing_requests is None:
