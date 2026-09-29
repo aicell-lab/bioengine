@@ -81,6 +81,44 @@ _UNAUTHENTICATED_EMAILS = frozenset(
 _ACCESS_REQUEST_DECISIONS = ("grant", "deny", "clear")
 
 
+# What ``get_status`` tells a caller who is not a worker admin.
+#
+# The worker service is registered public and this is its health surface: the
+# Kubernetes startup and liveness probes curl it unauthenticated and grep
+# ``is_ready``, the worker list renders ``geo_location`` and
+# ``bioengine_version`` on each card, and the CLI's cluster view reads
+# ``ray_cluster``. So everything describing *this worker* — its versions, its
+# mode, its readiness, where it runs and what hardware it has — stays anonymous.
+#
+# Held back is ``admin_users``, the only field naming people. It is the same
+# list PR #208 stopped permission denials from disclosing, and ``list_admin_users``
+# already requires admin to return it, so publishing it here contradicted both.
+#
+# An allowlist rather than a denylist, for the same reason ``get_app_status``
+# uses one: a field added to the status payload later must not become public by
+# nobody having thought about it. Adding a name here is the decision to publish it.
+PUBLIC_WORKER_STATUS_FIELDS = (
+    "service_start_time",
+    "service_uptime",
+    "bioengine_version",
+    "ray_version",
+    "hypha_rpc_version",
+    "worker_mode",
+    "workspace",
+    "client_id",
+    "ray_cluster",
+    "geo_location",
+    "is_ready",
+)
+
+
+def public_worker_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    """The worker's status as a caller who is not a worker admin may see it."""
+    return {
+        field: status[field] for field in PUBLIC_WORKER_STATUS_FIELDS if field in status
+    }
+
+
 class BioEngineWorker:
     """
     Enterprise-grade BioEngine worker for distributed AI model deployment and execution.
@@ -2072,7 +2110,7 @@ class BioEngineWorker:
 
         This method provides a complete overview of the worker's operational state including Ray cluster health, active deployments, loaded datasets, resource utilization, and service availability. Essential for monitoring, debugging, health checks, and dashboard displays.
 
-        SECURITY: This method is publicly accessible and does not require admin permissions, making it suitable for monitoring dashboards and health checks by any authenticated user.
+        SECURITY: This method is publicly accessible and does not require admin permissions, making it suitable for monitoring dashboards and health checks by any caller, including an unauthenticated one. Authentication is optional and widens the response: `admin_users` is returned only to a worker admin, who is on that list already; a "*" entry does not earn it. See PUBLIC_WORKER_STATUS_FIELDS for the fields everyone receives.
 
         STATUS INFORMATION CATEGORIES:
 
@@ -2081,7 +2119,7 @@ class BioEngineWorker:
         - service_uptime: Duration in seconds since worker startup
         - workspace: Hypha workspace name where worker is registered
         - client_id: Unique client identifier for this worker instance
-        - admin_users: List of user identifiers with administrative privileges
+        - admin_users: List of user identifiers with administrative privileges (worker admins only)
         - is_ready: Boolean indicating if worker is fully operational
 
         RAY CLUSTER STATUS:
@@ -2148,6 +2186,16 @@ class BioEngineWorker:
                 )
             except Exception as e:
                 self.logger.warning(f"Failed to refresh slurm_jobs for get_status: {e}")
+
+        try:
+            check_permissions(
+                context=context,
+                authorized_users=self.admin_users,
+                resource_name="the admin users of the BioEngine worker",
+                allow_wildcard=False,
+            )
+        except PermissionError:
+            return public_worker_status(status)
 
         return status
 
