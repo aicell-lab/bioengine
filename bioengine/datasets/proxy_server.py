@@ -49,6 +49,10 @@ from bioengine.utils.permissions import check_permissions
 
 AUTHENTICATION_SERVER_URL: str = "https://hypha.aicell.io"
 
+# The identity of a caller who sent no usable credential. Matches no entry in
+# any authorized_users list, so it is authorized for nothing.
+ANONYMOUS_USER_INFO = {"id": "anonymous-user", "email": "no-email"}
+
 logger = logging.getLogger("ProxyServer")
 
 
@@ -279,7 +283,7 @@ async def parse_token(
         if len(cached_user_info) > 1000:
             cached_user_info.pop(next(iter(cached_user_info)))
     else:
-        user_info = {"id": "anonymous-user", "email": "no-email"}
+        user_info = dict(ANONYMOUS_USER_INFO)
 
     return user_info
 
@@ -421,10 +425,28 @@ def _build_app(
         A '*' entry does not earn the roster. It authorizes reading the data,
         not reading who else may read it, and a dataset listing both '*' and
         named addresses would otherwise hand those addresses to everyone.
+
+        An unusable credential degrades to the public view rather than being
+        refused. On this route a token only ever *widens* what comes back, so
+        failing closed on one would take away something the caller could have
+        had by sending nothing at all — and it would break the tokenless
+        listing of a public dataset whenever a token happened to be expired or
+        the auth server was briefly unreachable. The file and byte routes,
+        where a credential grants rather than widens, still refuse.
         """
-        user_info = await parse_token(
-            resolve_token(authorization, token), cached_user_info
-        )
+        try:
+            user_info = await parse_token(
+                resolve_token(authorization, token), cached_user_info
+            )
+        except Exception as e:
+            logger.debug(
+                f"Ignoring an unusable token on the dataset listing and "
+                f"returning the public view ({type(e).__name__}: {e})."
+            )
+            # Not via parse_token: whatever just failed is very likely to fail
+            # again, and the auth server being unreachable is the case this
+            # fallback exists for.
+            user_info = dict(ANONYMOUS_USER_INFO)
         listing = {}
         for dataset_id, info in datasets.items():
             try:

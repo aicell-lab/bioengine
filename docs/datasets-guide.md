@@ -115,11 +115,13 @@ Listing available datasets (`GET /datasets`) never requires authentication — a
 
 **`authorized_users` is not part of that public view.** Its entries are the email addresses of third parties, and a dataset's collaborator roster is often itself the sensitive thing — it names who is working on what. The unauthenticated listing returns only the fields below; every other manifest key, including any the data owner invented, is withheld.
 
-| Returned to anyone | Returned only to a user named in `authorized_users` |
+| Returned to anyone | Returned only to a user named in the manifest's `authorized_users` |
 |---|---|
 | `id`, `name`, `description`, `version`, `license`, `authors`, `tags`, `documentation`, `git_repo` | the whole manifest, including `authorized_users` and any custom fields |
 
 Pass a token to `GET /datasets` to get the fuller view of the datasets you are named on. A `"*"` entry does **not** earn the roster: it authorizes reading the data, not reading who else may read it, so a dataset listing both `"*"` and named addresses does not hand those addresses to everyone.
+
+On this route a token only ever *widens* the response, so an unusable one — expired, malformed, or unverifiable because the auth server is briefly unreachable — returns the public view rather than an error. Listing a public dataset therefore keeps working without a usable credential, as it did before any of this existed. The file and byte routes behave the opposite way, because there a credential grants access rather than widening a view: a bad token is refused.
 
 ---
 

@@ -120,8 +120,58 @@ def test_anonymous_listing_drops_invented_fields(tmp_path):
     assert "cohort_note" not in manifest
 
 
-def test_an_invalid_token_is_still_refused(tmp_path):
-    assert build(tmp_path).get("/datasets", headers=auth("tok-bogus")).status_code == 401
+def test_an_unusable_token_degrades_to_the_public_view(tmp_path):
+    """A token only ever widens this route, so refusing on a bad one would take
+    away what the caller could have had by sending nothing at all."""
+    response = build(tmp_path).get("/datasets", headers=auth("tok-bogus"))
+    assert response.status_code == 200
+    manifest = response.json()["blood-atlas"]
+    assert "authorized_users" not in manifest
+    assert manifest["name"] == "Blood Cell Atlas"
+
+
+def test_a_public_dataset_still_lists_while_the_auth_server_is_down(tmp_path, monkeypatch):
+    """An expired token in an app replica, or a brief Hypha outage, must not
+    break the one dataset operation that never needed a token."""
+    client = build(tmp_path, [{"id": "open", "authorized_users": ["*"]}])
+
+    async def unreachable(token, cached_user_info):
+        raise RuntimeError("auth server unreachable")
+
+    monkeypatch.setattr(proxy_server, "parse_token", unreachable)
+
+    for headers in ({}, auth("tok-member")):
+        response = client.get("/datasets", headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"open": {"id": "open"}}
+
+
+# ---------------------------------------------------------------------------
+# The boundary: widening degrades, granting does not
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path", ["/datasets/blood-atlas/files", "/data/blood-atlas/notes.txt"]
+)
+def test_an_unusable_token_is_still_refused_where_it_grants(tmp_path, path):
+    """On the file and byte routes a credential grants rather than widens, so a
+    bad one must fail closed — degrading there would hand out the data."""
+    data_dir = tmp_path / "data"
+    (data_dir / "blood-atlas").mkdir(parents=True)
+    (data_dir / "blood-atlas" / "manifest.yaml").write_text(
+        yaml.dump({"id": "blood-atlas", "authorized_users": [MEMBER]})
+    )
+    (data_dir / "blood-atlas" / "notes.txt").write_text("payload")
+    client = TestClient(
+        _build_app(
+            data_dir=data_dir,
+            datasets=load_datasets(data_dir),
+            cached_user_info={},
+        )
+    )
+    assert client.get(path, headers=auth("tok-bogus")).status_code == 401
+    assert client.get(path).status_code == 403
 
 
 # ---------------------------------------------------------------------------
