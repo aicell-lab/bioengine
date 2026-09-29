@@ -735,6 +735,10 @@ class AppBuilder:
             "source_signature": source_signature,
             "display_name": manifest["name"],
             "description": manifest["description"],
+            # Carried so a worker adopting this app can tell it has a frontend
+            # and rebuild the static site URL; there is no manifest read on the
+            # recovery path.
+            "frontend_entry": manifest.get("frontend_entry"),
             "artifact_id": artifact_id,
             "version": version,
             "application_kwargs": application_kwargs,
