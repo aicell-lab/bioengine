@@ -288,18 +288,25 @@ prebuilt image that bakes the app's dependencies — the same pattern as
 every pin is already satisfied and the app starts fast.
 
 Published as one general GHCR package, `ghcr.io/aicell-lab/model-finetune`, with
-a per-backend tag suffix: `<app-version>-<backend>`, e.g. `0.21.0-cellpose`. The
-**cellpose** variant (`docker/model-finetune.Dockerfile`) bakes
-`MODEL_FINETUNE_BACKENDS=cellpose` so a worker from it runs the app Cellpose-only
-on a single GPU with no deploy-time install. Build on demand (not in CI):
+a per-backend tag suffix: `<app-version>-<backend>`, e.g. `0.21.0-cellpose` or
+`0.21.0-microsam`. There are **two Dockerfiles**, one per backend, because they
+need different numpy/protobuf majors in the base image and one image can bake
+only one of each:
+
+- `docker/model-finetune-cellpose.Dockerfile` — `MODEL_FINETUNE_BACKENDS=cellpose`, whole image at `numpy==1.26.4` / `protobuf<5`.
+- `docker/model-finetune-microsam.Dockerfile` — `MODEL_FINETUNE_BACKENDS=microsam`, whole image at `numpy>=2` / `protobuf<6` (micro-sam's `python-elf` AIS decoder hard-requires numpy 2).
+
+Build on demand (not in CI):
 
 ```bash
-scripts/build_model_finetune.sh            # build ghcr.io/aicell-lab/model-finetune:<ver>-cellpose
-scripts/build_model_finetune.sh --push     # build + publish (refuses to overwrite a published tag)
+scripts/build_model_finetune.sh                     # cellpose → :<ver>-cellpose
+BACKEND=microsam scripts/build_model_finetune.sh    # micro-sam → :<ver>-microsam
+scripts/build_model_finetune.sh --push              # build + publish (refuses to overwrite a published tag)
 ```
 
 The tag is the model-finetune app version from `manifest.yaml`; the BioEngine
 version each tag is built against is read from `pyproject.toml` and baked in as
-`io.bioengine.version`. A **micro-sam** variant is not a drop-in second tag off
-this base: micro-sam needs `numpy>=2` while the worker image pins `numpy==1.26.4`
-(the cellpose pin), so it needs a different base and is tracked separately.
+`io.bioengine.version`. The micro-sam image runs the bioengine worker itself at
+numpy 2.x (vs the standard worker's 1.26.4 pin); that the worker + Ray 2.55 run
+correctly at numpy 2.x is the one thing to confirm on a worker-from-image smoke
+test before relying on a `-microsam` tag (see that Dockerfile's header).

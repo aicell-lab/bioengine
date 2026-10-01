@@ -8,10 +8,11 @@
 # build it on demand, like the model-runner image.
 #
 # ONE general GHCR package (ghcr.io/aicell-lab/model-finetune) with a per-backend
-# tag suffix: <app-version>-<backend>, e.g. 0.21.0-cellpose. Only the CELLPOSE
-# variant is buildable today (docker/model-finetune.Dockerfile, single-GPU,
-# micro-sam disabled). A micro-sam variant needs a different base (numpy>=2 vs
-# the worker's 1.26.4 pin — see the Dockerfile header) and is not yet wired here.
+# tag suffix: <app-version>-<backend>, e.g. 0.21.0-cellpose or 0.21.0-microsam.
+# BACKEND picks the Dockerfile: cellpose -> docker/model-finetune-cellpose.Dockerfile
+# (numpy 1.26.4 / protobuf<5), microsam -> docker/model-finetune-microsam.Dockerfile
+# (numpy>=2 / protobuf<6). They are separate Dockerfiles because one image cannot
+# bake both numpy majors (see each Dockerfile's header).
 #
 # Rebuild when either half of what is baked in changes:
 #   * the app's pins — apps/model-finetune/requirements-{entry,runtime-cellpose}.txt
@@ -25,7 +26,7 @@
 #   scripts/build_model_finetune.sh [--push]
 #
 # Environment overrides:
-#   BACKEND      backend variant (default cellpose; only cellpose supported today)
+#   BACKEND      backend variant: cellpose (default) or microsam
 #   IMAGE        image name (default ghcr.io/aicell-lab/model-finetune)
 #   TAG          image tag  (default: <manifest-version>-<backend>)
 #   RAY_VERSION  Ray to bake (default: the Dockerfile's pinned version)
@@ -36,12 +37,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 BACKEND="${BACKEND:-cellpose}"
-if [[ "$BACKEND" != "cellpose" ]]; then
-    echo "Unsupported BACKEND='$BACKEND'. Only 'cellpose' is buildable today; a" >&2
-    echo "micro-sam variant needs a different base (see docker/model-finetune.Dockerfile)." >&2
-    exit 2
-fi
-DOCKERFILE="$PROJECT_ROOT/docker/model-finetune.Dockerfile"
+case "$BACKEND" in
+    cellpose) DOCKERFILE="$PROJECT_ROOT/docker/model-finetune-cellpose.Dockerfile" ;;
+    microsam) DOCKERFILE="$PROJECT_ROOT/docker/model-finetune-microsam.Dockerfile" ;;
+    *)
+        echo "Unknown BACKEND='$BACKEND'. Use 'cellpose' or 'microsam'." >&2
+        exit 2
+        ;;
+esac
 
 MODEL_FINETUNE_VERSION="$(grep -E '^version\s*:' "$PROJECT_ROOT/apps/model-finetune/manifest.yaml" \
     | sed -E 's/version\s*:\s*"?([^"]*)"?/\1/' | head -1)"

@@ -7,14 +7,13 @@
 # a per-backend tag suffix (e.g. 0.21.0-cellpose). This file builds the CELLPOSE
 # variant: the CPU-entry + Cellpose-runtime pins are preinstalled and
 # MODEL_FINETUNE_BACKENDS=cellpose is baked in, so the micro-sam runtime is never
-# composed and the app fits a single GPU. A future micro-sam variant is NOT a
-# drop-in second tag off this same base: micro-sam needs numpy>=2 (its
-# python-elf AIS decoder) while requirements-worker.txt pins numpy==1.26.4 (the
-# cellpose pin), and the worker's ProxyDeployment runs numpy 1.x and cannot
-# unpickle numpy-2.x arrays — which is exactly why the two backends run as
-# separate Ray runtime envs today. A -microsam tag therefore needs a different
-# base (worker reqs without the numpy pin + a resolved proxy path), tracked
-# separately; this image intentionally bakes cellpose only.
+# composed and the app fits a single GPU.
+#
+# The micro-sam variant is a SEPARATE Dockerfile (docker/model-finetune-microsam.Dockerfile),
+# not a parameterised flag off this one, because the two backends need different
+# base pins: cellpose runs the whole image at numpy==1.26.4 / protobuf<5 (this
+# file), while micro-sam needs numpy>=2 (its python-elf AIS decoder) and
+# protobuf<6. One Dockerfile cannot bake both numpy majors, so there are two.
 #
 # Mirrors docker/model-runner.Dockerfile: installs the app requirements FIRST
 # (the largest, least-changing layer), then worker requirements, the bioengine
