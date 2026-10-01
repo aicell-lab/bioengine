@@ -168,6 +168,19 @@ launch instead of OOMing mid-train.
   `resume_checkpoint_file`. This closes the train → export → refine loop with a
   replica-independent checkpoint. `resume_session_id` and `init_checkpoint` are
   mutually exclusive, and `model_type` must match the checkpoint's architecture.
+- **`preflight_training_dataset(train_images, train_labels, val_images=None, val_labels=None, enable_clahe=False, stage=True)`**
+  Validate and ingest a dataset from an external store *before* committing to a run.
+  `train_images`/`train_labels` are http(s) URLs (e.g. BioImage Archive FIRE files) or
+  `get_upload_url` paths, paired 1:1. Each pair is resolved and checked (readable,
+  matching H×W, a 2-D integer instance-label map with ≥1 object); a bad or missing
+  source is reported per-pair as `{ok: false, error}` rather than failing the batch.
+  With `stage=True` (default) the prepared arrays are re-staged into the app's temp
+  store and the returned `train_images`/`train_labels` URL lists feed straight into
+  `start_training` (call it promptly — staged URLs are short-lived). `enable_clahe`
+  applies contrast-limited adaptive histogram equalisation while staging (forces
+  `stage` on) — reintroducing the old Cellpose app's CLAHE as an explicit opt-in for
+  low-contrast fluorescence. Returns `{ok, train_pair_count, train_pair_ok,
+  val_pair_count, pairs:[...], message, train_images?, train_labels?, ...}`.
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, n_epochs_completed, n_epochs_completed_basis, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`. `n_epochs` is the requested count; `n_epochs_completed` is how many actually ran (updated live during training) — for micro-SAM this can be below `n_epochs` when early stopping fires, so a COMPLETED run with `n_epochs_completed < n_epochs` is expected, not a truncation. **`n_epochs_completed_basis` tells you which kind of number that is**, because the two backends produce different kinds under one name: `measured` (micro-SAM — read from torch_em's per-epoch `latest.pt`, an observation that can disagree with the request) versus `floor_if_completed` (cellpose — `train_seg` has no early stopping and only checkpoints after the full loop, so on COMPLETED the count *equals* `n_epochs` and is a guaranteed lower bound, **not** a measurement that the epochs ran; cellpose exposes no per-epoch counter). Do not read a `floor_if_completed` value as evidence of how long the run ran — it can only ever equal the request. A terminal status carries `terminated_by` (`child` | `supervisor` | `user_stop` | `entry`) recording who wrote it; the child's outcome overrides a bystander's premature terminal, while a user stop is never overwritten by a late completion. For runs that predate this field, retrospective recovery starts by matching an absent `end_time`. Recovering the *epoch count* from there is **micro-SAM only** — read the host-mount `train.log` for its "Finished training after N epochs" line; cellpose's `train_seg` emits no such line. Recovering only the *yes/no* — did the trainer outlive its terminal record — is backend-independent and needs no log parsing: a newest-checkpoint mtime (`latest.pt`/`best.pt`) later than the last `status.json` write means the run kept training past a bystander's premature terminal. Both signals read host-mount files, so neither is reachable through an RPC handle — which is why `n_epochs_completed` is surfaced in status going forward.
 - **`list_training_sessions()`** → all sessions on this worker.
 - **`stop_training(session_id)`** Request cancellation (an in-flight epoch may finish first).

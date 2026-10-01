@@ -99,6 +99,35 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
+def _apply_clahe(img_array: np.ndarray) -> np.ndarray:
+    """Grayscale uint8 + CLAHE contrast enhancement. Accepts (H,W), (H,W,C) or
+    (C,H,W); returns a (H,W) uint8 array. Rescues low-contrast fluorescence that
+    Cellpose-SAM otherwise cannot segment (opt-in via preflight_training_dataset).
+    """
+    import cv2
+
+    arr = np.asarray(img_array)
+    if arr.ndim == 3 and arr.shape[0] in (1, 2, 3, 4) and arr.shape[0] < arr.shape[1]:
+        arr = arr.transpose(1, 2, 0)
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = arr[:, :, 0]
+        elif arr.shape[2] >= 3:
+            arr = (
+                0.299 * arr[:, :, 0].astype(np.float32)
+                + 0.587 * arr[:, :, 1].astype(np.float32)
+                + 0.114 * arr[:, :, 2].astype(np.float32)
+            ).astype(np.uint8)
+    if arr.dtype != np.uint8:
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi > lo:
+            arr = ((arr.astype(np.float32) - lo) / (hi - lo) * 255).astype(np.uint8)
+        else:
+            arr = np.zeros(arr.shape, dtype=np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
+    return clahe.apply(arr)
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -916,6 +945,122 @@ class EntryApp:
         ))
         self._training_tasks[session_id] = task
         return training.get_status(session_id)
+
+    @bioengine.method
+    async def preflight_training_dataset(
+        self,
+        train_images: List[str] = Field(
+            ..., description="Raw training image sources to ingest from an external "
+            "store before a run: http(s) URLs (e.g. BioImage Archive FIRE files) or "
+            "get_upload_url paths, one per training pair."),
+        train_labels: List[str] = Field(
+            ..., description="Instance-label mask sources paired 1:1 with train_images "
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection)."),
+        val_images: Optional[List[str]] = Field(
+            None, description="Optional validation image sources."),
+        val_labels: Optional[List[str]] = Field(
+            None, description="Optional validation label sources, paired with val_images."),
+        enable_clahe: bool = Field(
+            False, description="Apply CLAHE (contrast-limited adaptive histogram "
+            "equalisation) to each image while staging — rescues low-contrast "
+            "fluorescence Cellpose-SAM otherwise cannot segment. Off by default; the "
+            "min-max rescale during training is unaffected. Forces staging on."),
+        stage: bool = Field(
+            True, description="Download, validate and RE-STAGE each prepared image+label "
+            "into the app's temp store, returning URL lists ready to pass straight into "
+            "start_training. If False, validate the sources in place and report only."),
+    ) -> Dict[str, Any]:
+        """Validate and ingest a training dataset from an external store before a run.
+
+        Resolves each (image, label) source, checks the pair is usable (readable,
+        matching H×W, a 2-D integer instance-label map with at least one object),
+        optionally applies CLAHE, and — when ``stage`` is set (forced on by
+        ``enable_clahe``) — re-stages the prepared arrays into the app's temp store so
+        the returned ``train_images``/``train_labels`` URL lists feed straight into
+        ``start_training``. Returns a per-pair report plus counts so a dataset can be
+        vetted before committing to a long run. Staged URLs are short-lived — call
+        start_training promptly.
+        """
+        if len(train_images) != len(train_labels):
+            raise ValueError("train_images and train_labels must have equal length.")
+        if (val_images is None) ^ (val_labels is None):
+            raise ValueError("val_images and val_labels must be provided together.")
+        if val_images is not None and len(val_images) != len(val_labels):
+            raise ValueError("val_images and val_labels must have equal length.")
+
+        do_stage = bool(stage or enable_clahe)
+
+        async def _prepare(split, img_sources, lbl_sources):
+            report, staged_imgs, staged_lbls = [], [], []
+            for i, (img_src, lbl_src) in enumerate(zip(img_sources, lbl_sources)):
+                item = {"split": split, "index": i,
+                        "image": str(img_src), "label": str(lbl_src)}
+                try:
+                    img = await self._resolve_image(img_src)
+                    lbl = np.squeeze(await self._resolve_label_array(lbl_src, img.shape))
+                    img_hw = tuple(int(x) for x in img.shape[:2])
+                    if lbl.ndim != 2:
+                        raise ValueError(f"label is not 2-D (shape {tuple(lbl.shape)}).")
+                    if tuple(int(x) for x in lbl.shape[:2]) != img_hw:
+                        raise ValueError(
+                            f"image/label shape mismatch: image H×W {img_hw} vs "
+                            f"label {tuple(int(x) for x in lbl.shape)}.")
+                    if not np.issubdtype(lbl.dtype, np.integer):
+                        lbl = lbl.astype(np.int64)
+                    n_inst = int(np.unique(lbl[lbl > 0]).size)
+                    if n_inst == 0:
+                        raise ValueError("label map has no foreground objects.")
+                    if enable_clahe:
+                        img = _apply_clahe(img)
+                    item.update(ok=True, image_shape=list(img.shape),
+                                label_shape=list(lbl.shape), n_instances=n_inst)
+                    if do_stage:
+                        staged_imgs.append(await self._save_npy_to_temp(np.asarray(img)))
+                        staged_lbls.append(await self._save_npy_to_temp(lbl))
+                except Exception as exc:
+                    item.update(ok=False, error=str(exc))
+                report.append(item)
+            return report, staged_imgs, staged_lbls
+
+        train_report, train_imgs, train_lbls = await _prepare(
+            "train", train_images, train_labels)
+        val_report, val_imgs, val_lbls = [], [], []
+        if val_images is not None:
+            val_report, val_imgs, val_lbls = await _prepare(
+                "val", val_images, val_labels)
+
+        pairs = train_report + val_report
+        n_bad = sum(1 for p in pairs if not p["ok"])
+        n_train_ok = sum(1 for p in train_report if p["ok"])
+        ok = n_bad == 0 and n_train_ok > 0
+
+        result = {
+            "ok": ok,
+            "train_pair_count": len(train_report),
+            "train_pair_ok": n_train_ok,
+            "val_pair_count": len(val_report),
+            "clahe_applied": bool(enable_clahe),
+            "staged": do_stage,
+            "pairs": pairs,
+        }
+        if do_stage and ok:
+            result["train_images"] = train_imgs
+            result["train_labels"] = train_lbls
+            if val_images is not None:
+                result["val_images"] = val_imgs
+                result["val_labels"] = val_lbls
+        if ok:
+            msg = f"Validated {n_train_ok} training pair(s)"
+            if val_report:
+                msg += f" and {sum(1 for p in val_report if p['ok'])} validation pair(s)"
+            result["message"] = (msg + "; staged for start_training.") if do_stage else (msg + ".")
+        elif n_bad:
+            result["message"] = (
+                f"{n_bad} of {len(pairs)} pair(s) failed validation; see 'pairs' for "
+                "per-pair errors.")
+        else:
+            result["message"] = "No usable training pairs resolved."
+        return result
 
     @bioengine.method
     async def get_training_status(
