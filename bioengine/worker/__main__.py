@@ -452,7 +452,7 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         "--further-apptainer-args",
         type=str,
         metavar="ARGS",
-        help="Additional CLI flags forwarded to 'apptainer exec' inside each "
+        help="Additional CLI flags forwarded to the container runtime's 'exec' inside each "
         "SLURM worker job, passed as a single quoted, shell-style string. "
         'Example: --further-apptainer-args "--bind /proj/aicell:/proj/aicell".',
     )

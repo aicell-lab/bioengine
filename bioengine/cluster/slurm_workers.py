@@ -82,7 +82,7 @@ class SlurmWorkers:
                 "--gres=gpu:{n}" (clusters that require the gres syntax). Set to an
                 empty string to omit the directive (e.g. when GPUs are requested via
                 ``further_slurm_args``).
-            further_apptainer_args: Additional CLI flags passed to ``apptainer exec``
+            further_apptainer_args: Additional CLI flags passed to the container runtime's ``exec``
                 between the built-in flags and the container image. Use for extra
                 bind mounts (e.g. ["--bind", "/proj/aicell:/proj/aicell"]) or to
                 forward host env vars.
