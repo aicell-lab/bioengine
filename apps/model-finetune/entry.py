@@ -853,6 +853,13 @@ class EntryApp:
         pool_token: Optional[str] = Field(
             None, description="Token with read access to init_from_pool's artifact. Scoped to "
             "the pool, not the app's own token."),
+        metrics: Optional[List[str]] = Field(
+            None, description="Which quantitative metrics to compute, from a predefined set. "
+            "'loss' (per-epoch train/validation loss curves — cheap, always on) and "
+            "'instance_ap' (mean instance AP at IoU 0.5/0.75/0.9 on the validation split — "
+            "expensive, runs a full held-out inference pass, so opt-in and needs validation "
+            "data). Results surface in get_training_status. Cellpose backend; defaults to "
+            "['loss']."),
         label: str = Field("", description="Optional human-readable tag for this session."),
     ) -> Dict[str, Any]:
         """Start a μSAM fine-tuning session (AIS decoder) and return immediately
@@ -910,6 +917,7 @@ class EntryApp:
             resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
             pool_provenance=pool_provenance,
             patch_shape=(patch_size, patch_size), num_workers=0,
+            metrics=metrics or ["loss"],
         )
         task = asyncio.create_task(self._run_training(
             session_id, model_type, train_images, train_labels, val_images, val_labels, params

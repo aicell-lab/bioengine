@@ -47,6 +47,48 @@ def _measure_diameters(label_files):
     return {"min": float(a.min()), "max": float(a.max()), "median": float(np.median(a))}
 
 
+def _loss_list(x):
+    """Coerce train_seg's returned per-epoch losses to a plain list of floats
+    (None preserved for skipped-validation epochs); [] if not array-like."""
+    import numpy as np
+
+    if x is None:
+        return []
+    try:
+        return [None if v is None else float(v) for v in np.asarray(x).ravel().tolist()]
+    except Exception:
+        return []
+
+
+def _instance_ap(model, val_image_files, val_label_files, thresholds=(0.5, 0.75, 0.9)):
+    """Mean instance AP (Hungarian-matched, cellpose.metrics.average_precision) over
+    the validation split, per IoU threshold. The expensive opt-in metric: runs a full
+    inference pass on the held-out set. Best-effort — returns {error: ...} on any
+    failure so a metrics request never fails the training run itself."""
+    import numpy as np
+    from cellpose import io as cpio
+    from cellpose import metrics as cpmetrics
+
+    if not val_image_files or not val_label_files:
+        return None
+    try:
+        imgs = [np.asarray(cpio.imread(f)) for f in val_image_files]
+        gts = [np.squeeze(np.asarray(cpio.imread(f))) for f in val_label_files]
+        preds = model.eval(imgs, normalize=True, rescale=False)[0]
+        ap, _tp, _fp, _fn = cpmetrics.average_precision(
+            gts, preds, threshold=list(thresholds))
+        ap = np.asarray(ap, dtype=float)
+        if ap.ndim == 1:
+            ap = ap[None, :]
+        return {
+            "n_val": len(gts),
+            "thresholds": list(thresholds),
+            "mean_ap": {f"{t}": float(ap[:, i].mean()) for i, t in enumerate(thresholds)},
+        }
+    except Exception as exc:
+        return {"error": str(exc)[:300]}
+
+
 def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -> None:
     """Refresh status.json's ``updated_at`` while train_seg runs, so a long epoch
     doesn't trip the stale-window check (get_status marks TRAINING → STOPPED after
@@ -105,7 +147,7 @@ def main(session_id: str) -> None:
             net.dtype = torch.float32
             net.to(torch.float32)
 
-        train_seg(
+        result = train_seg(
             net,
             train_files=p["train_images"], train_labels_files=p["train_labels"],
             test_files=p["val_images"], test_labels_files=p["val_labels"],
@@ -116,13 +158,23 @@ def main(session_id: str) -> None:
             normalize=True, rescale=False,
         )
         stop.set()
+        # Stock train_seg returns (model_path, train_losses, test_losses); capture
+        # defensively so a signature change can't break the run.
+        train_losses, test_losses = [], []
+        if isinstance(result, (tuple, list)) and len(result) >= 3:
+            train_losses, test_losses = _loss_list(result[1]), _loss_list(result[2])
         ok = training.checkpoint_path(session_id).exists()
         cell_diameters = None
+        instance_metrics = None
+        metrics_requested = [m for m in (p.get("metrics") or ["loss"])]
         if ok:
             try:
                 cell_diameters = _measure_diameters(p.get("train_labels") or [])
             except Exception:
                 cell_diameters = None
+            if "instance_ap" in metrics_requested:
+                instance_metrics = _instance_ap(
+                    model, p.get("val_images"), p.get("val_labels"))
         # train_seg has no early stopping and only checkpoints after the full
         # range(n_epochs) loop, so a COMPLETED cellpose run ran exactly the
         # requested epochs; a truncated run never checkpoints → never COMPLETED.
@@ -136,6 +188,10 @@ def main(session_id: str) -> None:
             n_epochs_completed=p["n_epochs"] if ok else None,
             n_epochs_completed_basis="floor_if_completed" if ok else None,
             cell_diameters=cell_diameters,
+            metrics_requested=metrics_requested,
+            train_losses=train_losses,
+            test_losses=test_losses,
+            instance_metrics=instance_metrics,
         )
     except Exception as e:
         stop.set()
