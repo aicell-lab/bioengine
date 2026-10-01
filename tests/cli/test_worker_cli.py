@@ -466,3 +466,86 @@ def test_an_explicit_gpu_choice_overrides_the_host(monkeypatch, nvidia_smi_prese
         )
         assert result.exit_code == 0, result.output
         assert ("--gpus=all" in result.output) is expected
+
+
+# --- NVIDIA device nodes in the OCI spec -------------------------------------
+#
+# `--gpus=all` records only a DeviceRequest; the nvidia-container-runtime hook
+# patches the device cgroup out of band, so the OCI spec never names the nodes.
+# A cgroup re-apply rebuilds the allowlist from that spec and the container
+# silently loses the GPU. These pin the nodes into the command instead.
+
+_HOST_NODES = [
+    "/dev/nvidia0",
+    "/dev/nvidia1",
+    "/dev/nvidia-caps",  # a DIRECTORY — must not be passed as a device
+    "/dev/nvidia-modeset",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidiactl",
+]
+_CAPS_NODES = ["/dev/nvidia-caps/nvidia-cap1", "/dev/nvidia-caps/nvidia-cap2"]
+
+
+@pytest.fixture
+def fake_nvidia_host(monkeypatch):
+    """A host with two GPUs, the control nodes, and the caps directory."""
+    from bioengine.cli import worker as worker_module
+
+    def fake_glob(pattern):
+        if pattern == "/dev/nvidia*":
+            return list(_HOST_NODES)
+        if pattern == "/dev/nvidia-caps/*":
+            return list(_CAPS_NODES)
+        return []
+
+    monkeypatch.setattr(worker_module.glob, "glob", fake_glob)
+    monkeypatch.setattr(
+        worker_module.os.path, "isdir", lambda p: p == "/dev/nvidia-caps"
+    )
+
+
+def test_docker_names_every_nvidia_node_as_a_device(fake_nvidia_host):
+    command = _build("docker", gpus=True)
+    for node in ["/dev/nvidia0", "/dev/nvidia1", "/dev/nvidiactl",
+                 "/dev/nvidia-modeset", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"]:
+        assert f"--device={node}" in command, node
+    for node in _CAPS_NODES:
+        assert f"--device={node}" in command, node
+
+
+def test_the_caps_directory_is_not_passed_as_a_device(fake_nvidia_host):
+    # /dev/nvidia* matches the caps directory too. Docker tolerates being handed
+    # one (measured: exit 0), so this is hygiene rather than a crash guard — but
+    # the cap nodes inside it are listed individually, and naming their parent as
+    # a device as well says something about the request that isn't true.
+    assert "--device=/dev/nvidia-caps" not in _build("docker", gpus=True)
+
+
+def test_the_device_flags_do_not_replace_the_gpu_flag(fake_nvidia_host):
+    # Measured: a container given the nodes WITHOUT --gpus fails at
+    # "libcuda.so.1: cannot open shared object file" — the driver libraries
+    # come from the hook, which only runs for --gpus. The two are a pair.
+    command = _build("docker", gpus=True)
+    assert "--gpus=all" in command
+    assert any(arg.startswith("--device=/dev/nvidia") for arg in command)
+
+
+def test_no_device_flags_when_gpus_are_off(fake_nvidia_host):
+    assert not [a for a in _build("docker", gpus=False) if a.startswith("--device=")]
+
+
+def test_a_host_with_no_nvidia_nodes_adds_nothing(monkeypatch):
+    from bioengine.cli import worker as worker_module
+
+    monkeypatch.setattr(worker_module.glob, "glob", lambda pattern: [])
+    command = _build("docker", gpus=True)
+    assert not [a for a in command if a.startswith("--device=")]
+    assert "--gpus=all" in command
+
+
+def test_podman_and_apptainer_are_untouched(fake_nvidia_host):
+    # podman's CDI reference already lands in the spec, and apptainer does not
+    # use the device cgroup this way; widening either would be scope creep.
+    assert not [a for a in _build("podman", gpus=True) if a.startswith("--device=/dev/nvidia")]
+    assert not [a for a in _build("apptainer", gpus=True) if a.startswith("--device=/dev/nvidia")]

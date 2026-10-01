@@ -13,6 +13,7 @@ Examples:
 """
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import subprocess
@@ -38,6 +39,31 @@ _GPU_FLAGS = {
     "podman": ["--device", "nvidia.com/gpu=all"],
     "apptainer": ["--nv"],
 }
+
+_NVIDIA_DEV_GLOBS = ("/dev/nvidia*", "/dev/nvidia-caps/*")
+
+
+def _nvidia_device_flags() -> List[str]:
+    """``--device`` for every NVIDIA node present on the host.
+
+    ``--gpus=all`` records only a *DeviceRequest*; the nvidia-container-runtime
+    prestart hook injects the nodes and patches the device cgroup afterwards, so
+    the OCI spec never names them. Anything that makes runc re-apply the cgroup
+    (a ``systemctl daemon-reload`` under cgroup v2 + the systemd driver) rebuilds
+    the allowlist from that spec and drops the hook's patch: the container keeps
+    running but can no longer open a graphics device, and only the next process
+    to need one finds out. Naming the nodes puts them where the rebuild looks.
+
+    These are additive. ``--gpus`` still has to be passed — the driver libraries
+    come from the hook, and a container given the nodes without it fails at
+    ``libcuda.so.1: cannot open shared object file``.
+    """
+    return [
+        f"--device={node}"
+        for pattern in _NVIDIA_DEV_GLOBS
+        for node in sorted(glob.glob(pattern))
+        if not os.path.isdir(node)
+    ]
 
 _RUNTIME_PREFERENCE = ("docker", "podman", "apptainer")
 
@@ -101,6 +127,8 @@ def build_command(
     command += ["--shm-size", shm_size]
     if gpus:
         command += _GPU_FLAGS[runtime]
+        if runtime == "docker":
+            command += _nvidia_device_flags()
     command += ["-v", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
     for name in _passthrough_env(token, server_url):
         command += ["-e", name]
