@@ -115,7 +115,7 @@ bioengine worker start -- \
   --head-num-gpus 1
 ```
 
-This runs the worker image in a container. It picks the first of `docker`, `podman` and `apptainer` on your `PATH`, mounts `~/.bioengine` as the workspace, passes `HYPHA_TOKEN` through the environment, and pins the image tag to the installed `bioengine` version. Everything after `--` is forwarded verbatim to `python -m bioengine.worker` inside the container — see `bioengine worker start -- --help` for the full list.
+This runs the worker image in a container. It picks the first of `docker`, `podman`, `apptainer` and `singularity` on your `PATH`, mounts `~/.bioengine` as the workspace, passes `HYPHA_TOKEN` through the environment, and pins the image tag to the installed `bioengine` version. Everything after `--` is forwarded verbatim to `python -m bioengine.worker` inside the container — see `bioengine worker start -- --help` for the full list.
 
 ```bash
 bioengine worker start --dry-run -- --mode single-machine  # print the command, run nothing
@@ -126,7 +126,7 @@ bioengine worker stop
 
 | Option | Default | Description |
 |---|---|---|
-| `--runtime` | `auto` | `docker`, `podman`, `apptainer`, or `native` to run the worker in the current environment instead of a container |
+| `--runtime` | `auto` | `docker`, `podman`, `apptainer`, `singularity`, or `native` to run the worker in the current environment instead of a container |
 | `--image` | `ghcr.io/aicell-lab/bioengine-worker:<version>` | Worker image |
 | `--workspace-dir` | `~/.bioengine` | Host directory mounted at `/.bioengine` |
 | `--name` | `bioengine-worker` | Container name. Starting a second worker while this name is taken is refused — give it a different `--name` |

@@ -39,7 +39,14 @@ _GPU_FLAGS = {
     "docker": ["--gpus=all"],
     "podman": ["--device", "nvidia.com/gpu=all"],
     "apptainer": ["--nv"],
+    "singularity": ["--nv"],
 }
+
+# Singularity is apptainer's predecessor and the CLI surface this launcher uses
+# is identical, so both take the same command shape. They differ only in the
+# prefix each one honours for forwarding host variables into the container.
+_SIF_RUNTIMES = ("apptainer", "singularity")
+_SIF_ENV_PREFIX = {"apptainer": "APPTAINERENV_", "singularity": "SINGULARITYENV_"}
 
 # Only the nodes the prestart hook actually injects. Measured against a running
 # container: `--gpus=all` alone grants nvidia0..N, nvidiactl, nvidia-uvm and
@@ -83,7 +90,7 @@ def _nvidia_device_flags() -> List[str]:
     ]
 
 
-_RUNTIME_PREFERENCE = ("docker", "podman", "apptainer")
+_RUNTIME_PREFERENCE = ("docker", "podman", "apptainer", "singularity")
 
 
 def _passthrough_env(token: Optional[str], server_url: Optional[str]) -> dict:
@@ -131,10 +138,10 @@ def build_command(
     if runtime == "native":
         return entrypoint
 
-    if runtime == "apptainer":
-        command = ["apptainer", "exec"]
+    if runtime in _SIF_RUNTIMES:
+        command = [runtime, "exec"]
         if gpus:
-            command += _GPU_FLAGS["apptainer"]
+            command += _GPU_FLAGS[runtime]
         command += ["--bind", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
         return command + [f"docker://{image}", *entrypoint]
 
@@ -192,9 +199,11 @@ def _subprocess_env(runtime: str, token: Optional[str], server_url: Optional[str
     passthrough = _passthrough_env(token, server_url)
     env = dict(os.environ)
     env.update(passthrough)
-    if runtime == "apptainer":
-        # Apptainer only forwards host variables it is told about explicitly.
-        env.update({f"APPTAINERENV_{name}": value for name, value in passthrough.items()})
+    if runtime in _SIF_RUNTIMES:
+        # These only forward host variables they are told about explicitly, and
+        # each honours its own prefix.
+        prefix = _SIF_ENV_PREFIX[runtime]
+        env.update({f"{prefix}{name}": value for name, value in passthrough.items()})
     return env
 
 
@@ -214,7 +223,7 @@ def _resolve_runtime(runtime: str, require_available: bool = True) -> str:
         if not require_available:
             return _RUNTIME_PREFERENCE[0]
         error_exit(
-            "No container runtime found (looked for docker, podman, apptainer).",
+            f"No container runtime found (looked for {', '.join(_RUNTIME_PREFERENCE)}).",
             "Install one, or pass --runtime native to run the worker in this environment.",
         )
     return detected
@@ -232,10 +241,11 @@ def worker_group():
 @click.argument("worker_args", nargs=-1, type=click.UNPROCESSED)
 @click.option(
     "--runtime",
-    type=click.Choice(["auto", "docker", "podman", "apptainer", "native"]),
+    type=click.Choice(["auto", *_RUNTIME_PREFERENCE, "native"]),
     default="auto",
-    help="Container runtime. 'auto' picks the first of docker, podman, apptainer on PATH. "
-    "'native' runs the worker in this environment instead (requires the 'worker' extra).",
+    help=f"Container runtime. 'auto' picks the first of {', '.join(_RUNTIME_PREFERENCE)} "
+    "on PATH. 'native' runs the worker in this environment instead (requires the "
+    "'worker' extra).",
 )
 @click.option(
     "--image",
