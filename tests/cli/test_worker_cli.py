@@ -466,3 +466,147 @@ def test_an_explicit_gpu_choice_overrides_the_host(monkeypatch, nvidia_smi_prese
         )
         assert result.exit_code == 0, result.output
         assert ("--gpus=all" in result.output) is expected
+
+
+# --- NVIDIA device nodes in the OCI spec -------------------------------------
+#
+# `--gpus=all` records only a DeviceRequest; the nvidia-container-runtime hook
+# patches the device cgroup out of band, so the OCI spec never names the nodes.
+# A cgroup re-apply rebuilds the allowlist from that spec and the container
+# silently loses the GPU. These pin the nodes into the command instead — and
+# pin the set to exactly what the hook injects, no wider.
+
+import stat as _stat
+
+# Two GPUs, the control nodes, and the MIG caps the hook does NOT inject.
+_CHAR_NODES = {
+    "/dev/nvidia0",
+    "/dev/nvidia1",
+    "/dev/nvidiactl",
+    "/dev/nvidia-modeset",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidia-caps/nvidia-cap1",
+    "/dev/nvidia-caps/nvidia-cap2",
+}
+_DIR_NODES = {"/dev/nvidia-caps"}
+
+
+@pytest.fixture
+def fake_nvidia_host(monkeypatch):
+    """A host with two GPUs, the control nodes, and a caps directory."""
+    from bioengine.cli import worker as worker_module
+
+    everything = sorted(_CHAR_NODES | _DIR_NODES)
+
+    def fake_glob(pattern):
+        import fnmatch
+
+        return [p for p in everything if fnmatch.fnmatch(p, pattern)]
+
+    # Delegate anything that is not one of our fakes to the real os.stat, and
+    # keep the real signature. Patching os.stat is process-wide: a fake that
+    # swallows every path (or drops follow_symlinks) breaks pytest's own
+    # teardown, which calls Path.exists() long after the test has finished.
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        name = str(path)
+        if name in _CHAR_NODES:
+            return os.stat_result((_stat.S_IFCHR, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        if name in _DIR_NODES:
+            return os.stat_result((_stat.S_IFDIR, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(worker_module.glob, "glob", fake_glob)
+    monkeypatch.setattr(worker_module.os, "stat", fake_stat)
+
+
+def _devices(command):
+    return [a[len("--device=") :] for a in command if a.startswith("--device=")]
+
+
+def test_docker_names_the_nodes_the_hook_injects(fake_nvidia_host):
+    assert _devices(_build("docker", gpus=True)) == [
+        "/dev/nvidia0",
+        "/dev/nvidia1",
+        "/dev/nvidiactl",
+        "/dev/nvidia-modeset",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+    ]
+
+
+def test_the_mig_capability_nodes_are_not_granted(fake_nvidia_host):
+    # Measured: `--gpus=all` alone does NOT grant /dev/nvidia-caps, so naming
+    # them protects nothing a cgroup rebuild could drop. It would hand out the
+    # MIG-configuration capability that nvidia-container-toolkit deliberately
+    # gates behind NVIDIA_MIG_CONFIG_DEVICES. The fix must be no wider than the
+    # bug.
+    granted = _devices(_build("docker", gpus=True))
+    assert not [node for node in granted if "nvidia-caps" in node]
+
+
+def test_the_caps_directory_is_not_passed_as_a_device(fake_nvidia_host):
+    # Belt and braces: the directory is outside the glob set now, and the
+    # character-device check would reject it even if a glob reached it.
+    assert "/dev/nvidia-caps" not in _devices(_build("docker", gpus=True))
+
+
+def test_a_node_that_is_not_a_character_device_is_skipped(monkeypatch):
+    # Handing `docker run` a non-device makes it hard-fail with "not a device
+    # node", so the filter has to be a real check rather than decoration. The
+    # narrowed globs mean no realistic host hits this, which is exactly why it
+    # needs a test: without one, deleting the filter changes no verdict.
+    from bioengine.cli import worker as worker_module
+
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if str(path) == "/dev/nvidia0":
+            return os.stat_result((_stat.S_IFREG, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        if str(path) == "/dev/nvidiactl":
+            return os.stat_result((_stat.S_IFCHR, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_stat(path, *args, **kwargs)
+
+    # Pin a single pattern of our own rather than keying on the production
+    # tuple, so this test stays about the filter and does not go red merely
+    # because the glob set was retuned.
+    monkeypatch.setattr(worker_module, "_NVIDIA_DEV_GLOBS", ("/fake/nvidia*",))
+    monkeypatch.setattr(
+        worker_module.glob, "glob", lambda pattern: ["/dev/nvidia0", "/dev/nvidiactl"]
+    )
+    monkeypatch.setattr(worker_module.os, "stat", fake_stat)
+
+    assert _devices(_build("docker", gpus=True)) == ["/dev/nvidiactl"]
+
+
+def test_the_device_flags_do_not_replace_the_gpu_flag(fake_nvidia_host):
+    # Measured: a container given the nodes WITHOUT --gpus fails at
+    # "libcuda.so.1: cannot open shared object file" — the driver libraries
+    # come from the hook, which only runs for --gpus. The two are a pair.
+    command = _build("docker", gpus=True)
+    assert "--gpus=all" in command
+    assert _devices(command)
+
+
+def test_no_device_flags_when_gpus_are_off(fake_nvidia_host):
+    assert not _devices(_build("docker", gpus=False))
+
+
+def test_a_host_with_no_nvidia_nodes_adds_nothing(monkeypatch):
+    from bioengine.cli import worker as worker_module
+
+    monkeypatch.setattr(worker_module.glob, "glob", lambda pattern: [])
+    command = _build("docker", gpus=True)
+    assert not _devices(command)
+    assert "--gpus=all" in command
+
+
+def test_podman_and_apptainer_are_untouched(fake_nvidia_host):
+    # podman's CDI reference already names the devices in the spec — measured:
+    # `nvidia-ctk cdi generate` emits explicit deviceNodes and its only hook is
+    # update-ldcache, a library-path edit rather than a cgroup patch. apptainer
+    # does not use the device cgroup this way. Widening either is scope creep.
+    assert not _devices(_build("podman", gpus=True))
+    assert not _devices(_build("apptainer", gpus=True))

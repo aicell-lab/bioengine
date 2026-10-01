@@ -13,8 +13,10 @@ Examples:
 """
 from __future__ import annotations
 
+import glob
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +40,48 @@ _GPU_FLAGS = {
     "podman": ["--device", "nvidia.com/gpu=all"],
     "apptainer": ["--nv"],
 }
+
+# Only the nodes the prestart hook actually injects. Measured against a running
+# container: `--gpus=all` alone grants nvidia0..N, nvidiactl, nvidia-uvm and
+# nvidia-uvm-tools. It does NOT grant the /dev/nvidia-caps nodes, so naming them
+# would not protect anything — it would hand out the MIG-configuration
+# capability the toolkit gates behind NVIDIA_MIG_CONFIG_DEVICES. nvidia-modeset
+# IS injected once NVIDIA_DRIVER_CAPABILITIES asks for graphics or display, and
+# is exactly the kind of node a cgroup rebuild drops, so it stays.
+_NVIDIA_DEV_GLOBS = (
+    "/dev/nvidia[0-9]*",
+    "/dev/nvidiactl",
+    "/dev/nvidia-modeset",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+)
+
+
+def _nvidia_device_flags() -> List[str]:
+    """``--device`` for every NVIDIA node present on the host.
+
+    ``--gpus=all`` records only a *DeviceRequest*; the nvidia-container-runtime
+    prestart hook injects the nodes and patches the device cgroup afterwards, so
+    the OCI spec never names them. Anything that makes runc re-apply the cgroup
+    (a ``systemctl daemon-reload`` under cgroup v2 + the systemd driver) rebuilds
+    the allowlist from that spec and drops the hook's patch: the container keeps
+    running but can no longer open a graphics device, and only the next process
+    to need one finds out. Naming the nodes puts them where the rebuild looks.
+
+    These are additive. ``--gpus`` still has to be passed — the driver libraries
+    come from the hook, and a container given the nodes without it fails at
+    ``libcuda.so.1: cannot open shared object file``.
+    """
+    return [
+        f"--device={node}"
+        for pattern in _NVIDIA_DEV_GLOBS
+        for node in sorted(glob.glob(pattern))
+        # Character devices only, matching the `[ -c ]` the deployment guide
+        # documents. Anything else matching the glob makes `docker run` hard-fail
+        # with "not a device node".
+        if stat.S_ISCHR(os.stat(node).st_mode)
+    ]
+
 
 _RUNTIME_PREFERENCE = ("docker", "podman", "apptainer")
 
@@ -101,6 +145,8 @@ def build_command(
     command += ["--shm-size", shm_size]
     if gpus:
         command += _GPU_FLAGS[runtime]
+        if runtime == "docker":
+            command += _nvidia_device_flags()
     command += ["-v", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
     for name in _passthrough_env(token, server_url):
         command += ["-e", name]
