@@ -190,9 +190,15 @@ class SlurmWorkers:
             Exception: If script creation fails
         """
         try:
-            # Define the apptainer command with the Ray worker command
+            # Define the container command with the Ray worker command.
+            # The binary is resolved by the batch script at job time rather than
+            # named here: this runs on a compute node whose toolchain the head
+            # node cannot see, so a submit-time choice would report the wrong
+            # host's answer. The rest of this script is already runtime-agnostic
+            # (it resets both *_BIND and exports both *_CACHEDIR); only the exec
+            # was pinned.
             apptainer_args = [
-                "apptainer exec",
+                '"$CONTAINER_CMD" exec',
                 "--nv",
                 "--cleanenv",
                 "--env=SLURM_JOB_ID='${SLURM_JOB_ID}'",
@@ -304,6 +310,20 @@ class SlurmWorkers:
             # Set the cache directory for Apptainer
             export APPTAINER_CACHEDIR="{self.worker_workspace_dir}/images"
             export SINGULARITY_CACHEDIR="{self.worker_workspace_dir}/images"
+
+            # Resolve the container runtime HERE, on the compute node. The head
+            # node that generated this script cannot see what this node has, and
+            # sites commonly differ between the two. Same order as
+            # scripts/start_hpc_worker.sh.
+            if command -v apptainer > /dev/null 2>&1; then
+                CONTAINER_CMD=apptainer
+            elif command -v singularity > /dev/null 2>&1; then
+                CONTAINER_CMD=singularity
+            else
+                echo "Neither apptainer nor singularity found on $(hostname). Install one on the compute nodes." >&2
+                exit 1
+            fi
+            echo "Container runtime: $CONTAINER_CMD ($(command -v $CONTAINER_CMD))"
 
             {apptainer_cmd}
 
