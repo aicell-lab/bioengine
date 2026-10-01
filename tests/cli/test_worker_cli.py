@@ -466,3 +466,62 @@ def test_an_explicit_gpu_choice_overrides_the_host(monkeypatch, nvidia_smi_prese
         )
         assert result.exit_code == 0, result.output
         assert ("--gpus=all" in result.output) is expected
+
+
+# --- singularity, apptainer's predecessor ------------------------------------
+#
+# The deployment guide has always said "Apptainer / Singularity", but
+# --runtime singularity was rejected by the Choice. The CLI surface this
+# launcher uses is identical; only the env-forwarding prefix differs.
+
+def test_singularity_is_an_accepted_runtime():
+    from bioengine.cli.worker import _RUNTIME_PREFERENCE
+
+    assert "singularity" in _RUNTIME_PREFERENCE
+
+
+def test_singularity_takes_the_apptainer_command_shape():
+    singularity = _build("singularity", gpus=True)
+    apptainer = _build("apptainer", gpus=True)
+    assert singularity[0] == "singularity"
+    assert apptainer[0] == "apptainer"
+    # Identical apart from the binary name — if they ever diverge, that is a
+    # decision someone should have to make explicitly.
+    assert singularity[1:] == apptainer[1:]
+
+
+def test_singularity_binds_rather_than_mounting():
+    command = _build("singularity", gpus=False)
+    assert command[:2] == ["singularity", "exec"]
+    assert "--bind" in command
+    assert "-v" not in command
+    assert f"docker://{IMAGE}" in command
+
+
+def test_singularity_gets_the_nv_flag_only_with_gpus():
+    # Position, not mere presence. _GPU_FLAGS carries "--nv" for singularity
+    # regardless of which branch builds the command, so `"--nv" in command`
+    # also passes when singularity wrongly takes the docker `run` shape — the
+    # test would be green while naming a property that had been broken.
+    assert _build("singularity", gpus=True)[:3] == ["singularity", "exec", "--nv"]
+    assert _build("singularity", gpus=False)[:2] == ["singularity", "exec"]
+    assert "--nv" not in _build("singularity", gpus=False)
+
+
+def test_each_sif_runtime_uses_its_own_env_prefix():
+    # Apptainer honours APPTAINERENV_; singularity honours SINGULARITYENV_.
+    # Forwarding under the wrong prefix is silent: the variable simply never
+    # arrives, and the worker starts with no token.
+    apptainer_env = _subprocess_env("apptainer", FAKE_TOKEN, None)
+    singularity_env = _subprocess_env("singularity", FAKE_TOKEN, None)
+    assert apptainer_env["APPTAINERENV_HYPHA_TOKEN"] == FAKE_TOKEN
+    assert singularity_env["SINGULARITYENV_HYPHA_TOKEN"] == FAKE_TOKEN
+    assert "SINGULARITYENV_HYPHA_TOKEN" not in apptainer_env
+    assert "APPTAINERENV_HYPHA_TOKEN" not in singularity_env
+
+
+def test_docker_and_podman_get_no_sif_prefixes():
+    for runtime in ("docker", "podman"):
+        env = _subprocess_env(runtime, FAKE_TOKEN, None)
+        assert env["HYPHA_TOKEN"] == FAKE_TOKEN
+        assert not [k for k in env if k.startswith(("APPTAINERENV_", "SINGULARITYENV_"))]
