@@ -115,7 +115,7 @@ bioengine worker start -- \
   --head-num-gpus 1
 ```
 
-This runs the worker image in a container. It picks the first of `docker`, `podman` and `apptainer` on your `PATH`, mounts `~/.bioengine` as the workspace, passes `HYPHA_TOKEN` through the environment, and pins the image tag to the installed `bioengine` version. Everything after `--` is forwarded verbatim to `python -m bioengine.worker` inside the container — see `bioengine worker start -- --help` for the full list.
+This runs the worker image in a container. It picks the first of `docker`, `podman`, `apptainer` and `singularity` on your `PATH`, mounts `~/.bioengine` as the workspace, passes `HYPHA_TOKEN` through the environment, and pins the image tag to the installed `bioengine` version. Everything after `--` is forwarded verbatim to `python -m bioengine.worker` inside the container — see `bioengine worker start -- --help` for the full list.
 
 ```bash
 bioengine worker start --dry-run -- --mode single-machine  # print the command, run nothing
@@ -126,7 +126,7 @@ bioengine worker stop
 
 | Option | Default | Description |
 |---|---|---|
-| `--runtime` | `auto` | `docker`, `podman`, `apptainer`, or `native` to run the worker in the current environment instead of a container |
+| `--runtime` | `auto` | `docker`, `podman`, `apptainer`, `singularity`, or `native` to run the worker in the current environment instead of a container |
 | `--image` | `ghcr.io/aicell-lab/bioengine-worker:<version>` | Worker image |
 | `--workspace-dir` | `~/.bioengine` | Host directory mounted at `/.bioengine` |
 | `--name` | `bioengine-worker` | Container name. Starting a second worker while this name is taken is refused — give it a different `--name` |
@@ -145,7 +145,7 @@ The CLI is a thin wrapper — the underlying commands work on their own:
 docker run --rm -it \
   --user $(id -u):$(id -g) \
   --shm-size=8g \
-  --gpus=all \
+  --gpus=all $(for d in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm /dev/nvidia-uvm-tools; do [ -c "$d" ] && printf -- '--device=%s ' "$d"; done) \
   -v $HOME/.bioengine:/.bioengine \
   ghcr.io/aicell-lab/bioengine-worker:latest \
   python -m bioengine.worker \
@@ -155,9 +155,17 @@ docker run --rm -it \
 ```
 
 **GPU support:**
-- Docker: add `--gpus=all` (requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html))
-- Podman: use `--device nvidia.com/gpu=all` instead
+- Docker: `--gpus=all` (requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)) **plus an explicit `--device` for each NVIDIA node** — see below
+- Podman: use `--device nvidia.com/gpu=all` instead; its CDI reference already names the devices in the spec
 - No GPU: omit the GPU flag; CPU-only inference still works for most models
+
+> **Why `--gpus=all` is not enough on its own.** It records only a *DeviceRequest*: the nvidia-container-runtime prestart hook injects the device nodes and patches the device cgroup afterwards, so the container's OCI spec never names them. Anything that makes runc re-apply the cgroup — classically a `systemctl daemon-reload`, including ones fired by package managers — rebuilds the allowlist **from that spec** and silently drops the hook's patch. The container keeps running, and applications already holding the GPU keep working, so nothing looks wrong until the next process that needs a fresh CUDA context fails with `CUDA_ERROR_NO_DEVICE`. Listing the nodes with `--device` puts them where the rebuild looks. Preconditions are cgroup v2 with Docker's systemd cgroup driver; check yours with `docker info --format '{{.CgroupDriver}} {{.CgroupVersion}}'`.
+>
+> The `--device` flags are **additional**, never a replacement. The driver libraries come from the same hook, so a container given the nodes without `--gpus` fails at `libcuda.so.1: cannot open shared object file`.
+>
+> The list is deliberately only what the hook injects. `/dev/nvidia-caps/*` is **not** included: `--gpus=all` never grants those, so naming them would protect nothing while handing out the MIG-configuration capability that nvidia-container-toolkit gates behind `NVIDIA_MIG_CONFIG_DEVICES`.
+>
+> `bioengine worker start` adds these for you on Docker; the expansion above is for hand-written commands.
 
 **Apptainer / Singularity** (HPC login nodes without Docker):
 

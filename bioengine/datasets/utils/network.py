@@ -4,6 +4,34 @@ from typing import Dict, Optional
 
 import httpx
 
+from bioengine._app.errors import DataServerError
+
+# Enough of the body to carry a FastAPI `detail` message without pulling a
+# whole HTML error page across the Ray boundary.
+_BODY_EXCERPT_CHARS = 500
+
+
+def _as_data_server_error(exc: httpx.HTTPStatusError) -> DataServerError:
+    response = exc.response
+    url = str(response.request.url)
+    body = response.text[:_BODY_EXCERPT_CHARS]
+    message = f"Data server returned HTTP {response.status_code} for '{url}'"
+    if body:
+        message = f"{message}: {body}"
+    return DataServerError(message, response.status_code, url, body)
+
+
+def raise_for_data_server_status(response: httpx.Response) -> None:
+    """``response.raise_for_status()``, raising the picklable error instead.
+
+    Unchained on purpose — httpx is an implementation detail of this client,
+    and chaining would print its traceback at every caller.
+    """
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _as_data_server_error(exc) from None
+
 
 async def get_url_with_retry(
     url: str,
@@ -25,7 +53,8 @@ async def get_url_with_retry(
     Returns:
         The HTTP response object
     Raises:
-        httpx.HTTPError: If all retry attempts fail
+        DataServerError: If the server answered non-2xx and raise_for_status
+        httpx.HTTPError: If all retry attempts fail on a transport error
     """
     if http_client is None:
         http_client = httpx.AsyncClient(timeout=20.0)  # seconds
@@ -50,7 +79,7 @@ async def get_url_with_retry(
                     and e.response.status_code != 429
                 ):
                     if raise_for_status:
-                        raise e
+                        raise _as_data_server_error(e) from None
 
                     return response
 
@@ -67,8 +96,10 @@ async def get_url_with_retry(
                 logger.error(
                     f"Failed to fetch URL '{url}' after {max_attempts} attempts: {e}"
                 )
-                if not isinstance(e, httpx.HTTPStatusError) or raise_for_status:
+                if not isinstance(e, httpx.HTTPStatusError):
                     raise e
+                if raise_for_status:
+                    raise _as_data_server_error(e) from None
 
                 return response
 

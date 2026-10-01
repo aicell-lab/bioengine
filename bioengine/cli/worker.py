@@ -13,8 +13,10 @@ Examples:
 """
 from __future__ import annotations
 
+import glob
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -37,9 +39,58 @@ _GPU_FLAGS = {
     "docker": ["--gpus=all"],
     "podman": ["--device", "nvidia.com/gpu=all"],
     "apptainer": ["--nv"],
+    "singularity": ["--nv"],
 }
 
-_RUNTIME_PREFERENCE = ("docker", "podman", "apptainer")
+# Singularity is apptainer's predecessor and the CLI surface this launcher uses
+# is identical, so both take the same command shape. They differ only in the
+# prefix each one honours for forwarding host variables into the container.
+_SIF_RUNTIMES = ("apptainer", "singularity")
+_SIF_ENV_PREFIX = {"apptainer": "APPTAINERENV_", "singularity": "SINGULARITYENV_"}
+
+# Only the nodes the prestart hook actually injects. Measured against a running
+# container: `--gpus=all` alone grants nvidia0..N, nvidiactl, nvidia-uvm and
+# nvidia-uvm-tools. It does NOT grant the /dev/nvidia-caps nodes, so naming them
+# would not protect anything — it would hand out the MIG-configuration
+# capability the toolkit gates behind NVIDIA_MIG_CONFIG_DEVICES. nvidia-modeset
+# IS injected once NVIDIA_DRIVER_CAPABILITIES asks for graphics or display, and
+# is exactly the kind of node a cgroup rebuild drops, so it stays.
+_NVIDIA_DEV_GLOBS = (
+    "/dev/nvidia[0-9]*",
+    "/dev/nvidiactl",
+    "/dev/nvidia-modeset",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+)
+
+
+def _nvidia_device_flags() -> List[str]:
+    """``--device`` for every NVIDIA node present on the host.
+
+    ``--gpus=all`` records only a *DeviceRequest*; the nvidia-container-runtime
+    prestart hook injects the nodes and patches the device cgroup afterwards, so
+    the OCI spec never names them. Anything that makes runc re-apply the cgroup
+    (a ``systemctl daemon-reload`` under cgroup v2 + the systemd driver) rebuilds
+    the allowlist from that spec and drops the hook's patch: the container keeps
+    running but can no longer open a graphics device, and only the next process
+    to need one finds out. Naming the nodes puts them where the rebuild looks.
+
+    These are additive. ``--gpus`` still has to be passed — the driver libraries
+    come from the hook, and a container given the nodes without it fails at
+    ``libcuda.so.1: cannot open shared object file``.
+    """
+    return [
+        f"--device={node}"
+        for pattern in _NVIDIA_DEV_GLOBS
+        for node in sorted(glob.glob(pattern))
+        # Character devices only, matching the `[ -c ]` the deployment guide
+        # documents. Anything else matching the glob makes `docker run` hard-fail
+        # with "not a device node".
+        if stat.S_ISCHR(os.stat(node).st_mode)
+    ]
+
+
+_RUNTIME_PREFERENCE = ("docker", "podman", "apptainer", "singularity")
 
 
 def _passthrough_env(token: Optional[str], server_url: Optional[str]) -> dict:
@@ -87,10 +138,10 @@ def build_command(
     if runtime == "native":
         return entrypoint
 
-    if runtime == "apptainer":
-        command = ["apptainer", "exec"]
+    if runtime in _SIF_RUNTIMES:
+        command = [runtime, "exec"]
         if gpus:
-            command += _GPU_FLAGS["apptainer"]
+            command += _GPU_FLAGS[runtime]
         command += ["--bind", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
         return command + [f"docker://{image}", *entrypoint]
 
@@ -101,6 +152,8 @@ def build_command(
     command += ["--shm-size", shm_size]
     if gpus:
         command += _GPU_FLAGS[runtime]
+        if runtime == "docker":
+            command += _nvidia_device_flags()
     command += ["-v", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
     for name in _passthrough_env(token, server_url):
         command += ["-e", name]
@@ -146,9 +199,11 @@ def _subprocess_env(runtime: str, token: Optional[str], server_url: Optional[str
     passthrough = _passthrough_env(token, server_url)
     env = dict(os.environ)
     env.update(passthrough)
-    if runtime == "apptainer":
-        # Apptainer only forwards host variables it is told about explicitly.
-        env.update({f"APPTAINERENV_{name}": value for name, value in passthrough.items()})
+    if runtime in _SIF_RUNTIMES:
+        # These only forward host variables they are told about explicitly, and
+        # each honours its own prefix.
+        prefix = _SIF_ENV_PREFIX[runtime]
+        env.update({f"{prefix}{name}": value for name, value in passthrough.items()})
     return env
 
 
@@ -168,7 +223,7 @@ def _resolve_runtime(runtime: str, require_available: bool = True) -> str:
         if not require_available:
             return _RUNTIME_PREFERENCE[0]
         error_exit(
-            "No container runtime found (looked for docker, podman, apptainer).",
+            f"No container runtime found (looked for {', '.join(_RUNTIME_PREFERENCE)}).",
             "Install one, or pass --runtime native to run the worker in this environment.",
         )
     return detected
@@ -186,10 +241,11 @@ def worker_group():
 @click.argument("worker_args", nargs=-1, type=click.UNPROCESSED)
 @click.option(
     "--runtime",
-    type=click.Choice(["auto", "docker", "podman", "apptainer", "native"]),
+    type=click.Choice(["auto", *_RUNTIME_PREFERENCE, "native"]),
     default="auto",
-    help="Container runtime. 'auto' picks the first of docker, podman, apptainer on PATH. "
-    "'native' runs the worker in this environment instead (requires the 'worker' extra).",
+    help=f"Container runtime. 'auto' picks the first of {', '.join(_RUNTIME_PREFERENCE)} "
+    "on PATH. 'native' runs the worker in this environment instead (requires the "
+    "'worker' extra).",
 )
 @click.option(
     "--image",

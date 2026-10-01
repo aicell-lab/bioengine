@@ -16,15 +16,48 @@ Two invariants matter:
 """
 from __future__ import annotations
 
-import importlib.metadata as md
 import logging
 
 import pytest
 
 from bioengine._app.bootstrap import _merge_pip_lists
-from bioengine.utils.requirements import get_pip_requirements, requirement_name
+from bioengine.utils.requirements import requirement_name
 
-INSTALLED_HYPHA_RPC = md.version("hypha-rpc")
+
+class _WarningCollector(logging.Handler):
+    """Collect ``ray.serve`` warnings on the ``ray.serve`` logger itself.
+
+    ``import ray.serve`` runs ``configure_default_serve_logger``, which sets
+    ``propagate = False`` and installs its own stderr handler — and
+    ``tests/conftest.py`` reaches it via ``bioengine.cluster.ray_cluster``, so
+    the logger is always in that state here. Whether pytest's ``caplog``
+    handler, which is attached to the *root* logger, still sees a
+    non-propagating record is a pytest-version detail (9.0.0 does not, 9.1.1
+    does), so reading ``caplog.records`` asserts on the runner rather than on
+    the code under test.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@pytest.fixture
+def serve_warnings():
+    """Every ``ray.serve`` warning emitted inside the test, in order."""
+    logger = logging.getLogger("ray.serve")
+    handler = _WarningCollector()
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        yield handler.messages
+    finally:
+        logger.setLevel(previous_level)
+        logger.removeHandler(handler)
 
 
 @pytest.mark.parametrize(
@@ -141,24 +174,28 @@ def test_idempotent_when_framework_already_in_base() -> None:
     assert merged == ["hypha-rpc==0.21.40", "pydantic==2.12.0"]
 
 
-def test_override_is_logged_with_both_versions(caplog) -> None:
+def test_override_is_logged_with_both_versions(serve_warnings) -> None:
     """A silent override trades one invisible version for another. The app
     author has to be able to see that their pin did not take, and what it
     was replaced with."""
-    with caplog.at_level(logging.WARNING, logger="ray.serve"):
-        _merge_pip_lists(["hypha-rpc==0.20.0"], ["hypha-rpc==0.21.40"])
-    logged = "\n".join(r.message for r in caplog.records)
+    _merge_pip_lists(["hypha-rpc==0.20.0"], ["hypha-rpc==0.21.40"])
+    logged = "\n".join(serve_warnings)
     assert "hypha-rpc==0.20.0" in logged
     assert "hypha-rpc==0.21.40" in logged
 
 
-def test_no_log_when_the_app_already_asked_for_the_enforced_version(caplog) -> None:
+def test_no_log_when_the_app_already_asked_for_the_enforced_version(
+    serve_warnings,
+) -> None:
     """An app that agrees with the worker is not doing anything wrong, and a
-    warning on every build would train people to ignore the one above."""
-    with caplog.at_level(logging.WARNING, logger="ray.serve"):
-        _merge_pip_lists(["hypha-rpc==0.21.40"], ["hypha-rpc==0.21.40"])
-        _merge_pip_lists(["pandas==2.2.0"], ["hypha-rpc==0.21.40"])
-    assert caplog.records == []
+    warning on every build would train people to ignore the one above.
+
+    The test above is this one's positive control: it proves the same fixture
+    does see a warning when there is one, so an empty list here is silence
+    rather than a capture that never worked."""
+    _merge_pip_lists(["hypha-rpc==0.21.40"], ["hypha-rpc==0.21.40"])
+    _merge_pip_lists(["pandas==2.2.0"], ["hypha-rpc==0.21.40"])
+    assert serve_warnings == []
 
 
 def test_case_insensitive_name_match() -> None:
@@ -176,7 +213,7 @@ def test_case_insensitive_name_match() -> None:
     ["hypha_rpc", "hypha.rpc", "HYPHA-RPC", "hypha-rpc"],
 )
 def test_every_spelling_of_hypha_rpc_is_overridden_by_the_workers_pin(
-    spelling: str, caplog
+    spelling: str, serve_warnings
 ) -> None:
     """PEP 503 says these four strings name one distribution, and pip agrees.
     The override is a name match, so a spelling it failed to recognise did not
@@ -185,24 +222,23 @@ def test_every_spelling_of_hypha_rpc_is_overridden_by_the_workers_pin(
     whichever pip resolved was outside the worker's control. ``hypha_rpc`` is
     the import name, so it is the spelling an author types from memory.
 
-    The framework list is built exactly as ``bioengine.apps.builder`` builds
-    it, off the installed distribution's metadata rather than a literal, so
-    the assertion tracks whatever the worker actually carries.
+    The framework version is a literal the test owns. It used to be read from
+    ``get_pip_requirements``, which resolves it off the *installed bioengine
+    distribution*'s metadata — so in a checkout with no bioengine installed
+    this test failed on the environment rather than on the merge. That the
+    worker's real list carries the installed hypha-rpc is asserted in
+    ``tests/test_replica_framework_pins.py``; here only the name match matters.
     """
-    framework_pip = get_pip_requirements(select=["hypha-rpc"], extras=[])
-    assert framework_pip == [f"hypha-rpc=={INSTALLED_HYPHA_RPC}"]
+    framework_pip = ["hypha-rpc==9.9.9-probe"]
 
-    with caplog.at_level(logging.WARNING, logger="ray.serve"):
-        merged = _merge_pip_lists([f"{spelling}==0.0.1", "pandas==2.2.0"], framework_pip)
+    merged = _merge_pip_lists([f"{spelling}==0.0.1", "pandas==2.2.0"], framework_pip)
 
     # Asserted first, and counted without the normaliser under test, so a
     # broken one cannot hide a second entry and the failure output names the
     # defect — both spellings in one list — rather than a list mismatch.
-    assert [req for req in merged if "rpc" in req.lower()] == [
-        f"hypha-rpc=={INSTALLED_HYPHA_RPC}"
-    ]
-    assert merged == [f"hypha-rpc=={INSTALLED_HYPHA_RPC}", "pandas==2.2.0"]
+    assert [req for req in merged if "rpc" in req.lower()] == ["hypha-rpc==9.9.9-probe"]
+    assert merged == ["hypha-rpc==9.9.9-probe", "pandas==2.2.0"]
 
-    logged = "\n".join(record.message for record in caplog.records)
+    logged = "\n".join(serve_warnings)
     assert f"{spelling}==0.0.1" in logged
-    assert f"hypha-rpc=={INSTALLED_HYPHA_RPC}" in logged
+    assert "hypha-rpc==9.9.9-probe" in logged

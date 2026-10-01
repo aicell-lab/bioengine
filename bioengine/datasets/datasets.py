@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 import httpx
 
 from bioengine.datasets.chunk_cache import ChunkCache, _DEFAULT_CACHE_SIZE_GB
+from bioengine.datasets.utils.network import raise_for_data_server_status
 
 # Transport errors that signal the cached data-server URL may now point at
 # the wrong endpoint (container restarted on a new IP, pod rescheduled,
@@ -271,7 +272,7 @@ class BioEngineDatasets:
             Empty dictionary if service_url is None.
 
         Raises:
-            httpx.HTTPStatusError: If the request fails due to HTTP error
+            DataServerError: If the data server answers with a non-2xx status
         """
         self._resolve_service_url()
         if self.service_url is None:
@@ -357,7 +358,7 @@ class BioEngineDatasets:
 
         Raises:
             ValueError: If the service_url is None or dataset does not exist
-            httpx.HTTPStatusError: If the request fails due to HTTP error
+            DataServerError: If the data server answers with a non-2xx status
         """
         self._resolve_service_url()
         if self.service_url is None:
@@ -529,7 +530,7 @@ class BioEngineDatasets:
             headers=self._auth_headers(token),
             content=content,
         )
-        response.raise_for_status()
+        raise_for_data_server_status(response)
         result = response.json()
         self.logger.debug(
             f"Saved '{filename}' to '{result['dataset_id']}' ({result['size']} bytes)"
@@ -648,7 +649,7 @@ class BioEngineDatasets:
             params={"reason": reason},
             headers=self._auth_headers(token or self.default_token),
         )
-        response.raise_for_status()
+        raise_for_data_server_status(response)
         return response.json()
 
     async def get_dataset_access_request(
@@ -662,7 +663,7 @@ class BioEngineDatasets:
             url=f"{self.service_url}/datasets/{dataset_id}/access-request",
             headers=self._auth_headers(token or self.default_token),
         )
-        response.raise_for_status()
+        raise_for_data_server_status(response)
         return response.json()
 
     async def list_dataset_access_requests(
@@ -679,7 +680,7 @@ class BioEngineDatasets:
             url=f"{self.service_url}/access-requests",
             headers=self._auth_headers(token or self.default_token),
         )
-        response.raise_for_status()
+        raise_for_data_server_status(response)
         return response.json()
 
     async def resolve_dataset_access_request(
@@ -707,7 +708,7 @@ class BioEngineDatasets:
             params={"user": user, "decision": decision},
             headers=self._auth_headers(token or self.default_token),
         )
-        response.raise_for_status()
+        raise_for_data_server_status(response)
         return response.json()
 
 

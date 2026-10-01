@@ -1476,6 +1476,39 @@ class EntryDeployment:
         self._mark_env_complete(env_name)
         return True
 
+    @staticmethod
+    def _explain_env_create_failure(stderr_text: str) -> Optional[str]:
+        """Say what a git credential prompt in a conda build actually proves.
+
+        git only reaches this prompt after the remote answered with a 401, so
+        the message names neither of the two causes that produce it.
+        """
+        import re
+
+        match = re.search(
+            r"could not read Username for '(https://[^'/]+)", stderr_text
+        )
+        if not match or "git clone" not in stderr_text:
+            return None
+        host = match.group(1).split("//", 1)[1]
+        # Only github's /archive/<sha>.tar.gz shape is offered: gitlab, gitea
+        # and bitbucket each differ, and none has appeared in an incident.
+        suggestion = (
+            f":\n    <package> @ https://{host}/<org>/<repo>/archive/"
+            f"<sha>.tar.gz#sha256=<digest>"
+            if host == "github.com"
+            else "."
+        )
+        return (
+            f"{host} answered but demanded credentials, and this worker has no "
+            f"git credentials and cannot prompt for any, so a git dependency in "
+            f"this environment could not be cloned. This happens when the "
+            f"repository or one of its submodules is private or misspelled, or "
+            f"when something on this network intercepts git-over-HTTPS. If the "
+            f"repository is public, depend on a pinned source archive over "
+            f"plain HTTPS instead, which needs no git transport{suggestion}"
+        )
+
     async def _mamba_env_create(
         self,
         env_name: str,
@@ -1486,10 +1519,9 @@ class EntryDeployment:
         """Non-blocking ``mamba env create`` from encoded YAML bytes.
 
         Writes the env spec to a tempfile (mamba only accepts
-        ``--file=<path>``, not stdin) and awaits the child. On
-        non-zero exit, raises a compact error with the last ~1 KB of
-        the child's stderr — enough to diagnose solver failures
-        without dumping the full libmamba trace.
+        ``--file=<path>``, not stdin) and awaits the child. On non-zero
+        exit, raises either a translated explanation or the last ~1 KB of
+        the child's stderr.
         """
         import tempfile
 
@@ -1524,10 +1556,13 @@ class EntryDeployment:
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                tail = (stderr or b"").decode(errors="replace")[-1000:]
+                text = (stderr or b"").decode(errors="replace")
+                # Match on the FULL stderr, not the tail below: a noisy build
+                # pushes the git line out of the last kilobyte.
+                explanation = self._explain_env_create_failure(text)
                 raise RuntimeError(
                     f"mamba env create failed for weight format "
-                    f"{wf!r} (env {env_name}): {tail}"
+                    f"{wf!r} (env {env_name}): {explanation or text[-1000:]}"
                 )
             self._mark_env_complete(env_name)
             logger.info(f"✅ Built conda env for {wf!r}: {env_name}")
@@ -2714,6 +2749,13 @@ class EntryDeployment:
         Anonymous callers and callers holding only ``'*': 'r'`` or the ``'@'``
         authenticated-user grant get their test run and their report returned;
         only the publish is skipped.
+
+        NOTE the consequence for token scoping: ``parent`` is the human, so a
+        token minted for one workspace still publishes here if that human has
+        the grant. Workspace-scoping a token does not bound what it can reach
+        through this app. Tightening that means also requiring
+        ``_MODELS_WORKSPACE`` in the caller's scope, which would lock out any
+        caller holding a personal-workspace token — check the nightly first.
         """
         identities = self._caller_identities(caller)
         if not identities:

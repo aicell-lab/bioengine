@@ -23,6 +23,7 @@ from bioengine._app.decorators import (
 from bioengine._app.errors import (
     BioEngineUserError,
     CompositionCycleError,
+    DataServerError,
     MissingDataServerError,
     ReservedMethodNameError,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "BioEngineRuntimeHandle",
     "BioEngineUserError",
     "CompositionCycleError",
+    "DataServerError",
     "MissingDataServerError",
     "ReservedMethodNameError",
 ]

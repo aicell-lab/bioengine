@@ -16,6 +16,12 @@ because Ray builds runtime_env venvs with ``--system-site-packages``:
 
 The tests below hold both halves: the pin exists, it is read off the installed
 distribution rather than written down, and pydantic is still absent.
+
+These tests read the real installed ``bioengine`` distribution on purpose — that
+table is their subject, so faking it would reduce them to comparing a fixture
+against itself. With no installed distribution (``pip uninstall bioengine`` over
+a checkout, the usual way to stop an image's own copy shadowing the source) they
+fail with ``PackageNotFoundError``: a broken measurement setup, not a regression.
 """
 
 from __future__ import annotations
