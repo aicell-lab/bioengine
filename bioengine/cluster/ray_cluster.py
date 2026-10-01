@@ -160,7 +160,7 @@ class RayCluster:
             gpu_slurm_flag: Template for the GPU sbatch directive (default
                 "--gpus={n}"). Use "--gres=gpu:{n}" on clusters that require gres,
                 or "" to omit and supply via ``further_slurm_args``.
-            further_apptainer_args: Extra CLI flags forwarded to ``apptainer exec``
+            further_apptainer_args: Extra CLI flags forwarded to the container runtime's ``exec``
                 inside each SLURM worker job (e.g. additional ``--bind`` mounts).
             min_workers: Minimum number of workers for autoscaling. Default 0.
             max_workers: Maximum number of workers for autoscaling. Default 4.
