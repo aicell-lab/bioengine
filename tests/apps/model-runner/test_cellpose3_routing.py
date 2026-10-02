@@ -122,6 +122,27 @@ def test_runtime_threads_the_env_through_to_the_child():
     assert "sys.executable" not in spawn, spawn
 
 
+def test_venv_is_built_before_the_gpu_lock_is_taken():
+    """A multi-gigabyte pip install under ``_gpu_lock`` stalls the replica.
+
+    Measured on a dev instance: the first Cellpose-3 request held the lock
+    for the whole install and never completed.
+    """
+    src = RUNTIME.read_text()
+    body = src[src.index("    async def predict_from_disk(") :]
+    body = body[: body.index("async with self._gpu_lock:")]
+    assert "_ensure_alt_venv" in body, body[-600:]
+
+
+def test_venv_build_subprocesses_have_timeouts():
+    """Without these a hung pip wedges every later request on the lock."""
+    src = RUNTIME.read_text()
+    build = src[src.index("def _ensure_alt_venv") :]
+    build = build[: build.index('(target / ".ready").write_text')]
+    assert build.count("timeout=") >= 2, build
+    assert "TimeoutExpired" in build
+
+
 def test_warm_child_key_includes_the_env():
     """Otherwise a model switch could reuse a child on the wrong interpreter."""
     src = RUNTIME.read_text()

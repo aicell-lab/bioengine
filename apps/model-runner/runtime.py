@@ -1191,20 +1191,39 @@ class RuntimeDeployment:
                 logger.warning(f"🧹 [{name}] Removing a half-built venv at {target}")
                 shutil.rmtree(target, ignore_errors=True)
             logger.info(f"🐍 [{name}] Building inference venv at {target} (first use)")
-            # No --system-site-packages: inheriting the replica's venv is what
-            # would put the wrong Cellpose on the path.
-            subprocess.run(
-                [sys.executable, "-m", "venv", str(target)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                [str(target / "bin" / "pip"), "install", "-r", str(req)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            # Timeouts, because an install that never returns would otherwise
+            # leave every later request waiting on this lock forever. A torch
+            # wheel is gigabytes, so the install budget is generous.
+            try:
+                # No --system-site-packages: inheriting the replica's venv is
+                # what would put the wrong Cellpose on the path.
+                subprocess.run(
+                    [sys.executable, "-m", "venv", str(target)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                subprocess.run(
+                    [str(target / "bin" / "pip"), "install", "-r", str(req)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2700,
+                )
+            except subprocess.TimeoutExpired as e:
+                shutil.rmtree(target, ignore_errors=True)
+                raise RuntimeError(
+                    f"building the {name} inference venv timed out after "
+                    f"{e.timeout:.0f}s; no model needing it can run until a "
+                    f"later request rebuilds it"
+                ) from e
+            except subprocess.CalledProcessError as e:
+                shutil.rmtree(target, ignore_errors=True)
+                raise RuntimeError(
+                    f"building the {name} inference venv failed: "
+                    f"{(e.stderr or '')[-800:]}"
+                ) from e
             (target / ".ready").write_text("")
             logger.info(f"✅ [{name}] Inference venv ready at {target}")
         return str(python)
@@ -1249,6 +1268,12 @@ class RuntimeDeployment:
         input_dir = request_dir / "input"
         output_dir = request_dir / "output"
         state_file = request_dir / "state.json"
+
+        # Build the alternate venv BEFORE taking the lock. It touches no GPU,
+        # and a multi-gigabyte pip install held under ``_gpu_lock`` would
+        # stall every other request on this replica for its whole duration.
+        if python_env:
+            await asyncio.to_thread(self._ensure_alt_venv, python_env)
 
         async with self._gpu_lock:
             cpu_before, gpu_before = self._get_memory_usage()
