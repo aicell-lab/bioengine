@@ -978,7 +978,11 @@ class RuntimeDeployment:
     # === Prediction ===
 
     def _spawn_warm(
-        self, key: tuple, rdf_path: str, load_params: Dict[str, object]
+        self,
+        key: tuple,
+        rdf_path: str,
+        load_params: Dict[str, object],
+        python_env: Optional[str] = None,
     ) -> None:
         """Spawn a resident inference child that loads the model once and
         then serves predict requests until stdin closes.
@@ -1000,7 +1004,6 @@ class RuntimeDeployment:
         """
         import collections
         import subprocess
-        import sys
         import tempfile
         import threading
 
@@ -1015,7 +1018,14 @@ class RuntimeDeployment:
             f"🐍 [predict] Spawning resident inference child for {rdf_path}"
         )
         proc = subprocess.Popen(
-            [sys.executable, "-c", _WARM_CHILD_SCRIPT, rdf_path, lp_path, str(w_fd)],
+            [
+                self._interpreter(python_env),
+                "-c",
+                _WARM_CHILD_SCRIPT,
+                rdf_path,
+                lp_path,
+                str(w_fd),
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1130,6 +1140,75 @@ class RuntimeDeployment:
         if reader is not None:
             reader.join(timeout=5)
 
+    def _interpreter(self, python_env: Optional[str]) -> str:
+        """Python that runs the inference child.
+
+        ``None`` means the replica's own venv. A named env is a separate venv
+        built on first use from ``requirements-<name>.txt``: Cellpose 3 and 4
+        are one distribution name at two versions and cannot share a
+        site-packages, so the only way to serve both from one GPU deployment
+        is to run one of them under a different interpreter. Swapping the
+        interpreter keeps ``pass_fds`` and the whole warm-child protocol
+        intact, which wrapping the spawn in ``mamba run`` would not.
+        """
+        import sys
+
+        if not python_env:
+            return sys.executable
+        return self._ensure_alt_venv(python_env)
+
+    def _ensure_alt_venv(self, name: str) -> str:
+        """Path to ``name``'s venv python on the shared HOME, building it once.
+
+        Built in place rather than staged-then-renamed: a venv bakes its own
+        absolute path into ``pyvenv.cfg`` and its console scripts, so moving
+        it breaks it. A ``.ready`` marker written only after the install
+        succeeds is what makes a half-built directory detectable, and an
+        ``flock`` keeps two replicas — which share this HOME — from building
+        into the same directory at once.
+        """
+        import fcntl
+        import shutil
+        import subprocess
+        import sys
+
+        req = Path(__file__).parent / f"requirements-{name}.txt"
+        if not req.exists():
+            raise RuntimeError(f"no requirements file for python_env {name!r}")
+
+        root = Path(os.environ.get("HOME", "/tmp")) / ".model-runner-envs"
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / name
+        python = target / "bin" / "python"
+        if (target / ".ready").exists():
+            return str(python)
+
+        with open(root / f".{name}.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if (target / ".ready").exists():
+                return str(python)
+            if target.exists():
+                logger.warning(f"🧹 [{name}] Removing a half-built venv at {target}")
+                shutil.rmtree(target, ignore_errors=True)
+            logger.info(f"🐍 [{name}] Building inference venv at {target} (first use)")
+            # No --system-site-packages: inheriting the replica's venv is what
+            # would put the wrong Cellpose on the path.
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(target)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [str(target / "bin" / "pip"), "install", "-r", str(req)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (target / ".ready").write_text("")
+            logger.info(f"✅ [{name}] Inference venv ready at {target}")
+        return str(python)
+
     async def predict_from_disk(
         self,
         request_id: str,
@@ -1140,6 +1219,7 @@ class RuntimeDeployment:
         remote_modified: Optional[str] = None,
         force_reload: bool = False,
         overrides: Optional[Dict[str, Dict[str, Optional[dict]]]] = None,
+        python_env: Optional[str] = None,
     ) -> None:
         """Read inputs from disk, run inference in a subprocess, write
         outputs to disk.
@@ -1210,6 +1290,7 @@ class RuntimeDeployment:
                 weights_format,
                 default_blocksize_parameter,
                 json.dumps(overrides or {}, sort_keys=True),
+                python_env,
             )
             # ``force_reload`` (entry passes it for cache="skip") bypasses reuse
             # so a byte-identical re-download — which leaves ``remote_modified``
@@ -1245,7 +1326,7 @@ class RuntimeDeployment:
                     "app_dir": str(Path(__file__).parent),
                 }
                 await asyncio.to_thread(
-                    self._spawn_warm, key, rdf_path, load_params
+                    self._spawn_warm, key, rdf_path, load_params, python_env
                 )
             await asyncio.to_thread(
                 self._send_predict,

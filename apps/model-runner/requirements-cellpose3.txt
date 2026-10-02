@@ -1,0 +1,29 @@
+# Cellpose-3 inference venv. NOT a Ray runtime_env: RuntimeImpl builds this
+# with `python -m venv` on the shared HOME at first use and runs the inference
+# child under it (``_ensure_alt_venv``). Diverges from requirements-runtime.txt
+# in ONE package that matters: cellpose 3 and 4 are the same distribution name
+# and cannot share a site-packages.
+#
+# Must stay self-sufficient for the warm child — the venv is built WITHOUT
+# --system-site-packages, so anything _WARM_CHILD_SCRIPT imports belongs here.
+#
+# torch/torchvision track the runtime's pins rather than cellpose3-runner's
+# older 2.5.1/0.20.1. Measured 2026-10-01, not inferred from `torch>=1.6`:
+# cellpose 3.1.1.2 imports, loads cyto3 and runs eval() on torch 2.7.1 with
+# numpy 1.26.4.
+#
+# opencv is pinned because cellpose declares it bare and the current
+# opencv-python-headless (5.0.0.93) requires numpy>=2, which collides with the
+# numpy 1.26.4 the rest of the app is pinned to. 4.11 is the newest that does
+# not; `pip check` is clean with it.
+bioimageio.core==0.11.0
+cellpose==3.1.1.2
+imageio>=2.37.0
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+nvidia-ml-py==12.555.43
+psutil==6.1.1
+scikit-image==0.25.2
+torch==2.7.1
+torchvision==0.22.1
+xarray==2025.1.2

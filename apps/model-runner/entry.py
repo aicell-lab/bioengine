@@ -6,9 +6,9 @@ GPU-bound work (``predict`` and the heavy ``bioimageio.core.test_model``
 call) to :class:`runtime.RuntimeDeployment` via the v0.6 type-hint composition.
 
 The GPU runtime ships Cellpose-4 (Cellpose-SAM / Cellpose-DINO) and runs
-those models natively. It cannot run the older Cellpose-3 zoo models;
-deploy the ``bioimage-io/cellpose3-runner`` app for those and call its
-``list_supported_models()`` for the accepted ids.
+those models natively. The older Cellpose-3 zoo models need an incompatible
+Cellpose, so inference for them runs in a separate venv on the same GPU
+deployment — see ``CELLPOSE3_MODELS`` and ``_python_env_for``.
 
 Heavier helper modules:
 
@@ -51,10 +51,11 @@ logger.setLevel("INFO")
 
 SUPPORTED_FILES_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 
-# Cellpose-3 zoo models. The runtime ships Cellpose 4, whose API these
-# models' architectures do not survive, so ``infer`` refuses them and points
-# at cellpose3-runner. Mirrors that app's ``SUPPORTED_MODELS``; ``test`` still
-# accepts them because it runs in each model's own conda environment.
+# Cellpose-3 zoo models. The runtime ships Cellpose 4, whose API these models'
+# architectures do not survive, so ``infer`` runs them under a separate venv
+# built from ``requirements-cellpose3.txt``. Mirrors cellpose3-runner's
+# ``SUPPORTED_MODELS``; ``test`` needs no special handling because it already
+# runs in each model's own conda environment.
 CELLPOSE3_MODELS = (
     "famous-fish",
     "happy-elephant",
@@ -62,6 +63,19 @@ CELLPOSE3_MODELS = (
     "philosophical-panda",
     "thoughtful-chipmunk",
 )
+
+
+def _python_env_for(model_id: str) -> Optional[str]:
+    """Name of the venv that can load this model, or ``None`` for the
+    runtime's own.
+
+    Keeping this a property of the *model id* rather than of a second Ray
+    deployment is deliberate: one GPU deployment is one card by construction,
+    and one ``_gpu_lock`` still serialises everything that touches the device.
+    """
+    if model_id.rsplit("/", 1)[-1] in CELLPOSE3_MODELS:
+        return "cellpose3"
+    return None
 
 
 def _read_pip(name: str) -> List[str]:
@@ -1885,10 +1899,10 @@ class EntryDeployment:
         The per-model artifacts under ``test-reports`` are written by this
         runner as it tests, so they track the current runtime. They cannot
         vouch for the Cellpose models older than Cellpose 4: those need the
-        incompatible Cellpose-3 runtime, so they score below the pass mark
-        here however healthy they are. ``cellpose3-runner`` serves them, so
-        they are added back from ``CELLPOSE3_MODELS`` — the same list
-        ``infer`` uses to redirect them.
+        incompatible Cellpose-3 environment, so they score below the pass
+        mark here however healthy they are. They are added back from
+        ``CELLPOSE3_MODELS`` — the same list ``infer`` uses to pick the venv
+        it runs them in.
         """
         prefix = "test-report-"
         reports = await self.artifact_manager.list(
@@ -3240,13 +3254,6 @@ class EntryDeployment:
         model_id = self._normalize_model_id(model_id)
         logger.info(f"🤖 Queuing inference for model '{model_id}'...")
 
-        if model_id.rsplit("/", 1)[-1] in CELLPOSE3_MODELS:
-            raise ValueError(
-                f"model_id {model_id!r} is a Cellpose-3 model, which this "
-                f"runner's Cellpose-4 runtime cannot run. Use the "
-                f"'bioimage-io/cellpose3-runner' app instead."
-            )
-
         # Resolve any URL or temporary file path strings to numpy
         # arrays BEFORE handing off — matches the user's spec ("save
         # the image the moment it's received") and surfaces broken
@@ -3385,6 +3392,7 @@ class EntryDeployment:
                     remote_modified=package.latest_remote_modified,
                     force_reload=(cache == "skip"),
                     overrides=overrides,
+                    python_env=_python_env_for(model_id),
                 )
 
             self._update_infer_job(job, state="completed")
