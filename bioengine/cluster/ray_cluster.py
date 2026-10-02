@@ -27,6 +27,7 @@ from bioengine.utils import (
     date_format,
     get_internal_ip,
     head_memory_budget_warning,
+    host_census,
     read_meminfo,
     stream_logging_format,
 )
@@ -215,6 +216,13 @@ class RayCluster:
         self.slurm_workers = None
         self._last_slurm_jobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
+        # Host co-tenancy census. The deadline is the same quantity as the
+        # liveness heartbeat's — both say "this long without a monitoring pass
+        # means gone" — so the worker sets it from the value it already
+        # computes for the heartbeat once the monitoring interval is known.
+        self.census_stale_after_seconds = host_census.STARTUP_STALE_AFTER_SECONDS
+        self._co_tenancy_warnings: List[str] = []
+
         # Base configuration for connecting to Ray cluster
         self.ray_cluster_config = {
             "head_node_address": str(head_node_address or get_internal_ip()),
@@ -360,6 +368,11 @@ class RayCluster:
             "queued": [],
             "running": [],
         }
+
+        # Co-tenancy warnings from the host census. Always present as a list so
+        # UI code can render unconditionally; empty is the normal case, and is
+        # also what an unmounted census directory produces.
+        status["co_tenancy_warnings"] = list(self._co_tenancy_warnings)
 
         return status
 
@@ -755,6 +768,74 @@ class RayCluster:
         if warning:
             self.logger.warning(warning)
 
+    def _own_advertisement(self) -> Dict[str, Any]:
+        """This worker's resource claim, as the census publishes it."""
+        return {
+            "head_memory_in_gb": self.ray_cluster_config["head_memory_in_gb"],
+            "shm_size_bytes": host_census.shm_size_bytes(),
+            "head_num_cpus": self.ray_cluster_config["head_num_cpus"],
+            "head_num_gpus": self.ray_cluster_config["head_num_gpus"],
+            "gpu_device_ids": host_census.visible_gpu_device_ids(),
+            "mode": self.mode,
+        }
+
+    def _publish_host_census(self, stale_after_seconds: float) -> None:
+        """Publish or refresh this worker's claim in the shared census.
+
+        Advisory: a census directory that is missing, read-only or not mounted
+        at all leaves the feature inert rather than failing the worker.
+        """
+        directory = host_census.census_dir()
+        if directory is None or self.mode == "external-cluster":
+            # In external-cluster mode the head is not ours to size, so this
+            # worker holds no host reservation worth advertising.
+            return
+        try:
+            host_census.write_advertisement(
+                directory=directory,
+                worker_id=host_census.worker_id(),
+                stale_after_seconds=stale_after_seconds,
+                resources=self._own_advertisement(),
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not publish the host census entry: {e}")
+
+    def _withdraw_host_census(self) -> None:
+        """Remove this worker's claim so co-tenants stop counting it."""
+        directory = host_census.census_dir()
+        if directory is None:
+            return
+        try:
+            host_census.remove_advertisement(directory, host_census.worker_id())
+        except Exception as e:
+            self.logger.debug(f"Could not withdraw the host census entry: {e}")
+
+    def _check_host_co_tenancy(self) -> List[str]:
+        """Warnings about workers on this host whose claims collide with ours.
+
+        Returns the warnings so the worker status can carry them too; logging
+        them is the caller's job, because the status read must not log on every
+        poll.
+        """
+        directory = host_census.census_dir()
+        if directory is None or self.mode == "external-cluster":
+            return []
+        try:
+            co_tenants = host_census.read_co_tenants(directory, host_census.worker_id())
+            if not co_tenants:
+                return []
+            return host_census.co_tenancy_warnings(
+                own=self._own_advertisement(),
+                co_tenants=co_tenants,
+                mem_total_bytes=read_meminfo()["MemTotal"],
+                budget_fraction=self.ray_cluster_config[
+                    "head_memory_budget_fraction"
+                ],
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not check host co-tenancy: {e}")
+            return []
+
     async def _start_cluster(self) -> None:
         """Start Ray cluster head node with configured ports and resources.
 
@@ -793,6 +874,12 @@ class RayCluster:
                 await self._generate_cdi_spec()
 
             self._check_head_memory_budget()
+
+            # Advertise before reading, so two workers starting at once still
+            # see each other rather than both finding an empty census.
+            self._publish_host_census(host_census.STARTUP_STALE_AFTER_SECONDS)
+            for warning in self._check_host_co_tenancy():
+                self.logger.warning(warning)
 
             # Start ray as the head node with the specified parameters
             args = [
@@ -1201,6 +1288,11 @@ class RayCluster:
     async def monitor_cluster(self) -> None:
         """Monitor cluster status and update worker nodes history."""
         try:
+            # Refresh first: an unrefreshed advertisement ages out and this
+            # worker's claim silently stops counting for its co-tenants.
+            self._publish_host_census(self.census_stale_after_seconds)
+            self._co_tenancy_warnings = self._check_host_co_tenancy()
+
             # Get the current status of the cluster from the BioEngineProxy
             cluster_status = await self._get_cluster_state_with_reconnect()
 
@@ -1298,6 +1390,11 @@ class RayCluster:
         try:
             self.is_ready.clear()
             self.start_time = None
+
+            # Withdraw the census claim before the slow part of shutdown, so a
+            # co-tenant starting during it does not count memory we are giving
+            # back.
+            self._withdraw_host_census()
 
             # Shutdown all SLURM workers if running in SLURM mode
             if self.slurm_workers:
