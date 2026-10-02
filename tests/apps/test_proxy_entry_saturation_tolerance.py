@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 
 import pytest
 
@@ -78,6 +79,8 @@ def _bare_proxy(**attrs):
     inst._next_register_at = 0.0
     inst._maintenance_task = None
     inst._proxy_actor_handle = None
+    inst._sibling_read_started_at = None
+    inst._sibling_read_job_running = False
     # The maintenance loop is exercised in test_proxy_hypha_decoupled_health;
     # here it would only spawn a background task the gate tests never await.
     inst._ensure_maintenance_task = lambda: None
@@ -347,6 +350,139 @@ async def test_sibling_states_unknown_app_is_none(monkeypatch) -> None:
 
     monkeypatch.setattr(serve, "status", lambda: ServeStatus())
     assert await _bare_proxy()._sibling_states() is None
+
+
+# ===== svamp #0037: the controller read is bounded, and bounded two ways =====
+#
+# ``serve.status()`` is sync, so it runs in the user-code executor — 5 threads,
+# because the proxy declares ``num_cpus: 0``. Ray re-arms an abandoned health
+# check without cancelling it, so an unguarded read parks one thread per probe
+# period and the only thing that used to stop it was the replica being
+# condemned at pool exhaustion. Suppressing the duplicate dispatch on its own
+# would replace that with a silent permanent failure instead, so the two cases
+# are separated: a still-running job past the deadline is a wedged controller
+# and raises; a finished job whose coroutine has not resumed is a starved loop
+# and must not.
+
+
+@pytest.mark.asyncio
+async def test_healthy_read_leaves_no_residue(monkeypatch) -> None:
+    """The guard is inert on the healthy path, so a second read still dispatches."""
+    from ray import serve
+    from ray.serve.schema import ServeStatus
+
+    calls = []
+    monkeypatch.setattr(serve, "status", lambda: calls.append(1) or ServeStatus())
+
+    inst = _bare_proxy()
+    assert await inst._sibling_states() is None
+    assert inst._sibling_read_started_at is None
+    assert inst._sibling_read_job_running is False
+    assert await inst._sibling_states() is None
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_outstanding_read_is_not_dispatched_twice(monkeypatch) -> None:
+    """A real concurrent call while the executor job blocks parks no second thread."""
+    import threading
+
+    from ray import serve
+    from ray.serve.schema import ServeStatus
+
+    release = threading.Event()
+    entered = threading.Event()
+    calls = []
+
+    def _blocking_status():
+        calls.append(1)
+        entered.set()
+        release.wait(timeout=5)
+        return ServeStatus()
+
+    monkeypatch.setattr(serve, "status", _blocking_status)
+
+    inst = _bare_proxy()
+    first = asyncio.ensure_future(inst._sibling_states())
+    await asyncio.get_event_loop().run_in_executor(None, entered.wait, 5)
+    assert inst._sibling_read_job_running is True
+
+    assert await inst._sibling_states() is None, "the duplicate must read unknown"
+    assert len(calls) == 1, "a second executor job was dispatched"
+
+    release.set()
+    assert await first is None
+    assert inst._sibling_read_started_at is None
+
+
+def _count_status_calls(monkeypatch):
+    """Record ``serve.status()`` calls so "no second dispatch" is asserted directly.
+
+    Without this the state-level tests below fall through to the real
+    ``serve.status()`` whenever the guard is absent — which is slow, order
+    dependent, and makes them fail for a reason other than the defect.
+    """
+    from ray import serve
+    from ray.serve.schema import ServeStatus
+
+    calls = []
+    monkeypatch.setattr(serve, "status", lambda: calls.append(1) or ServeStatus())
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_wedged_controller_read_raises_past_deadline(monkeypatch) -> None:
+    """A job still running past the deadline is no answer, not a slow one."""
+    monkeypatch.setattr(pd_module, "_SIBLING_READ_DEADLINE_S", 0.0)
+    calls = _count_status_calls(monkeypatch)
+    inst = _bare_proxy(
+        _sibling_read_started_at=time.monotonic() - 1.0,
+        _sibling_read_job_running=True,
+    )
+    with pytest.raises(RuntimeError, match="controller is not answering"):
+        await inst._sibling_states()
+    assert calls == [], "the wedged case must raise instead of dispatching again"
+
+
+@pytest.mark.asyncio
+async def test_starved_loop_past_deadline_does_not_raise(monkeypatch) -> None:
+    """The false positive this whole issue is about: do not condemn on starvation.
+
+    State-level rather than a real starvation repro — blocking the event loop
+    deterministically from inside a test running on it is not something to fake
+    convincingly. What is asserted is the discriminator: the executor job has
+    *finished* (``_sibling_read_job_running`` False) and only the coroutine's
+    resumption is late, which says the loop is starved and the replica is fine.
+    """
+    monkeypatch.setattr(pd_module, "_SIBLING_READ_DEADLINE_S", 0.0)
+    calls = _count_status_calls(monkeypatch)
+    inst = _bare_proxy(
+        _sibling_read_started_at=time.monotonic() - 3600.0,
+        _sibling_read_job_running=False,
+    )
+    assert await inst._sibling_states() is None
+    assert calls == [], "a read is still outstanding; do not stack another on it"
+
+
+@pytest.mark.asyncio
+async def test_wedged_read_fails_the_health_check(monkeypatch) -> None:
+    """The raise has to reach Serve, or the bound buys nothing."""
+    monkeypatch.setattr(pd_module, "_SIBLING_READ_DEADLINE_S", 0.0)
+    _count_status_calls(monkeypatch)
+    inst = _bare_proxy(
+        entry_deployment_ready=True,
+        _dep_seen_ready={"EntryDeployment": True},
+        server=_Server(),
+        websocket_service_id="ws",
+        _sibling_read_started_at=time.monotonic() - 1.0,
+        _sibling_read_job_running=True,
+    )
+    with pytest.raises(RuntimeError, match="controller is not answering"):
+        await inst.check_health()
+    assert inst._deregister_services.called is False, (
+        "a controller that cannot be read says nothing about the siblings, so "
+        "the service must not be pulled on the way out"
+    )
 
 
 def test_probe_is_off_the_data_plane() -> None:
