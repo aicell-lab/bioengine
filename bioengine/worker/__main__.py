@@ -232,6 +232,7 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         type=str,
         metavar="URL",
         help="URL of the Hypha server for service registration and remote access. "
+        "Defaults to $BIOENGINE_SERVER_URL when unset. "
         "Used both by the worker itself and by deployed apps (HYPHA_SERVER_URL env "
         "var + ProxyDeployment's connection URL), so it must be reachable from every "
         "node hosting an app — including Ray worker pods.",
@@ -603,6 +604,34 @@ def resolve_token(
     return group_configs
 
 
+def resolve_server_url(
+    group_configs: Dict[str, Dict[str, any]],
+) -> Dict[str, Dict[str, any]]:
+    """Fall back to ``BIOENGINE_SERVER_URL`` when ``--server-url`` is absent.
+
+    The container launcher passes the server as an environment variable
+    (``cli/worker.py``), and the image's entrypoint is this module — so without
+    this the variable reaches the process and is ignored, the worker falls
+    through to its own ``hypha.aicell.io`` default, and it registers against the
+    wrong server while reporting healthy. Nothing else in the startup path reads
+    it, so there is no later stage that could notice.
+
+    Resolved here rather than via ``argparse``'s ``envvar`` so that a direct
+    ``python -m bioengine.worker`` is covered on the same terms as the CLI, and
+    so the precedence sits next to the token's.
+    """
+    hypha_options = group_configs.get("Hypha Options", {})
+    if hypha_options.get("server_url"):
+        return group_configs
+
+    server_url = os.environ.get("BIOENGINE_SERVER_URL")
+    if server_url:
+        hypha_options["server_url"] = server_url
+        group_configs["Hypha Options"] = hypha_options
+
+    return group_configs
+
+
 def _expand_env_in_config(value: Any) -> Any:
     """Recursively expand ``${VAR}`` / ``$VAR`` from the worker's own
     environment in every string within a startup-application config.
@@ -758,6 +787,7 @@ if __name__ == "__main__":
         group_configs = get_args_by_group(parser)
 
         group_configs = resolve_token(group_configs)
+        group_configs = resolve_server_url(group_configs)
 
         # Process startup applications if provided
         group_configs = read_startup_applications(group_configs)
