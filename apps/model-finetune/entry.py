@@ -103,9 +103,9 @@ def _apply_clahe(img_array: np.ndarray) -> np.ndarray:
     """Grayscale uint8 + CLAHE contrast enhancement. Accepts (H,W), (H,W,C) or
     (C,H,W); returns a (H,W) uint8 array. Rescues low-contrast fluorescence that
     Cellpose-SAM otherwise cannot segment (opt-in via preflight_training_dataset).
-    """
-    import cv2
-
+    Pure numpy — NO cv2 — so the CPU entry's numpy ABI is never perturbed: adding
+    opencv dragged in an incompatible numpy and crashed EntryApp init at deploy
+    (numpy.dtype size mismatch vs the pandas imported at init; deNBI verify of 0.21.0)."""
     arr = np.asarray(img_array)
     if arr.ndim == 3 and arr.shape[0] in (1, 2, 3, 4) and arr.shape[0] < arr.shape[1]:
         arr = arr.transpose(1, 2, 0)
@@ -124,8 +124,56 @@ def _apply_clahe(img_array: np.ndarray) -> np.ndarray:
             arr = ((arr.astype(np.float32) - lo) / (hi - lo) * 255).astype(np.uint8)
         else:
             arr = np.zeros(arr.shape, dtype=np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
-    return clahe.apply(arr)
+    return _clahe_numpy(arr, clip_limit=3.0, grid=(16, 16))
+
+
+def _clahe_numpy(gray: np.ndarray, clip_limit: float = 3.0, grid=(16, 16)) -> np.ndarray:
+    """Contrast-limited adaptive histogram equalisation, bilinearly interpolated
+    between per-tile clipped-CDF LUTs — a numpy reimplementation of
+    ``cv2.createCLAHE(clipLimit, tileGridSize).apply()`` so no compiled dep is pulled
+    into the CPU entry. gray: (H,W) uint8 -> (H,W) uint8."""
+    g = np.asarray(gray, dtype=np.uint8)
+    h, w = g.shape
+    gy, gx = grid
+    ys = np.linspace(0, h, gy + 1).astype(int)
+    xs = np.linspace(0, w, gx + 1).astype(int)
+    luts = np.empty((gy, gx, 256), dtype=np.float32)
+    for i in range(gy):
+        for j in range(gx):
+            tile = g[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            n = tile.size
+            if n == 0:
+                luts[i, j] = np.arange(256, dtype=np.float32)
+                continue
+            hist = np.bincount(tile.ravel(), minlength=256).astype(np.float32)
+            limit = max(1.0, clip_limit * n / 256.0)
+            excess = np.maximum(hist - limit, 0.0).sum()
+            hist = np.minimum(hist, limit) + excess / 256.0
+            cdf = np.cumsum(hist)
+            lo, hi = cdf.min(), cdf.max()
+            luts[i, j] = (cdf - lo) / (hi - lo + 1e-9) * 255.0
+    cy = (ys[:-1] + ys[1:]) / 2.0
+    cx = (xs[:-1] + xs[1:]) / 2.0
+
+    def _iw(coords, centers):
+        idx = np.searchsorted(centers, coords)
+        i1 = np.clip(idx, 0, len(centers) - 1)
+        i0 = np.clip(idx - 1, 0, len(centers) - 1)
+        c0, c1 = centers[i0], centers[i1]
+        wt = np.where(i0 == i1, 0.0,
+                      np.clip((coords - c0) / np.where(c1 > c0, c1 - c0, 1.0), 0, 1))
+        return i0, i1, wt
+
+    ri0, ri1, rw = _iw(np.arange(h), cy)
+    ci0, ci1, cw = _iw(np.arange(w), cx)
+    R0 = np.repeat(ri0[:, None], w, 1); R1 = np.repeat(ri1[:, None], w, 1)
+    C0 = np.repeat(ci0[None, :], h, 0); C1 = np.repeat(ci1[None, :], h, 0)
+    gi = g.astype(np.int64)
+    v00 = luts[R0, C0, gi]; v01 = luts[R0, C1, gi]
+    v10 = luts[R1, C0, gi]; v11 = luts[R1, C1, gi]
+    RW = rw[:, None]; CW = cw[None, :]
+    out = (v00 * (1 - CW) + v01 * CW) * (1 - RW) + (v10 * (1 - CW) + v11 * CW) * RW
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 @bioengine.app(

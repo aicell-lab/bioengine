@@ -7,6 +7,3 @@ tifffile
 Pillow
 httpx
 pyyaml
-# preflight_training_dataset's optional CLAHE step (cv2.createCLAHE). Headless =
-# no GUI/X deps; recent wheels build against numpy 2.x, matching this env.
-opencv-python-headless
