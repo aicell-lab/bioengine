@@ -163,6 +163,12 @@ def main(session_id: str) -> None:
         train_losses, test_losses = [], []
         if isinstance(result, (tuple, list)) and len(result) >= 3:
             train_losses, test_losses = _loss_list(result[1]), _loss_list(result[2])
+            # Stock train_seg validates only every validation_interval epochs and
+            # returns 0.0 for the off-cadence epochs; a real segmentation test loss
+            # is never exactly 0.0, so surface those as null — a consumer must not
+            # read a non-validated epoch as a test loss of 0.0 (verified on deNBI:
+            # a 4-epoch run gave [11.05, 0, 0, 0] = validated at epoch 0 only).
+            test_losses = [None if (v is not None and v == 0.0) else v for v in test_losses]
         ok = training.checkpoint_path(session_id).exists()
         cell_diameters = None
         instance_metrics = None
