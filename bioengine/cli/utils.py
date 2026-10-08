@@ -243,10 +243,28 @@ def error_exit(msg: str, hint: str = "") -> None:
 # ── Env helpers ───────────────────────────────────────────────────────────────
 
 def get_server_url(ctx_param: Optional[str]) -> str:
-    """Resolve server URL from CLI flag → env var → default."""
-    return ctx_param or os.environ.get("BIOENGINE_SERVER_URL", DEFAULT_SERVER_URL)
+    """Resolve server URL from CLI flag → env var → default.
+
+    An exported-but-empty variable means unset, as it does everywhere else
+    here: click's own ``resolve_envvar_value`` returns only truthy values, and
+    ``get_token`` below chains with ``or`` for the same reason. The two-argument
+    ``os.environ.get`` default does not cover it — the key exists, so the
+    default is never reached and the caller gets ``""``.
+    """
+    return ctx_param or os.environ.get("BIOENGINE_SERVER_URL") or DEFAULT_SERVER_URL
 
 
 def get_token(ctx_param: Optional[str]) -> Optional[str]:
-    """Resolve auth token from CLI flag → env var."""
-    return ctx_param or os.environ.get("HYPHA_TOKEN") or os.environ.get("BIOENGINE_TOKEN")
+    """Resolve auth token from CLI flag → env var.
+
+    The trailing ``or None`` keeps the return type honest: with every source
+    exported-but-empty the ``or`` chain ends on the last empty string, so this
+    returned ``""`` rather than ``None`` and a caller testing ``is None`` saw a
+    token that is not one.
+    """
+    return (
+        ctx_param
+        or os.environ.get("HYPHA_TOKEN")
+        or os.environ.get("BIOENGINE_TOKEN")
+        or None
+    )
