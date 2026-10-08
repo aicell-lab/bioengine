@@ -1,24 +1,27 @@
 """``BIOENGINE_SERVER_URL`` must actually reach the worker process.
 
-The container launcher passes the server as an environment variable and the
-image's entrypoint is ``python -m bioengine.worker``, so the variable arrives in
-the process environment. Nothing read it: ``--server-url`` was declared without
-an ``envvar``, the unset flag was dropped before construction, and the worker
-fell through to its own ``hypha.aicell.io`` default — registering against the
-wrong server while reporting healthy, with no stage at which the operator is
-told their setting was ignored.
+The launcher puts the server in the container's environment and runs
+``python -m bioengine.worker`` as the command (``cli/worker.py``; the image's
+own ``CMD`` is ``/bin/bash``), so the variable arrives in the process
+environment. Nothing read it: ``--server-url`` was declared with no
+environment source at all, the unset flag was dropped before construction, and
+the worker fell through to its own ``hypha.aicell.io`` default — registering
+against the wrong server while reporting healthy, with no stage at which the
+operator is told their setting was ignored.
 
-**Two halves, and they cover different failures.** The resolver's *behaviour*
-is exercised below in a subprocess that runs the same functions in the same
-order. That does NOT cover the *wiring*, because the probe calls those
-functions itself — mutation-checked: deleting the ``resolve_server_url`` call
-from the entrypoint, which is precisely the shape of the original bug, left
-every behavioural test green.
+**Two layers, covering different failures.** The resolver's *behaviour* is
+exercised in a subprocess that calls the same functions in the same order.
+That alone does NOT cover the *wiring*: deleting the ``resolve_server_url``
+call from the entrypoint — precisely the original bug's shape — leaves every
+such test green, because the probe calls the resolver itself.
 
-The wiring is therefore asserted separately, against the module source. It has
-to be: the resolution chain lives in a bare ``if __name__ == "__main__":``
-block, so it cannot be imported and called — which is also why it never had a
-test, and why a declared-but-unread option could sit there unnoticed.
+So the wiring is asserted at the **boundary**, by running the real entrypoint
+with ``runpy`` and a stubbed ``BioEngineWorker`` that reports what it was
+constructed with. The resolution chain lives in a bare
+``if __name__ == "__main__":`` block and therefore cannot be imported and
+called directly — but it can be *executed*, which is what makes this possible
+and is the reason no source-grepping is needed. A string match would pass on
+any textual hit and false-fail on a rename; the boundary assertion cannot.
 """
 
 import json
@@ -39,7 +42,7 @@ CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 
 ENV_URL = "https://env.example.invalid"
 FLAG_URL = "https://flag.example.invalid"
-DEFAULT_URL = "https://hypha.aicell.io"
+PADDED_URL = "  https://padded.example.invalid  "
 
 # Resolves exactly as the real entrypoint does — same functions, same order —
 # then prints the result instead of starting a worker.
@@ -200,8 +203,21 @@ def _server_url_at_the_boundary(argv, env_url):
         (["--mode", "single-machine", "--server-url", FLAG_URL], ENV_URL, FLAG_URL),
         (["--mode", "single-machine"], None, "<ABSENT>"),
         (["--mode", "single-machine"], "", "<ABSENT>"),
+        (["--mode", "single-machine"], PADDED_URL, PADDED_URL.strip()),
+        (
+            ["--mode", "single-machine", "--server-url", PADDED_URL],
+            None,
+            PADDED_URL.strip(),
+        ),
     ],
-    ids=["env-only", "flag-beats-env", "neither", "empty-env-is-unset"],
+    ids=[
+        "env-only",
+        "flag-beats-env",
+        "neither",
+        "empty-env-is-unset",
+        "padded-env-is-stripped",
+        "padded-flag-is-stripped",
+    ],
 )
 def test_the_entrypoint_hands_the_worker_the_right_server(argv, env_url, expected) -> None:
     """The wiring, asserted at the boundary rather than by reading source.

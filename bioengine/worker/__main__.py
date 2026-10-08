@@ -609,12 +609,12 @@ def resolve_server_url(
 ) -> Dict[str, Dict[str, any]]:
     """Fall back to ``BIOENGINE_SERVER_URL`` when ``--server-url`` is absent.
 
-    The container launcher passes the server as an environment variable
-    (``cli/worker.py``), and the image's entrypoint is this module — so without
-    this the variable reaches the process and is ignored, the worker falls
-    through to its own ``hypha.aicell.io`` default, and it registers against the
-    wrong server while reporting healthy. Nothing else in the startup path reads
-    it, so there is no later stage that could notice.
+    The container launcher puts the server in the container's environment and
+    runs this module as the command (``cli/worker.py``), so without this the
+    variable reaches the process and is ignored, the worker falls through to its
+    own ``hypha.aicell.io`` default, and it registers against the wrong server
+    while reporting healthy. Nothing else in the startup path reads it, so there
+    is no later stage that could notice.
 
     The alternative is ``default=os.environ.get("BIOENGINE_SERVER_URL")`` on the
     argument itself, which is behaviourally identical and has one real advantage
@@ -638,11 +638,15 @@ def resolve_server_url(
         # export, which is the failure this function exists to prevent.
         if not server_url.strip():
             raise ValueError("--server-url was given an empty URL")
+        # Stored stripped: deciding a value is meaningful by its stripped form
+        # and then handing connect_to_server the padded one turns a stray space
+        # in a Helm value into a confusing connection failure.
+        hypha_options["server_url"] = server_url.strip()
         return group_configs
 
     server_url = os.environ.get("BIOENGINE_SERVER_URL")
     if server_url and server_url.strip():
-        hypha_options["server_url"] = server_url
+        hypha_options["server_url"] = server_url.strip()
         group_configs["Hypha Options"] = hypha_options
 
     return group_configs
