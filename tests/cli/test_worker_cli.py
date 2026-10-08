@@ -40,6 +40,7 @@ def _build(runtime, **overrides):
         workspace_dir=WORKSPACE,
         container_name="bioengine-worker",
         shm_size="8g",
+        memory=None,
         gpus=False,
         detach=False,
         tty=True,
@@ -691,3 +692,54 @@ def test_every_detected_runtime_is_also_an_accepted_choice():
         f"{sorted(set(_RUNTIME_PREFERENCE) - accepted)}"
     )
     assert {"auto", "native"} <= accepted
+
+
+# ── Container memory limit (svamp #0125) ─────────────────────────────────────
+#
+# Ray sizes its memory monitor from `min(cgroup limit, host total)`. With no
+# cgroup limit it reads the host's total, so an unlimited worker only starts
+# shedding its own tasks at 95% of the WHOLE MACHINE — by which point the
+# kernel's OOM killer has usually acted first, and it picks Ray's actors
+# because Ray sets oom_score_adj=1000 on them. A limit moves that budget onto
+# the container, where it can act early and locally.
+
+
+def test_the_memory_limit_reaches_the_runtime():
+    command = _build("docker", memory="32g")
+    assert command[command.index("--memory") + 1] == "32g"
+
+
+def test_podman_takes_the_memory_limit_too():
+    command = _build("podman", memory="32g")
+    assert command[command.index("--memory") + 1] == "32g"
+
+
+def test_no_memory_limit_means_no_flag():
+    """Unlimited stays the default — a limit that is too low turns a working
+    single-machine deployment into a crash loop, so it is opt-in."""
+    assert "--memory" not in _build("docker", memory=None)
+
+
+def test_the_memory_limit_is_refused_rather_than_dropped_for_sif_runtimes():
+    """Silently ignoring it is the exact failure this option exists to prevent.
+
+    An operator who passes --memory and gets no limit believes the worker is
+    capped when it is not — which is strictly worse than being told no, because
+    they stop looking.
+    """
+    for runtime in ("apptainer", "singularity", "native"):
+        result = _run(
+            ["start", "--runtime", runtime, "--memory", "32g", "--dry-run",
+             "--", "--mode", "single-machine"]
+        )
+        assert result.exit_code != 0, f"{runtime} accepted --memory silently"
+        assert "--memory is not supported" in result.output
+
+
+def test_those_runtimes_still_work_without_the_flag():
+    """The refusal must be scoped to the flag, not to the runtime."""
+    result = _run(
+        ["start", "--runtime", "apptainer", "--dry-run", "--", "--mode", "single-machine"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "--memory" not in result.output

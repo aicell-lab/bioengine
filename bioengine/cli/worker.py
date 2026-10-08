@@ -126,6 +126,7 @@ def build_command(
     workspace_dir: Path,
     container_name: str,
     shm_size: str,
+    memory: Optional[str],
     gpus: bool,
     detach: bool,
     tty: bool,
@@ -145,11 +146,17 @@ def build_command(
         command += ["--bind", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
         return command + [f"docker://{image}", *entrypoint]
 
+    # ``--memory`` is docker/podman only. apptainer applies cgroups through a
+    # separate TOML file, so it is rejected in the command handler rather than
+    # silently dropped here.
+
     command = [runtime, "run", "--rm"]
     command += ["--detach"] if detach else ["-it" if tty else "-i"]
     command += ["--name", container_name]
     command += ["--user", f"{os.getuid()}:{os.getgid()}"]
     command += ["--shm-size", shm_size]
+    if memory:
+        command += ["--memory", memory]
     if gpus:
         command += _GPU_FLAGS[runtime]
         if runtime == "docker":
@@ -271,6 +278,17 @@ def worker_group():
     "--shm-size", default=DEFAULT_SHM_SIZE, show_default=True, help="Shared memory size."
 )
 @click.option(
+    "--memory",
+    default=None,
+    metavar="LIMIT",
+    help="Container memory limit (e.g. 32g), passed to the runtime as --memory. "
+    "Unlimited by default. Worth setting on a shared host: Ray sizes its own "
+    "memory monitor from the cgroup limit when there is one and from the host's "
+    "total when there is not, so an unlimited worker only starts shedding its "
+    "own tasks once the whole machine is nearly gone — by which point the "
+    "kernel's OOM killer has usually acted first. Docker and podman only.",
+)
+@click.option(
     "--gpus/--no-gpus",
     default=None,
     help="Request GPUs. Defaults to on when nvidia-smi is present.",
@@ -296,6 +314,7 @@ def worker_start(
     workspace_dir,
     container_name,
     shm_size,
+    memory,
     gpus,
     detach,
     token,
@@ -317,6 +336,18 @@ def worker_start(
     """
     runtime = _resolve_runtime(runtime, require_available=not dry_run)
 
+    # Refuse rather than drop it: a memory limit that is silently ignored is
+    # the exact failure this option exists to prevent, and the operator would
+    # believe the worker was capped when it was not.
+    if memory and runtime in (*_SIF_RUNTIMES, "native"):
+        error_exit(
+            f"--memory is not supported with runtime '{runtime}'.",
+            "Docker and podman apply it as a cgroup limit; apptainer and "
+            "singularity take cgroups from a separate TOML file, and 'native' "
+            "has no container to limit. Drop --memory, or cap the worker from "
+            "outside (systemd MemoryMax=, or a cgroup you place it in).",
+        )
+
     if gpus is None:
         gpus = _has_gpu()
 
@@ -335,6 +366,7 @@ def worker_start(
         workspace_dir=workspace_dir,
         container_name=container_name,
         shm_size=shm_size,
+        memory=memory,
         gpus=gpus,
         detach=detach,
         tty=sys.stdin.isatty(),
