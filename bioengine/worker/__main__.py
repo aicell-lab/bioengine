@@ -616,16 +616,32 @@ def resolve_server_url(
     wrong server while reporting healthy. Nothing else in the startup path reads
     it, so there is no later stage that could notice.
 
-    Resolved here rather than via ``argparse``'s ``envvar`` so that a direct
-    ``python -m bioengine.worker`` is covered on the same terms as the CLI, and
-    so the precedence sits next to the token's.
+    The alternative is ``default=os.environ.get("BIOENGINE_SERVER_URL")`` on the
+    argument itself, which is behaviourally identical and has one real advantage
+    over this: a parser default cannot be left uncalled, so it is immune by
+    construction to the bug being fixed here. A function has to be invoked, and
+    this one is invoked from a block that cannot be imported, which is why it
+    needs its own wiring test.
+
+    It is a function anyway because of the empty-value rule below: an empty
+    ``--server-url`` has to be rejected the way ``resolve_token`` rejects an
+    empty ``--token-file``, and a parser default offers nowhere to do that.
     """
     hypha_options = group_configs.get("Hypha Options", {})
-    if hypha_options.get("server_url"):
+    server_url = hypha_options.get("server_url")
+
+    if server_url is not None:
+        # Same reasoning as resolve_token's empty --token-file: an unset Helm
+        # value renders as --server-url= rather than omitting the flag, so an
+        # empty one is a misconfiguration. Falling back to the environment here
+        # would silently point the worker at whatever the host happens to
+        # export, which is the failure this function exists to prevent.
+        if not server_url.strip():
+            raise ValueError("--server-url was given an empty URL")
         return group_configs
 
     server_url = os.environ.get("BIOENGINE_SERVER_URL")
-    if server_url:
+    if server_url and server_url.strip():
         hypha_options["server_url"] = server_url
         group_configs["Hypha Options"] = hypha_options
 

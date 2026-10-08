@@ -114,6 +114,24 @@ def test_an_empty_environment_variable_is_not_a_url(monkeypatch) -> None:
     assert _resolve(["--mode", "single-machine"], monkeypatch, "") is None
 
 
+def test_an_empty_flag_is_rejected_like_an_empty_token_file(monkeypatch) -> None:
+    """``--server-url ""`` is a misconfiguration, not a request to fall back.
+
+    ``resolve_token`` rejects an empty ``--token-file`` because an unset Helm
+    value renders as ``--token-file=`` rather than omitting the flag. The same
+    rendering applies here, and falling back to the environment on an empty flag
+    would point the worker at whatever the host exports — silently, which is the
+    failure this whole change exists to prevent.
+    """
+    with pytest.raises(ValueError, match="empty URL"):
+        _resolve(["--mode", "single-machine", "--server-url", ""], monkeypatch, ENV_URL)
+
+    # ...and with no environment set either, so it cannot be mistaken for a
+    # precedence question.
+    with pytest.raises(ValueError, match="empty URL"):
+        _resolve(["--mode", "single-machine", "--server-url", "   "], monkeypatch, None)
+
+
 def test_resolution_is_idempotent(monkeypatch) -> None:
     """Called twice it must not change its own answer — the chain in __main__
     is easy to reorder, and a resolver that rewrites a resolved value would
@@ -132,26 +150,71 @@ def test_resolution_is_idempotent(monkeypatch) -> None:
 # ===== the wiring, which the behavioural tests above cannot see =====
 
 
-def test_the_entrypoint_actually_calls_the_resolver() -> None:
-    """The original bug was a declared option nothing read. A resolver that is
-    never called reproduces it exactly, and every behavioural test stays green
-    — verified by mutation, which is why this assertion exists at all.
+# Runs the REAL entrypoint — ``if __name__ == "__main__":`` and all — with
+# BioEngineWorker replaced, so the assertion is on what the worker is actually
+# constructed with. ``SystemExit`` is a BaseException, so the entrypoint's own
+# ``except Exception`` cannot swallow it and mask a failure as a clean run.
+_ENTRYPOINT_PROBE = """
+import json, runpy, sys
+import bioengine.worker as pkg
 
-    Source-level because the chain sits in ``if __name__ == "__main__":`` and
-    cannot be imported. If that block is ever lifted into a function, replace
-    this with a call to it.
-    """
-    source = (CHECKOUT_ROOT / "bioengine" / "worker" / "__main__.py").read_text()
-    entrypoint = source.split('if __name__ == "__main__":', 1)
-    assert len(entrypoint) == 2, "entrypoint block not found — has it been refactored?"
-    body = entrypoint[1]
+class _Stub:
+    def __init__(self, **kwargs):
+        print("CAPTURED " + json.dumps({"server_url": kwargs.get("server_url", "<ABSENT>")}))
+        raise SystemExit(0)
 
-    assert "resolve_server_url(group_configs)" in body, (
-        "the entrypoint does not call resolve_server_url, so BIOENGINE_SERVER_URL "
-        "is ignored again exactly as it was before this fix"
+pkg.BioEngineWorker = _Stub
+sys.argv = ["bioengine.worker", *sys.argv[1:]]
+runpy.run_module("bioengine.worker", run_name="__main__")
+"""
+
+
+def _server_url_at_the_boundary(argv, env_url):
+    """What BioEngineWorker is really handed, running the real entrypoint."""
+    env = dict(os.environ)
+    env.pop("BIOENGINE_SERVER_URL", None)
+    env.pop("HYPHA_TOKEN", None)
+    if env_url is not None:
+        env["BIOENGINE_SERVER_URL"] = env_url
+    env["PYTHONPATH"] = str(CHECKOUT_ROOT)
+
+    result = subprocess.run(
+        [sys.executable, "-c", _ENTRYPOINT_PROBE, *argv],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(CHECKOUT_ROOT),
+        timeout=180,
     )
-    # Order matters: resolving before the args exist would read an empty config.
-    assert body.index("get_args_by_group") < body.index("resolve_server_url")
+    captured = [
+        line for line in result.stdout.splitlines() if line.startswith("CAPTURED ")
+    ]
+    assert captured, f"entrypoint never reached BioEngineWorker:\n{result.stdout}\n{result.stderr}"
+    return json.loads(captured[-1][len("CAPTURED ") :])["server_url"]
+
+
+@pytest.mark.parametrize(
+    "argv, env_url, expected",
+    [
+        (["--mode", "single-machine"], ENV_URL, ENV_URL),
+        (["--mode", "single-machine", "--server-url", FLAG_URL], ENV_URL, FLAG_URL),
+        (["--mode", "single-machine"], None, "<ABSENT>"),
+        (["--mode", "single-machine"], "", "<ABSENT>"),
+    ],
+    ids=["env-only", "flag-beats-env", "neither", "empty-env-is-unset"],
+)
+def test_the_entrypoint_hands_the_worker_the_right_server(argv, env_url, expected) -> None:
+    """The wiring, asserted at the boundary rather than by reading source.
+
+    The original bug was a declared option nothing read, and a resolver that is
+    never *called* reproduces it exactly. Deleting the call from the entrypoint
+    makes the first case below return ``<ABSENT>`` — so this kills that mutation
+    by observing behaviour, where a source-level string match would pass on any
+    textual hit and false-fail on a harmless rename.
+
+    Credit to the review for this technique; my first version grepped the file.
+    """
+    assert _server_url_at_the_boundary(argv, env_url) == expected
 
 
 # ===== the documentation the operator reads =====
