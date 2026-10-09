@@ -26,6 +26,7 @@ import click
 
 from bioengine import __version__
 from bioengine.cli.utils import error_exit
+from bioengine.utils import read_meminfo
 
 DEFAULT_IMAGE_REPO = "ghcr.io/aicell-lab/bioengine-worker"
 DEFAULT_CONTAINER_NAME = "bioengine-worker"
@@ -33,6 +34,39 @@ DEFAULT_WORKSPACE_DIR = Path.home() / ".bioengine"
 # The path the image mounts the workspace at — see docs/deployment-guide.md.
 CONTAINER_WORKSPACE_DIR = "/.bioengine"
 DEFAULT_SHM_SIZE = "8g"
+
+# Share of host memory the container may use when --memory is left at "auto".
+# Deliberately generous: the point of a default is to give Ray a cgroup number
+# to budget against instead of the host's total, which it gets at any cap. A
+# tight default would instead turn working single-machine deployments into
+# crash loops, because exceeding a cgroup limit kills processes inside the
+# container. Bounding BioEngine's share of a *shared* host is a separate
+# problem that a number chosen here cannot solve — see the co-tenancy census.
+DEFAULT_MEMORY_FRACTION = 0.9
+AUTO_MEMORY = "auto"
+_MEMORY_DISABLED = ("none", "0", "")
+
+
+def _auto_memory_limit() -> Optional[str]:
+    """Container limit for ``--memory auto``, or None if it can't be computed."""
+    try:
+        mem_total = read_meminfo()["MemTotal"]
+    except Exception:
+        # Advisory: a host whose meminfo cannot be read simply gets no limit,
+        # which is the behaviour from before this flag existed.
+        return None
+    gib = int(mem_total * DEFAULT_MEMORY_FRACTION) // (1024**3)
+    return f"{gib}g" if gib > 0 else None
+
+
+def resolve_memory(memory: str) -> Optional[str]:
+    """Turn the ``--memory`` option into a runtime value, or None for no limit."""
+    value = (memory or "").strip().lower()
+    if value in _MEMORY_DISABLED:
+        return None
+    if value == AUTO_MEMORY:
+        return _auto_memory_limit()
+    return memory.strip()
 
 # Only the GPU flag differs between docker and podman (deployment-guide.md).
 _GPU_FLAGS = {
@@ -279,14 +313,18 @@ def worker_group():
 )
 @click.option(
     "--memory",
-    default=None,
+    default=AUTO_MEMORY,
+    show_default=True,
     metavar="LIMIT",
-    help="Container memory limit (e.g. 32g), passed to the runtime as --memory. "
-    "Unlimited by default. Worth setting on a shared host: Ray sizes its own "
-    "memory monitor from the cgroup limit when there is one and from the host's "
-    "total when there is not, so an unlimited worker only starts shedding its "
-    "own tasks once the whole machine is nearly gone — by which point the "
-    "kernel's OOM killer has usually acted first. Docker and podman only.",
+    help="Container memory limit, passed to the runtime as --memory. 'auto' is "
+    f"{DEFAULT_MEMORY_FRACTION:.0%} of this host's total memory; give a size "
+    "(e.g. 32g) to set it yourself, or 'none' for no limit. It exists because "
+    "Ray sizes its own memory monitor from the cgroup limit when there is one "
+    "and from the host's total when there is not — so an unlimited worker only "
+    "starts shedding its own tasks once the whole machine is nearly gone, by "
+    "which point the kernel's OOM killer has usually acted, and it kills Ray's "
+    "workers first. Keep the limit above --head-memory-in-gb, which is a Ray "
+    "scheduling reservation rather than a cap. Docker and podman only.",
 )
 @click.option(
     "--gpus/--no-gpus",
@@ -339,7 +377,13 @@ def worker_start(
     # Refuse rather than drop it: a memory limit that is silently ignored is
     # the exact failure this option exists to prevent, and the operator would
     # believe the worker was capped when it was not.
-    if memory and runtime in (*_SIF_RUNTIMES, "native"):
+    #
+    # Only an EXPLICIT limit is refused. The default must stay silent here, or
+    # every apptainer and native run would fail on an option its operator never
+    # typed.
+    requested = (memory or "").strip().lower()
+    cannot_apply_a_limit = runtime in (*_SIF_RUNTIMES, "native")
+    if cannot_apply_a_limit and requested not in (AUTO_MEMORY, *_MEMORY_DISABLED):
         error_exit(
             f"--memory is not supported with runtime '{runtime}'.",
             "Docker and podman apply it as a cgroup limit; apptainer and "
@@ -347,6 +391,8 @@ def worker_start(
             "has no container to limit. Drop --memory, or cap the worker from "
             "outside (systemd MemoryMax=, or a cgroup you place it in).",
         )
+
+    memory_limit = None if cannot_apply_a_limit else resolve_memory(memory)
 
     if gpus is None:
         gpus = _has_gpu()
@@ -366,7 +412,7 @@ def worker_start(
         workspace_dir=workspace_dir,
         container_name=container_name,
         shm_size=shm_size,
-        memory=memory,
+        memory=memory_limit,
         gpus=gpus,
         detach=detach,
         tty=sys.stdin.isatty(),

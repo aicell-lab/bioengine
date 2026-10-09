@@ -17,12 +17,15 @@ from bioengine import __version__
 from bioengine.cli.worker import (
     CONTAINER_WORKSPACE_DIR,
     DEFAULT_IMAGE_REPO,
+    DEFAULT_MEMORY_FRACTION,
     _has_gpu,
     _subprocess_env,
     build_command,
     redact_secrets,
+    resolve_memory,
     worker_group,
 )
+from bioengine.utils import read_meminfo
 
 WORKSPACE = Path("/home/someone/.bioengine")
 IMAGE = f"{DEFAULT_IMAGE_REPO}:{__version__}"
@@ -715,17 +718,39 @@ def test_podman_takes_the_memory_limit_too():
 
 
 def test_no_memory_limit_means_no_flag():
-    """Unlimited stays the default — a limit that is too low turns a working
-    single-machine deployment into a crash loop, so it is opt-in."""
     assert "--memory" not in _build("docker", memory=None)
 
 
-def test_the_memory_limit_is_refused_rather_than_dropped_for_sif_runtimes():
+def test_docker_gets_a_limit_by_default():
+    """The default is 'auto', so a worker started with no thought about memory
+    still gets a cgroup limit — which is the whole point. Without one Ray sizes
+    its monitor from host total and only sheds tasks at 95% of the machine."""
+    result = _run(["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"])
+    assert result.exit_code == 0, result.output
+    assert "--memory" in result.output
+
+
+def test_auto_resolves_to_a_share_of_host_memory():
+    total = read_meminfo()["MemTotal"]
+    expected = f"{int(total * DEFAULT_MEMORY_FRACTION) // 1024**3}g"
+    assert resolve_memory("auto") == expected
+    assert resolve_memory("AUTO") == expected, "the sentinel is case-insensitive"
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [("32g", "32g"), ("  32g  ", "32g"), ("none", None), ("0", None), ("", None)],
+)
+def test_memory_values_resolve(value, expected):
+    assert resolve_memory(value) == expected
+
+
+def test_an_explicit_limit_is_refused_rather_than_dropped_for_sif_runtimes():
     """Silently ignoring it is the exact failure this option exists to prevent.
 
     An operator who passes --memory and gets no limit believes the worker is
-    capped when it is not — which is strictly worse than being told no, because
-    they stop looking.
+    capped when it is not — strictly worse than being told no, because they
+    stop looking.
     """
     for runtime in ("apptainer", "singularity", "native"):
         result = _run(
@@ -736,10 +761,26 @@ def test_the_memory_limit_is_refused_rather_than_dropped_for_sif_runtimes():
         assert "--memory is not supported" in result.output
 
 
-def test_those_runtimes_still_work_without_the_flag():
-    """The refusal must be scoped to the flag, not to the runtime."""
+def test_the_default_does_not_refuse_those_runtimes():
+    """The regression a default introduces, and the reason this test exists.
+
+    Once --memory defaults to 'auto' the option is always set, so a refusal
+    keyed on "was it given" fails every apptainer and native run on a flag its
+    operator never typed. Only an EXPLICIT limit may be refused.
+    """
+    for runtime in ("apptainer", "singularity", "native"):
+        result = _run(
+            ["start", "--runtime", runtime, "--dry-run", "--", "--mode", "single-machine"]
+        )
+        assert result.exit_code == 0, f"{runtime} failed on the default: {result.output}"
+        assert "--memory" not in result.output
+
+
+def test_explicitly_disabling_it_is_not_refused_either():
+    """'none' is the operator agreeing there is no limit, not asking for one."""
     result = _run(
-        ["start", "--runtime", "apptainer", "--dry-run", "--", "--mode", "single-machine"]
+        ["start", "--runtime", "apptainer", "--memory", "none", "--dry-run",
+         "--", "--mode", "single-machine"]
     )
     assert result.exit_code == 0, result.output
     assert "--memory" not in result.output
