@@ -898,6 +898,10 @@ class BioEngineProxyActor:
         self.service_registrations[application_id] = {
             "replica_id": replica_id,
             "registered": False,
+            # Not yet known for the incoming replica, and deliberately not
+            # carried over from its predecessor: a new replica is constructed
+            # with the deploy-time token and may renew to a different time.
+            "token_issued_at": None,
         }
         logger.info(
             f"Replica '{replica_id}' claimed the Hypha registration record of "
@@ -910,6 +914,7 @@ class BioEngineProxyActor:
         application_id: str,
         registered: bool,
         replica_id: Optional[str] = None,
+        token_issued_at: Optional[float] = None,
     ) -> None:
         """Record whether an application's Hypha services exist right now.
 
@@ -948,6 +953,10 @@ class BioEngineProxyActor:
         self.service_registrations[application_id] = {
             "replica_id": replica_id,
             "registered": registered,
+            # When the serving replica last minted its Hypha token. The worker
+            # only knows the deploy-time value, which renewal makes stale, so
+            # this is the one that says whether the app is really near a 401.
+            "token_issued_at": token_issued_at,
         }
         logger.info(
             f"Application '{application_id}' reported its Hypha services as "
@@ -965,6 +974,18 @@ class BioEngineProxyActor:
         """
         record = self.service_registrations.get(application_id)
         return None if record is None else record["registered"]
+
+    @_touch_on_call
+    def get_reported_token_issued_at(self, application_id: str) -> Optional[float]:
+        """When the serving replica last minted its Hypha token, if it said.
+
+        None covers three different things and the caller must not distinguish
+        them: never reported, reported by a replica too old to send the field,
+        and no record at all. In every one of them the deploy-time value the
+        worker already holds is the best available answer.
+        """
+        record = self.service_registrations.get(application_id)
+        return None if record is None else record.get("token_issued_at")
 
     @_touch_on_call
     def get_replica_identities(
