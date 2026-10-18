@@ -226,6 +226,23 @@ def _belongs_to_worker_workspace(
     return True
 
 
+def _token_expires_in_seconds(
+    issued_at: Optional[float], ttl_seconds: Optional[float]
+) -> Optional[float]:
+    """Seconds until the proxy token lapses; negative once it has.
+
+    None when either input is missing — an app deployed before these were
+    recorded has no issue time, and guessing one would turn "unknown" into a
+    confident wrong answer about whether it is about to 401.
+    """
+    if issued_at is None or ttl_seconds is None:
+        return None
+    try:
+        return float(ttl_seconds) - (time.time() - float(issued_at))
+    except (TypeError, ValueError):
+        return None
+
+
 def _entry_deployment_name(entry_id: Optional[str]) -> Optional[str]:
     """Ray Serve deployment name of an app's entry class.
 
@@ -315,6 +332,10 @@ PUBLIC_APP_STATUS_FIELDS = (
     "deployed_by_worker_client_id",
     "proxy_service_token_issued_at",
     "proxy_service_token_ttl_seconds",
+    # Published deliberately, and it discloses nothing the two fields above it
+    # do not: it is their difference. Named here so a watcher can read "about
+    # to fail registration" instead of recomputing it from a timestamp.
+    "proxy_service_token_expires_in_seconds",
 )
 
 # Same, one level down. ``logs`` is verbatim replica stdout/stderr: its content
@@ -1347,6 +1368,10 @@ class AppsManager:
             application_id
         )
 
+        token_issued_at = await self._reported_token_issued_at(
+            application_id, application_info.get("proxy_service_token_issued_at")
+        )
+
         # Report what the replicas actually loaded, not just the requested
         # version — a stale reused replica reads as "healthy" otherwise.
         # ``running_version`` shows the entry replica's baked version;
@@ -1422,13 +1447,54 @@ class AppsManager:
             "deployed_by_worker_client_id": application_info.get(
                 "deployed_by_worker_client_id"
             ),
-            "proxy_service_token_issued_at": application_info.get(
-                "proxy_service_token_issued_at"
-            ),
+            # The serving replica's own figure when it has reported one, because
+            # the proxy renews its token and the deploy-time value then
+            # describes a token that no longer exists. Reporting the stale one
+            # would make a renewed app read as nearly expired and page a
+            # watcher that is working correctly.
+            "proxy_service_token_issued_at": token_issued_at,
             "proxy_service_token_ttl_seconds": application_info.get(
                 "proxy_service_token_ttl_seconds"
             ),
+            # Derived so a watcher does not reimplement the arithmetic, and so
+            # "this app is about to fail Hypha registration" is readable rather
+            # than inferable. Negative once expired. None when either input is
+            # missing, which is the case for an app deployed before these were
+            # recorded.
+            "proxy_service_token_expires_in_seconds": _token_expires_in_seconds(
+                token_issued_at,
+                application_info.get("proxy_service_token_ttl_seconds"),
+            ),
         }
+
+    async def _reported_token_issued_at(
+        self, application_id: str, deployed_at: Optional[float]
+    ) -> Optional[float]:
+        """The serving replica's token issue time, falling back to deploy time.
+
+        The proxy renews its own token, so the deploy-time value describes a
+        token that may no longer exist. Preferring the replica's report is what
+        keeps ``proxy_service_token_expires_in_seconds`` describing the token
+        actually in use — otherwise a renewed app reads as nearly expired and
+        pages a watcher that is behaving correctly.
+
+        Advisory: any failure, or a replica too old to send the field, falls
+        back to the deploy-time value. That is stale rather than wrong — it
+        under-states the remaining life, which errs toward alerting.
+        """
+        try:
+            reported = (
+                await self.ray_cluster.proxy_actor_handle.get_reported_token_issued_at.remote(
+                    application_id
+                )
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not read the reported token issue time for "
+                f"'{application_id}': {exc}"
+            )
+            return deployed_at
+        return deployed_at if reported is None else reported
 
     async def complete_initialization(
         self, server: RemoteService, admin_users: List[str], worker_service_id: str

@@ -81,6 +81,11 @@ def _bare_proxy(tmp_path: Path, behaviour, *, authorized_users=None, slots=4):
     inst._usage_ledger = UsageLedger(
         tmp_path / "ledger", "replica-a", {"app_version": "1.0.0"}
     )
+    # Token-renewal state, which _maintenance_tick now reads. A fresh issue
+    # time keeps these tests about the ledger: renewal is covered in
+    # test_proxy_token_renewal.py.
+    inst._token_issued_at = time.time()
+    inst._token_ttl_seconds = float(3600 * 24 * 30)
     return inst
 
 
