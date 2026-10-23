@@ -817,6 +817,11 @@ class AppBuilder:
             "workspace": self.server.config.workspace,
             "worker_client_id": self.server.config.client_id,
             "proxy_service_token": proxy_service_token,
+            # The proxy renews its own token before this TTL runs out. Without
+            # these it has no way to know when that is: a deploy is the only
+            # thing that mints one, so an adopted app would 401 at 30 days.
+            "proxy_service_token_issued_at": proxy_service_token_issued_at,
+            "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
             "authorized_users": effective_authorized_users,
             "proxy_actor_name": self.proxy_actor_name,
             "debug": debug,

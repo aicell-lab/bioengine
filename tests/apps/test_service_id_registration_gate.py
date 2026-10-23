@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -247,6 +248,7 @@ class _Handle:
 
     def __init__(self) -> None:
         self.reports = []
+        self.token_reports = []
         self.claims = []
         self.report_service_registration = MagicMock()
         self.report_service_registration.remote = self._record
@@ -255,9 +257,18 @@ class _Handle:
         self.register_serve_replica = MagicMock()
 
     def _record(
-        self, application_id: str, registered: bool, replica_id=None
+        self,
+        application_id: str,
+        registered: bool,
+        replica_id=None,
+        # Named rather than absorbed by **kwargs on purpose. The production
+        # call is fire-and-forget, so a signature mismatch here surfaces as
+        # "no report was made" instead of "the fake is out of date" — which
+        # is exactly how the token_issued_at addition first showed up.
+        token_issued_at=None,
     ) -> None:
         self.reports.append((application_id, registered))
+        self.token_reports.append((application_id, token_issued_at))
 
     def _record_claim(self, application_id: str, replica_id=None) -> None:
         self.claims.append((application_id, replica_id))
@@ -282,6 +293,10 @@ def _bare_proxy(**attrs):
     inst._probe_due_at = 0.0
     inst._next_register_at = 0.0
     inst._proxy_actor_handle = _Handle()
+    # Token-renewal state, which _maintenance_tick now reads. A fresh issue time
+    # keeps these tests about the registration gate; renewal has its own file.
+    inst._token_issued_at = time.time()
+    inst._token_ttl_seconds = float(3600 * 24 * 30)
     for key, value in attrs.items():
         setattr(inst, key, value)
     return inst
@@ -349,6 +364,8 @@ def _construct_proxy(monkeypatch, handle: _Handle, replica_tag: str = "replica-0
         server_url="https://hypha.example",
         workspace="bioimage-io",
         proxy_service_token="tok",
+        proxy_service_token_issued_at=time.time(),
+        proxy_service_token_ttl_seconds=float(3600 * 24 * 30),
         worker_client_id=WORKER_CLIENT_ID,
         authorized_users={"*": ["*"]},
         proxy_actor_name="proxy-actor",
