@@ -665,11 +665,30 @@ class EntryApp:
             params["val_fraction"], params["patch_shape"],
         )
 
+    async def _preparing_heartbeat(self, session_id: str, interval: float = 60.0) -> None:
+        """Refresh status.json's ``updated_at`` while a run is still PREPARING.
+
+        Nothing between the PREPARING write and the runtime's TRAINING write
+        reports progress — input resolution, a cold runtime replica coming up,
+        the GPU lock — so on a cold instance that span can exceed
+        STATUS_STALE_SECONDS and get_status sweeps a healthy run to STOPPED.
+        Exits as soon as the status moves on, so a wedged TRAINING run is still
+        swept; the worker's own heartbeat covers that phase.
+        """
+        import training
+
+        while True:
+            await asyncio.sleep(interval)
+            if training.read_status(session_id).get("status") != "PREPARING":
+                return
+            training.write_status(session_id)
+
     async def _run_training(
         self, session_id, model_type, train_images, train_labels, val_images, val_labels, params
     ) -> None:
         import training
 
+        preparing_hb = asyncio.create_task(self._preparing_heartbeat(session_id))
         try:
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
@@ -734,6 +753,7 @@ class EntryApp:
             training.write_status(session_id, status="FAILED",
                                    message=str(e)[:800], terminated_by="entry")
         finally:
+            preparing_hb.cancel()
             self._training_tasks.pop(session_id, None)
 
     @bioengine.method
