@@ -232,6 +232,7 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         type=str,
         metavar="URL",
         help="URL of the Hypha server for service registration and remote access. "
+        "Defaults to $BIOENGINE_SERVER_URL when unset. "
         "Used both by the worker itself and by deployed apps (HYPHA_SERVER_URL env "
         "var + ProxyDeployment's connection URL), so it must be reachable from every "
         "node hosting an app — including Ray worker pods.",
@@ -603,6 +604,54 @@ def resolve_token(
     return group_configs
 
 
+def resolve_server_url(
+    group_configs: Dict[str, Dict[str, any]],
+) -> Dict[str, Dict[str, any]]:
+    """Fall back to ``BIOENGINE_SERVER_URL`` when ``--server-url`` is absent.
+
+    The container launcher puts the server in the container's environment and
+    runs this module as the command (``cli/worker.py``), so without this the
+    variable reaches the process and is ignored, the worker falls through to its
+    own ``hypha.aicell.io`` default, and it registers against the wrong server
+    while reporting healthy. Nothing else in the startup path reads it, so there
+    is no later stage that could notice.
+
+    The alternative is ``default=os.environ.get("BIOENGINE_SERVER_URL")`` on the
+    argument itself, which is behaviourally identical and has one real advantage
+    over this: a parser default cannot be left uncalled, so it is immune by
+    construction to the bug being fixed here. A function has to be invoked, and
+    this one is invoked from a block that cannot be imported, which is why it
+    needs its own wiring test.
+
+    It is a function anyway because of the empty-value rule below: an empty
+    ``--server-url`` has to be rejected the way ``resolve_token`` rejects an
+    empty ``--token-file``, and a parser default offers nowhere to do that.
+    """
+    hypha_options = group_configs.get("Hypha Options", {})
+    server_url = hypha_options.get("server_url")
+
+    if server_url is not None:
+        # Same reasoning as resolve_token's empty --token-file: an unset Helm
+        # value renders as --server-url= rather than omitting the flag, so an
+        # empty one is a misconfiguration. Falling back to the environment here
+        # would silently point the worker at whatever the host happens to
+        # export, which is the failure this function exists to prevent.
+        if not server_url.strip():
+            raise ValueError("--server-url was given an empty URL")
+        # Stored stripped: deciding a value is meaningful by its stripped form
+        # and then handing connect_to_server the padded one turns a stray space
+        # in a Helm value into a confusing connection failure.
+        hypha_options["server_url"] = server_url.strip()
+        return group_configs
+
+    server_url = os.environ.get("BIOENGINE_SERVER_URL")
+    if server_url and server_url.strip():
+        hypha_options["server_url"] = server_url.strip()
+        group_configs["Hypha Options"] = hypha_options
+
+    return group_configs
+
+
 def _expand_env_in_config(value: Any) -> Any:
     """Recursively expand ``${VAR}`` / ``$VAR`` from the worker's own
     environment in every string within a startup-application config.
@@ -758,6 +807,7 @@ if __name__ == "__main__":
         group_configs = get_args_by_group(parser)
 
         group_configs = resolve_token(group_configs)
+        group_configs = resolve_server_url(group_configs)
 
         # Process startup applications if provided
         group_configs = read_startup_applications(group_configs)
