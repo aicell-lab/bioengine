@@ -74,6 +74,13 @@ _USAGE_FLUSH_TIMEOUT_S = 10
 # it is mid-reconnect abandons the connection it is repairing and starts a
 # rebuild storm, so a drop only brings the next probe forward.
 _RECONNECT_GRACE_S = 30
+# How long the Serve controller gets to answer a status read before the read is
+# treated as wedged. A local controller call normally takes milliseconds, so
+# this is not a latency tolerance — it is the line past which "still running"
+# stops being a slow answer and starts being no answer. Comfortably longer than
+# the ~3 x health_check_period_s it takes Serve to condemn today, so a replica
+# that is merely slow is never caught by it.
+_SIBLING_READ_DEADLINE_S = 60.0
 
 # Hypha reports a workspace we may not use as a plain exception with no
 # error code, from two different call sites in hypha_rpc. The message is the
@@ -321,6 +328,12 @@ class ProxyDeployment:
         # Per-sibling "seen serviceable at least once" latch, so a slow initial
         # start doesn't deregister a not-yet-ready app.
         self._dep_seen_ready: Dict[str, bool] = {}
+        # Single-in-flight guard for the controller read, plus enough state to
+        # tell a wedged read from a starved event loop. Ray never cancels an
+        # abandoned health check, so without this a wedged serve.status() parks
+        # one thread of the 5-slot user-code executor per probe period.
+        self._sibling_read_started_at: Optional[float] = None
+        self._sibling_read_job_running = False
 
         # Custom ICE servers for WebRTC (None means fetch from default URL)
         self.ice_servers = ice_servers
@@ -1536,13 +1549,53 @@ class ProxyDeployment:
         collected state and never issues an in-band request, so a saturated app
         can't affect the reading or count against ``max_ongoing_requests``.
         Returns ``None`` when the status can't be determined (controller
-        mid-restart, app not yet in the view) — the caller treats ``None`` as
-        "unknown" and never deregisters on it.
+        mid-restart, app not yet in the view, or a previous read still
+        outstanding) — the caller treats ``None`` as "unknown" and never
+        deregisters on it.
 
         The status is carried because the replica count alone cannot separate a
         deployment idling at ``min_replicas: 0`` from one that crashed to zero.
+
+        At most one read is in flight at a time. ``serve.status()`` is sync and
+        runs in the user-code executor, which the proxy sizes at 5 threads
+        (``num_cpus: 0``), and Ray re-arms the health check without cancelling
+        the abandoned one — so an unguarded read parks a thread per probe period
+        until the pool is exhausted, after which later calls block in the
+        executor queue with no log signature at all.
+
+        Suppressing the duplicate dispatch alone would trade that for a silent
+        permanent failure: the next check would return "unknown" promptly, the
+        replica would pass its health check forever and never finish gating. So
+        an outstanding read is only tolerated while the executor job itself is
+        still running *and* inside ``_SIBLING_READ_DEADLINE_S``. Past that the
+        controller read is genuinely wedged and this raises, which is the same
+        outcome as today but bounded, named in the log, and reached without
+        exhausting the pool first.
+
+        A job that has *finished* while the coroutine has not resumed is the
+        other case entirely — the event loop is starved, the replica is fine,
+        and condemning it would destroy healthy capacity. That reports unknown
+        for as long as the starvation lasts and clears itself when the abandoned
+        coroutine finally resumes.
         """
         from ray import serve as _serve
+
+        if self._sibling_read_started_at is not None:
+            elapsed = time.monotonic() - self._sibling_read_started_at
+            if self._sibling_read_job_running and elapsed > _SIBLING_READ_DEADLINE_S:
+                raise RuntimeError(
+                    f"Serve controller status read for '{self.application_id}' "
+                    f"has been outstanding for {elapsed:.0f}s "
+                    f"(deadline {_SIBLING_READ_DEADLINE_S:.0f}s); the controller "
+                    f"is not answering."
+                )
+            logger.debug(
+                f"Sibling status read for '{self.application_id}' still "
+                f"outstanding after {elapsed:.1f}s (executor job "
+                f"{'running' if self._sibling_read_job_running else 'finished'}); "
+                f"reporting unknown rather than queueing another."
+            )
+            return None
 
         if self._own_deployment_name is None:
             try:
@@ -1569,13 +1622,21 @@ class ProxyDeployment:
 
         def _read() -> Optional[Dict[str, Tuple[int, str]]]:
             try:
-                return _query()
-            except Exception:
-                # A restarted Serve controller leaves serve.status() wedged on a
-                # dead cached client handle; drop it so the retry reconnects.
-                _serve.context._set_global_client(None)
-                return _query()
+                try:
+                    return _query()
+                except Exception:
+                    # A restarted Serve controller leaves serve.status() wedged
+                    # on a dead cached client handle; drop it so the retry
+                    # reconnects.
+                    _serve.context._set_global_client(None)
+                    return _query()
+            finally:
+                # Set from the executor thread; the guard above reads it to tell
+                # a wedged controller from a starved loop.
+                self._sibling_read_job_running = False
 
+        self._sibling_read_started_at = time.monotonic()
+        self._sibling_read_job_running = True
         try:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, _read)
@@ -1584,6 +1645,9 @@ class ProxyDeployment:
                 f"Could not read sibling status for '{self.application_id}': {e}"
             )
             return None
+        finally:
+            self._sibling_read_started_at = None
+            self._sibling_read_job_running = False
 
     async def check_health(self):
         """
