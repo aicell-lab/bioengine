@@ -2641,7 +2641,7 @@ class AppsManager:
         ),
         version: str = Field(
             ...,
-            description="Pre-release version to delete. Its tag must contain 'dev' (e.g. '1.2.3-dev1') — released versions are immutable and cannot be deleted through this method.",
+            description="Pre-release version to delete. Its tag must contain 'dev' (e.g. '1.2.3-dev1') — released versions are immutable and cannot be deleted through this method. It must also be the artifact's newest committed version, because deleting it would otherwise corrupt every version committed after it.",
         ),
         context: Dict[str, Any] = Field(
             ...,
@@ -2652,10 +2652,11 @@ class AppsManager:
         Delete a single PRE-RELEASE version of an application artifact.
 
         For the dev-iteration workflow: iterate on 'X.Y.Z-devN' pre-releases,
-        publish the verified bundle once as 'X.Y.Z', then drop the throwaway
-        pre-releases with this method. Only versions whose tag contains 'dev'
-        are deletable, so released versions stay permanent, and the version
-        must not be currently deployed on this worker.
+        drop the throwaway pre-releases with this method, and only then publish
+        the verified bundle as 'X.Y.Z'. Only versions whose tag contains 'dev'
+        are deletable, so released versions stay permanent; the version must not
+        be currently deployed on this worker; and nothing may have been committed
+        after it, so delete pre-releases newest-first and before the release.
 
         Args:
             artifact_id: The artifact whose version to delete (current workspace).
@@ -2663,7 +2664,8 @@ class AppsManager:
 
         Raises:
             ValueError: version isn't a 'dev' pre-release, is currently deployed,
-                or the artifact isn't in this workspace.
+                has later committed versions that the delete would corrupt, or
+                the artifact isn't in this workspace.
             PermissionError: If the caller lacks admin permissions.
             RuntimeError: If the worker is not initialized.
         """
@@ -2701,6 +2703,27 @@ class AppsManager:
                 raise ValueError(
                     f"Version '{version}' of '{artifact_id}' is currently deployed "
                     f"as application '{app_id}'. Stop it first with stop_app()."
+                )
+
+        # Hypha maps a version to its stored files by POSITION in this list, so
+        # deleting one shifts every later version's payload down a slot: the next
+        # version starts serving its predecessor's files under its own label, with
+        # a 200 and a version list that still looks right. Position is what decides
+        # that, not version ordering — the two disagree once a version has been
+        # deleted and a lower one re-added. Read failures propagate on purpose: an
+        # unverified delete is the one this guard exists to stop.
+        artifact = await self.artifact_manager.read(artifact_id)
+        committed = [v["version"] for v in (artifact.get("versions") or [])]
+        if str(version) in committed:
+            later = committed[committed.index(str(version)) + 1 :]
+            if later:
+                raise ValueError(
+                    f"Refusing to delete version '{version}' of '{artifact_id}': "
+                    f"{len(later)} version(s) were committed after it "
+                    f"({', '.join(later)}), and deleting it would make each of them "
+                    f"serve the preceding version's files under its own label, with "
+                    f"no error anywhere. Delete versions newest-first, and drop "
+                    f"pre-releases before publishing the release that follows them."
                 )
 
         await self.artifact_manager.delete(artifact_id, version=version)
