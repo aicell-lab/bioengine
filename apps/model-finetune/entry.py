@@ -665,11 +665,30 @@ class EntryApp:
             params["val_fraction"], params["patch_shape"],
         )
 
+    async def _preparing_heartbeat(self, session_id: str, interval: float = 60.0) -> None:
+        """Refresh status.json's ``updated_at`` while a run is still PREPARING.
+
+        Nothing between the PREPARING write and the runtime's TRAINING write
+        reports progress — input resolution, a cold runtime replica coming up,
+        the GPU lock — so on a cold instance that span can exceed
+        STATUS_STALE_SECONDS and get_status sweeps a healthy run to STOPPED.
+        Exits as soon as the status moves on, so a wedged TRAINING run is still
+        swept; the worker's own heartbeat covers that phase.
+        """
+        import training
+
+        while True:
+            await asyncio.sleep(interval)
+            if training.read_status(session_id).get("status") != "PREPARING":
+                return
+            training.write_status(session_id)
+
     async def _run_training(
         self, session_id, model_type, train_images, train_labels, val_images, val_labels, params
     ) -> None:
         import training
 
+        preparing_hb = asyncio.create_task(self._preparing_heartbeat(session_id))
         try:
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
@@ -734,6 +753,7 @@ class EntryApp:
             training.write_status(session_id, status="FAILED",
                                    message=str(e)[:800], terminated_by="entry")
         finally:
+            preparing_hb.cancel()
             self._training_tasks.pop(session_id, None)
 
     @bioengine.method
@@ -853,6 +873,16 @@ class EntryApp:
         pool_token: Optional[str] = Field(
             None, description="Token with read access to init_from_pool's artifact. Scoped to "
             "the pool, not the app's own token."),
+        metrics: Optional[List[str]] = Field(
+            None, description="Which quantitative metrics to compute, chosen from the fixed "
+            "set ['loss', 'pixel', 'instance'] — an unrecognised name is rejected, not "
+            "ignored. 'loss': per-epoch train/validation loss curves, free, the default. "
+            "'pixel': foreground/background accuracy, precision, recall, f1 and iou on the "
+            "validation split. 'instance': instance AP and F1 at IoU 0.5/0.75/0.9 — a full "
+            "instance-segmentation eval, the expensive one, never computed unless asked. "
+            "'pixel' and 'instance' score the finished model on held-out data and share one "
+            "inference pass. Results surface in get_training_status. Cellpose backend only; "
+            "defaults to ['loss']."),
         label: str = Field("", description="Optional human-readable tag for this session."),
     ) -> Dict[str, Any]:
         """Start a μSAM fine-tuning session (AIS decoder) and return immediately
@@ -868,6 +898,10 @@ class EntryApp:
                 "Pass at most one of init_checkpoint, resume_session_id, or init_from_pool — "
                 "they select different starting checkpoints."
             )
+
+        # Before the session dir exists, so a bad name fails the call outright
+        # rather than leaving a PREPARING session behind.
+        selected_metrics = training.validate_metrics(metrics)
 
         pool_provenance = None
         if init_from_pool:
@@ -910,6 +944,7 @@ class EntryApp:
             resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
             pool_provenance=pool_provenance,
             patch_shape=(patch_size, patch_size), num_workers=0,
+            metrics=selected_metrics,
         )
         task = asyncio.create_task(self._run_training(
             session_id, model_type, train_images, train_labels, val_images, val_labels, params
