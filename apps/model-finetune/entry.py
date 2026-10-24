@@ -104,10 +104,17 @@ def _read_pip(name: str) -> List[str]:
     memory_mb=4 * 1024,
     pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=10,
+    # Scales to zero so an idle deployment holds nothing on an HPC login node;
+    # the proxy stays up and serves the service either way. Held at one replica
+    # because the training/export task maps and the GPU semaphore are
+    # replica-local; the records a caller polls are on disk, so a teardown
+    # between calls is invisible to the frontend.
     autoscaling_config={
-        "min_replicas": 1,
-        "initial_replicas": 1,
+        "min_replicas": 0,
+        "initial_replicas": 0,
         "max_replicas": 1,
+        "downscale_delay_s": 600.0,
+        "upscale_delay_s": 0.0,
     },
     health_check_period_s=30.0,
     health_check_timeout_s=30.0,
@@ -145,9 +152,6 @@ class EntryApp:
         self._s3 = None
         self._http: Optional[httpx.AsyncClient] = None
         self._training_tasks: Dict[str, asyncio.Task] = {}
-        # In-memory export registry (v1): export_id -> status record. Lost on
-        # replica restart — the frontend re-exports if a handle goes missing.
-        self._exports: Dict[str, Dict[str, Any]] = {}
         self._export_tasks: Dict[str, asyncio.Task] = {}
         # Bound concurrent GPU fine-tuning. Default 1 serializes training so
         # autoscaled replicas stay free to serve inference during a long run
@@ -745,8 +749,15 @@ class EntryApp:
                     session_id=session_id, model_type=model_type, params=params
                 )
         except asyncio.CancelledError:
-            training.write_status(session_id, status="STOPPED",
-                                   message="training task cancelled", terminated_by="user_stop")
+            # Only a user stop may claim rank-4 user_stop, which no later writer
+            # can correct. This task is also cancelled when the entry replica is
+            # torn down (it scales to zero), while the runtime subprocess keeps
+            # running and owns the real outcome — recording that as a user stop
+            # would discard the child's COMPLETED for good.
+            if training.stop_requested(session_id):
+                training.write_status(session_id, status="STOPPED",
+                                       message="training task cancelled",
+                                       terminated_by="user_stop")
             raise
         except Exception as e:
             logger.error(f"Training session {session_id} failed: {e}")
@@ -1028,41 +1039,61 @@ class EntryApp:
             "license": license,
             "provenance": provenance,
         }
-        self._exports[export_id] = {
-            "export_id": export_id, "status": "PENDING", "progress": 0.0,
-            "message": "queued", "download_url": None, "size_bytes": None, "error": None,
-        }
+        training.write_export(
+            export_id, status="PENDING", progress=0.0, message="queued",
+            download_url=None, size_bytes=None, error=None,
+        )
         self._export_tasks[export_id] = asyncio.create_task(
             self._run_export(export_id, session_id, request)
         )
         return {"export_id": export_id, "status": "PENDING"}
 
+    async def _export_heartbeat(self, export_id: str, interval: float = 60.0) -> None:
+        """Refresh the export record's ``updated_at`` while its build is alive.
+
+        Building the package and uploading it each run for minutes with no
+        progress write, which would exceed STATUS_STALE_SECONDS and have
+        get_export sweep a healthy export to FAILED. This dies with the replica,
+        which is what lets the sweep fire for a build nobody is driving.
+        """
+        import training
+
+        while True:
+            await asyncio.sleep(interval)
+            if training.read_export(export_id).get("status") not in ("PENDING", "BUILDING"):
+                return
+            training.write_export(export_id)
+
     async def _run_export(self, export_id: str, session_id: str, request: Dict[str, Any]) -> None:
         import training
 
-        rec = self._exports[export_id]
+        export_hb = asyncio.create_task(self._export_heartbeat(export_id))
         try:
-            rec.update(status="BUILDING", progress=0.1, message="building package")
+            training.write_export(export_id, status="BUILDING", progress=0.1,
+                                  message="building package")
             served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
             res = await self._runtime_for(served).export_bioimageio(
                 session_id=session_id, request=request
             )
-            rec["_package_dir"] = res["package_dir"]
-            rec.update(progress=0.8, message="staging package")
+            training.write_export(export_id, _package_dir=res["package_dir"],
+                                  progress=0.8, message="staging package")
             zip_path = Path(res["zip"])
             file_path = f"temp/{export_id}/{zip_path.name}"
             upload_url = await self._s3.put_file(file_path=file_path, ttl=6 * 3600)
             resp = await self._put_file(upload_url, zip_path, timeout=600.0)
             resp.raise_for_status()
             download_url = await self._get_download_url(file_path)
-            rec.update(
-                status="READY", progress=1.0, message="ready",
+            training.write_export(
+                export_id, status="READY", progress=1.0, message="ready",
                 download_url=download_url, size_bytes=res["zip_size"], files=res["files"],
                 resume_checkpoint_file=res.get("resume_checkpoint_file"),
             )
         except Exception as e:
             logger.exception(f"Export {export_id} failed")
-            rec.update(status="FAILED", progress=1.0, message="failed", error=str(e))
+            training.write_export(export_id, status="FAILED", progress=1.0,
+                                  message="failed", error=str(e))
+        finally:
+            export_hb.cancel()
 
     @bioengine.method
     async def get_export_status(
@@ -1074,8 +1105,10 @@ class EntryApp:
         can mirror them when creating the draft artifact and calling push_export.
         ``resume_checkpoint_file`` names the package's resumable weights file, to
         feed back into ``start_training(init_checkpoint=...)``."""
-        rec = self._exports.get(export_id)
-        if rec is None:
+        import training
+
+        rec = training.get_export(export_id)
+        if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         return {k: v for k, v in rec.items() if not k.startswith("_")}
 
@@ -1095,8 +1128,10 @@ class EntryApp:
         draft with the user's token, mints a presigned put_file URL per package
         file, then calls this. Draft-only: this app never creates, commits, or
         reads the artifact."""
-        rec = self._exports.get(export_id)
-        if rec is None:
+        import training
+
+        rec = training.get_export(export_id)
+        if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         if rec.get("status") != "READY":
             raise RuntimeError(f"Export '{export_id}' is not READY (status={rec.get('status')}).")
