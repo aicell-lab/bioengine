@@ -1,0 +1,29 @@
+# Checked-in record of the recurring half of the worktree sweep (#0049).
+#
+# It REPORTS and never deletes: the step runs sweep_agent_worktrees.py with
+# --notify, which is mutually exclusive with --apply, and delivers the candidate
+# list to the head session. Removal stays a human decision. A workflow step's
+# stdout reaches nobody, so a tick that only printed would have reported nothing.
+#
+# The step reads the script out of `origin/main` rather than off the working
+# tree: the main checkout can sit many commits behind, and the watcher must run
+# the landed code, not whatever a session happens to have checked out.
+#
+# Install (from anywhere inside the repo; `myco workflow add` also arms it):
+#
+#   myco workflow add worktree-sweep-report --on schedule --cron '37 7 * * *' \
+#     --run 'set -e; d="$HOME/.cache/bioengine-worktree-sweep"; mkdir -p "$d"; git -C /data/nmechtel/bioengine fetch -q origin; git -C /data/nmechtel/bioengine show origin/main:scripts/sweep_agent_worktrees.py > "$d/sweep.py"; timeout 900 python3 "$d/sweep.py" --notify nice-bird-njonwf'
+#
+# Verify it is armed, not merely present on disk:
+#
+#   myco workflow show worktree-sweep-report
+#   python3 -c "import json;print('worktree-sweep-report' in json.load(open('$HOME/.myco/.mycolab/.workflow-armed-names')))"
+name: worktree-sweep-report
+session: nice-bird-njonwf
+on:
+  schedule:
+  - cron: 37 7 * * *
+jobs:
+  run:
+    steps:
+    - run: 'set -e; d="$HOME/.cache/bioengine-worktree-sweep"; mkdir -p "$d"; git -C /data/nmechtel/bioengine fetch -q origin; git -C /data/nmechtel/bioengine show origin/main:scripts/sweep_agent_worktrees.py > "$d/sweep.py"; timeout 900 python3 "$d/sweep.py" --notify nice-bird-njonwf'
