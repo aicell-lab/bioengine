@@ -20,6 +20,20 @@ The four gates, all of which must pass before anything is removed:
 A run that removes nothing because every gate failed is a pass, not a failure.
 Idle is not done: a hibernating session may be blocked on a human answer, so a
 session only counts as retirable once its working directory is already gone.
+
+To run it on a schedule, arm a workflow that reads the script out of
+``origin/main`` rather than off a working tree -- a checkout can sit a hundred
+commits behind, and a watcher must run the landed code. Say where the repo and
+the reporting session are; both are machine-local and neither belongs in here::
+
+    myco workflow add worktree-sweep-report --on schedule --cron '37 7 * * *' \\
+      --run 'set -e; r=<your checkout>; d="$HOME/.cache/bioengine-sweep";
+             mkdir -p "$d"; git -C "$r" fetch -q origin;
+             git -C "$r" show origin/main:scripts/sweep_agent_worktrees.py > "$d/sweep.py";
+             timeout 900 python3 "$d/sweep.py" --repo "$r" --notify <your session id>'
+
+--notify is required for a scheduled run: a workflow step's stdout reaches
+nobody, so a tick that only printed would report nothing and still look green.
 """
 
 import argparse
@@ -34,11 +48,12 @@ import time
 # which are named after open PRs and open issues.
 BAND_SWEEPABLE = ("agent", "named", "crew")
 
-WATCHER_ROOTS = [
-    os.path.expanduser("~/worker-watch"),
-    "/data/nmechtel/kth-k8s/scripts",
-]
-WORKFLOW_SEARCH_ROOTS = ["/data/nmechtel", os.path.expanduser("~")]
+# Watcher scripts live outside the repo and their location differs per machine.
+# Discovery below finds most of them via the workflow files that invoke them;
+# name any that nothing schedules in SWEEP_WATCHER_ROOTS (os.pathsep-separated)
+# or with --watcher-root. Gate 4 is only as wide as what this reaches, so the
+# report prints how many files were searched.
+SWEEP_WATCHER_ROOTS_ENV = "SWEEP_WATCHER_ROOTS"
 SCRIPT_REF = re.compile(r"(/[\w./@+-]+\.(?:sh|py|js|ts))")
 MAX_WATCHER_FILE_BYTES = 2 * 1024 * 1024
 OWNED_IF_TOUCHED_WITHIN = 24 * 3600
@@ -276,14 +291,22 @@ def gate_unowned(row, sess, procs, self_cwd, owned_within):
     return True, "no session, process, lock or recent write"
 
 
-def watcher_corpus(override_roots=None):
+def watcher_roots_from_env():
+    raw = os.environ.get(SWEEP_WATCHER_ROOTS_ENV, "")
+    return [p for p in raw.split(os.pathsep) if p.strip()]
+
+
+def watcher_corpus(repo, override_roots=None):
     """Every file that could hardcode a worktree path, branch or session id."""
-    deep = list(override_roots) if override_roots else list(WATCHER_ROOTS)
+    deep = list(override_roots) if override_roots else watcher_roots_from_env()
     shallow, files = [], []
 
     wf_dirs = []
     if not override_roots:
-        for base in WORKFLOW_SEARCH_ROOTS:
+        # Siblings of the repo and the home directory: a workflow lives in
+        # <somewhere>/.mycolab/workflows, and the checkouts it drives are
+        # usually parked beside this one.
+        for base in (os.path.dirname(os.path.abspath(repo)), os.path.expanduser("~")):
             p = run(
                 ["find", base, "-maxdepth", "3", "-type", "d",
                  "(", "-path", "*/.mycolab/workflows", "-o", "-path", "*/.svamp/workflows", ")"]
@@ -388,7 +411,7 @@ def session_verdict(s, self_id):
 def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots=None):
     sess = sessions()
     procs = process_cwds()
-    corpus = watcher_corpus(watcher_roots)
+    corpus = watcher_corpus(repo, watcher_roots)
     self_cwd = os.path.realpath(os.getcwd())
     self_id = os.environ.get("MYCOLAB_SESSION_ID")
 
@@ -515,9 +538,25 @@ def apply_removals(repo, rows, baseline):
     return removed
 
 
+def default_repo():
+    """The checkout to sweep, when --repo is not given.
+
+    Deliberately not derived from ``__file__``: the recurring reporter runs a
+    copy of this script out of a cache directory, where the repo is nowhere up
+    the path. $BIOENGINE_REPO is how that caller names it.
+    """
+    env = os.environ.get("BIOENGINE_REPO")
+    if env:
+        return env
+    p = run(["git", "rev-parse", "--show-toplevel"])
+    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", default="/data/nmechtel/bioengine", help="main checkout that owns the worktrees")
+    ap.add_argument("--repo", default=default_repo(),
+                    help="main checkout that owns the worktrees (default: $BIOENGINE_REPO, "
+                         "else the checkout containing the current directory)")
     ap.add_argument("--apply", action="store_true", help="remove the entries that pass all four gates")
     ap.add_argument("--json", action="store_true", help="emit the full report as JSON")
     ap.add_argument("--notify", metavar="SESSION_ID",
@@ -533,6 +572,8 @@ def main():
 
     if args.apply and args.notify:
         ap.error("--apply and --notify are mutually exclusive: the recurring reporter never removes anything")
+    if not args.repo:
+        ap.error("no checkout to sweep: pass --repo, set $BIOENGINE_REPO, or run from inside one")
 
     baseline = fetch_baseline(args.repo)
     rows, srows, counted = evaluate(args.repo, baseline, args.owned_within, args.watcher_root)
