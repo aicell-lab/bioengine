@@ -1636,6 +1636,25 @@ class EntryApp:
                 cur_member_ids = list(cur_manifest.get("selected_contribution_ids", []))
             cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
 
+            pending = pool.undecided_contributions(index)
+            batch = pending[:max_batch]
+            deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
+            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
+
+            # Refuse a merge that cannot fit BEFORE any scoring pass, rather than
+            # discovering it as an OOM kill 11 passes in. This is as early as the
+            # check can go: it needs `batch`, which is the first point at which the
+            # members that will actually be loaded are known.
+            budget = await runtime.soup_memory_budget()
+            refusal = pool.soup_admission(
+                [c.get("n_bytes") for c in batch] + [by_id[cid].get("n_bytes")
+                                                     for cid in cur_member_ids],
+                budget_bytes=budget["declared_bytes"],
+                base_bytes=budget["rss_bytes"] or 0,
+            )
+            if refusal:
+                raise ValueError(f"aggregate() refused this merge: {refusal}")
+
             # Stock baseline on A and B (anchor of the witness curve — the level to beat).
             baseline = index.get("baseline")
             if baseline is None:
@@ -1652,11 +1671,6 @@ class EntryApp:
 
             cur_a = (await _score(cur_member_paths, gate_id)
                      if cur_member_paths else baseline["selection_metric"]["aggregate"])
-
-            pending = pool.undecided_contributions(index)
-            batch = pending[:max_batch]
-            deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
-            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
 
             # Best-first ordering: individual marginal of adding each candidate to the
             # current soup, on A. Re-scored against the CURRENT head (a stale solo

@@ -160,6 +160,45 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
     return total ** 0.5
 
 
+# Resident set of a merge, as a multiple of ONE member's on-disk size. uniform_soup
+# holds a float32 accumulator for the whole model plus the single member being added,
+# and at the end builds the output while the accumulator is still live. 3x covers
+# that even when members are stored at half precision (so the fp32 accumulator is 2x
+# a member). It is a BUDGET, not a measurement: one cpsam member's real size and the
+# replica's real base footprint are GPU-node numbers and are not known here.
+SOUP_RESIDENT_FACTOR = 3
+
+
+def soup_admission(
+    member_bytes: Sequence[Optional[int]], budget_bytes: int, base_bytes: int,
+) -> Optional[str]:
+    """Reject a merge that cannot fit before it burns any GPU, or None to proceed.
+
+    Returns the reason as a string so the caller owns the exception type.
+
+    Peak no longer depends on member count — the combine streams and the member
+    cache is bounded — so this sizes the ONE member that has to be resident, not the
+    soup. Fails OPEN: a pool that has not recorded n_bytes for its contributions
+    tells us nothing about the peak, and refusing to merge on missing metadata would
+    be a worse failure than the one this guards against.
+    """
+    known = [int(n) for n in member_bytes if n is not None]
+    if not known:
+        return None
+    predicted = base_bytes + SOUP_RESIDENT_FACTOR * max(known)
+    if predicted <= budget_bytes:
+        return None
+    return (
+        f"this merge needs about {predicted / 1024 ** 3:.1f} GiB resident "
+        f"({base_bytes / 1024 ** 3:.1f} GiB base + {SOUP_RESIDENT_FACTOR}x the "
+        f"largest member at {max(known) / 1024 ** 3:.1f} GiB) but the cpsam runtime "
+        f"declares {budget_bytes / 1024 ** 3:.1f} GiB to Ray. Raise memory_mb on "
+        f"CellposeRuntime to at least {predicted / 1024 ** 2:.0f} MiB and redeploy. "
+        f"Refusing up front: exceeding the declaration gets the replica OOM-killed "
+        f"mid-merge, which costs the whole run's GPU time instead of none of it."
+    )
+
+
 def split_identity(split: Dict[str, Any]) -> str:
     """Stable id for a validation split, from the provenance every merge already
     records. Two splits with the same sha256 score identically, so a score may be

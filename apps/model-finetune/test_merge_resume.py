@@ -203,3 +203,58 @@ def test_no_scoring_call_bypasses_the_journal():
     assert "runtime.score_soup(" in inside_score
     assert "pool.record_score(" in inside_score
     assert "_write_merge_journal(" in inside_score
+
+
+# ── up-front admission (clause 1's second disjunct) ──────────────────────────
+
+GIB = 1024 ** 3
+
+
+def test_a_merge_that_fits_is_admitted():
+    assert pool.soup_admission([2 * GIB, 1 * GIB], budget_bytes=12 * GIB,
+                               base_bytes=3 * GIB) is None
+
+
+def test_a_merge_that_cannot_fit_is_refused_with_the_numbers():
+    reason = pool.soup_admission([3 * GIB], budget_bytes=8 * GIB, base_bytes=3 * GIB)
+    assert reason is not None
+    # The caller has to be able to act on it without reading this source.
+    assert "12.0 GiB" in reason and "memory_mb" in reason
+
+
+def test_refusal_sizes_the_largest_member_not_the_count():
+    """Peak no longer depends on member count — the combine streams and the member
+    cache is bounded — so sixteen small members must still be admitted where one
+    large one is refused. A check that summed them would invert both."""
+    many_small = [256 * 1024 ** 2] * 16
+    assert pool.soup_admission(many_small, budget_bytes=12 * GIB, base_bytes=3 * GIB) is None
+    assert pool.soup_admission([4 * GIB], budget_bytes=12 * GIB, base_bytes=3 * GIB) is not None
+
+
+def test_the_base_footprint_is_counted():
+    """Discrimination control: same members, same budget, only the replica's current
+    RSS differs. A check that ignored it would admit both."""
+    members = [3 * GIB]
+    assert pool.soup_admission(members, budget_bytes=12 * GIB, base_bytes=0) is None
+    assert pool.soup_admission(members, budget_bytes=12 * GIB, base_bytes=6 * GIB) is not None
+
+
+@pytest.mark.parametrize("sizes", [[], [None], [None, None]])
+def test_unknown_member_sizes_fail_open(sizes):
+    """A pool that never recorded n_bytes tells us nothing about the peak. Refusing
+    to merge on missing metadata would be a worse failure than the one this guards."""
+    assert pool.soup_admission(sizes, budget_bytes=1, base_bytes=0) is None
+
+
+def test_a_known_size_is_used_even_when_others_are_missing():
+    """Positive control for failing open: partial metadata must not disable it."""
+    assert pool.soup_admission([None, 8 * GIB], budget_bytes=12 * GIB,
+                               base_bytes=0) is not None
+
+
+def test_the_refusal_happens_before_any_scoring_pass():
+    """"Rejected up front" is the clause. A check that ran after the baseline passes
+    would already have spent GPU time, so the ORDER is the property — pinned at
+    source because no unit test of pool can see it."""
+    source = (pathlib.Path(__file__).parent / "entry.py").read_text()
+    assert source.index("pool.soup_admission(") < source.index("await _score(")

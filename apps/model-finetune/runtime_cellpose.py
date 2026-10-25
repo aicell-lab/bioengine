@@ -41,6 +41,12 @@ _SERVE_DIAMETER = 30.0
 # BIOENGINE_SOUP_CACHE_MAX_BYTES.
 _SOUP_CACHE_MAX_BYTES = 24 * 1024 ** 3
 
+# What this deployment promises Ray. Named rather than inlined in the decorator so
+# soup_memory_budget() reports the figure actually in force: aggregate() rejects a
+# merge that would exceed it, and a second copy of the number would let the check
+# pass while the scheduler used a different one.
+_RUNTIME_MEMORY_MB = 12 * 1024
+
 
 def _read_pip(name: str) -> List[str]:
     text = (Path(__file__).parent / name).read_text()
@@ -54,7 +60,7 @@ def _read_pip(name: str) -> List[str]:
 @bioengine.app(
     num_cpus=2,
     gpu_memory_mb=-1,
-    memory_mb=12 * 1024,
+    memory_mb=_RUNTIME_MEMORY_MB,
     pip=_read_pip("requirements-runtime-cellpose.txt"),
     max_ongoing_requests=10,
     autoscaling_config={
@@ -93,6 +99,24 @@ class CellposeRuntime:
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
         }
+
+    async def soup_memory_budget(self) -> Dict[str, Any]:
+        """What this replica promised Ray, and what it is using — the two numbers
+        aggregate()'s up-front admission check compares a merge against.
+
+        ``rss_bytes`` is the replica's real footprint right now, so the check sizes
+        a merge against the space actually left rather than against an empty
+        replica; it is None where /proc is unavailable. Ray kills on the NODE's
+        total, so fitting the declaration is necessary and not sufficient — a
+        co-tenant can still take the node over the threshold.
+        """
+        rss = None
+        try:
+            with open("/proc/self/statm") as fh:
+                rss = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except Exception:
+            pass
+        return {"declared_bytes": _RUNTIME_MEMORY_MB * 1024 ** 2, "rss_bytes": rss}
 
     async def gpu_memory_info(self) -> Dict[str, Any]:
         """Total/free VRAM of this runtime's GPU, for the entry's training gate
