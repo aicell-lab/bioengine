@@ -18,12 +18,13 @@ decorator module stays introspectable with only ``bioengine[worker]`` + stdlib.
 
 import asyncio
 import gc
+import hashlib
 import os
 import subprocess
 import sys
 import time
 import uuid
-from io import BytesIO
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -78,9 +79,6 @@ class CellposeRuntime:
         self._loaded_key: Optional[str] = None
         self._device_cached: Optional[str] = None
         self._gpu_mem_cached: Optional[Dict[str, Any]] = None
-        # Model-soup member state_dicts, keyed by their immutable pool weights_path
-        # (content-addressed → no staleness); populated on demand during aggregate.
-        self._soup_cache: Dict[str, Dict[str, Any]] = {}
         self._soup_dl_bytes = 0
 
     async def ping(self) -> Dict[str, Any]:
@@ -240,18 +238,27 @@ class CellposeRuntime:
         return obj
 
     def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
-        """Download + cache a member state_dict by its immutable pool weights_path."""
+        """Load a member state_dict, downloading on first use.
+
+        The download is cached as a file, not as tensors: one download per member
+        per replica, but no member stays resident between uses. Keyed by the
+        immutable pool weights_path (content-addressed → no staleness). Written
+        via a temporary name so an interrupted download cannot leave a truncated
+        file that every later aggregate would then fail to unpickle."""
         import torch
         from urllib.request import urlopen
 
-        if key not in self._soup_cache:
+        cached = self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+        if not cached.exists():
             with urlopen(url, timeout=600) as resp:
                 content = resp.read()
             self._soup_dl_bytes += len(content)
-            self._soup_cache[key] = self._unwrap_sd(
-                torch.load(BytesIO(content), map_location="cpu", weights_only=False)
-            )
-        return self._soup_cache[key]
+            partial_file = cached.with_suffix(".part")
+            partial_file.write_bytes(content)
+            partial_file.rename(cached)
+        return self._unwrap_sd(
+            torch.load(cached, map_location="cpu", weights_only=False)
+        )
 
     def _build_soup(self, members: List[Dict[str, str]]):
         """Uniform mean of member state_dicts; None when empty (= stock base)."""
@@ -259,8 +266,9 @@ class CellposeRuntime:
 
         if not members:
             return None
-        sds = [self._fetch_member(m["key"], m["url"]) for m in members]
-        return pool.uniform_soup(sds)
+        return pool.uniform_soup(
+            [partial(self._fetch_member, m["key"], m["url"]) for m in members]
+        )
 
     async def score_soup(
         self, members: List[Dict[str, str]], images: List[np.ndarray],

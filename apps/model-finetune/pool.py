@@ -20,7 +20,7 @@ unit-testable and free of transport concerns.
 
 import hashlib
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
 # record and every read method so the page can flag a backend/page mismatch
@@ -156,8 +156,14 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
     return total ** 0.5
 
 
-def uniform_soup(state_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
+def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, Any]:
     """Key-wise uniform mean of full weight tensors — the AXIS-1 combine rule.
+
+    Takes one zero-arg loader per member rather than materialised state dicts, and
+    accumulates member-by-member, so peak memory is the running sum plus a single
+    member regardless of member count. Taking a list and looping key-outer instead
+    pins every member in RAM at once: at 16 cpsam members that measured ~27 GB
+    against the runtime's 12 GiB reservation and the replica was OOM-killed.
 
     Every member must share one parameter layout (``assert_compatible`` guards this
     at contribute + aggregate time), so the mean is well-defined per key. cpsam is
@@ -167,18 +173,23 @@ def uniform_soup(state_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
     dtype so the community checkpoint round-trips into cellpose unchanged."""
     import torch
 
-    if not state_dicts:
+    n = len(loaders)
+    if not n:
         raise ValueError("uniform_soup requires at least one state_dict")
-    keys = list(state_dicts[0].keys())
-    out: Dict[str, Any] = {}
-    n = len(state_dicts)
-    for key in keys:
-        ref = state_dicts[0][key]
-        acc = torch.zeros_like(ref, dtype=torch.float32)
-        for sd in state_dicts:
-            acc += sd[key].detach().float()
-        out[key] = (acc / n).to(ref.dtype)
-    return out
+    acc: Dict[str, Any] = {}
+    dtypes: Dict[str, Any] = {}
+    for load in loaders:
+        sd = load()
+        if not acc:
+            dtypes = {key: value.dtype for key, value in sd.items()}
+            acc = {key: torch.zeros_like(value, dtype=torch.float32)
+                   for key, value in sd.items()}
+        for key in acc:
+            acc[key] += sd[key].detach().float()
+        del sd
+    for key in acc:
+        acc[key] = (acc[key] / n).to(dtypes[key])
+    return acc
 
 
 # ── instance-segmentation metric (the gate + witness score) ──────────────────
