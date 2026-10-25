@@ -1642,6 +1642,16 @@ class EntryApp:
             # downloads + caches the tensors by path, so nothing large crosses the
             # entry and no cross-actor local checkpoint is ever shared.
             url_cache: Dict[str, str] = {}
+            # Bytes this merge downloaded, per serving replica. The member cache is
+            # per-replica instance state and each gate pass is routed independently,
+            # so a merge served by more than one replica downloads on each of them —
+            # draining a single replica's counter at the end would drop the rest.
+            replica_dl: Dict[str, int] = {}
+
+            def _fold(result: Dict[str, Any]) -> Dict[str, Any]:
+                replica_dl[result["replica"]] = (
+                    replica_dl.get(result["replica"], 0) + int(result["soup_dl_bytes"]))
+                return result
 
             async def _specs(paths: List[str]) -> List[Dict[str, str]]:
                 out = []
@@ -1652,7 +1662,8 @@ class EntryApp:
                 return out
 
             async def _score(member_paths: List[str], imgs, gts) -> float:
-                return await runtime.score_soup(await _specs(member_paths), imgs, gts, diam_mean)
+                return _fold(await runtime.score_soup(
+                    await _specs(member_paths), imgs, gts, diam_mean))["f1"]
 
             cc = pool.current_community(index)
             cur_member_ids: List[str] = []
@@ -1728,7 +1739,7 @@ class EntryApp:
                 # never traverse the CPU entry.
                 await am.edit(pool_artifact_id, stage=True)
                 w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
-                mat = await runtime.materialize_soup(await _specs(s_paths), w_url)
+                mat = _fold(await runtime.materialize_soup(await _specs(s_paths), w_url))
                 head_sha = mat["sha256"]
                 head_bytes_out = int(mat["n_bytes"])
                 manifest = pool.build_community_manifest(
@@ -1758,7 +1769,14 @@ class EntryApp:
                     role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.EMPTY_SELECTION_BASIS)
                 wit_metric = None
 
-            self._bump_transport(bytes_down=await runtime.pop_soup_dl_bytes())
+            soup_bytes_down = sum(replica_dl.values())
+            if len(replica_dl) > 1:
+                logger.warning(
+                    f"⚠️ This merge was served by {len(replica_dl)} CellposeRuntime "
+                    f"replicas, so at least one re-downloaded the member set: "
+                    f"{replica_dl}"
+                )
+            self._bump_transport(bytes_down=soup_bytes_down)
 
             index["baseline"] = baseline
             index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + [c["contribution_id"] for c in batch]
@@ -1774,6 +1792,8 @@ class EntryApp:
                 "bytes_out": head_bytes_out,
                 "n_transfers": len(batch) + (1 if changed else 0),
                 "sources_complete": True if all(nb is not None for nb in member_bytes) else None,
+                "soup_bytes_down": soup_bytes_down,
+                "soup_replicas": len(replica_dl),
             }
             pool.append_merge(index, {
                 "published_version": new_version, "baseline_version": baseline_version,

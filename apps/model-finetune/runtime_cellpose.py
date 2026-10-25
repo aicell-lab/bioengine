@@ -237,6 +237,19 @@ class CellposeRuntime:
         return d
 
     @staticmethod
+    def _replica_id() -> str:
+        """Which replica is serving this call.
+
+        A merge issues ~2n+3 gate passes as separate Serve calls, each routed
+        independently, while the member cache is ordinary instance state — so the
+        caller cannot account for a merge's transport, or notice a cold replica
+        re-downloading the member set, without knowing who answered each pass.
+        """
+        from ray import serve
+
+        return serve.get_replica_context().replica_id.unique_id
+
+    @staticmethod
     def _unwrap_sd(obj):
         if isinstance(obj, dict) and "model_state_dict" in obj:
             return obj["model_state_dict"]
@@ -303,13 +316,19 @@ class CellposeRuntime:
     async def score_soup(
         self, members: List[Dict[str, str]], images: List[np.ndarray],
         labels: List[np.ndarray], diam_mean: float = 30.0,
-    ) -> float:
-        """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split.
+    ) -> Dict[str, Any]:
+        """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split,
+        with the serving replica and the bytes this one call downloaded.
         ``members`` is a list of ``{"key": weights_path, "url": presigned_get}``;
         empty scores the stock cpsam base. Downloads happen off-lock; segmentation
-        holds the shared GPU lock."""
+        holds the shared GPU lock.
+
+        ``soup_dl_bytes`` is this call's delta, not the replica's running total, so
+        the caller can sum across passes without double-counting a warm replica or
+        carrying a previous merge's bytes into this one."""
         import pool
 
+        dl_before = self._soup_dl_bytes
         soup = await asyncio.to_thread(self._build_soup, members)
         ckpt = None
         async with self._gpu_lock:
@@ -327,7 +346,11 @@ class CellposeRuntime:
             finally:
                 if ckpt and ckpt.exists():
                     ckpt.unlink()
-        return pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels])
+        return {
+            "f1": pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels]),
+            "replica": self._replica_id(),
+            "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+        }
 
     async def materialize_soup(self, members: List[Dict[str, str]], put_url: str) -> Dict[str, Any]:
         """Build the uniform soup of ``members``, PUT it to the pool's presigned URL,
@@ -338,6 +361,7 @@ class CellposeRuntime:
 
         import pool
 
+        dl_before = self._soup_dl_bytes
         soup = await asyncio.to_thread(self._build_soup, members)
         path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
         await asyncio.to_thread(lambda: torch.save(soup, str(path)))
@@ -353,7 +377,11 @@ class CellposeRuntime:
             await asyncio.to_thread(_put)
         finally:
             path.unlink()
-        return {"sha256": sha, "n_bytes": n_bytes}
+        return {
+            "sha256": sha, "n_bytes": n_bytes,
+            "replica": self._replica_id(),
+            "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+        }
 
     async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
         """Inspect a finished session's local cpsam checkpoint (architecture
@@ -412,13 +440,6 @@ class CellposeRuntime:
             "n_bytes": int(n_bytes),
             "cellpose_version": cellpose_version,
         }
-
-    def pop_soup_dl_bytes(self) -> int:
-        """Return + zero the bytes downloaded for soup members since the last call,
-        so the entry can fold pool traffic into its durable transport counter."""
-        b = self._soup_dl_bytes
-        self._soup_dl_bytes = 0
-        return b
 
     def _subprocess_env(self) -> Dict[str, str]:
         return {
