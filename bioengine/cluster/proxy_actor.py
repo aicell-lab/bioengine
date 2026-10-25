@@ -31,7 +31,7 @@ date_format = "%Y-%m-%d %H:%M:%S %Z"
 
 
 def _mask_secret_env_vars(value: Any) -> Any:
-    """Replace the value of every ``_``-prefixed env var found anywhere in ``value``.
+    """Replace every ``env_vars`` value found anywhere in ``value``.
 
     A detailed Ray state record carries the pending actor/task/job's entire
     runtime env, ``env_vars`` included, under a different key for each
@@ -40,19 +40,17 @@ def _mask_secret_env_vars(value: Any) -> Any:
     walks the record rather than naming those keys, so neither a Ray rename
     nor a fourth record type can silently reopen the leak.
 
-    The ``_`` prefix is ``AppBuilder``'s marker for an injected secret
-    (``_BIOENGINE_SECRET_<KEY>``). Unlike
-    ``ApplicationManager._filter_secret_env_vars``, the key is left as-is:
-    this is a verbatim view of a Ray record, and the env var really is
-    named that way on the actor.
+    Every value is masked, not only the ``_``-prefixed ones that
+    ``AppBuilder`` marks as injected secrets and that
+    ``ApplicationManager._filter_secret_env_vars`` recognises: a disclosure
+    boundary should not depend on a naming convention applied in another
+    module. Keys survive, so the rest of the runtime env stays readable for
+    diagnosing a stuck deploy.
     """
     if isinstance(value, dict):
         return {
             key: (
-                {
-                    name: "*****" if name.startswith("_") else item
-                    for name, item in entry.items()
-                }
+                {name: "*****" for name in entry}
                 if key == "env_vars" and isinstance(entry, dict)
                 else _mask_secret_env_vars(entry)
             )
@@ -64,7 +62,8 @@ def _mask_secret_env_vars(value: Any) -> Any:
         try:
             parsed = json.loads(value)
         except ValueError:
-            return value
+            # Unparseable means its contents cannot be shown to be safe.
+            return "*****"
         return json.dumps(_mask_secret_env_vars(parsed))
     return value
 
