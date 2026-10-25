@@ -709,7 +709,10 @@ class SlurmWorkers:
 
             self.logger.info(f"Stopping all processes on worker '{node_id}'...")
 
-            @ray.remote(resources={f"slurm_job_id:{job_id}": 0.1})
+            # num_cpus=0 because a node is now also removed while its CPUs are
+            # reserved — booking one for the shutdown task would leave it queued
+            # behind the very reservations it is there to release.
+            @ray.remote(num_cpus=0, resources={f"slurm_job_id:{job_id}": 0.1})
             def stop_worker():
                 """Stops the worker node by executing 'ray stop'."""
                 import subprocess
@@ -722,17 +725,22 @@ class SlurmWorkers:
 
             # This should only effect a single worker node if the worker runs in a container
             obj_ref = stop_worker.remote()
+            stopped_gracefully = True
             try:
                 await asyncio.wait_for(obj_ref, timeout=self.grace_period)
-            except TimeoutError:
+            except Exception as e:
+                # Falling through to scancel is the point: a node that cannot be
+                # asked to leave is exactly the one whose allocation would
+                # otherwise be held until the site reaps it.
+                ray.cancel(obj_ref, force=True)
+                stopped_gracefully = False
                 self.logger.error(
-                    f"Failed to send shutdown command to worker '{node_id}' within {self.grace_period} seconds. Cancelling job..."
+                    f"Failed to send shutdown command to worker '{node_id}' within {self.grace_period} seconds ({e}). Cancelling job..."
                 )
-                raise
 
             # Wait for worker node to be removed from the cluster
             start_time = time.time()
-            while time.time() - start_time < self.grace_period:
+            while stopped_gracefully and time.time() - start_time < self.grace_period:
                 await asyncio.sleep(3)
                 worker_nodes = self.ray_cluster.status["nodes"]
                 if node_id not in worker_nodes:

@@ -329,5 +329,54 @@ async def test_min_workers_blocks_scale_down():
     assert worker.closed == []
 
 
+# --------------------------------------------------------------------------- #
+# _close_worker
+# --------------------------------------------------------------------------- #
+
+
+class _Closer:
+    def __init__(self):
+        self.logger = logger
+        self.grace_period = 0.05
+        self.worker_deletion_tasks = {"n1": object()}
+        self.cancelled_jobs = []
+        self.ray_cluster = SimpleNamespace(status={"nodes": {}})
+
+    async def _cancel_jobs(self, job_ids):
+        self.cancelled_jobs.append(job_ids)
+        return job_ids
+
+
+async def _close(monkeypatch, result):
+    fake_ray = _FakeRay(result)
+    monkeypatch.setattr(slurm_workers_module, "ray", fake_ray)
+    worker = _Closer()
+    await SlurmWorkers._close_worker(worker, "n1", "12345")
+    return worker, fake_ray
+
+
+async def test_the_shutdown_task_books_no_cpu(monkeypatch):
+    """A node is now also closed while every CPU on it is reserved, so a
+    shutdown task asking for a CPU would queue behind those reservations and
+    never run."""
+    _, fake_ray = await _close(monkeypatch, None)
+    assert fake_ray.options["num_cpus"] == 0
+    assert fake_ray.options["resources"] == {"slurm_job_id:12345": 0.1}
+
+
+async def test_the_job_is_cancelled_after_a_graceful_stop(monkeypatch):
+    worker, _ = await _close(monkeypatch, None)
+    assert worker.cancelled_jobs == [["12345"]]
+    assert "n1" not in worker.worker_deletion_tasks
+
+
+async def test_the_job_is_cancelled_even_when_the_node_will_not_stop(monkeypatch):
+    """A node too wedged to answer is exactly the one whose allocation would
+    otherwise be held until the site reaps it."""
+    worker, fake_ray = await _close(monkeypatch, _HANGS)
+    assert worker.cancelled_jobs == [["12345"]]
+    assert len(fake_ray.cancelled) == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
