@@ -164,8 +164,14 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
 # holds a float32 accumulator for the whole model plus the single member being added,
 # and at the end builds the output while the accumulator is still live. 3x covers
 # that even when members are stored at half precision (so the fp32 accumulator is 2x
-# a member). It is a BUDGET, not a measurement: one cpsam member's real size and the
-# replica's real base footprint are GPU-node numbers and are not known here.
+# a member).
+#
+# Deliberately conservative. Measured on europa CPU against a real cpsam member
+# (348 keys, float32, 1.135 GiB): the pre-fix combine fit peak = 3.078 + 1.135*n GiB
+# with residuals under 0.001 over n = 2/4/8, so it broke the 12 GiB declaration at
+# just EIGHT members (12.161) and reached 21.2 at sixteen. The streaming combine is
+# flat, and its own overhead measured under one member — so 3x over-predicts by
+# roughly 4x and refuses nothing it should admit at today's member size.
 SOUP_RESIDENT_FACTOR = 3
 
 

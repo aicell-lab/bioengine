@@ -269,10 +269,12 @@ class CellposeRuntime:
         16-member merge, with peaks within 0.8% of each other).
 
         Overflowing the cap costs a re-download, never a failure, so the default is
-        a disk budget rather than a derived figure: one cpsam member's real size has
-        not been measured here, so "big enough for a 32-candidate batch" is not a
-        claim this code can make. Raise it if re-downloads show up mid-merge and the
-        volume behind ``$HOME`` has room.
+        a disk budget and NOT sized to a full batch. At the measured cpsam member
+        size of 1.135 GiB, 24 GiB holds about 21 members; a full 32-candidate batch
+        would want 36.3 GiB and will re-download its oldest members. That is the
+        deliberate trade — the volume behind ``$HOME`` on the worker has not been
+        measured, and an unbounded cache is what this is fixing. Raise it if
+        re-downloads show up mid-merge and the volume has room.
         """
         import pool
 
