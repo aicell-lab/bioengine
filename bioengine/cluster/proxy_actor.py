@@ -7,7 +7,7 @@ import time
 import json
 import http.client
 import urllib.request
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import ray
@@ -28,6 +28,58 @@ from ray.util.state.exception import RayStateApiException
 
 logger = logging.getLogger("ray")
 date_format = "%Y-%m-%d %H:%M:%S %Z"
+
+
+def _mask_secret_env_vars(value: Any) -> Any:
+    """Replace the value of every ``_``-prefixed env var found anywhere in ``value``.
+
+    A detailed Ray state record carries the pending actor/task/job's entire
+    runtime env, ``env_vars`` included, under a different key for each
+    record type: ``serialized_runtime_env`` (actors, holding JSON as a
+    string), ``runtime_env_info`` (tasks) and ``runtime_env`` (jobs). This
+    walks the record rather than naming those keys, so neither a Ray rename
+    nor a fourth record type can silently reopen the leak.
+
+    The ``_`` prefix is ``AppBuilder``'s marker for an injected secret
+    (``_BIOENGINE_SECRET_<KEY>``). Unlike
+    ``ApplicationManager._filter_secret_env_vars``, the key is left as-is:
+    this is a verbatim view of a Ray record, and the env var really is
+    named that way on the actor.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                {
+                    name: "*****" if name.startswith("_") else item
+                    for name, item in entry.items()
+                }
+                if key == "env_vars" and isinstance(entry, dict)
+                else _mask_secret_env_vars(entry)
+            )
+            for key, entry in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_secret_env_vars(entry) for entry in value]
+    if isinstance(value, str) and "env_vars" in value:
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return value
+        return json.dumps(_mask_secret_env_vars(parsed))
+    return value
+
+
+def _pending_records(records: List[Any]) -> List[Dict[str, Any]]:
+    """Convert Ray state records to masked dicts for the status payload.
+
+    Every pending-resource collector goes through here so none of them can
+    forget the masking. ``asdict`` is not enough on its own: ``JobState`` is
+    a pydantic model, not a dataclass, and ``asdict`` raises on it.
+    """
+    return [
+        _mask_secret_env_vars(asdict(record) if is_dataclass(record) else record.dict())
+        for record in records
+    ]
 
 
 def _touch_on_call(method: Callable) -> Callable:
@@ -257,7 +309,7 @@ class BioEngineProxyActor:
             ),
             raise_on_missing_output=True,
         )
-        return [asdict(job) for job in pending_jobs]
+        return _pending_records(pending_jobs)
 
     def _get_pending_actors(self) -> List[Dict[str, Any]]:
         """Get list of actors whose creation is genuinely blocked on resources.
@@ -286,8 +338,7 @@ class BioEngineProxyActor:
             raise_on_missing_output=True,
         )
         filtered: List[Dict[str, Any]] = []
-        for actor in pending_actors:
-            entry = asdict(actor)
+        for entry in _pending_records(pending_actors):
             req = entry.get("required_resources") or {}
             # A 0-CPU, 0-GPU, 0-memory actor never needs a new worker node;
             # it will schedule onto whatever node has any spare bytes — in
@@ -322,7 +373,7 @@ class BioEngineProxyActor:
             ),
             raise_on_missing_output=True,
         )
-        return [asdict(task) for task in pending_tasks]
+        return _pending_records(pending_tasks)
 
     def _get_node_ip(self, resources: Dict[str, float]) -> Optional[str]:
         """Extract the IP address from a node's resource dictionary.
