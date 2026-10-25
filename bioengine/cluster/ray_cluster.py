@@ -16,6 +16,7 @@ import ray
 from ray import serve
 
 import bioengine
+from bioengine.cluster._ray_compat import RAY_PROCESSES, psutil
 from bioengine.cluster.proxy_actor import BioEngineProxyActor
 from bioengine.cluster.slurm_workers import SlurmWorkers
 from bioengine.utils import (
@@ -1015,8 +1016,80 @@ class RayCluster:
             self.logger.error(f"Failed to connect to existing Ray cluster: {e}")
             raise e
 
+    def _find_cluster_processes(self) -> List[List["psutil.Process"]]:
+        """Ray processes belonging to THIS cluster, in Ray's own kill order.
+
+        Returns three buckets — raylet, everything else, gcs_server — because
+        Ray requires that order: the raylet has to exit before the agents that
+        fate-share with it, and the GCS has to exit last.
+
+        A process is claimed only if it both matches one of Ray's own
+        ``RAY_PROCESSES`` keywords and is attributable to this cluster. Ray's
+        processes name this cluster's temp dir on their command line; the
+        Ray client server names the GCS address instead; task and actor
+        workers are renamed ``ray::...`` and name neither, so they are claimed
+        through their parent raylet.
+        """
+        # Trailing separator on purpose: a bare prefix match would claim a
+        # sibling cluster at '<temp_dir>-other', and the second worker on a
+        # node is exactly the one named that way.
+        temp_dir = os.path.join(str(self.ray_cluster_config["ray_temp_dir"]), "")
+        gcs_argument = (
+            f"--address={self.ray_cluster_config['head_node_address']}:"
+            f"{self.ray_cluster_config['ports']['head_node']}"
+        )
+
+        candidates = []
+        for process in psutil.process_iter(["name", "cmdline", "ppid"]):
+            try:
+                name = process.info["name"] or ""
+                argv = process.info["cmdline"] or []
+            except psutil.Error:
+                continue
+            cmdline = subprocess.list2cmdline(argv)
+            for index, (keyword, filter_by_cmd) in enumerate(RAY_PROCESSES):
+                if keyword in (name if filter_by_cmd else cmdline):
+                    candidates.append((process, index, cmdline, argv))
+                    break
+
+        claimed = {
+            process.pid
+            for process, _, cmdline, argv in candidates
+            # Compared whole, not as a substring: ':6379' is a prefix of
+            # ':63790', and the Ray client server is the only process that
+            # identifies its cluster by address rather than by temp dir.
+            if temp_dir in cmdline or gcs_argument in argv
+        }
+        # Workers are renamed, so they identify no cluster themselves; the
+        # raylet that owns them does. Repeat until nothing new is claimed, so
+        # a worker that respawned a child is not left behind.
+        while True:
+            adopted = {
+                process.pid
+                for process, _, _, _ in candidates
+                if process.pid not in claimed
+                and process.info["ppid"] in claimed
+            }
+            if not adopted:
+                break
+            claimed |= adopted
+
+        buckets = [[], [], []]
+        last_index = len(RAY_PROCESSES) - 1
+        for process, index, _, _ in candidates:
+            if process.pid not in claimed:
+                continue
+            bucket = 0 if index == 0 else (2 if index == last_index else 1)
+            buckets[bucket].append(process)
+        return buckets
+
     async def _shutdown_head_node(self, grace_period: int = 30) -> None:
         """Shutdown the Ray cluster head node.
+
+        Only this cluster's processes are stopped. ``ray stop`` is deliberately
+        not used: it takes no cluster selector and kills every Ray process the
+        user owns on the node, which on a shared login node means stopping one
+        worker silently kills every other worker of the same account.
 
         Args:
             grace_period: Grace period in seconds for graceful shutdown.
@@ -1025,42 +1098,41 @@ class RayCluster:
         self.logger.info(
             f"Starting graceful shutdown of Ray head node (grace period: {grace_period}s)..."
         )
-        args = [self.ray_exec_path, "stop", "--grace-period", str(grace_period)]
+        buckets = await asyncio.to_thread(self._find_cluster_processes)
 
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            self.logger.error(
-                f"Ray stop command failed with error code {proc.returncode}:\n{error_msg}"
-            )
-            raise subprocess.CalledProcessError(
-                proc.returncode, " ".join(args), stderr=error_msg
-            )
-
-        output = stdout.decode()
-        if re.search(r"Stopped all \d+ Ray processes\.", output):
-            self.logger.info("All Ray processes stopped successfully")
-        elif "Did not find any active Ray processes." in output:
+        found = sum(len(bucket) for bucket in buckets)
+        if not found:
             self.logger.info("Did not find any active Ray processes.")
-        else:
-            message = re.search(
-                r"Stopped only (\d+) out of (\d+) Ray processes within the grace period (\d+) seconds\.",
-                output,
+            return
+
+        force = grace_period < 0
+        bucket_grace = max(grace_period, 0) / len(buckets)
+        remaining = []
+        for bucket in buckets:
+            for process in bucket:
+                try:
+                    process.kill() if force else process.terminate()
+                except psutil.Error:
+                    pass
+            _, alive = await asyncio.to_thread(
+                psutil.wait_procs, bucket, timeout=bucket_grace
             )
-            if message:
-                self.logger.warning(
-                    f"Some Ray processes could not be stopped: {message.group(0)}"
-                )
-            else:
-                self.logger.warning(
-                    f"Unknown message during Ray shutdown:\n----------\n{output}"
-                )
+            for process in alive:
+                try:
+                    process.kill()
+                except psutil.Error:
+                    pass
+            await asyncio.to_thread(psutil.wait_procs, alive, timeout=2)
+            remaining.extend(process for process in alive if process.is_running())
+
+        if remaining:
+            self.logger.warning(
+                f"Some Ray processes could not be stopped: "
+                f"{found - len(remaining)} of {found} exited within the grace "
+                f"period {grace_period}s; the rest were killed."
+            )
+        else:
+            self.logger.info("All Ray processes stopped successfully")
 
     async def check_connection(self) -> None:
         """Check if Ray cluster is initialized and connected.
