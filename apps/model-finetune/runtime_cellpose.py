@@ -18,12 +18,13 @@ decorator module stays introspectable with only ``bioengine[worker]`` + stdlib.
 
 import asyncio
 import gc
+import hashlib
 import os
 import subprocess
 import sys
 import time
 import uuid
-from io import BytesIO
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +42,16 @@ _SERVE_DIAMETER = 30.0
 _MEMBER_DOWNLOAD_ATTEMPTS = 4
 _MEMBER_DOWNLOAD_BACKOFF_S = 2.0
 
+# Disk budget for cached soup members; see _evict_members. Override with
+# BIOENGINE_SOUP_CACHE_MAX_BYTES.
+_SOUP_CACHE_MAX_BYTES = 24 * 1024 ** 3
+
+# What this deployment promises Ray. Named rather than inlined in the decorator so
+# soup_memory_budget() reports the figure actually in force: aggregate() rejects a
+# merge that would exceed it, and a second copy of the number would let the check
+# pass while the scheduler used a different one.
+_RUNTIME_MEMORY_MB = 12 * 1024
+
 
 def _read_pip(name: str) -> List[str]:
     text = (Path(__file__).parent / name).read_text()
@@ -54,7 +65,7 @@ def _read_pip(name: str) -> List[str]:
 @bioengine.app(
     num_cpus=2,
     gpu_memory_mb=-1,
-    memory_mb=12 * 1024,
+    memory_mb=_RUNTIME_MEMORY_MB,
     pip=_read_pip("requirements-runtime-cellpose.txt"),
     max_ongoing_requests=10,
     autoscaling_config={
@@ -83,9 +94,6 @@ class CellposeRuntime:
         self._loaded_key: Optional[str] = None
         self._device_cached: Optional[str] = None
         self._gpu_mem_cached: Optional[Dict[str, Any]] = None
-        # Model-soup member state_dicts, keyed by their immutable pool weights_path
-        # (content-addressed → no staleness); populated on demand during aggregate.
-        self._soup_cache: Dict[str, Dict[str, Any]] = {}
         self._soup_dl_bytes = 0
 
     async def ping(self) -> Dict[str, Any]:
@@ -96,6 +104,24 @@ class CellposeRuntime:
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
         }
+
+    async def soup_memory_budget(self) -> Dict[str, Any]:
+        """What this replica promised Ray, and what it is using — the two numbers
+        aggregate()'s up-front admission check compares a merge against.
+
+        ``rss_bytes`` is the replica's real footprint right now, so the check sizes
+        a merge against the space actually left rather than against an empty
+        replica; it is None where /proc is unavailable. Ray kills on the NODE's
+        total, so fitting the declaration is necessary and not sufficient — a
+        co-tenant can still take the node over the threshold.
+        """
+        rss = None
+        try:
+            with open("/proc/self/statm") as fh:
+                rss = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except Exception:
+            pass
+        return {"declared_bytes": _RUNTIME_MEMORY_MB * 1024 ** 2, "rss_bytes": rss}
 
     async def gpu_memory_info(self) -> Dict[str, Any]:
         """Total/free VRAM of this runtime's GPU, for the entry's training gate
@@ -236,6 +262,34 @@ class CellposeRuntime:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _evict_members(self, incoming_bytes: int = 0) -> None:
+        """Keep the on-disk member cache under its byte cap, dropping LRU first.
+
+        The cap exists because the cache is filled by candidates WEIGHED, not by
+        members admitted: the best-first ordering pass scores every candidate in the
+        batch, so a merge touches up to ``max_batch`` (default 32) members whatever
+        it ends up admitting. Unbounded, that accumulates across merges for the
+        replica's whole lifetime — the same shape as the RAM cache whose saturation
+        at the batch bound OOM-killed this replica (two kills, on a 4-member and a
+        16-member merge, with peaks within 0.8% of each other).
+
+        Overflowing the cap costs a re-download, never a failure, so the default is
+        a disk budget and NOT sized to a full batch. At the measured cpsam member
+        size of 1.135 GiB, 24 GiB holds about 21 members; a full 32-candidate batch
+        would want 36.3 GiB and will re-download its oldest members. That is the
+        deliberate trade — the volume behind ``$HOME`` on the worker has not been
+        measured, and an unbounded cache is what this is fixing. Raise it if
+        re-downloads show up mid-merge and the volume has room.
+        """
+        import pool
+
+        pool.evict_lru_to_cap(
+            self._soup_dir(), "member-*.pt",
+            cap_bytes=int(os.environ.get(
+                "BIOENGINE_SOUP_CACHE_MAX_BYTES", _SOUP_CACHE_MAX_BYTES)),
+            incoming_bytes=incoming_bytes,
+        )
+
     @staticmethod
     def _replica_id() -> str:
         """Which replica is serving this call.
@@ -293,16 +347,28 @@ class CellposeRuntime:
                 time.sleep(_MEMBER_DOWNLOAD_BACKOFF_S * 2**attempt)
 
     def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
-        """Download + cache a member state_dict by its immutable pool weights_path."""
+        """Load a member state_dict, downloading on first use.
+
+        The download is cached as a file, not as tensors: one download per member
+        per replica, but no member stays resident between uses. Keyed by the
+        immutable pool weights_path (content-addressed → no staleness). Written
+        via a temporary name so an interrupted download cannot leave a truncated
+        file that every later aggregate would then fail to unpickle."""
         import torch
 
-        if key not in self._soup_cache:
+        cached = self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+        if cached.exists():
+            os.utime(cached)  # mark as most-recently-used for _evict_members
+        else:
             content = self._download_member(url)
             self._soup_dl_bytes += len(content)
-            self._soup_cache[key] = self._unwrap_sd(
-                torch.load(BytesIO(content), map_location="cpu", weights_only=False)
-            )
-        return self._soup_cache[key]
+            self._evict_members(incoming_bytes=len(content))
+            partial_file = cached.with_suffix(".part")
+            partial_file.write_bytes(content)
+            partial_file.rename(cached)
+        return self._unwrap_sd(
+            torch.load(cached, map_location="cpu", weights_only=False)
+        )
 
     def _build_soup(self, members: List[Dict[str, str]]):
         """Uniform mean of member state_dicts; None when empty (= stock base)."""
@@ -310,8 +376,9 @@ class CellposeRuntime:
 
         if not members:
             return None
-        sds = [self._fetch_member(m["key"], m["url"]) for m in members]
-        return pool.uniform_soup(sds)
+        return pool.uniform_soup(
+            [partial(self._fetch_member, m["key"], m["url"]) for m in members]
+        )
 
     async def score_soup(
         self, members: List[Dict[str, str]], images: List[np.ndarray],

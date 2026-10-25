@@ -1216,6 +1216,56 @@ class EntryApp:
         resp.raise_for_status()
         return resp.json()
 
+    async def _read_merge_journal(self, am, pool_artifact_id: str) -> Optional[Dict[str, Any]]:
+        """Read aggregate()'s resume journal, or None when there is nothing to resume.
+
+        Absent is the normal first-merge case, so unlike the pool index this never
+        raises on a miss: a merge that cannot read its journal must still run, just
+        without the saved passes.
+        """
+        import pool
+
+        try:
+            url = await am.get_file(pool_artifact_id, file_path=pool.MERGE_JOURNAL)
+            resp = await self._http_retry("GET", url, timeout=120.0)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"no usable merge journal for '{pool_artifact_id}' ({e}); "
+                           f"this merge starts from no saved passes.")
+            return None
+
+    async def _write_merge_journal(self, am, pool_artifact_id: str, journal: Dict[str, Any]) -> None:
+        """Persist the resume journal, after every score so none is paid for twice.
+
+        Never raises. The journal buys resumability; it is not an input to the
+        merge, so a failed write must cost the saved passes and not the GPU hours
+        still running. It is logged at warning on every miss rather than once,
+        because the degraded mode — a merge that completes but cannot be resumed —
+        is otherwise indistinguishable from a healthy one.
+
+        Safe to call only while no staged edit is open: committing with a stage
+        pending promotes that stage to a new version instead of overwriting in
+        place. Every call site is in the scoring phase, before aggregate() opens
+        its own stage to publish the head.
+        """
+        import pool
+
+        try:
+            await am.edit(pool_artifact_id, stage=True)
+            url = await am.put_file(pool_artifact_id, file_path=pool.MERGE_JOURNAL)
+            (await self._http_retry(
+                "PUT", url, content=json.dumps(journal).encode("utf-8"), timeout=120.0
+            )).raise_for_status()
+            await self._commit_with_retry(am, pool_artifact_id)
+        except Exception as e:
+            logger.warning(f"could not persist the merge journal for "
+                           f"'{pool_artifact_id}' ({e}); a kill now would lose the "
+                           f"{len(journal.get('scores', {}))} scored pass(es) since "
+                           f"the last successful write.")
+
     async def _commit_with_retry(self, am, artifact_id: str, tries: int = 6, base: float = 2.0) -> None:
         """Commit a staged artifact, retrying the transient read-after-write 404 the
         deNBI/isilon S3 raises when a just-PUT object is not yet visible to commit's
@@ -1614,7 +1664,15 @@ class EntryApp:
 
         Crash-safe: the new ``community/<version>/`` weights + manifest are committed
         BEFORE the index pointer is repointed, so a reader never sees the head aimed
-        at a half-written version."""
+        at a half-written version.
+
+        Resumable: a merge is ``2 * len(batch) + 3`` scoring passes and each is
+        minutes of exclusive GPU, so every score is written to the pool as it is
+        earned. Calling aggregate() again on the same pool, splits and ``diam_mean``
+        re-reads them, and a run killed mid-merge pays only for the passes it lost
+        rather than starting over. ``resumed_passes`` in the result reports how many
+        were reused; anything else — different splits, a different ``diam_mean``, a
+        schema bump — discards the journal and scores from scratch."""
         import pool
 
         model_type = "cpsam"
@@ -1661,9 +1719,39 @@ class EntryApp:
                     out.append({"key": p, "url": url_cache[p]})
                 return out
 
-            async def _score(member_paths: List[str], imgs, gts) -> float:
-                return _fold(await runtime.score_soup(
+            # Resume journal. A merge is 2*len(batch)+3 scoring passes and each pass
+            # is minutes of exclusive GPU; the run that prompted this was killed at
+            # pass 11 of 35 and returned nothing, losing 62 minutes. Every score is
+            # written to the pool as it is earned, so a replica kill costs the pass
+            # in flight and not the merge. The pool is the right home for it rather
+            # than replica-local disk: the process that dies mid-merge is exactly the
+            # one whose disk cannot be trusted afterwards.
+            # Validate the splits before anything derives an identity from them:
+            # the journal stamps those identities, so a bad one is baked in here.
+            bad_split = pool.split_provenance_error(gate_split, witness_split)
+            if bad_split:
+                raise ValueError(f"aggregate() refused this merge: {bad_split}")
+
+            journal = pool.usable_merge_journal(
+                await self._read_merge_journal(am, pool_artifact_id),
+                gate_split, witness_split, diam_mean)
+            resumed_from = len(journal["scores"])
+            gate_id = pool.split_identity(gate_split)
+            wit_id = pool.split_identity(witness_split)
+            splits = {gate_id: (gate_imgs, gate_gts), wit_id: (wit_imgs, wit_gts)}
+
+            async def _score(member_paths: List[str], split_id: str) -> float:
+                key = pool.score_key(split_id, member_paths)
+                if key in journal["scores"]:
+                    return float(journal["scores"][key])
+                imgs, gts = splits[split_id]
+                # A journal hit returns above without folding, which is correct: that
+                # pass transported nothing on this run.
+                value = _fold(await runtime.score_soup(
                     await _specs(member_paths), imgs, gts, diam_mean))["f1"]
+                pool.record_score(journal, key, value)
+                await self._write_merge_journal(am, pool_artifact_id, journal)
+                return value
 
             cc = pool.current_community(index)
             cur_member_ids: List[str] = []
@@ -1674,11 +1762,30 @@ class EntryApp:
                 cur_member_ids = list(cur_manifest.get("selected_contribution_ids", []))
             cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
 
+            pending = pool.undecided_contributions(index)
+            batch = pending[:max_batch]
+            deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
+            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
+
+            # Refuse a merge that cannot fit BEFORE any scoring pass, rather than
+            # discovering it as an OOM kill 11 passes in. This is as early as the
+            # check can go: it needs `batch`, which is the first point at which the
+            # members that will actually be loaded are known.
+            budget = await runtime.soup_memory_budget()
+            refusal = pool.soup_admission(
+                [c.get("n_bytes") for c in batch] + [by_id[cid].get("n_bytes")
+                                                     for cid in cur_member_ids],
+                budget_bytes=budget["declared_bytes"],
+                base_bytes=budget["rss_bytes"] or 0,
+            )
+            if refusal:
+                raise ValueError(f"aggregate() refused this merge: {refusal}")
+
             # Stock baseline on A and B (anchor of the witness curve — the level to beat).
             baseline = index.get("baseline")
             if baseline is None:
-                stock_a = await _score([], gate_imgs, gate_gts)
-                stock_b = await _score([], wit_imgs, wit_gts)
+                stock_a = await _score([], gate_id)
+                stock_b = await _score([], wit_id)
                 baseline = {
                     "model": "stock-cpsam",
                     "selection_metric": pool.round_metric(
@@ -1688,13 +1795,8 @@ class EntryApp:
                     "created_at": time.time(),
                 }
 
-            cur_a = (await _score(cur_member_paths, gate_imgs, gate_gts)
+            cur_a = (await _score(cur_member_paths, gate_id)
                      if cur_member_paths else baseline["selection_metric"]["aggregate"])
-
-            pending = pool.undecided_contributions(index)
-            batch = pending[:max_batch]
-            deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
-            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
 
             # Best-first ordering: individual marginal of adding each candidate to the
             # current soup, on A. Re-scored against the CURRENT head (a stale solo
@@ -1702,7 +1804,7 @@ class EntryApp:
             marg = {}
             for c in batch:
                 cid = c["contribution_id"]
-                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_imgs, gate_gts)
+                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_id)
             ordered = sorted(batch, key=lambda c: marg[c["contribution_id"]], reverse=True)
 
             s_paths = list(cur_member_paths)
@@ -1712,7 +1814,7 @@ class EntryApp:
             admitted: List[str] = []
             for c in ordered:
                 cid = c["contribution_id"]
-                trial_a = await _score(s_paths + [cand_path[cid]], gate_imgs, gate_gts)
+                trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
                 included = trial_a >= (s_a - eps)
                 members_record.append({"contribution_id": cid, "gate_score": round(trial_a, 4), "included": bool(included)})
                 if included:
@@ -1727,7 +1829,7 @@ class EntryApp:
             if changed:
                 new_version = await self._next_free_community_version(am, pool_artifact_id, index)
                 head_a = s_a
-                head_b = await _score(s_paths, wit_imgs, wit_gts)
+                head_b = await _score(s_paths, wit_id)
                 sel_metric = pool.round_metric(
                     role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.SELECTION_BASIS)
                 wit_metric = pool.round_metric(
@@ -1822,4 +1924,9 @@ class EntryApp:
             "witness_metric": round(head_b, 4) if head_b is not None else None,
             "baseline": baseline,
             "n_members": len(s_ids),
+            # Passes this merge did not have to pay for because a previous attempt
+            # had already scored them. Non-zero means a killed merge resumed rather
+            # than restarted, which is the only caller-visible proof it did.
+            "resumed_passes": resumed_from,
+            "scored_passes": len(journal["scores"]) - resumed_from,
         }
