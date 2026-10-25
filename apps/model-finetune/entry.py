@@ -870,6 +870,12 @@ class EntryApp:
             "pool's latest community weights and trains from them — the at-your-own-pace round "
             "start. Requires pool_token; mutually exclusive with init_checkpoint and "
             "resume_session_id; the pool's model_type must match."),
+        init_from_pool_version: Optional[str] = Field(
+            None, description="Seed from a NAMED community version ('v1', 'v2', …) instead of the "
+            "pool's current pointer. Resolves the version's own manifest.json rather than the "
+            "index, so it still reaches a version whose weights were published but whose index "
+            "entry was never committed (an aggregate interrupted between its two commits). "
+            "Requires init_from_pool."),
         pool_token: Optional[str] = Field(
             None, description="Token with read access to init_from_pool's artifact. Scoped to "
             "the pool, not the app's own token."),
@@ -903,10 +909,16 @@ class EntryApp:
         # rather than leaving a PREPARING session behind.
         selected_metrics = training.validate_metrics(metrics)
 
+        if init_from_pool_version and not init_from_pool:
+            raise ValueError(
+                "init_from_pool_version names a version inside a pool, so it requires "
+                "init_from_pool."
+            )
+
         pool_provenance = None
         if init_from_pool:
             init_checkpoint, pool_provenance = await self._resolve_pool_init(
-                model_type, init_from_pool, pool_token
+                model_type, init_from_pool, pool_token, init_from_pool_version
             )
 
         await self._check_runtime_available(model_type)
@@ -1203,10 +1215,54 @@ class EntryApp:
                     raise
                 await asyncio.sleep(base * (2 ** i))
 
-    async def _resolve_pool_init(self, model_type, init_from_pool, pool_token):
-        """Resolve a pool's CURRENT community checkpoint to a download URL for
+    async def _read_community_manifest(
+        self, am, pool_artifact_id: str, community_version: str
+    ) -> Dict[str, Any]:
+        """Read ``community/<version>/manifest.json`` and shape it like an index
+        ``current_community`` entry, so a named version and the pointer resolve
+        through one code path downstream."""
+        import pool
+
+        paths = pool.community_paths(community_version)
+        try:
+            url = await am.get_file(pool_artifact_id, file_path=paths["manifest"])
+        except Exception as e:
+            raise FileNotFoundError(
+                f"pool '{pool_artifact_id}' has no {paths['manifest']} — version "
+                f"'{community_version}' was never published ({e}). Versions count from "
+                f"'v1'; note get_pool_state reads the index, so it cannot list a version "
+                f"whose index entry was never committed."
+            )
+        resp = await self._http_retry("GET", url, timeout=120.0)
+        if resp.status_code == 404:
+            raise FileNotFoundError(
+                f"manifest missing for '{pool_artifact_id}' version '{community_version}'."
+            )
+        resp.raise_for_status()
+        manifest = resp.json()
+        return {
+            "version": manifest.get("community_version", community_version),
+            "path": paths["weights"],
+            "sha256": manifest.get("weights_sha256"),
+            "selection_metric": manifest.get("selection_metric"),
+            "witness_metric": manifest.get("witness_metric"),
+        }
+
+    async def _resolve_pool_init(
+        self, model_type, init_from_pool, pool_token, community_version=None
+    ):
+        """Resolve a pool community checkpoint to a download URL for
         start_training(init_from_pool=...). Returns (url, provenance); provenance
-        is persisted with the session so _run_training can count the download."""
+        is persisted with the session so _run_training can count the download.
+
+        ``community_version`` ('v1', …) resolves that version's own manifest.json
+        instead of the index pointer. aggregate() publishes a version in two commits
+        — weights + manifest first, then the index pointer — so an interruption
+        between them leaves complete, scoreable weights the pointer never names. At
+        v1 there is no prior pointer to fall back to, so the index reads
+        ``current_community: null`` and the pointer path cannot reach the weights at
+        all. The manifest is written in the FIRST commit, so requiring it here also
+        proves the version was fully published rather than half-written."""
         import pool
 
         am, client = await self._pool_service(pool_token)
@@ -1218,12 +1274,20 @@ class EntryApp:
                     f"pool '{init_from_pool}' holds {idx_model} checkpoints, but "
                     f"model_type is {model_type}; they must match to seed from it."
                 )
-            cc = pool.current_community(index)
-            if not cc:
-                raise ValueError(
-                    f"pool '{init_from_pool}' has no community checkpoint yet — "
-                    f"nothing to seed from (contribute + aggregate first)."
+            if community_version:
+                cc = await self._read_community_manifest(
+                    am, init_from_pool, community_version
                 )
+            else:
+                cc = pool.current_community(index)
+                if not cc:
+                    raise ValueError(
+                        f"pool '{init_from_pool}' has no community checkpoint yet — "
+                        f"nothing to seed from (contribute + aggregate first). If an "
+                        f"aggregate was interrupted after publishing weights but before "
+                        f"the index pointer, name the version directly with "
+                        f"init_from_pool_version='v1'."
+                    )
             url = await am.get_file(init_from_pool, file_path=cc["path"])
             provenance = {
                 "pool_artifact_id": init_from_pool,
