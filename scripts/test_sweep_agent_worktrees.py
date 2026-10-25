@@ -154,12 +154,13 @@ def verdicts(report):
     return out
 
 
-def notify(root, repo, watchers, fail_first, attempts):
+def notify(root, repo, watchers, fail_first, attempts, fallback=None):
     """Run --notify against a `myco` whose first `fail_first` sends fail.
 
-    Returns the finished process and how many times `session send` was called,
-    so a run that succeeded by retrying is distinguishable from one that
-    succeeded first time.
+    Returns the finished process, how many times `session send` was called (so a
+    run that succeeded by retrying is distinguishable from one that succeeded
+    first time) and the fallback path, which must exist only when every attempt
+    missed. Pass `fallback` to point it somewhere unwritable.
     """
     bindir = os.path.join(root, f"shim-{fail_first}-{attempts}")
     os.makedirs(bindir, exist_ok=True)
@@ -175,13 +176,15 @@ def notify(root, repo, watchers, fail_first, attempts):
     os.chmod(shim, 0o755)
     env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"],
            "SWEEP_NOTIFY_ATTEMPTS": str(attempts), "SWEEP_NOTIFY_RETRY_SECONDS": "0"}
+    fb = fallback or os.path.join(bindir, "fallback.md")
     p = subprocess.run(
         [sys.executable, SWEEP, "--repo", repo, "--owned-within", "0",
-         "--watcher-root", watchers, "--notify", "no-such-session"],
+         "--watcher-root", watchers, "--notify", "no-such-session",
+         "--fallback-file", fb],
         capture_output=True, text=True, env=env,
     )
     n = int(open(calls).read().strip()) if os.path.exists(calls) else 0
-    return p, n
+    return p, n, fb
 
 
 def main():
@@ -217,20 +220,32 @@ def main():
             "agent-stale" in git(repo, "worktree", "list"),
         )
 
-        print("notify (a flaky registry lookup must be retried, a dead one must still fail)")
-        p, calls = notify(root, repo, watchers, fail_first=0, attempts=3)
+        print("notify (a flaky lookup is retried; an unreachable one falls back to a file)")
+        p, calls, fb = notify(root, repo, watchers, fail_first=0, attempts=3)
         check("a delivery that works is sent once", p.returncode == 0 and calls == 1,
               f"exit {p.returncode}, {calls} call(s): {p.stderr.strip()}")
-        p, calls = notify(root, repo, watchers, fail_first=2, attempts=3)
+        check("a delivery that works writes no fallback", not os.path.exists(fb), fb)
+        p, calls, fb = notify(root, repo, watchers, fail_first=2, attempts=3)
         check("two transient misses are retried and the report still lands",
               p.returncode == 0 and calls == 3, f"exit {p.returncode}, {calls} call(s)")
-        p, calls = notify(root, repo, watchers, fail_first=2, attempts=1)
-        check("the same two misses DO fail when only one attempt is allowed",
-              p.returncode == 1 and calls == 1, f"exit {p.returncode}, {calls} call(s)")
-        p, calls = notify(root, repo, watchers, fail_first=9, attempts=3)
-        check("a recipient that never answers still fails the run",
-              p.returncode == 1 and calls == 3 and "after 3 attempts" in p.stderr,
+        check("a retried delivery writes no fallback", not os.path.exists(fb), fb)
+        p, calls, fb = notify(root, repo, watchers, fail_first=2, attempts=1)
+        check("the same two misses fall back to the file on a single attempt",
+              p.returncode == 0 and calls == 1 and os.path.exists(fb),
+              f"exit {p.returncode}, {calls} call(s)")
+        p, calls, fb = notify(root, repo, watchers, fail_first=9, attempts=3)
+        check("a recipient that never answers preserves the report instead of failing",
+              p.returncode == 0 and calls == 3 and "after 3 attempts" in p.stderr,
               f"exit {p.returncode}, {calls} call(s): {p.stderr.strip()}")
+        check("the preserved report is the summary, not an empty file",
+              os.path.exists(fb) and "worktrees against origin/main" in open(fb).read(), fb)
+        blocked = os.path.join(root, "blocked")  # a FILE where the fallback needs a directory
+        write(blocked, "not a directory\n")
+        p, calls, fb = notify(root, repo, watchers, fail_first=9, attempts=1,
+                              fallback=os.path.join(blocked, "r.md"))
+        check("an undeliverable report that cannot be saved either DOES fail the run",
+              p.returncode == 1 and "fallback write" in p.stderr,
+              f"exit {p.returncode}: {p.stderr.strip()}")
 
         print("apply (only the two that pass every gate should go)")
         sweep(repo, watchers, "--apply")
