@@ -171,9 +171,9 @@ class EntryDeployment:
     _INFERENCE_PASS_SCORE = 3.0
 
     # Async infer-request registry TTL — how long a completed/failed
-    # infer job stays in memory after completion before being swept.
-    # Also bounds how long the on-disk request dir survives if the
-    # caller never polls after the runtime completes.
+    # infer job stays retrievable after completion before being swept.
+    # Bounds both the in-memory record and the on-disk request dir that
+    # backs it, whether or not the caller ever polls.
     _INFER_JOBS_TTL_SEC = 3600
 
     # Per-request scratch on the app's shared PVC-backed HOME. EntryDeployment
@@ -183,6 +183,13 @@ class EntryDeployment:
     # to ``output/<key>.npy``, and records state timestamps in
     # ``state.json``. Kept in sync with ``RuntimeDeployment._INFERENCE_DIR_NAME``.
     _INFERENCE_DIR_NAME = ".model-runner-inference"
+
+    # Durable per-request record written alongside that request's data.
+    # ``$HOME`` is per-app, not per-replica, so these outlive the replica
+    # that wrote them and ``_recover_infer_jobs`` rebuilds the in-memory
+    # registry from them at startup. Without this, scaling the Entry tier
+    # to zero and back discards results of inferences that already ran.
+    _JOB_FILE_NAME = "job.json"
 
     def __init__(
         self,
@@ -246,9 +253,11 @@ class EntryDeployment:
         # Async infer-request registry — same shape as ``_test_jobs``.
         # Keyed by opaque request id (``ij-<hex12>``); each value
         # tracks state, step timestamps and (once completed) the
-        # in-memory result cached after its first successful poll. Also
-        # per-replica in-memory; a restart drops everything and orphan
-        # on-disk request dirs are swept in ``_async_init``.
+        # in-memory result cached after its first successful poll.
+        # Unlike ``_test_jobs`` this one is only a cache: every record is
+        # mirrored to ``<request_id>/job.json`` on the app's shared HOME
+        # and rebuilt from there in ``_async_init``, so a replica
+        # replacement (autoscaling to zero and back) does not lose it.
         self._infer_jobs: Dict[str, dict] = {}
         # Filled in ``_async_init`` — HOME isn't guaranteed to be the
         # final PVC path until then.
@@ -298,27 +307,12 @@ class EntryDeployment:
         self.s3_controller = await self.hypha_client.get_service("public/s3-storage")
         logger.info(f"Connected to Hypha Server at {self.server_url}")
 
-        # Per-request scratch directory on the shared PVC. On a fresh
-        # replica life the in-memory registry is empty, so any lingering
-        # request dirs belong to a previous replica and are safe to
-        # reap (their in-memory job records went away with the replica).
+        # Per-request scratch directory on the shared PVC. Any request dir
+        # found here was written by a replica that is gone, so its records
+        # are adopted into this replica's registry rather than reaped.
         self._inference_dir = Path(os.environ["HOME"]) / self._INFERENCE_DIR_NAME
         self._inference_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            leftovers = await asyncio.to_thread(
-                lambda: [p for p in self._inference_dir.iterdir() if p.is_dir()]
-            )
-        except FileNotFoundError:
-            leftovers = []
-        for leftover in leftovers:
-            await asyncio.to_thread(
-                shutil.rmtree, str(leftover), ignore_errors=True
-            )
-        if leftovers:
-            logger.info(
-                f"🧹 Cleaned {len(leftovers)} stale inference request dir(s) "
-                f"from a previous replica."
-            )
+        await asyncio.to_thread(self._recover_infer_jobs)
 
         # Reports are published under the app's own token. Publishing
         # requires that token to carry at least read-write scope on the
@@ -1055,14 +1049,15 @@ class EntryDeployment:
                 except OSError:
                     pass
 
-    def _new_infer_job(
-        self, model_id: str, return_download_url: bool
+    def _blank_infer_job(
+        self, request_id: str, model_id: str, return_download_url: bool
     ) -> dict:
-        """Create an infer-job record and return it. Sweeps expired
-        jobs on the way in.
+        """An infer-job record in its initial state.
+
+        Also the skeleton a persisted record is merged onto in
+        ``_load_infer_job_file``, so every field a poll reads exists even
+        if the file on disk predates it.
         """
-        self._sweep_expired_infer_jobs()
-        request_id = f"ij-{uuid.uuid4().hex[:12]}"
         now = time.time()
         job = {
             "job_id": request_id,
@@ -1089,16 +1084,172 @@ class EntryDeployment:
             # the FIRST successful poll after completion; subsequent
             # polls read this cached value until the job TTL sweeps it.
             "result": None,
-            # Only meaningful once ``state == "completed"``: True once
-            # the first poll has read the outputs off disk and deleted
-            # the request dir. Guards against re-reading a deleted dir.
+            # Only meaningful once ``state == "completed"``: True once a
+            # poll on THIS replica has read the outputs into ``result``.
+            # Not persisted — a fresh replica re-reads them off disk.
             "_result_materialized": False,
             # Background asyncio.Task handle for ``cancel_request``. Never
             # surfaced in the progress dict.
             "_task": None,
         }
+        return job
+
+    def _new_infer_job(
+        self, model_id: str, return_download_url: bool
+    ) -> dict:
+        """Create an infer-job record, register it and return it. Sweeps
+        expired jobs on the way in.
+        """
+        self._sweep_expired_infer_jobs()
+        request_id = f"ij-{uuid.uuid4().hex[:12]}"
+        job = self._blank_infer_job(request_id, model_id, return_download_url)
         self._infer_jobs[request_id] = job
         return job
+
+    def _write_infer_job_file(self, job: dict) -> None:
+        """Mirror ``job`` to ``<request_id>/job.json``, atomically via
+        rename so a concurrent recovery never reads a half-written file.
+
+        ``result`` is written only when it is JSON-safe — an error dict or
+        the presigned-URL form. An ndarray result is not duplicated here:
+        it already exists as ``output/*.npy``, which the next poll on a
+        fresh replica re-materializes.
+        """
+        request_dir = self._inference_dir / job["job_id"]
+        request_dir.mkdir(parents=True, exist_ok=True)
+        record = {k: v for k, v in job.items() if not k.startswith("_")}
+        result = record.get("result")
+        if not (
+            isinstance(result, dict)
+            and all(isinstance(v, str) for v in result.values())
+        ):
+            record["result"] = None
+        tmp = request_dir / f"{self._JOB_FILE_NAME}.tmp"
+        tmp.write_text(json.dumps(record))
+        tmp.replace(request_dir / self._JOB_FILE_NAME)
+
+    async def _persist_infer_job(self, job: dict) -> None:
+        """``_write_infer_job_file`` off the event loop, best-effort.
+
+        A record that cannot be written costs durability, not the
+        inference — the in-memory registry still serves this replica.
+        """
+        if self._inference_dir is None:
+            return
+        try:
+            await asyncio.to_thread(self._write_infer_job_file, job)
+        except OSError as e:
+            logger.warning(
+                f"⚠️ Could not persist the record for request "
+                f"{job['job_id']!r}: {e} — it will not survive a replica "
+                f"replacement."
+            )
+
+    def _load_infer_job_file(self, request_dir: Path) -> Optional[dict]:
+        """Parse ``<request_dir>/job.json`` into a job record, or None if
+        there is no readable record for this directory.
+        """
+        try:
+            record = json.loads((request_dir / self._JOB_FILE_NAME).read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict) or record.get("job_id") != request_dir.name:
+            return None
+        job = self._blank_infer_job(
+            request_dir.name,
+            str(record.get("model_id", "unknown")),
+            bool(record.get("return_download_url")),
+        )
+        for key in job:
+            if not key.startswith("_") and key in record:
+                job[key] = record[key]
+        # A persisted result is the whole result; an absent one means the
+        # outputs are still on disk and the next poll must read them.
+        job["_result_materialized"] = job["result"] is not None
+        return job
+
+    def _adopt_unfinished_infer_job(self, job: dict, request_dir: Path) -> None:
+        """Give a terminal state to a request whose driver task died with
+        its replica, and persist it.
+
+        If the runtime recorded ``runtime_completed_at`` and left outputs
+        behind, the inference itself succeeded and only the bookkeeping
+        was lost — adopt it as ``completed`` so the next poll materializes
+        those outputs. Otherwise nothing is collectable and the caller is
+        owed an error rather than a request that never leaves ``running``.
+        """
+        try:
+            state = json.loads((request_dir / "state.json").read_text())
+            runtime_completed_at = state.get("runtime_completed_at")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            runtime_completed_at = None
+        output_dir = request_dir / "output"
+        try:
+            has_outputs = any(p.suffix == ".npy" for p in output_dir.iterdir())
+        except OSError:
+            has_outputs = False
+
+        if runtime_completed_at is not None and has_outputs:
+            job["state"] = "completed"
+            job["completed_at"] = float(runtime_completed_at)
+            job["result"] = None
+        else:
+            job["state"] = "failed"
+            job["completed_at"] = time.time()
+            job["result"] = {
+                "error": (
+                    f"The Entry replica running request {job['job_id']!r} was "
+                    f"replaced before the inference finished, so it cannot be "
+                    f"resumed. Resubmit via infer()."
+                )
+            }
+            shutil.rmtree(request_dir / "input", ignore_errors=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+        self._write_infer_job_file(job)
+
+    def _recover_infer_jobs(self) -> None:
+        """Rebuild ``_infer_jobs`` from the ``job.json`` files a previous
+        replica left on the shared HOME. Called once from ``_async_init``.
+
+        The Entry tier runs a single replica, so every request dir present
+        at startup belongs to a replica that is gone and nothing in flight
+        can be resumed — ``_adopt_unfinished_infer_job`` closes those out.
+        Records past the TTL and dirs with no readable record are removed.
+        """
+        now = time.time()
+        recovered = 0
+        discarded = 0
+        try:
+            request_dirs = sorted(
+                p for p in self._inference_dir.iterdir() if p.is_dir()
+            )
+        except OSError:
+            return
+
+        for request_dir in request_dirs:
+            job = self._load_infer_job_file(request_dir)
+            if job is None:
+                shutil.rmtree(request_dir, ignore_errors=True)
+                discarded += 1
+                continue
+            if job["state"] not in ("completed", "failed", "cancelled"):
+                self._adopt_unfinished_infer_job(job, request_dir)
+            completed_at = job["completed_at"]
+            if (
+                completed_at is None
+                or (now - completed_at) > self._INFER_JOBS_TTL_SEC
+            ):
+                shutil.rmtree(request_dir, ignore_errors=True)
+                discarded += 1
+                continue
+            self._infer_jobs[job["job_id"]] = job
+            recovered += 1
+
+        if recovered or discarded:
+            logger.info(
+                f"♻️ Recovered {recovered} inference request(s) from a previous "
+                f"replica, discarded {discarded} expired or unreadable one(s)."
+            )
 
     def _update_infer_job(
         self,
@@ -1110,6 +1261,8 @@ class EntryDeployment:
         """Idempotent state update for infer jobs — same semantics as
         ``_update_test_job`` (auto-stamp step timestamps, set
         ``completed_at`` on terminal states).
+
+        In-memory only; the caller persists with ``_persist_infer_job``.
         """
         if state is not None:
             job["state"] = state
@@ -3050,8 +3203,9 @@ class EntryDeployment:
 
         Routing is by id prefix (``tj-`` test, ``ij-`` infer). An already
         finished request is a no-op (``cancelled: False``). Unknown ids raise
-        ``KeyError`` — runs live in-memory per Entry replica and expire after
-        their TTL.
+        ``KeyError`` — test runs live in-memory per Entry replica, infer
+        requests are backed by shared storage, and both expire after their
+        TTL.
 
         Returns ``{"request_id", "state", "cancelled"}``.
         """
@@ -3085,13 +3239,16 @@ class EntryDeployment:
 
         is_infer = registry is self._infer_jobs
         update = self._update_infer_job if is_infer else self._update_test_job
-        update(job, state="cancelled", result={"error": "cancelled"})
         if is_infer and self._inference_dir is not None:
             await asyncio.to_thread(
                 shutil.rmtree,
                 str(self._inference_dir / request_id),
                 ignore_errors=True,
             )
+        update(job, state="cancelled", result={"error": "cancelled"})
+        if is_infer:
+            # After the purge, so the dir it re-creates holds only the record.
+            await self._persist_infer_job(job)
 
         logger.info(f"🛑 Cancelled request {request_id!r}.")
         return {"request_id": request_id, "state": "cancelled", "cancelled": True}
@@ -3237,9 +3394,10 @@ class EntryDeployment:
              "completed_at": None, "result": None, "stages": {...}}
 
         Once ``result`` is populated, the outputs are read off disk on
-        that first poll and the request dir is deleted; subsequent
-        polls return the cached result. Jobs are held for 1 hour after
-        completion, then swept.
+        that first poll; subsequent polls return the cached result.
+        Requests are held for 1 hour after completion, then swept —
+        including across a replica replacement, so scaling the app to
+        zero between submit and collect does not lose the result.
 
         When ``return_download_url=True`` the ``result`` maps output
         keys to presigned S3 URLs instead of raw arrays; the S3 upload
@@ -3299,6 +3457,7 @@ class EntryDeployment:
         request_dir = self._inference_dir / request_id
         input_dir = request_dir / "input"
         input_dir.mkdir(parents=True, exist_ok=True)
+        await self._persist_infer_job(job)
 
         # Write inputs as uncompressed .npy — spec is speed over disk
         # space. ``np.save`` writes atomically (single ``open`` +
@@ -3360,6 +3519,7 @@ class EntryDeployment:
         request_id = job["job_id"]
         try:
             self._update_infer_job(job, state="model_download")
+            await self._persist_infer_job(job)
             package = await self.model_cache.get_model_package(
                 model_id=model_id,
                 stage=False,
@@ -3383,6 +3543,7 @@ class EntryDeployment:
                 # may queue at the runtime router; the poll refines
                 # ``running_ts`` from the state.json marker.
                 self._update_infer_job(job, state="running")
+                await self._persist_infer_job(job)
                 await self.runtime.predict_from_disk(
                     request_id=request_id,
                     rdf_path=package.source,
@@ -3396,6 +3557,10 @@ class EntryDeployment:
                 )
 
             self._update_infer_job(job, state="completed")
+            # Persist BEFORE logging success: from here on the outputs are
+            # on disk and the record that points at them must be too, or a
+            # replica replacement in the gap loses a finished inference.
+            await self._persist_infer_job(job)
             logger.info(f"✅ Inference completed for request {request_id!r}.")
         except Exception as exc:
             # Wrap RayTaskError so the caller sees a plain RuntimeError
@@ -3418,12 +3583,21 @@ class EntryDeployment:
             self._update_infer_job(
                 job, state="failed", result={"error": str(exc)}
             )
+            # Re-creates the request dir holding nothing but ``job.json``,
+            # so the caller still gets the error after a replica swap
+            # instead of a bare "unknown request_id".
+            await self._persist_infer_job(job)
 
     async def _materialize_infer_result(self, job: dict) -> None:
         """Read outputs off disk, apply ``return_download_url`` conversion
-        if requested, cache the result on the job, and delete the
-        request dir. Called at most once per job — guarded by
-        ``job["_result_materialized"]``.
+        if requested, and cache the result on the job. Called at most once
+        per replica per job — guarded by ``job["_result_materialized"]``.
+
+        The ``output/*.npy`` files are NOT deleted here: they are the only
+        durable copy of an ndarray result, and a replica replaced before
+        the TTL sweep would otherwise leave a finished inference with
+        nothing to return. Presigned URLs go into ``job.json`` instead, so
+        on that path the arrays are dropped as soon as they are uploaded.
         """
         request_id = job["job_id"]
         request_dir = self._inference_dir / request_id
@@ -3449,9 +3623,7 @@ class EntryDeployment:
                 )
             }
             job["_result_materialized"] = True
-            await asyncio.to_thread(
-                shutil.rmtree, str(request_dir), ignore_errors=True
-            )
+            await self._persist_infer_job(job)
             return
 
         if job["return_download_url"]:
@@ -3459,18 +3631,20 @@ class EntryDeployment:
             for key, array in outputs.items():
                 converted[key] = await self._save_array_to_temp_file(array)
             job["result"] = converted
+            job["_result_materialized"] = True
+            await self._persist_infer_job(job)
+            # The presigned URLs are the durable copy now.
+            await asyncio.to_thread(
+                shutil.rmtree, str(output_dir), ignore_errors=True
+            )
         else:
             job["result"] = outputs
+            job["_result_materialized"] = True
+            await self._persist_infer_job(job)
 
-        job["_result_materialized"] = True
-        # Free the disk immediately — user's spec: read the result,
-        # delete it from disk, return the result in the ``result`` key.
-        await asyncio.to_thread(
-            shutil.rmtree, str(request_dir), ignore_errors=True
-        )
         logger.info(
             f"📤 Materialized {len(outputs)} output(s) for request "
-            f"{request_id!r} and cleaned up on-disk data."
+            f"{request_id!r}."
         )
 
     @bioengine.method
@@ -3502,21 +3676,23 @@ class EntryDeployment:
             }
 
         On the FIRST poll after ``result`` becomes available the
-        outputs are read off ``<request_id>/output/*.npy``, converted
-        to presigned S3 URLs if ``return_download_url=True`` was set
-        on submit, cached in memory, and the request dir is deleted.
-        Subsequent polls return the cached result until the job TTL
-        (1 hour after completion) sweeps it.
+        outputs are read off ``<request_id>/output/*.npy`` and cached in
+        memory, converted to presigned S3 URLs if
+        ``return_download_url=True`` was set on submit. Subsequent polls
+        return the cached result until the TTL (1 hour after completion)
+        sweeps it.
 
-        Requests live in-memory per Entry replica and disappear on
-        replica restart. Unknown ids raise ``KeyError``.
+        Requests are backed by the app's shared storage, so a request
+        survives the Entry replica that ran it — including the replica
+        replacement an autoscale to zero and back performs. Unknown ids
+        raise ``KeyError``.
         """
         job = self._infer_jobs.get(request_id)
         if job is None:
             raise KeyError(
-                f"Unknown request_id {request_id!r}. Requests live in-memory "
-                f"per Entry replica and expire {self._INFER_JOBS_TTL_SEC // 60} "
-                f"minutes after completion. Start a fresh request via infer()."
+                f"Unknown request_id {request_id!r}. Requests expire "
+                f"{self._INFER_JOBS_TTL_SEC // 60} minutes after completion. "
+                f"Start a fresh request via infer()."
             )
 
         # Materialise the result on the first poll after completion —
