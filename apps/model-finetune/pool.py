@@ -199,6 +199,47 @@ def soup_admission(
     )
 
 
+def split_provenance_error(
+    gate_split: Dict[str, Any], witness_split: Dict[str, Any],
+) -> Optional[str]:
+    """Reject split provenance that cannot safely identify a split, or None to proceed.
+
+    aggregate() is an RPC entry point and its ``gate_split``/``witness_split`` are
+    ``Dict[str, Any] = Field(...)``: the dict is required, its CONTENTS are not. A
+    caller that omits ``sha256`` gets the identity ``"<artifact_id>@None"`` for BOTH
+    splits, and two things go wrong silently:
+
+    * entry.py maps identity -> images. One identity means one entry, the witness
+      overwrites the gate, and every selection score is then computed on the witness
+      split — the circularity the two-split design exists to prevent.
+    * a journal written for a different split that also lacked ``sha256`` compares
+      equal on all four stamps and is judged usable, so scores measured on other
+      validation data decide which members are admitted.
+
+    Neither raises on its own, so this is checked once at the boundary rather than
+    defended at each call site.
+    """
+    for name, split in (("gate_split", gate_split), ("witness_split", witness_split)):
+        if not isinstance(split, dict):
+            return f"{name} must be a dict of {{artifact_id, sha256}}, got {type(split).__name__}."
+        for field in ("artifact_id", "sha256"):
+            if not str(split.get(field) or "").strip():
+                return (
+                    f"{name} is missing '{field}'. Both splits need "
+                    f"{{artifact_id, sha256}} provenance: it is what identifies a "
+                    f"split, and without it the gate and witness splits collapse to "
+                    f"one identity and selection silently reads the witness data."
+                )
+    if split_identity(gate_split) == split_identity(witness_split):
+        return (
+            f"gate_split and witness_split both resolve to "
+            f"'{split_identity(gate_split)}'. Selection reads split A and the "
+            f"reported curve is split B; scoring both on one split makes the "
+            f"witness curve circular."
+        )
+    return None
+
+
 def split_identity(split: Dict[str, Any]) -> str:
     """Stable id for a validation split, from the provenance every merge already
     records. Two splits with the same sha256 score identically, so a score may be

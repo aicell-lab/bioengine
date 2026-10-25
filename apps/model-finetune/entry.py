@@ -1608,6 +1608,12 @@ class EntryApp:
             # in flight and not the merge. The pool is the right home for it rather
             # than replica-local disk: the process that dies mid-merge is exactly the
             # one whose disk cannot be trusted afterwards.
+            # Validate the splits before anything derives an identity from them:
+            # the journal stamps those identities, so a bad one is baked in here.
+            bad_split = pool.split_provenance_error(gate_split, witness_split)
+            if bad_split:
+                raise ValueError(f"aggregate() refused this merge: {bad_split}")
+
             journal = pool.usable_merge_journal(
                 await self._read_merge_journal(am, pool_artifact_id),
                 gate_split, witness_split, diam_mean)

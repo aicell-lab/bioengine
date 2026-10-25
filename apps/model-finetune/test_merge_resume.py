@@ -258,3 +258,63 @@ def test_the_refusal_happens_before_any_scoring_pass():
     source because no unit test of pool can see it."""
     source = (pathlib.Path(__file__).parent / "entry.py").read_text()
     assert source.index("pool.soup_admission(") < source.index("await _score(")
+
+
+# ── split provenance, validated at the RPC boundary ──────────────────────────
+# aggregate() is an RPC entry point and `gate_split`/`witness_split` are
+# Dict[str, Any] = Field(...): the dict is required, its CONTENTS are not. With
+# sha256 absent both identities become "<artifact_id>@None" and collapse, which is
+# silent and changes the result two ways — see test_colliding_split_ids_* below.
+
+NO_SHA_GATE = {"artifact_id": "bioimage-io/splits"}
+NO_SHA_WITNESS = {"artifact_id": "bioimage-io/splits"}
+
+
+def test_missing_sha256_would_route_gate_scores_to_witness_images():
+    """The reason the guard exists, pinned as a fact about split_identity.
+
+    entry.py builds ``splits = {gate_id: gate, wit_id: witness}``. If the two ids
+    collapse, that dict has ONE entry, the witness overwrites the gate, and every
+    selection score is computed on the witness split — the exact circularity the
+    two-split design exists to prevent.
+    """
+    gate_id = pool.split_identity(NO_SHA_GATE)
+    wit_id = pool.split_identity(NO_SHA_WITNESS)
+    assert gate_id == wit_id, "this test documents the collision; if it stops colliding, delete the guard"
+
+    splits = {gate_id: "gate_images", wit_id: "witness_images"}
+    assert len(splits) == 1
+    assert splits[gate_id] == "witness_images"
+
+
+@pytest.mark.parametrize("gate,witness,needle", [
+    (NO_SHA_GATE, WITNESS, "gate_split"),
+    (GATE, NO_SHA_WITNESS, "witness_split"),
+    ({"sha256": "a" * 64}, WITNESS, "artifact_id"),
+    ({"artifact_id": "x", "sha256": ""}, WITNESS, "sha256"),
+])
+def test_incomplete_split_provenance_is_refused(gate, witness, needle):
+    reason = pool.split_provenance_error(gate, witness)
+    assert reason is not None, "incomplete provenance must be refused"
+    assert needle in reason, f"the refusal must name the offending field; got: {reason}"
+
+
+def test_two_identical_splits_are_refused():
+    """Selection reads A and the curve is reported on B; if they are the same split
+    the witness is no longer disjoint and the curve is circular. Distinct-looking
+    dicts that resolve to one identity must be caught too."""
+    assert pool.split_provenance_error(GATE, dict(GATE)) is not None
+
+
+def test_complete_and_distinct_provenance_is_accepted():
+    """Positive control: without this the four refusals above would all pass for a
+    function that rejected everything."""
+    assert pool.split_provenance_error(GATE, WITNESS) is None
+
+
+def test_aggregate_validates_the_splits_before_using_them():
+    """Source-level guard: the check must run before the journal is built, because
+    usable_merge_journal() stamps the very identities being validated."""
+    source = (pathlib.Path(__file__).parent / "entry.py").read_text()
+    assert "pool.split_provenance_error(" in source
+    assert source.index("pool.split_provenance_error(") < source.index("pool.usable_merge_journal(")
