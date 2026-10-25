@@ -99,6 +99,22 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
+def _is_missing_file(exc: BaseException) -> bool:
+    """True only when an artifact-manager call failed because the file is absent.
+
+    hypha-rpc flattens a server-side exception into a RemoteException carrying the
+    remote traceback as text, so the original class survives only on its last line.
+    Hypha raises FileNotFoundError for an absent file and KeyError for an artifact
+    that is missing or unreachable — and both messages contain "does not exist", so
+    the class name is the only thing that separates absence from a transport,
+    permission or token failure that must never be read as absence.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return True
+    lines = [line for line in str(exc).splitlines() if line.strip()]
+    return bool(lines) and lines[-1].startswith("FileNotFoundError:")
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -1188,6 +1204,8 @@ class EntryApp:
         try:
             url = await am.get_file(pool_artifact_id, file_path=pool.POOL_INDEX)
         except Exception as e:
+            if not _is_missing_file(e):
+                raise
             raise FileNotFoundError(
                 f"pool '{pool_artifact_id}' has no {pool.POOL_INDEX} — it is not an "
                 f"initialized model-soup pool ({e})."
@@ -1227,6 +1245,8 @@ class EntryApp:
         try:
             url = await am.get_file(pool_artifact_id, file_path=paths["manifest"])
         except Exception as e:
+            if not _is_missing_file(e):
+                raise
             raise FileNotFoundError(
                 f"pool '{pool_artifact_id}' has no {paths['manifest']} — version "
                 f"'{community_version}' was never published ({e}). Versions count from "
