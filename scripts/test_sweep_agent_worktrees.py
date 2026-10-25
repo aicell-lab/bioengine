@@ -154,6 +154,36 @@ def verdicts(report):
     return out
 
 
+def notify(root, repo, watchers, fail_first, attempts):
+    """Run --notify against a `myco` whose first `fail_first` sends fail.
+
+    Returns the finished process and how many times `session send` was called,
+    so a run that succeeded by retrying is distinguishable from one that
+    succeeded first time.
+    """
+    bindir = os.path.join(root, f"shim-{fail_first}-{attempts}")
+    os.makedirs(bindir, exist_ok=True)
+    calls = os.path.join(bindir, "calls")
+    shim = os.path.join(bindir, "myco")
+    write(shim, '#!/bin/sh\n'
+                'if [ "$1" = session ] && [ "$2" = send ]; then\n'
+                '  cat > /dev/null\n'
+                f'  n=$(cat "{calls}" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "{calls}"\n'
+                f'  [ "$n" -le {fail_first} ] && {{ echo "names no host" >&2; exit 1; }}\n'
+                'fi\n'
+                'exit 0\n')
+    os.chmod(shim, 0o755)
+    env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"],
+           "SWEEP_NOTIFY_ATTEMPTS": str(attempts), "SWEEP_NOTIFY_RETRY_SECONDS": "0"}
+    p = subprocess.run(
+        [sys.executable, SWEEP, "--repo", repo, "--owned-within", "0",
+         "--watcher-root", watchers, "--notify", "no-such-session"],
+        capture_output=True, text=True, env=env,
+    )
+    n = int(open(calls).read().strip()) if os.path.exists(calls) else 0
+    return p, n
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="sweep-control-") as root:
         repo, watchers, paths = build_fixture(root)
@@ -186,6 +216,21 @@ def main():
             "a report run leaves the stale registration in place",
             "agent-stale" in git(repo, "worktree", "list"),
         )
+
+        print("notify (a flaky registry lookup must be retried, a dead one must still fail)")
+        p, calls = notify(root, repo, watchers, fail_first=0, attempts=3)
+        check("a delivery that works is sent once", p.returncode == 0 and calls == 1,
+              f"exit {p.returncode}, {calls} call(s): {p.stderr.strip()}")
+        p, calls = notify(root, repo, watchers, fail_first=2, attempts=3)
+        check("two transient misses are retried and the report still lands",
+              p.returncode == 0 and calls == 3, f"exit {p.returncode}, {calls} call(s)")
+        p, calls = notify(root, repo, watchers, fail_first=2, attempts=1)
+        check("the same two misses DO fail when only one attempt is allowed",
+              p.returncode == 1 and calls == 1, f"exit {p.returncode}, {calls} call(s)")
+        p, calls = notify(root, repo, watchers, fail_first=9, attempts=3)
+        check("a recipient that never answers still fails the run",
+              p.returncode == 1 and calls == 3 and "after 3 attempts" in p.stderr,
+              f"exit {p.returncode}, {calls} call(s): {p.stderr.strip()}")
 
         print("apply (only the two that pass every gate should go)")
         sweep(repo, watchers, "--apply")

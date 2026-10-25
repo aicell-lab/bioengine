@@ -58,6 +58,12 @@ SCRIPT_REF = re.compile(r"(/[\w./@+-]+\.(?:sh|py|js|ts))")
 MAX_WATCHER_FILE_BYTES = 2 * 1024 * 1024
 OWNED_IF_TOUCHED_WITHIN = 24 * 3600
 
+# The registry lookup behind `myco session send` is flaky per-process: a session
+# that resolves one minute answers "names no host" the next, so one miss is not
+# evidence the recipient is gone.
+NOTIFY_ATTEMPTS = int(os.environ.get("SWEEP_NOTIFY_ATTEMPTS", "3"))
+NOTIFY_RETRY_SECONDS = float(os.environ.get("SWEEP_NOTIFY_RETRY_SECONDS", "20"))
+
 
 def run(cmd, cwd=None, check=False):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -580,18 +586,22 @@ def main():
 
     if args.notify:
         body = summarise(rows, srows, baseline)
-        p = subprocess.run(
-            ["myco", "session", "send", args.notify, "--subject",
-             "Worktree sweep: %d of %d retirable"
-             % (sum(1 for r in rows if r["verdict"] in ("DONE", "STALE")), len(rows)),
-             "--body-file", "-"],
-            input=body, text=True, capture_output=True,
-        )
-        if p.returncode != 0:
-            print(f"FAILED to deliver the report to {args.notify}: {p.stderr.strip()}", file=sys.stderr)
-            return 1
-        print(f"delivered to {args.notify}: {len(body)} bytes")
-        return 0
+        cmd = ["myco", "session", "send", args.notify, "--subject",
+               "Worktree sweep: %d of %d retirable"
+               % (sum(1 for r in rows if r["verdict"] in ("DONE", "STALE")), len(rows)),
+               "--body-file", "-"]
+        for attempt in range(1, NOTIFY_ATTEMPTS + 1):
+            p = subprocess.run(cmd, input=body, text=True, capture_output=True)
+            if p.returncode == 0:
+                print(f"delivered to {args.notify}: {len(body)} bytes (attempt {attempt})")
+                return 0
+            print(f"delivery to {args.notify} failed (attempt {attempt}/{NOTIFY_ATTEMPTS}): "
+                  f"{p.stderr.strip()}", file=sys.stderr)
+            if attempt < NOTIFY_ATTEMPTS:
+                time.sleep(NOTIFY_RETRY_SECONDS)
+        print(f"FAILED to deliver the report to {args.notify} after {NOTIFY_ATTEMPTS} attempts",
+              file=sys.stderr)
+        return 1
 
     if args.json:
         print(json.dumps({"origin_main": baseline, "worktrees": rows, "sessions": srows, "counted": counted}, indent=2))
