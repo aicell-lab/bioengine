@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+import site
 import time
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
@@ -573,6 +574,32 @@ class RuntimeDeployment:
             if not any(needle in k.upper() for needle in self._SENSITIVE_ENV_NEEDLES)
         }
 
+    def _same_interpreter_env(self) -> Dict[str, str]:
+        """Scrubbed env for a child running this replica's own ``sys.executable``.
+
+        ``replica_init`` repoints ``HOME`` at the app's own directory *after*
+        the replica's interpreter has started, so a child that inherits the new
+        ``HOME`` computes a different user site than its parent and silently
+        loses every package living there. On an HPC worker that is where pip
+        leaves anything the login home already provided: a
+        ``--system-site-packages`` venv counts a user-site package as satisfied
+        and never copies it in, so the parent imports it and the child raises
+        ``ModuleNotFoundError`` (measured on Berzelius: ``pygments``, pulled
+        into ``~/.local`` by a ``pip install --user pytest``, which rich — and
+        so every bioimageio summary — needs).
+
+        Pinning ``PYTHONUSERBASE`` rather than appending to ``PYTHONPATH`` keeps
+        the child's ``sys.path`` order identical to the parent's. Only for a
+        child on this interpreter: a conda env on another Python would get an
+        unrelated site directory, and ``_ensure_alt_venv``'s plain ``venv`` is
+        isolated on purpose (``ENABLE_USER_SITE`` is False there, so this is
+        inert even if it does reach one).
+        """
+        env = self._safe_subprocess_env()
+        if site.ENABLE_USER_SITE and site.USER_BASE:
+            env["PYTHONUSERBASE"] = site.USER_BASE
+        return env
+
     def _mamba_env_vars(self) -> Dict[str, str]:
         """Scrubbed env with mamba's env-prefix + package cache
         redirected to the replica's writable HOME.
@@ -798,7 +825,7 @@ class RuntimeDeployment:
                 [sys.executable, "-c", script, str(rdf_path), summary_path],
                 capture_output=True,
                 text=True,
-                env=self._safe_subprocess_env(),
+                env=self._same_interpreter_env(),
             )
             # Route child stdio through the replica's logger so
             # bioimageio's own log lines (progress, per-weight-format
@@ -950,7 +977,7 @@ class RuntimeDeployment:
                 [sys.executable, "-c", script, rdf_path],
                 capture_output=True,
                 text=True,
-                env=self._safe_subprocess_env(),
+                env=self._same_interpreter_env(),
                 timeout=600,
             )
         except subprocess.TimeoutExpired:
@@ -1030,7 +1057,7 @@ class RuntimeDeployment:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             pass_fds=(w_fd,),
-            env=self._safe_subprocess_env(),
+            env=self._same_interpreter_env(),
             text=True,
         )
         os.close(w_fd)
