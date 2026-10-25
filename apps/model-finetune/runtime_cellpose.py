@@ -36,6 +36,11 @@ logger = bioengine.logger
 # package's self-test output; diameter is cpsam's mean-diameter prior.
 _SERVE_DIAMETER = 30.0
 
+# A merge weighs up to a full candidate batch of 1.1 GiB members and is
+# all-or-nothing, so one truncated read loses every completed gate pass.
+_MEMBER_DOWNLOAD_ATTEMPTS = 4
+_MEMBER_DOWNLOAD_BACKOFF_S = 2.0
+
 
 def _read_pip(name: str) -> List[str]:
     text = (Path(__file__).parent / name).read_text()
@@ -239,14 +244,47 @@ class CellposeRuntime:
             return obj["model_state"]
         return obj
 
+    @staticmethod
+    def _download_member(url: str) -> bytes:
+        """GET a member checkpoint, retrying a truncated or dropped read.
+
+        The URL is a presigned GET for an immutable pool ``weights_path``, so a
+        retry cannot return different bytes. ``read()`` on a response the server
+        cut short raises ``IncompleteRead`` only when a Content-Length was sent;
+        without one it returns short silently, so the length is re-checked here.
+        An ``HTTPError`` is a verdict (403 on an expired presign, 404 on a wrong
+        key) and will not heal, so it is not retried.
+        """
+        from http.client import HTTPException, IncompleteRead
+        from urllib.error import HTTPError, URLError
+        from urllib.request import urlopen
+
+        for attempt in range(_MEMBER_DOWNLOAD_ATTEMPTS):
+            try:
+                with urlopen(url, timeout=600) as resp:
+                    declared = resp.headers.get("Content-Length")
+                    content = resp.read()
+                if declared is not None and len(content) != int(declared):
+                    raise IncompleteRead(content, int(declared) - len(content))
+                return content
+            except HTTPError:
+                raise
+            except (HTTPException, URLError, OSError) as e:
+                if attempt == _MEMBER_DOWNLOAD_ATTEMPTS - 1:
+                    raise
+                logger.warning(
+                    f"⚠️ Member download attempt {attempt + 1}/"
+                    f"{_MEMBER_DOWNLOAD_ATTEMPTS} failed ({type(e).__name__}: {e}); "
+                    f"retrying..."
+                )
+                time.sleep(_MEMBER_DOWNLOAD_BACKOFF_S * 2**attempt)
+
     def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
         """Download + cache a member state_dict by its immutable pool weights_path."""
         import torch
-        from urllib.request import urlopen
 
         if key not in self._soup_cache:
-            with urlopen(url, timeout=600) as resp:
-                content = resp.read()
+            content = self._download_member(url)
             self._soup_dl_bytes += len(content)
             self._soup_cache[key] = self._unwrap_sd(
                 torch.load(BytesIO(content), map_location="cpu", weights_only=False)
