@@ -29,6 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 SCHEMA_VERSION = "0.13.0-draft"
 
 POOL_INDEX = "pool_index.json"
+# Resume journal for aggregate(): scores already paid for, so a killed merge
+# restarts from where it died instead of from nothing. See usable_merge_journal.
+MERGE_JOURNAL = "merge_journal.json"
 WEIGHTS_NAME = "weights.pt"
 METADATA_NAME = "metadata.json"
 MANIFEST_NAME = "manifest.json"
@@ -155,6 +158,71 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
             continue
         total += float(torch.sum((cur.detach().float() - ref.detach().float()) ** 2).item())
     return total ** 0.5
+
+
+def split_identity(split: Dict[str, Any]) -> str:
+    """Stable id for a validation split, from the provenance every merge already
+    records. Two splits with the same sha256 score identically, so a score may be
+    reused across merges; two with different sha256 may not."""
+    return f"{split.get('artifact_id')}@{split.get('sha256')}"
+
+
+def score_key(split_id: str, member_paths: Sequence[str]) -> str:
+    """Identity of one scoring pass: which soup, on which split.
+
+    Sorted, because a soup is a uniform MEAN and so is defined by the SET of its
+    members — ``[a, b]`` and ``[b, a]`` are the same checkpoint and must not be
+    scored twice. That is also what lets the greedy admission pass reuse the
+    best-first ordering pass's score for the candidate it ends up taking first.
+    """
+    canonical = "\x1f".join([split_id, *sorted(member_paths)])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def new_merge_journal(gate_split, witness_split, diam_mean: float) -> Dict[str, Any]:
+    """An empty resume journal stamped with everything a recorded score depends on."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "gate_split": split_identity(gate_split),
+        "witness_split": split_identity(witness_split),
+        "diam_mean": float(diam_mean),
+        "scores": {},
+    }
+
+
+def usable_merge_journal(
+    journal: Optional[Dict[str, Any]], gate_split, witness_split, diam_mean: float,
+) -> Dict[str, Any]:
+    """Return ``journal`` if every score in it is still valid for this merge's
+    inputs, else a fresh empty one.
+
+    A recorded score is ``mean_instance_f1`` of a soup on a split, so it stays true
+    only while the splits and the segmentation diameter are the ones it was measured
+    with. Those are stamped on the journal and compared here; a mismatch discards
+    the whole file rather than trying to salvage entries, because the stamp is
+    per-journal. ``schema_version`` is included so a draft bump that changes the
+    metric also invalidates it — anything else that changes what a score MEANS,
+    without moving one of these four, would have to invalidate it by hand.
+    """
+    fresh = new_merge_journal(gate_split, witness_split, diam_mean)
+    if not isinstance(journal, dict) or not isinstance(journal.get("scores"), dict):
+        return fresh
+    if any(journal.get(field) != fresh[field]
+           for field in ("schema_version", "gate_split", "witness_split", "diam_mean")):
+        return fresh
+    return journal
+
+
+def record_score(journal: Dict[str, Any], key: str, value: float, cap: int = 512) -> None:
+    """Add a score, evicting oldest-first so the journal cannot grow without bound.
+
+    One merge records at most ``2 * max_batch + 3`` scores (67 at the default
+    max_batch of 32), so the cap holds several merges' worth — enough for deferred
+    candidates, which aggregate() re-scores on the next merge, to come back free.
+    """
+    journal["scores"][key] = round(float(value), 6)
+    while len(journal["scores"]) > cap:
+        del journal["scores"][next(iter(journal["scores"]))]
 
 
 def evict_lru_to_cap(
