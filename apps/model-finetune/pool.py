@@ -20,6 +20,7 @@ unit-testable and free of transport concerns.
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
@@ -154,6 +155,38 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
             continue
         total += float(torch.sum((cur.detach().float() - ref.detach().float()) ** 2).item())
     return total ** 0.5
+
+
+def evict_lru_to_cap(
+    directory: Path, pattern: str, cap_bytes: int, incoming_bytes: int = 0,
+) -> int:
+    """Delete least-recently-modified files matching ``pattern`` until the directory
+    holds at most ``cap_bytes``, counting ``incoming_bytes`` as already present.
+
+    Returns the number of files deleted. Callers treat a cache miss as a re-fetch,
+    so losing a file is a cost and never an error; a file that vanishes underneath
+    (a concurrent replica sharing the directory) is skipped rather than raised on.
+    """
+    entries = []
+    for path in directory.glob(pattern):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append((stat.st_mtime, stat.st_size, path))
+
+    total = sum(size for _, size, _ in entries) + incoming_bytes
+    deleted = 0
+    for _, size, path in sorted(entries, key=lambda e: e[0]):
+        if total <= cap_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        deleted += 1
+    return deleted
 
 
 def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, Any]:

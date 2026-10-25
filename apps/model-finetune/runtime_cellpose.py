@@ -37,6 +37,10 @@ logger = bioengine.logger
 # package's self-test output; diameter is cpsam's mean-diameter prior.
 _SERVE_DIAMETER = 30.0
 
+# Disk budget for cached soup members; see _evict_members. Override with
+# BIOENGINE_SOUP_CACHE_MAX_BYTES.
+_SOUP_CACHE_MAX_BYTES = 24 * 1024 ** 3
+
 
 def _read_pip(name: str) -> List[str]:
     text = (Path(__file__).parent / name).read_text()
@@ -229,6 +233,32 @@ class CellposeRuntime:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _evict_members(self, incoming_bytes: int = 0) -> None:
+        """Keep the on-disk member cache under its byte cap, dropping LRU first.
+
+        The cap exists because the cache is filled by candidates WEIGHED, not by
+        members admitted: the best-first ordering pass scores every candidate in the
+        batch, so a merge touches up to ``max_batch`` (default 32) members whatever
+        it ends up admitting. Unbounded, that accumulates across merges for the
+        replica's whole lifetime — the same shape as the RAM cache whose saturation
+        at the batch bound OOM-killed this replica (two kills, on a 4-member and a
+        16-member merge, with peaks within 0.8% of each other).
+
+        Overflowing the cap costs a re-download, never a failure, so the default is
+        a disk budget rather than a derived figure: one cpsam member's real size has
+        not been measured here, so "big enough for a 32-candidate batch" is not a
+        claim this code can make. Raise it if re-downloads show up mid-merge and the
+        volume behind ``$HOME`` has room.
+        """
+        import pool
+
+        pool.evict_lru_to_cap(
+            self._soup_dir(), "member-*.pt",
+            cap_bytes=int(os.environ.get(
+                "BIOENGINE_SOUP_CACHE_MAX_BYTES", _SOUP_CACHE_MAX_BYTES)),
+            incoming_bytes=incoming_bytes,
+        )
+
     @staticmethod
     def _unwrap_sd(obj):
         if isinstance(obj, dict) and "model_state_dict" in obj:
@@ -249,10 +279,13 @@ class CellposeRuntime:
         from urllib.request import urlopen
 
         cached = self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
-        if not cached.exists():
+        if cached.exists():
+            os.utime(cached)  # mark as most-recently-used for _evict_members
+        else:
             with urlopen(url, timeout=600) as resp:
                 content = resp.read()
             self._soup_dl_bytes += len(content)
+            self._evict_members(incoming_bytes=len(content))
             partial_file = cached.with_suffix(".part")
             partial_file.write_bytes(content)
             partial_file.rename(cached)
