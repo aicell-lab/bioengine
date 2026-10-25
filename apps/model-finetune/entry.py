@@ -1248,6 +1248,30 @@ class EntryApp:
             "witness_metric": manifest.get("witness_metric"),
         }
 
+    async def _next_free_community_version(self, am, pool_artifact_id: str, index: Dict[str, Any]) -> str:
+        """The next ``vN`` that is not already published.
+
+        pool.next_community_version derives it from the index pointer alone, so a pool
+        whose pointer was never committed (an aggregate interrupted between its two
+        commits) gets back a version whose weights are already on disk — and publishing
+        onto it overwrites an immutable community checkpoint in place. Probe the manifest
+        and advance past anything already there."""
+        import pool
+
+        v = pool.next_community_version(index)
+        for _ in range(100):
+            try:
+                await self._read_community_manifest(am, pool_artifact_id, v)
+            except FileNotFoundError:
+                return v
+            logger.warning(
+                f"community {v} is already published in '{pool_artifact_id}' but the index "
+                f"does not name it (an interrupted publish); advancing rather than "
+                f"overwriting it."
+            )
+            v = f"v{int(v.lstrip('v')) + 1}"
+        raise RuntimeError(f"no free community version below v100 in '{pool_artifact_id}'.")
+
     async def _resolve_pool_init(
         self, model_type, init_from_pool, pool_token, community_version=None
     ):
@@ -1670,7 +1694,7 @@ class EntryApp:
             baseline_version = cc["version"] if (cc and cc.get("path")) else "stock-cpsam"
 
             if changed:
-                new_version = pool.next_community_version(index)
+                new_version = await self._next_free_community_version(am, pool_artifact_id, index)
                 head_a = s_a
                 head_b = await _score(s_paths, wit_imgs, wit_gts)
                 sel_metric = pool.round_metric(
