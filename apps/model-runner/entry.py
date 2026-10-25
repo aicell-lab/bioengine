@@ -189,6 +189,12 @@ class EntryDeployment:
     # that wrote them and ``_recover_infer_jobs`` rebuilds the in-memory
     # registry from them at startup. Without this, scaling the Entry tier
     # to zero and back discards results of inferences that already ran.
+    #
+    # This inherits the assumption above: a replica that comes back on a
+    # different node must read what the previous one wrote, so the app's
+    # HOME has to be on storage shared by every node the deployment can
+    # land on. The entry→runtime input/output handoff already requires
+    # that; recovery just makes the dependency outlive a single request.
     _JOB_FILE_NAME = "job.json"
 
     def __init__(
