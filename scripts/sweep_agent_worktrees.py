@@ -60,11 +60,15 @@ OWNED_IF_TOUCHED_WITHIN = 24 * 3600
 
 # The registry lookup behind `myco session send` is flaky per-process: a session
 # that resolves one minute answers "names no host" the next, so one miss is not
-# evidence the recipient is gone. Retries do not cover every case, though — a
-# session on the legacy node-daemon plane is invisible to the mesh permanently,
-# and six sends 15s apart all failed identically. So exhausting the attempts is
-# a plumbing fault, not a sweep finding: the report goes to the fallback file
-# and the run still succeeds. Only a real gate failure may fail the run.
+# evidence the recipient is gone. Retries do not cover every case, though. A
+# recipient resolves only inside its own MYCOLAB_WORKSPACE, and the errors for
+# the wrong workspace never mention one — they blame a lost daemon index or a
+# legacy session plane, and they are permanent, so retrying cannot clear them
+# (measured: six sends 15s apart, two wrong workspaces, 6/6 identical failures;
+# the same recipient answered first try once correctly scoped).
+# Either way the recipient being unreachable is a plumbing fault, not a sweep
+# finding, so the report goes to the fallback file and the run still succeeds.
+# Only a real gate failure, or losing the report entirely, may fail the run.
 NOTIFY_ATTEMPTS = int(os.environ.get("SWEEP_NOTIFY_ATTEMPTS", "3"))
 NOTIFY_RETRY_SECONDS = float(os.environ.get("SWEEP_NOTIFY_RETRY_SECONDS", "20"))
 NOTIFY_FALLBACK_DEFAULT = os.path.join(
