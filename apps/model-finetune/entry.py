@@ -200,6 +200,16 @@ class EntryApp:
         # own bounds, but neither sees that an aggregate is what is holding them.
         self._merges_in_flight = 0
         self._busy = busy.BusyLog({"aggregate": lambda: self._merges_in_flight > 0})
+        # One merge at a time per pool. aggregate() picks its community version by
+        # probing which ones exist and then spends minutes building the soup before
+        # publishing, so two overlapping calls both read the same free vN. Hypha does
+        # not arbitrate it: two callers can hold stage=True on one artifact at once,
+        # and the first commit clears the single artifact-level flag, so a caller's
+        # commit can report success over bytes another caller PUT.
+        # This is process-local and that is sufficient ONLY because EntryApp is pinned
+        # to max_replicas=1 (see the deployment decorator) — every aggregate lands in this
+        # process. Raising max_replicas voids it and needs a pool-side lease instead.
+        self._pool_locks: Dict[str, asyncio.Lock] = {}
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -1714,6 +1724,18 @@ class EntryApp:
         wit_imgs, wit_gts = await self._resolve_val_split(witness_val_images, witness_val_labels)
 
         am, client = await self._pool_service(pool_token)
+        # Held from the index read to the index commit, not just around the publish:
+        # a merge that only locked the publish would still have built its soup from
+        # the head it read before waiting, and committing that would drop the merge
+        # that ran while it waited. Serialised, the second caller re-reads the index
+        # and weighs what is genuinely still undecided.
+        lock = self._pool_locks.setdefault(pool_artifact_id, asyncio.Lock())
+        if lock.locked():
+            logger.info(
+                f"aggregate() is waiting: another merge holds '{pool_artifact_id}'. "
+                f"Scores already earned are in the pool journal, so the wait is not lost work."
+            )
+        await lock.acquire()
         self._merges_in_flight += 1
         try:
             index = await self._read_pool_index(am, pool_artifact_id)
@@ -1943,6 +1965,7 @@ class EntryApp:
             await self._commit_with_retry(am, pool_artifact_id)
         finally:
             self._merges_in_flight -= 1
+            lock.release()
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
