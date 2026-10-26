@@ -611,7 +611,8 @@ def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
 def append_merge(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append one merge event to the timeline. ``entry`` carries
     ``{published_version|None, baseline_version, members[{contribution_id,
-    gate_score, included}], selection_metric (RoundMetric role=selection),
+    marginal_score, gate_score, included}] (admission-ordered, see
+    ``community_manifest``), selection_metric (RoundMetric role=selection),
     witness_metric (RoundMetric role=witness, or None when nothing was admitted),
     global_sha256|None, transport, deferred[], created_at}``. A merge with
     ``published_version=None`` admitted nothing and projects to an empty_merge
@@ -674,11 +675,17 @@ def build_community_manifest(
     is the only number the improvement curve plots — reporting the selection metric
     as the curve would be circular. Both are role-tagged RoundMetric records, so the
     role is a property of the stored artifact, not an assignment the page makes.
-    ``members`` records every candidate weighed as ``{contribution_id, gate_score,
-    included}`` for internal audit (a rejected candidate reads "evaluated, not
-    included", never a failure); the per-member gate_score is audit-only and is
-    stripped from the wire projection. ``combine`` is "uniform" unless sample-
-    weighting was empirically justified for this version."""
+    ``members`` records every candidate weighed as ``{contribution_id,
+    marginal_score, gate_score, included}`` for internal audit (a rejected candidate
+    reads "evaluated, not included", never a failure), **in the order the gate
+    weighed them** — the admitted subsequence is the order ``uniform_soup``
+    accumulated in, and float addition is not associative, so reordering this list
+    loses the only record of which checkpoint was published. ``marginal_score`` is
+    what that ordering was sorted on (the candidate's score against the head as it
+    stood); ``gate_score`` is the cumulative score of the soup including it, so the
+    two are not interconvertible. Both are audit-only and stripped from the wire
+    projection. ``combine`` is "uniform" unless sample-weighting was empirically
+    justified for this version."""
     return {
         "schema_version": SCHEMA_VERSION,
         "community_version": community_version,
@@ -746,7 +753,7 @@ def assert_compatible(index: Dict[str, Any], *, model_type: str, signature: str)
 # The backend stores pool_index.json in its own shape; the campaign page reads the
 # subset below. This projection is where the page's data model is produced: it
 # partitions the merge timeline into published soups and empty merges, strips the
-# audit-only per-member gate_score (a per-candidate score in the wire payload is a
+# audit-only per-member scores (a per-candidate score in the wire payload is a
 # contract violation — assessed is IDs only), and surfaces the role-tagged metrics
 # straight from storage. Pure and torch-free so the contract is unit-testable.
 

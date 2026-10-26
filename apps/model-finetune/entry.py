@@ -1873,7 +1873,8 @@ class EntryApp:
                 cid = c["contribution_id"]
                 trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
                 included = trial_a >= (s_a - eps)
-                members_record.append({"contribution_id": cid, "gate_score": round(trial_a, 4), "included": bool(included)})
+                members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
+                                       "gate_score": round(trial_a, 4), "included": bool(included)})
                 if included:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)

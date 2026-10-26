@@ -55,7 +55,7 @@ SOUP1_A, SOUP1_B = 0.8300, 0.8478
 
 
 def _member(cid, score, included):
-    return {"contribution_id": cid, "gate_score": score, "included": included}
+    return {"contribution_id": cid, "marginal_score": score, "gate_score": score, "included": included}
 
 
 def _synthetic_index():
@@ -207,8 +207,8 @@ class TestWireShape:
 
 
 class TestAssessedIsIdsOnly:
-    """A per-candidate gate_score in the wire payload is a contract violation:
-    ``assessed`` is IDs only, and the audit-only gate_score must not leak."""
+    """A per-candidate score in the wire payload is a contract violation:
+    ``assessed`` is IDs only, and the audit-only per-member scores must not leak."""
 
     def test_assessed_and_contributions_are_id_strings(self, wire):
         for soup in wire["soups"]:
@@ -221,10 +221,11 @@ class TestAssessedIsIdsOnly:
         assert s0["assessed"] == ["alpha-0", "beta-0"]
         assert s0["contributions"] == ["alpha-0"]
 
-    def test_no_gate_score_anywhere_in_the_wire(self, wire):
+    def test_no_per_member_score_anywhere_in_the_wire(self, wire):
         import json
 
         assert "gate_score" not in json.dumps(wire)
+        assert "marginal_score" not in json.dumps(wire)
 
 
 class TestContributionDisposition:
