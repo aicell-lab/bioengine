@@ -331,7 +331,7 @@ class CodeExecutor:
         ),
         remote_options: Optional[Dict[str, Any]] = Field(
             None,
-            description="Ray remote task configuration for resource allocation. Supported keys: 'num_cpus' (number of CPU cores), 'num_gpus' (number of GPU devices), 'memory' (bytes), 'runtime_env' (Python environment). Example: {'num_cpus': 4, 'num_gpus': 1, 'memory': 2000000000}.",
+            description="Ray remote task configuration for resource allocation. Supported keys: 'num_cpus' (number of CPU cores), 'num_gpus' (number of GPU devices), 'memory' (bytes), 'runtime_env' (Python environment). Any other key is forwarded to Ray's .options() and validated by Ray, except 'resources', which is rejected here because Ray accepts it and the task then dies with an unrelated error. Example: {'num_cpus': 4, 'num_gpus': 1, 'memory': 2000000000}.",
         ),
         write_stdout: Optional[Callable[[str], None]] = Field(
             None,
@@ -373,6 +373,10 @@ class CodeExecutor:
         - num_gpus: Number of GPU devices (integer, default: 0)
         - memory: Memory allocation in bytes (integer, default: unlimited)
         - runtime_env: Python environment configuration (dict, default: current environment)
+        Any other key is forwarded to Ray's .options() and validated by Ray. The one
+        exception is 'resources', which is rejected here: Ray accepts it, but the
+        nested dict reaches it as a Hypha RPC ObjectProxy and the task then dies with
+        an unrelated error, whatever the dict asks for.
 
         REAL-TIME MONITORING: Stream execution output using callback functions:
         - write_stdout: Receives each line of standard output as it's generated
@@ -470,6 +474,18 @@ class CodeExecutor:
         # Configure Ray task with resource options (validates provided remote_options)
         remote_options = remote_options or {}
         try:
+            if "resources" in remote_options:
+                # Ray takes this key, but the nested dict reaches it as a Hypha RPC
+                # ObjectProxy, which Ray's submit_task rejects outright; over a Ray
+                # client the options are re-pickled in the head pod instead, where
+                # unpickling the proxy raises ModuleNotFoundError for hypha_rpc.
+                raise ValueError(
+                    "Unsupported remote_options key 'resources'. Nested values arrive "
+                    "from Hypha RPC as an ObjectProxy rather than a dict, and Ray then "
+                    "fails the task with an unrelated error ('Expected dict, got "
+                    "ObjectProxy', or 'No module named hypha_rpc' via a Ray client). "
+                    "Supported keys: 'num_cpus', 'num_gpus', 'memory', 'runtime_env'."
+                )
             configured_ray_task = ray_task.options(**remote_options)
         except ValueError as e:
             return {
