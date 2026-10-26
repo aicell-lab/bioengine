@@ -29,9 +29,11 @@ from typing import Any, Dict, List
 
 # The defect is that peak RSS GREW with member count, so the gate is on the slope,
 # not on the absolute ratio. An absolute ceiling measures the fixed interpreter +
-# torch-import overhead as much as the merge: the same flat implementation reads
-# 2.87x with 256 MiB members and 5.49x with 64 MiB ones, because that fixed cost is
-# divided by a smaller member. Growth is the property and is size-robust.
+# torch-import overhead as much as the merge: on one host the same flat
+# implementation read 2.87x with 256 MiB members and 5.49x with 64 MiB ones, because
+# that fixed cost is divided by a smaller member. The ratio therefore does NOT
+# transfer across environments — a worker container on torch 2.7.1+cu126 read 3.63x
+# at the same 256 MiB. Growth is the property and is size- and host-robust.
 # Budgeted as one member's worth across the whole sweep; the pre-fix combine spends
 # one per member added (+14.00x from 2 to 16).
 MAX_GROWTH = 1.0
