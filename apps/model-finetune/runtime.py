@@ -9,9 +9,12 @@ predict+test. Fine-tuning runs in a **subprocess** so the OS reclaims all
 training VRAM on exit; the resident inference model is evicted first so the
 subprocess gets the whole GPU.
 
-Autoscaling (``max_replicas=3``, ``target=1``) lets a long training run hold one
-GPU replica's lock while concurrent inference requests spin up and run on the
-other GPU replicas — training and inference at the same time.
+Autoscaling declares ``max_replicas=3``. The per-replica target it also declared
+was spelled with a field name Ray Serve removed, so the effective target has
+always been Serve's default of 2 (#0091) — at which a long training plus one
+concurrent inference asks for one replica, not two. This runtime has therefore
+never run training and inference on separate GPU replicas; whether to pin it to
+one replica or restore the eager target is open as #0097.
 
 Import rule: heavy deps (``torch``, ``micro_sam``, ``segment_anything``) are
 imported inside method bodies so the ``@bioengine.app`` decorator module stays
@@ -69,10 +72,9 @@ def _read_pip(name: str) -> List[str]:
         "min_replicas": 1,
         "initial_replicas": 1,
         "max_replicas": 3,
-        # target=1: a single concurrent op (a long train + one infer) is enough
-        # to spin the 2nd GPU replica, so training and inference run at the same
-        # time on the two GPUs instead of queueing on one lock.
-        "target_num_ongoing_requests_per_replica": 1.0,
+        # No target declared on purpose: the name this dict used is one Serve
+        # removed, so the effective target is Serve's default of 2 either way
+        # (#0091), and declaring 1.0 now is a behaviour change, not a fix (#0097).
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
         "downscale_delay_s": 600,
