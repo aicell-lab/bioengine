@@ -392,7 +392,7 @@ def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
         # Scale up when >3 ongoing per replica — with 1 replica and
         # 4 ongoing (1 running + 3 queued behind the lock), metric
         # 4/1 > 3 triggers a scale-up to 2. Then 4/2 = 2 ≤ 3 → stay.
-        "target_num_ongoing_requests_per_replica": 3.0,
+        "target_ongoing_requests": 3.0,
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
         # 10 min after the last scale-up condition clears before

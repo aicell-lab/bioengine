@@ -58,6 +58,22 @@ SCRIPT_REF = re.compile(r"(/[\w./@+-]+\.(?:sh|py|js|ts))")
 MAX_WATCHER_FILE_BYTES = 2 * 1024 * 1024
 OWNED_IF_TOUCHED_WITHIN = 24 * 3600
 
+# The registry lookup behind `myco session send` is flaky per-process: a session
+# that resolves one minute answers "names no host" the next, so one miss is not
+# evidence the recipient is gone. Retries do not cover every case, though. A
+# recipient resolves only inside its own MYCOLAB_WORKSPACE, and the errors for
+# the wrong workspace never mention one — they blame a lost daemon index or a
+# legacy session plane, and they are permanent, so retrying cannot clear them
+# (measured: six sends 15s apart, two wrong workspaces, 6/6 identical failures;
+# the same recipient answered first try once correctly scoped).
+# Either way the recipient being unreachable is a plumbing fault, not a sweep
+# finding, so the report goes to the fallback file and the run still succeeds.
+# Only a real gate failure, or losing the report entirely, may fail the run.
+NOTIFY_ATTEMPTS = int(os.environ.get("SWEEP_NOTIFY_ATTEMPTS", "3"))
+NOTIFY_RETRY_SECONDS = float(os.environ.get("SWEEP_NOTIFY_RETRY_SECONDS", "20"))
+NOTIFY_FALLBACK_DEFAULT = os.path.join(
+    os.path.expanduser("~"), ".cache", "bioengine-worktree-sweep", "last-report.md")
+
 
 def run(cmd, cwd=None, check=False):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -561,6 +577,9 @@ def main():
     ap.add_argument("--json", action="store_true", help="emit the full report as JSON")
     ap.add_argument("--notify", metavar="SESSION_ID",
                     help="send the summary to a session with `myco session send`; never removes anything")
+    ap.add_argument("--fallback-file", metavar="PATH", default=NOTIFY_FALLBACK_DEFAULT,
+                    help="where --notify writes the report when delivery fails "
+                         f"(default: {NOTIFY_FALLBACK_DEFAULT})")
     # The two knobs below exist so the gates can be exercised on a scratch repo
     # (scripts/test_sweep_agent_worktrees.py). Lowering --owned-within weakens
     # gate 3; narrowing --watcher-root weakens gate 4.
@@ -580,17 +599,30 @@ def main():
 
     if args.notify:
         body = summarise(rows, srows, baseline)
-        p = subprocess.run(
-            ["myco", "session", "send", args.notify, "--subject",
-             "Worktree sweep: %d of %d retirable"
-             % (sum(1 for r in rows if r["verdict"] in ("DONE", "STALE")), len(rows)),
-             "--body-file", "-"],
-            input=body, text=True, capture_output=True,
-        )
-        if p.returncode != 0:
-            print(f"FAILED to deliver the report to {args.notify}: {p.stderr.strip()}", file=sys.stderr)
+        cmd = ["myco", "session", "send", args.notify, "--subject",
+               "Worktree sweep: %d of %d retirable"
+               % (sum(1 for r in rows if r["verdict"] in ("DONE", "STALE")), len(rows)),
+               "--body-file", "-"]
+        for attempt in range(1, NOTIFY_ATTEMPTS + 1):
+            p = subprocess.run(cmd, input=body, text=True, capture_output=True)
+            if p.returncode == 0:
+                print(f"delivered to {args.notify}: {len(body)} bytes (attempt {attempt})")
+                return 0
+            print(f"delivery to {args.notify} failed (attempt {attempt}/{NOTIFY_ATTEMPTS}): "
+                  f"{p.stderr.strip()}", file=sys.stderr)
+            if attempt < NOTIFY_ATTEMPTS:
+                time.sleep(NOTIFY_RETRY_SECONDS)
+        try:
+            os.makedirs(os.path.dirname(args.fallback_file) or ".", exist_ok=True)
+            with open(args.fallback_file, "w") as fh:
+                fh.write(body)
+        except OSError as exc:
+            print(f"FAILED to deliver the report to {args.notify} after {NOTIFY_ATTEMPTS} "
+                  f"attempts, and the fallback write to {args.fallback_file} failed: {exc}",
+                  file=sys.stderr)
             return 1
-        print(f"delivered to {args.notify}: {len(body)} bytes")
+        print(f"undelivered to {args.notify} after {NOTIFY_ATTEMPTS} attempts; "
+              f"report written to {args.fallback_file} ({len(body)} bytes)", file=sys.stderr)
         return 0
 
     if args.json:

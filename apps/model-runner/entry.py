@@ -106,7 +106,7 @@ def _read_pip(name: str) -> List[str]:
         "min_replicas": 1,
         "initial_replicas": 1,
         "max_replicas": 1,
-        "target_num_ongoing_requests_per_replica": 1,
+        "target_ongoing_requests": 1,
     },
     health_check_period_s=30.0,
     health_check_timeout_s=30.0,
