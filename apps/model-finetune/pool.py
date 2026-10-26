@@ -166,19 +166,18 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
 # torch.load materialises them from the same file. Three member-equivalents on first
 # use, two on every later one.
 #
-# Measured on europa CPU against real cpsam members (348 keys, float32, 1.1348 GiB),
-# peak RSS above a bare torch process, swept over n = 2/4/8/16:
+# bench_soup_memory.py is the re-runnable gate for the flatness this relies on. At a
+# real cpsam member size (348 keys, float32, 1.1348 GiB) it holds: `--mode after
+# --member-mb 1162` is 2.68 GiB at every n in 2/4/8/16, growth +0.00x, and `--mode
+# before` is +13.98x over the same sweep, so the flat rows are a property of the
+# combine and not of the rig.
 #
-#   warm (member already cached)  2.2727 GiB = 2.00x a member, flat in n to 0.8 MiB
-#   cold (first download)         3.4076 GiB = 3.00x a member, flat in n to 0.6 MiB
-#   pre-fix combine, as control   1.528 + 1.1339*n GiB — one whole member per member
-#
-# So 3 is the cold path exactly, not slack — lowering it under-predicts first use, and
-# first use is the common case for a newly contributed member. The control is what
-# licenses leaving the member count out of the formula: it shares the rig and does
-# grow, so the flat rows above are a property of the combine, not of the measurement.
-# Its slope also reproduces the historical pre-fix fit (1.135 GiB/member), which broke
-# the 12 GiB declaration at eight members and reached ~21 GiB at sixteen.
+# What picks the factor is a different denominator, because the formula adds to a LIVE
+# base_bytes: growth above the process baseline, which is 2.00x a member warm and
+# 3.00x on a member's first use. So 3 is the cold peak exactly, not slack — lowering
+# it under-predicts first use, which is the common case for a newly contributed
+# member. (The cold path is the one thing the bench does not cover; measured
+# separately on the same members, flat in n to 0.6 MiB.)
 SOUP_RESIDENT_FACTOR = 3
 
 
