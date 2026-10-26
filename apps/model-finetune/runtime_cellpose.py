@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import bioengine
+import busy
 import numpy as np
 
 logger = bioengine.logger
@@ -102,6 +103,18 @@ class CellposeRuntime:
         # single-flight here for that model to hold.
         self._soup_sem = asyncio.Semaphore(1)
         self._soup_idle_rss: Optional[int] = None
+        # Both bounds, because a concurrent caller waits at both and which one it
+        # is waiting at is the whole diagnosis.
+        self._busy = busy.BusyLog(
+            {
+                "cpsam soup build (_soup_sem)": self._soup_sem.locked,
+                "cpsam GPU work (_gpu_lock)": self._gpu_lock.locked,
+            }
+        )
+
+    @bioengine.async_init
+    async def _start_busy_log(self) -> None:
+        self._busy.start()
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""

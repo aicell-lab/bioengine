@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import bioengine
+import busy
 import httpx
 import numpy as np
 import yaml
@@ -177,6 +178,10 @@ class EntryApp:
         # total (the number would otherwise under-count in the unsafe direction);
         # the final accumulation location is being settled with the campaign page.
         self._transport = self._load_transport()
+        # A merge is minutes to an hour on the entry; the runtimes report their
+        # own bounds, but neither sees that an aggregate is what is holding them.
+        self._merges_in_flight = 0
+        self._busy = busy.BusyLog({"aggregate": lambda: self._merges_in_flight > 0})
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -185,6 +190,7 @@ class EntryApp:
         )
         self._s3 = await self._hypha.get_service("public/s3-storage")
         self._http = httpx.AsyncClient(timeout=60.0)
+        self._busy.start()
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
 
     @bioengine.health_check
@@ -1682,6 +1688,7 @@ class EntryApp:
         wit_imgs, wit_gts = await self._resolve_val_split(witness_val_images, witness_val_labels)
 
         am, client = await self._pool_service(pool_token)
+        self._merges_in_flight += 1
         try:
             index = await self._read_pool_index(am, pool_artifact_id)
             if index.get("model_type") != model_type:
@@ -1909,6 +1916,7 @@ class EntryApp:
             (await self._http_retry("PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0)).raise_for_status()
             await self._commit_with_retry(am, pool_artifact_id)
         finally:
+            self._merges_in_flight -= 1
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:

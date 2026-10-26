@@ -50,6 +50,7 @@ def _load_runtime():
     """Import runtime_cellpose.py with its heavy deps stubbed out."""
     fake_be = types.ModuleType("bioengine")
     fake_be.app = lambda **kw: (lambda cls: cls)
+    fake_be.async_init = lambda f: f
     fake_be.logger = logging.getLogger("bench")
     sys.modules["bioengine"] = fake_be
 
