@@ -144,6 +144,23 @@ def architecture_signature(state_dict: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def state_dict_digest(state_dict: Dict[str, Any]) -> str:
+    """sha256 over a state_dict's keys, shapes, dtypes and raw weight bytes.
+
+    Digests the TENSORS rather than a file ``torch.save`` wrote: torch's zip
+    container embeds the target file's stem in every record name, so hashing the
+    saved bytes makes the digest a function of the filename and two merges of
+    identical members can never agree. This is reproducible by construction and
+    independent of the container format.
+    """
+    h = hashlib.sha256()
+    for name in sorted(state_dict):
+        t = state_dict[name]
+        h.update(f"{name}|{tuple(t.shape)}|{t.dtype}|".encode("utf-8"))
+        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
 # Entries that live in a cpsam state_dict but are data statistics rather than
 # learned weights: cellpose_model.py:78-79 registers both as
 # nn.Parameter(requires_grad=False), so they are float32 scalars with matching
