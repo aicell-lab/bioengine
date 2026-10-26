@@ -92,8 +92,10 @@ class RuntimeApp:
 
     def __init__(self) -> None:
         self.start_time = time.time()
-        # Serialises ALL GPU work (serving + training) within a replica; the
-        # queue this creates is what the autoscaler measures to add a 2nd replica.
+        # Serialises ALL GPU work (serving + training) within a replica. The queue
+        # it creates is what the autoscaler measures, but at the effective target
+        # of 2 (#0091) a single concurrent call waits here rather than adding a
+        # replica; it takes three in flight to ask for a second one.
         self._gpu_lock = asyncio.Lock()
         self._predictor = None
         self._segmenter = None
@@ -489,8 +491,9 @@ class RuntimeApp:
 
         Evicts the resident inference model first so the subprocess owns the GPU;
         the subprocess (``train_worker.py``) writes COMPLETED/FAILED to the
-        session status. Held for the run's duration → the ongoing-request count
-        drives autoscaling so concurrent inference lands on a second replica.
+        session status. Held for the run's duration, so concurrent inference
+        queues behind it on this replica — at the effective target of 2 (#0091) a
+        training plus one inference asks for one replica, not two (#0097).
         """
         import training
 

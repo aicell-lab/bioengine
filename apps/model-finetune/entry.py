@@ -785,7 +785,9 @@ class EntryApp:
                 **resolved,
             })
             # Long-running: this await holds one GPU runtime replica for the whole
-            # training run, so a concurrent infer is routed to a second replica.
+            # training run, and a concurrent infer queues behind it on that same
+            # replica — at the effective target of 2 (#0091) two calls in flight
+            # ask for one replica, not two (#0097).
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
             # so a session waiting here is not false-flagged STOPPED.
