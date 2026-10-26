@@ -85,6 +85,21 @@ def test_empty_is_rejected():
         pool.uniform_soup([])
 
 
+def test_an_empty_first_member_is_rejected_not_averaged_away():
+    """The guard used to be ``if not acc``, so an empty FIRST member left the
+    accumulator falsy, the branch re-entered on member 2, and the sum ran over
+    n-1 while the divisor stayed n — a soup scaled by (n-1)/n with nothing
+    raised. Later positions failed loudly on a KeyError, so only this one was
+    silent."""
+    with pytest.raises(ValueError, match="member 0 loaded an empty state_dict"):
+        pool.uniform_soup([dict] + [lambda: _sd(10.0)] * 3)
+
+
+def test_an_empty_later_member_is_rejected_by_the_same_guard():
+    with pytest.raises(ValueError, match="member 2 loaded an empty state_dict"):
+        pool.uniform_soup([lambda: _sd(10.0), lambda: _sd(10.0), dict])
+
+
 # ── l2_from_base is weight-only (#0070 requirement 2) ────────────────────────
 # diam_labels and diam_mean are registered as non-learned nn.Parameter
 # (cellpose_model.py:78-79), so they sit in the state dict as float32 scalars

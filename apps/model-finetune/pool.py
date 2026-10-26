@@ -405,9 +405,13 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
         raise ValueError("uniform_soup requires at least one state_dict")
     acc: Dict[str, Any] = {}
     dtypes: Dict[str, Any] = {}
-    for load in loaders:
+    for index, load in enumerate(loaders):
         sd = load()
-        if not acc:
+        if not sd:
+            raise ValueError(
+                f"uniform_soup member {index} loaded an empty state_dict"
+            )
+        if not index:
             dtypes = {key: value.dtype for key, value in sd.items()}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
                    for key, value in sd.items()}
