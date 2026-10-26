@@ -71,15 +71,15 @@ def _read_pip(name: str) -> List[str]:
     memory_mb=_RUNTIME_MEMORY_MB,
     pip=_read_pip("requirements-runtime-cellpose.txt"),
     max_ongoing_requests=10,
+    # One replica, not autoscaled. Serve chooses which replica to stop from node
+    # occupancy and replica age only, never from work in progress, so a second replica
+    # makes the one holding a live merge removable — and min_replicas bounds the count,
+    # not the identity (#0088). A burst is absorbed by one replica regardless, since
+    # max_ongoing_requests admits ten of them before an upscale can take any.
     autoscaling_config={
         "min_replicas": 1,
         "initial_replicas": 1,
-        "max_replicas": 3,
-        "target_num_ongoing_requests_per_replica": 1.0,
-        "metrics_interval_s": 2.0,
-        "look_back_period_s": 10.0,
-        "downscale_delay_s": 600,
-        "upscale_delay_s": 0.0,
+        "max_replicas": 1,
     },
     health_check_period_s=30.0,
     health_check_timeout_s=30.0,
