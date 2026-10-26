@@ -404,8 +404,9 @@ class CellposeRuntime:
         """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split,
         with the serving replica and the bytes this one call downloaded.
         ``members`` is a list of ``{"key": weights_path, "url": presigned_get}``;
-        empty scores the stock cpsam base. Downloads happen off-lock; segmentation
-        holds the shared GPU lock.
+        empty scores the stock cpsam base. Downloads happen off-lock; the soup build
+        is single-flight per replica, and segmentation holds the shared GPU lock — so
+        a concurrent caller waits twice, once per bound.
 
         ``soup_dl_bytes`` is this call's delta, not the replica's running total, so
         the caller can sum across passes without double-counting a warm replica or
@@ -413,23 +414,31 @@ class CellposeRuntime:
         import pool
 
         dl_before = self._soup_dl_bytes
-        soup = await asyncio.to_thread(self._build_soup, members)
         ckpt = None
-        async with self._gpu_lock:
-            if soup is not None:
-                import torch
+        try:
+            # ``_build_soup`` allocates the same soup the merge does, and ten of these
+            # can be admitted at once, so it is bounded by the same semaphore. The
+            # checkpoint is written here rather than under ``_gpu_lock`` because
+            # ``_segment`` loads it from disk: once it is on disk the resident copy is
+            # dead weight, and the lock wait below can be minutes.
+            async with self._soup_sem:
+                soup = await asyncio.to_thread(self._build_soup, members)
+                if soup is not None:
+                    import torch
 
-                ckpt = self._soup_dir() / f"soup-{uuid.uuid4().hex}.pt"
-                await asyncio.to_thread(lambda: torch.save(soup, str(ckpt)))
-            try:
+                    ckpt = self._soup_dir() / f"soup-{uuid.uuid4().hex}.pt"
+                    await asyncio.to_thread(lambda: torch.save(soup, str(ckpt)))
+                soup = None
+
+            async with self._gpu_lock:
                 gk = {"diameter": diam_mean}
                 masks = []
                 for image in images:
                     masks.append(await asyncio.to_thread(
                         self._segment, image, gk, str(ckpt) if ckpt else None, "cpsam"))
-            finally:
-                if ckpt and ckpt.exists():
-                    ckpt.unlink()
+        finally:
+            if ckpt and ckpt.exists():
+                ckpt.unlink()
         return {
             "f1": pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels]),
             "replica": self._replica_id(),
