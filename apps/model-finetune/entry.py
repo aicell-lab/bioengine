@@ -116,6 +116,24 @@ def _is_missing_file(exc: BaseException) -> bool:
     return bool(lines) and lines[-1].startswith("FileNotFoundError:")
 
 
+def _write_file_atomic(path: Path, content: bytes) -> None:
+    """Write ``content`` to ``path`` so no reader can observe a partial file.
+
+    The HOME caches are keyed on the request (pool, version, model id) and HOME is
+    shared by every call the worker serves, so two callers asking for the same thing
+    write the same path. ``write_bytes`` opens ``'wb'``, which truncates first — a
+    reader of a 1.2 GB checkpoint then sees a prefix, and identical content is no
+    defence because the problem is the length, not the bytes. The temp name carries
+    a uuid so concurrent writers cannot share it either.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(content)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -484,9 +502,13 @@ class EntryApp:
             w_url = await am.get_file(model_id, file_path=ps["source"])
             content = (await self._http_retry("GET", w_url, timeout=600.0)).content
             cache_dir.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(weights_path.write_bytes, content)
+            await asyncio.to_thread(_write_file_atomic, weights_path, content)
             meta = {"model_type": model_type}
-            meta_path.write_text(json.dumps(meta))
+            # kwargs.json is the commit marker for the pair above: the cache-hit branch
+            # gates on both files existing, so it must appear whole or not at all — a
+            # plain write_text makes it exist (empty) before it has content, and the
+            # reader then json.loads("").
+            _write_file_atomic(meta_path, json.dumps(meta).encode())
             return {"weights_path": str(weights_path), **meta}
         finally:
             if caller_client is not None:
@@ -1615,7 +1637,11 @@ class EntryApp:
         version_tag = re.sub(r"[^\w.-]", "_", str(community_version or (cc or {}).get("version") or "current"))
         dest = Path.home() / ".bioengine" / "pool_eval" / re.sub(r"[^\w.-]", "_", pool_artifact_id) / f"community_{version_tag}.pt"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(dest.write_bytes, content)
+        # dest is handed to the runtime as the checkpoint path below, so writing
+        # it in place would let a concurrent evaluation of the same community
+        # truncate ('wb') the file a torch.load is reading. Unique temp name:
+        # the path is keyed on (pool, version) only, so writers do collide.
+        await asyncio.to_thread(_write_file_atomic, dest, content)
         self._bump_transport(bytes_down=len(content))
 
         await self._check_runtime_available(model_type)
