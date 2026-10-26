@@ -310,3 +310,69 @@ def test_matches_fixture_corpus():
     assert set(soup["selection_metric"]) == ROUNDMETRIC_KEYS
     assert set(soup["witness_metric"]) == ROUNDMETRIC_KEYS
     assert set(prog["empty_merges"][0]) == EMPTY_MERGE_KEYS
+
+
+# ── soup member cache eviction (pool.evict_lru_to_cap) ───────────────────────
+# The cache this bounds is the one whose unbounded growth OOM-killed the soup
+# replica. It is filled by candidates WEIGHED (up to max_batch, default 32), not
+# by members admitted, and it outlives any one merge — so a cap, not a per-merge
+# clear, is what bounds it.
+
+
+def _cached_member(directory, name, size, mtime):
+    path = directory / name
+    path.write_bytes(b"\0" * size)
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_evicts_oldest_first_until_under_cap(tmp_path):
+    a = _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    b = _cached_member(tmp_path, "member-b.pt", 100, mtime=2_000)
+    c = _cached_member(tmp_path, "member-c.pt", 100, mtime=3_000)
+
+    assert pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=250) == 1
+    assert not a.exists()
+    assert b.exists() and c.exists()
+
+
+def test_incoming_bytes_make_room_before_the_write(tmp_path):
+    """``_fetch_member`` evicts BEFORE writing, so the file about to land has to be
+    counted or the cap is exceeded by exactly one member every time."""
+    _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    _cached_member(tmp_path, "member-b.pt", 100, mtime=2_000)
+
+    assert pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=250) == 0
+    assert pool.evict_lru_to_cap(
+        tmp_path, "member-*.pt", cap_bytes=250, incoming_bytes=100) == 1
+
+
+def test_under_cap_evicts_nothing(tmp_path):
+    kept = _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    assert pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=10_000) == 0
+    assert kept.exists()
+
+
+def test_only_the_pattern_is_evicted(tmp_path):
+    """The directory also holds transient soup-*/head-* scratch that the merge
+    unlinks itself; eviction must not reach into it."""
+    _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    scratch = _cached_member(tmp_path, "soup-deadbeef.pt", 5_000, mtime=500)
+
+    pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=50)
+    assert scratch.exists()
+
+
+def test_cap_is_actually_enforced_not_just_approached(tmp_path):
+    """Discrimination control for the three above: they assert a delete COUNT, which
+    a policy that evicts one file and stops would also satisfy. This asserts the
+    post-condition the cap exists for — total on disk is at or under it — against a
+    directory that needs several evictions, and fails for a policy that under-evicts."""
+    for i in range(10):
+        _cached_member(tmp_path, f"member-{i}.pt", 100, mtime=1_000 + i)
+
+    pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=250)
+    remaining = sorted(p.name for p in tmp_path.glob("member-*.pt"))
+    assert sum(p.stat().st_size for p in tmp_path.glob("member-*.pt")) <= 250
+    # and it kept the NEWEST, not an arbitrary two
+    assert remaining == ["member-8.pt", "member-9.pt"]
