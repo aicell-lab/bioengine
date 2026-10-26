@@ -83,3 +83,83 @@ def test_no_member_is_resident_once_merged():
 def test_empty_is_rejected():
     with pytest.raises(ValueError):
         pool.uniform_soup([])
+
+
+# ── l2_from_base is weight-only (#0070 requirement 2) ────────────────────────
+# diam_labels and diam_mean are registered as non-learned nn.Parameter
+# (cellpose_model.py:78-79), so they sit in the state dict as float32 scalars
+# with matching shapes and pass every dtype/shape filter the drift metric had.
+# A site's median object diameter differs from the base's by tens of pixels
+# while real weight motion is single digits, which made the contributor-facing
+# l2_from_base ~99.5% diameter metadata and inverted the per-site ordering.
+
+BASE_DIAM = 30.0
+SITE_DIAM = 117.353
+
+
+def _ckpt(weight_value, diam, prefix=""):
+    sd = _sd(weight_value)
+    sd[f"{prefix}diam_labels"] = torch.tensor([diam])
+    sd[f"{prefix}diam_mean"] = torch.tensor([diam])
+    return sd
+
+
+def test_l2_from_base_ignores_a_moved_diam_scalar() -> None:
+    """A contribution whose *only* difference from its base is the diameter has
+    not moved its weights at all, so its reported drift must be exactly zero."""
+    base = _ckpt(1.0, BASE_DIAM)
+    current = _ckpt(1.0, SITE_DIAM)
+
+    assert pool.state_dict_l2_from_base(current, base) == 0.0
+
+
+def test_l2_from_base_reports_weight_motion_not_diameter_spread() -> None:
+    base = _ckpt(1.0, BASE_DIAM)
+    current = _ckpt(1.1, SITE_DIAM)
+
+    measured = pool.state_dict_l2_from_base(current, base)
+
+    # 6 weight elements each moved 0.1; the two diam scalars each moved 87.353.
+    weight_only = (6 * 0.1**2) ** 0.5
+    with_diameter = (6 * 0.1**2 + 2 * (SITE_DIAM - BASE_DIAM) ** 2) ** 0.5
+    assert measured == pytest.approx(weight_only, rel=1e-5)
+    # The discrimination control: the two answers differ by ~500x, so this test
+    # cannot pass by accident on a metric that still counts the diameter.
+    assert with_diameter / weight_only > 100
+    assert measured < with_diameter / 100
+
+
+def test_a_module_prefixed_diam_scalar_is_excluded_too() -> None:
+    """The same checkpoint reaches this code bare or module-prefixed depending on
+    how it was wrapped when saved, so the exclusion keys off the last component."""
+    base = _ckpt(1.0, BASE_DIAM, prefix="net.")
+    current = _ckpt(1.0, SITE_DIAM, prefix="net.")
+
+    assert pool.state_dict_l2_from_base(current, base) == 0.0
+
+
+def test_a_nonweight_name_does_not_swallow_a_real_weight() -> None:
+    """A substring match would drop any learned tensor whose name merely contains
+    one of the excluded names, silently under-reporting drift instead of over."""
+    base = {"encoder.diam_labels_proj.weight": torch.full((4,), 1.0)}
+    current = {"encoder.diam_labels_proj.weight": torch.full((4,), 1.1)}
+
+    assert not pool.is_non_weight_param("encoder.diam_labels_proj.weight")
+    assert pool.state_dict_l2_from_base(current, base) == pytest.approx(
+        (4 * 0.1**2) ** 0.5, rel=1e-5
+    )
+
+
+def test_the_merge_still_averages_diam_so_requirement_1_stays_open() -> None:
+    """NOT evidence the diameter defect is fixed — the opposite.
+
+    uniform_soup still takes a uniform mean over the diameter scalars, which is
+    #0070 requirement 1, and that has no defined output until requirement 3
+    (what a community checkpoint should carry instead) is decided. This pins the
+    open half so that implementing it announces itself here rather than passing
+    unnoticed.
+    """
+    out = pool.uniform_soup([lambda: _ckpt(1.0, 29.711), lambda: _ckpt(1.0, 54.986),
+                             lambda: _ckpt(1.0, 28.912), lambda: _ckpt(1.0, 117.353)])
+
+    assert float(out["diam_labels"][0]) == pytest.approx(57.7405, rel=1e-4)

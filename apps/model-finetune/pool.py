@@ -144,17 +144,45 @@ def architecture_signature(state_dict: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# Entries that live in a cpsam state_dict but are data statistics rather than
+# learned weights: cellpose_model.py:78-79 registers both as
+# nn.Parameter(requires_grad=False), so they are float32 scalars with matching
+# shapes and pass every dtype/shape filter. requires_grad is not serialised, so
+# a state_dict carries no way to tell them apart — the name is the only handle,
+# and it must come from the key (storage keys inside a .pt are bare positional
+# integers and position is not stable across writers).
+NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
+
+
+def is_non_weight_param(key: str) -> bool:
+    """True for a state_dict key holding a data statistic, not a learned weight.
+
+    Matches on the final dot-component because the same checkpoint reaches us
+    both bare and module-prefixed depending on how it was wrapped when saved.
+    """
+    return key.rsplit(".", 1)[-1] in NON_WEIGHT_PARAMS
+
+
 def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> float:
-    """L2 distance between two state_dicts over shared floating-point params — how
-    far a contribution's weights moved from the checkpoint it started from. A drift
-    proxy recorded on every contribution; its use as an acceptance BOUND is a
-    pending aggregation decision, so this only measures, it does not gate."""
+    """L2 distance between two state_dicts over shared learned weights — how far a
+    contribution's weights moved from the checkpoint it started from. A drift proxy
+    recorded on every contribution; its use as an acceptance BOUND is a pending
+    aggregation decision, so this only measures, it does not gate.
+
+    Non-weight entries are excluded: a site's median object diameter differs from
+    the base's by tens of pixels while real weight motion is single digits, so
+    including it made this field ~99.5% diameter metadata and inverted the
+    per-site ordering it implies (it reported one site as having moved 17x
+    further than another where the weights say 1.3x).
+    """
     import torch
 
     total = 0.0
     for key, cur in current.items():
         ref = base.get(key)
         if ref is None or not torch.is_floating_point(cur) or cur.shape != ref.shape:
+            continue
+        if is_non_weight_param(key):
             continue
         total += float(torch.sum((cur.detach().float() - ref.detach().float()) ** 2).item())
     return total ** 0.5
@@ -357,6 +385,12 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
     member regardless of member count. Taking a list and looping key-outer instead
     pins every member in RAM at once: at 16 cpsam members that measured ~27 GB
     against the runtime's 12 GiB reservation and the replica was OOM-killed.
+
+    Still averages ``NON_WEIGHT_PARAMS``, which is wrong and deliberately left:
+    what a community checkpoint should carry for an object diameter instead of a
+    mean is a product decision, and "stop averaging it" has no defined output
+    until that is answered (#0070 requirement 3). Only the contributor-facing
+    ``state_dict_l2_from_base`` is fixed so far.
 
     Every member must share one parameter layout (``assert_compatible`` guards this
     at contribute + aggregate time), so the mean is well-defined per key. cpsam is
