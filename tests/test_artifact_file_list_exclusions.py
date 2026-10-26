@@ -1,20 +1,28 @@
-"""Unit tests for what ``create_file_list_from_directory`` refuses to ship.
+"""Tests for what ``create_file_list_from_directory`` refuses to ship.
 
 A committed artifact version is immutable and is exactly what a deploy runs, so a
 git-ignored local leftover swept into the file list is permanent and does not
 appear in git. ``bioimage-io/model-finetune`` 0.27.3 shipped four
 ``.pytest_cache/`` files that way while 0.27.1 was clean, which is #0085.
 
-These exercise the pure helper against real temporary directories, so they need
-no Hypha server. See ``test_artifact_version.py`` for live ``upload_app``
-coverage.
+Most of these exercise the pure helper against real temporary directories, so
+they need no Hypha server. The last one is live-gated and goes the whole way to
+a committed version, because the helper excluding a path and the *artifact* not
+carrying it are two different claims. It creates its scratch artifact in the
+test user's own workspace rather than in ``bioimage-io``, and deletes it again.
+
+Run the live one with:
+    source .env && pytest tests/test_artifact_file_list_exclusions.py --live
 """
 
 import subprocess
 
 import pytest
 
-from bioengine.utils.artifact_utils import create_file_list_from_directory
+from bioengine.utils.artifact_utils import (
+    create_application_from_files,
+    create_file_list_from_directory,
+)
 
 
 def _names(directory):
@@ -123,3 +131,77 @@ def test_without_a_work_tree_ordinary_files_still_ship(loose_app):
     above for the wrong reason."""
     (loose_app / "scratch.txt").write_text("not ignored by anything")
     assert _names(loose_app) == {"entry.py", "manifest.yaml", "scratch.txt"}
+
+
+@pytest.mark.asyncio
+async def test_a_committed_version_does_not_carry_a_gitignored_file(
+    tmp_path, hypha_client, artifact_manager
+):
+    """The clause the unit tests above cannot settle: that the *artifact* is clean.
+
+    The scratch artifact is created in the connected user's own workspace, not in
+    ``bioimage-io``, and is deleted on the way out. The staged file is asserted to
+    be git-ignored before the upload, so a silent no-op in the staging step cannot
+    make the absence assertion pass for the wrong reason.
+    """
+    _git_init(tmp_path, ".pytest_cache/\n")
+    alias = "gitignore-exclusion-test-pytest"
+    app = _app(tmp_path / "apps")
+    (app / "manifest.yaml").write_text(
+        "name: Gitignore Exclusion Test\n"
+        f"id: {alias}\n"
+        'id_emoji: "🧪"\n'
+        'description: "Temporary app used to test gitignored-file exclusion"\n'
+        "type: ray-serve\n"
+        "format_version: 0.6.0\n"
+        "version: 1.0.0\n"
+        "entry: entry:EntryApp\n"
+        "authors:\n"
+        "  - {name: \"Test\"}\n"
+        "license: MIT\n"
+        "authorized_users:\n"
+        '  - "*"\n'
+    )
+    (app / "entry.py").write_text(
+        "import bioengine\n\n\n"
+        '@bioengine.app(ray_actor_options={"num_cpus": 0, "num_gpus": 0})\n'
+        "class EntryApp:\n    pass\n"
+    )
+    cache = app / ".pytest_cache"
+    cache.mkdir()
+    (cache / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172")
+
+    staged = subprocess.run(
+        ["git", "-C", str(app), "check-ignore", ".pytest_cache/CACHEDIR.TAG"],
+        capture_output=True,
+        text=True,
+    )
+    assert staged.returncode == 0, "the staging step did nothing: git does not ignore it"
+
+    files = create_file_list_from_directory(app)
+    workspace = hypha_client.config.workspace
+    artifact_id = f"{workspace}/{alias}"
+
+    try:
+        await artifact_manager.delete(artifact_id)
+    except Exception:
+        pass
+
+    try:
+        saved_id = await create_application_from_files(
+            artifact_manager=artifact_manager,
+            files=files,
+            workspace=workspace,
+            user_id=hypha_client.config.user["id"],
+        )
+        committed = await artifact_manager.list_files(
+            artifact_id=saved_id, version="1.0.0"
+        )
+        names = {f["name"] for f in committed}
+        assert ".pytest_cache" not in names
+        assert {"manifest.yaml", "entry.py"} <= names
+    finally:
+        try:
+            await artifact_manager.delete(artifact_id)
+        except Exception:
+            pass
