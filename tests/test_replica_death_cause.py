@@ -171,6 +171,77 @@ def test_cause_survives_a_replica_whose_logs_cannot_be_read():
     assert logs["dd12spcw"]["death_cause"]["reason"] == "WORKER_DIED"
 
 
+def test_the_default_n_previous_replica_hides_the_cause_entirely():
+    """Why the CLI has to override it: at the default the dead replica is gone.
+
+    ``get_deployment_logs`` returns early when ``n_previous_replica == 0``, and
+    both the dead replica's logs and its ``death_cause`` are attached after
+    that return. Every other test here passes ``-1``, so this is the one that
+    pins the behaviour a caller gets by default.
+    """
+    actor = _deployment_actor(
+        death_causes={"a_dead": _WORKER_DIED},
+        alive={"live1": "a_live"},
+        registered={
+            "live1": ("a_live", 1.0, "UTC"),
+            "dd12spcw": ("a_dead", 2.0, "UTC"),
+        },
+    )
+    logs = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
+    assert set(logs) == {"live1"}
+    assert not any("death_cause" in streams for streams in logs.values())
+
+
+def test_apps_logs_asks_for_the_dead_replica():
+    """The seam the rendering depends on: the request has to reach past 0.
+
+    Rendering is covered below with hand-built maps, which cannot catch a
+    caller that never asks for a dead replica — the field would simply never
+    be in the payload and every render test would still pass.
+    """
+    from unittest.mock import patch
+
+    from click.testing import CliRunner
+
+    from bioengine.cli import apps as apps_cli
+
+    seen = {}
+
+    async def _get_app_status(**kwargs):
+        seen.update(kwargs)
+        return {
+            "deployments": {
+                "CellposeRuntime": {
+                    "logs": {
+                        "dd12spcw": {
+                            "stdout": ["CALL ping OK 1.1ms"],
+                            "stderr": [],
+                            "death_cause": {
+                                "reason": "WORKER_DIED",
+                                "message": "Worker exit type: SYSTEM_ERROR",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+    async def _connect(*args, **kwargs):
+        return SimpleNamespace(get_app_status=_get_app_status)
+
+    with patch.object(
+        apps_cli, "require_worker", lambda w, t, s: ("http://srv", "ws/worker", "tok")
+    ), patch.object(apps_cli, "connect_worker", _connect):
+        result = CliRunner().invoke(apps_cli.logs, ["soup"])
+
+    assert result.exit_code == 0, result.output
+    assert seen.get("n_previous_replica", 0) >= 1
+    assert "died: WORKER_DIED" in result.output
+
+
 def _render(logs):
     """``bioengine apps logs`` output for one deployment's replica log map."""
     from click.testing import CliRunner

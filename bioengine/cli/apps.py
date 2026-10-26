@@ -546,6 +546,11 @@ def logs(app_id, tail, as_json, worker_service_id, token, server_url):
             result = await worker.get_app_status(
                 application_ids=[app_id],
                 logs_tail=tail,
+                # Defaults to 0, which returns live replicas only — and a dead
+                # replica's logs and its death_cause are both attached past
+                # that early return. Without this the crashed replica is
+                # invisible to the one command run after a crash.
+                n_previous_replica=1,
             )
         except Exception as exc:
             error_exit(f"Failed to get logs for '{app_id}': {exc}")
