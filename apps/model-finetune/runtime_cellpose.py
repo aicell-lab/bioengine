@@ -10,8 +10,10 @@ deployments by type hint and routes by ``model_type`` (cellpose types → here,
 ``vit_*`` → RuntimeApp).
 
 Mirrors ``RuntimeApp``'s contract: a single ``asyncio.Lock`` serialises all GPU
-work (serving + training); fine-tuning and export run in **subprocesses** so the
-OS reclaims their VRAM on exit; export is CPU-only. Heavy deps (``torch``,
+work (serving + training), and a separate semaphore keeps the federated merge
+single-flight because it is bounded by host RAM rather than by the GPU;
+fine-tuning and export run in **subprocesses** so the OS reclaims their VRAM on
+exit; export is CPU-only. Heavy deps (``torch``,
 ``cellpose``) are imported inside method bodies so the ``@bioengine.app``
 decorator module stays introspectable with only ``bioengine[worker]`` + stdlib.
 """
@@ -95,6 +97,11 @@ class CellposeRuntime:
         self._device_cached: Optional[str] = None
         self._gpu_mem_cached: Optional[Dict[str, Any]] = None
         self._soup_dl_bytes = 0
+        # The entry's admission check sizes ONE resident merge, but Serve's
+        # max_ongoing_requests admits ten into this replica — so merges must be
+        # single-flight here for that model to hold.
+        self._soup_sem = asyncio.Semaphore(1)
+        self._soup_idle_rss: Optional[int] = None
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""
@@ -109,11 +116,14 @@ class CellposeRuntime:
         """What this replica promised Ray, and what it is using — the two numbers
         aggregate()'s up-front admission check compares a merge against.
 
-        ``rss_bytes`` is the replica's real footprint right now, so the check sizes
-        a merge against the space actually left rather than against an empty
-        replica; it is None where /proc is unavailable. Ray kills on the NODE's
-        total, so fitting the declaration is necessary and not sufficient — a
-        co-tenant can still take the node over the threshold.
+        ``rss_bytes`` is the footprint the merge will actually start from, so the
+        check sizes it against the space left rather than against an empty replica;
+        it is None where /proc is unavailable. While another merge holds
+        ``_soup_sem`` the instantaneous RSS includes *that* merge, and the caller
+        asking will run alone once it releases — so the last idle sample is
+        reported instead, or the check would refuse a merge that fits. Ray kills on
+        the NODE's total, so fitting the declaration is necessary and not
+        sufficient — a co-tenant can still take the node over the threshold.
         """
         rss = None
         try:
@@ -121,7 +131,14 @@ class CellposeRuntime:
                 rss = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
         except Exception:
             pass
-        return {"declared_bytes": _RUNTIME_MEMORY_MB * 1024 ** 2, "rss_bytes": rss}
+        in_flight = self._soup_sem.locked()
+        if rss is not None and not in_flight:
+            self._soup_idle_rss = rss
+        return {
+            "declared_bytes": _RUNTIME_MEMORY_MB * 1024 ** 2,
+            "rss_bytes": self._soup_idle_rss if in_flight else rss,
+            "soup_in_flight": in_flight,
+        }
 
     async def gpu_memory_info(self) -> Dict[str, Any]:
         """Total/free VRAM of this runtime's GPU, for the entry's training gate
@@ -429,26 +446,29 @@ class CellposeRuntime:
         import pool
 
         dl_before = self._soup_dl_bytes
-        soup = await asyncio.to_thread(self._build_soup, members)
-        path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
-        await asyncio.to_thread(lambda: torch.save(soup, str(path)))
-        sha = await asyncio.to_thread(pool.sha256_file, str(path))
-        n_bytes = path.stat().st_size
+        # Returns from inside the semaphore so the soup and the PUT's own copy of it
+        # are both released before the next merge starts allocating.
+        async with self._soup_sem:
+            soup = await asyncio.to_thread(self._build_soup, members)
+            path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
+            await asyncio.to_thread(lambda: torch.save(soup, str(path)))
+            sha = await asyncio.to_thread(pool.sha256_file, str(path))
+            n_bytes = path.stat().st_size
 
-        def _put():
-            data = path.read_bytes()
-            with urlopen(Request(put_url, data=data, method="PUT"), timeout=600) as r:
-                r.read()
+            def _put():
+                data = path.read_bytes()
+                with urlopen(Request(put_url, data=data, method="PUT"), timeout=600) as r:
+                    r.read()
 
-        try:
-            await asyncio.to_thread(_put)
-        finally:
-            path.unlink()
-        return {
-            "sha256": sha, "n_bytes": n_bytes,
-            "replica": self._replica_id(),
-            "soup_dl_bytes": self._soup_dl_bytes - dl_before,
-        }
+            try:
+                await asyncio.to_thread(_put)
+            finally:
+                path.unlink()
+            return {
+                "sha256": sha, "n_bytes": n_bytes,
+                "replica": self._replica_id(),
+                "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+            }
 
     async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
         """Inspect a finished session's local cpsam checkpoint (architecture
