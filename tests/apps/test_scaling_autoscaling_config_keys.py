@@ -154,6 +154,19 @@ async def test_the_live_target_field_with_the_same_value_is_accepted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_non_dict_autoscaling_config_is_left_to_serve() -> None:
+    # The key check is `set(asc) - valid`, and `set()` on a non-mapping either
+    # raises TypeError or enumerates characters as key names — so an int would
+    # have escaped as an uncaught TypeError and a string would have been
+    # reported as the unknown keys 'f' and 'o'. Neither is this check's job;
+    # a malformed autoscaling_config reaches Serve exactly as it did before.
+    for bad in (5, "foo"):
+        manager = _make_manager()
+        await _deploy(manager, bad)
+        assert APP_ID in manager._deployed_applications
+
+
+@pytest.mark.asyncio
 async def test_every_unknown_key_is_listed_so_one_fix_round_is_enough() -> None:
     manager = _make_manager()
 

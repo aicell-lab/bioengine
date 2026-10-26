@@ -3165,10 +3165,12 @@ class AppsManager:
                         f"scaling entry for '{dep_name}' has num_replicas="
                         f"{nr}; must be >= 0."
                     )
-                if asc:
+                if isinstance(asc, dict):
                     # AutoscalingConfig drops unknown keys instead of raising, so
                     # a renamed field reaches Serve and is lost with no warning
                     # and the deployment silently runs on Serve's defaults.
+                    # Non-dicts are left to Serve, as before: set() on one either
+                    # raises TypeError or yields characters as key names.
                     valid_keys = set(AutoscalingConfig.model_fields)
                     unknown_keys = sorted(set(asc) - valid_keys)
                     if unknown_keys:
