@@ -169,3 +169,61 @@ def test_cause_survives_a_replica_whose_logs_cannot_be_read():
     )
     assert "rotated away" in logs["dd12spcw"]["stderr"][0]
     assert logs["dd12spcw"]["death_cause"]["reason"] == "WORKER_DIED"
+
+
+def _render(logs):
+    """``bioengine apps logs`` output for one deployment's replica log map."""
+    from click.testing import CliRunner
+
+    import click
+
+    from bioengine.cli.apps import _echo_deployment_logs
+
+    @click.command()
+    def cmd():
+        _echo_deployment_logs({"logs": logs})
+
+    result = CliRunner().invoke(cmd, [])
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_the_cli_shows_the_cause_a_dead_replica_s_own_logs_do_not_carry():
+    out = _render(
+        {
+            "dd12spcw": {
+                "stdout": ["CALL ping OK 1.1ms"],
+                "stderr": [],
+                "death_cause": {
+                    "reason": "WORKER_DIED",
+                    "message": "Worker exit type: SYSTEM_ERROR\nsecond line",
+                },
+            }
+        }
+    )
+    assert "died: WORKER_DIED" in out
+    assert "SYSTEM_ERROR" in out
+    # Ray's OOM text runs to kilobytes, so only the first line is rendered.
+    assert "second line" not in out
+    # The healthy-looking tail is still shown — it is why the cause is needed.
+    assert "CALL ping OK" in out
+
+
+def test_a_cause_with_no_log_lines_is_not_reported_as_nothing_logged():
+    out = _render(
+        {
+            "dd12spcw": {
+                "stdout": [],
+                "stderr": [],
+                "death_cause": {"reason": "RAY_KILL", "message": ""},
+            }
+        }
+    )
+    assert "died: RAY_KILL" in out
+    assert "No logs recorded yet" not in out
+
+
+def test_a_live_replica_renders_exactly_as_before():
+    out = _render({"live1": {"stdout": ["hello"], "stderr": []}})
+    assert "died:" not in out
+    assert out.splitlines() == ["[live1] stdout", "  hello"]

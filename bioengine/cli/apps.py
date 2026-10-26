@@ -603,6 +603,17 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
 
     printed = False
     for replica_id, streams in logs.items():
+        cause = streams.get("death_cause")
+        if cause:
+            # A replica killed mid-request writes no traceback, so its streams
+            # just stop; the reason is only in this field. First line only —
+            # Ray's OOM text runs to kilobytes and `--json` still has it whole.
+            message = (cause.get("message") or "").strip().splitlines()
+            click.echo(
+                f"{indent}[{replica_id}] died: {cause.get('reason') or 'UNKNOWN'}"
+                + (f" — {message[0]}" if message else "")
+            )
+            printed = True
         for stream in ("stdout", "stderr"):
             lines = streams.get(stream) or []
             if isinstance(lines, str):
