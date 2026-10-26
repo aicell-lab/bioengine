@@ -10,24 +10,28 @@ deployments by type hint and routes by ``model_type`` (cellpose types → here,
 ``vit_*`` → RuntimeApp).
 
 Mirrors ``RuntimeApp``'s contract: a single ``asyncio.Lock`` serialises all GPU
-work (serving + training); fine-tuning and export run in **subprocesses** so the
-OS reclaims their VRAM on exit; export is CPU-only. Heavy deps (``torch``,
+work (serving + training), and a separate semaphore keeps the federated merge
+single-flight because it is bounded by host RAM rather than by the GPU;
+fine-tuning and export run in **subprocesses** so the OS reclaims their VRAM on
+exit; export is CPU-only. Heavy deps (``torch``,
 ``cellpose``) are imported inside method bodies so the ``@bioengine.app``
 decorator module stays introspectable with only ``bioengine[worker]`` + stdlib.
 """
 
 import asyncio
 import gc
+import hashlib
 import os
 import subprocess
 import sys
 import time
 import uuid
-from io import BytesIO
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import bioengine
+import busy
 import numpy as np
 
 logger = bioengine.logger
@@ -35,6 +39,21 @@ logger = bioengine.logger
 # Match CellposeSAMWrapper's eval kwargs so served masks reproduce the exported
 # package's self-test output; diameter is cpsam's mean-diameter prior.
 _SERVE_DIAMETER = 30.0
+
+# A merge weighs up to a full candidate batch of 1.1 GiB members and is
+# all-or-nothing, so one truncated read loses every completed gate pass.
+_MEMBER_DOWNLOAD_ATTEMPTS = 4
+_MEMBER_DOWNLOAD_BACKOFF_S = 2.0
+
+# Disk budget for cached soup members; see _evict_members. Override with
+# BIOENGINE_SOUP_CACHE_MAX_BYTES.
+_SOUP_CACHE_MAX_BYTES = 24 * 1024 ** 3
+
+# What this deployment promises Ray. Named rather than inlined in the decorator so
+# soup_memory_budget() reports the figure actually in force: aggregate() rejects a
+# merge that would exceed it, and a second copy of the number would let the check
+# pass while the scheduler used a different one.
+_RUNTIME_MEMORY_MB = 12 * 1024
 
 
 def _read_pip(name: str) -> List[str]:
@@ -49,7 +68,7 @@ def _read_pip(name: str) -> List[str]:
 @bioengine.app(
     num_cpus=2,
     gpu_memory_mb=-1,
-    memory_mb=12 * 1024,
+    memory_mb=_RUNTIME_MEMORY_MB,
     pip=_read_pip("requirements-runtime-cellpose.txt"),
     max_ongoing_requests=10,
     autoscaling_config={
@@ -78,10 +97,24 @@ class CellposeRuntime:
         self._loaded_key: Optional[str] = None
         self._device_cached: Optional[str] = None
         self._gpu_mem_cached: Optional[Dict[str, Any]] = None
-        # Model-soup member state_dicts, keyed by their immutable pool weights_path
-        # (content-addressed → no staleness); populated on demand during aggregate.
-        self._soup_cache: Dict[str, Dict[str, Any]] = {}
         self._soup_dl_bytes = 0
+        # The entry's admission check sizes ONE resident merge, but Serve's
+        # max_ongoing_requests admits ten into this replica — so merges must be
+        # single-flight here for that model to hold.
+        self._soup_sem = asyncio.Semaphore(1)
+        self._soup_idle_rss: Optional[int] = None
+        # Both bounds, because a concurrent caller waits at both and which one it
+        # is waiting at is the whole diagnosis.
+        self._busy = busy.BusyLog(
+            {
+                "cpsam soup build (_soup_sem)": self._soup_sem.locked,
+                "cpsam GPU work (_gpu_lock)": self._gpu_lock.locked,
+            }
+        )
+
+    @bioengine.async_init
+    async def _start_busy_log(self) -> None:
+        self._busy.start()
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""
@@ -90,6 +123,34 @@ class CellposeRuntime:
             "loaded_checkpoint": self._loaded_key,
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
+        }
+
+    async def soup_memory_budget(self) -> Dict[str, Any]:
+        """What this replica promised Ray, and what it is using — the two numbers
+        aggregate()'s up-front admission check compares a merge against.
+
+        ``rss_bytes`` is the footprint the merge will actually start from, so the
+        check sizes it against the space left rather than against an empty replica;
+        it is None where /proc is unavailable. While another merge holds
+        ``_soup_sem`` the instantaneous RSS includes *that* merge, and the caller
+        asking will run alone once it releases — so the last idle sample is
+        reported instead, or the check would refuse a merge that fits. Ray kills on
+        the NODE's total, so fitting the declaration is necessary and not
+        sufficient — a co-tenant can still take the node over the threshold.
+        """
+        rss = None
+        try:
+            with open("/proc/self/statm") as fh:
+                rss = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except Exception:
+            pass
+        in_flight = self._soup_sem.locked()
+        if rss is not None and not in_flight:
+            self._soup_idle_rss = rss
+        return {
+            "declared_bytes": _RUNTIME_MEMORY_MB * 1024 ** 2,
+            "rss_bytes": self._soup_idle_rss if in_flight else rss,
+            "soup_in_flight": in_flight,
         }
 
     async def gpu_memory_info(self) -> Dict[str, Any]:
@@ -231,6 +292,47 @@ class CellposeRuntime:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _evict_members(self, incoming_bytes: int = 0) -> None:
+        """Keep the on-disk member cache under its byte cap, dropping LRU first.
+
+        The cap exists because the cache is filled by candidates WEIGHED, not by
+        members admitted: the best-first ordering pass scores every candidate in the
+        batch, so a merge touches up to ``max_batch`` (default 32) members whatever
+        it ends up admitting. Unbounded, that accumulates across merges for the
+        replica's whole lifetime — the same shape as the RAM cache whose saturation
+        at the batch bound OOM-killed this replica (two kills, on a 4-member and a
+        16-member merge, with peaks within 0.8% of each other).
+
+        Overflowing the cap costs a re-download, never a failure, so the default is
+        a disk budget and NOT sized to a full batch. At the measured cpsam member
+        size of 1.135 GiB, 24 GiB holds about 21 members; a full 32-candidate batch
+        would want 36.3 GiB and will re-download its oldest members. That is the
+        deliberate trade — the volume behind ``$HOME`` on the worker has not been
+        measured, and an unbounded cache is what this is fixing. Raise it if
+        re-downloads show up mid-merge and the volume has room.
+        """
+        import pool
+
+        pool.evict_lru_to_cap(
+            self._soup_dir(), "member-*.pt",
+            cap_bytes=int(os.environ.get(
+                "BIOENGINE_SOUP_CACHE_MAX_BYTES", _SOUP_CACHE_MAX_BYTES)),
+            incoming_bytes=incoming_bytes,
+        )
+
+    @staticmethod
+    def _replica_id() -> str:
+        """Which replica is serving this call.
+
+        A merge issues ~2n+3 gate passes as separate Serve calls, each routed
+        independently, while the member cache is ordinary instance state — so the
+        caller cannot account for a merge's transport, or notice a cold replica
+        re-downloading the member set, without knowing who answered each pass.
+        """
+        from ray import serve
+
+        return serve.get_replica_context().replica_id.unique_id
+
     @staticmethod
     def _unwrap_sd(obj):
         if isinstance(obj, dict) and "model_state_dict" in obj:
@@ -239,19 +341,64 @@ class CellposeRuntime:
             return obj["model_state"]
         return obj
 
-    def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
-        """Download + cache a member state_dict by its immutable pool weights_path."""
-        import torch
+    @staticmethod
+    def _download_member(url: str) -> bytes:
+        """GET a member checkpoint, retrying a truncated or dropped read.
+
+        The URL is a presigned GET for an immutable pool ``weights_path``, so a
+        retry cannot return different bytes. ``read()`` on a response the server
+        cut short raises ``IncompleteRead`` only when a Content-Length was sent;
+        without one it returns short silently, so the length is re-checked here.
+        An ``HTTPError`` is a verdict (403 on an expired presign, 404 on a wrong
+        key) and will not heal, so it is not retried.
+        """
+        from http.client import HTTPException, IncompleteRead
+        from urllib.error import HTTPError, URLError
         from urllib.request import urlopen
 
-        if key not in self._soup_cache:
-            with urlopen(url, timeout=600) as resp:
-                content = resp.read()
+        for attempt in range(_MEMBER_DOWNLOAD_ATTEMPTS):
+            try:
+                with urlopen(url, timeout=600) as resp:
+                    declared = resp.headers.get("Content-Length")
+                    content = resp.read()
+                if declared is not None and len(content) != int(declared):
+                    raise IncompleteRead(content, int(declared) - len(content))
+                return content
+            except HTTPError:
+                raise
+            except (HTTPException, URLError, OSError) as e:
+                if attempt == _MEMBER_DOWNLOAD_ATTEMPTS - 1:
+                    raise
+                logger.warning(
+                    f"⚠️ Member download attempt {attempt + 1}/"
+                    f"{_MEMBER_DOWNLOAD_ATTEMPTS} failed ({type(e).__name__}: {e}); "
+                    f"retrying..."
+                )
+                time.sleep(_MEMBER_DOWNLOAD_BACKOFF_S * 2**attempt)
+
+    def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
+        """Load a member state_dict, downloading on first use.
+
+        The download is cached as a file, not as tensors: one download per member
+        per replica, but no member stays resident between uses. Keyed by the
+        immutable pool weights_path (content-addressed → no staleness). Written
+        via a temporary name so an interrupted download cannot leave a truncated
+        file that every later aggregate would then fail to unpickle."""
+        import torch
+
+        cached = self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+        if cached.exists():
+            os.utime(cached)  # mark as most-recently-used for _evict_members
+        else:
+            content = self._download_member(url)
             self._soup_dl_bytes += len(content)
-            self._soup_cache[key] = self._unwrap_sd(
-                torch.load(BytesIO(content), map_location="cpu", weights_only=False)
-            )
-        return self._soup_cache[key]
+            self._evict_members(incoming_bytes=len(content))
+            partial_file = cached.with_suffix(".part")
+            partial_file.write_bytes(content)
+            partial_file.rename(cached)
+        return self._unwrap_sd(
+            torch.load(cached, map_location="cpu", weights_only=False)
+        )
 
     def _build_soup(self, members: List[Dict[str, str]]):
         """Uniform mean of member state_dicts; None when empty (= stock base)."""
@@ -259,37 +406,57 @@ class CellposeRuntime:
 
         if not members:
             return None
-        sds = [self._fetch_member(m["key"], m["url"]) for m in members]
-        return pool.uniform_soup(sds)
+        return pool.uniform_soup(
+            [partial(self._fetch_member, m["key"], m["url"]) for m in members]
+        )
 
     async def score_soup(
         self, members: List[Dict[str, str]], images: List[np.ndarray],
         labels: List[np.ndarray], diam_mean: float = 30.0,
-    ) -> float:
-        """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split.
+    ) -> Dict[str, Any]:
+        """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split,
+        with the serving replica and the bytes this one call downloaded.
         ``members`` is a list of ``{"key": weights_path, "url": presigned_get}``;
-        empty scores the stock cpsam base. Downloads happen off-lock; segmentation
-        holds the shared GPU lock."""
+        empty scores the stock cpsam base. Downloads happen off-lock; the soup build
+        is single-flight per replica, and segmentation holds the shared GPU lock — so
+        a concurrent caller waits twice, once per bound.
+
+        ``soup_dl_bytes`` is this call's delta, not the replica's running total, so
+        the caller can sum across passes without double-counting a warm replica or
+        carrying a previous merge's bytes into this one."""
         import pool
 
-        soup = await asyncio.to_thread(self._build_soup, members)
+        dl_before = self._soup_dl_bytes
         ckpt = None
-        async with self._gpu_lock:
-            if soup is not None:
-                import torch
+        try:
+            # ``_build_soup`` allocates the same soup the merge does, and ten of these
+            # can be admitted at once, so it is bounded by the same semaphore. The
+            # checkpoint is written here rather than under ``_gpu_lock`` because
+            # ``_segment`` loads it from disk: once it is on disk the resident copy is
+            # dead weight, and the lock wait below can be minutes.
+            async with self._soup_sem:
+                soup = await asyncio.to_thread(self._build_soup, members)
+                if soup is not None:
+                    import torch
 
-                ckpt = self._soup_dir() / f"soup-{uuid.uuid4().hex}.pt"
-                await asyncio.to_thread(lambda: torch.save(soup, str(ckpt)))
-            try:
+                    ckpt = self._soup_dir() / f"soup-{uuid.uuid4().hex}.pt"
+                    await asyncio.to_thread(lambda: torch.save(soup, str(ckpt)))
+                soup = None
+
+            async with self._gpu_lock:
                 gk = {"diameter": diam_mean}
                 masks = []
                 for image in images:
                     masks.append(await asyncio.to_thread(
                         self._segment, image, gk, str(ckpt) if ckpt else None, "cpsam"))
-            finally:
-                if ckpt and ckpt.exists():
-                    ckpt.unlink()
-        return pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels])
+        finally:
+            if ckpt and ckpt.exists():
+                ckpt.unlink()
+        return {
+            "f1": pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels]),
+            "replica": self._replica_id(),
+            "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+        }
 
     async def materialize_soup(self, members: List[Dict[str, str]], put_url: str) -> Dict[str, Any]:
         """Build the uniform soup of ``members``, PUT it to the pool's presigned URL,
@@ -300,22 +467,30 @@ class CellposeRuntime:
 
         import pool
 
-        soup = await asyncio.to_thread(self._build_soup, members)
-        path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
-        await asyncio.to_thread(lambda: torch.save(soup, str(path)))
-        sha = await asyncio.to_thread(pool.sha256_file, str(path))
-        n_bytes = path.stat().st_size
+        dl_before = self._soup_dl_bytes
+        # Returns from inside the semaphore so the soup and the PUT's own copy of it
+        # are both released before the next merge starts allocating.
+        async with self._soup_sem:
+            soup = await asyncio.to_thread(self._build_soup, members)
+            path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
+            await asyncio.to_thread(lambda: torch.save(soup, str(path)))
+            sha = await asyncio.to_thread(pool.sha256_file, str(path))
+            n_bytes = path.stat().st_size
 
-        def _put():
-            data = path.read_bytes()
-            with urlopen(Request(put_url, data=data, method="PUT"), timeout=600) as r:
-                r.read()
+            def _put():
+                data = path.read_bytes()
+                with urlopen(Request(put_url, data=data, method="PUT"), timeout=600) as r:
+                    r.read()
 
-        try:
-            await asyncio.to_thread(_put)
-        finally:
-            path.unlink()
-        return {"sha256": sha, "n_bytes": n_bytes}
+            try:
+                await asyncio.to_thread(_put)
+            finally:
+                path.unlink()
+            return {
+                "sha256": sha, "n_bytes": n_bytes,
+                "replica": self._replica_id(),
+                "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+            }
 
     async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
         """Inspect a finished session's local cpsam checkpoint (architecture
@@ -374,13 +549,6 @@ class CellposeRuntime:
             "n_bytes": int(n_bytes),
             "cellpose_version": cellpose_version,
         }
-
-    def pop_soup_dl_bytes(self) -> int:
-        """Return + zero the bytes downloaded for soup members since the last call,
-        so the entry can fold pool traffic into its durable transport counter."""
-        b = self._soup_dl_bytes
-        self._soup_dl_bytes = 0
-        return b
 
     def _subprocess_env(self) -> Dict[str, str]:
         return {

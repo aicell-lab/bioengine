@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import bioengine
+import busy
 import numpy as np
 
 logger = bioengine.logger
@@ -99,6 +100,15 @@ class RuntimeApp:
         self._onnx_cache: Dict[str, bytes] = {}
         self._device_cached: Optional[str] = None
         self._gpu_mem_cached: Optional[Dict[str, Any]] = None
+        # No soup path here, but starvation is not soup-specific: any long call
+        # holding this lock queues every other caller on the replica.
+        self._busy = busy.BusyLog(
+            {"micro-sam GPU work (_gpu_lock)": self._gpu_lock.locked}
+        )
+
+    @bioengine.async_init
+    async def _start_busy_log(self) -> None:
+        self._busy.start()
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check — not a Hypha method,
