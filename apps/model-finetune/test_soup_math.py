@@ -95,6 +95,15 @@ def test_an_empty_first_member_is_rejected_not_averaged_away():
         pool.uniform_soup([dict] + [lambda: _sd(10.0)] * 3)
 
 
+def test_an_empty_first_member_is_rejected_at_two_members_too():
+    """n=2 is the maximal-error case: the old guard summed one member and divided
+    by two, so every published weight was exactly half. Worth its own arm because
+    a (n-1)/n scale factor is easy to dismiss as noise at n=16 and impossible to
+    at n=2."""
+    with pytest.raises(ValueError, match="member 0 loaded an empty state_dict"):
+        pool.uniform_soup([dict, lambda: _sd(10.0)])
+
+
 def test_an_empty_later_member_is_rejected_by_the_same_guard():
     with pytest.raises(ValueError, match="member 2 loaded an empty state_dict"):
         pool.uniform_soup([lambda: _sd(10.0), lambda: _sd(10.0), dict])
