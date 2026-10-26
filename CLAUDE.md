@@ -23,14 +23,19 @@ before opening a PR — sync first:
 
 - **On `main`**: `git fetch origin && git log --oneline HEAD..origin/main` — if any commits are listed, `git pull --ff-only origin main` before touching anything else. If the fast-forward fails, stop and ask; never `git pull` with a merge.
 - **On an existing feature branch** (may have commits pushed from another machine): `git fetch origin && git log --oneline HEAD..origin/<branch>` — if commits exist, `git pull --rebase origin <branch>` before adding your own. Never push without fetching first; force-push only with explicit user approval.
-- **Before bumping `version` in `pyproject.toml`**: do NOT trust the local file. Another machine may already have merged a higher version. Check the latest published image tag on GHCR — the CI version-strictly-greater check uses this, not the local file:
+- **A worker version bump is TWO files**: `version` in `pyproject.toml` and `__version__` in `bioengine/_version.py`, edited in lock-step in the same commit. `version-check.yml` has a dedicated step that fails the required check when they differ. (`_version.py` exists because Ray Serve replicas import `bioengine` via `runtime_env.py_modules`, which ships module source but no `.dist-info`, so `importlib.metadata` has nothing to read replica-side.)
+- **Before bumping**: do NOT trust the local files. Another machine may already have merged a higher version. Two different checks compare against two different baselines, and only one of them runs on your PR:
+  - `version-check.yml` — the required PR check — compares your branch's `pyproject.toml` against **`origin/main`'s**. GHCR is not involved.
+  - `docker-publish-worker.yml` compares against the **newest published GHCR tag**, and it triggers on push to `main` — i.e. *after* merge. A version higher than `origin/main` but not higher than the newest GHCR tag passes the PR gate and then fails the publish on `main`.
+
+  So bump from whichever is higher: `origin/main`'s `pyproject.toml`, or the latest GHCR tag:
   ```bash
   source .env && curl -s -H "Authorization: Bearer $GITHUB_PAT" \
     "https://api.github.com/orgs/aicell-lab/packages/container/bioengine-worker/versions?per_page=20" \
     | python3 -c "import json,sys; print('\n'.join(t for v in json.load(sys.stdin) for t in v.get('metadata',{}).get('container',{}).get('tags',[]) if t and t!='latest'))" \
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
   ```
-  Bump from whichever is higher: `origin/main`'s `pyproject.toml` or the latest GHCR tag.
+  One page is enough to answer *"what is the newest tag"*; it is not enough to answer *"how far back does the tag history go"* — that API paginates over digests, most of them untagged.
 - **Before bumping `version` in `apps/<name>/manifest.yaml`**: check `get_app_status` on the live worker for the currently deployed version AND check `origin/main`'s copy. Bump from the higher of the two so the next CI publish strictly increases.
 
 ## Code conventions
@@ -64,11 +69,11 @@ Code should explain *what* via good names; comments earn their place only when t
 
 ## PR workflow (for paths above that require one)
 
-1. Push the feature branch with the substantive changes only (NO `pyproject.toml` version edit).
+1. Push the feature branch with the substantive changes only (NO version edit).
 2. `gh pr create --draft …` so it's visible for review but cannot be auto-merged. **Open as DRAFT.**
-3. **Bump pyproject.toml just before marking ready.** Bumping early causes lost-bump collisions when a different PR merges first and ships the version you reserved. Workflow:
+3. **Bump the version just before marking ready.** Bumping early causes lost-bump collisions when a different PR merges first and ships the version you reserved — and because the bump touches exactly two one-line files, every other open PR that already bumped goes conflicted the moment one lands. Bump last, and land one at a time. Workflow:
    - Re-check the latest published image tag on GHCR AND `origin/main`'s `pyproject.toml`.
-   - Bump from the higher of the two as a separate atomic commit: `chore(release): bump version to X.Y.Z`.
+   - Bump from the higher of the two, editing **both** `pyproject.toml` and `bioengine/_version.py`, as a separate atomic commit: `chore(release): bump version to X.Y.Z`.
    - Push, then `gh pr ready <number>`.
 4. `version-check.yml` listens for `ready_for_review`, so marking a draft PR ready fires the required status check without any manual re-trigger.
 5. **Always open the PR immediately after pushing the branch** using the GitHub PAT from `.env` so the user can see and review it without navigating to GitHub manually.
@@ -174,7 +179,7 @@ Don't duplicate this content here:
 | Hypha platform invariants (handle expiry, replica pinning) | `.claude/skills/bioengine-maintainer/SKILL.md` |
 | Issue and PR writing style (lede first, then detail) | `.claude/skills/bioengine-maintainer/SKILL.md` |
 | BioEngine skills overview (user-facing skill structure) | `.claude/skills/bioengine-maintainer/SKILL.md` |
-| End-to-end deploy_app flow (14-step v0.11.4 walkthrough) | `docs/deploy_app_flow.md` |
+| End-to-end deploy_app flow (14-step walkthrough) | `docs/deploy_app_flow.md` |
 | App authoring (`@bioengine.app`, manifest fields, deploying apps) | `../bioimage.io/public/skills/bioengine/SKILL.md` |
 | Hypha platform basics (tokens, workspaces, RPC, artifacts) | <https://hypha.aicell.io/ws/agent-skills/SKILL.md> |
 
