@@ -144,17 +144,62 @@ def architecture_signature(state_dict: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def state_dict_digest(state_dict: Dict[str, Any]) -> str:
+    """sha256 over a state_dict's keys, shapes, dtypes and raw weight bytes.
+
+    Digests the TENSORS rather than a file ``torch.save`` wrote: torch's zip
+    container embeds the target file's stem in every record name, so hashing the
+    saved bytes makes the digest a function of the filename and two merges of
+    identical members can never agree. This is reproducible by construction and
+    independent of the container format.
+    """
+    h = hashlib.sha256()
+    for name in sorted(state_dict):
+        t = state_dict[name]
+        h.update(f"{name}|{tuple(t.shape)}|{t.dtype}|".encode("utf-8"))
+        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+# Entries that live in a cpsam state_dict but are data statistics rather than
+# learned weights: cellpose_model.py:78-79 registers both as
+# nn.Parameter(requires_grad=False), so they are float32 scalars with matching
+# shapes and pass every dtype/shape filter. requires_grad is not serialised, so
+# a state_dict carries no way to tell them apart — the name is the only handle,
+# and it must come from the key (storage keys inside a .pt are bare positional
+# integers and position is not stable across writers).
+NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
+
+
+def is_non_weight_param(key: str) -> bool:
+    """True for a state_dict key holding a data statistic, not a learned weight.
+
+    Matches on the final dot-component because the same checkpoint reaches us
+    both bare and module-prefixed depending on how it was wrapped when saved.
+    """
+    return key.rsplit(".", 1)[-1] in NON_WEIGHT_PARAMS
+
+
 def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> float:
-    """L2 distance between two state_dicts over shared floating-point params — how
-    far a contribution's weights moved from the checkpoint it started from. A drift
-    proxy recorded on every contribution; its use as an acceptance BOUND is a
-    pending aggregation decision, so this only measures, it does not gate."""
+    """L2 distance between two state_dicts over shared learned weights — how far a
+    contribution's weights moved from the checkpoint it started from. A drift proxy
+    recorded on every contribution; its use as an acceptance BOUND is a pending
+    aggregation decision, so this only measures, it does not gate.
+
+    Non-weight entries are excluded: a site's median object diameter differs from
+    the base's by tens of pixels while real weight motion is single digits, so
+    including it made this field ~99.5% diameter metadata and inverted the
+    per-site ordering it implies (it reported one site as having moved 17x
+    further than another where the weights say 1.3x).
+    """
     import torch
 
     total = 0.0
     for key, cur in current.items():
         ref = base.get(key)
         if ref is None or not torch.is_floating_point(cur) or cur.shape != ref.shape:
+            continue
+        if is_non_weight_param(key):
             continue
         total += float(torch.sum((cur.detach().float() - ref.detach().float()) ** 2).item())
     return total ** 0.5
@@ -358,6 +403,12 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
     pins every member in RAM at once: at 16 cpsam members that measured ~27 GB
     against the runtime's 12 GiB reservation and the replica was OOM-killed.
 
+    Still averages ``NON_WEIGHT_PARAMS``, which is wrong and deliberately left:
+    what a community checkpoint should carry for an object diameter instead of a
+    mean is a product decision, and "stop averaging it" has no defined output
+    until that is answered (#0070 requirement 3). Only the contributor-facing
+    ``state_dict_l2_from_base`` is fixed so far.
+
     Every member must share one parameter layout (``assert_compatible`` guards this
     at contribute + aggregate time), so the mean is well-defined per key. cpsam is
     LayerNorm-only with zero persistent buffers, so there is no running statistic to
@@ -371,9 +422,13 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
         raise ValueError("uniform_soup requires at least one state_dict")
     acc: Dict[str, Any] = {}
     dtypes: Dict[str, Any] = {}
-    for load in loaders:
+    for index, load in enumerate(loaders):
         sd = load()
-        if not acc:
+        if not sd:
+            raise ValueError(
+                f"uniform_soup member {index} loaded an empty state_dict"
+            )
+        if not index:
             dtypes = {key: value.dtype for key, value in sd.items()}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
                    for key, value in sd.items()}
@@ -556,7 +611,8 @@ def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
 def append_merge(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append one merge event to the timeline. ``entry`` carries
     ``{published_version|None, baseline_version, members[{contribution_id,
-    gate_score, included}], selection_metric (RoundMetric role=selection),
+    marginal_score, gate_score, included}] (admission-ordered, see
+    ``community_manifest``), selection_metric (RoundMetric role=selection),
     witness_metric (RoundMetric role=witness, or None when nothing was admitted),
     global_sha256|None, transport, deferred[], created_at}``. A merge with
     ``published_version=None`` admitted nothing and projects to an empty_merge
@@ -619,11 +675,17 @@ def build_community_manifest(
     is the only number the improvement curve plots — reporting the selection metric
     as the curve would be circular. Both are role-tagged RoundMetric records, so the
     role is a property of the stored artifact, not an assignment the page makes.
-    ``members`` records every candidate weighed as ``{contribution_id, gate_score,
-    included}`` for internal audit (a rejected candidate reads "evaluated, not
-    included", never a failure); the per-member gate_score is audit-only and is
-    stripped from the wire projection. ``combine`` is "uniform" unless sample-
-    weighting was empirically justified for this version."""
+    ``members`` records every candidate weighed as ``{contribution_id,
+    marginal_score, gate_score, included}`` for internal audit (a rejected candidate
+    reads "evaluated, not included", never a failure), **in the order the gate
+    weighed them** — the admitted subsequence is the order ``uniform_soup``
+    accumulated in, and float addition is not associative, so reordering this list
+    loses the only record of which checkpoint was published. ``marginal_score`` is
+    what that ordering was sorted on (the candidate's score against the head as it
+    stood); ``gate_score`` is the cumulative score of the soup including it, so the
+    two are not interconvertible. Both are audit-only and stripped from the wire
+    projection. ``combine`` is "uniform" unless sample-weighting was empirically
+    justified for this version."""
     return {
         "schema_version": SCHEMA_VERSION,
         "community_version": community_version,
@@ -691,7 +753,7 @@ def assert_compatible(index: Dict[str, Any], *, model_type: str, signature: str)
 # The backend stores pool_index.json in its own shape; the campaign page reads the
 # subset below. This projection is where the page's data model is produced: it
 # partitions the merge timeline into published soups and empty merges, strips the
-# audit-only per-member gate_score (a per-candidate score in the wire payload is a
+# audit-only per-member scores (a per-candidate score in the wire payload is a
 # contract violation — assessed is IDs only), and surfaces the role-tagged metrics
 # straight from storage. Pure and torch-free so the contract is unit-testable.
 

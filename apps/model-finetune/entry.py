@@ -116,6 +116,24 @@ def _is_missing_file(exc: BaseException) -> bool:
     return bool(lines) and lines[-1].startswith("FileNotFoundError:")
 
 
+def _write_file_atomic(path: Path, content: bytes) -> None:
+    """Write ``content`` to ``path`` so no reader can observe a partial file.
+
+    The HOME caches are keyed on the request (pool, version, model id) and HOME is
+    shared by every call the worker serves, so two callers asking for the same thing
+    write the same path. ``write_bytes`` opens ``'wb'``, which truncates first — a
+    reader of a 1.2 GB checkpoint then sees a prefix, and identical content is no
+    defence because the problem is the length, not the bytes. The temp name carries
+    a uuid so concurrent writers cannot share it either.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(content)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -182,6 +200,16 @@ class EntryApp:
         # own bounds, but neither sees that an aggregate is what is holding them.
         self._merges_in_flight = 0
         self._busy = busy.BusyLog({"aggregate": lambda: self._merges_in_flight > 0})
+        # One merge at a time per pool. aggregate() picks its community version by
+        # probing which ones exist and then spends minutes building the soup before
+        # publishing, so two overlapping calls both read the same free vN. Hypha does
+        # not arbitrate it: two callers can hold stage=True on one artifact at once,
+        # and the first commit clears the single artifact-level flag, so a caller's
+        # commit can report success over bytes another caller PUT.
+        # This is process-local and that is sufficient ONLY because EntryApp is pinned
+        # to max_replicas=1 (see the deployment decorator) — every aggregate lands in this
+        # process. Raising max_replicas voids it and needs a pool-side lease instead.
+        self._pool_locks: Dict[str, asyncio.Lock] = {}
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -484,9 +512,13 @@ class EntryApp:
             w_url = await am.get_file(model_id, file_path=ps["source"])
             content = (await self._http_retry("GET", w_url, timeout=600.0)).content
             cache_dir.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(weights_path.write_bytes, content)
+            await asyncio.to_thread(_write_file_atomic, weights_path, content)
             meta = {"model_type": model_type}
-            meta_path.write_text(json.dumps(meta))
+            # kwargs.json is the commit marker for the pair above: the cache-hit branch
+            # gates on both files existing, so it must appear whole or not at all — a
+            # plain write_text makes it exist (empty) before it has content, and the
+            # reader then json.loads("").
+            _write_file_atomic(meta_path, json.dumps(meta).encode())
             return {"weights_path": str(weights_path), **meta}
         finally:
             if caller_client is not None:
@@ -753,7 +785,9 @@ class EntryApp:
                 **resolved,
             })
             # Long-running: this await holds one GPU runtime replica for the whole
-            # training run, so a concurrent infer is routed to a second replica.
+            # training run, and a concurrent infer queues behind it on that same
+            # replica — at the effective target of 2 (#0091) two calls in flight
+            # ask for one replica, not two (#0097).
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
             # so a session waiting here is not false-flagged STOPPED.
@@ -1615,7 +1649,11 @@ class EntryApp:
         version_tag = re.sub(r"[^\w.-]", "_", str(community_version or (cc or {}).get("version") or "current"))
         dest = Path.home() / ".bioengine" / "pool_eval" / re.sub(r"[^\w.-]", "_", pool_artifact_id) / f"community_{version_tag}.pt"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(dest.write_bytes, content)
+        # dest is handed to the runtime as the checkpoint path below, so writing
+        # it in place would let a concurrent evaluation of the same community
+        # truncate ('wb') the file a torch.load is reading. Unique temp name:
+        # the path is keyed on (pool, version) only, so writers do collide.
+        await asyncio.to_thread(_write_file_atomic, dest, content)
         self._bump_transport(bytes_down=len(content))
 
         await self._check_runtime_available(model_type)
@@ -1688,6 +1726,18 @@ class EntryApp:
         wit_imgs, wit_gts = await self._resolve_val_split(witness_val_images, witness_val_labels)
 
         am, client = await self._pool_service(pool_token)
+        # Held from the index read to the index commit, not just around the publish:
+        # a merge that only locked the publish would still have built its soup from
+        # the head it read before waiting, and committing that would drop the merge
+        # that ran while it waited. Serialised, the second caller re-reads the index
+        # and weighs what is genuinely still undecided.
+        lock = self._pool_locks.setdefault(pool_artifact_id, asyncio.Lock())
+        if lock.locked():
+            logger.info(
+                f"aggregate() is waiting: another merge holds '{pool_artifact_id}'. "
+                f"Scores already earned are in the pool journal, so the wait is not lost work."
+            )
+        await lock.acquire()
         self._merges_in_flight += 1
         try:
             index = await self._read_pool_index(am, pool_artifact_id)
@@ -1823,7 +1873,8 @@ class EntryApp:
                 cid = c["contribution_id"]
                 trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
                 included = trial_a >= (s_a - eps)
-                members_record.append({"contribution_id": cid, "gate_score": round(trial_a, 4), "included": bool(included)})
+                members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
+                                       "gate_score": round(trial_a, 4), "included": bool(included)})
                 if included:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)
@@ -1917,6 +1968,7 @@ class EntryApp:
             await self._commit_with_retry(am, pool_artifact_id)
         finally:
             self._merges_in_flight -= 1
+            lock.release()
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
