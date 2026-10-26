@@ -161,17 +161,24 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
 
 
 # Resident set of a merge, as a multiple of ONE member's on-disk size. uniform_soup
-# holds a float32 accumulator for the whole model plus the single member being added,
-# and at the end builds the output while the accumulator is still live. 3x covers
-# that even when members are stored at half precision (so the fp32 accumulator is 2x
-# a member).
+# holds a float32 accumulator for the whole model plus the single member being added;
+# on a member's FIRST use _fetch_member also holds the downloaded bytes while
+# torch.load materialises them from the same file. Three member-equivalents on first
+# use, two on every later one.
 #
-# Deliberately conservative. Measured on europa CPU against a real cpsam member
-# (348 keys, float32, 1.135 GiB): the pre-fix combine fit peak = 3.078 + 1.135*n GiB
-# with residuals under 0.001 over n = 2/4/8, so it broke the 12 GiB declaration at
-# just EIGHT members (12.161) and reached 21.2 at sixteen. The streaming combine is
-# flat, and its own overhead measured under one member — so 3x over-predicts by
-# roughly 4x and refuses nothing it should admit at today's member size.
+# Measured on europa CPU against real cpsam members (348 keys, float32, 1.1348 GiB),
+# peak RSS above a bare torch process, swept over n = 2/4/8/16:
+#
+#   warm (member already cached)  2.2727 GiB = 2.00x a member, flat in n to 0.8 MiB
+#   cold (first download)         3.4076 GiB = 3.00x a member, flat in n to 0.6 MiB
+#   pre-fix combine, as control   1.528 + 1.1339*n GiB — one whole member per member
+#
+# So 3 is the cold path exactly, not slack — lowering it under-predicts first use, and
+# first use is the common case for a newly contributed member. The control is what
+# licenses leaving the member count out of the formula: it shares the rig and does
+# grow, so the flat rows above are a property of the combine, not of the measurement.
+# Its slope also reproduces the historical pre-fix fit (1.135 GiB/member), which broke
+# the 12 GiB declaration at eight members and reached ~21 GiB at sixteen.
 SOUP_RESIDENT_FACTOR = 3
 
 
