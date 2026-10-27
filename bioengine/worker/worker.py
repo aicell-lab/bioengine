@@ -424,7 +424,9 @@ class BioEngineWorker:
 
         # After this many consecutive monitoring-loop failures get_status
         # reports the worker not-ready, so dashboards and callers can see a
-        # degraded worker. The loop keeps running and usually recovers.
+        # degraded worker. The loop keeps running and usually recovers; a
+        # loop that has stopped running entirely is caught by the heartbeat
+        # file instead, since a frozen loop never reaches this counter.
         self._monitor_consecutive_errors = 0
         self._monitor_degraded_threshold = 5
 
@@ -2206,8 +2208,11 @@ class BioEngineWorker:
                 self.is_ready.is_set()
                 and self._monitor_consecutive_errors
                 < self._monitor_degraded_threshold
+                # .get, not a subscript: this is the unauthenticated health
+                # surface, so raising here would fail the probe that reads it.
+                # The key's presence is pinned by tests instead.
                 and not self._cluster_snapshot_is_stale(
-                    ray_cluster_status["last_cluster_update"]
+                    ray_cluster_status.get("last_cluster_update")
                 )
             ),
         }

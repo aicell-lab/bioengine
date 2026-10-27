@@ -165,6 +165,18 @@ async def test_an_empty_history_does_not_report_not_ready():
     assert await is_ready_of(worker_with_snapshot(None)) is True
 
 
+async def test_a_status_payload_missing_the_field_does_not_raise():
+    """``get_status`` is the unauthenticated health surface the k8s startup
+    probe curls, so a payload without the field must degrade to "no snapshot
+    yet" rather than raise and fail that probe. The tolerance is why
+    ``test_ray_cluster_status_publishes_the_newest_history_key`` below is not
+    optional: without it, the key silently disappearing would disable the gate
+    instead of failing anything."""
+    worker = worker_with_snapshot(time.time())
+    del worker.ray_cluster.status["last_cluster_update"]
+    assert await is_ready_of(worker) is True
+
+
 async def test_no_deadline_yet_does_not_report_not_ready():
     """The deadline is derived inside the monitoring loop, so a worker whose
     loop has not reached that line has none. It must not read as stale."""
