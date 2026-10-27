@@ -424,11 +424,18 @@ class BioEngineWorker:
 
         # After this many consecutive monitoring-loop failures get_status
         # reports the worker not-ready, so dashboards and callers can see a
-        # degraded worker. The loop keeps running and usually recovers; a
-        # loop that has stopped running entirely is caught by the heartbeat
-        # file instead, since a frozen loop never reaches this counter.
+        # degraded worker. The loop keeps running and usually recovers.
         self._monitor_consecutive_errors = 0
         self._monitor_degraded_threshold = 5
+
+        # A loop hung mid-pass raises nothing, so it never reaches that counter
+        # and its last cluster snapshot is served forever; get_status therefore
+        # also requires the snapshot to be advancing. The heartbeat file covers
+        # the same gap for a container liveness probe, but it is node-local,
+        # while the k8s startup probe and any remote caller see only this field.
+        # Set by the monitoring loop from the same deadline the heartbeat uses;
+        # None until the loop runs, which is before is_ready is ever set.
+        self._monitor_stale_after_seconds = None
 
         self.is_ready = asyncio.Event()
         self._shutdown_event = asyncio.Event()
@@ -1335,6 +1342,19 @@ class BioEngineWorker:
                 f"worker dead until the path is writable."
             )
 
+    def _cluster_snapshot_is_stale(self, last_cluster_update: Optional[float]) -> bool:
+        """Whether the newest cluster snapshot has stopped advancing.
+
+        ``None`` is not stale: it means the monitor has not ticked yet, which is
+        a worker that is starting rather than one that is stuck. Deliberately
+        says nothing about what the snapshot *contains* — zero totals and an
+        empty node map are the correct idle reading for a slurm worker, whose
+        head is excluded from the totals and started with no CPUs.
+        """
+        if last_cluster_update is None or self._monitor_stale_after_seconds is None:
+            return False
+        return time.time() - last_cluster_update > self._monitor_stale_after_seconds
+
     async def _create_monitoring_task(
         self,
         backoff_initial_seconds: float = 2.0,
@@ -1383,6 +1403,7 @@ class BioEngineWorker:
             stale_after_seconds = heartbeat_stale_after_seconds(
                 self.monitoring_interval_seconds, backoff_max_seconds
             )
+            self._monitor_stale_after_seconds = stale_after_seconds
             self.logger.info(
                 f"Writing liveness heartbeat to {self.heartbeat_file} after every "
                 f"completed monitoring pass (stale after {stale_after_seconds:.0f}s)"
@@ -2165,6 +2186,7 @@ class BioEngineWorker:
         Returns partial status if individual components fail to report, with error information included in the component's status section.
         """
         current_time = time.time()
+        ray_cluster_status = self.ray_cluster.status
         status = {
             "service_start_time": self.start_time,
             "service_uptime": current_time - self.start_time if self.start_time else 0,
@@ -2177,13 +2199,16 @@ class BioEngineWorker:
             "worker_mode": self.ray_cluster.mode,
             "workspace": self.workspace,
             "client_id": self.client_id,
-            "ray_cluster": self.ray_cluster.status,
+            "ray_cluster": ray_cluster_status,
             "admin_users": self.admin_users,
             "geo_location": self.geo_location,
             "is_ready": (
                 self.is_ready.is_set()
                 and self._monitor_consecutive_errors
                 < self._monitor_degraded_threshold
+                and not self._cluster_snapshot_is_stale(
+                    ray_cluster_status["last_cluster_update"]
+                )
             ),
         }
 

@@ -338,6 +338,8 @@ class RayCluster:
                 - start_time: Formatted start time string
                 - uptime: Human-readable uptime string
                 - nodes: Most recent worker nodes status grouped by state
+                - last_cluster_update: Unix timestamp the newest snapshot was
+                  written, or None if the monitor has not ticked yet
         """
         status = {
             "head_address": self.address,
@@ -346,11 +348,17 @@ class RayCluster:
             "geo_location": self.head_geo_location,
         }
 
-        last_status = (
-            next(reversed(self.cluster_status_history.values()))
+        # History is keyed by the time.time() of the write and the newest entry is
+        # served regardless of age, so the key travels with it. A monitoring loop
+        # hung mid-pass writes no new entry while raising nothing, which makes age
+        # the only in-process signal that these totals have stopped tracking
+        # reality. None means the monitor has not ticked yet.
+        last_update, last_status = (
+            next(reversed(self.cluster_status_history.items()))
             if self.cluster_status_history
-            else None
+            else (None, None)
         )
+        status["last_cluster_update"] = last_update
         status["cluster"] = last_status["cluster"] if last_status else {}
         status["nodes"] = last_status["nodes"] if last_status else {}
 
