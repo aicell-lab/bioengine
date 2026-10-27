@@ -30,6 +30,9 @@ RECONNECT_BOUNDED_COST_S = 30.0
 # backoff_max_seconds, which together set the liveness staleness deadline.
 DEFAULT_MONITORING_INTERVAL_S = 10.0
 DEFAULT_BACKOFF_MAX_S = 60.0
+# Slowest healthy call measured on ray 2.55.1 — the cold first one, which
+# dominates the warm p95 of 33 ms.
+MEASURED_COLD_CALL_S = 0.322
 # Outer guard so an unbounded helper fails the suite instead of hanging it.
 # It must stay well above the patched bound for the elapsed assertions below
 # to tell the two apart.
@@ -74,8 +77,8 @@ async def test_a_head_that_stops_answering_raises_instead_of_hanging(monkeypatch
     """DISCRIMINATION CONTROL for this whole file.
 
     Drop the ``asyncio.wait_for`` from ``_get_cluster_state_bounded`` and this
-    test does not fail with a nicer message — it hangs until the suite's own
-    timeout kills it, because the future is never resolved.
+    fails on the elapsed assertion at 5.00 s, measured — the outer guard is
+    what turns a never-resolving future into a failure instead of a hang.
     """
     monkeypatch.setattr(rc_mod, "CLUSTER_STATE_TIMEOUT_S", 0.1)
     cluster = _cluster(_Handle(_never_answers))
@@ -164,16 +167,21 @@ def test_the_timeout_reaches_the_per_step_error_counter():
 
 
 def test_the_bound_leaves_a_pass_inside_the_liveness_staleness_deadline():
-    """The value is justified from both ends, not copied from the geo call.
+    """The value is justified by the ceiling, not copied from the geo call.
 
-    Floor: the actor's own slowest bounded IO is the 2 s dashboard fetch, and a
-    healthy call measured p95 33 ms (max 67 ms, 322 ms cold) on Ray 2.55.1, so
-    the bound has to sit far above 2 s to never fire on a working worker.
+    The ceiling is the binding constraint: the worst path through
+    ``_get_cluster_state_with_reconnect`` crosses the bound three times — once
+    before the reconnect, once inside the connection probe, once on the retry —
+    around the reconnect's own bounded cost, and that has to still fit inside
+    the heartbeat staleness deadline.
 
-    Ceiling: the worst path through ``_get_cluster_state_with_reconnect``
-    crosses the bound three times — once before the reconnect, once inside the
-    connection probe, once on the retry — around the reconnect's own bounded
-    cost, and that has to still fit inside the heartbeat staleness deadline.
+    There is no floor that also satisfies it. A healthy call measured p95 33 ms
+    (max 67 ms, 322 ms cold) on Ray 2.55.1, but in slurm mode
+    ``check_pending_resources`` adds three Ray state-API calls at
+    DEFAULT_RPC_TIMEOUT, so a slow-but-healthy worst case is ~92 s — above
+    anything that can be crossed three times inside the deadline. The bound
+    therefore cuts a stalled GCS deliberately; that is the behaviour, not a
+    gap in it.
     """
     bound = rc_mod.CLUSTER_STATE_TIMEOUT_S
     deadline = heartbeat_stale_after_seconds(
@@ -181,7 +189,7 @@ def test_the_bound_leaves_a_pass_inside_the_liveness_staleness_deadline():
     )
 
     assert deadline == DEFAULT_BACKOFF_MAX_S + MISSED_PASSES_BEFORE_STALE * 10.0
-    assert bound > 2.0
+    assert bound > MEASURED_COLD_CALL_S * 10
     assert 3 * bound + RECONNECT_BOUNDED_COST_S < deadline
 
 

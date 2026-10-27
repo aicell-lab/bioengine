@@ -68,13 +68,18 @@ RECONNECT_BUDGET_S = 15.0
 # steps run as sequential awaits, so an unbounded wait on a head that has
 # stopped answering starves every later step — including the app recovery and
 # proxy-token renewal that keep deployed apps reachable.
-# Sized from both ends. Floor: the actor's own IO is already bounded (a 2 s
-# dashboard fetch, Ray's state API at DEFAULT_RPC_TIMEOUT), and a healthy call
-# measured p95 33 ms / max 67 ms with a 322 ms cold first call, so 20 s cannot
-# fire on a working worker. Ceiling: the worst path through
+# A healthy call measured p95 33 ms / max 67 ms, with a 322 ms cold first call.
+# The ceiling is what sets the value: the worst path through
 # ``_get_cluster_state_with_reconnect`` crosses this bound three times either
 # side of a reconnect's own 30 s of bounded cost, and 3*20+30 still leaves the
 # rest of the pass room inside the 120 s staleness deadline above.
+# This bound CAN cut a call that is still technically healthy, and that is
+# intended rather than impossible. In slurm mode ``check_pending_resources`` is
+# on, so get_cluster_state makes three Ray state-API calls at
+# DEFAULT_RPC_TIMEOUT (30 s each) plus a 2 s dashboard fetch — a worst case of
+# ~92 s, which no value small enough to cross three times inside 120 s can sit
+# above. A cluster-state read taking 20 s is a worker whose GCS has stopped
+# answering, and cutting it is the point.
 CLUSTER_STATE_TIMEOUT_S = 20.0
 
 
