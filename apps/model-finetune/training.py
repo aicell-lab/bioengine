@@ -58,6 +58,38 @@ def cellpose_base_model(model_type: str) -> str:
     return _CELLPOSE_BASE.get(model_type, "cpsam_v2")
 
 
+# === training metrics: a fixed set the caller opts into ===
+
+# What ``start_training(metrics=[...])`` accepts. "loss" is the per-epoch
+# train/validation loss curves ``train_seg`` already returns — free, hence the
+# default. "pixel" and "instance" both score the finished net on the validation
+# split and share one held-out inference pass; "instance" adds Hungarian
+# matching at several IoU thresholds, which is the expensive part and why
+# neither is on by default.
+TRAINING_METRICS = ("loss", "pixel", "instance")
+DEFAULT_TRAINING_METRICS = ("loss",)
+# Metrics scored against held-out data, so they need val_images/val_labels.
+METRICS_NEEDING_VALIDATION = ("pixel", "instance")
+INSTANCE_IOU_THRESHOLDS = (0.5, 0.75, 0.9)
+
+
+def validate_metrics(metrics: Optional[List[str]]) -> List[str]:
+    """Normalise a caller's metric selection against ``TRAINING_METRICS``.
+
+    Unknown names are rejected rather than dropped, because in the returned
+    status a typo that silently computed nothing is indistinguishable from a
+    metric that legitimately produced nothing."""
+    if metrics is None:
+        return list(DEFAULT_TRAINING_METRICS)
+    unknown = sorted({m for m in metrics if m not in TRAINING_METRICS})
+    if unknown:
+        raise ValueError(
+            f"Unknown training metric(s) {unknown}. Choose from "
+            f"{list(TRAINING_METRICS)}."
+        )
+    return [m for m in TRAINING_METRICS if m in metrics]
+
+
 # Minimum total GPU VRAM (MB) a model needs to fine-tune AT ALL, at the smallest
 # viable config (micro-sam: n_objects_per_batch=1, patch 256; cellpose:
 # batch_size=1). The training gate compares detected device VRAM against this to
