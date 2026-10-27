@@ -588,8 +588,11 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
     That field is a mapping of replica id to its ``stdout``/``stderr`` lines,
     already tailed to the requested number by the worker — so everything fetched
     is printed, and the caller's line count means what it says. Iterating it
-    rather than the deployment's ``replicas`` is deliberate: the map also keys
-    recently dead replicas, which the live replica list does not contain.
+    rather than the deployment's ``replicas`` is deliberate: the map keys
+    recently dead replicas too, which the live replica list does not contain —
+    but only for a caller that passed ``n_previous_replica > 0``. ``apps logs``
+    does; ``apps status`` does not, because it fetches logs on every invocation
+    and each dead replica adds a GCS lookup to every poll.
 
     The field is *absent* rather than empty when the caller may not read it, so
     the withheld case must not print the same thing as "nothing logged yet".
