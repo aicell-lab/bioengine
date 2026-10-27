@@ -64,6 +64,15 @@ def is_transient_connect_error(error: BaseException) -> bool:
 STARTUP_CONNECT_BUDGET_S = 120.0
 RECONNECT_BUDGET_S = 15.0
 
+# Bound on one proxy-actor cluster-state read. Measured healthy durations over 30
+# calls (ray 2.55.1, single node): 5.8 ms median / 7.2 ms max without pending
+# resources, 28.7 ms / 36.6 ms with them. The bound is set by the staleness
+# deadline above, not by those: a tick that waits longer than one Ray state-API
+# call (DEFAULT_RPC_TIMEOUT, 30 s — slurm mode makes three of them) cannot fit a
+# whole pass inside 120 s, and a head that is dead rather than slow never answers
+# at all.
+CLUSTER_STATE_TIMEOUT_S = 30.0
+
 
 async def connect_with_retry(
     connect: Callable[[], Awaitable[T]],
