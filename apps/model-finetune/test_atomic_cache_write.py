@@ -53,6 +53,42 @@ def _entry_class():
     return entry.EntryApp.func_or_class
 
 
+class _Resp:
+    """``raise_for_status`` is modelled, not stubbed away.
+
+    The status is the thing under test in
+    ``test_an_error_response_never_reaches_the_cache``, so a no-op version would make
+    that test pass against the unfixed function.
+    """
+
+    def __init__(self, body: bytes, declared: int, status: int) -> None:
+        self.content = body
+        self.text = body.decode(errors="replace")
+        self.headers = {"Content-Length": str(declared)}
+        self.status_code = status
+
+    def raise_for_status(self) -> "_Resp":
+        if self.status_code >= 400:
+            import httpx
+
+            raise httpx.HTTPStatusError(
+                f"Server error '{self.status_code}'",
+                request=httpx.Request("GET", "https://example.invalid/w.pt"),
+                response=self,
+            )
+        return self
+
+
+class _Caller:
+    """Just enough of EntryApp: ``_get_verified`` consumes ``_http_retry``'s response."""
+
+    def __init__(self, body: bytes, declared: int, status: int = 200) -> None:
+        self._resp = _Resp(body, declared, status)
+
+    async def _http_retry(self, *args, **kwargs):
+        return self._resp
+
+
 def test_the_destination_is_never_opened_for_writing(tmp_path: Path) -> None:
     """The invariant: at the moment of the rename, dest still holds the OLD bytes.
 
@@ -169,19 +205,36 @@ def test_a_short_download_never_reaches_the_cache() -> None:
 
     get_verified = _entry_class()._get_verified
 
-    class _Caller:
-        """Just enough of EntryApp: ``_get_verified`` consumes ``_http_retry``'s response."""
-
-        def __init__(self, body: bytes, declared: int) -> None:
-            self._resp = type("R", (), {"content": body, "headers": {"Content-Length": str(declared)}})()
-
-        async def _http_retry(self, *args, **kwargs):
-            return self._resp
-
     with pytest.raises(IncompleteRead):
         asyncio.run(get_verified(_Caller(NEW[:17], len(NEW)), "https://example.invalid/w.pt"))
 
     assert asyncio.run(get_verified(_Caller(NEW, len(NEW)), "https://example.invalid/w.pt")) == NEW
+
+
+def test_an_error_response_never_reaches_the_cache() -> None:
+    """A 403 body is WHOLE, so the length check passes it through as a checkpoint.
+
+    This is the input that discriminates: ``_http_retry`` keeps 403/404 in its retry
+    set and returns the last response unraised, and an S3 error document declares its
+    own length correctly — so ``len(content) == declared`` holds and a few hundred
+    bytes of XML get written as a ``.pt``. ``torch.load`` then reports
+    ``failed finding central directory``, the same symptom as a prefix, which is why
+    the length check reads like it already covers this and does not.
+
+    Worse for the zoo cache, whose hit branch gates on ``weights_path.exists() and
+    meta_path.exists()``: an error body satisfies that gate for every later caller
+    asking for the same ``model_id``, so one transient 403 poisons it until the file
+    is removed by hand.
+    """
+    import asyncio
+
+    import httpx
+
+    get_verified = _entry_class()._get_verified
+    xml = b"<?xml version='1.0'?><Error><Code>AccessDenied</Code></Error>"
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(get_verified(_Caller(xml, len(xml), status=403), "https://example.invalid/w.pt"))
 
 
 def test_a_concurrent_reader_never_observes_a_partial_file(tmp_path: Path) -> None:

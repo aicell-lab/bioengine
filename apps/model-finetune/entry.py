@@ -360,6 +360,11 @@ class EntryApp:
         from http.client import IncompleteRead
 
         resp = await self._http_retry("GET", url, **kwargs)
+        # The length check alone cannot catch an error response: 403/404 are in
+        # _http_retry's retry set and it returns the last one unraised, and an S3
+        # error body declares its own length correctly — so a few hundred bytes of
+        # XML passes as "whole" and gets written as a .pt.
+        resp.raise_for_status()
         content = resp.content
         declared = resp.headers.get("Content-Length")
         if declared is not None and len(content) != int(declared):
@@ -545,7 +550,9 @@ class EntryApp:
                 raise FileNotFoundError(
                     f"No RDF (bioimageio.yaml or rdf.yaml) found in artifact '{model_id}'."
                 )
-            rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
+            rdf_resp = await self._http_retry("GET", rdf_url)
+            rdf_resp.raise_for_status()
+            rdf = yaml.safe_load(rdf_resp.text)
             ps = rdf["weights"]["pytorch_state_dict"]
             model_type = ps["architecture"]["kwargs"]["model_type"]
 

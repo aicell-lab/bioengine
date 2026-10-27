@@ -65,7 +65,15 @@ class _Caller:
         return f"https://example.invalid/{artifact_id}/{file_path}"
 
     async def _http_retry(self, *args, **kwargs):
-        return type("R", (), {"text": json.dumps(self._rdf)})()
+        return type(
+            "R",
+            (),
+            {
+                "text": json.dumps(self._rdf),
+                "status_code": 200,
+                "raise_for_status": lambda self_: self_,
+            },
+        )()
 
     async def _get_verified(self, url, timeout=None):
         self.downloaded = True
