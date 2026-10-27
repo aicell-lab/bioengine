@@ -1517,6 +1517,9 @@ class EntryApp:
             metadata = pool.build_contribution_metadata(
                 contribution_id=cid,
                 model_type=model_type,
+                # Empty is the same as unset here: an exported-but-empty var
+                # would otherwise stamp "" and read as a known version.
+                app_version=os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None,
                 cellpose_version=info["cellpose_version"],
                 architecture_signature=signature,
                 base_checkpoint_id=base_checkpoint_id,

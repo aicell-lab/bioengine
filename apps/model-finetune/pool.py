@@ -552,6 +552,7 @@ def build_contribution_metadata(
     *,
     contribution_id: str,
     model_type: str,
+    app_version: Optional[str],
     cellpose_version: str,
     architecture_signature: str,
     base_checkpoint_id: str,
@@ -567,11 +568,18 @@ def build_contribution_metadata(
     """A contribution's metadata.json. ``samples_seen`` and ``l2_from_base`` are
     recorded on every contribution but only become load-bearing under specific
     aggregation families (sample-weighting, drift bound) — recording them now
-    keeps the pool auditable regardless of which family Nils picks."""
+    keeps the pool auditable regardless of which family Nils picks.
+
+    ``app_version`` is written unconditionally, null included: a field that is
+    absent when unknown cannot be told apart from one written before versions
+    were stamped at all, which is the ambiguity it exists to remove.
+    ``schema_version`` does not cover it — 0.27.6 moved every ``l2_from_base``
+    value without changing the record's shape."""
     return {
         "schema_version": SCHEMA_VERSION,
         "contribution_id": contribution_id,
         "model_type": model_type,
+        "app_version": app_version,
         "cellpose_version": cellpose_version,
         "architecture_signature": architecture_signature,
         "base_checkpoint_id": base_checkpoint_id,
