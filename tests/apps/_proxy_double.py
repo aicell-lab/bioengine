@@ -23,11 +23,10 @@ PROXY_CLS = pd_module.ProxyDeployment.func_or_class
 class ProxyDouble(PROXY_CLS):
     """``ProxyDeployment`` without the async destructor Ray Serve drives."""
 
-    # Token renewal off unless a test opts in. ``_maintenance_tick`` calls
-    # ``_renew_token_if_due`` on every pass, and a zero TTL is its documented
-    # "disabled" input — without these class defaults every fixture that drives
-    # the tick would have to carry two attributes for a feature it is not
-    # testing, and would fail with AttributeError if it forgot.
+    # The constructor sets both; a zero TTL is the documented "renewal
+    # disabled" input. Kept as class defaults so a fixture that drives a path
+    # reading either one — ``_report_service_registration``, the renewal log —
+    # does not have to carry two attributes for a feature it is not testing.
     _token_ttl_seconds = 0
     _token_issued_at = 0.0
 

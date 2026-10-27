@@ -215,6 +215,7 @@ def _bare_actor() -> object:
     actor.application_replicas = {}
     actor.replica_identities = {}
     actor.service_registrations = {}
+    actor._pending_tokens = {}
     return actor
 
 
@@ -238,6 +239,16 @@ def test_clearing_an_application_forgets_its_registration() -> None:
     actor.report_service_registration(APP_ID, True)
     actor.clear_application_replicas(APP_ID)
     assert actor.get_service_registration(APP_ID) is None
+
+
+def test_clearing_an_application_drops_its_uncollected_token() -> None:
+    # An undeployed app has nobody left to collect it, and the drop box is the
+    # one place a live credential sits outside a replica.
+    actor = _bare_actor()
+    actor.set_pending_token(APP_ID, "NOT-A-CREDENTIAL", 0.0, 1.0)
+    assert actor.has_pending_token(APP_ID) is True
+    actor.clear_application_replicas(APP_ID)
+    assert actor.has_pending_token(APP_ID) is False
 
 
 # ===== the proxy pushes the state it is in =====

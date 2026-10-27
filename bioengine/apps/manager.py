@@ -289,6 +289,15 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
+# Mint a proxy's replacement Hypha token once this much of its life has passed.
+# It is a deploy-time credential with a 30-day TTL and a deploy is the only
+# thing that used to mint one, so an app the worker *adopted* rather than
+# deployed kept the original and died at 30 days with HTTP 401 — reported as
+# UNHEALTHY, which points at the app rather than at the credential. Renewed at
+# two thirds, so a worker down for a week still has ten days of margin when it
+# returns; the margin is the point rather than the cadence.
+_TOKEN_RENEW_AFTER_FRACTION = 2 / 3
+
 
 # What ``get_app_status`` tells a caller who is neither a worker admin nor named
 # on the application's own roster.
@@ -1852,6 +1861,72 @@ class AppsManager:
             self._startup_retry_task.cancel()
         self._startup_retry_task = None
 
+    async def _renew_proxy_tokens(self) -> None:
+        """Mint replacements for proxy tokens that are two-thirds spent.
+
+        The proxy cannot do this itself. Hypha's ``generate_token`` requires
+        admin on the target workspace and the proxy is given ``read_write``, so
+        it gets ``PermissionError: Only admin can generate token.`` — measured
+        against hypha.aicell.io on 2026-10-27, with a ``public`` arm refused for
+        a different reason and a nonexistent-workspace arm raising, so the
+        refusal is the permission check and not a dead client. The worker holds
+        the admin credential, so it mints here and leaves the result in the
+        proxy actor for the replica to collect.
+
+        Never raises: renewal has days of margin and the next tick retries, so a
+        failure must not cost the caller its own pass.
+        """
+        if not self.server:
+            return
+
+        handle = getattr(self.ray_cluster, "proxy_actor_handle", None)
+        if handle is None:
+            return
+
+        now = time.time()
+        for application_id, application_info in list(
+            self._deployed_applications.items()
+        ):
+            if not application_info["is_deployed"].is_set():
+                continue
+            ttl_seconds = application_info.get("proxy_service_token_ttl_seconds")
+            if not ttl_seconds or ttl_seconds <= 0:
+                continue
+
+            issued_at = None
+            try:
+                issued_at = await self._reported_token_issued_at(
+                    application_id,
+                    application_info.get("proxy_service_token_issued_at"),
+                )
+                if issued_at is None:
+                    continue
+                if now - issued_at < ttl_seconds * _TOKEN_RENEW_AFTER_FRACTION:
+                    continue
+                if await handle.has_pending_token.remote(application_id):
+                    continue
+
+                token = await self.server.generate_token(
+                    {
+                        "workspace": self.server.config.workspace,
+                        "permission": "read_write",
+                        "expires_in": int(ttl_seconds),
+                    }
+                )
+                await handle.set_pending_token.remote(
+                    application_id=application_id,
+                    token=token,
+                    issued_at=time.time(),
+                    ttl_seconds=ttl_seconds,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"Could not renew the proxy Hypha token for "
+                    f"'{application_id}' ({(now - (issued_at or now)) / 86400:.1f} "
+                    f"days into a {ttl_seconds / 86400:.0f}-day TTL): {exc}. "
+                    f"Keeping the current token; the next tick retries."
+                )
+
     async def monitor_applications(self) -> None:
         """Auto-redeploy unhealthy apps with per-app exponential backoff.
 
@@ -1885,6 +1960,11 @@ class AppsManager:
                 unreachable). The outer monitoring loop catches and applies
                 its own exponential backoff.
         """
+        # Ahead of the auto-redeploy filter and its early return: a proxy token
+        # expires whether or not the app opted into auto-redeploy, and the app
+        # that hit this first was an adopted one with the flag unset.
+        await self._renew_proxy_tokens()
+
         apps_to_redeploy = [
             app_id
             for app_id, app_info in self._deployed_applications.items()

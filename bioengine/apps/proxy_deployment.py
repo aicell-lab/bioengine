@@ -74,15 +74,6 @@ _USAGE_FLUSH_TIMEOUT_S = 10
 # it is mid-reconnect abandons the connection it is repairing and starts a
 # rebuild storm, so a drop only brings the next probe forward.
 _RECONNECT_GRACE_S = 30
-# Renew the proxy's Hypha token once this much of its life has passed. It is a
-# deploy-time credential with a 30-day TTL and a deploy is the only thing that
-# used to mint one, so an app the worker *adopted* rather than deployed kept the
-# original and died at 30 days with HTTP 401 — reported as UNHEALTHY, which
-# points at the app rather than at the credential. Renewed at two thirds, so a
-# worker down for a week still has ten days of margin when it returns; an
-# expired token cannot mint its own replacement, which is what makes the margin
-# the point rather than the cadence.
-_TOKEN_RENEW_AFTER_FRACTION = 2 / 3
 
 # Hypha reports a workspace we may not use as a plain exception with no
 # error code, from two different call sites in hypha_rpc. The message is the
@@ -1448,53 +1439,50 @@ class ProxyDeployment:
             return True
         return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
 
-    async def _renew_token_if_due(self) -> None:
-        """Mint a fresh Hypha token before the current one expires.
+    async def _collect_renewed_token(self) -> None:
+        """Adopt a replacement Hypha token the worker has left for us.
 
-        Verified against a live server: a ``read_write`` workspace token — the
-        scope the proxy is given — can mint its replacement, so this needs no
-        worker round trip. It must run while the token is still valid, because
-        an expired one cannot mint anything.
+        The proxy cannot mint its own: ``generate_token`` requires admin on the
+        target workspace and this replica holds ``read_write``, so Hypha answers
+        ``PermissionError: Only admin can generate token.`` The worker decides
+        when a token is due and deposits the replacement in the proxy actor; all
+        that is left here is to collect it. See
+        ``BioEngineProxyActor.take_pending_token`` and
+        ``BioEngineAppsManager._renew_proxy_tokens``.
 
         Advisory. A failure here leaves the existing token in place and the next
         tick tries again, which is the right shape: there are days of margin,
         and failing the replica over a renewal that can be retried would be a
         worse outcome than the expiry this prevents.
         """
-        if self._token_ttl_seconds <= 0 or self.server is None:
-            return
-
-        age = time.time() - self._token_issued_at
-        if age < self._token_ttl_seconds * _TOKEN_RENEW_AFTER_FRACTION:
+        handle = getattr(self, "_proxy_actor_handle", None)
+        if handle is None:
             return
 
         try:
-            token = await self.server.generate_token(
-                {
-                    "workspace": self.workspace,
-                    "permission": "read_write",
-                    "expires_in": int(self._token_ttl_seconds),
-                }
-            )
+            pending = await handle.take_pending_token.remote(self.application_id)
         except Exception as e:
             logger.warning(
-                f"⚠️ Could not renew the Hypha token for '{self.application_id}' "
-                f"({age / 86400:.1f} days old, TTL "
-                f"{self._token_ttl_seconds / 86400:.0f} days): {e}. Keeping the "
-                f"current token; the next tick retries."
+                f"⚠️ Could not check for a renewed Hypha token for "
+                f"'{self.application_id}': {e}. Keeping the current token; the "
+                f"next tick retries."
             )
             return
 
-        self.proxy_service_token = token
-        self._token_issued_at = time.time()
+        if not pending:
+            return
+
+        self.proxy_service_token = pending["token"]
+        self._token_issued_at = pending["issued_at"]
+        self._token_ttl_seconds = pending["ttl_seconds"]
         # The live client still holds the OLD token. Nothing re-authenticates an
         # established connection, so the new one only takes effect on a rebuild
         # — without this the renewal is recorded and never used.
         self._connection_lost = True
         logger.info(
-            f"🔑 Renewed the Hypha token for '{self.application_id}' at "
-            f"{age / 86400:.1f} days of a {self._token_ttl_seconds / 86400:.0f}-day "
-            f"TTL; rebuilding the client so the new one is used."
+            f"🔑 Collected a renewed Hypha token for '{self.application_id}' "
+            f"(TTL {self._token_ttl_seconds / 86400:.0f} days); rebuilding the "
+            f"client so the new one is used."
         )
 
     async def _maintenance_tick(self) -> None:
@@ -1511,7 +1499,7 @@ class ProxyDeployment:
             # down. check_health owns that gate; nothing to maintain.
             return
 
-        await self._renew_token_if_due()
+        await self._collect_renewed_token()
 
         needs_registration = (
             self.server is None or self.websocket_service_id is None or self._connection_lost
