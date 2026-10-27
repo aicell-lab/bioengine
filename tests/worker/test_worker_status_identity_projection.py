@@ -155,8 +155,8 @@ async def test_every_public_field_reaches_an_anonymous_caller():
 
 async def test_the_kubernetes_startup_probe_still_reads_readiness_unauthenticated():
     """The deployed startup probe is a plain ``curl | grep '"is_ready": true'``
-    with no token, and it is the one probe that calls this method — the
-    deployed liveness probe is a local ``kill -0 1``. Asserted on the serialized
+    with no token, and it is the one probe that calls this method — the deployed
+    liveness probe reads the heartbeat file locally. Asserted on the serialized
     bytes because that is what the probe actually matches."""
     status = await bare_worker().get_status(context=ANONYMOUS)
     assert '"is_ready": true' in json.dumps(status)
