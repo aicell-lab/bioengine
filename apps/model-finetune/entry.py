@@ -1772,8 +1772,11 @@ class EntryApp:
                 return result
 
             # The digest each member is expected to hash to, so the replica that
-            # downloads it can check the bytes rather than trust the path.
-            sha_by_path = {c["weights_path"]: c.get("weights_sha256")
+            # downloads it can check the bytes rather than trust the path. Subscripted,
+            # not .get(): every index contribution has carried weights_sha256 since the
+            # pool backend existed, so a row without one is a corrupt index and must
+            # raise here rather than degrade into an unverified soup.
+            sha_by_path = {c["weights_path"]: c["weights_sha256"]
                            for c in index.get("contributions", [])}
 
             async def _specs(paths: List[str]) -> List[Dict[str, str]]:
@@ -1781,7 +1784,7 @@ class EntryApp:
                 for p in paths:
                     if p not in url_cache:
                         url_cache[p] = await am.get_file(pool_artifact_id, file_path=p)
-                    out.append({"key": p, "url": url_cache[p], "sha256": sha_by_path.get(p)})
+                    out.append({"key": p, "url": url_cache[p], "sha256": sha_by_path[p]})
                 return out
 
             # Resume journal. A merge is 2*len(batch)+3 scoring passes and each pass
@@ -1830,17 +1833,6 @@ class EntryApp:
             pending = pool.undecided_contributions(index)
             batch = pending[:max_batch]
             deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
-
-            # A contribution with no recorded digest cannot be checked against the
-            # bytes a replica downloads, so it is excluded instead of souped on trust.
-            # The pool outlives the app version that wrote its records and still holds
-            # ones written before the digest was banked, so this is a live case and not
-            # a defensive branch. Excluded here rather than scored-and-dropped: the
-            # greedy's rejections lost on merit, these were never weighed, and the
-            # merge record keeps the two apart.
-            unverified_ids = pool.unverifiable_contributions(batch)
-            excluded = set(unverified_ids)
-            batch = [c for c in batch if c["contribution_id"] not in excluded]
             cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
 
             # Refuse a merge that cannot fit BEFORE any scoring pass, rather than
@@ -1958,10 +1950,7 @@ class EntryApp:
             self._bump_transport(bytes_down=soup_bytes_down)
 
             index["baseline"] = baseline
-            # The unverifiable ones are decided too: nothing will ever add a digest to
-            # an immutable committed record, so leaving them undecided would re-weigh
-            # them at every future merge forever.
-            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + [c["contribution_id"] for c in batch] + unverified_ids
+            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + [c["contribution_id"] for c in batch]
             # bytes_in counts the assessed set (the batch weighed at this merge);
             # bytes_out is the published head, 0 when nothing was admitted. n_bytes is
             # written per contribution in a different function, so if any assessed member
@@ -1982,8 +1971,7 @@ class EntryApp:
                 "members": members_record,
                 "selection_metric": sel_metric, "witness_metric": wit_metric,
                 "global_sha256": head_sha, "transport": merge_transport,
-                "deferred": deferred_ids, "unverified": unverified_ids,
-                "created_at": time.time(),
+                "deferred": deferred_ids, "created_at": time.time(),
             })
             await am.edit(pool_artifact_id, stage=True)
             i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
@@ -2002,10 +1990,6 @@ class EntryApp:
             "published_version": new_version,
             "admitted": admitted,
             "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
-            # Excluded for missing provenance, NOT weighed and found wanting — a
-            # caller that folded these into `rejected` would read them as a quality
-            # verdict on a contribution nothing ever scored.
-            "unverified": unverified_ids,
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
             "witness_metric": round(head_b, 4) if head_b is not None else None,

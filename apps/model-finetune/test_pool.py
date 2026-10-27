@@ -429,51 +429,8 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
 
 
 # ---------------------------------------------------------------------------
-# #0139: a contribution with no verified digest must not enter a soup.
+# #0139: a soup member's bytes must hash to the digest the pool recorded.
 # ---------------------------------------------------------------------------
-
-def _batch_of_three():
-    """A pool batch as `aggregate` sees it: one pre-digest record, one that banked
-    the key as null, one good. All three are otherwise complete and mergeable, so
-    anything that excludes more or fewer than two is reacting to the digest."""
-    return [
-        {"contribution_id": "legacy-0", "weights_path": "c/legacy-0/weights.pt",
-         "n_bytes": 1_300_000_000, "samples_seen": 4000},
-        {"contribution_id": "null-0", "weights_path": "c/null-0/weights.pt",
-         "weights_sha256": None, "n_bytes": 1_300_000_000, "samples_seen": 2000},
-        {"contribution_id": "good-0", "weights_path": "c/good-0/weights.pt",
-         "weights_sha256": "c" * 64, "n_bytes": 1_300_000_000, "samples_seen": 1000},
-    ]
-
-
-def test_an_absent_and_a_null_digest_are_both_unverifiable_and_a_good_one_is_not():
-    assert pool.unverifiable_contributions(_batch_of_three()) == ["legacy-0", "null-0"]
-
-
-def test_the_verifiable_contribution_survives_the_filter():
-    """The other half of the clause: excluding the two is only correct if the third
-    still merges. A guard that returned every id would pass the test above."""
-    batch = _batch_of_three()
-    excluded = set(pool.unverifiable_contributions(batch))
-    kept = [c["contribution_id"] for c in batch if c["contribution_id"] not in excluded]
-    assert kept == ["good-0"]
-
-
-def test_a_digest_is_the_only_field_this_keys_on():
-    """Discrimination control. `soup_admission` deliberately fails OPEN on a missing
-    `n_bytes`, so a guard that keyed on 'any absent metadata' would silently reverse
-    that decision for the memory gate as well. A row with a digest and nothing else
-    must pass."""
-    batch = [{"contribution_id": "sparse-0", "weights_path": "c/sparse-0/weights.pt",
-              "weights_sha256": "d" * 64}]
-    assert pool.unverifiable_contributions(batch) == []
-
-
-def test_an_empty_batch_excludes_nothing():
-    """Discrimination control: the filter is reached with an empty batch on a pool
-    whose contributions are all already decided, and must not invent an exclusion."""
-    assert pool.unverifiable_contributions([]) == []
-
 
 def test_matching_bytes_are_accepted():
     content = b"the tensors as attested"
@@ -493,11 +450,17 @@ def test_bytes_that_do_not_match_the_recorded_digest_are_refused():
     assert hashlib.sha256(content).hexdigest() in refusal
 
 
-def test_no_recorded_digest_means_no_check_at_the_replica():
-    """Discrimination control, and it pins a deliberate split of responsibility: the
-    replica sees one member and cannot know a pool-wide rule, so the absent-digest
-    refusal belongs to admission (tested above) and NOT here. A `member_digest_refusal`
-    that refused on None would make the two guards fight — admission would exclude the
-    contribution and this would also raise for any caller that skipped admission."""
-    assert pool.member_digest_refusal("c/legacy-0/weights.pt", None, b"anything") is None
-    assert pool.member_digest_refusal("c/legacy-0/weights.pt", "", b"anything") is None
+def test_an_empty_digest_is_refused_rather_than_skipped():
+    """The failure this guard exists to prevent is souping bytes nothing checked, so
+    the one thing it must never do is treat an unusable expectation as 'nothing to
+    verify'. An earlier draft returned None on a falsy digest and would pass every
+    other test here."""
+    assert pool.member_digest_refusal("c/good-0/weights.pt", "", b"anything") is not None
+
+
+def test_the_whole_digest_is_compared_and_not_a_prefix():
+    """Discrimination control: a prefix or startswith comparison passes both tests
+    above, because their two digests differ in the first character."""
+    content = b"the tensors as attested"
+    full = hashlib.sha256(content).hexdigest()
+    assert pool.member_digest_refusal("c/good-0/weights.pt", full[:32], content) is not None

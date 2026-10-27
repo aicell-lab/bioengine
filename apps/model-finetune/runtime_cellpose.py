@@ -377,7 +377,7 @@ class CellposeRuntime:
                 )
                 time.sleep(_MEMBER_DOWNLOAD_BACKOFF_S * 2**attempt)
 
-    def _fetch_member(self, key: str, url: str, expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+    def _fetch_member(self, key: str, url: str, expected_sha256: str) -> Dict[str, Any]:
         """Load a member state_dict, downloading on first use.
 
         The download is cached as a file, not as tensors: one download per member
@@ -390,7 +390,12 @@ class CellposeRuntime:
         cached, so a member that does not hash to what the pool recorded never
         reaches the cache and cannot be served to a later merge as if it had been
         verified. The check costs one hash of bytes already in RAM, once per member
-        per replica — not once per scoring pass, because a cache hit skips it."""
+        per replica — not once per scoring pass, because a cache hit skips it.
+
+        A cache HIT is therefore trusted on the strength of the check that admitted
+        it. That is sound only because the cache key is the immutable pool
+        weights_path and the file is written via a temporary name, so a cached entry
+        can only be bytes this method already verified."""
         import torch
 
         import pool
@@ -419,7 +424,7 @@ class CellposeRuntime:
         if not members:
             return None
         return pool.uniform_soup(
-            [partial(self._fetch_member, m["key"], m["url"], m.get("sha256"))
+            [partial(self._fetch_member, m["key"], m["url"], m["sha256"])
              for m in members]
         )
 
