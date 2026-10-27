@@ -797,7 +797,13 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
     admitted nothing: selection bar only, no witness), and enriched
     ``contributions[]`` stubs (disposition + which soup they merged into). Campaign-
     registry metadata the page owns (contributor demographics, licences, stewards,
-    description) is composed on the page, not here."""
+    description) is composed on the page, not here.
+
+    A contribution's ``weights_sha256`` is published because ``contribute()`` returns
+    it exactly once: a deposit whose response is lost — measured at 4 of 92 against a
+    1.2 GiB PUT — otherwise leaves the client unable to tell a landed upload from one
+    it must retry, and a retry duplicates the member and silently weights that site
+    2:1 in the uniform mean. Reading it back makes that question answerable."""
     alias = pool_artifact_id.split("/")[-1]
     merges = index.get("merges", [])
 
@@ -855,6 +861,7 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         contributions.append({
             "contribution_id": cid,
             "received_at": _iso(c.get("uploaded_at")),
+            "weights_sha256": c.get("weights_sha256"),
             # Published under the storage name on purpose: soup_admission fails
             # open on a missing n_bytes, so the audit question is "did the pool
             # record n_bytes?" and the view has to answer it under that word.
