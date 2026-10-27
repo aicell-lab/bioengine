@@ -516,7 +516,14 @@ class EntryApp:
         weights_path = cache_dir / "weights.pt"
         meta_path = cache_dir / "kwargs.json"
         if weights_path.exists() and meta_path.exists():
-            return {"weights_path": str(weights_path), **json.loads(meta_path.read_text())}
+            meta = json.loads(meta_path.read_text())
+            # The recorded length, not the pair existing, is what says the weights are
+            # whole. Both files existing only proves they were written by a version that
+            # had ``_write_file_atomic``; versions before it wrote ``weights.pt`` in
+            # place, and this cache lives in an app HOME that outlives any one version.
+            # So an entry carrying no length is a MISS and re-downloads once.
+            if meta.pop("bytes", None) == weights_path.stat().st_size:
+                return {"weights_path": str(weights_path), **meta}
 
         caller_client = (
             await connect_to_server({"server_url": SERVER_URL, "token": model_token})
@@ -551,7 +558,9 @@ class EntryApp:
             # gates on both files existing, so it must appear whole or not at all — a
             # plain write_text makes it exist (empty) before it has content, and the
             # reader then json.loads("").
-            _write_file_atomic(meta_path, json.dumps(meta).encode())
+            _write_file_atomic(
+                meta_path, json.dumps({**meta, "bytes": len(content)}).encode()
+            )
             return {"weights_path": str(weights_path), **meta}
         finally:
             if caller_client is not None:
