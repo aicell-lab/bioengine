@@ -125,11 +125,25 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     reader of a 1.2 GB checkpoint then sees a prefix, and identical content is no
     defence because the problem is the length, not the bytes. The temp name carries
     a uuid so concurrent writers cannot share it either.
+
+    Both fsyncs are for the cross-node case rather than the same-process one: callers
+    hand ``path`` to a runtime replica on a different node, and ``os.replace`` publishes
+    the name immediately while the data may still sit in this client's page cache — so
+    the reader opens the new name and legitimately sees fewer bytes than were written.
+    Syncing the file before the rename and the directory after closes that window.
     """
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_bytes(content)
+        with open(tmp, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -333,6 +347,25 @@ class EntryApp:
                 continue
             return resp
 
+    async def _get_verified(self, url: str, **kwargs) -> bytes:
+        """GET a body whole, rejecting a short read.
+
+        httpx raises on a body cut short of its declared length, so this check is a
+        second line of defence — but the one that matters: a prefix reaching
+        ``_write_file_atomic`` is indistinguishable from a prefix a reader sees for
+        lack of an fsync, both surfacing as ``failed finding central directory`` from
+        ``torch.load`` far from the cause. Same contract as
+        ``runtime_cellpose._download_member``.
+        """
+        from http.client import IncompleteRead
+
+        resp = await self._http_retry("GET", url, **kwargs)
+        content = resp.content
+        declared = resp.headers.get("Content-Length")
+        if declared is not None and len(content) != int(declared):
+            raise IncompleteRead(content, int(declared) - len(content))
+        return content
+
     @staticmethod
     async def _file_chunks(fpath: Path, size: int = 1 << 20):
         with open(fpath, "rb") as fh:
@@ -510,7 +543,7 @@ class EntryApp:
             model_type = ps["architecture"]["kwargs"]["model_type"]
 
             w_url = await am.get_file(model_id, file_path=ps["source"])
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
             cache_dir.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(_write_file_atomic, weights_path, content)
             meta = {"model_type": model_type}
@@ -1637,7 +1670,7 @@ class EntryApp:
                     raise ValueError(f"pool '{pool_artifact_id}' has no community checkpoint to evaluate.")
                 weights_rel = cc["path"]
             w_url = await am.get_file(pool_artifact_id, file_path=weights_rel)
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
