@@ -646,6 +646,44 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sorted(pending, key=lambda c: c.get("uploaded_at", 0.0))
 
 
+def unverifiable_contributions(batch: Sequence[Dict[str, Any]]) -> List[str]:
+    """Ids in ``batch`` with no recorded weights digest, in batch order.
+
+    Absent and ``null`` are the same answer — neither says what the bytes should
+    hash to — so a reader cannot tell a pre-digest record from a writer that
+    declined to bank one, and must not merge either on trust.
+
+    Unlike ``soup_admission``, this fails CLOSED on missing metadata, and the
+    difference is the stake rather than the taste: an unknown ``n_bytes`` predicts
+    nothing about the peak, whereas an unknown digest means the bytes about to enter
+    a published checkpoint cannot be attributed at all. It is also closed per
+    CONTRIBUTION and not per merge — the merge still runs on whatever is verifiable,
+    so a single legacy record cannot wedge a pool.
+    """
+    return [c["contribution_id"] for c in batch if not c.get("weights_sha256")]
+
+
+def member_digest_refusal(key: str, expected_sha256: Optional[str], content: bytes) -> Optional[str]:
+    """Reason to refuse downloaded member bytes, or None to use them.
+
+    Returns the reason as a string so the caller owns the exception type (as
+    ``soup_admission`` does). No expected digest means no check is possible here;
+    admission is where that is refused, because this runs on the replica and only
+    sees one member.
+    """
+    if not expected_sha256:
+        return None
+    got = hashlib.sha256(content).hexdigest()
+    if got == expected_sha256:
+        return None
+    return (
+        f"member '{key}' does not hash to the digest the pool recorded for it "
+        f"(expected {expected_sha256}, downloaded {got}). Refusing it: souping bytes "
+        f"that are not the ones the contribution attested to would publish a "
+        f"community checkpoint whose members cannot be reproduced."
+    )
+
+
 def next_community_version(index: Dict[str, Any]) -> str:
     """Monotonic ``vN`` for the next community checkpoint, derived from the current
     pointer so no separate counter can drift out of sync with it."""

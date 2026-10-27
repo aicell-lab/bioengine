@@ -377,15 +377,23 @@ class CellposeRuntime:
                 )
                 time.sleep(_MEMBER_DOWNLOAD_BACKOFF_S * 2**attempt)
 
-    def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
+    def _fetch_member(self, key: str, url: str, expected_sha256: Optional[str] = None) -> Dict[str, Any]:
         """Load a member state_dict, downloading on first use.
 
         The download is cached as a file, not as tensors: one download per member
         per replica, but no member stays resident between uses. Keyed by the
         immutable pool weights_path (content-addressed → no staleness). Written
         via a temporary name so an interrupted download cannot leave a truncated
-        file that every later aggregate would then fail to unpickle."""
+        file that every later aggregate would then fail to unpickle.
+
+        ``expected_sha256`` is checked against the downloaded bytes before they are
+        cached, so a member that does not hash to what the pool recorded never
+        reaches the cache and cannot be served to a later merge as if it had been
+        verified. The check costs one hash of bytes already in RAM, once per member
+        per replica — not once per scoring pass, because a cache hit skips it."""
         import torch
+
+        import pool
 
         cached = self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
         if cached.exists():
@@ -393,6 +401,9 @@ class CellposeRuntime:
         else:
             content = self._download_member(url)
             self._soup_dl_bytes += len(content)
+            bad_digest = pool.member_digest_refusal(key, expected_sha256, content)
+            if bad_digest:
+                raise ValueError(f"aggregate() refused this member: {bad_digest}")
             self._evict_members(incoming_bytes=len(content))
             partial_file = cached.with_suffix(".part")
             partial_file.write_bytes(content)
@@ -408,7 +419,8 @@ class CellposeRuntime:
         if not members:
             return None
         return pool.uniform_soup(
-            [partial(self._fetch_member, m["key"], m["url"]) for m in members]
+            [partial(self._fetch_member, m["key"], m["url"], m.get("sha256"))
+             for m in members]
         )
 
     async def score_soup(
