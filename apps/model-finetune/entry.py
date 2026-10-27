@@ -1514,12 +1514,17 @@ class EntryApp:
             else:
                 pool.assert_compatible(index, model_type=model_type, signature=signature)
 
+            # Resolved once and used by both the stored metadata and the value
+            # returned to the caller, so the two records cannot date the same
+            # contribution differently. Empty is the same as unset here: an
+            # exported-but-empty var would otherwise stamp "" and read as a
+            # known version.
+            app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
             metadata = pool.build_contribution_metadata(
                 contribution_id=cid,
                 model_type=model_type,
-                # Empty is the same as unset here: an exported-but-empty var
-                # would otherwise stamp "" and read as a known version.
-                app_version=os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None,
+                app_version=app_version,
                 cellpose_version=info["cellpose_version"],
                 architecture_signature=signature,
                 base_checkpoint_id=base_checkpoint_id,
@@ -1561,6 +1566,11 @@ class EntryApp:
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
             "schema_version": pool.SCHEMA_VERSION,
+            # The caller keeps this record, not the stored metadata.json, so it
+            # carries app_version too: schema_version does not cover a release
+            # that changes a value without changing the shape (0.27.6 moved
+            # every l2_from_base), which leaves a saved response undatable.
+            "app_version": app_version,
             "contribution_id": cid,
             "pool_artifact_id": pool_artifact_id,
             "architecture_signature": signature,
