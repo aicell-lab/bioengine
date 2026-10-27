@@ -1685,7 +1685,7 @@ class EntryApp:
         self,
         pool_artifact_id: str = Field(..., description="Community pool artifact id."),
         pool_token: str = Field(..., description="COORDINATOR token with WRITE access to the pool. Scoped to the pool, never the app's own HYPHA_TOKEN."),
-        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images (public benchmark, disjoint from ALL contributor training data)."),
+        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images — disjoint from ALL contributor training data; a precondition the app cannot check."),
         gate_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Gate split A ground-truth instance label maps (0=background), one per image."),
         witness_val_images: List[Union[np.ndarray, str]] = Field(..., description="Witness split B images — disjoint from A AND from all training data; never influences selection."),
         witness_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Witness split B ground-truth instance label maps, one per image."),

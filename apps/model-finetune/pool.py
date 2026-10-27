@@ -44,13 +44,19 @@ MANIFEST_NAME = "manifest.json"
 # pooled per-site average.
 METRIC_NAME = "mean instance F1 at IoU 0.5"
 _HOLDOUT = "campaign_holdout"
+# A basis string is published provenance, so it may only state what this app can
+# check. Split A and B arrive as caller-supplied arrays; their disjointness is a
+# precondition of aggregate(), never something verified here. Name the corpus by the
+# gate_split/witness_split hash on the same record and attribute the rest.
 SELECTION_BASIS = (
-    "the score the greedy gate admitted contributions against, on split A, a public "
-    "benchmark disjoint from every contributor's training data"
+    "the score the greedy gate admitted contributions against, on split A, the corpus "
+    "recorded as gate_split on this record and declared by the coordinator disjoint "
+    "from every contributor's training data"
 )
 WITNESS_BASIS = (
-    "scored on the disjoint witness split B, held back from the selection split and "
-    "from every contributor, the only number the improvement curve plots"
+    "scored on split B, the corpus recorded as witness_split on this record and declared "
+    "by the coordinator held back from split A and from every contributor, the only "
+    "number the improvement curve plots"
 )
 EMPTY_SELECTION_BASIS = (
     "the score the greedy gate required a contribution to beat on split A, which none "
