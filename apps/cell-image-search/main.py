@@ -1042,7 +1042,7 @@ def _make_deployment():
             "min_replicas": 1,
             "initial_replicas": 1,
             "max_replicas": 1,
-            "target_num_ongoing_requests_per_replica": 3,
+            "target_ongoing_requests": 3,
         },
         health_check_period_s=60.0,
         health_check_timeout_s=60.0,
