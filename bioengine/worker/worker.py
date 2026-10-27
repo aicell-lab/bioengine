@@ -431,11 +431,12 @@ class BioEngineWorker:
         # reports the worker not-ready, so dashboards and callers can see a
         # degraded worker. The loop keeps running and usually recovers; a
         # loop that has stopped running entirely is caught by the heartbeat
-        # file instead, since a frozen loop never reaches this counter — but
-        # only where something is configured to read that file, which today is
-        # the Kubernetes liveness probe and nothing else. Under Apptainer on
-        # SLURM, and in a plain ``docker run``, the beat is written and nobody
-        # checks it, so a frozen loop there is caught by neither mechanism.
+        # file instead, since a frozen loop never reaches this counter. The
+        # heartbeat is also the only one of these signals that gets a worker
+        # restarted, and only where something reads the file — today the
+        # Kubernetes liveness probe and nothing else. Under Apptainer on SLURM
+        # and in a plain ``docker run`` nobody reads it, so a frozen loop there
+        # is at best observable and is restarted by no one.
         self._monitor_consecutive_errors = 0
         self._monitor_degraded_threshold = 5
 
