@@ -386,6 +386,13 @@ def gate_unwatched(row, corpus, sess):
             continue
         pat = re.compile(r"(?<![\w./-])" + re.escape(term) + r"(?![\w-])")
         for fp, text in corpus:
+            # The pattern is the literal term plus zero-width assertions, so the plain
+            # substring is a necessary condition for it to match -- and str.__contains__
+            # is ~100x faster than this lookbehind regex. Without the prefilter the gate
+            # rescans the whole corpus once per term (94 worktrees x 3 terms x 474 files
+            # = 98 s of a 110 s sweep), which overran the 120 s workflow step budget.
+            if term not in text:
+                continue
             m = pat.search(text)
             if m:
                 line = text.count("\n", 0, m.start()) + 1
