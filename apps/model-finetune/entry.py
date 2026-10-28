@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import bioengine
+import busy
 import httpx
 import numpy as np
 import yaml
@@ -99,6 +100,40 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
+def _is_missing_file(exc: BaseException) -> bool:
+    """True only when an artifact-manager call failed because the file is absent.
+
+    hypha-rpc flattens a server-side exception into a RemoteException carrying the
+    remote traceback as text, so the original class survives only on its last line.
+    Hypha raises FileNotFoundError for an absent file and KeyError for an artifact
+    that is missing or unreachable — and both messages contain "does not exist", so
+    the class name is the only thing that separates absence from a transport,
+    permission or token failure that must never be read as absence.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return True
+    lines = [line for line in str(exc).splitlines() if line.strip()]
+    return bool(lines) and lines[-1].startswith("FileNotFoundError:")
+
+
+def _write_file_atomic(path: Path, content: bytes) -> None:
+    """Write ``content`` to ``path`` so no reader can observe a partial file.
+
+    The HOME caches are keyed on the request (pool, version, model id) and HOME is
+    shared by every call the worker serves, so two callers asking for the same thing
+    write the same path. ``write_bytes`` opens ``'wb'``, which truncates first — a
+    reader of a 1.2 GB checkpoint then sees a prefix, and identical content is no
+    defence because the problem is the length, not the bytes. The temp name carries
+    a uuid so concurrent writers cannot share it either.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(content)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -161,6 +196,20 @@ class EntryApp:
         # total (the number would otherwise under-count in the unsafe direction);
         # the final accumulation location is being settled with the campaign page.
         self._transport = self._load_transport()
+        # A merge is minutes to an hour on the entry; the runtimes report their
+        # own bounds, but neither sees that an aggregate is what is holding them.
+        self._merges_in_flight = 0
+        self._busy = busy.BusyLog({"aggregate": lambda: self._merges_in_flight > 0})
+        # One merge at a time per pool. aggregate() picks its community version by
+        # probing which ones exist and then spends minutes building the soup before
+        # publishing, so two overlapping calls both read the same free vN. Hypha does
+        # not arbitrate it: two callers can hold stage=True on one artifact at once,
+        # and the first commit clears the single artifact-level flag, so a caller's
+        # commit can report success over bytes another caller PUT.
+        # This is process-local and that is sufficient ONLY because EntryApp is pinned
+        # to max_replicas=1 (see the deployment decorator) — every aggregate lands in this
+        # process. Raising max_replicas voids it and needs a pool-side lease instead.
+        self._pool_locks: Dict[str, asyncio.Lock] = {}
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -169,6 +218,7 @@ class EntryApp:
         )
         self._s3 = await self._hypha.get_service("public/s3-storage")
         self._http = httpx.AsyncClient(timeout=60.0)
+        self._busy.start()
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
 
     @bioengine.health_check
@@ -462,9 +512,13 @@ class EntryApp:
             w_url = await am.get_file(model_id, file_path=ps["source"])
             content = (await self._http_retry("GET", w_url, timeout=600.0)).content
             cache_dir.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(weights_path.write_bytes, content)
+            await asyncio.to_thread(_write_file_atomic, weights_path, content)
             meta = {"model_type": model_type}
-            meta_path.write_text(json.dumps(meta))
+            # kwargs.json is the commit marker for the pair above: the cache-hit branch
+            # gates on both files existing, so it must appear whole or not at all — a
+            # plain write_text makes it exist (empty) before it has content, and the
+            # reader then json.loads("").
+            _write_file_atomic(meta_path, json.dumps(meta).encode())
             return {"weights_path": str(weights_path), **meta}
         finally:
             if caller_client is not None:
@@ -731,7 +785,9 @@ class EntryApp:
                 **resolved,
             })
             # Long-running: this await holds one GPU runtime replica for the whole
-            # training run, so a concurrent infer is routed to a second replica.
+            # training run, and a concurrent infer queues behind it on that same
+            # replica — at the effective target of 2 (#0091) two calls in flight
+            # ask for one replica, not two (#0097).
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
             # so a session waiting here is not false-flagged STOPPED.
@@ -870,6 +926,12 @@ class EntryApp:
             "pool's latest community weights and trains from them — the at-your-own-pace round "
             "start. Requires pool_token; mutually exclusive with init_checkpoint and "
             "resume_session_id; the pool's model_type must match."),
+        init_from_pool_version: Optional[str] = Field(
+            None, description="Seed from a NAMED community version ('v1', 'v2', …) instead of the "
+            "pool's current pointer. Resolves the version's own manifest.json rather than the "
+            "index, so it still reaches a version whose weights were published but whose index "
+            "entry was never committed (an aggregate interrupted between its two commits). "
+            "Requires init_from_pool."),
         pool_token: Optional[str] = Field(
             None, description="Token with read access to init_from_pool's artifact. Scoped to "
             "the pool, not the app's own token."),
@@ -903,10 +965,16 @@ class EntryApp:
         # rather than leaving a PREPARING session behind.
         selected_metrics = training.validate_metrics(metrics)
 
+        if init_from_pool_version and not init_from_pool:
+            raise ValueError(
+                "init_from_pool_version names a version inside a pool, so it requires "
+                "init_from_pool."
+            )
+
         pool_provenance = None
         if init_from_pool:
             init_checkpoint, pool_provenance = await self._resolve_pool_init(
-                model_type, init_from_pool, pool_token
+                model_type, init_from_pool, pool_token, init_from_pool_version
             )
 
         await self._check_runtime_available(model_type)
@@ -1176,6 +1244,8 @@ class EntryApp:
         try:
             url = await am.get_file(pool_artifact_id, file_path=pool.POOL_INDEX)
         except Exception as e:
+            if not _is_missing_file(e):
+                raise
             raise FileNotFoundError(
                 f"pool '{pool_artifact_id}' has no {pool.POOL_INDEX} — it is not an "
                 f"initialized model-soup pool ({e})."
@@ -1185,6 +1255,56 @@ class EntryApp:
             raise FileNotFoundError(f"pool index missing for '{pool_artifact_id}'.")
         resp.raise_for_status()
         return resp.json()
+
+    async def _read_merge_journal(self, am, pool_artifact_id: str) -> Optional[Dict[str, Any]]:
+        """Read aggregate()'s resume journal, or None when there is nothing to resume.
+
+        Absent is the normal first-merge case, so unlike the pool index this never
+        raises on a miss: a merge that cannot read its journal must still run, just
+        without the saved passes.
+        """
+        import pool
+
+        try:
+            url = await am.get_file(pool_artifact_id, file_path=pool.MERGE_JOURNAL)
+            resp = await self._http_retry("GET", url, timeout=120.0)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"no usable merge journal for '{pool_artifact_id}' ({e}); "
+                           f"this merge starts from no saved passes.")
+            return None
+
+    async def _write_merge_journal(self, am, pool_artifact_id: str, journal: Dict[str, Any]) -> None:
+        """Persist the resume journal, after every score so none is paid for twice.
+
+        Never raises. The journal buys resumability; it is not an input to the
+        merge, so a failed write must cost the saved passes and not the GPU hours
+        still running. It is logged at warning on every miss rather than once,
+        because the degraded mode — a merge that completes but cannot be resumed —
+        is otherwise indistinguishable from a healthy one.
+
+        Safe to call only while no staged edit is open: committing with a stage
+        pending promotes that stage to a new version instead of overwriting in
+        place. Every call site is in the scoring phase, before aggregate() opens
+        its own stage to publish the head.
+        """
+        import pool
+
+        try:
+            await am.edit(pool_artifact_id, stage=True)
+            url = await am.put_file(pool_artifact_id, file_path=pool.MERGE_JOURNAL)
+            (await self._http_retry(
+                "PUT", url, content=json.dumps(journal).encode("utf-8"), timeout=120.0
+            )).raise_for_status()
+            await self._commit_with_retry(am, pool_artifact_id)
+        except Exception as e:
+            logger.warning(f"could not persist the merge journal for "
+                           f"'{pool_artifact_id}' ({e}); a kill now would lose the "
+                           f"{len(journal.get('scores', {}))} scored pass(es) since "
+                           f"the last successful write.")
 
     async def _commit_with_retry(self, am, artifact_id: str, tries: int = 6, base: float = 2.0) -> None:
         """Commit a staged artifact, retrying the transient read-after-write 404 the
@@ -1203,10 +1323,80 @@ class EntryApp:
                     raise
                 await asyncio.sleep(base * (2 ** i))
 
-    async def _resolve_pool_init(self, model_type, init_from_pool, pool_token):
-        """Resolve a pool's CURRENT community checkpoint to a download URL for
+    async def _read_community_manifest(
+        self, am, pool_artifact_id: str, community_version: str
+    ) -> Dict[str, Any]:
+        """Read ``community/<version>/manifest.json`` and shape it like an index
+        ``current_community`` entry, so a named version and the pointer resolve
+        through one code path downstream."""
+        import pool
+
+        paths = pool.community_paths(community_version)
+        try:
+            url = await am.get_file(pool_artifact_id, file_path=paths["manifest"])
+        except Exception as e:
+            if not _is_missing_file(e):
+                raise
+            raise FileNotFoundError(
+                f"pool '{pool_artifact_id}' has no {paths['manifest']} — version "
+                f"'{community_version}' was never published ({e}). Versions count from "
+                f"'v1'; note get_pool_state reads the index, so it cannot list a version "
+                f"whose index entry was never committed."
+            )
+        resp = await self._http_retry("GET", url, timeout=120.0)
+        if resp.status_code == 404:
+            raise FileNotFoundError(
+                f"manifest missing for '{pool_artifact_id}' version '{community_version}'."
+            )
+        resp.raise_for_status()
+        manifest = resp.json()
+        return {
+            "version": manifest.get("community_version", community_version),
+            "path": paths["weights"],
+            "sha256": manifest.get("weights_sha256"),
+            "selection_metric": manifest.get("selection_metric"),
+            "witness_metric": manifest.get("witness_metric"),
+        }
+
+    async def _next_free_community_version(self, am, pool_artifact_id: str, index: Dict[str, Any]) -> str:
+        """The next ``vN`` that is not already published.
+
+        pool.next_community_version derives it from the index pointer alone, so a pool
+        whose pointer was never committed (an aggregate interrupted between its two
+        commits) gets back a version whose weights are already on disk — and publishing
+        onto it overwrites an immutable community checkpoint in place. Probe the manifest
+        and advance past anything already there."""
+        import pool
+
+        v = pool.next_community_version(index)
+        for _ in range(100):
+            try:
+                await self._read_community_manifest(am, pool_artifact_id, v)
+            except FileNotFoundError:
+                return v
+            logger.warning(
+                f"community {v} is already published in '{pool_artifact_id}' but the index "
+                f"does not name it (an interrupted publish); advancing rather than "
+                f"overwriting it."
+            )
+            v = f"v{int(v.lstrip('v')) + 1}"
+        raise RuntimeError(f"no free community version below v100 in '{pool_artifact_id}'.")
+
+    async def _resolve_pool_init(
+        self, model_type, init_from_pool, pool_token, community_version=None
+    ):
+        """Resolve a pool community checkpoint to a download URL for
         start_training(init_from_pool=...). Returns (url, provenance); provenance
-        is persisted with the session so _run_training can count the download."""
+        is persisted with the session so _run_training can count the download.
+
+        ``community_version`` ('v1', …) resolves that version's own manifest.json
+        instead of the index pointer. aggregate() publishes a version in two commits
+        — weights + manifest first, then the index pointer — so an interruption
+        between them leaves complete, scoreable weights the pointer never names. At
+        v1 there is no prior pointer to fall back to, so the index reads
+        ``current_community: null`` and the pointer path cannot reach the weights at
+        all. The manifest is written in the FIRST commit, so requiring it here also
+        proves the version was fully published rather than half-written."""
         import pool
 
         am, client = await self._pool_service(pool_token)
@@ -1218,12 +1408,20 @@ class EntryApp:
                     f"pool '{init_from_pool}' holds {idx_model} checkpoints, but "
                     f"model_type is {model_type}; they must match to seed from it."
                 )
-            cc = pool.current_community(index)
-            if not cc:
-                raise ValueError(
-                    f"pool '{init_from_pool}' has no community checkpoint yet — "
-                    f"nothing to seed from (contribute + aggregate first)."
+            if community_version:
+                cc = await self._read_community_manifest(
+                    am, init_from_pool, community_version
                 )
+            else:
+                cc = pool.current_community(index)
+                if not cc:
+                    raise ValueError(
+                        f"pool '{init_from_pool}' has no community checkpoint yet — "
+                        f"nothing to seed from (contribute + aggregate first). If an "
+                        f"aggregate was interrupted after publishing weights but before "
+                        f"the index pointer, name the version directly with "
+                        f"init_from_pool_version='v1'."
+                    )
             url = await am.get_file(init_from_pool, file_path=cc["path"])
             provenance = {
                 "pool_artifact_id": init_from_pool,
@@ -1319,6 +1517,9 @@ class EntryApp:
             metadata = pool.build_contribution_metadata(
                 contribution_id=cid,
                 model_type=model_type,
+                # Empty is the same as unset here: an exported-but-empty var
+                # would otherwise stamp "" and read as a known version.
+                app_version=os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None,
                 cellpose_version=info["cellpose_version"],
                 architecture_signature=signature,
                 base_checkpoint_id=base_checkpoint_id,
@@ -1451,7 +1652,11 @@ class EntryApp:
         version_tag = re.sub(r"[^\w.-]", "_", str(community_version or (cc or {}).get("version") or "current"))
         dest = Path.home() / ".bioengine" / "pool_eval" / re.sub(r"[^\w.-]", "_", pool_artifact_id) / f"community_{version_tag}.pt"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(dest.write_bytes, content)
+        # dest is handed to the runtime as the checkpoint path below, so writing
+        # it in place would let a concurrent evaluation of the same community
+        # truncate ('wb') the file a torch.load is reading. Unique temp name:
+        # the path is keyed on (pool, version) only, so writers do collide.
+        await asyncio.to_thread(_write_file_atomic, dest, content)
         self._bump_transport(bytes_down=len(content))
 
         await self._check_runtime_available(model_type)
@@ -1480,7 +1685,7 @@ class EntryApp:
         self,
         pool_artifact_id: str = Field(..., description="Community pool artifact id."),
         pool_token: str = Field(..., description="COORDINATOR token with WRITE access to the pool. Scoped to the pool, never the app's own HYPHA_TOKEN."),
-        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images (public benchmark, disjoint from ALL contributor training data)."),
+        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images — disjoint from ALL contributor training data; a precondition the app cannot check."),
         gate_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Gate split A ground-truth instance label maps (0=background), one per image."),
         witness_val_images: List[Union[np.ndarray, str]] = Field(..., description="Witness split B images — disjoint from A AND from all training data; never influences selection."),
         witness_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Witness split B ground-truth instance label maps, one per image."),
@@ -1506,7 +1711,15 @@ class EntryApp:
 
         Crash-safe: the new ``community/<version>/`` weights + manifest are committed
         BEFORE the index pointer is repointed, so a reader never sees the head aimed
-        at a half-written version."""
+        at a half-written version.
+
+        Resumable: a merge is ``2 * len(batch) + 3`` scoring passes and each is
+        minutes of exclusive GPU, so every score is written to the pool as it is
+        earned. Calling aggregate() again on the same pool, splits and ``diam_mean``
+        re-reads them, and a run killed mid-merge pays only for the passes it lost
+        rather than starting over. ``resumed_passes`` in the result reports how many
+        were reused; anything else — different splits, a different ``diam_mean``, a
+        schema bump — discards the journal and scores from scratch."""
         import pool
 
         model_type = "cpsam"
@@ -1516,6 +1729,19 @@ class EntryApp:
         wit_imgs, wit_gts = await self._resolve_val_split(witness_val_images, witness_val_labels)
 
         am, client = await self._pool_service(pool_token)
+        # Held from the index read to the index commit, not just around the publish:
+        # a merge that only locked the publish would still have built its soup from
+        # the head it read before waiting, and committing that would drop the merge
+        # that ran while it waited. Serialised, the second caller re-reads the index
+        # and weighs what is genuinely still undecided.
+        lock = self._pool_locks.setdefault(pool_artifact_id, asyncio.Lock())
+        if lock.locked():
+            logger.info(
+                f"aggregate() is waiting: another merge holds '{pool_artifact_id}'. "
+                f"Scores already earned are in the pool journal, so the wait is not lost work."
+            )
+        await lock.acquire()
+        self._merges_in_flight += 1
         try:
             index = await self._read_pool_index(am, pool_artifact_id)
             if index.get("model_type") != model_type:
@@ -1534,6 +1760,16 @@ class EntryApp:
             # downloads + caches the tensors by path, so nothing large crosses the
             # entry and no cross-actor local checkpoint is ever shared.
             url_cache: Dict[str, str] = {}
+            # Bytes this merge downloaded, per serving replica. The member cache is
+            # per-replica instance state and each gate pass is routed independently,
+            # so a merge served by more than one replica downloads on each of them —
+            # draining a single replica's counter at the end would drop the rest.
+            replica_dl: Dict[str, int] = {}
+
+            def _fold(result: Dict[str, Any]) -> Dict[str, Any]:
+                replica_dl[result["replica"]] = (
+                    replica_dl.get(result["replica"], 0) + int(result["soup_dl_bytes"]))
+                return result
 
             async def _specs(paths: List[str]) -> List[Dict[str, str]]:
                 out = []
@@ -1543,8 +1779,39 @@ class EntryApp:
                     out.append({"key": p, "url": url_cache[p]})
                 return out
 
-            async def _score(member_paths: List[str], imgs, gts) -> float:
-                return await runtime.score_soup(await _specs(member_paths), imgs, gts, diam_mean)
+            # Resume journal. A merge is 2*len(batch)+3 scoring passes and each pass
+            # is minutes of exclusive GPU; the run that prompted this was killed at
+            # pass 11 of 35 and returned nothing, losing 62 minutes. Every score is
+            # written to the pool as it is earned, so a replica kill costs the pass
+            # in flight and not the merge. The pool is the right home for it rather
+            # than replica-local disk: the process that dies mid-merge is exactly the
+            # one whose disk cannot be trusted afterwards.
+            # Validate the splits before anything derives an identity from them:
+            # the journal stamps those identities, so a bad one is baked in here.
+            bad_split = pool.split_provenance_error(gate_split, witness_split)
+            if bad_split:
+                raise ValueError(f"aggregate() refused this merge: {bad_split}")
+
+            journal = pool.usable_merge_journal(
+                await self._read_merge_journal(am, pool_artifact_id),
+                gate_split, witness_split, diam_mean)
+            resumed_from = len(journal["scores"])
+            gate_id = pool.split_identity(gate_split)
+            wit_id = pool.split_identity(witness_split)
+            splits = {gate_id: (gate_imgs, gate_gts), wit_id: (wit_imgs, wit_gts)}
+
+            async def _score(member_paths: List[str], split_id: str) -> float:
+                key = pool.score_key(split_id, member_paths)
+                if key in journal["scores"]:
+                    return float(journal["scores"][key])
+                imgs, gts = splits[split_id]
+                # A journal hit returns above without folding, which is correct: that
+                # pass transported nothing on this run.
+                value = _fold(await runtime.score_soup(
+                    await _specs(member_paths), imgs, gts, diam_mean))["f1"]
+                pool.record_score(journal, key, value)
+                await self._write_merge_journal(am, pool_artifact_id, journal)
+                return value
 
             cc = pool.current_community(index)
             cur_member_ids: List[str] = []
@@ -1555,11 +1822,30 @@ class EntryApp:
                 cur_member_ids = list(cur_manifest.get("selected_contribution_ids", []))
             cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
 
+            pending = pool.undecided_contributions(index)
+            batch = pending[:max_batch]
+            deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
+            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
+
+            # Refuse a merge that cannot fit BEFORE any scoring pass, rather than
+            # discovering it as an OOM kill 11 passes in. This is as early as the
+            # check can go: it needs `batch`, which is the first point at which the
+            # members that will actually be loaded are known.
+            budget = await runtime.soup_memory_budget()
+            refusal = pool.soup_admission(
+                [c.get("n_bytes") for c in batch] + [by_id[cid].get("n_bytes")
+                                                     for cid in cur_member_ids],
+                budget_bytes=budget["declared_bytes"],
+                base_bytes=budget["rss_bytes"] or 0,
+            )
+            if refusal:
+                raise ValueError(f"aggregate() refused this merge: {refusal}")
+
             # Stock baseline on A and B (anchor of the witness curve — the level to beat).
             baseline = index.get("baseline")
             if baseline is None:
-                stock_a = await _score([], gate_imgs, gate_gts)
-                stock_b = await _score([], wit_imgs, wit_gts)
+                stock_a = await _score([], gate_id)
+                stock_b = await _score([], wit_id)
                 baseline = {
                     "model": "stock-cpsam",
                     "selection_metric": pool.round_metric(
@@ -1569,13 +1855,8 @@ class EntryApp:
                     "created_at": time.time(),
                 }
 
-            cur_a = (await _score(cur_member_paths, gate_imgs, gate_gts)
+            cur_a = (await _score(cur_member_paths, gate_id)
                      if cur_member_paths else baseline["selection_metric"]["aggregate"])
-
-            pending = pool.undecided_contributions(index)
-            batch = pending[:max_batch]
-            deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
-            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
 
             # Best-first ordering: individual marginal of adding each candidate to the
             # current soup, on A. Re-scored against the CURRENT head (a stale solo
@@ -1583,7 +1864,7 @@ class EntryApp:
             marg = {}
             for c in batch:
                 cid = c["contribution_id"]
-                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_imgs, gate_gts)
+                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_id)
             ordered = sorted(batch, key=lambda c: marg[c["contribution_id"]], reverse=True)
 
             s_paths = list(cur_member_paths)
@@ -1593,9 +1874,10 @@ class EntryApp:
             admitted: List[str] = []
             for c in ordered:
                 cid = c["contribution_id"]
-                trial_a = await _score(s_paths + [cand_path[cid]], gate_imgs, gate_gts)
+                trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
                 included = trial_a >= (s_a - eps)
-                members_record.append({"contribution_id": cid, "gate_score": round(trial_a, 4), "included": bool(included)})
+                members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
+                                       "gate_score": round(trial_a, 4), "included": bool(included)})
                 if included:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)
@@ -1606,9 +1888,9 @@ class EntryApp:
             baseline_version = cc["version"] if (cc and cc.get("path")) else "stock-cpsam"
 
             if changed:
-                new_version = pool.next_community_version(index)
+                new_version = await self._next_free_community_version(am, pool_artifact_id, index)
                 head_a = s_a
-                head_b = await _score(s_paths, wit_imgs, wit_gts)
+                head_b = await _score(s_paths, wit_id)
                 sel_metric = pool.round_metric(
                     role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.SELECTION_BASIS)
                 wit_metric = pool.round_metric(
@@ -1620,7 +1902,7 @@ class EntryApp:
                 # never traverse the CPU entry.
                 await am.edit(pool_artifact_id, stage=True)
                 w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
-                mat = await runtime.materialize_soup(await _specs(s_paths), w_url)
+                mat = _fold(await runtime.materialize_soup(await _specs(s_paths), w_url))
                 head_sha = mat["sha256"]
                 head_bytes_out = int(mat["n_bytes"])
                 manifest = pool.build_community_manifest(
@@ -1650,7 +1932,14 @@ class EntryApp:
                     role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.EMPTY_SELECTION_BASIS)
                 wit_metric = None
 
-            self._bump_transport(bytes_down=await runtime.pop_soup_dl_bytes())
+            soup_bytes_down = sum(replica_dl.values())
+            if len(replica_dl) > 1:
+                logger.warning(
+                    f"⚠️ This merge was served by {len(replica_dl)} CellposeRuntime "
+                    f"replicas, so at least one re-downloaded the member set: "
+                    f"{replica_dl}"
+                )
+            self._bump_transport(bytes_down=soup_bytes_down)
 
             index["baseline"] = baseline
             index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + [c["contribution_id"] for c in batch]
@@ -1666,6 +1955,8 @@ class EntryApp:
                 "bytes_out": head_bytes_out,
                 "n_transfers": len(batch) + (1 if changed else 0),
                 "sources_complete": True if all(nb is not None for nb in member_bytes) else None,
+                "soup_bytes_down": soup_bytes_down,
+                "soup_replicas": len(replica_dl),
             }
             pool.append_merge(index, {
                 "published_version": new_version, "baseline_version": baseline_version,
@@ -1679,6 +1970,8 @@ class EntryApp:
             (await self._http_retry("PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0)).raise_for_status()
             await self._commit_with_retry(am, pool_artifact_id)
         finally:
+            self._merges_in_flight -= 1
+            lock.release()
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
@@ -1694,4 +1987,9 @@ class EntryApp:
             "witness_metric": round(head_b, 4) if head_b is not None else None,
             "baseline": baseline,
             "n_members": len(s_ids),
+            # Passes this merge did not have to pay for because a previous attempt
+            # had already scored them. Non-zero means a killed merge resumed rather
+            # than restarted, which is the only caller-visible proof it did.
+            "resumed_passes": resumed_from,
+            "scored_passes": len(journal["scores"]) - resumed_from,
         }

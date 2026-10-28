@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import subprocess
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 import httpx
 import yaml
@@ -73,6 +74,31 @@ def latest_committed_version(artifact: Dict[str, Any]) -> Optional[str]:
     return max(versions, key=lambda v: v["created_at"])["version"]
 
 
+def _git_ignored(directory_path: Path, relative_paths: List[Path]) -> Set[Path]:
+    """The subset of ``relative_paths`` git would ignore, empty if it cannot say.
+
+    An app directory is not always a checkout — this also runs inside a Ray actor
+    against a runtime_env staging directory — so "not a work tree" is a normal
+    answer and yields no filtering rather than an error.
+    """
+    if not relative_paths:
+        return set()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(directory_path), "check-ignore", "--stdin"],
+            input="\n".join(str(p) for p in relative_paths),
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return set()
+    # 0 = some path is ignored, 1 = none are. Anything else (128 for "not a git
+    # repository") means git did not answer the question that was asked.
+    if proc.returncode not in (0, 1):
+        return set()
+    return {Path(line) for line in proc.stdout.splitlines() if line}
+
+
 def create_file_list_from_directory(
     directory_path: Union[str, Path],
     _artifact_id_suffix: Optional[str] = None,
@@ -83,6 +109,10 @@ def create_file_list_from_directory(
     This utility function reads all files from a directory and converts them to the
     format expected by create_application_from_files. It automatically handles text
     and binary files, and can modify the manifest ID with a suffix for testing.
+
+    ``__pycache__`` and ``.git`` are always skipped, and so is anything git would
+    ignore when the directory is inside a work tree — a committed version is
+    immutable, so a local leftover swept in here is permanent and absent from git.
 
     Args:
         directory_path: Path to the directory containing application files
@@ -115,11 +145,23 @@ def create_file_list_from_directory(
 
     files = []
 
-    for file_path in directory_path.rglob("*"):
-        if file_path.is_file():
-            # Get relative path from the directory
-            relative_path = file_path.relative_to(directory_path)
+    candidates = sorted(p for p in directory_path.rglob("*") if p.is_file())
+    relatives = [p.relative_to(directory_path) for p in candidates]
+    ignored = _git_ignored(directory_path, relatives)
 
+    for file_path, relative_path in zip(candidates, relatives):
+        # A committed artifact version is immutable, so a local leftover swept in
+        # here can never be removed and does not appear in git. `.env` is itself
+        # git-ignored, which makes this a credential path and not only clutter.
+        # __pycache__ and .git are skipped unconditionally: the Ray-actor caller has
+        # no work tree for git to answer from, and `git check-ignore` never reports
+        # `.git` as ignored, so uploading a directory that is itself a repository
+        # root would otherwise publish `.git/config` and any token in a remote URL.
+        if (
+            "__pycache__" not in relative_path.parts
+            and ".git" not in relative_path.parts
+            and relative_path not in ignored
+        ):
             # Read file content
             try:
                 # Try to read as text first
