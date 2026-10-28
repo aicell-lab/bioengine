@@ -6,12 +6,92 @@ VLM-backed microscopy analyst. Define re-usable visual tests with a few positive
 
 | | |
 |---|---|
-| Model | `Qwen/Qwen2.5-VL-7B-Instruct` |
-| License | Apache 2.0 |
-| Engine | HuggingFace `transformers` 4.51.3 + `torch==2.5.1` |
-| Precision | 4-bit NF4 (`bitsandbytes`, double-quantised, FP16 compute); vision tower and `lm_head` left in FP16 |
-| Hardware | 1× NVIDIA A40-16C vGPU slice per replica (Ampere sm_86, 16 GB framebuffer, time-shared with co-tenants on the host A40) |
+| Model | one of four backends, chosen per deployment — see [Backends](#backends) |
+| License | Apache 2.0 (all backends) |
+| Engine | HuggingFace `transformers` 4.57.6 + `torch==2.7.1` |
+| Precision | 4-bit NF4 (`bitsandbytes`, double-quantised); vision tower and `lm_head` left at compute dtype |
 | Image budget | server-side downscale to ≤ `1280 × 28 × 28` pixels and ≤ 2048 longest side, with a hard reject above 200 MP |
+
+## Backends
+
+This is **one app that serves several models**. The backend is picked at deploy
+time with the `SMA_MODEL` environment variable, and each one declares its own
+GPU-memory reservation, so a deployment books only what its model needs rather
+than claiming a whole card:
+
+```python
+await worker.deploy_app(
+    artifact_id="bioimage-io/smart-microscopy-assistant",
+    application_id="sma-32b",
+    version="0.15.0",
+    application_env_vars={"SmartMicroscopyAssistant": {"SMA_MODEL": "qwen3-vl-32b"}},
+)
+```
+
+| `SMA_MODEL` | Model | Params | Compute dtype | Reserves | Observed peak | Fits on |
+|---|---|---:|---|---:|---:|---|
+| `qwen2.5-vl-7b` *(default)* | `Qwen/Qwen2.5-VL-7B-Instruct` | 8.3B | float16 | 12 GB | 9.02 GiB †  | 16 GB vGPU slice |
+| `qwen3-vl-4b` | `Qwen/Qwen3-VL-4B-Instruct` | 4.4B | bfloat16 | 8 GB | 5245 MiB ‡ | 16 GB vGPU slice |
+| `qwen3-vl-8b` | `Qwen/Qwen3-VL-8B-Instruct` | 8.8B | bfloat16 | 12 GB | *not measured* | 16 GB vGPU slice |
+| `qwen3-vl-32b` | `Qwen/Qwen3-VL-32B-Instruct` | 33B | bfloat16 | 26 GB | 22813 MiB ‡ | 32 GB card (RTX 5090, A100, H100) |
+
+† measured on a KTH A40-16C vGPU at 0.14.0 (see Operating characteristics).
+‡ measured on an RTX 5090 (sm_120): 10 reference images plus a 1000 × 1000
+query, `nvidia-smi` resident footprint. The 32B idles at 20213 MiB once loaded,
+so the few-shot prompt costs it ~2.6 GB. Only the 8B is unmeasured — its figure
+is inferred from the 7B's (comparable parameter count), so treat it as an
+upper-bound guess until someone runs it.
+
+The registry lives in `models.py`; `list_models()` returns the same table from a
+running replica. Omitting `SMA_MODEL` keeps the 7B this app has served since
+0.14.0, so existing deployments are unaffected by the addition.
+
+**How `Reserves` is enforced.** `models.py` feeds the selected backend's
+`gpu_memory_mb` to `@bioengine.app`, which the worker's app builder turns into a
+Ray resource request. On a worker that advertises the `VRAM_MB` custom resource
+(single-GPU head), the replica reserves that many megabytes of real GPU memory
+and Ray packs backends onto cards by memory. Running two backends at once means
+deploying this artifact twice, each with its own `application_id` and
+`SMA_MODEL`. Measured on a 32 GB RTX 5090: two `qwen3-vl-4b` deployments
+co-reside at `16384.0/32607.0 VRAM_MB`, and a third deployment asking for
+`qwen3-vl-32b` stays pending with a Ray demand of exactly `VRAM_MB: 26624.0`
+rather than being scheduled on top of them — an over-subscribed backend waits
+instead of OOM-ing its neighbours. On a worker without `VRAM_MB`, the figure
+becomes a fraction of the smallest GPU, and a request larger than that GPU is
+refused at deploy time.
+
+Up to 0.14.4 the app requested `gpu_memory_mb=-1` — the portable "whole GPU" —
+so on a cluster without `VRAM_MB` the default 7B now books 0.8 of a 16 GB slice
+instead of all of it. That still admits only one replica per GPU (two would need
+1.6), and every other GPU app in this repo asks for `-1`, so nothing packs into
+the remainder today. It does mean the reservation no longer *formally* excludes a
+fractional co-tenant, and a Ray GPU fraction is a scheduling hint that does not
+cap memory — on a cluster that mixes fractional GPU apps, prefer one that
+advertises `VRAM_MB`, where the reservation is enforced against real megabytes.
+
+**Why these numbers.** `Reserves` has to cover the heaviest prompt the app will
+build — a few-shot verdict carrying 10 reference images plus a full-size query —
+not just the weights. Reference images are capped at 512 × 512 by
+`_EXAMPLE_MAX_PIXELS`, so the query is the only lever on prompt length; raising
+it from 512 × 512 to the 1.0 MP ceiling cost the 4B 232 MiB and the 32B 430 MiB,
+which is why the reservations carry a wide margin rather than a tight one. To
+re-measure, run a few-shot `inspect()` and read the replica's resident footprint
+from `nvidia-smi` (the torch caching allocator makes `max_memory_allocated()`
+understate what the GPU is actually holding).
+
+On the 32B a few-shot verdict over 10 references takes 2.7–3.4 s and a one-image
+`describe` 3.2 s (RTX 5090, 63 generated tokens), so the largest backend is still
+interactive — the ceiling here is VRAM, not latency.
+
+**Why NF4 and not a pre-quantised checkpoint.** Quantisation happens at load
+time from the official Qwen weights, which keeps the skip-module choice (below)
+explicit in this app's code rather than inherited from a third party's
+`config.json`. The cost is download size, not cold start: the 32B's bf16
+checkpoint is ~64 GB on disk, but loading and quantising all 14 shards took
+47 s measured on NVMe. Operators who would rather trade
+provenance for speed can point `model_id` at
+`unsloth/Qwen3-VL-32B-Instruct-bnb-4bit` (20.4 GB, same NF4 + double-quant
+recipe, skip-list a superset of ours) and drop the `quantization_config`.
 
 ### Why Qwen2.5-VL-7B-Instruct (NF4)
 
@@ -32,7 +112,7 @@ The vision tower is excluded from quantisation. It is a small share of the weigh
 - **autoawq Triton kernel** — bundled `awq_gemm_triton` doesn't compile against the Triton shipped with current torch.
 - **autoawq-kernels CUDA path** — `awq_ext.gemm_forward_cuda` raises `expected scalar type Int but found Half` on the `lm_head` linear for `Qwen2.5-VL-7B-Instruct-AWQ` (known upstream issue, fix sits in autoawq 0.2.8 which itself caps `transformers <= 4.47.1` — older than the 4.49 minimum Qwen2.5-VL needs).
 
-The app shipped on 3B FP16 from 0.11.x to 0.13.2 for that reason. 0.14.0 moves to the 7B on NF4, which needs no kernel beyond `bitsandbytes` and the stock `transformers` integration.
+The app shipped on 3B FP16 from 0.11.x to 0.13.2 for that reason. 0.14.0 moves to the 7B on NF4, which needs no kernel beyond `bitsandbytes` and the stock `transformers` integration. 0.15.0 reuses that same NF4 path for every Qwen3-VL backend, so adding a larger model needed no new kernel either.
 
 ## Image and instruction limits
 
@@ -205,17 +285,48 @@ A visual test is therefore **persistent within a worker** but **not portable acr
 
 Liveness probe returning `{status, model, uptime_s}`.
 
+### `list_models() -> dict`
+
+Every backend this app can serve, which one this replica loaded, and what each
+one reserves — so a caller can tell whether a backend fits a target GPU without
+deploying it first. Only `active` is loaded; the others need their own
+deployment.
+
+```json
+{
+  "active": "qwen3-vl-32b",
+  "default": "qwen2.5-vl-7b",
+  "select_with": "application_env_vars={'SmartMicroscopyAssistant': {'SMA_MODEL': '<name>'}}",
+  "models": {
+    "qwen3-vl-32b": {
+      "model": "Qwen/Qwen3-VL-32B-Instruct",
+      "params": "33B",
+      "gpu_memory_mb": 26624,
+      "quantization": "nf4",
+      "compute_dtype": "bfloat16",
+      "license": "apache-2.0 (Qwen3-VL-32B-Instruct weights)"
+    }
+  }
+}
+```
+
 ### `get_model_info() -> dict`
 
-Describes the served model and the input/output contract:
+Describes the served model and the input/output contract. `model_name`,
+`params`, `dtype`, `quantization`, `gpu_memory_mb` and `license` are read off
+the active backend, so they follow a model swap rather than being revisited by
+hand:
 
 ```json
 {
   "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "model_name": "qwen2.5-vl-7b",
+  "params": "8.3B",
   "task": "vision-language",
   "engine": "huggingface-transformers",
   "dtype": "4-bit NF4 (float16 compute)",
   "quantization": "bitsandbytes nf4, double-quantised; visual tower and lm_head kept in float16",
+  "gpu_memory_mb": 12288,
   "device": "cuda:0",
   "max_image_bytes": 26214400,
   "max_instruction_chars": 4000,
@@ -227,11 +338,11 @@ Describes the served model and the input/output contract:
   "max_visual_test_name_chars": 50,
   "max_visual_test_desc_chars": 800,
   "verdicts": ["passed", "failed", "unsure"],
-  "license": "Qwen2.5-VL Apache 2.0 weights"
+  "license": "apache-2.0 (Qwen2.5-VL-7B-Instruct weights)"
 }
 ```
 
-## Operating characteristics (measured on KTH A40-16C vGPU)
+## Operating characteristics (measured on KTH A40-16C vGPU, `qwen2.5-vl-7b`)
 
 10 back-to-back `inspect()` calls, same 512×512 HPA RGB image, identical 200-char instruction, `max_new_tokens=192`, 66 generated tokens each:
 
