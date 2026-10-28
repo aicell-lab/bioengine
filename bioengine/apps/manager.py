@@ -276,11 +276,17 @@ _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 # to start before that stops counting as transitional. Ray applies no deadline
 # of its own: a replica it cannot place stays PENDING_ALLOCATION indefinitely
 # and only a 30 s log warning marks it, so the deployment reads as mid-wake-up
-# for as long as the cluster stays full. Deliberately generous, because a cold
-# replica start here includes a runtime_env venv build and takes minutes:
-# reporting late only delays visibility, while reporting early would make a
-# legitimate wake-up look broken.
-_REPLICA_STALL_SECONDS = 900.0
+# for as long as the cluster stays full.
+#
+# Deliberately far above any observed start. The longest pending replica we have
+# actually measured is a CellposeRuntime upscale that stayed STARTING across 87
+# consecutive samples, t+10s to t+897s, and was still not RUNNING when sampling
+# stopped — and whether it would ever have started is precisely what no status
+# field could say, which is why this one exists. A cold start here includes a
+# runtime_env venv build and takes minutes. The asymmetry decides the value:
+# reporting late only delays visibility of a condition that is permanent once
+# real, while reporting early invents an outage during a legitimate slow start.
+_REPLICA_STALL_SECONDS = 1800.0
 
 # A replica in one of these states is trying to come up and is not serving, so
 # its start time is worth measuring. Ray's own slow-start check covers exactly
