@@ -56,7 +56,8 @@ def _resolving_method(**_kw):
     return decorate
 
 
-def _install_runtime_stubs() -> None:
+def _install_runtime_stubs() -> list:
+    inserted = []
     if "bioengine" not in sys.modules:
         stub = types.ModuleType("bioengine")
         stub.logger = logging.getLogger("test-broker")
@@ -65,6 +66,7 @@ def _install_runtime_stubs() -> None:
         stub.async_init = lambda fn: fn
         stub.health_check = lambda fn: fn
         sys.modules["bioengine"] = stub
+        inserted.append("bioengine")
     if "hypha_rpc" not in sys.modules:
         stub = types.ModuleType("hypha_rpc")
 
@@ -73,14 +75,22 @@ def _install_runtime_stubs() -> None:
 
         stub.connect_to_server = _connect
         sys.modules["hypha_rpc"] = stub
+        inserted.append("hypha_rpc")
+    return inserted
 
 
-_install_runtime_stubs()
+_stubbed = _install_runtime_stubs()
 import os
 
 os.environ.setdefault("HYPHA_TOKEN", "test-token")
 
 import broker as bk  # noqa: E402  (must follow the stubs)
+
+# ``broker`` holds its own references now, so take the stubs back out. Leaving a
+# fake ``bioengine`` in sys.modules breaks every other app suite collected into
+# the same pytest process -- it imports the stub instead of the real package.
+for _name in _stubbed:
+    del sys.modules[_name]
 
 
 # ---------------------------------------------------------------------------
