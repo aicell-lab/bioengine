@@ -28,11 +28,17 @@ where <test-id> is a hash of owner + name. Each user can have a test
 named "focus-quality" without colliding with another user's. Public
 tests are visible to and usable by everyone; delete is owner-only.
 
-Backed by Qwen2.5-VL-7B-Instruct via HuggingFace transformers on a single
-NVIDIA A40-16C vGPU slice (Ampere, sm_86; 16 GB framebuffer time-shared
-with co-tenants on the host A40). The 7B is served in 4-bit NF4 because
-its FP16 weights (~15.4 GiB) do not leave room for a CUDA context and
-activations under a 16 GiB ceiling.
+Served by HuggingFace transformers on one GPU, in 4-bit NF4 — the models
+worth serving here do not fit a single card's VRAM unquantised, and the
+visual tower is left unquantised because 4-bit is what costs fine visual
+detail, which is the whole job.
+
+Which model is a deploy-time choice: ``models.py`` lists the backends, each
+with the VRAM it needs, and ``SMA_MODEL`` picks one. The decorator reads
+``gpu_memory_mb`` off that choice, so a deployment books only what its model
+uses and the ladder runs from a 4B screener on 8 GB to Qwen3-VL-32B on 26 GB.
+``list_models()`` reports the ladder; ``get_model_info()`` reports the
+backend this replica actually loaded.
 """
 
 import asyncio
@@ -46,12 +52,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import bioengine
+import models
 from pydantic import Field
 from pydantic.fields import FieldInfo
 
 logger = bioengine.logger
 
-_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+# Resolved at import, which is also when the worker introspects this module —
+# so the decorator below sees the deployment's own SMA_MODEL and books that
+# backend's VRAM. See models.py.
+_MODEL_NAME, _BACKEND = models.resolve(os.environ.get("SMA_MODEL", ""))
+_MODEL_ID = _BACKEND["model_id"]
 _DEFAULT_SERVER_URL = "https://hypha.aicell.io"
 # This app's own (public) artifact — the smoke test resolves a fixture from it.
 _SELF_ARTIFACT = "bioimage-io/smart-microscopy-assistant"
@@ -281,7 +292,7 @@ def _read_pip(name: str) -> List[str]:
 
 @bioengine.app(
     num_cpus=4,
-    gpu_memory_mb=-1,
+    gpu_memory_mb=_BACKEND["gpu_memory_mb"],
     memory_mb=12 * 1024,
     pip=_read_pip("requirements-deployment.txt"),
     env_vars={
@@ -330,40 +341,49 @@ class SmartMicroscopyAssistant:
             self._tests_dir, len(existing), "" if len(existing) == 1 else "s",
         )
 
-        from transformers import (
-            AutoProcessor,
-            BitsAndBytesConfig,
-            Qwen2_5_VLForConditionalGeneration,
-        )
+        import transformers
+        from transformers import AutoProcessor, BitsAndBytesConfig
         import torch
 
         logger.info("Connecting to Hypha for artifact-manager access...")
         await self._ensure_artifact_manager()
 
-        logger.info("Loading Qwen2.5-VL processor (%s)...", _MODEL_ID)
+        logger.info("Loading processor for %s (%s)...", _MODEL_NAME, _MODEL_ID)
         self._processor = AutoProcessor.from_pretrained(_MODEL_ID)
 
-        logger.info("Loading Qwen2.5-VL-7B weights on cuda:0 (NF4)...")
-        # The vision tower stays in FP16: it is a small share of the weights
-        # and 4-bit quantising it is what degrades fine visual detail, which
-        # is the whole job here.
+        arch = getattr(transformers, _BACKEND["arch"])
+        dtype = getattr(torch, _BACKEND["compute_dtype"])
+        logger.info(
+            "Loading %s weights on cuda:0 (%s, %s compute, booked %d MB)...",
+            _MODEL_NAME, _BACKEND["quantization"], _BACKEND["compute_dtype"],
+            _BACKEND["gpu_memory_mb"],
+        )
+        # The vision tower stays unquantised: it is a small share of the
+        # weights and 4-bit quantising it is what degrades fine visual
+        # detail, which is the whole job here.
         quantization = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type=_BACKEND["quantization"],
+            bnb_4bit_compute_dtype=dtype,
             bnb_4bit_use_double_quant=True,
             llm_int8_skip_modules=["visual", "lm_head"],
         )
         self._engine = await asyncio.to_thread(
-            Qwen2_5_VLForConditionalGeneration.from_pretrained,
+            arch.from_pretrained,
             _MODEL_ID,
-            torch_dtype=torch.float16,
+            torch_dtype=dtype,
             device_map="cuda:0",
             quantization_config=quantization,
             low_cpu_mem_usage=True,
         )
         self._engine.eval()
-        logger.info("Qwen2.5-VL-7B ready on %s.", next(self._engine.parameters()).device)
+        logger.info(
+            "%s ready on %s (peak load %.1f GiB of %.1f GiB).",
+            _MODEL_NAME,
+            next(self._engine.parameters()).device,
+            torch.cuda.max_memory_allocated() / 1024**3,
+            torch.cuda.get_device_properties(0).total_memory / 1024**3,
+        )
 
     @bioengine.smoke_test
     async def _smoke_test(self) -> None:
@@ -931,22 +951,52 @@ class SmartMicroscopyAssistant:
         }
 
     @bioengine.method
+    async def list_models(self) -> dict:
+        """Every backend this app can serve, and what each one costs.
+
+        `gpu_memory_mb` is what a deployment of that backend reserves, so a
+        caller can tell before deploying whether it fits the target GPU. Only
+        `active` is loaded here; the others need their own deployment.
+        """
+        return {
+            "active": _MODEL_NAME,
+            "default": models.DEFAULT_MODEL,
+            "select_with": "application_env_vars={'SmartMicroscopyAssistant': {'SMA_MODEL': '<name>'}}",
+            "models": {
+                name: {
+                    "model": spec["model_id"],
+                    "params": spec["params"],
+                    "gpu_memory_mb": spec["gpu_memory_mb"],
+                    "quantization": spec["quantization"],
+                    "compute_dtype": spec["compute_dtype"],
+                    "license": spec["license"],
+                }
+                for name, spec in models.MODELS.items()
+            },
+        }
+
+    @bioengine.method
     async def get_model_info(self) -> dict:
         """Describe the served model and the input/output contract.
 
-        `dtype`, `quantization` and `license` describe _MODEL_ID but are not
-        derived from it — revisit all three on any model swap. The 3B this app
-        served until 0.13.2 is qwen-research (non-commercial), not Apache 2.0.
+        `dtype`, `quantization` and `license` come from the backend's own
+        registry entry, so they follow a model swap instead of having to be
+        revisited by hand. The 3B this app served until 0.13.2 is
+        qwen-research (non-commercial), not Apache 2.0.
         """
+        dtype = _BACKEND["compute_dtype"]
         return {
             "model": _MODEL_ID,
+            "model_name": _MODEL_NAME,
+            "params": _BACKEND["params"],
             "task": "vision-language",
             "engine": "huggingface-transformers",
-            "dtype": "4-bit NF4 (float16 compute)",
+            "dtype": f"4-bit {_BACKEND['quantization'].upper()} ({dtype} compute)",
             "quantization": (
-                "bitsandbytes nf4, double-quantised; visual tower and lm_head "
-                "kept in float16"
+                f"bitsandbytes {_BACKEND['quantization']}, double-quantised; "
+                f"visual tower and lm_head kept in {dtype}"
             ),
+            "gpu_memory_mb": _BACKEND["gpu_memory_mb"],
             "device": "cuda:0",
             "max_image_bytes": _MAX_IMAGE_BYTES,
             "max_instruction_chars": _MAX_INSTRUCTION_CHARS,
@@ -958,7 +1008,7 @@ class SmartMicroscopyAssistant:
             "max_visual_test_name_chars": _MAX_TEST_NAME_CHARS,
             "max_visual_test_desc_chars": _MAX_TEST_DESC_CHARS,
             "verdicts": list(_VERDICT_VALUES),
-            "license": "apache-2.0 (Qwen2.5-VL-7B-Instruct weights)",
+            "license": _BACKEND["license"],
         }
 
     # ----------------------------------------------- visual-test management
