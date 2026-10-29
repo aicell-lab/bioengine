@@ -18,6 +18,8 @@ The four gates, all of which must pass before anything is removed:
   4. no watcher script, workflow or crontab entry names it
 
 A run that removes nothing because every gate failed is a pass, not a failure.
+A row reported UNKNOWN is one the run did not reach before SWEEP_GATE_DEADLINE:
+it is not cleared and never removable, and the report says how many there were.
 Idle is not done: a hibernating session may be blocked on a human answer, so a
 session only counts as retirable once its working directory is already gone.
 
@@ -37,6 +39,7 @@ nobody, so a tick that only printed would report nothing and still look green.
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -57,6 +60,27 @@ SWEEP_WATCHER_ROOTS_ENV = "SWEEP_WATCHER_ROOTS"
 SCRIPT_REF = re.compile(r"(/[\w./@+-]+\.(?:sh|py|js|ts))")
 MAX_WATCHER_FILE_BYTES = 2 * 1024 * 1024
 OWNED_IF_TOUCHED_WITHIN = 24 * 3600
+
+# A worktree's four gates are independent of every other worktree's and spend
+# nearly all their time blocked in fork/wait -- 565 subprocess calls, 9.0s of a
+# 14.7s run inside select.poll -- so they are evaluated concurrently: 11.1s ->
+# 6.2s over 116 worktrees, identical verdicts on every row. Past ~8 the curve
+# turns back up (16 cpus, and gate 4 is CPU-bound under the GIL).
+GATE_WORKERS = int(os.environ.get("SWEEP_GATE_WORKERS", "8"))
+
+# Speed alone cannot be trusted to keep this inside the 120s step budget, which
+# is not configurable. The tick that failed ran 139s end to end where an
+# interactive run of the same corpus takes 11s, and that 12x was NOT reproduced:
+# an 8-way fork/wait load arm left both arms flat. The leading unproven
+# explanation is cold page cache -- the gates are disk walks over ~100 worktrees
+# (`git status --untracked-files=all`, `find -newermt`) and the daily tick is the
+# first thing to touch those trees in 24h -- untestable here without root to drop
+# caches. So the loop is bounded as well as faster: rows not reached by the
+# deadline are reported UNKNOWN, never DONE, and the report still goes out. A
+# killed step delivers nothing at all, which is the worse failure (#0156). The
+# budget also covers the caller's fetch and the notify send, hence the headroom.
+GATE_DEADLINE = float(os.environ.get("SWEEP_GATE_DEADLINE", "75"))
+STARTED = time.monotonic()
 
 # The registry lookup behind `myco session send` is flaky per-process: a session
 # that resolves one minute answers "names no host" the next, so one miss is not
@@ -438,8 +462,7 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
     self_cwd = os.path.realpath(os.getcwd())
     self_id = os.environ.get("MYCOLAB_SESSION_ID")
 
-    rows = []
-    for row in worktrees(repo):
+    def judge(row):
         gates = {}
         if not os.path.isdir(row["path"]):
             # A registration whose directory is already gone. Pruning it deletes
@@ -450,6 +473,14 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
         elif row["band"] not in BAND_SWEEPABLE:
             row["verdict"] = "EXCLUDED"
             row["why"] = f"{row['band']} band is never swept automatically"
+        elif time.monotonic() - STARTED > GATE_DEADLINE:
+            # Only the gates are bounded. STALE and EXCLUDED above cost a stat
+            # and a string compare, so a late row still gets classified.
+            row["verdict"] = "UNKNOWN"
+            row["why"] = (
+                f"not evaluated: the sweep passed its {GATE_DEADLINE:g}s deadline before reaching this "
+                "row, so none of its four gates were run (raise SWEEP_GATE_DEADLINE to check it)"
+            )
         else:
             gates["1-merged"] = gate_merged(repo, row, baseline)
             gates["2-clean"] = gate_clean(row)
@@ -461,7 +492,15 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
                 f"gate {k} FAILED: {why}" for k, (ok, why) in sorted(gates.items()) if not ok
             )
         row["gates"] = {k: {"pass": ok, "evidence": why} for k, (ok, why) in gates.items()}
-        rows.append(row)
+
+    rows = list(worktrees(repo))
+    if GATE_WORKERS > 1 and len(rows) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=GATE_WORKERS) as pool:
+            for _ in pool.map(judge, rows):
+                pass
+    else:
+        for row in rows:
+            judge(row)
 
     srows = []
     for s in sess:
@@ -479,7 +518,7 @@ def render(rows, srows, baseline, counted):
         f"{counted['watcher_files']} watcher/workflow/cron files, {counted['processes']} processes inspected"
     )
     out.append("")
-    for verdict in ("DONE", "STALE", "NOT-DONE", "EXCLUDED"):
+    for verdict in ("DONE", "STALE", "NOT-DONE", "UNKNOWN", "EXCLUDED"):
         band = [r for r in rows if r["verdict"] == verdict]
         out.append(f"== WORKTREES {verdict} ({len(band)}) ==")
         for r in sorted(band, key=lambda r: (r["band"], r["name"])):
@@ -501,6 +540,7 @@ def summarise(rows, srows, baseline):
     stale = [r for r in rows if r["verdict"] == "STALE"]
     nd = [r for r in rows if r["verdict"] == "NOT-DONE"]
     ex = [r for r in rows if r["verdict"] == "EXCLUDED"]
+    unk = [r for r in rows if r["verdict"] == "UNKNOWN"]
     sdone = [s for s in srows if s["verdict"] == "DONE"]
     lines = [
         "Worktree/session sweep (report only, nothing was removed).",
@@ -509,6 +549,12 @@ def summarise(rows, srows, baseline):
         f"{len(nd)} fail a gate, {len(ex)} excluded by band.",
         f"{len(srows)} spawned sessions: {len(sdone)} retirable (working directory gone).",
     ]
+    if unk:
+        lines.append(
+            f"INCOMPLETE: {len(unk)} worktree(s) were NOT checked — the sweep hit its "
+            f"{GATE_DEADLINE:g}s deadline, which exists so a slow tick still delivers this "
+            "report instead of being killed. They are not cleared and not removable."
+        )
     if done or stale:
         lines.append("")
         lines.append("Removable with `scripts/sweep_agent_worktrees.py --apply`:")
@@ -521,7 +567,7 @@ def summarise(rows, srows, baseline):
         lines.append("Sessions whose working directory is gone — archive with `myco session archive <id>`:")
         for s in sdone:
             lines.append(f"  {s['id']}  ({s['why']})")
-    if not done and not stale and not sdone:
+    if not done and not stale and not sdone and not unk:
         lines.append("")
         lines.append("Nothing is retirable this tick. That is a pass, not a failure.")
     return "\n".join(lines)
