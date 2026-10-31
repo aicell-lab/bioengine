@@ -46,6 +46,40 @@ def _touch_on_call(method: Callable) -> Callable:
     return wrapper
 
 
+def _mask_runtime_env_secrets(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace every ``env_vars`` value in a pending record's runtime env.
+
+    Ray's state API with ``detail=True`` returns ``serialized_runtime_env``
+    verbatim, which for a BioEngine deployment carries the injected
+    ``_BIOENGINE_SECRET_HYPHA_TOKEN``. These records are surfaced by
+    ``get_status``, so without this the worker hands a workspace credential to
+    anyone who can read its status.
+
+    Values are masked rather than the field dropped so the rest of the runtime
+    env (pip, working_dir, container) stays readable for diagnosing a stuck
+    deploy, and every value is masked rather than only the ``_``-prefixed ones
+    ``AppsManager._filter_secret_env_vars`` recognises — a disclosure boundary
+    should not depend on a naming convention applied in another module.
+    """
+    serialized = record.get("serialized_runtime_env")
+    if not isinstance(serialized, str) or not serialized:
+        return record
+
+    try:
+        runtime_env = json.loads(serialized)
+    except (TypeError, ValueError):
+        # Unparseable means its contents cannot be shown to be safe.
+        record["serialized_runtime_env"] = "*****"
+        return record
+
+    env_vars = runtime_env.get("env_vars") if isinstance(runtime_env, dict) else None
+    if isinstance(env_vars, dict) and env_vars:
+        runtime_env["env_vars"] = {key: "*****" for key in env_vars}
+        record["serialized_runtime_env"] = json.dumps(runtime_env)
+
+    return record
+
+
 @ray.remote(
     num_cpus=0,
     resources={"node:__internal_head__": 0.001},
@@ -257,7 +291,7 @@ class BioEngineProxyActor:
             ),
             raise_on_missing_output=True,
         )
-        return [asdict(job) for job in pending_jobs]
+        return [_mask_runtime_env_secrets(asdict(job)) for job in pending_jobs]
 
     def _get_pending_actors(self) -> List[Dict[str, Any]]:
         """Get list of actors whose creation is genuinely blocked on resources.
@@ -287,7 +321,7 @@ class BioEngineProxyActor:
         )
         filtered: List[Dict[str, Any]] = []
         for actor in pending_actors:
-            entry = asdict(actor)
+            entry = _mask_runtime_env_secrets(asdict(actor))
             req = entry.get("required_resources") or {}
             # A 0-CPU, 0-GPU, 0-memory actor never needs a new worker node;
             # it will schedule onto whatever node has any spare bytes — in
@@ -322,7 +356,7 @@ class BioEngineProxyActor:
             ),
             raise_on_missing_output=True,
         )
-        return [asdict(task) for task in pending_tasks]
+        return [_mask_runtime_env_secrets(asdict(task)) for task in pending_tasks]
 
     def _get_node_ip(self, resources: Dict[str, float]) -> Optional[str]:
         """Extract the IP address from a node's resource dictionary.
