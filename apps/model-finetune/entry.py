@@ -1593,7 +1593,9 @@ class EntryApp:
         """The pool's state projected onto the campaign-page wire contract
         (schema_version 0.13.0-draft): merge_trigger, baseline_metric (role=witness),
         soups[] (published merges), empty_merges[] (merges that admitted nothing),
-        and enriched contribution stubs. Role-tagged metrics come straight from
+        and enriched contribution stubs — each carrying that contribution's
+        weights_sha256, so a contributor whose deposit response was lost can tell a
+        landed upload from one it must retry. Role-tagged metrics come straight from
         storage — the role is a property of the artifact, not assigned here."""
         import pool
 

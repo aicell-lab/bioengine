@@ -117,15 +117,15 @@ def _synthetic_index():
                               "selection_metric": merges[2]["selection_metric"],
                               "witness_metric": merges[2]["witness_metric"]},
         "contributions": [
-            {"contribution_id": "alpha-0", "uploaded_at": 1_750_050_000.0,
+            {"contribution_id": "alpha-0", "weights_sha256": "a1" * 32, "uploaded_at": 1_750_050_000.0,
              "n_bytes": 1_300_000_000, "n_train_images": 400, "samples_seen": 4000},
-            {"contribution_id": "beta-0", "uploaded_at": 1_750_060_000.0,
+            {"contribution_id": "beta-0", "weights_sha256": "b2" * 32, "uploaded_at": 1_750_060_000.0,
              "n_bytes": 1_300_000_000, "n_train_images": 200, "samples_seen": 2000},
-            {"contribution_id": "gamma-0", "uploaded_at": 1_750_150_000.0,
+            {"contribution_id": "gamma-0", "weights_sha256": "c3" * 32, "uploaded_at": 1_750_150_000.0,
              "n_bytes": 1_300_000_000, "n_train_images": 100, "samples_seen": 1000},
-            {"contribution_id": "delta-0", "uploaded_at": 1_750_250_000.0,
+            {"contribution_id": "delta-0", "weights_sha256": "d4" * 32, "uploaded_at": 1_750_250_000.0,
              "n_bytes": 1_300_000_000, "n_train_images": 300, "samples_seen": 3000},
-            {"contribution_id": "epsilon-0", "uploaded_at": 1_750_350_000.0,
+            {"contribution_id": "epsilon-0", "weights_sha256": "e5" * 32, "uploaded_at": 1_750_350_000.0,
              "n_bytes": 1_300_000_000, "n_train_images": 500, "samples_seen": 5000},
         ],
         "decided_contribution_ids": ["alpha-0", "beta-0", "gamma-0", "delta-0"],
@@ -425,3 +425,31 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
     assert m["cellpose_version"] == "4.0.1"
     assert m["schema_version"] == pool.SCHEMA_VERSION
     assert m["app_version"] != m["cellpose_version"] != m["schema_version"]
+
+
+# ---------------------------------------------------------------------------
+# #0141: the wire view must publish the digest the index already holds.
+# ---------------------------------------------------------------------------
+
+def test_every_contribution_publishes_its_stored_weights_digest(wire):
+    """The fixture gives all five contributions DISTINCT digests, so this cannot
+    pass against a hardcoded value or a constant leaked from a sibling row — which
+    is the discrimination that matters here, the projection having previously
+    dropped the field rather than mangled it."""
+    stored = {c["contribution_id"]: c["weights_sha256"]
+              for c in _synthetic_index()["contributions"]}
+    published = {c["contribution_id"]: c.get("weights_sha256")
+                 for c in wire["contributions"]}
+    assert published == stored
+    assert len(set(published.values())) == len(published)
+
+
+def test_a_contribution_without_a_stored_digest_publishes_null_rather_than_raising():
+    """Control on the choice of `.get()` over a subscript here. The merge path
+    subscripts, because souping unchecked bytes is the harm it guards; this is a
+    page projection, where one absent field must not take the whole view down."""
+    idx = _synthetic_index()
+    del idx["contributions"][0]["weights_sha256"]
+    wire = pool.pool_wire_state(idx, pool_artifact_id=POOL_ID)
+    assert wire["contributions"][0]["weights_sha256"] is None
+    assert wire["contributions"][1]["weights_sha256"] == "b2" * 32
