@@ -1771,12 +1771,20 @@ class EntryApp:
                     replica_dl.get(result["replica"], 0) + int(result["soup_dl_bytes"]))
                 return result
 
+            # The digest each member is expected to hash to, so the replica that
+            # downloads it can check the bytes rather than trust the path. Subscripted,
+            # not .get(): every index contribution has carried weights_sha256 since the
+            # pool backend existed, so a row without one is a corrupt index and must
+            # raise here rather than degrade into an unverified soup.
+            sha_by_path = {c["weights_path"]: c["weights_sha256"]
+                           for c in index.get("contributions", [])}
+
             async def _specs(paths: List[str]) -> List[Dict[str, str]]:
                 out = []
                 for p in paths:
                     if p not in url_cache:
                         url_cache[p] = await am.get_file(pool_artifact_id, file_path=p)
-                    out.append({"key": p, "url": url_cache[p]})
+                    out.append({"key": p, "url": url_cache[p], "sha256": sha_by_path[p]})
                 return out
 
             # Resume journal. A merge is 2*len(batch)+3 scoring passes and each pass

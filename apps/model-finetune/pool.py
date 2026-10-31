@@ -646,6 +646,25 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sorted(pending, key=lambda c: c.get("uploaded_at", 0.0))
 
 
+def member_digest_refusal(key: str, expected_sha256: str, content: bytes) -> Optional[str]:
+    """Reason to refuse downloaded member bytes, or None to use them.
+
+    Returns the reason as a string so the caller owns the exception type (as
+    ``soup_admission`` does). The digest is required rather than optional: a
+    signature that tolerated None would let the one failure this exists to prevent
+    — souping bytes nothing checked — come back as a silent skip.
+    """
+    got = hashlib.sha256(content).hexdigest()
+    if got == expected_sha256:
+        return None
+    return (
+        f"member '{key}' does not hash to the digest the pool recorded for it "
+        f"(expected {expected_sha256}, downloaded {got}). Refusing it: souping bytes "
+        f"that are not the ones the contribution attested to would publish a "
+        f"community checkpoint whose members cannot be reproduced."
+    )
+
+
 def next_community_version(index: Dict[str, Any]) -> str:
     """Monotonic ``vN`` for the next community checkpoint, derived from the current
     pointer so no separate counter can drift out of sync with it."""
