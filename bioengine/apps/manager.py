@@ -14,6 +14,7 @@ from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
 from ray import serve
+from ray.serve.config import AutoscalingConfig
 
 from bioengine import __version__
 from bioengine.apps.builder import AppBuilder
@@ -2836,7 +2837,7 @@ class AppsManager:
             description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. Classes not in the map run at Ray Serve's default of one fixed replica. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
             examples=[
                 {"DemoApp": {"num_replicas": 3}},
-                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_num_ongoing_requests_per_replica": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
+                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_ongoing_requests": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
             ],
         ),
         context: Dict[str, Any] = Field(
@@ -3164,6 +3165,21 @@ class AppsManager:
                         f"scaling entry for '{dep_name}' has num_replicas="
                         f"{nr}; must be >= 0."
                     )
+                if isinstance(asc, dict):
+                    # AutoscalingConfig drops unknown keys instead of raising, so
+                    # a renamed field reaches Serve and is lost with no warning
+                    # and the deployment silently runs on Serve's defaults.
+                    # Non-dicts are left to Serve, as before: set() on one either
+                    # raises TypeError or yields characters as key names.
+                    valid_keys = set(AutoscalingConfig.model_fields)
+                    unknown_keys = sorted(set(asc) - valid_keys)
+                    if unknown_keys:
+                        raise ValueError(
+                            f"scaling entry for '{dep_name}' has unknown "
+                            f"autoscaling_config key(s) {unknown_keys}; Ray "
+                            f"Serve would drop them silently. Valid keys: "
+                            f"{sorted(valid_keys)}."
+                        )
 
             # A content change (new version, different artifact, or the same
             # version string re-staged with different files) must reach every
