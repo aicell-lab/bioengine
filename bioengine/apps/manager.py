@@ -938,9 +938,11 @@ class AppsManager:
             user_id: ID of the user initiating the undeployment (for logging)
 
         Note:
-            This method handles errors gracefully and logs failures.
-            The application is removed from _deployed_applications even if
-            some cleanup steps fail.
+            This method handles errors gracefully and logs failures. The
+            application is removed from _deployed_applications only if
+            ``serve.delete`` succeeded — a failed delete leaves the app
+            running in Ray Serve, so its tracking entry is restored to keep
+            it visible to ``get_app_status`` and stoppable via ``stop_app``.
         """
         start_time = time.time()
         self.logger.info(
@@ -953,11 +955,12 @@ class AppsManager:
         # if the entry survived the serve.delete window, a monitor tick could
         # re-adopt the app mid-stop and re-deploy it, racing the stop. Popping
         # first makes the app invisible to the monitor for the rest of teardown.
-        self._deployed_applications.pop(application_id, None)
+        application_info = self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
         self._missing_from_status.pop(application_id, None)
         self._deleted_pending_redeploy.discard(application_id)
 
+        delete_failed = False
         try:
             await self.ray_cluster.call_with_reconnect(
                 serve.delete, application_id
@@ -966,6 +969,7 @@ class AppsManager:
                 f"Deleted Ray Serve application '{application_id}' in {time.time() - start_time:.2f} seconds."
             )
         except Exception as delete_err:
+            delete_failed = True
             self.logger.error(
                 f"Error deleting Ray Serve application '{application_id}' "
                 f"after {time.time() - start_time:.2f} seconds: {delete_err}"
@@ -982,6 +986,20 @@ class AppsManager:
             self.logger.error(
                 f"Error clearing application replica history for '{application_id}': {e}"
             )
+
+        if delete_failed and application_info is not None:
+            # The app is still running in Ray Serve. Leaving it untracked makes it
+            # invisible to get_app_status and unreachable by stop_app, so it holds
+            # its GPU forever with no API route to release it. auto_redeploy is
+            # forced off so monitor_applications still ignores it.
+            application_info["auto_redeploy"] = False
+            self._deployed_applications[application_id] = application_info
+            self.logger.error(
+                f"Undeployment of application '{application_id}' FAILED: it is still "
+                "running in Ray Serve. Keeping it tracked so it stays visible and "
+                "can be stopped again."
+            )
+            return
 
         # Remove from internal tracking after all cleanup operations complete
         self._deployed_applications.pop(application_id, None)
