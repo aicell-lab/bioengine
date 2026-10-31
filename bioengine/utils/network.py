@@ -64,6 +64,24 @@ def is_transient_connect_error(error: BaseException) -> bool:
 STARTUP_CONNECT_BUDGET_S = 120.0
 RECONNECT_BUDGET_S = 15.0
 
+# Ceiling on one ``proxy_actor.get_cluster_state`` round trip. The monitoring
+# steps run as sequential awaits, so an unbounded wait on a head that has
+# stopped answering starves every later step — including the app recovery and
+# proxy-token renewal that keep deployed apps reachable.
+# A healthy call measured p95 33 ms / max 67 ms, with a 322 ms cold first call.
+# The ceiling is what sets the value: the worst path through
+# ``_get_cluster_state_with_reconnect`` crosses this bound three times either
+# side of a reconnect's own 30 s of bounded cost, and 3*20+30 still leaves the
+# rest of the pass room inside the 120 s staleness deadline above.
+# This bound CAN cut a call that is still technically healthy, and that is
+# intended rather than impossible. In slurm mode ``check_pending_resources`` is
+# on, so get_cluster_state makes three Ray state-API calls at
+# DEFAULT_RPC_TIMEOUT (30 s each) plus a 2 s dashboard fetch — a worst case of
+# ~92 s, which no value small enough to cross three times inside 120 s can sit
+# above. A cluster-state read taking 20 s is a worker whose GCS has stopped
+# answering, and cutting it is the point.
+CLUSTER_STATE_TIMEOUT_S = 20.0
+
 
 async def connect_with_retry(
     connect: Callable[[], Awaitable[T]],
