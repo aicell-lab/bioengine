@@ -28,6 +28,15 @@ services:
     container_name: bioengine-worker
     user: "${UID}:${GID}"
     shm_size: 8g
+    # Ray sizes its memory monitor from min(cgroup limit, host total), so without
+    # this it budgets against the whole machine and only sheds its own tasks at
+    # 95% of it — past the point the kernel's OOM killer acts, and the kernel
+    # picks Ray's workers first because Ray marks them oom_score_adj 1000.
+    #
+    # Must stay ABOVE --head-memory-in-gb below: that is a Ray *scheduling
+    # reservation*, not a cap, so a limit under it makes Ray hand out work it
+    # cannot fit. 42g = 30 reserved + 8 shared memory + 4 overhead.
+    mem_limit: 42g
     volumes:
       - ${HOME}/.bioengine:/home/.bioengine
     environment:
