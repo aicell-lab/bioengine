@@ -13,6 +13,17 @@ import ray
 from bioengine import __version__
 from bioengine.utils import create_logger
 
+# A GPU drawing at least this much is doing real work by the same rule HPC sites
+# use to reap allocations: NSC/Berzelius terminates a job whose moving-average
+# power stays below 90 W (their measured idle level is ~52 W). Above that floor
+# the node is not at risk, so there is no reason to take it away.
+GPU_BUSY_POWER_WATTS = 90.0
+
+# Upper bound for a single nvidia-smi probe on a worker node. Generous because
+# the task has to be scheduled through the raylet first; a node too wedged to
+# answer within this is reported as unmeasurable, never as idle.
+GPU_PROBE_TIMEOUT_SECONDS = 30
+
 
 class SlurmWorkers:
     """
@@ -155,6 +166,8 @@ class SlurmWorkers:
         # Initialize state variables
         self.last_scale_up_time = 0
         self.last_scale_down_check = 0
+        self.last_gpu_sample_time = 0
+        self.gpu_idle_since = {}
         self.worker_creation_task = None
         self.worker_deletion_tasks = {}
 
@@ -696,7 +709,10 @@ class SlurmWorkers:
 
             self.logger.info(f"Stopping all processes on worker '{node_id}'...")
 
-            @ray.remote(resources={f"slurm_job_id:{job_id}": 0.1})
+            # num_cpus=0 because a node is now also removed while its CPUs are
+            # reserved — booking one for the shutdown task would leave it queued
+            # behind the very reservations it is there to release.
+            @ray.remote(num_cpus=0, resources={f"slurm_job_id:{job_id}": 0.1})
             def stop_worker():
                 """Stops the worker node by executing 'ray stop'."""
                 import subprocess
@@ -709,17 +725,22 @@ class SlurmWorkers:
 
             # This should only effect a single worker node if the worker runs in a container
             obj_ref = stop_worker.remote()
+            stopped_gracefully = True
             try:
                 await asyncio.wait_for(obj_ref, timeout=self.grace_period)
-            except TimeoutError:
+            except Exception as e:
+                # Falling through to scancel is the point: a node that cannot be
+                # asked to leave is exactly the one whose allocation would
+                # otherwise be held until the site reaps it.
+                ray.cancel(obj_ref, force=True)
+                stopped_gracefully = False
                 self.logger.error(
-                    f"Failed to send shutdown command to worker '{node_id}' within {self.grace_period} seconds. Cancelling job..."
+                    f"Failed to send shutdown command to worker '{node_id}' within {self.grace_period} seconds ({e}). Cancelling job..."
                 )
-                raise
 
             # Wait for worker node to be removed from the cluster
             start_time = time.time()
-            while time.time() - start_time < self.grace_period:
+            while stopped_gracefully and time.time() - start_time < self.grace_period:
                 await asyncio.sleep(3)
                 worker_nodes = self.ray_cluster.status["nodes"]
                 if node_id not in worker_nodes:
@@ -834,9 +855,11 @@ class SlurmWorkers:
 
     async def _check_is_idle(self, node_resources: Dict) -> bool:
         """
-        Check if a worker node is idle based on its GPU and CPU utilization.
+        Check if a worker node is idle based on its Ray resource reservations.
 
-        A node is considered idle if it has no active CPU or GPU usage.
+        A node is considered idle if Ray has booked none of its CPUs or GPUs. Note
+        that a reservation is a promise, not work: see ``_find_gpu_idle_nodes``
+        for the hardware-side check that catches a node booked but unused.
 
         Args:
             node_resources: Dictionary containing node resource information with
@@ -872,6 +895,129 @@ class SlurmWorkers:
                 idle_nodes.add(node_id)
 
         return idle_nodes
+
+    async def _sample_gpu_is_busy(self, job_id: str) -> Optional[bool]:
+        """
+        Sample what the GPUs of a worker node are actually doing.
+
+        ``nvidia-smi`` runs inside the job, where SLURM's gres cgroup restricts it
+        to the devices this allocation owns, so the reading describes the worker
+        and not the shared compute node.
+
+        Args:
+            job_id: SLURM job ID of the worker node to sample
+
+        Returns:
+            True if any GPU is working, False if all of them are idle, or None if
+            the node could not be measured. Callers must not treat None as idle.
+        """
+
+        @ray.remote(num_cpus=0, resources={f"slurm_job_id:{job_id}": 0.01})
+        def query_gpus() -> str:
+            import subprocess
+
+            return subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,power.draw",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=True,
+            ).stdout
+
+        obj_ref = query_gpus.remote()
+        try:
+            output = await asyncio.wait_for(obj_ref, timeout=GPU_PROBE_TIMEOUT_SECONDS)
+        except Exception as e:
+            # A probe left pending on a wedged node would hold its share of that
+            # node's slurm_job_id resource until the node goes away.
+            ray.cancel(obj_ref, force=True)
+            self.logger.warning(f"Could not sample GPUs of job '{job_id}': {e}")
+            return None
+
+        utilization = None
+        power = None
+        for line in output.strip().splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 2:
+                continue
+            # Either field can come back as "[N/A]" (MIG instances report no
+            # power); take whichever the driver did answer.
+            try:
+                utilization = max(utilization or 0.0, float(fields[0]))
+            except ValueError:
+                pass
+            try:
+                power = max(power or 0.0, float(fields[1]))
+            except ValueError:
+                pass
+
+        if utilization is None and power is None:
+            self.logger.warning(
+                f"No usable GPU metrics from job '{job_id}': {output.strip()!r}"
+            )
+            return None
+
+        is_busy = (utilization or 0.0) > 0 or (power or 0.0) >= GPU_BUSY_POWER_WATTS
+        self.logger.debug(
+            f"GPUs of job '{job_id}' are {'busy' if is_busy else 'idle'} "
+            f"(utilization: {utilization}%, power: {power}W)"
+        )
+        return is_busy
+
+    async def _find_gpu_idle_nodes(self, worker_nodes: Dict[str, dict]) -> Set[str]:
+        """
+        Find GPU worker nodes whose GPUs have gone unused for longer than the threshold.
+
+        ``_check_is_idle`` only sees what Ray has promised a node, and a Ray Serve
+        replica that is alive but serving nothing keeps its CPU and GPU reserved.
+        Such a node is never a scale-down candidate there, while the physical GPU
+        draws idle power until the site reaps the allocation. Measuring the
+        hardware instead is what closes that gap.
+
+        Args:
+            worker_nodes: Current per-node resources, keyed by Ray node ID
+
+        Returns:
+            Set of node_ids whose GPUs have been idle past the scale down threshold
+        """
+        current_time = time.time()
+
+        # Scale-down checks are skipped entirely while work is pending, and a gap
+        # in sampling says nothing about what the GPUs did meanwhile.
+        sampling_gap = current_time - self.last_gpu_sample_time
+        if sampling_gap > 2 * self.scale_down_check_interval:
+            self.gpu_idle_since.clear()
+        self.last_gpu_sample_time = current_time
+
+        gpu_idle_nodes = set()
+        for node_id, node_resources in worker_nodes.items():
+            if not node_resources["total_gpu"] or node_id in self.worker_deletion_tasks:
+                self.gpu_idle_since.pop(node_id, None)
+                continue
+
+            job_id = node_resources["slurm_job_id"]
+            if await self._sample_gpu_is_busy(job_id) is not False:
+                self.gpu_idle_since.pop(node_id, None)
+                continue
+
+            idle_time = current_time - self.gpu_idle_since.setdefault(
+                node_id, current_time
+            )
+            if idle_time > self.scale_down_threshold:
+                self.logger.info(
+                    f"Worker '{node_id}' (job_id='{job_id}') has held its GPUs without "
+                    f"using them for {idle_time:.1f}s"
+                )
+                gpu_idle_nodes.add(node_id)
+
+        for node_id in set(self.gpu_idle_since) - set(worker_nodes):
+            self.gpu_idle_since.pop(node_id)
+
+        return gpu_idle_nodes
 
     async def _check_scale_down(self) -> None:
         """
@@ -935,30 +1081,40 @@ class SlurmWorkers:
                 if idle_time > self.scale_down_threshold:
                     break
 
-        # Remove all nodes that have been idle for at least the threshold
+        worker_nodes = self.ray_cluster.status["nodes"]
+
+        # Collect the nodes that have been idle for at least the threshold
+        nodes_to_close = set()
         if nodes_to_remove and max_idle_time > self.scale_down_threshold:
-            workers_removed = False
-            for idle_node_id in list(nodes_to_remove):
+            for idle_node_id in nodes_to_remove:
                 # Double-check current worker status to ensure it's still idle
-                worker_resources = self.ray_cluster.status["nodes"].get(idle_node_id)
+                worker_resources = worker_nodes.get(idle_node_id)
                 if worker_resources and await self._check_is_idle(worker_resources):
                     self.logger.info(
                         f"Scaling down worker '{idle_node_id}' due to inactivity for at least {max_idle_time:.1f}s"
                     )
-                    job_id = worker_resources["slurm_job_id"]
-                    self.worker_deletion_tasks[idle_node_id] = asyncio.create_task(
-                        self._close_worker(node_id=idle_node_id, job_id=job_id),
-                        name=f"WorkerScaleDownTask_{idle_node_id}",
-                    )
-                    workers_removed = True
+                    nodes_to_close.add(idle_node_id)
 
-            if not workers_removed:
+            if not nodes_to_close:
                 self.logger.debug(
                     "No workers met the criteria for removal after final validation"
                 )
         else:
             self.logger.debug(
                 f"No idle workers found to scale down. Max idle time: {max_idle_time:.1f}s (threshold: {self.scale_down_threshold}s)"
+            )
+
+        # Reservations alone keep a node with a parked replica out of the set
+        # above forever, so ask the hardware as well.
+        nodes_to_close |= await self._find_gpu_idle_nodes(worker_nodes)
+
+        for node_id in nodes_to_close:
+            if node_id in self.worker_deletion_tasks:
+                continue
+            job_id = worker_nodes[node_id]["slurm_job_id"]
+            self.worker_deletion_tasks[node_id] = asyncio.create_task(
+                self._close_worker(node_id=node_id, job_id=job_id),
+                name=f"WorkerScaleDownTask_{node_id}",
             )
 
     async def get_num_worker_jobs(self) -> int:
