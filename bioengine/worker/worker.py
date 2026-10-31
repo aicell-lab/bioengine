@@ -1387,6 +1387,9 @@ class BioEngineWorker:
                 f"Writing liveness heartbeat to {self.heartbeat_file} after every "
                 f"completed monitoring pass (stale after {stale_after_seconds:.0f}s)"
             )
+            # Same quantity, different reader: the host census ages a worker
+            # out on exactly the gap that marks it dead to the liveness probe.
+            self.ray_cluster.census_stale_after_seconds = stale_after_seconds
             self._monitor_consecutive_errors = 0
             while self.is_ready.is_set():
                 try:
