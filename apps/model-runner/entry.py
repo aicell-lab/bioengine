@@ -97,6 +97,9 @@ def _read_pip(name: str) -> List[str]:
     num_cpus=1,
     memory_mb=4 * 1024,
     pip=_read_pip("requirements-entry.txt"),
+    # See RuntimeDeployment: keeps the submitting account's ``~/.local`` out of
+    # this venv's pip resolution, which otherwise ships it missing a dep.
+    env_vars={"PYTHONNOUSERSITE": "1"},
     max_ongoing_requests=10,
     max_queued_requests=30,
     autoscaling_config={
