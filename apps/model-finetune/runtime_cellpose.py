@@ -45,6 +45,15 @@ _SERVE_DIAMETER = 30.0
 _MEMBER_DOWNLOAD_ATTEMPTS = 4
 _MEMBER_DOWNLOAD_BACKOFF_S = 2.0
 
+# The weights PUT is the download's counterpart: ~1.2 GiB, once per merge, and
+# equally all-or-nothing — a 504 on it discarded a completed 8-member merge
+# (31 min wall) because one attempt was all it got. 403/404 stay unretried for
+# the same reason _download_member does not retry them, and because a retry
+# re-sends 1.2 GiB; this deliberately differs from EntryApp._http_retry, which
+# does retry them because its URLs can outlive a broker commit + re-stage cycle.
+_WEIGHTS_PUT_ATTEMPTS = 4
+_WEIGHTS_PUT_BACKOFF_S = 2.0
+
 # Disk budget for cached soup members; see _evict_members. Override with
 # BIOENGINE_SOUP_CACHE_MAX_BYTES.
 _SOUP_CACHE_MAX_BYTES = 24 * 1024 ** 3
@@ -377,6 +386,38 @@ class CellposeRuntime:
                 )
                 time.sleep(_MEMBER_DOWNLOAD_BACKOFF_S * 2**attempt)
 
+    @staticmethod
+    def _upload_weights(url: str, path: Path, timeout: float = 600.0) -> None:
+        """PUT a weights file to a presigned URL, retrying transient failures.
+
+        The body is re-read per attempt so a retry sends a fresh copy. Callers run
+        this in a thread; it blocks.
+        """
+        from urllib.error import HTTPError, URLError
+        from urllib.request import Request, urlopen
+
+        for attempt in range(_WEIGHTS_PUT_ATTEMPTS):
+            try:
+                data = path.read_bytes()
+                with urlopen(Request(url, data=data, method="PUT"), timeout=timeout) as r:
+                    r.read()
+                return
+            except HTTPError as e:
+                if not (e.code in (408, 429) or e.code >= 500):
+                    raise
+                if attempt == _WEIGHTS_PUT_ATTEMPTS - 1:
+                    raise
+                reason = f"HTTP {e.code}"
+            except (URLError, OSError) as e:
+                if attempt == _WEIGHTS_PUT_ATTEMPTS - 1:
+                    raise
+                reason = f"{type(e).__name__}: {e}"
+            logger.warning(
+                f"⚠️ Weights upload attempt {attempt + 1}/{_WEIGHTS_PUT_ATTEMPTS} "
+                f"failed ({reason}); retrying..."
+            )
+            time.sleep(_WEIGHTS_PUT_BACKOFF_S * 2**attempt)
+
     def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
         """Load a member state_dict, downloading on first use.
 
@@ -464,7 +505,6 @@ class CellposeRuntime:
         and return its sha256 + byte size — so the head weights never traverse the
         CPU entry. ``members`` must be non-empty (a published head always has one)."""
         import torch
-        from urllib.request import Request, urlopen
 
         import pool
 
@@ -481,13 +521,8 @@ class CellposeRuntime:
             await asyncio.to_thread(lambda: torch.save(soup, str(path)))
             n_bytes = path.stat().st_size
 
-            def _put():
-                data = path.read_bytes()
-                with urlopen(Request(put_url, data=data, method="PUT"), timeout=600) as r:
-                    r.read()
-
             try:
-                await asyncio.to_thread(_put)
+                await asyncio.to_thread(self._upload_weights, put_url, path)
             finally:
                 path.unlink()
             return {
@@ -503,7 +538,6 @@ class CellposeRuntime:
         cellpose version. The checkpoint is torch + a runtime-local file, neither of
         which the torch-free CPU entry can touch, so all of it happens here."""
         import torch
-        from urllib.request import Request, urlopen
 
         import pool
         import training
@@ -533,12 +567,7 @@ class CellposeRuntime:
         weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)
         n_bytes = Path(ckpt).stat().st_size
 
-        def _put():
-            data = Path(ckpt).read_bytes()
-            with urlopen(Request(weights_put_url, data=data, method="PUT"), timeout=600) as r:
-                r.read()
-
-        await asyncio.to_thread(_put)
+        await asyncio.to_thread(self._upload_weights, weights_put_url, Path(ckpt))
 
         try:
             import importlib.metadata as _im
