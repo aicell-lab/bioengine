@@ -1,7 +1,15 @@
 # BioEngine worker image with the model-finetune app's dependencies baked in.
 # Ray's runtime_env venv inherits the image's site-packages, so at deploy time
-# every pin resolves as already satisfied and the app skips the multi-GB
+# the pins resolve as already satisfied and the app skips the multi-GB
 # download/install that otherwise runs on first startup.
+#
+# This image is fast-start but NOT air-gapped. pip always re-resolves direct VCS
+# references, however they are baked, so the two git+https pins in
+# requirements-runtime-cellpose.txt (dinov3, segment-anything) are re-cloned from
+# github.com on every deploy. Measured on 0.20.1-cellpose: 93 requirements
+# already satisfied, nothing downloaded, 17 s — but the same install fails with
+# "Could not resolve host: github.com" when the network is cut. A site that needs
+# a genuinely offline deploy has to vendor those two.
 #
 # Published as ONE general GHCR package, ghcr.io/aicell-lab/model-finetune, with
 # a per-backend tag suffix (e.g. 0.21.0-cellpose). This file builds the CELLPOSE
