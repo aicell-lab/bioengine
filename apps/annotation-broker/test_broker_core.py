@@ -57,11 +57,9 @@ class TestResolveRole:
         assert bc.resolve_role(meta, "some-user-id", None) == "annotator"
 
     def test_public_dataset_anonymous_user_is_public(self):
-        # Anonymous callers reach resolve_role as id=None (mapped upstream in
-        # BrokerApp._ctx_user from Hypha's is_anonymous flag), so None is the
-        # anonymous case here — not an "anonymous" string Hypha never emits.
         meta = _meta(public=True)
         assert bc.resolve_role(meta, None, None) == "public"
+        assert bc.resolve_role(meta, "anonymous", None) == "public"
 
     def test_private_dataset_anonymous_user_is_none(self):
         assert bc.resolve_role(_meta(), None, None) == "none"
@@ -628,6 +626,35 @@ class TestEnsureStaged:
         assert calls == ["call", "restage", "call"]
 
     @pytest.mark.asyncio
+    async def test_retries_on_hyphas_verbatim_staging_message(self):
+        # Regression: every other test here uses the invented phrase "stage
+        # mode". Hypha actually raises "Artifact must be in staging mode.",
+        # and "staging" does not contain the substring "stage", so a
+        # predicate keyed on the longer form matched none of the real
+        # failures. Captured verbatim from a live KTH broker traceback.
+        attempts = {"n": 0}
+        calls = []
+
+        async def call():
+            attempts["n"] += 1
+            calls.append("call")
+            if attempts["n"] < 2:
+                raise AssertionError("Artifact must be in staging mode.")
+            return "ok"
+
+        async def restage():
+            calls.append("restage")
+
+        result = await bc.ensure_staged(call, restage, sleep=_no_sleep)
+        assert result == "ok"
+        assert calls == ["call", "restage", "call"]
+
+    def test_is_stage_mode_error_accepts_both_wordings(self):
+        assert bc.is_stage_mode_error(AssertionError("Artifact must be in staging mode."))
+        assert bc.is_stage_mode_error(RuntimeError("Artifact is not in stage mode"))
+        assert not bc.is_stage_mode_error(ValueError("something else entirely"))
+
+    @pytest.mark.asyncio
     async def test_gives_up_after_max_attempts(self):
         async def call():
             raise RuntimeError("not in stage mode")
@@ -714,13 +741,12 @@ class TestCallerMatchesArtifactOwner:
         assert not bc.caller_matches_artifact_owner({}, None, "u1", None)
 
 
-def test_resolve_role_anonymous_is_public_on_public_dataset():
+def test_resolve_role_http_anonymous_is_public_on_public_dataset():
     import broker_core as core
     meta = core.new_metadata("bioimage-io/x", owner={"id": "u1"})
     meta["public"] = True
-    # Anonymous callers arrive as id=None (BrokerApp._ctx_user maps Hypha's
-    # is_anonymous flag to None, covering anonymouz-http / anonymouz-<random>);
-    # a real id is logged-in and gets annotator on a public dataset.
+    assert core.resolve_role(meta, "http-anonymous", None) == "public"
+    assert core.resolve_role(meta, "anonymous", None) == "public"
     assert core.resolve_role(meta, None, None) == "public"
     assert core.resolve_role(meta, "real-user", None) == "annotator"
 
@@ -941,3 +967,792 @@ class TestEmbeddingRemovalPaths:
         assert bc.embedding_removal_paths("19681_1836_A2_1", "vit_l_lm") == [
             "embeddings/19681_1836_A2_1_vit_l_lm.npz"
         ]
+
+
+# ---------------------------------------------------------------------------
+# Image manifest (0.10.0)
+# ---------------------------------------------------------------------------
+
+
+def _listing(*names, dirs=()):
+    """A list_files("images") result: files plus optional directory entries."""
+    return (
+        [{"name": n, "type": "file"} for n in names]
+        + [{"name": d, "type": "directory"} for d in dirs]
+    )
+
+
+class TestImageNamesFromListing:
+    def test_keeps_files_drops_directories(self):
+        entries = _listing("a.png", "b.tif", dirs=("nested",))
+        assert bc.image_names_from_listing(entries) == ["a.png", "b.tif"]
+
+    def test_excludes_the_manifest_itself(self):
+        # manifest.json lives inside the directory it describes, so a naive
+        # listing would import it as an image called "manifest".
+        entries = _listing("a.png", "manifest.json")
+        assert bc.image_names_from_listing(entries) == ["a.png"]
+
+    def test_accepts_bare_strings(self):
+        assert bc.image_names_from_listing(["a.png", ""]) == ["a.png"]
+
+    def test_is_dir_flag_is_honoured(self):
+        assert bc.image_names_from_listing([{"name": "sub", "is_dir": True}]) == []
+
+
+class TestParseImageManifest:
+    def test_round_trip(self):
+        entries = {"a": bc.local_image_entry("a.png", [10, 20])}
+        assert bc.parse_image_manifest(bc.build_image_manifest(entries)) == entries
+
+    def test_rejects_unknown_version(self):
+        doc = bc.build_image_manifest({"a": bc.local_image_entry("a.png")})
+        doc["manifest_version"] = 999
+        assert bc.parse_image_manifest(doc) == {}
+
+    def test_rejects_garbage_without_raising(self):
+        for doc in (None, [], "nope", {}, {"manifest_version": 1, "images": []}):
+            assert bc.parse_image_manifest(doc) == {}
+
+    def test_drops_entries_with_an_unknown_state(self):
+        doc = {
+            "manifest_version": 1,
+            "images": {
+                "a": {"state": "local", "path": "images/a.png"},
+                "b": {"state": "banana", "path": "images/b.png"},
+                "c": "not-a-dict",
+            },
+        }
+        assert set(bc.parse_image_manifest(doc)) == {"a"}
+
+    def test_build_sorts_stems(self):
+        entries = {s: bc.local_image_entry(f"{s}.png") for s in ("c", "a", "b")}
+        assert list(bc.build_image_manifest(entries)["images"]) == ["a", "b", "c"]
+
+
+class TestLocalImageEntry:
+    def test_path_and_state(self):
+        assert bc.local_image_entry("img001.png") == {
+            "state": "local",
+            "path": "images/img001.png",
+        }
+
+    def test_dims_included_when_plausible(self):
+        entry = bc.local_image_entry("a.png", [640, 480])
+        assert (entry["width"], entry["height"]) == (640, 480)
+
+    def test_implausible_dims_omitted(self):
+        for dims in (None, [], [0, 100], [100], [0, 0]):
+            assert "width" not in bc.local_image_entry("a.png", dims)
+
+
+class TestMergeImageManifest:
+    def test_listing_only_builds_the_whole_manifest(self):
+        entries, changed = bc.merge_image_manifest({}, ["a.png", "b.tif"])
+        assert changed is True
+        assert set(entries) == {"a", "b"}
+        assert entries["b"]["path"] == "images/b.tif"
+
+    def test_no_op_when_already_in_sync(self):
+        stored = {"a": bc.local_image_entry("a.png")}
+        entries, changed = bc.merge_image_manifest(stored, ["a.png"])
+        assert changed is False
+        assert entries == stored
+
+    def test_read_never_drops_a_missing_local_file(self):
+        # A transient listing failure must not delete images from the dataset.
+        stored = {"a": bc.local_image_entry("a.png")}
+        entries, changed = bc.merge_image_manifest(stored, [])
+        assert set(entries) == {"a"}
+        assert changed is False
+
+    def test_prune_drops_a_deleted_local_file(self):
+        stored = {"a": bc.local_image_entry("a.png"), "b": bc.local_image_entry("b.png")}
+        entries, changed = bc.merge_image_manifest(stored, ["a.png"], prune=True)
+        assert set(entries) == {"a"}
+        assert changed is True
+
+    def test_prune_never_drops_a_remote_entry(self):
+        # A remote image has no file under images/ by definition.
+        stored = {"r": {"state": "remote", "source": {"kind": "ngff"}}}
+        entries, changed = bc.merge_image_manifest(stored, [], prune=True)
+        assert set(entries) == {"r"}
+        assert changed is False
+
+    def test_dims_backfilled_into_an_existing_entry(self):
+        stored = {"a": bc.local_image_entry("a.png")}
+        entries, changed = bc.merge_image_manifest(stored, ["a.png"], dims={"a": [8, 9]})
+        assert changed is True
+        assert (entries["a"]["width"], entries["a"]["height"]) == (8, 9)
+
+    def test_existing_dims_are_not_overwritten(self):
+        stored = {"a": bc.local_image_entry("a.png", [1, 2])}
+        entries, changed = bc.merge_image_manifest(stored, ["a.png"], dims={"a": [8, 9]})
+        assert changed is False
+        assert (entries["a"]["width"], entries["a"]["height"]) == (1, 2)
+
+    def test_a_remote_entry_survives_a_read_merge(self):
+        stored = {"r": {"state": "remote", "source": {"kind": "ngff"}}}
+        entries, _ = bc.merge_image_manifest(stored, ["a.png"])
+        assert set(entries) == {"r", "a"}
+
+    def test_same_stem_two_extensions_collapses_deterministically(self):
+        entries, _ = bc.merge_image_manifest({}, ["a.tif", "a.png"])
+        assert set(entries) == {"a"}
+        assert entries["a"]["path"] == "images/a.tif"
+
+    def test_does_not_mutate_the_input(self):
+        stored = {"a": bc.local_image_entry("a.png")}
+        bc.merge_image_manifest(stored, ["b.png"], dims={"a": [1, 2]}, prune=True)
+        assert stored == {"a": {"state": "local", "path": "images/a.png"}}
+
+
+# ---------------------------------------------------------------------------
+# Remote NGFF sources (0.10.0)
+# ---------------------------------------------------------------------------
+
+
+class TestNormaliseStoreRoot:
+    def test_adds_exactly_one_trailing_slash(self):
+        assert bc.normalise_store_root("https://x/y") == "https://x/y/"
+        assert bc.normalise_store_root("https://x/y/") == "https://x/y/"
+        assert bc.normalise_store_root("https://x/y///") == "https://x/y/"
+
+    def test_strips_surrounding_whitespace(self):
+        assert bc.normalise_store_root("  https://x/y  ") == "https://x/y/"
+
+    def test_rejects_a_query_string(self):
+        # The whole point: '?token=' would land before the chunk key.
+        with pytest.raises(bc.NgffSourceError, match="query string"):
+            bc.normalise_store_root("https://x/y?token=abc")
+
+    def test_rejects_a_fragment(self):
+        with pytest.raises(bc.NgffSourceError, match="query string"):
+            bc.normalise_store_root("https://x/y#frag")
+
+    def test_rejects_a_non_http_scheme(self):
+        with pytest.raises(bc.NgffSourceError, match="http"):
+            bc.normalise_store_root("s3://bucket/key")
+
+    def test_rejects_empty(self):
+        for value in ("", "   ", None, 7):
+            with pytest.raises(bc.NgffSourceError):
+                bc.normalise_store_root(value)
+
+
+class TestStoreCredential:
+    def test_splits_the_omezarr_view_path_token(self):
+        root, token = bc.split_store_credential(
+            "https://ov.example/t/secret-123/zarr/ds1/"
+        )
+        assert root == "https://ov.example/zarr/ds1/"
+        assert token == "secret-123"
+
+    def test_a_plain_bucket_root_is_returned_unchanged(self):
+        root, token = bc.split_store_credential("https://s3.example/bucket/img.zarr/")
+        assert root == "https://s3.example/bucket/img.zarr/"
+        assert token is None
+
+    def test_round_trips(self):
+        original = "https://ov.example/t/secret-123/zarr/ds1/"
+        root, token = bc.split_store_credential(original)
+        assert bc.apply_store_credential(root, token) == original
+
+    def test_apply_is_a_no_op_without_a_credential(self):
+        assert bc.apply_store_credential("https://x/y/", None) == "https://x/y/"
+        assert bc.apply_store_credential("https://x/y/", "") == "https://x/y/"
+
+    def test_apply_onto_a_bare_host(self):
+        assert bc.apply_store_credential("https://x", "tok") == "https://x/t/tok/"
+
+    def test_a_path_segment_merely_named_t_is_not_a_token(self):
+        # '/t/' must be a *credential* segment; the regex is anchored on
+        # slashes so a directory called 't' at the end is left alone.
+        root, token = bc.split_store_credential("https://x/data/t/")
+        assert (root, token) == ("https://x/data/t/", None)
+
+
+def _zattrs(axes=None, datasets=("0", "1"), name=None):
+    entry = {"datasets": [{"path": p} for p in datasets]}
+    if axes is not None:
+        entry["axes"] = axes
+    if name is not None:
+        entry["name"] = name
+    return {"multiscales": [entry]}
+
+
+class TestParseNgffMultiscales:
+    def test_v04_axes_and_datasets(self):
+        parsed = bc.parse_ngff_multiscales(
+            _zattrs(axes=[{"name": "c"}, {"name": "y"}, {"name": "x"}])
+        )
+        assert parsed["dataset_paths"] == ["0", "1"]
+        assert parsed["axes"] == ["c", "y", "x"]
+
+    def test_absent_axes_implies_tczyx(self):
+        assert bc.parse_ngff_multiscales(_zattrs())["axes"] == ["t", "c", "z", "y", "x"]
+
+    def test_string_axes_are_accepted(self):
+        assert bc.parse_ngff_multiscales(_zattrs(axes=["Y", "X"]))["axes"] == ["y", "x"]
+
+    def test_string_datasets_are_accepted(self):
+        doc = {"multiscales": [{"datasets": ["0", "1", "2"]}]}
+        assert bc.parse_ngff_multiscales(doc)["dataset_paths"] == ["0", "1", "2"]
+
+    def test_v3_nests_under_ome(self):
+        doc = {"ome": _zattrs(axes=["y", "x"])}
+        assert bc.parse_ngff_multiscales(doc)["dataset_paths"] == ["0", "1"]
+
+    def test_named_multiscale_selection(self):
+        doc = {
+            "multiscales": [
+                {"name": "a", "datasets": [{"path": "a0"}]},
+                {"name": "b", "datasets": [{"path": "b0"}]},
+            ]
+        }
+        assert bc.parse_ngff_multiscales(doc, "b")["dataset_paths"] == ["b0"]
+
+    def test_missing_named_multiscale_lists_what_exists(self):
+        doc = {"multiscales": [{"name": "a", "datasets": [{"path": "a0"}]}]}
+        with pytest.raises(bc.NgffSourceError, match="'nope'.*a"):
+            bc.parse_ngff_multiscales(doc, "nope")
+
+    def test_rejects_a_group_that_is_not_ome_zarr(self):
+        for doc in ({}, {"multiscales": []}, None, {"multiscales": "0"}):
+            with pytest.raises(bc.NgffSourceError, match="multiscales"):
+                bc.parse_ngff_multiscales(doc)
+
+    def test_rejects_a_multiscale_with_no_datasets(self):
+        with pytest.raises(bc.NgffSourceError, match="no datasets"):
+            bc.parse_ngff_multiscales({"multiscales": [{"datasets": []}]})
+
+
+class TestNgffAxisRoles:
+    def test_tczyx(self):
+        roles = bc.ngff_axis_roles(["t", "c", "z", "y", "x"], 5)
+        assert (roles["y"], roles["x"], roles["c"]) == (3, 4, 1)
+
+    def test_two_dimensional(self):
+        roles = bc.ngff_axis_roles(["y", "x"], 2)
+        assert (roles["y"], roles["x"], roles["c"]) == (0, 1, None)
+
+    def test_channel_last(self):
+        roles = bc.ngff_axis_roles(["y", "x", "c"], 3)
+        assert (roles["y"], roles["x"], roles["c"]) == (0, 1, 2)
+
+    def test_rank_disagreement_falls_back_to_the_last_two_dims(self):
+        # Declared 5 axes, actual rank 3: trust the array, not the metadata.
+        roles = bc.ngff_axis_roles(["t", "c", "z", "y", "x"], 3)
+        assert (roles["y"], roles["x"], roles["c"]) == (1, 2, None)
+
+    def test_no_y_or_x_falls_back(self):
+        roles = bc.ngff_axis_roles(["a", "b", "c"], 3)
+        assert (roles["y"], roles["x"]) == (1, 2)
+
+    def test_rank_below_two_raises(self):
+        with pytest.raises(bc.NgffSourceError, match="at least 2"):
+            bc.ngff_axis_roles(["x"], 1)
+
+    def test_level_dims_reads_the_role_axes_not_the_tail(self):
+        roles = bc.ngff_axis_roles(["c", "y", "x"], 3)
+        assert bc.ngff_level_dims([3, 600, 800], roles) == {"width": 800, "height": 600}
+
+
+class TestParseZarrArrayMeta:
+    def test_v2_blosc(self):
+        meta = bc.parse_zarr_array_meta({
+            "shape": [3, 600, 800],
+            "chunks": [1, 256, 256],
+            "dtype": "<u2",
+            "compressor": {"id": "blosc", "cname": "zstd"},
+            "zarr_format": 2,
+        })
+        assert meta["shape"] == [3, 600, 800]
+        assert meta["chunks"] == [1, 256, 256]
+        assert meta["dtype"] == "<u2"
+        assert meta["codecs"] == ["blosc"]
+        assert meta["separator"] == "."
+
+    def test_v2_filters_come_before_the_compressor(self):
+        meta = bc.parse_zarr_array_meta({
+            "shape": [4, 4], "chunks": [2, 2], "dtype": "|u1",
+            "filters": [{"id": "delta", "dtype": "|u1"}],
+            "compressor": {"id": "zstd"},
+        })
+        assert meta["codecs"] == ["delta", "zstd"]
+
+    def test_v2_uncompressed(self):
+        meta = bc.parse_zarr_array_meta({
+            "shape": [4, 4], "chunks": [2, 2], "dtype": "|u1", "compressor": None,
+        })
+        assert meta["codecs"] == []
+
+    def test_v2_honours_dimension_separator(self):
+        meta = bc.parse_zarr_array_meta({
+            "shape": [4, 4], "chunks": [2, 2], "dtype": "|u1",
+            "dimension_separator": "/",
+        })
+        assert meta["separator"] == "/"
+
+    def test_v3(self):
+        meta = bc.parse_zarr_array_meta({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [600, 800],
+            "data_type": "uint16",
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [256, 256]}},
+            "chunk_key_encoding": {"name": "default"},
+            "codecs": [{"name": "bytes"}, {"name": "blosc"}],
+        })
+        assert meta["dtype"] == "uint16"
+        assert meta["codecs"] == ["bytes", "blosc"]
+        assert meta["separator"] == "/"
+
+    def test_v3_with_v2_key_encoding_defaults_to_a_dot(self):
+        meta = bc.parse_zarr_array_meta({
+            "zarr_format": 3, "shape": [4, 4], "data_type": "uint8",
+            "chunk_grid": {"configuration": {"chunk_shape": [2, 2]}},
+            "chunk_key_encoding": {"name": "v2"},
+            "codecs": [],
+        })
+        assert meta["separator"] == "."
+
+    def test_rejects_junk(self):
+        with pytest.raises(bc.NgffSourceError):
+            bc.parse_zarr_array_meta(None)
+        with pytest.raises(bc.NgffSourceError, match="shape"):
+            bc.parse_zarr_array_meta({"dtype": "|u1"})
+
+
+class TestNgffCodecAndDtypeGates:
+    def test_accepts_what_zarrita_ships(self):
+        for codec in ("blosc", "lz4", "zstd", "gzip", "zlib", "transpose", "bytes", "crc32c"):
+            assert bc.undecodable_ngff_codecs({"codecs": [codec]}) == []
+
+    def test_names_only_the_offenders(self):
+        assert bc.undecodable_ngff_codecs(
+            {"codecs": ["bytes", "jpeg2k", "blosc", "delta"]}
+        ) == ["delta", "jpeg2k"]
+
+    def test_no_codecs_is_fine(self):
+        assert bc.undecodable_ngff_codecs({}) == []
+
+    def test_dtype_gate_accepts_both_spellings(self):
+        for dtype in ("<u2", "|u1", ">f4", "uint16", "float32", "bool"):
+            assert bc.ngff_dtype_is_readable(dtype) is True
+
+    def test_dtype_gate_rejects_bigint_and_strings(self):
+        # 64-bit ints decode to BigInt64Array, which cannot be scaled to RGBA.
+        for dtype in ("<i8", "<u8", "int64", "uint64", "|S10", "<U5", ""):
+            assert bc.ngff_dtype_is_readable(dtype) is False
+
+
+class TestFirstChunkKey:
+    def test_v2_dot_separated(self):
+        assert bc.first_chunk_key(
+            {"zarr_format": 2, "chunks": [1, 256, 256], "separator": ".", "key_encoding": "v2"}
+        ) == "0.0.0"
+
+    def test_v2_slash_separated(self):
+        assert bc.first_chunk_key(
+            {"zarr_format": 2, "chunks": [256, 256], "separator": "/", "key_encoding": "v2"}
+        ) == "0/0"
+
+    def test_v3_default_encoding(self):
+        assert bc.first_chunk_key(
+            {"zarr_format": 3, "chunks": [1, 256, 256], "separator": "/", "key_encoding": "default"}
+        ) == "c/0/0/0"
+
+    def test_v3_with_v2_keys(self):
+        assert bc.first_chunk_key(
+            {"zarr_format": 3, "chunks": [4, 4], "separator": ".", "key_encoding": "v2"}
+        ) == "0.0"
+
+
+class TestNgffChannelNames:
+    def test_reads_omero_labels(self):
+        names = bc.ngff_channel_names(
+            {"omero": {"channels": [{"label": "DAPI"}, {"label": "GFP"}]}}
+        )
+        assert names == ["DAPI", "GFP"]
+
+    def test_falls_back_to_name(self):
+        assert bc.ngff_channel_names({"omero": {"channels": [{"name": "Cy5"}]}}) == ["Cy5"]
+
+    def test_absent_omero_is_none_not_an_error(self):
+        for doc in ({}, None, {"omero": {}}, {"omero": {"channels": []}}, {"omero": 3}):
+            assert bc.ngff_channel_names(doc) is None
+
+    def test_v3_nested_under_ome(self):
+        assert bc.ngff_channel_names(
+            {"ome": {"omero": {"channels": [{"label": "BF"}]}}}
+        ) == ["BF"]
+
+
+class TestRemoteImageEntry:
+    def test_shape(self):
+        entry = bc.remote_image_entry(
+            "https://x/zarr/ds1/", "0", 800, 600,
+            dtype="uint16", channels=["DAPI"], levels=3, content_hint="etag-1",
+            fetched_at="2026-09-10T00:00:00Z",
+        )
+        assert entry["state"] == "remote"
+        assert (entry["width"], entry["height"]) == (800, 600)
+        assert entry["dtype"] == "uint16"
+        assert entry["channels"] == ["DAPI"]
+        assert entry["levels"] == 3
+        assert entry["source"] == {
+            "kind": "ngff",
+            "store_root": "https://x/zarr/ds1/",
+            "multiscale_path": "0",
+            "region": None,
+            "fetched_at": "2026-09-10T00:00:00Z",
+            "content_hint": "etag-1",
+        }
+
+    def test_has_no_path_so_presigning_callers_fail_loudly(self):
+        entry = bc.remote_image_entry("https://x/", None, 4, 4)
+        assert "path" not in entry
+
+    def test_optional_fields_are_omitted_rather_than_null(self):
+        entry = bc.remote_image_entry("https://x/", None, 4, 4)
+        assert "dtype" not in entry and "channels" not in entry and "levels" not in entry
+
+    def test_survives_a_manifest_round_trip(self):
+        entry = bc.remote_image_entry("https://x/", "0", 4, 4)
+        doc = bc.build_image_manifest({"r": entry})
+        assert bc.parse_image_manifest(json.loads(json.dumps(doc)))["r"] == entry
+
+
+class TestNormaliseRegion:
+    def test_absent_region_is_the_whole_store(self):
+        assert bc.normalise_region(None, 1000, 800) is None
+
+    def test_a_patch_is_kept_verbatim(self):
+        assert bc.normalise_region(
+            {"x": 100, "y": 50, "width": 256, "height": 256}, 1000, 800
+        ) == {"x": 100, "y": 50, "width": 256, "height": 256}
+
+    def test_string_numbers_from_json_are_coerced(self):
+        assert bc.normalise_region(
+            {"x": "0", "y": "0", "width": "10", "height": "20"}, 1000, 800
+        ) == {"x": 0, "y": 0, "width": 10, "height": 20}
+
+    def test_a_whole_store_region_collapses_to_none(self):
+        # Identical to a whole-store import, so it must produce an identical
+        # entry rather than a second spelling of the same thing.
+        assert bc.normalise_region(
+            {"x": 0, "y": 0, "width": 1000, "height": 800}, 1000, 800
+        ) is None
+
+    def test_far_edge_is_clamped_not_refused(self):
+        assert bc.normalise_region(
+            {"x": 900, "y": 700, "width": 256, "height": 256}, 1000, 800
+        ) == {"x": 900, "y": 700, "width": 100, "height": 100}
+
+    def test_origin_outside_the_store_is_refused(self):
+        with pytest.raises(ValueError, match="outside"):
+            bc.normalise_region({"x": 1200, "y": 0, "width": 8, "height": 8}, 1000, 800)
+        with pytest.raises(ValueError, match="outside"):
+            bc.normalise_region({"x": 0, "y": -4, "width": 8, "height": 8}, 1000, 800)
+
+    def test_empty_region_is_refused(self):
+        with pytest.raises(ValueError, match="empty"):
+            bc.normalise_region({"x": 0, "y": 0, "width": 0, "height": 8}, 1000, 800)
+
+    def test_malformed_region_is_refused(self):
+        with pytest.raises(ValueError):
+            bc.normalise_region({"x": 0, "y": 0}, 1000, 800)
+        with pytest.raises(ValueError):
+            bc.normalise_region([0, 0, 8, 8], 1000, 800)
+        with pytest.raises(ValueError):
+            bc.normalise_region({"x": 0, "y": 0, "width": "wide", "height": 8}, 1000, 800)
+
+    def test_entry_dimensions_are_the_patchs(self):
+        region = bc.normalise_region(
+            {"x": 10, "y": 20, "width": 512, "height": 384}, 100000, 80000
+        )
+        entry = bc.remote_image_entry(
+            "https://x/slide.zarr/", None, region["width"], region["height"],
+            dtype="uint8", channels=["r", "g", "b"], region=region,
+        )
+        assert (entry["width"], entry["height"]) == (512, 384)
+        assert entry["source"]["region"] == region
+        # ...which is the whole point: the size gate sees the patch, so a
+        # slide that could never be materialised whole becomes materialisable
+        # a patch at a time with no new code in the gate.
+        assert bc.materialisation_bytes(entry) == 512 * 384 * 3
+        bc.check_materialisable("slide", entry)
+        whole = bc.remote_image_entry(
+            "https://x/slide.zarr/", None, 100000, 80000,
+            dtype="uint8", channels=["r", "g", "b"],
+        )
+        with pytest.raises(ValueError):
+            bc.check_materialisable("slide", whole)
+
+
+class TestImageEntryIsLocal:
+    def test_local_with_a_path(self):
+        assert bc.image_entry_is_local(bc.local_image_entry("a.png")) is True
+
+    def test_remote_is_not_local(self):
+        assert bc.image_entry_is_local(bc.remote_image_entry("https://x/", None, 4, 4)) is False
+
+    def test_local_without_a_path_is_not_local(self):
+        # A bug if it happens; treating it as local would push the failure
+        # down to whoever tried to presign it.
+        assert bc.image_entry_is_local({"state": "local"}) is False
+
+    def test_junk(self):
+        for entry in (None, {}, "local", []):
+            assert bc.image_entry_is_local(entry) is False
+
+    def test_non_local_stems_names_only_known_unmaterialised_ones(self):
+        entries = {
+            "a": bc.local_image_entry("a.png"),
+            "r": bc.remote_image_entry("https://x/", None, 4, 4),
+            "q": bc.remote_image_entry("https://x/", None, 4, 4),
+        }
+        # 'ghost' is unknown, which is the *other* validator's error to raise.
+        assert bc.non_local_stems(entries, ["a", "r", "q", "ghost"]) == ["q", "r"]
+
+    def test_non_local_stems_empty_when_all_materialised(self):
+        entries = {"a": bc.local_image_entry("a.png")}
+        assert bc.non_local_stems(entries, ["a"]) == []
+
+
+class TestDtypeItemsize:
+    @pytest.mark.parametrize(
+        "dtype,size",
+        [
+            ("<u2", 2), ("uint16", 2), ("|u1", 1), ("uint8", 1),
+            (">f4", 4), ("float32", 4), ("float64", 8), ("b1", 1),
+        ],
+    )
+    def test_both_spellings(self, dtype, size):
+        assert bc.dtype_itemsize(dtype) == size
+
+    def test_unknown_is_zero_not_a_guess(self):
+        # 0 has to mean "no opinion" downstream, so an unrecognised dtype must
+        # not fall back to some plausible itemsize.
+        for dtype in ("", None, "str", "<U8", 7, "complex128"):
+            assert bc.dtype_itemsize(dtype) == 0
+
+
+class TestMaterialisationBytes:
+    def test_counts_channels(self):
+        entry = bc.remote_image_entry(
+            "https://x/", "0", 1000, 1000, dtype="uint16", channels=["a", "b"]
+        )
+        assert bc.materialisation_bytes(entry) == 1000 * 1000 * 2 * 2
+
+    def test_no_channel_metadata_counts_one(self):
+        entry = bc.remote_image_entry("https://x/", "0", 1000, 1000, dtype="uint16")
+        assert bc.materialisation_bytes(entry) == 1000 * 1000 * 2
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            None,
+            {},
+            {"state": "remote", "width": 10, "height": 10},          # no dtype
+            {"state": "remote", "width": 0, "height": 10, "dtype": "uint8"},
+            {"state": "remote", "width": 10, "height": 10, "dtype": "str"},
+        ],
+    )
+    def test_unknown_is_zero(self, entry):
+        assert bc.materialisation_bytes(entry) == 0
+
+
+class TestCheckMaterialisable:
+    def _remote(self, **kw):
+        return bc.remote_image_entry("https://x/", "0", 512, 512, **kw)
+
+    def test_accepts_a_small_remote_image(self):
+        bc.check_materialisable("r", self._remote(dtype="uint16"))
+
+    def test_missing_entry(self):
+        with pytest.raises(FileNotFoundError):
+            bc.check_materialisable("ghost", None)
+
+    def test_local_entry_is_a_value_error_not_a_silent_pass(self):
+        with pytest.raises(ValueError, match="not a remote image"):
+            bc.check_materialisable("a", bc.local_image_entry("a.tif"))
+
+    def test_refuses_a_slide_sized_source(self):
+        huge = bc.remote_image_entry(
+            "https://x/", "0", 100_000, 80_000, dtype="uint16"
+        )
+        with pytest.raises(ValueError, match="over the 64 MB"):
+            bc.check_materialisable("wsi", huge)
+
+    def test_unknown_size_is_allowed_through(self):
+        # 0 bytes means "no opinion", not "zero pixels". Refusing on it would
+        # block every store whose dtype we failed to record.
+        bc.check_materialisable("r", {"state": "remote", "width": 4, "height": 4})
+
+
+class TestMaterialiseImageEntry:
+    def _remote(self):
+        return bc.remote_image_entry(
+            "https://x/zarr/ds1/", "0", 800, 600,
+            dtype="uint16", channels=["DAPI"], levels=3, content_hint="etag-1",
+        )
+
+    def test_flips_state_and_sets_the_path(self):
+        out = bc.materialise_image_entry(self._remote(), "r.tif", levels=2)
+        assert out["state"] == "local"
+        assert out["path"] == "images/r.tif"
+        assert out["levels"] == 2
+        assert bc.image_entry_is_local(out) is True
+
+    def test_keeps_provenance(self):
+        remote = self._remote()
+        out = bc.materialise_image_entry(remote, "r.tif", levels=2)
+        assert out["source"] == remote["source"]
+        assert (out["width"], out["height"], out["dtype"]) == (800, 600, "uint16")
+        assert out["channels"] == ["DAPI"]
+
+    def test_does_not_mutate_the_input(self):
+        remote = self._remote()
+        bc.materialise_image_entry(remote, "r.tif", levels=2)
+        assert remote["state"] == "remote" and "path" not in remote
+
+    def test_drops_the_sources_level_count_when_none_is_given(self):
+        # levels describes the file we wrote, not the store we read. Carrying
+        # the remote's 3 over to a file with a different pyramid would make
+        # the manifest lie about the artifact's own content.
+        out = bc.materialise_image_entry(self._remote(), "r.tif")
+        assert "levels" not in out
+
+    def test_survives_a_manifest_round_trip(self):
+        out = bc.materialise_image_entry(self._remote(), "r.tif", levels=2)
+        doc = bc.build_image_manifest({"r": out})
+        assert bc.parse_image_manifest(json.loads(json.dumps(doc)))["r"] == out
+
+    def test_materialised_name(self):
+        assert bc.materialised_image_name("a.b-c_1") == "a.b-c_1.tif"
+
+
+class TestMergeImageManifestPromotesRemote:
+    """A file appearing under a stem that is still marked remote.
+
+    This is the recoverable half of a crashed materialisation: the OME-TIFF
+    upload landed, the manifest write did not. The union must promote the
+    entry, not overwrite it with a bare local one, or the crash silently
+    destroys the provenance the design promises to keep (§2).
+    """
+
+    def _remote(self):
+        return bc.remote_image_entry(
+            "https://x/zarr/ds1/", "0", 800, 600,
+            dtype="uint16", channels=["DAPI", "GFP"], levels=3,
+            content_hint="etag-1",
+        )
+
+    def test_promotes_instead_of_replacing(self):
+        entries, changed = bc.merge_image_manifest(
+            {"r": self._remote()}, ["r.tif"]
+        )
+        assert changed is True
+        assert entries["r"]["state"] == "local"
+        assert entries["r"]["path"] == "images/r.tif"
+
+    def test_keeps_provenance_through_the_promotion(self):
+        remote = self._remote()
+        entries, _ = bc.merge_image_manifest({"r": remote}, ["r.tif"])
+        assert entries["r"]["source"] == remote["source"]
+        assert entries["r"]["dtype"] == "uint16"
+        assert entries["r"]["channels"] == ["DAPI", "GFP"]
+        assert (entries["r"]["width"], entries["r"]["height"]) == (800, 600)
+
+    def test_drops_the_stores_level_count(self):
+        entries, _ = bc.merge_image_manifest({"r": self._remote()}, ["r.tif"])
+        assert "levels" not in entries["r"]
+
+    def test_a_remote_with_no_file_is_left_alone(self):
+        remote = self._remote()
+        entries, changed = bc.merge_image_manifest({"r": remote}, [])
+        assert changed is False
+        assert entries["r"] == remote
+
+    def test_promotion_survives_a_prune(self):
+        # prune only removes local entries whose file is gone. The promoted
+        # entry's file is right there in the listing, so it stays.
+        entries, _ = bc.merge_image_manifest(
+            {"r": self._remote()}, ["r.tif"], prune=True
+        )
+        assert entries["r"]["path"] == "images/r.tif"
+
+    def test_an_unrelated_local_file_still_gets_a_bare_entry(self):
+        entries, _ = bc.merge_image_manifest(
+            {"r": self._remote()}, ["r.tif", "plain.png"], dims={"plain": [10, 20]}
+        )
+        assert "source" not in entries["plain"]
+        assert (entries["plain"]["width"], entries["plain"]["height"]) == (10, 20)
+
+
+class TestLooksLikeTiff:
+    @pytest.mark.parametrize(
+        "head",
+        [
+            b"II*\x00\x08\x00\x00\x00",   # classic, little endian
+            b"MM\x00*\x00\x00\x00\x08",   # classic, big endian
+            b"II+\x00\x08\x00",           # BigTIFF, little endian
+            b"MM\x00+\x00\x08",           # BigTIFF, big endian
+        ],
+    )
+    def test_accepts_every_tiff_flavour(self, head):
+        assert bc.looks_like_tiff(head) is True
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            b"",
+            b"II",                        # truncated signature
+            b"\x89PNG\r\n\x1a\n",         # a PNG
+            b"<?xml version",             # an S3 error document
+            b"II*\x01",                   # wrong magic
+            None,
+            "II*\x00",                    # str, not bytes
+        ],
+    )
+    def test_rejects_everything_else(self, head):
+        assert bc.looks_like_tiff(head) is False
+
+    def test_accepts_a_bytearray(self):
+        assert bc.looks_like_tiff(bytearray(b"II*\x00")) is True
+
+
+class TestCheckMaterialisableChannels:
+    def _remote(self, channels):
+        return bc.remote_image_entry(
+            "https://x/zarr/ds1/", "0", 64, 64,
+            dtype="uint16", channels=channels, levels=1,
+        )
+
+    @pytest.mark.parametrize("n", [0, 1, 2, 3, 4])
+    def test_accepts_up_to_four(self, n):
+        bc.check_materialisable("r", self._remote([f"c{i}" for i in range(n)]))
+
+    @pytest.mark.parametrize("n", [5, 40])
+    def test_refuses_wider(self, n):
+        with pytest.raises(ValueError, match="over the 4 the OME-TIFF profile"):
+            bc.check_materialisable("r", self._remote([f"c{i}" for i in range(n)]))
+
+    def test_unknown_channel_count_is_allowed_through(self):
+        # A store with no omero metadata reports nothing. Refusing on "we do
+        # not know" would block the common single-channel case.
+        entry = self._remote(None)
+        entry.pop("channels", None)
+        bc.check_materialisable("r", entry)
+
+    def test_the_channel_gate_runs_before_the_size_gate(self):
+        # Both would fire here. The channel message is the actionable one:
+        # a smaller region (design §13 step 6) fixes size, never width.
+        wide = bc.remote_image_entry(
+            "https://x/zarr/ds1/", "0", 100000, 80000,
+            dtype="uint16", channels=[f"c{i}" for i in range(9)], levels=1,
+        )
+        with pytest.raises(ValueError, match="9 channels"):
+            bc.check_materialisable("r", wide)
