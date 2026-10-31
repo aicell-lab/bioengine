@@ -1827,6 +1827,11 @@ class EntryApp:
             deferred_ids = [c["contribution_id"] for c in pending[max_batch:]]
             cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
 
+            undigested = pool.digest_provenance_error(
+                list(batch) + [by_id[cid] for cid in cur_member_ids])
+            if undigested:
+                raise ValueError(f"aggregate() refused this merge: {undigested}")
+
             # Refuse a merge that cannot fit BEFORE any scoring pass, rather than
             # discovering it as an OOM kill 11 passes in. This is as early as the
             # check can go: it needs `batch`, which is the first point at which the
