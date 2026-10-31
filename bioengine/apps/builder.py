@@ -1003,6 +1003,7 @@ class BuiltApp:
         self.replica_env_vars = replica_env_vars
         self.proxy_memory_in_gb = proxy_memory_in_gb
         # Map of {user_deployment_class_name: {num_replicas, autoscaling_config}}.
-        # Empty default means every user deployment runs at Ray Serve's default
-        # of one replica with no autoscaling.
+        # An absent class gets no override, so it keeps what its own
+        # @bioengine.app decorator declared — an empty map is NOT "one replica
+        # with no autoscaling" for a class that declares autoscaling_config.
         self.scaling = dict(scaling or {})
