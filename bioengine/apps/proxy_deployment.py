@@ -171,6 +171,11 @@ class ProxyDeployment:
         server_url: str,
         workspace: str,
         proxy_service_token: str,
+        # Required, not defaulted. A default would have to be a zero TTL, which
+        # disables renewal — so a caller that forgot to pass these would get a
+        # proxy that looks fine and expires in 30 days, which is the bug.
+        proxy_service_token_issued_at: float,
+        proxy_service_token_ttl_seconds: float,
         worker_client_id: str,
         authorized_users: Dict[str, List[str]],
         proxy_actor_name: str,
@@ -303,6 +308,8 @@ class ProxyDeployment:
         self.server_url = server_url
         self.workspace = workspace
         self.proxy_service_token = proxy_service_token
+        self._token_issued_at = float(proxy_service_token_issued_at)
+        self._token_ttl_seconds = float(proxy_service_token_ttl_seconds)
 
         # Deterministic client_id derived from the application_id — stable across
         # replica restarts so consumers holding a service handle auto-route to
@@ -407,6 +414,10 @@ class ProxyDeployment:
                 application_id=self.application_id,
                 registered=registered,
                 replica_id=self._replica_id,
+                # The deploy-time issue time is the only one the worker has,
+                # and renewal makes it wrong — a renewed app would read as
+                # nearly expired and page a watcher that is working correctly.
+                token_issued_at=getattr(self, "_token_issued_at", None),
             )
         except Exception as e:
             logger.warning(
@@ -1428,6 +1439,52 @@ class ProxyDeployment:
             return True
         return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
 
+    async def _collect_renewed_token(self) -> None:
+        """Adopt a replacement Hypha token the worker has left for us.
+
+        The proxy cannot mint its own: ``generate_token`` requires admin on the
+        target workspace and this replica holds ``read_write``, so Hypha answers
+        ``PermissionError: Only admin can generate token.`` The worker decides
+        when a token is due and deposits the replacement in the proxy actor; all
+        that is left here is to collect it. See
+        ``BioEngineProxyActor.take_pending_token`` and
+        ``BioEngineAppsManager._renew_proxy_tokens``.
+
+        Advisory. A failure here leaves the existing token in place and the next
+        tick tries again, which is the right shape: there are days of margin,
+        and failing the replica over a renewal that can be retried would be a
+        worse outcome than the expiry this prevents.
+        """
+        handle = getattr(self, "_proxy_actor_handle", None)
+        if handle is None:
+            return
+
+        try:
+            pending = await handle.take_pending_token.remote(self.application_id)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not check for a renewed Hypha token for "
+                f"'{self.application_id}': {e}. Keeping the current token; the "
+                f"next tick retries."
+            )
+            return
+
+        if not pending:
+            return
+
+        self.proxy_service_token = pending["token"]
+        self._token_issued_at = pending["issued_at"]
+        self._token_ttl_seconds = pending["ttl_seconds"]
+        # The live client still holds the OLD token. Nothing re-authenticates an
+        # established connection, so the new one only takes effect on a rebuild
+        # — without this the renewal is recorded and never used.
+        self._connection_lost = True
+        logger.info(
+            f"🔑 Collected a renewed Hypha token for '{self.application_id}' "
+            f"(TTL {self._token_ttl_seconds / 86400:.0f} days); rebuilding the "
+            f"client so the new one is used."
+        )
+
     async def _maintenance_tick(self) -> None:
         """One pass of connection upkeep. Never raises.
 
@@ -1441,6 +1498,8 @@ class ProxyDeployment:
             # Not serviceable yet, or deregistered because a sibling went
             # down. check_health owns that gate; nothing to maintain.
             return
+
+        await self._collect_renewed_token()
 
         needs_registration = (
             self.server is None or self.websocket_service_id is None or self._connection_lost
@@ -1768,6 +1827,8 @@ if __name__ == "__main__":
             server_url=server_url,
             workspace=workspace,
             proxy_service_token=token,
+            proxy_service_token_issued_at=time.time(),
+            proxy_service_token_ttl_seconds=3600 * 24 * 30,
             worker_client_id=worker_client_id,
             authorized_users=["*"],
             proxy_actor_name="mock_actor",

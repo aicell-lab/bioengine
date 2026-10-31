@@ -157,8 +157,18 @@ class BioEngineProxyActor:
         # The replica id is kept so a departing replica cannot overwrite its
         # successor's verdict; see report_service_registration and
         # claim_service_registration.
-        # Structure: {app_id: {"replica_id": str|None, "registered": bool}}
+        # Structure: {app_id: {"replica_id": str|None, "registered": bool,
+        #                      "token_issued_at": float|None}}
         self.service_registrations: Dict[str, Dict[str, Any]] = {}
+
+        # Renewed Hypha tokens the worker has minted but no replica has picked
+        # up yet. Deliberately NOT inside service_registrations: that record is
+        # read by several getters and a future "return the whole record" change
+        # would publish a live credential. Nothing here is readable except
+        # take_pending_token, which consumes.
+        # Structure: {app_id: {"token": str, "issued_at": float,
+        #                      "ttl_seconds": float}}
+        self._pending_tokens: Dict[str, Dict[str, Any]] = {}
 
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
@@ -873,6 +883,8 @@ class BioEngineProxyActor:
         self.application_replicas.pop(application_id, None)
         self.replica_identities.pop(application_id, None)
         self.service_registrations.pop(application_id, None)
+        # An undeployed app has nobody left to collect its token.
+        self._pending_tokens.pop(application_id, None)
         logger.info(
             f"Cleared all registered replicas for application '{application_id}'."
         )
@@ -898,6 +910,10 @@ class BioEngineProxyActor:
         self.service_registrations[application_id] = {
             "replica_id": replica_id,
             "registered": False,
+            # Not yet known for the incoming replica, and deliberately not
+            # carried over from its predecessor: a new replica is constructed
+            # with the deploy-time token and may renew to a different time.
+            "token_issued_at": None,
         }
         logger.info(
             f"Replica '{replica_id}' claimed the Hypha registration record of "
@@ -910,6 +926,7 @@ class BioEngineProxyActor:
         application_id: str,
         registered: bool,
         replica_id: Optional[str] = None,
+        token_issued_at: Optional[float] = None,
     ) -> None:
         """Record whether an application's Hypha services exist right now.
 
@@ -948,6 +965,10 @@ class BioEngineProxyActor:
         self.service_registrations[application_id] = {
             "replica_id": replica_id,
             "registered": registered,
+            # When the serving replica last minted its Hypha token. The worker
+            # only knows the deploy-time value, which renewal makes stale, so
+            # this is the one that says whether the app is really near a 401.
+            "token_issued_at": token_issued_at,
         }
         logger.info(
             f"Application '{application_id}' reported its Hypha services as "
@@ -965,6 +986,72 @@ class BioEngineProxyActor:
         """
         record = self.service_registrations.get(application_id)
         return None if record is None else record["registered"]
+
+    @_touch_on_call
+    def get_reported_token_issued_at(self, application_id: str) -> Optional[float]:
+        """When the serving replica last minted its Hypha token, if it said.
+
+        None covers three different things and the caller must not distinguish
+        them: never reported, reported by a replica too old to send the field,
+        and no record at all. In every one of them the deploy-time value the
+        worker already holds is the best available answer.
+        """
+        record = self.service_registrations.get(application_id)
+        return None if record is None else record.get("token_issued_at")
+
+    @_touch_on_call
+    def set_pending_token(
+        self,
+        application_id: str,
+        token: str,
+        issued_at: float,
+        ttl_seconds: float,
+    ) -> None:
+        """Leave a freshly minted Hypha token for an app's proxy to collect.
+
+        Only the worker can mint one: Hypha requires admin to call
+        ``generate_token`` and the proxy holds a ``read_write`` token, so it
+        cannot replace its own credential. This actor is the drop point because
+        it outlives the worker (``lifetime="detached"``) and the proxy already
+        polls it.
+
+        Overwrites any uncollected token for the same app. The newest is always
+        the one with the most life left, and both were minted with the same
+        scope, so there is nothing to preserve in the older one.
+        """
+        self._pending_tokens[application_id] = {
+            "token": token,
+            "issued_at": issued_at,
+            "ttl_seconds": ttl_seconds,
+        }
+        # No token value, here or anywhere: these logs are readable through
+        # get_app_status.
+        logger.info(
+            f"Stored a renewed Hypha token for application '{application_id}' "
+            f"(TTL {ttl_seconds / 86400:.0f} days), awaiting collection by its "
+            f"proxy replica."
+        )
+
+    @_touch_on_call
+    def has_pending_token(self, application_id: str) -> bool:
+        """Whether a minted token is still waiting to be collected.
+
+        Lets the worker skip minting a second one while the first is in flight,
+        without consuming it. The proxy polls every few seconds, so this is
+        normally False.
+        """
+        return application_id in self._pending_tokens
+
+    @_touch_on_call
+    def take_pending_token(self, application_id: str) -> Optional[Dict[str, Any]]:
+        """Hand the app's renewed token to its proxy replica, once.
+
+        Consuming on read is what keeps a replica that restarts between mint
+        and collection from adopting a token its predecessor already took. The
+        loss is self-correcting: the replica goes on reporting the old issue
+        time, so the worker's next pass mints again.
+        """
+        return self._pending_tokens.pop(application_id, None)
 
     @_touch_on_call
     def get_replica_identities(

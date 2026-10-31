@@ -226,6 +226,23 @@ def _belongs_to_worker_workspace(
     return True
 
 
+def _token_expires_in_seconds(
+    issued_at: Optional[float], ttl_seconds: Optional[float]
+) -> Optional[float]:
+    """Seconds until the proxy token lapses; negative once it has.
+
+    None when either input is missing — an app deployed before these were
+    recorded has no issue time, and guessing one would turn "unknown" into a
+    confident wrong answer about whether it is about to 401.
+    """
+    if issued_at is None or ttl_seconds is None:
+        return None
+    try:
+        return float(ttl_seconds) - (time.time() - float(issued_at))
+    except (TypeError, ValueError):
+        return None
+
+
 def _entry_deployment_name(entry_id: Optional[str]) -> Optional[str]:
     """Ray Serve deployment name of an app's entry class.
 
@@ -272,6 +289,15 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
+# Mint a proxy's replacement Hypha token once this much of its life has passed.
+# It is a deploy-time credential with a 30-day TTL and a deploy is the only
+# thing that used to mint one, so an app the worker *adopted* rather than
+# deployed kept the original and died at 30 days with HTTP 401 — reported as
+# UNHEALTHY, which points at the app rather than at the credential. Renewed at
+# two thirds, so a worker down for a week still has ten days of margin when it
+# returns; the margin is the point rather than the cadence.
+_TOKEN_RENEW_AFTER_FRACTION = 2 / 3
+
 
 # What ``get_app_status`` tells a caller who is neither a worker admin nor named
 # on the application's own roster.
@@ -315,6 +341,10 @@ PUBLIC_APP_STATUS_FIELDS = (
     "deployed_by_worker_client_id",
     "proxy_service_token_issued_at",
     "proxy_service_token_ttl_seconds",
+    # Published deliberately, and it discloses nothing the two fields above it
+    # do not: it is their difference. Named here so a watcher can read "about
+    # to fail registration" instead of recomputing it from a timestamp.
+    "proxy_service_token_expires_in_seconds",
 )
 
 # Same, one level down. ``logs`` is verbatim replica stdout/stderr: its content
@@ -1347,6 +1377,10 @@ class AppsManager:
             application_id
         )
 
+        token_issued_at = await self._reported_token_issued_at(
+            application_id, application_info.get("proxy_service_token_issued_at")
+        )
+
         # Report what the replicas actually loaded, not just the requested
         # version — a stale reused replica reads as "healthy" otherwise.
         # ``running_version`` shows the entry replica's baked version;
@@ -1422,13 +1456,54 @@ class AppsManager:
             "deployed_by_worker_client_id": application_info.get(
                 "deployed_by_worker_client_id"
             ),
-            "proxy_service_token_issued_at": application_info.get(
-                "proxy_service_token_issued_at"
-            ),
+            # The serving replica's own figure when it has reported one, because
+            # the proxy renews its token and the deploy-time value then
+            # describes a token that no longer exists. Reporting the stale one
+            # would make a renewed app read as nearly expired and page a
+            # watcher that is working correctly.
+            "proxy_service_token_issued_at": token_issued_at,
             "proxy_service_token_ttl_seconds": application_info.get(
                 "proxy_service_token_ttl_seconds"
             ),
+            # Derived so a watcher does not reimplement the arithmetic, and so
+            # "this app is about to fail Hypha registration" is readable rather
+            # than inferable. Negative once expired. None when either input is
+            # missing, which is the case for an app deployed before these were
+            # recorded.
+            "proxy_service_token_expires_in_seconds": _token_expires_in_seconds(
+                token_issued_at,
+                application_info.get("proxy_service_token_ttl_seconds"),
+            ),
         }
+
+    async def _reported_token_issued_at(
+        self, application_id: str, deployed_at: Optional[float]
+    ) -> Optional[float]:
+        """The serving replica's token issue time, falling back to deploy time.
+
+        The proxy renews its own token, so the deploy-time value describes a
+        token that may no longer exist. Preferring the replica's report is what
+        keeps ``proxy_service_token_expires_in_seconds`` describing the token
+        actually in use — otherwise a renewed app reads as nearly expired and
+        pages a watcher that is behaving correctly.
+
+        Advisory: any failure, or a replica too old to send the field, falls
+        back to the deploy-time value. That is stale rather than wrong — it
+        under-states the remaining life, which errs toward alerting.
+        """
+        try:
+            reported = (
+                await self.ray_cluster.proxy_actor_handle.get_reported_token_issued_at.remote(
+                    application_id
+                )
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not read the reported token issue time for "
+                f"'{application_id}': {exc}"
+            )
+            return deployed_at
+        return deployed_at if reported is None else reported
 
     async def complete_initialization(
         self, server: RemoteService, admin_users: List[str], worker_service_id: str
@@ -1786,6 +1861,72 @@ class AppsManager:
             self._startup_retry_task.cancel()
         self._startup_retry_task = None
 
+    async def _renew_proxy_tokens(self) -> None:
+        """Mint replacements for proxy tokens that are two-thirds spent.
+
+        The proxy cannot do this itself. Hypha's ``generate_token`` requires
+        admin on the target workspace and the proxy is given ``read_write``, so
+        it gets ``PermissionError: Only admin can generate token.`` — measured
+        against hypha.aicell.io on 2026-10-27, with a ``public`` arm refused for
+        a different reason and a nonexistent-workspace arm raising, so the
+        refusal is the permission check and not a dead client. The worker holds
+        the admin credential, so it mints here and leaves the result in the
+        proxy actor for the replica to collect.
+
+        Never raises: renewal has days of margin and the next tick retries, so a
+        failure must not cost the caller its own pass.
+        """
+        if not self.server:
+            return
+
+        handle = getattr(self.ray_cluster, "proxy_actor_handle", None)
+        if handle is None:
+            return
+
+        now = time.time()
+        for application_id, application_info in list(
+            self._deployed_applications.items()
+        ):
+            if not application_info["is_deployed"].is_set():
+                continue
+            ttl_seconds = application_info.get("proxy_service_token_ttl_seconds")
+            if not ttl_seconds or ttl_seconds <= 0:
+                continue
+
+            issued_at = None
+            try:
+                issued_at = await self._reported_token_issued_at(
+                    application_id,
+                    application_info.get("proxy_service_token_issued_at"),
+                )
+                if issued_at is None:
+                    continue
+                if now - issued_at < ttl_seconds * _TOKEN_RENEW_AFTER_FRACTION:
+                    continue
+                if await handle.has_pending_token.remote(application_id):
+                    continue
+
+                token = await self.server.generate_token(
+                    {
+                        "workspace": self.server.config.workspace,
+                        "permission": "read_write",
+                        "expires_in": int(ttl_seconds),
+                    }
+                )
+                await handle.set_pending_token.remote(
+                    application_id=application_id,
+                    token=token,
+                    issued_at=time.time(),
+                    ttl_seconds=ttl_seconds,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"Could not renew the proxy Hypha token for "
+                    f"'{application_id}' ({(now - (issued_at or now)) / 86400:.1f} "
+                    f"days into a {ttl_seconds / 86400:.0f}-day TTL): {exc}. "
+                    f"Keeping the current token; the next tick retries."
+                )
+
     async def monitor_applications(self) -> None:
         """Auto-redeploy unhealthy apps with per-app exponential backoff.
 
@@ -1819,6 +1960,11 @@ class AppsManager:
                 unreachable). The outer monitoring loop catches and applies
                 its own exponential backoff.
         """
+        # Ahead of the auto-redeploy filter and its early return: a proxy token
+        # expires whether or not the app opted into auto-redeploy, and the app
+        # that hit this first was an adopted one with the flag unset.
+        await self._renew_proxy_tokens()
+
         apps_to_redeploy = [
             app_id
             for app_id, app_info in self._deployed_applications.items()
