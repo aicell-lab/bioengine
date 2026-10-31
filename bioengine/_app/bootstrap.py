@@ -470,6 +470,27 @@ def _merge_pip_lists(base: List[str], to_add: List[str]) -> List[str]:
     return merged
 
 
+def _apply_scaling(cls: Any, per_class: Dict[str, Any]) -> Any:
+    """Apply one ``deploy_app(scaling=…)`` entry to a deployment class.
+
+    ``num_replicas`` must clear ``autoscaling_config``: Ray's controller reads
+    ``num_replicas`` only in the ``else`` of ``if deployment_config
+    .autoscaling_config`` (``ray/serve/_private/deployment_state.py``), and
+    ``.options(num_replicas=…)`` leaves an ``autoscaling_config`` the
+    ``@bioengine.app`` decorator declared in place — so without the explicit
+    ``None`` a fixed replica count is accepted and then ignored.
+    """
+    per_class_autoscale = per_class.get("autoscaling_config")
+    per_class_replicas = per_class.get("num_replicas")
+    if per_class_autoscale:
+        return cls.options(autoscaling_config=per_class_autoscale)
+    if per_class_replicas is not None:
+        return cls.options(
+            num_replicas=per_class_replicas, autoscaling_config=None
+        )
+    return cls
+
+
 #: Kept for back-compat with tests that pin the hook name; Ray Serve does
 #: NOT honour ``runtime_env.worker_process_setup_hook`` for its replicas
 #: (no references under ``ray/serve/``) so the actual replica bootstrap
@@ -670,13 +691,7 @@ def build_and_run_application(
         # (matching what get_app_status reports). Multi-class apps can
         # mix fixed and autoscaling configs across deployments.
         class_name = meta["qualname"].split(".")[-1]
-        per_class = scaling_map.get(class_name) or {}
-        per_class_autoscale = per_class.get("autoscaling_config")
-        per_class_replicas = per_class.get("num_replicas")
-        if per_class_autoscale:
-            cls = cls.options(autoscaling_config=per_class_autoscale)
-        elif per_class_replicas is not None and per_class_replicas != 1:
-            cls = cls.options(num_replicas=per_class_replicas)
+        cls = _apply_scaling(cls, scaling_map.get(class_name) or {})
         bind_kwargs: Dict[str, Any] = dict(application_kwargs.get(cid, {}))
         for param in meta["init_params"]:
             if param["kind"] == "deployment_handle":
