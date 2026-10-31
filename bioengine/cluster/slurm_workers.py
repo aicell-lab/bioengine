@@ -202,6 +202,11 @@ class SlurmWorkers:
                 "--nv",
                 "--cleanenv",
                 "--env=SLURM_JOB_ID='${SLURM_JOB_ID}'",
+                # Without this, Ray's runtime_env pip step resolves against the
+                # submitting user's ~/.local and skips as "already satisfied"
+                # packages the replica cannot import — its HOME is rebound per
+                # app, to a directory with no .local.
+                "--env=PYTHONNOUSERSITE=1",
                 "--pwd /app",
                 f"--bind {self.worker_workspace_dir}:${{HOME}}/.bioengine",
             ]
