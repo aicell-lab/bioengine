@@ -979,6 +979,59 @@ class BioEngineProxyActor:
         """
         return self.replica_identities.get(application_id, {})
 
+    def _get_actor_death_cause(self, actor_id: str) -> Optional[Dict[str, str]]:
+        """Why Ray says this actor died, or None if Ray does not say.
+
+        The Serve controller logs only "crashed, marking it unhealthy
+        immediately" and keeps no cause, so a replica that dies while serving
+        leaves nothing an operator can read. The GCS does hold one, and it
+        discriminates: ``reason`` is ``OOM`` (Ray's own memory monitor),
+        ``RAY_KILL`` (a deliberate stop), ``NODE_DIED``, or ``WORKER_DIED``
+        (the process exited on its own — a signal, or a crash). Returns None
+        for a live actor and for one the GCS has already evicted.
+        """
+        try:
+            actors = self.state_api_client.list(
+                resource=StateResource.ACTORS,
+                options=ListApiOptions(
+                    limit=1,
+                    timeout=DEFAULT_RPC_TIMEOUT,
+                    filters=[("actor_id", "=", actor_id)],
+                    detail=True,
+                    explain=False,
+                ),
+                raise_on_missing_output=False,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch death cause for actor {actor_id}: {e}")
+            return None
+
+        if not actors:
+            return None
+        death_cause = getattr(actors[0], "death_cause", None)
+        if not death_cause:
+            return None
+
+        # Ray nests the cause under exactly one of two keys, and only the OOM
+        # one carries no `reason` field of its own.
+        if "oom_context" in death_cause:
+            return {
+                "reason": "OOM",
+                "message": death_cause["oom_context"].get("error_message", ""),
+            }
+        context = death_cause.get("actor_died_error_context") or {}
+        if not context:
+            return None
+        reason = context.get("reason") or "UNKNOWN"
+        message = context.get("error_message", "")
+        node_death_info = context.get("node_death_info") or {}
+        if node_death_info:
+            message = (
+                f"{message} (node: {node_death_info.get('reason', '')} "
+                f"{node_death_info.get('reason_message', '')})".strip()
+            )
+        return {"reason": reason, "message": message}
+
     @_touch_on_call
     def get_actor_logs(
         self,
@@ -1086,6 +1139,8 @@ class BioEngineProxyActor:
                 "replica_2": {...}
             }
             Error messages are included in stderr if log retrieval fails.
+            Dead replicas additionally carry ``death_cause``
+            (``{"reason", "message"}``, or None if Ray no longer holds one).
         """
         logs = {}
 
@@ -1155,5 +1210,8 @@ class BioEngineProxyActor:
                     "stdout": [],
                     "stderr": [f"Error retrieving logs: {str(e)}"],
                 }
+            # A replica killed mid-request writes no traceback, so its own logs
+            # just stop. The cause lives in the GCS instead.
+            logs[replica_id]["death_cause"] = self._get_actor_death_cause(actor_id)
 
         return logs

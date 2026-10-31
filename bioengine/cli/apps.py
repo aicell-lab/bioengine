@@ -546,6 +546,11 @@ def logs(app_id, tail, as_json, worker_service_id, token, server_url):
             result = await worker.get_app_status(
                 application_ids=[app_id],
                 logs_tail=tail,
+                # Defaults to 0, which returns live replicas only — and a dead
+                # replica's logs and its death_cause are both attached past
+                # that early return. Without this the crashed replica is
+                # invisible to the one command run after a crash.
+                n_previous_replica=1,
             )
         except Exception as exc:
             error_exit(f"Failed to get logs for '{app_id}': {exc}")
@@ -583,8 +588,11 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
     That field is a mapping of replica id to its ``stdout``/``stderr`` lines,
     already tailed to the requested number by the worker — so everything fetched
     is printed, and the caller's line count means what it says. Iterating it
-    rather than the deployment's ``replicas`` is deliberate: the map also keys
-    recently dead replicas, which the live replica list does not contain.
+    rather than the deployment's ``replicas`` is deliberate: the map keys
+    recently dead replicas too, which the live replica list does not contain —
+    but only for a caller that passed ``n_previous_replica > 0``. ``apps logs``
+    does; ``apps status`` does not, because it fetches logs on every invocation
+    and each dead replica adds a GCS lookup to every poll.
 
     The field is *absent* rather than empty when the caller may not read it, so
     the withheld case must not print the same thing as "nothing logged yet".
@@ -603,6 +611,17 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
 
     printed = False
     for replica_id, streams in logs.items():
+        cause = streams.get("death_cause")
+        if cause:
+            # A replica killed mid-request writes no traceback, so its streams
+            # just stop; the reason is only in this field. First line only —
+            # Ray's OOM text runs to kilobytes and `--json` still has it whole.
+            message = (cause.get("message") or "").strip().splitlines()
+            click.echo(
+                f"{indent}[{replica_id}] died: {cause.get('reason') or 'UNKNOWN'}"
+                + (f" — {message[0]}" if message else "")
+            )
+            printed = True
         for stream in ("stdout", "stderr"):
             lines = streams.get(stream) or []
             if isinstance(lines, str):
