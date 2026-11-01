@@ -68,6 +68,13 @@ SCRIPT_REF = re.compile(r"(/[\w./@+-]+\.(?:sh|py|js|ts))")
 MAX_WATCHER_FILE_BYTES = 2 * 1024 * 1024
 OWNED_IF_TOUCHED_WITHIN = 24 * 3600
 
+# Directory names that hold records of what HAS run — the escalation sink's
+# evidence bundles and latches, and the workflow runner's own logs — rather than
+# definitions of what is scheduled. They sit beside the watchers inside the same
+# roots, and they quote the whole report, so leaving them in the corpus makes one
+# tick's alert fail gate 4 for every worktree the next tick looks at.
+GENERATED_RECORD_DIRS = {".runs", "bundles", ".escalations"}
+
 # A worktree's four gates are independent of every other worktree's and spend
 # nearly all their time blocked in fork/wait -- 565 subprocess calls, 9.0s of a
 # 14.7s run inside select.poll -- so they are evaluated concurrently: 11.1s ->
@@ -372,6 +379,8 @@ def watcher_corpus(repo, override_roots=None):
 
     corpus = []
     for fp in dict.fromkeys(files):
+        if GENERATED_RECORD_DIRS.intersection(fp.split(os.sep)[:-1]):
+            continue
         try:
             with open(fp, errors="replace") as fh:
                 corpus.append((fp, fh.read(MAX_WATCHER_FILE_BYTES)))

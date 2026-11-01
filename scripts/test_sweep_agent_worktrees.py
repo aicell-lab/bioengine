@@ -119,7 +119,19 @@ def build_fixture(root):
     watchers = os.path.join(root, "watchers")
     write(os.path.join(watchers, "check.sh"), "#!/bin/sh\ngit checkout agent-watched\n")
 
-    # 7. a registration left behind by a directory someone already deleted.
+    # 7. gate 4 must NOT fail on the sweep's own output: this worktree is named
+    # only inside the escalation sink's evidence bundle and the workflow
+    # runner's log, both of which live inside the watcher root and quote the
+    # whole report back. Without the exclusion, one tick's alert fails gate 4
+    # for everything the next tick looks at.
+    paths["agent-recorded"] = worktree("agent-recorded", "origin/main")
+    write(os.path.join(watchers, "bundles", "20260101T000000-sweep.md"),
+          "  [crew] agent-recorded  agent-recorded  0000000\n      all four gates pass\n")
+    write(os.path.join(watchers, ".runs", "worktree-sweep-report.jsonl"),
+          '{"workflow":"worktree-sweep-report","triggerContext":"agent-recorded"}\n')
+    write(os.path.join(watchers, ".escalations", "sweep.issue"), "agent-recorded\n")
+
+    # 8. a registration left behind by a directory someone already deleted.
     # It carries unmerged work, to prove a prune does not take the branch with it.
     p = worktree("agent-stale", "origin/main")
     write(os.path.join(p, "stale-only.txt"), "work only this branch has\n")
@@ -193,10 +205,29 @@ def main():
             "agent-dirty": "NOT-DONE",
             "agent-owned": "NOT-DONE",
             "agent-watched": "NOT-DONE",
+            "agent-recorded": "DONE",
             "agent-stale": "STALE",
         }
         for name, want in expected.items():
             check(f"{name} is {want}", before.get(name) == want, f"got {before.get(name)!r}")
+
+        # agent-recorded being DONE above is only meaningful if those three files
+        # really would have failed gate 4 — otherwise the exclusion is untested
+        # and the pass is free. Copy one of them to a path the exclusion does not
+        # cover and the same text must fail the gate.
+        decoy = os.path.join(watchers, "sweep-report-copy.md")
+        shutil.copyfile(os.path.join(watchers, "bundles", "20260101T000000-sweep.md"), decoy)
+        check(
+            "the same text OUTSIDE a generated-record dir still fails gate 4",
+            verdicts(sweep(repo, watchers)).get("agent-recorded") == "NOT-DONE",
+            "gate 4 ignored a bundle-shaped file sitting beside the watchers",
+        )
+        os.remove(decoy)
+        check(
+            "and removing it puts agent-recorded back to DONE",
+            verdicts(sweep(repo, watchers)).get("agent-recorded") == "DONE",
+            "the decoy left a residue",
+        )
         check(
             "the main checkout is excluded from the sweepable bands",
             before.get(os.path.basename(repo)) == "EXCLUDED",
@@ -247,12 +278,12 @@ def main():
               p.returncode == 2 and "--notify" in p.stderr,
               f"exit {p.returncode}: {p.stderr.strip()[:200]}")
 
-        print("apply (only the two that pass every gate should go)")
+        print("apply (only the three that pass every gate should go)")
         sweep(repo, watchers, "--apply")
         live = git(repo, "worktree", "list")
         branches = git(repo, "branch", "--format=%(refname:short)").split()
 
-        for name in ("agent-clean", "agent-squashed"):
+        for name in ("agent-clean", "agent-squashed", "agent-recorded"):
             check(f"{name} worktree removed", not os.path.isdir(paths[name]))
             check(f"{name} branch deleted", name not in branches, f"branches: {branches}")
         for name in ("agent-unmerged", "agent-dirty", "agent-owned", "agent-watched"):
