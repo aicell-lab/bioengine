@@ -85,6 +85,30 @@ def test_empty_is_rejected():
         pool.uniform_soup([])
 
 
+def test_an_empty_first_member_is_rejected_not_averaged_away():
+    """The guard used to be ``if not acc``, so an empty FIRST member left the
+    accumulator falsy, the branch re-entered on member 2, and the sum ran over
+    n-1 while the divisor stayed n — a soup scaled by (n-1)/n with nothing
+    raised. Later positions failed loudly on a KeyError, so only this one was
+    silent."""
+    with pytest.raises(ValueError, match="member 0 loaded an empty state_dict"):
+        pool.uniform_soup([dict] + [lambda: _sd(10.0)] * 3)
+
+
+def test_an_empty_first_member_is_rejected_at_two_members_too():
+    """n=2 is the maximal-error case: the old guard summed one member and divided
+    by two, so every published weight was exactly half. Worth its own arm because
+    a (n-1)/n scale factor is easy to dismiss as noise at n=16 and impossible to
+    at n=2."""
+    with pytest.raises(ValueError, match="member 0 loaded an empty state_dict"):
+        pool.uniform_soup([dict, lambda: _sd(10.0)])
+
+
+def test_an_empty_later_member_is_rejected_by_the_same_guard():
+    with pytest.raises(ValueError, match="member 2 loaded an empty state_dict"):
+        pool.uniform_soup([lambda: _sd(10.0), lambda: _sd(10.0), dict])
+
+
 # ── l2_from_base is weight-only (#0070 requirement 2) ────────────────────────
 # diam_labels and diam_mean are registered as non-learned nn.Parameter
 # (cellpose_model.py:78-79), so they sit in the state dict as float32 scalars
@@ -163,3 +187,55 @@ def test_the_merge_still_averages_diam_so_requirement_1_stays_open() -> None:
                              lambda: _ckpt(1.0, 28.912), lambda: _ckpt(1.0, 117.353)])
 
     assert float(out["diam_labels"][0]) == pytest.approx(57.7405, rel=1e-4)
+
+
+def test_the_published_digest_is_the_same_for_two_merges_of_the_same_members() -> None:
+    """#0104: a digest that changes for identical input is worse than no digest.
+
+    Two merges of the same members must publish the same weights_sha256, or the
+    obvious diagnostic — re-merge and compare — reports corruption where there
+    is none.
+    """
+    loaders = [lambda: _sd(1.0), lambda: _sd(3.0), lambda: _sd(5.0)]
+
+    first = pool.state_dict_digest(pool.uniform_soup(loaders))
+    second = pool.state_dict_digest(pool.uniform_soup(loaders))
+
+    assert first == second
+
+
+def test_the_digest_still_moves_when_a_tensor_moves() -> None:
+    """The discrimination control for the test above: a digest could be stable
+    because it stopped reading the tensors at all."""
+    soup = pool.uniform_soup([lambda: _sd(1.0), lambda: _sd(3.0)])
+    nudged = dict(soup)
+    nudged["a.weight"] = soup["a.weight"] + 1e-6
+
+    assert pool.state_dict_digest(nudged) != pool.state_dict_digest(soup)
+    assert pool.state_dict_digest({"renamed": soup["a.weight"],
+                                   "b.bias": soup["b.bias"]}) != pool.state_dict_digest(soup)
+
+
+def test_the_digest_does_not_follow_the_file_the_soup_is_saved_under(tmp_path) -> None:
+    """Why the digest cannot be ``sha256_file`` of the saved head.
+
+    ``materialize_soup`` writes to ``head-<uuid4>.pt`` — the stem has to stay
+    unique so two concurrent merges in one replica's soup dir cannot collide —
+    and torch's zip container embeds that stem in every record name. So the file
+    digest is a function of the filename. The first two asserts are a positive
+    control: they fail if torch ever stops doing that, which would mean this
+    test has stopped testing anything.
+    """
+    soup = pool.uniform_soup([lambda: _sd(1.0), lambda: _sd(3.0)])
+    a, b = tmp_path / "head-aaaaaaaa.pt", tmp_path / "head-bbbbbbbb.pt"
+    torch.save(soup, str(a))
+    once = pool.sha256_file(str(a))
+    torch.save(soup, str(a))
+    torch.save(soup, str(b))
+
+    assert pool.sha256_file(str(a)) == once, "torch.save is not deterministic"
+    assert a.stat().st_size == b.stat().st_size
+    assert pool.sha256_file(str(a)) != pool.sha256_file(str(b))
+    assert pool.state_dict_digest(soup) == pool.state_dict_digest(
+        torch.load(str(b), map_location="cpu", weights_only=False)
+    )
