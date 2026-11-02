@@ -321,6 +321,23 @@ The script handles container image download (via Singularity/Apptainer), Ray clu
 
 Monitor submitted jobs with `squeue -u $USER`.
 
+#### Surviving site policies that kill idle GPU jobs
+
+Some sites cancel jobs that hold a GPU without drawing power — a worker waiting for
+its first deployment looks exactly like a stalled job — and exempt jobs that run inside
+a reservation. Request one through `--further-slurm-args`; each entry becomes its own
+`#SBATCH` directive, so no separate flag is needed:
+
+```bash
+--further-slurm-args --reservation=safe --account=my-project
+```
+
+Leave it unset and no directive is emitted, which is the right default for sites that
+have no such policy. Confirm the reservation admits you before relying on it —
+`sbatch --test-only --reservation=NAME ...` reports access without creating a job, and
+an account you are not a member of fails the same way an inaccessible reservation does,
+so vary one at a time.
+
 ---
 
 ## After deployment
