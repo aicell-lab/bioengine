@@ -64,7 +64,8 @@ Code should explain *what* via good names; comments earn their place only when t
 | Path | Action |
 |---|---|
 | `bioengine/**`, `requirements*.txt`, `pyproject.toml`, `docker/**`, `.dockerignore` | **PR required.** These trigger `docker-publish-worker.yml` and `version-check.yml`. Never push directly to `main`. If the user asks you to, refuse and create a PR instead. |
-| `apps/**` | **Push direct to `main`** — no PR. Then re-upload via the running worker so the Hypha artifact tracks main. |
+| `apps/model-runner/**`, `apps/model-finetune/**` | **PR required** (backlog #0124). These two apps are published as Hypha artifacts and are gated by `app-version-check.yml`: on a non-draft PR, `version` in that app's `manifest.yaml` must be greater (PEP 440) than `origin/main`'s **and** must already exist in the published artifact's version list. So upload before you mark ready: open a draft PR, iterate on the live worker with `X.Y.Z-devN` pre-releases, upload the real `X.Y.Z`, then `gh pr ready`. |
+| `apps/**` (every other app) | **Push direct to `main`** — no PR. Then re-upload via the running worker so the Hypha artifact tracks main. An active GitHub ruleset actually forbids this and our PAT bypasses it silently (backlog #0112, still open for these paths). |
 | `docs/**`, `.github/**` (CI workflows), `.claude/skills/**`, `CLAUDE.md`, `README.md` | **Push direct to `main`** — no PR. |
 
 ## PR workflow (for paths above that require one)
