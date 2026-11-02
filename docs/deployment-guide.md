@@ -325,12 +325,16 @@ Monitor submitted jobs with `squeue -u $USER`.
 
 Some sites cancel jobs that hold a GPU without drawing power — a worker waiting for
 its first deployment looks exactly like a stalled job — and exempt jobs that run inside
-a reservation. Request one through `--further-slurm-args`; each entry becomes its own
-`#SBATCH` directive, so no separate flag is needed:
+a reservation. Request one through `--further-slurm-args`, which takes a single
+shell-style quoted string and turns each argument in it into its own `#SBATCH`
+directive, so no separate flag is needed:
 
 ```bash
---further-slurm-args --reservation=safe --account=my-project
+--further-slurm-args "--reservation=safe --account=my-project"
 ```
+
+The quotes are required: the flag takes one value, so a bare `--reservation=safe`
+after it is read as another flag and argparse exits with `expected one argument`.
 
 Leave it unset and no directive is emitted, which is the right default for sites that
 have no such policy. Confirm the reservation admits you before relying on it —
