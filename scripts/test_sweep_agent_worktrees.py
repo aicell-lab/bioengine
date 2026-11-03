@@ -11,6 +11,7 @@ gate is the *only* thing standing between a worktree and removal, and proves:
   * a branch holding work absent from origin/main is never deleted
   * a branch squash-landed under a different sha is still recognised as landed
   * a stale registration is pruned without taking its branch or its commits
+  * --summary prints the digest and invokes no transport at all
 
 Run it directly; it needs nothing but git and prints a line per assertion.
 
@@ -154,37 +155,29 @@ def verdicts(report):
     return out
 
 
-def notify(root, repo, watchers, fail_first, attempts, fallback=None):
-    """Run --notify against a `myco` whose first `fail_first` sends fail.
+def shimmed(root, repo, watchers, *extra, tag="shim"):
+    """Run the sweep against a `myco` that is a no-op recorder, not the real one.
 
-    Returns the finished process, how many times `session send` was called (so a
-    run that succeeded by retrying is distinguishable from one that succeeded
-    first time) and the fallback path, which must exist only when every attempt
-    missed. Pass `fallback` to point it somewhere unwritable.
+    Returns the finished process and every argv the shim was handed. The sweep
+    must not deliver anything itself (#0171), and the only way to show that is
+    to make a transport available and prove it was never reached.
     """
-    bindir = os.path.join(root, f"shim-{fail_first}-{attempts}")
+    bindir = os.path.join(root, tag)
     os.makedirs(bindir, exist_ok=True)
-    calls = os.path.join(bindir, "calls")
+    log = os.path.join(bindir, "argv")
     shim = os.path.join(bindir, "myco")
     write(shim, '#!/bin/sh\n'
-                'if [ "$1" = session ] && [ "$2" = send ]; then\n'
-                '  cat > /dev/null\n'
-                f'  n=$(cat "{calls}" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "{calls}"\n'
-                f'  [ "$n" -le {fail_first} ] && {{ echo "names no host" >&2; exit 1; }}\n'
-                'fi\n'
+                f'echo "$@" >> "{log}"\n'
                 'exit 0\n')
     os.chmod(shim, 0o755)
-    env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"],
-           "SWEEP_NOTIFY_ATTEMPTS": str(attempts), "SWEEP_NOTIFY_RETRY_SECONDS": "0"}
-    fb = fallback or os.path.join(bindir, "fallback.md")
+    env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"]}
     p = subprocess.run(
         [sys.executable, SWEEP, "--repo", repo, "--owned-within", "0",
-         "--watcher-root", watchers, "--notify", "no-such-session",
-         "--fallback-file", fb],
+         "--watcher-root", watchers, *extra],
         capture_output=True, text=True, env=env,
     )
-    n = int(open(calls).read().strip()) if os.path.exists(calls) else 0
-    return p, n, fb
+    calls = open(log).read().splitlines() if os.path.exists(log) else []
+    return p, calls
 
 
 def main():
@@ -220,32 +213,39 @@ def main():
             "agent-stale" in git(repo, "worktree", "list"),
         )
 
-        print("notify (a flaky lookup is retried; an unreachable one falls back to a file)")
-        p, calls, fb = notify(root, repo, watchers, fail_first=0, attempts=3)
-        check("a delivery that works is sent once", p.returncode == 0 and calls == 1,
-              f"exit {p.returncode}, {calls} call(s): {p.stderr.strip()}")
-        check("a delivery that works writes no fallback", not os.path.exists(fb), fb)
-        p, calls, fb = notify(root, repo, watchers, fail_first=2, attempts=3)
-        check("two transient misses are retried and the report still lands",
-              p.returncode == 0 and calls == 3, f"exit {p.returncode}, {calls} call(s)")
-        check("a retried delivery writes no fallback", not os.path.exists(fb), fb)
-        p, calls, fb = notify(root, repo, watchers, fail_first=2, attempts=1)
-        check("the same two misses fall back to the file on a single attempt",
-              p.returncode == 0 and calls == 1 and os.path.exists(fb),
-              f"exit {p.returncode}, {calls} call(s)")
-        p, calls, fb = notify(root, repo, watchers, fail_first=9, attempts=3)
-        check("a recipient that never answers preserves the report instead of failing",
-              p.returncode == 0 and calls == 3 and "after 3 attempts" in p.stderr,
-              f"exit {p.returncode}, {calls} call(s): {p.stderr.strip()}")
-        check("the preserved report is the summary, not an empty file",
-              os.path.exists(fb) and "worktrees against origin/main" in open(fb).read(), fb)
-        blocked = os.path.join(root, "blocked")  # a FILE where the fallback needs a directory
-        write(blocked, "not a directory\n")
-        p, calls, fb = notify(root, repo, watchers, fail_first=9, attempts=1,
-                              fallback=os.path.join(blocked, "r.md"))
-        check("an undeliverable report that cannot be saved either DOES fail the run",
-              p.returncode == 1 and "fallback write" in p.stderr,
-              f"exit {p.returncode}: {p.stderr.strip()}")
+        print("summary (the digest is data on stdout, and nothing is delivered)")
+        p, calls = shimmed(root, repo, watchers, "--summary", tag="shim-summary")
+        check("--summary exits 0 and prints the digest",
+              p.returncode == 0 and "worktrees against origin/main" in p.stdout,
+              f"exit {p.returncode}: {p.stdout.strip()[:200]} {p.stderr.strip()[:200]}")
+        check("--summary prints the compact form, not the long report",
+              "== WORKTREES DONE" not in p.stdout, p.stdout[:200])
+        check("--summary names the retirable worktrees it found",
+              "Removable with" in p.stdout, p.stdout[:200])
+        # The point of the row: a transport was on PATH and the sweep never used it.
+        check("--summary calls no transport at all",
+              not [c for c in calls if c.startswith("session send")],
+              f"myco was called with: {calls}")
+        check("--summary removes nothing",
+              all(os.path.isdir(x) for n, x in paths.items() if n != "agent-stale"))
+        # A control for the control: the same shim DOES record a send when one is made,
+        # so the empty result above is a measurement and not a shim that records nothing.
+        subprocess.run([os.path.join(root, "shim-summary", "myco"), "session", "send", "x"],
+                       capture_output=True)
+        logged = open(os.path.join(root, "shim-summary", "argv")).read()
+        check("the shim would have recorded a send if one had been made",
+              "session send x" in logged, f"recorded: {logged!r}")
+        p, _ = shimmed(root, repo, watchers, "--summary", "--apply", tag="shim-apply")
+        check("--summary --apply is refused, so a reporter can never remove",
+              p.returncode == 2 and "mutually exclusive" in p.stderr,
+              f"exit {p.returncode}: {p.stderr.strip()[:200]}")
+        p, _ = shimmed(root, repo, watchers, "--summary", "--json", tag="shim-json")
+        check("--summary --json is refused rather than silently picking one",
+              p.returncode == 2, f"exit {p.returncode}: {p.stderr.strip()[:200]}")
+        p, _ = shimmed(root, repo, watchers, "--notify", "no-such-session", tag="shim-notify")
+        check("the removed --notify fails loudly instead of claiming a delivery",
+              p.returncode == 2 and "--notify" in p.stderr,
+              f"exit {p.returncode}: {p.stderr.strip()[:200]}")
 
         print("apply (only the two that pass every gate should go)")
         sweep(repo, watchers, "--apply")

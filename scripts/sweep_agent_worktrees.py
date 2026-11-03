@@ -7,8 +7,8 @@ with the evidence for its verdict and left alone.
 
     scripts/sweep_agent_worktrees.py                 # report
     scripts/sweep_agent_worktrees.py --json          # machine-readable report
+    scripts/sweep_agent_worktrees.py --summary       # the compact digest, on stdout
     scripts/sweep_agent_worktrees.py --apply         # retire the DONE entries
-    scripts/sweep_agent_worktrees.py --notify <id>   # report into a session's chat
 
 The four gates, all of which must pass before anything is removed:
 
@@ -25,17 +25,24 @@ session only counts as retirable once its working directory is already gone.
 
 To run it on a schedule, arm a workflow that reads the script out of
 ``origin/main`` rather than off a working tree -- a checkout can sit a hundred
-commits behind, and a watcher must run the landed code. Say where the repo and
-the reporting session are; both are machine-local and neither belongs in here::
+commits behind, and a watcher must run the landed code. ``--summary`` gives the
+caller the digest as data; delivering it is the caller's job, and the repo and
+the delivery route are both machine-local and belong in the caller, not here::
 
     myco workflow add worktree-sweep-report --on schedule --cron '37 7 * * *' \\
       --run 'set -e; r=<your checkout>; d="$HOME/.cache/bioengine-sweep";
              mkdir -p "$d"; git -C "$r" fetch -q origin;
              git -C "$r" show origin/main:scripts/sweep_agent_worktrees.py > "$d/sweep.py";
-             timeout 900 python3 "$d/sweep.py" --repo "$r" --notify <your session id>'
+             timeout 900 python3 "$d/sweep.py" --repo "$r" --summary > "$d/report.txt";
+             <your delivery> < "$d/report.txt"'
 
---notify is required for a scheduled run: a workflow step's stdout reaches
-nobody, so a tick that only printed would report nothing and still look green.
+This script deliberately has no transport of its own. It used to deliver with
+``myco session send`` and report success on exit status 0, which it gets for a
+recipient that provably does not exist and for a send the server rejected
+outright -- so the delivery claim was unfalsifiable and the retry and
+report-preserving branches behind it were unreachable (#0169, #0171). A caller
+that can confirm its own delivery, or that files into something durable, is the
+only place the claim can honestly be made.
 """
 
 import argparse
@@ -78,25 +85,9 @@ GATE_WORKERS = int(os.environ.get("SWEEP_GATE_WORKERS", "8"))
 # caches. So the loop is bounded as well as faster: rows not reached by the
 # deadline are reported UNKNOWN, never DONE, and the report still goes out. A
 # killed step delivers nothing at all, which is the worse failure (#0156). The
-# budget also covers the caller's fetch and the notify send, hence the headroom.
+# budget also covers the caller's fetch and its delivery, hence the headroom.
 GATE_DEADLINE = float(os.environ.get("SWEEP_GATE_DEADLINE", "75"))
 STARTED = time.monotonic()
-
-# The registry lookup behind `myco session send` is flaky per-process: a session
-# that resolves one minute answers "names no host" the next, so one miss is not
-# evidence the recipient is gone. Retries do not cover every case, though. A
-# recipient resolves only inside its own MYCOLAB_WORKSPACE, and the errors for
-# the wrong workspace never mention one — they blame a lost daemon index or a
-# legacy session plane, and they are permanent, so retrying cannot clear them
-# (measured: six sends 15s apart, two wrong workspaces, 6/6 identical failures;
-# the same recipient answered first try once correctly scoped).
-# Either way the recipient being unreachable is a plumbing fault, not a sweep
-# finding, so the report goes to the fallback file and the run still succeeds.
-# Only a real gate failure, or losing the report entirely, may fail the run.
-NOTIFY_ATTEMPTS = int(os.environ.get("SWEEP_NOTIFY_ATTEMPTS", "3"))
-NOTIFY_RETRY_SECONDS = float(os.environ.get("SWEEP_NOTIFY_RETRY_SECONDS", "20"))
-NOTIFY_FALLBACK_DEFAULT = os.path.join(
-    os.path.expanduser("~"), ".cache", "bioengine-worktree-sweep", "last-report.md")
 
 
 def run(cmd, cwd=None, check=False):
@@ -535,7 +526,7 @@ def render(rows, srows, baseline, counted):
 
 
 def summarise(rows, srows, baseline):
-    """The compact form the recurring reporter sends into a session's chat."""
+    """The compact form a recurring reporter delivers, printed by --summary."""
     done = [r for r in rows if r["verdict"] == "DONE"]
     stale = [r for r in rows if r["verdict"] == "STALE"]
     nd = [r for r in rows if r["verdict"] == "NOT-DONE"]
@@ -627,12 +618,11 @@ def main():
                     help="main checkout that owns the worktrees (default: $BIOENGINE_REPO, "
                          "else the checkout containing the current directory)")
     ap.add_argument("--apply", action="store_true", help="remove the entries that pass all four gates")
-    ap.add_argument("--json", action="store_true", help="emit the full report as JSON")
-    ap.add_argument("--notify", metavar="SESSION_ID",
-                    help="send the summary to a session with `myco session send`; never removes anything")
-    ap.add_argument("--fallback-file", metavar="PATH", default=NOTIFY_FALLBACK_DEFAULT,
-                    help="where --notify writes the report when delivery fails "
-                         f"(default: {NOTIFY_FALLBACK_DEFAULT})")
+    form = ap.add_mutually_exclusive_group()
+    form.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    form.add_argument("--summary", action="store_true",
+                      help="print the compact digest on stdout and deliver nothing; "
+                           "for a scheduled caller that routes the report itself")
     # The two knobs below exist so the gates can be exercised on a scratch repo
     # (scripts/test_sweep_agent_worktrees.py). Lowering --owned-within weakens
     # gate 3; narrowing --watcher-root weakens gate 4.
@@ -642,40 +632,16 @@ def main():
                     help="search only these directories for watchers instead of discovering them")
     args = ap.parse_args()
 
-    if args.apply and args.notify:
-        ap.error("--apply and --notify are mutually exclusive: the recurring reporter never removes anything")
+    if args.apply and args.summary:
+        ap.error("--apply and --summary are mutually exclusive: the recurring reporter never removes anything")
     if not args.repo:
         ap.error("no checkout to sweep: pass --repo, set $BIOENGINE_REPO, or run from inside one")
 
     baseline = fetch_baseline(args.repo)
     rows, srows, counted = evaluate(args.repo, baseline, args.owned_within, args.watcher_root)
 
-    if args.notify:
-        body = summarise(rows, srows, baseline)
-        cmd = ["myco", "session", "send", args.notify, "--subject",
-               "Worktree sweep: %d of %d retirable"
-               % (sum(1 for r in rows if r["verdict"] in ("DONE", "STALE")), len(rows)),
-               "--body-file", "-"]
-        for attempt in range(1, NOTIFY_ATTEMPTS + 1):
-            p = subprocess.run(cmd, input=body, text=True, capture_output=True)
-            if p.returncode == 0:
-                print(f"delivered to {args.notify}: {len(body)} bytes (attempt {attempt})")
-                return 0
-            print(f"delivery to {args.notify} failed (attempt {attempt}/{NOTIFY_ATTEMPTS}): "
-                  f"{p.stderr.strip()}", file=sys.stderr)
-            if attempt < NOTIFY_ATTEMPTS:
-                time.sleep(NOTIFY_RETRY_SECONDS)
-        try:
-            os.makedirs(os.path.dirname(args.fallback_file) or ".", exist_ok=True)
-            with open(args.fallback_file, "w") as fh:
-                fh.write(body)
-        except OSError as exc:
-            print(f"FAILED to deliver the report to {args.notify} after {NOTIFY_ATTEMPTS} "
-                  f"attempts, and the fallback write to {args.fallback_file} failed: {exc}",
-                  file=sys.stderr)
-            return 1
-        print(f"undelivered to {args.notify} after {NOTIFY_ATTEMPTS} attempts; "
-              f"report written to {args.fallback_file} ({len(body)} bytes)", file=sys.stderr)
+    if args.summary:
+        print(summarise(rows, srows, baseline))
         return 0
 
     if args.json:
