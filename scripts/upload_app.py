@@ -68,14 +68,6 @@ async def upload_app(
             directory_path=directory,
         )
         logger.info(f"Created file list with {len(files)} files")
-        # Remove any files originating from __pycache__ directories
-        pycache_files = [f for f in files if "__pycache__" in f.get("name", "")]
-        if pycache_files:
-            original_count = len(files)
-            files = [f for f in files if f not in pycache_files]
-            logger.info(
-                f"Removed {len(pycache_files)} __pycache__ files; {original_count - len(pycache_files)} files remain"
-            )
     except Exception as e:
         logger.error(f"Failed to create file list from directory: {e}")
         raise
