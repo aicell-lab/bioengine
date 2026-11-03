@@ -1,9 +1,18 @@
-transformers==4.51.3
+# Qwen3-VL needs transformers >= 4.57; 4.57.x still serves Qwen2.5-VL, so one
+# pin covers every backend in models.py. 5.x is a deliberate no: it moves the
+# from_pretrained dtype keyword this app passes.
+transformers==4.57.6
 accelerate==1.6.0
-torch==2.5.1
-torchvision==0.20.1
-# NF4 kernels for the 7B; 0.45.x is the last line built against torch 2.5.
-bitsandbytes==0.45.5
+# torch 2.5.1 (cu124) built kernels up to sm_90 only, so every CUDA op failed
+# on Blackwell (sm_120). No local version suffix here on purpose: the pin is
+# satisfied by a +cu128 build already in the worker image, so Ray's venv
+# inherits it and skips a multi-GB install, while a cluster without one gets
+# the PyPI cu126 wheel, which covers Ampere.
+torch==2.7.1
+torchvision==0.22.1
+# NF4 kernels. 0.45.5 predates torch 2.7; 0.48.x calls getpass.getuser() at
+# import, which raises when the replica's uid has no passwd entry.
+bitsandbytes==0.47.0
 # numpy 1.26 keeps ABI in sync with the host Ray pod's pandas.
 numpy==1.26.4
 pillow==10.4.0

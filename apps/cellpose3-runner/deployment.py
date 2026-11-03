@@ -72,7 +72,7 @@ def _read_pip(name: str) -> List[str]:
         "min_replicas": 1,
         "initial_replicas": 1,
         "max_replicas": 2,
-        "target_num_ongoing_requests_per_replica": 3.0,
+        "target_ongoing_requests": 3.0,
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
         "downscale_delay_s": 600,
