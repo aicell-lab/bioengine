@@ -1,0 +1,17 @@
+name: Slack Notifier
+id: slack-notify
+id_emoji: '💬'
+covers: []
+description: Sends Slack direct messages, so BioEngine apps and agent sessions can page a person.
+documentation: README.md
+authors:
+- {affiliation: KTH, github_user: nilsmechtel, name: Nils Mechtel}
+maintainers: [nilsmechtel]
+license: MIT
+format_version: 0.6.0
+git_repo: https://github.com/aicell-lab/bioengine
+links: []
+tags: [bioengine, notification, slack]
+type: ray-serve
+version: 0.1.0
+entry: deployment:SlackNotifier

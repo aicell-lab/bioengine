@@ -20,7 +20,8 @@ unit-testable and free of transport concerns.
 
 import hashlib
 import json
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
 # record and every read method so the page can flag a backend/page mismatch
@@ -28,6 +29,9 @@ from typing import Any, Dict, List, Optional
 SCHEMA_VERSION = "0.13.0-draft"
 
 POOL_INDEX = "pool_index.json"
+# Resume journal for aggregate(): scores already paid for, so a killed merge
+# restarts from where it died instead of from nothing. See usable_merge_journal.
+MERGE_JOURNAL = "merge_journal.json"
 WEIGHTS_NAME = "weights.pt"
 METADATA_NAME = "metadata.json"
 MANIFEST_NAME = "manifest.json"
@@ -40,13 +44,19 @@ MANIFEST_NAME = "manifest.json"
 # pooled per-site average.
 METRIC_NAME = "mean instance F1 at IoU 0.5"
 _HOLDOUT = "campaign_holdout"
+# A basis string is published provenance, so it may only state what this app can
+# check. Split A and B arrive as caller-supplied arrays; their disjointness is a
+# precondition of aggregate(), never something verified here. Name the corpus by the
+# gate_split/witness_split hash on the same record and attribute the rest.
 SELECTION_BASIS = (
-    "the score the greedy gate admitted contributions against, on split A, a public "
-    "benchmark disjoint from every contributor's training data"
+    "the score the greedy gate admitted contributions against, on split A, the corpus "
+    "recorded as gate_split on this record and declared by the coordinator disjoint "
+    "from every contributor's training data"
 )
 WITNESS_BASIS = (
-    "scored on the disjoint witness split B, held back from the selection split and "
-    "from every contributor, the only number the improvement curve plots"
+    "scored on split B, the corpus recorded as witness_split on this record and declared "
+    "by the coordinator held back from split A and from every contributor, the only "
+    "number the improvement curve plots"
 )
 EMPTY_SELECTION_BASIS = (
     "the score the greedy gate required a contribution to beat on split A, which none "
@@ -140,11 +150,54 @@ def architecture_signature(state_dict: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def state_dict_digest(state_dict: Dict[str, Any]) -> str:
+    """sha256 over a state_dict's keys, shapes, dtypes and raw weight bytes.
+
+    Digests the TENSORS rather than a file ``torch.save`` wrote: torch's zip
+    container embeds the target file's stem in every record name, so hashing the
+    saved bytes makes the digest a function of the filename and two merges of
+    identical members can never agree. This is reproducible by construction and
+    independent of the container format.
+    """
+    h = hashlib.sha256()
+    for name in sorted(state_dict):
+        t = state_dict[name]
+        h.update(f"{name}|{tuple(t.shape)}|{t.dtype}|".encode("utf-8"))
+        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+# Entries that live in a cpsam state_dict but are data statistics rather than
+# learned weights: cellpose_model.py:78-79 registers both as
+# nn.Parameter(requires_grad=False), so they are float32 scalars with matching
+# shapes and pass every dtype/shape filter. requires_grad is not serialised, so
+# a state_dict carries no way to tell them apart — the name is the only handle,
+# and it must come from the key (storage keys inside a .pt are bare positional
+# integers and position is not stable across writers).
+NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
+
+
+def is_non_weight_param(key: str) -> bool:
+    """True for a state_dict key holding a data statistic, not a learned weight.
+
+    Matches on the final dot-component because the same checkpoint reaches us
+    both bare and module-prefixed depending on how it was wrapped when saved.
+    """
+    return key.rsplit(".", 1)[-1] in NON_WEIGHT_PARAMS
+
+
 def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> float:
-    """L2 distance between two state_dicts over shared floating-point params — how
-    far a contribution's weights moved from the checkpoint it started from. A drift
-    proxy recorded on every contribution; its use as an acceptance BOUND is a
-    pending aggregation decision, so this only measures, it does not gate."""
+    """L2 distance between two state_dicts over shared learned weights — how far a
+    contribution's weights moved from the checkpoint it started from. A drift proxy
+    recorded on every contribution; its use as an acceptance BOUND is a pending
+    aggregation decision, so this only measures, it does not gate.
+
+    Non-weight entries are excluded: a site's median object diameter differs from
+    the base's by tens of pixels while real weight motion is single digits, so
+    including it made this field ~99.5% diameter metadata and inverted the
+    per-site ordering it implies (it reported one site as having moved 17x
+    further than another where the weights say 1.3x).
+    """
     import torch
 
     total = 0.0
@@ -152,12 +205,215 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
         ref = base.get(key)
         if ref is None or not torch.is_floating_point(cur) or cur.shape != ref.shape:
             continue
+        if is_non_weight_param(key):
+            continue
         total += float(torch.sum((cur.detach().float() - ref.detach().float()) ** 2).item())
     return total ** 0.5
 
 
-def uniform_soup(state_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
+# Resident set of a merge, as a multiple of ONE member's on-disk size. uniform_soup
+# holds a float32 accumulator for the whole model plus the single member being added;
+# on a member's FIRST use _fetch_member also holds the downloaded bytes while
+# torch.load materialises them from the same file. Three member-equivalents on first
+# use, two on every later one.
+#
+# bench_soup_memory.py is the re-runnable gate for the flatness this relies on. At a
+# real cpsam member size (348 keys, float32, 1.1348 GiB) it holds: `--mode after
+# --member-mb 1162` is 2.68 GiB at every n in 2/4/8/16, growth +0.00x, and `--mode
+# before` is +13.98x over the same sweep, so the flat rows are a property of the
+# combine and not of the rig.
+#
+# What picks the factor is a different denominator, because the formula adds to a LIVE
+# base_bytes: growth above the process baseline, which is 2.00x a member warm and
+# 3.00x on a member's first use. So 3 is the cold peak exactly, not slack — lowering
+# it under-predicts first use, which is the common case for a newly contributed
+# member. (The cold path is the one thing the bench does not cover; measured
+# separately on the same members, flat in n to 0.6 MiB.)
+SOUP_RESIDENT_FACTOR = 3
+
+
+def soup_admission(
+    member_bytes: Sequence[Optional[int]], budget_bytes: int, base_bytes: int,
+) -> Optional[str]:
+    """Reject a merge that cannot fit before it burns any GPU, or None to proceed.
+
+    Returns the reason as a string so the caller owns the exception type.
+
+    Peak no longer depends on member count — the combine streams and the member
+    cache is bounded — so this sizes the ONE member that has to be resident, not the
+    soup. Fails OPEN: a pool that has not recorded n_bytes for its contributions
+    tells us nothing about the peak, and refusing to merge on missing metadata would
+    be a worse failure than the one this guards against.
+    """
+    known = [int(n) for n in member_bytes if n is not None]
+    if not known:
+        return None
+    predicted = base_bytes + SOUP_RESIDENT_FACTOR * max(known)
+    if predicted <= budget_bytes:
+        return None
+    return (
+        f"this merge needs about {predicted / 1024 ** 3:.1f} GiB resident "
+        f"({base_bytes / 1024 ** 3:.1f} GiB base + {SOUP_RESIDENT_FACTOR}x the "
+        f"largest member at {max(known) / 1024 ** 3:.1f} GiB) but the cpsam runtime "
+        f"declares {budget_bytes / 1024 ** 3:.1f} GiB to Ray. Raise memory_mb on "
+        f"CellposeRuntime to at least {predicted / 1024 ** 2:.0f} MiB and redeploy. "
+        f"Refusing up front: exceeding the declaration gets the replica OOM-killed "
+        f"mid-merge, which costs the whole run's GPU time instead of none of it."
+    )
+
+
+def split_provenance_error(
+    gate_split: Dict[str, Any], witness_split: Dict[str, Any],
+) -> Optional[str]:
+    """Reject split provenance that cannot safely identify a split, or None to proceed.
+
+    aggregate() is an RPC entry point and its ``gate_split``/``witness_split`` are
+    ``Dict[str, Any] = Field(...)``: the dict is required, its CONTENTS are not. A
+    caller that omits ``sha256`` gets the identity ``"<artifact_id>@None"`` for BOTH
+    splits, and two things go wrong silently:
+
+    * entry.py maps identity -> images. One identity means one entry, the witness
+      overwrites the gate, and every selection score is then computed on the witness
+      split — the circularity the two-split design exists to prevent.
+    * a journal written for a different split that also lacked ``sha256`` compares
+      equal on all four stamps and is judged usable, so scores measured on other
+      validation data decide which members are admitted.
+
+    Neither raises on its own, so this is checked once at the boundary rather than
+    defended at each call site.
+    """
+    for name, split in (("gate_split", gate_split), ("witness_split", witness_split)):
+        if not isinstance(split, dict):
+            return f"{name} must be a dict of {{artifact_id, sha256}}, got {type(split).__name__}."
+        for field in ("artifact_id", "sha256"):
+            if not str(split.get(field) or "").strip():
+                return (
+                    f"{name} is missing '{field}'. Both splits need "
+                    f"{{artifact_id, sha256}} provenance: it is what identifies a "
+                    f"split, and without it the gate and witness splits collapse to "
+                    f"one identity and selection silently reads the witness data."
+                )
+    if split_identity(gate_split) == split_identity(witness_split):
+        return (
+            f"gate_split and witness_split both resolve to "
+            f"'{split_identity(gate_split)}'. Selection reads split A and the "
+            f"reported curve is split B; scoring both on one split makes the "
+            f"witness curve circular."
+        )
+    return None
+
+
+def split_identity(split: Dict[str, Any]) -> str:
+    """Stable id for a validation split, from the provenance every merge already
+    records. Two splits with the same sha256 score identically, so a score may be
+    reused across merges; two with different sha256 may not."""
+    return f"{split.get('artifact_id')}@{split.get('sha256')}"
+
+
+def score_key(split_id: str, member_paths: Sequence[str]) -> str:
+    """Identity of one scoring pass: which soup, on which split.
+
+    Sorted, because a soup is a uniform MEAN and so is defined by the SET of its
+    members — ``[a, b]`` and ``[b, a]`` are the same checkpoint and must not be
+    scored twice. That is also what lets the greedy admission pass reuse the
+    best-first ordering pass's score for the candidate it ends up taking first.
+    """
+    canonical = "\x1f".join([split_id, *sorted(member_paths)])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def new_merge_journal(gate_split, witness_split, diam_mean: float) -> Dict[str, Any]:
+    """An empty resume journal stamped with everything a recorded score depends on."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "gate_split": split_identity(gate_split),
+        "witness_split": split_identity(witness_split),
+        "diam_mean": float(diam_mean),
+        "scores": {},
+    }
+
+
+def usable_merge_journal(
+    journal: Optional[Dict[str, Any]], gate_split, witness_split, diam_mean: float,
+) -> Dict[str, Any]:
+    """Return ``journal`` if every score in it is still valid for this merge's
+    inputs, else a fresh empty one.
+
+    A recorded score is ``mean_instance_f1`` of a soup on a split, so it stays true
+    only while the splits and the segmentation diameter are the ones it was measured
+    with. Those are stamped on the journal and compared here; a mismatch discards
+    the whole file rather than trying to salvage entries, because the stamp is
+    per-journal. ``schema_version`` is included so a draft bump that changes the
+    metric also invalidates it — anything else that changes what a score MEANS,
+    without moving one of these four, would have to invalidate it by hand.
+    """
+    fresh = new_merge_journal(gate_split, witness_split, diam_mean)
+    if not isinstance(journal, dict) or not isinstance(journal.get("scores"), dict):
+        return fresh
+    if any(journal.get(field) != fresh[field]
+           for field in ("schema_version", "gate_split", "witness_split", "diam_mean")):
+        return fresh
+    return journal
+
+
+def record_score(journal: Dict[str, Any], key: str, value: float, cap: int = 512) -> None:
+    """Add a score, evicting oldest-first so the journal cannot grow without bound.
+
+    One merge records at most ``2 * max_batch + 3`` scores (67 at the default
+    max_batch of 32), so the cap holds several merges' worth — enough for deferred
+    candidates, which aggregate() re-scores on the next merge, to come back free.
+    """
+    journal["scores"][key] = round(float(value), 6)
+    while len(journal["scores"]) > cap:
+        del journal["scores"][next(iter(journal["scores"]))]
+
+
+def evict_lru_to_cap(
+    directory: Path, pattern: str, cap_bytes: int, incoming_bytes: int = 0,
+) -> int:
+    """Delete least-recently-modified files matching ``pattern`` until the directory
+    holds at most ``cap_bytes``, counting ``incoming_bytes`` as already present.
+
+    Returns the number of files deleted. Callers treat a cache miss as a re-fetch,
+    so losing a file is a cost and never an error; a file that vanishes underneath
+    (a concurrent replica sharing the directory) is skipped rather than raised on.
+    """
+    entries = []
+    for path in directory.glob(pattern):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append((stat.st_mtime, stat.st_size, path))
+
+    total = sum(size for _, size, _ in entries) + incoming_bytes
+    deleted = 0
+    for _, size, path in sorted(entries, key=lambda e: e[0]):
+        if total <= cap_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        deleted += 1
+    return deleted
+
+
+def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, Any]:
     """Key-wise uniform mean of full weight tensors — the AXIS-1 combine rule.
+
+    Takes one zero-arg loader per member rather than materialised state dicts, and
+    accumulates member-by-member, so peak memory is the running sum plus a single
+    member regardless of member count. Taking a list and looping key-outer instead
+    pins every member in RAM at once: at 16 cpsam members that measured ~27 GB
+    against the runtime's 12 GiB reservation and the replica was OOM-killed.
+
+    Still averages ``NON_WEIGHT_PARAMS``, which is wrong and deliberately left:
+    what a community checkpoint should carry for an object diameter instead of a
+    mean is a product decision, and "stop averaging it" has no defined output
+    until that is answered (#0070 requirement 3). Only the contributor-facing
+    ``state_dict_l2_from_base`` is fixed so far.
 
     Every member must share one parameter layout (``assert_compatible`` guards this
     at contribute + aggregate time), so the mean is well-defined per key. cpsam is
@@ -167,18 +423,27 @@ def uniform_soup(state_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
     dtype so the community checkpoint round-trips into cellpose unchanged."""
     import torch
 
-    if not state_dicts:
+    n = len(loaders)
+    if not n:
         raise ValueError("uniform_soup requires at least one state_dict")
-    keys = list(state_dicts[0].keys())
-    out: Dict[str, Any] = {}
-    n = len(state_dicts)
-    for key in keys:
-        ref = state_dicts[0][key]
-        acc = torch.zeros_like(ref, dtype=torch.float32)
-        for sd in state_dicts:
-            acc += sd[key].detach().float()
-        out[key] = (acc / n).to(ref.dtype)
-    return out
+    acc: Dict[str, Any] = {}
+    dtypes: Dict[str, Any] = {}
+    for index, load in enumerate(loaders):
+        sd = load()
+        if not sd:
+            raise ValueError(
+                f"uniform_soup member {index} loaded an empty state_dict"
+            )
+        if not index:
+            dtypes = {key: value.dtype for key, value in sd.items()}
+            acc = {key: torch.zeros_like(value, dtype=torch.float32)
+                   for key, value in sd.items()}
+        for key in acc:
+            acc[key] += sd[key].detach().float()
+        del sd
+    for key in acc:
+        acc[key] = (acc[key] / n).to(dtypes[key])
+    return acc
 
 
 # ── instance-segmentation metric (the gate + witness score) ──────────────────
@@ -293,6 +558,7 @@ def build_contribution_metadata(
     *,
     contribution_id: str,
     model_type: str,
+    app_version: Optional[str],
     cellpose_version: str,
     architecture_signature: str,
     base_checkpoint_id: str,
@@ -308,11 +574,18 @@ def build_contribution_metadata(
     """A contribution's metadata.json. ``samples_seen`` and ``l2_from_base`` are
     recorded on every contribution but only become load-bearing under specific
     aggregation families (sample-weighting, drift bound) — recording them now
-    keeps the pool auditable regardless of which family Nils picks."""
+    keeps the pool auditable regardless of which family Nils picks.
+
+    ``app_version`` is written unconditionally, null included: a field that is
+    absent when unknown cannot be told apart from one written before versions
+    were stamped at all, which is the ambiguity it exists to remove.
+    ``schema_version`` does not cover it — 0.27.6 moved every ``l2_from_base``
+    value without changing the record's shape."""
     return {
         "schema_version": SCHEMA_VERSION,
         "contribution_id": contribution_id,
         "model_type": model_type,
+        "app_version": app_version,
         "cellpose_version": cellpose_version,
         "architecture_signature": architecture_signature,
         "base_checkpoint_id": base_checkpoint_id,
@@ -352,7 +625,8 @@ def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
 def append_merge(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append one merge event to the timeline. ``entry`` carries
     ``{published_version|None, baseline_version, members[{contribution_id,
-    gate_score, included}], selection_metric (RoundMetric role=selection),
+    marginal_score, gate_score, included}] (admission-ordered, see
+    ``community_manifest``), selection_metric (RoundMetric role=selection),
     witness_metric (RoundMetric role=witness, or None when nothing was admitted),
     global_sha256|None, transport, deferred[], created_at}``. A merge with
     ``published_version=None`` admitted nothing and projects to an empty_merge
@@ -415,11 +689,17 @@ def build_community_manifest(
     is the only number the improvement curve plots — reporting the selection metric
     as the curve would be circular. Both are role-tagged RoundMetric records, so the
     role is a property of the stored artifact, not an assignment the page makes.
-    ``members`` records every candidate weighed as ``{contribution_id, gate_score,
-    included}`` for internal audit (a rejected candidate reads "evaluated, not
-    included", never a failure); the per-member gate_score is audit-only and is
-    stripped from the wire projection. ``combine`` is "uniform" unless sample-
-    weighting was empirically justified for this version."""
+    ``members`` records every candidate weighed as ``{contribution_id,
+    marginal_score, gate_score, included}`` for internal audit (a rejected candidate
+    reads "evaluated, not included", never a failure), **in the order the gate
+    weighed them** — the admitted subsequence is the order ``uniform_soup``
+    accumulated in, and float addition is not associative, so reordering this list
+    loses the only record of which checkpoint was published. ``marginal_score`` is
+    what that ordering was sorted on (the candidate's score against the head as it
+    stood); ``gate_score`` is the cumulative score of the soup including it, so the
+    two are not interconvertible. Both are audit-only and stripped from the wire
+    projection. ``combine`` is "uniform" unless sample-weighting was empirically
+    justified for this version."""
     return {
         "schema_version": SCHEMA_VERSION,
         "community_version": community_version,
@@ -487,7 +767,7 @@ def assert_compatible(index: Dict[str, Any], *, model_type: str, signature: str)
 # The backend stores pool_index.json in its own shape; the campaign page reads the
 # subset below. This projection is where the page's data model is produced: it
 # partitions the merge timeline into published soups and empty merges, strips the
-# audit-only per-member gate_score (a per-candidate score in the wire payload is a
+# audit-only per-member scores (a per-candidate score in the wire payload is a
 # contract violation — assessed is IDs only), and surfaces the role-tagged metrics
 # straight from storage. Pure and torch-free so the contract is unit-testable.
 
