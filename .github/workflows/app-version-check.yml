@@ -1,0 +1,55 @@
+name: Enforce App Version Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_branch:
+        description: 'Branch to check'
+        required: true
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  check-app-version:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code (pull_request)
+      if: github.event_name == 'pull_request'
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for accurate origin/main reference
+
+    - name: Checkout code (workflow_dispatch)
+      if: github.event_name == 'workflow_dispatch'
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.pr_branch }}
+        fetch-depth: 0  # Fetch full history for accurate origin/main reference
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install --quiet packaging pyyaml
+
+    - name: Check app manifest versions
+      run: |
+        git fetch origin main --quiet
+
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+        else
+          BASE_SHA="origin/main"
+          HEAD_SHA="HEAD"
+        fi
+
+        python3 .github/scripts/check_app_artifact_version.py \
+          --base-ref "$BASE_SHA" \
+          --head-ref "$HEAD_SHA" \
+          --main-ref origin/main
