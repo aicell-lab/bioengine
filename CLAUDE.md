@@ -79,7 +79,7 @@ Code should explain *what* via good names; comments earn their place only when t
    - Push, then `gh pr ready <number>`.
 4. `version-check.yml` listens for `ready_for_review`, so marking a draft PR ready fires the required status check without any manual re-trigger.
 5. **Always open the PR immediately after pushing the branch** using the GitHub PAT from `.env` so the user can see and review it without navigating to GitHub manually.
-6. **Never merge a PR** — that is always left to the user.
+6. **Never merge your own PR.** A pull request is merged only after an **independent** agent has reviewed it and approved — never by the agent that wrote the code, and never on one agent's own judgement. The reviewer re-runs the evidence rather than reading it, and a review that cannot name what would have made the result RED is a refusal. Who plays which part is deployment-specific and is not recorded in this file: it is set by whatever agent team owns the checkout. If no such reviewer exists where you are, the merge is the user's.
 
 For deployment-side PRs (changes under `bioengine/**`, `bioengine/cluster/**`, `bioengine/_app/**`, `bioengine/apps/builder.py`, runtime_env transport, Ray client/server plumbing) the **dev image testing workflow** in `.claude/skills/bioengine-maintainer/SKILL.md` applies: build `<next-version>-devN`, validate on a live cluster, only then mark the PR ready.
 
