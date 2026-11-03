@@ -340,6 +340,33 @@ def test_a_free_container_name_starts_the_worker(monkeypatch, tmp_path):
     assert started and started[0][0][:3] == ["docker", "run", "--rm"]
 
 
+def test_a_directory_option_that_cannot_be_created_names_the_option(monkeypatch, tmp_path):
+    # An operator with a typo in a path got an uncaught OSError traceback, which
+    # says what the OS refused but never which option carried the bad path.
+    started = _fake_runtime(monkeypatch, "")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+
+    result = _run(
+        [
+            "start",
+            "--runtime",
+            "docker",
+            "--workspace-dir",
+            str(blocker / "ws"),
+            "--",
+            "--mode",
+            "single-machine",
+        ]
+    )
+
+    assert not isinstance(result.exception, OSError), result.exception
+    assert result.exit_code == 1
+    assert "--workspace-dir" in result.output
+    assert str(blocker / "ws") in result.output
+    assert started == []
+
+
 # ── The token reaches the container, however it was supplied ──────────────────
 #
 # Asserting on build_command or _subprocess_env alone passes on either side of

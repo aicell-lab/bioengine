@@ -229,6 +229,18 @@ def _resolve_runtime(runtime: str, require_available: bool = True) -> str:
     return detected
 
 
+def _create_option_dir(path: Path, option: str) -> None:
+    """Create a directory named by a CLI option, reporting which one on failure."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        error_exit(
+            f"{option} {path} could not be created: "
+            f"{exc.strerror or exc.__class__.__name__}.",
+            "Point it at a path this user can create, or create it beforehand.",
+        )
+
+
 @click.group("worker")
 def worker_group():
     """Start, stop and follow a BioEngine worker container."""
@@ -326,7 +338,7 @@ def worker_start(
 
     workspace_dir = workspace_dir.expanduser()
     if runtime != "native" and not dry_run:
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        _create_option_dir(workspace_dir, "--workspace-dir")
 
     command = build_command(
         runtime=runtime,
