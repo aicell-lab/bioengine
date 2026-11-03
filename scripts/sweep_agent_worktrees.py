@@ -7,8 +7,8 @@ with the evidence for its verdict and left alone.
 
     scripts/sweep_agent_worktrees.py                 # report
     scripts/sweep_agent_worktrees.py --json          # machine-readable report
+    scripts/sweep_agent_worktrees.py --summary       # the compact digest, on stdout
     scripts/sweep_agent_worktrees.py --apply         # retire the DONE entries
-    scripts/sweep_agent_worktrees.py --notify <id>   # report into a session's chat
 
 The four gates, all of which must pass before anything is removed:
 
@@ -18,25 +18,35 @@ The four gates, all of which must pass before anything is removed:
   4. no watcher script, workflow or crontab entry names it
 
 A run that removes nothing because every gate failed is a pass, not a failure.
+A row reported UNKNOWN is one the run did not reach before SWEEP_GATE_DEADLINE:
+it is not cleared and never removable, and the report says how many there were.
 Idle is not done: a hibernating session may be blocked on a human answer, so a
 session only counts as retirable once its working directory is already gone.
 
 To run it on a schedule, arm a workflow that reads the script out of
 ``origin/main`` rather than off a working tree -- a checkout can sit a hundred
-commits behind, and a watcher must run the landed code. Say where the repo and
-the reporting session are; both are machine-local and neither belongs in here::
+commits behind, and a watcher must run the landed code. ``--summary`` gives the
+caller the digest as data; delivering it is the caller's job, and the repo and
+the delivery route are both machine-local and belong in the caller, not here::
 
     myco workflow add worktree-sweep-report --on schedule --cron '37 7 * * *' \\
       --run 'set -e; r=<your checkout>; d="$HOME/.cache/bioengine-sweep";
              mkdir -p "$d"; git -C "$r" fetch -q origin;
              git -C "$r" show origin/main:scripts/sweep_agent_worktrees.py > "$d/sweep.py";
-             timeout 900 python3 "$d/sweep.py" --repo "$r" --notify <your session id>'
+             timeout 900 python3 "$d/sweep.py" --repo "$r" --summary > "$d/report.txt";
+             <your delivery> < "$d/report.txt"'
 
---notify is required for a scheduled run: a workflow step's stdout reaches
-nobody, so a tick that only printed would report nothing and still look green.
+This script deliberately has no transport of its own. It used to deliver with
+``myco session send`` and report success on exit status 0, which it gets for a
+recipient that provably does not exist and for a send the server rejected
+outright -- so the delivery claim was unfalsifiable and the retry and
+report-preserving branches behind it were unreachable (#0169, #0171). A caller
+that can confirm its own delivery, or that files into something durable, is the
+only place the claim can honestly be made.
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -57,6 +67,34 @@ SWEEP_WATCHER_ROOTS_ENV = "SWEEP_WATCHER_ROOTS"
 SCRIPT_REF = re.compile(r"(/[\w./@+-]+\.(?:sh|py|js|ts))")
 MAX_WATCHER_FILE_BYTES = 2 * 1024 * 1024
 OWNED_IF_TOUCHED_WITHIN = 24 * 3600
+
+# Directory names that hold records of what HAS run — the escalation sink's
+# evidence bundles and latches, and the workflow runner's own logs — rather than
+# definitions of what is scheduled. They sit beside the watchers inside the same
+# roots, and they quote the whole report, so leaving them in the corpus makes one
+# tick's alert fail gate 4 for every worktree the next tick looks at.
+GENERATED_RECORD_DIRS = {".runs", "bundles", ".escalations"}
+
+# A worktree's four gates are independent of every other worktree's and spend
+# nearly all their time blocked in fork/wait -- 565 subprocess calls, 9.0s of a
+# 14.7s run inside select.poll -- so they are evaluated concurrently: 11.1s ->
+# 6.2s over 116 worktrees, identical verdicts on every row. Past ~8 the curve
+# turns back up (16 cpus, and gate 4 is CPU-bound under the GIL).
+GATE_WORKERS = int(os.environ.get("SWEEP_GATE_WORKERS", "8"))
+
+# Speed alone cannot be trusted to keep this inside the 120s step budget, which
+# is not configurable. The tick that failed ran 139s end to end where an
+# interactive run of the same corpus takes 11s, and that 12x was NOT reproduced:
+# an 8-way fork/wait load arm left both arms flat. The leading unproven
+# explanation is cold page cache -- the gates are disk walks over ~100 worktrees
+# (`git status --untracked-files=all`, `find -newermt`) and the daily tick is the
+# first thing to touch those trees in 24h -- untestable here without root to drop
+# caches. So the loop is bounded as well as faster: rows not reached by the
+# deadline are reported UNKNOWN, never DONE, and the report still goes out. A
+# killed step delivers nothing at all, which is the worse failure (#0156). The
+# budget also covers the caller's fetch and its delivery, hence the headroom.
+GATE_DEADLINE = float(os.environ.get("SWEEP_GATE_DEADLINE", "75"))
+STARTED = time.monotonic()
 
 
 def run(cmd, cwd=None, check=False):
@@ -341,6 +379,8 @@ def watcher_corpus(repo, override_roots=None):
 
     corpus = []
     for fp in dict.fromkeys(files):
+        if GENERATED_RECORD_DIRS.intersection(fp.split(os.sep)[:-1]):
+            continue
         try:
             with open(fp, errors="replace") as fh:
                 corpus.append((fp, fh.read(MAX_WATCHER_FILE_BYTES)))
@@ -370,6 +410,13 @@ def gate_unwatched(row, corpus, sess):
             continue
         pat = re.compile(r"(?<![\w./-])" + re.escape(term) + r"(?![\w-])")
         for fp, text in corpus:
+            # The pattern is the literal term plus zero-width assertions, so the plain
+            # substring is a necessary condition for it to match -- and str.__contains__
+            # is ~100x faster than this lookbehind regex. Without the prefilter the gate
+            # rescans the whole corpus once per term (94 worktrees x 3 terms x 474 files
+            # = 98 s of a 110 s sweep), which overran the 120 s workflow step budget.
+            if term not in text:
+                continue
             m = pat.search(text)
             if m:
                 line = text.count("\n", 0, m.start()) + 1
@@ -415,8 +462,7 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
     self_cwd = os.path.realpath(os.getcwd())
     self_id = os.environ.get("MYCOLAB_SESSION_ID")
 
-    rows = []
-    for row in worktrees(repo):
+    def judge(row):
         gates = {}
         if not os.path.isdir(row["path"]):
             # A registration whose directory is already gone. Pruning it deletes
@@ -427,6 +473,14 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
         elif row["band"] not in BAND_SWEEPABLE:
             row["verdict"] = "EXCLUDED"
             row["why"] = f"{row['band']} band is never swept automatically"
+        elif time.monotonic() - STARTED > GATE_DEADLINE:
+            # Only the gates are bounded. STALE and EXCLUDED above cost a stat
+            # and a string compare, so a late row still gets classified.
+            row["verdict"] = "UNKNOWN"
+            row["why"] = (
+                f"not evaluated: the sweep passed its {GATE_DEADLINE:g}s deadline before reaching this "
+                "row, so none of its four gates were run (raise SWEEP_GATE_DEADLINE to check it)"
+            )
         else:
             gates["1-merged"] = gate_merged(repo, row, baseline)
             gates["2-clean"] = gate_clean(row)
@@ -438,7 +492,15 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
                 f"gate {k} FAILED: {why}" for k, (ok, why) in sorted(gates.items()) if not ok
             )
         row["gates"] = {k: {"pass": ok, "evidence": why} for k, (ok, why) in gates.items()}
-        rows.append(row)
+
+    rows = list(worktrees(repo))
+    if GATE_WORKERS > 1 and len(rows) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=GATE_WORKERS) as pool:
+            for _ in pool.map(judge, rows):
+                pass
+    else:
+        for row in rows:
+            judge(row)
 
     srows = []
     for s in sess:
@@ -456,7 +518,7 @@ def render(rows, srows, baseline, counted):
         f"{counted['watcher_files']} watcher/workflow/cron files, {counted['processes']} processes inspected"
     )
     out.append("")
-    for verdict in ("DONE", "STALE", "NOT-DONE", "EXCLUDED"):
+    for verdict in ("DONE", "STALE", "NOT-DONE", "UNKNOWN", "EXCLUDED"):
         band = [r for r in rows if r["verdict"] == verdict]
         out.append(f"== WORKTREES {verdict} ({len(band)}) ==")
         for r in sorted(band, key=lambda r: (r["band"], r["name"])):
@@ -473,11 +535,12 @@ def render(rows, srows, baseline, counted):
 
 
 def summarise(rows, srows, baseline):
-    """The compact form the recurring reporter sends into a session's chat."""
+    """The compact form a recurring reporter delivers, printed by --summary."""
     done = [r for r in rows if r["verdict"] == "DONE"]
     stale = [r for r in rows if r["verdict"] == "STALE"]
     nd = [r for r in rows if r["verdict"] == "NOT-DONE"]
     ex = [r for r in rows if r["verdict"] == "EXCLUDED"]
+    unk = [r for r in rows if r["verdict"] == "UNKNOWN"]
     sdone = [s for s in srows if s["verdict"] == "DONE"]
     lines = [
         "Worktree/session sweep (report only, nothing was removed).",
@@ -486,6 +549,12 @@ def summarise(rows, srows, baseline):
         f"{len(nd)} fail a gate, {len(ex)} excluded by band.",
         f"{len(srows)} spawned sessions: {len(sdone)} retirable (working directory gone).",
     ]
+    if unk:
+        lines.append(
+            f"INCOMPLETE: {len(unk)} worktree(s) were NOT checked — the sweep hit its "
+            f"{GATE_DEADLINE:g}s deadline, which exists so a slow tick still delivers this "
+            "report instead of being killed. They are not cleared and not removable."
+        )
     if done or stale:
         lines.append("")
         lines.append("Removable with `scripts/sweep_agent_worktrees.py --apply`:")
@@ -498,7 +567,7 @@ def summarise(rows, srows, baseline):
         lines.append("Sessions whose working directory is gone — archive with `myco session archive <id>`:")
         for s in sdone:
             lines.append(f"  {s['id']}  ({s['why']})")
-    if not done and not stale and not sdone:
+    if not done and not stale and not sdone and not unk:
         lines.append("")
         lines.append("Nothing is retirable this tick. That is a pass, not a failure.")
     return "\n".join(lines)
@@ -558,9 +627,11 @@ def main():
                     help="main checkout that owns the worktrees (default: $BIOENGINE_REPO, "
                          "else the checkout containing the current directory)")
     ap.add_argument("--apply", action="store_true", help="remove the entries that pass all four gates")
-    ap.add_argument("--json", action="store_true", help="emit the full report as JSON")
-    ap.add_argument("--notify", metavar="SESSION_ID",
-                    help="send the summary to a session with `myco session send`; never removes anything")
+    form = ap.add_mutually_exclusive_group()
+    form.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    form.add_argument("--summary", action="store_true",
+                      help="print the compact digest on stdout and deliver nothing; "
+                           "for a scheduled caller that routes the report itself")
     # The two knobs below exist so the gates can be exercised on a scratch repo
     # (scripts/test_sweep_agent_worktrees.py). Lowering --owned-within weakens
     # gate 3; narrowing --watcher-root weakens gate 4.
@@ -570,27 +641,16 @@ def main():
                     help="search only these directories for watchers instead of discovering them")
     args = ap.parse_args()
 
-    if args.apply and args.notify:
-        ap.error("--apply and --notify are mutually exclusive: the recurring reporter never removes anything")
+    if args.apply and args.summary:
+        ap.error("--apply and --summary are mutually exclusive: the recurring reporter never removes anything")
     if not args.repo:
         ap.error("no checkout to sweep: pass --repo, set $BIOENGINE_REPO, or run from inside one")
 
     baseline = fetch_baseline(args.repo)
     rows, srows, counted = evaluate(args.repo, baseline, args.owned_within, args.watcher_root)
 
-    if args.notify:
-        body = summarise(rows, srows, baseline)
-        p = subprocess.run(
-            ["myco", "session", "send", args.notify, "--subject",
-             "Worktree sweep: %d of %d retirable"
-             % (sum(1 for r in rows if r["verdict"] in ("DONE", "STALE")), len(rows)),
-             "--body-file", "-"],
-            input=body, text=True, capture_output=True,
-        )
-        if p.returncode != 0:
-            print(f"FAILED to deliver the report to {args.notify}: {p.stderr.strip()}", file=sys.stderr)
-            return 1
-        print(f"delivered to {args.notify}: {len(body)} bytes")
+    if args.summary:
+        print(summarise(rows, srows, baseline))
         return 0
 
     if args.json:
