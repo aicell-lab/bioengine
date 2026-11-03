@@ -747,6 +747,22 @@ def test_no_census_leaves_the_command_untouched():
     assert "BIOENGINE_WORKER_ID" not in env
 
 
+def test_the_census_flag_reaches_the_command():
+    """The positive half of the two opt-out tests below, which pass unchanged if
+    the flag never wires anything at all."""
+    result = _run(["start", "--dry-run", "--runtime", "docker", "--", "--mode", "single-machine"])
+    assert result.exit_code == 0
+    assert CONTAINER_CENSUS_DIR in result.output
+
+
+def test_no_census_opts_out_from_the_flag():
+    result = _run(
+        ["start", "--dry-run", "--runtime", "docker", "--no-census", "--", "--mode", "single-machine"]
+    )
+    assert result.exit_code == 0
+    assert CONTAINER_CENSUS_DIR not in result.output
+
+
 def test_native_mode_has_no_census_mount():
     """A native worker reads the host directly; there is no container to bind."""
     result = _run(["start", "--dry-run", "--runtime", "native", "--", "--mode", "single-machine"])
