@@ -238,10 +238,13 @@ def _make_worker(tmp_path: Path, steps: _MonitoringSteps) -> BioEngineWorker:
     return worker
 
 
+_BACKOFF_MAX_SECONDS = 0.5
+
+
 def _start_loop(worker: BioEngineWorker) -> asyncio.Task:
     return asyncio.create_task(
         worker._create_monitoring_task(
-            backoff_initial_seconds=0.01, backoff_max_seconds=0.5
+            backoff_initial_seconds=0.01, backoff_max_seconds=_BACKOFF_MAX_SECONDS
         )
     )
 
@@ -278,6 +281,28 @@ def test_startup_replaces_a_previous_runs_deadline(tmp_path):
 
     assert check_heartbeat(worker.heartbeat_file)[0] is True
     assert _beat(worker)["stale_after_seconds"] == STARTUP_STALE_AFTER_SECONDS
+
+
+async def test_the_loop_wires_the_staleness_deadline_onto_the_worker(tmp_path):
+    # Every other staleness test injects _monitor_stale_after_seconds by hand,
+    # so nothing exercises the one line in the loop's prologue that sets it on
+    # a real worker. Deleting that line leaves the whole suite green while
+    # get_status stops reporting a stalled cluster monitor in production.
+    worker = _make_worker(tmp_path, _MonitoringSteps())
+    assert not hasattr(worker, "_monitor_stale_after_seconds")
+
+    task = _start_loop(worker)
+    try:
+        await _wait_until(
+            lambda: getattr(worker, "_monitor_stale_after_seconds", None) is not None,
+            10,
+            "the monitoring loop never set the staleness deadline",
+        )
+        assert worker._monitor_stale_after_seconds == heartbeat_stale_after_seconds(
+            worker.monitoring_interval_seconds, _BACKOFF_MAX_SECONDS
+        )
+    finally:
+        await _stop_loop(task)
 
 
 async def test_a_hang_in_the_last_step_never_produces_a_beat(tmp_path):
