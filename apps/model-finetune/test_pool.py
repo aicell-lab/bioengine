@@ -55,7 +55,7 @@ SOUP1_A, SOUP1_B = 0.8300, 0.8478
 
 
 def _member(cid, score, included):
-    return {"contribution_id": cid, "gate_score": score, "included": included}
+    return {"contribution_id": cid, "marginal_score": score, "gate_score": score, "included": included}
 
 
 def _synthetic_index():
@@ -207,8 +207,8 @@ class TestWireShape:
 
 
 class TestAssessedIsIdsOnly:
-    """A per-candidate gate_score in the wire payload is a contract violation:
-    ``assessed`` is IDs only, and the audit-only gate_score must not leak."""
+    """A per-candidate score in the wire payload is a contract violation:
+    ``assessed`` is IDs only, and the audit-only per-member scores must not leak."""
 
     def test_assessed_and_contributions_are_id_strings(self, wire):
         for soup in wire["soups"]:
@@ -221,10 +221,11 @@ class TestAssessedIsIdsOnly:
         assert s0["assessed"] == ["alpha-0", "beta-0"]
         assert s0["contributions"] == ["alpha-0"]
 
-    def test_no_gate_score_anywhere_in_the_wire(self, wire):
+    def test_no_per_member_score_anywhere_in_the_wire(self, wire):
         import json
 
         assert "gate_score" not in json.dumps(wire)
+        assert "marginal_score" not in json.dumps(wire)
 
 
 class TestContributionDisposition:
@@ -310,3 +311,117 @@ def test_matches_fixture_corpus():
     assert set(soup["selection_metric"]) == ROUNDMETRIC_KEYS
     assert set(soup["witness_metric"]) == ROUNDMETRIC_KEYS
     assert set(prog["empty_merges"][0]) == EMPTY_MERGE_KEYS
+
+
+# ── soup member cache eviction (pool.evict_lru_to_cap) ───────────────────────
+# The cache this bounds is the one whose unbounded growth OOM-killed the soup
+# replica. It is filled by candidates WEIGHED (up to max_batch, default 32), not
+# by members admitted, and it outlives any one merge — so a cap, not a per-merge
+# clear, is what bounds it.
+
+
+def _cached_member(directory, name, size, mtime):
+    path = directory / name
+    path.write_bytes(b"\0" * size)
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_evicts_oldest_first_until_under_cap(tmp_path):
+    a = _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    b = _cached_member(tmp_path, "member-b.pt", 100, mtime=2_000)
+    c = _cached_member(tmp_path, "member-c.pt", 100, mtime=3_000)
+
+    assert pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=250) == 1
+    assert not a.exists()
+    assert b.exists() and c.exists()
+
+
+def test_incoming_bytes_make_room_before_the_write(tmp_path):
+    """``_fetch_member`` evicts BEFORE writing, so the file about to land has to be
+    counted or the cap is exceeded by exactly one member every time."""
+    _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    _cached_member(tmp_path, "member-b.pt", 100, mtime=2_000)
+
+    assert pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=250) == 0
+    assert pool.evict_lru_to_cap(
+        tmp_path, "member-*.pt", cap_bytes=250, incoming_bytes=100) == 1
+
+
+def test_under_cap_evicts_nothing(tmp_path):
+    kept = _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    assert pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=10_000) == 0
+    assert kept.exists()
+
+
+def test_only_the_pattern_is_evicted(tmp_path):
+    """The directory also holds transient soup-*/head-* scratch that the merge
+    unlinks itself; eviction must not reach into it."""
+    _cached_member(tmp_path, "member-a.pt", 100, mtime=1_000)
+    scratch = _cached_member(tmp_path, "soup-deadbeef.pt", 5_000, mtime=500)
+
+    pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=50)
+    assert scratch.exists()
+
+
+def test_cap_is_actually_enforced_not_just_approached(tmp_path):
+    """Discrimination control for the three above: they assert a delete COUNT, which
+    a policy that evicts one file and stops would also satisfy. This asserts the
+    post-condition the cap exists for — total on disk is at or under it — against a
+    directory that needs several evictions, and fails for a policy that under-evicts."""
+    for i in range(10):
+        _cached_member(tmp_path, f"member-{i}.pt", 100, mtime=1_000 + i)
+
+    pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=250)
+    remaining = sorted(p.name for p in tmp_path.glob("member-*.pt"))
+    assert sum(p.stat().st_size for p in tmp_path.glob("member-*.pt")) <= 250
+    # and it kept the NEWEST, not an arbitrary two
+    assert remaining == ["member-8.pt", "member-9.pt"]
+
+
+# ── a deposit record must always name the app version that wrote it (#0116) ──
+#
+# 0.27.6 moved every ``l2_from_base`` value without touching ``schema_version``,
+# so the record's shape cannot date its own contents. These pin the field that
+# can. The null case is the load-bearing one: an ABSENT key is what a pre-0116
+# writer produces, so writing the key with None is the only thing that tells
+# "this writer did not know its version" apart from "this writer did not stamp".
+
+def _metadata(app_version):
+    return pool.build_contribution_metadata(
+        contribution_id="c-1",
+        model_type="cpsam",
+        app_version=app_version,
+        cellpose_version="4.0.1",
+        architecture_signature="sig",
+        base_checkpoint_id="stock-cpsam",
+        base_checkpoint_sha256=None,
+        samples_seen=10,
+        training_params={},
+        l2_from_base=None,
+        dataset_fingerprint=None,
+        solo_val_metric=None,
+        weights_sha256="deadbeef",
+        uploaded_at=0.0,
+    )
+
+
+def test_app_version_is_recorded():
+    assert _metadata("0.27.14")["app_version"] == "0.27.14"
+
+
+def test_app_version_key_is_present_even_when_unknown():
+    """The key, not the value, is what a consumer partitions on."""
+    assert "app_version" in _metadata(None)
+    assert _metadata(None)["app_version"] is None
+
+
+def test_app_version_does_not_collide_with_the_other_version_fields():
+    """Discrimination control: three distinct version-ish fields live in this
+    record and a fix that overwrote the wrong one would still pass the two
+    tests above. cellpose_version names the library, schema_version the record
+    shape, app_version the code that computed the values."""
+    m = _metadata("0.27.14")
+    assert m["cellpose_version"] == "4.0.1"
+    assert m["schema_version"] == pool.SCHEMA_VERSION
+    assert m["app_version"] != m["cellpose_version"] != m["schema_version"]

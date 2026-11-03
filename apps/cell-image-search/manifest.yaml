@@ -14,7 +14,7 @@ license: MIT
 format_version: 0.5.0
 git_repo: https://github.com/aicell-lab/bioengine
 type: ray-serve
-version: 0.21.5
+version: 0.21.6
 tags:
   - bioengine
   - image-search
