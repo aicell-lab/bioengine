@@ -272,6 +272,32 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
+# How long a deployment may sit at zero RUNNING replicas with a replica trying
+# to start before that stops counting as transitional. Ray applies no deadline
+# of its own: a replica it cannot place stays PENDING_ALLOCATION indefinitely
+# and only a 30 s log warning marks it, so the deployment reads as mid-wake-up
+# for as long as the cluster stays full. Deliberately generous, because a cold
+# replica start here includes a runtime_env venv build and takes minutes:
+# reporting late only delays visibility, while reporting early would make a
+# legitimate wake-up look broken.
+_REPLICA_STALL_SECONDS = 900.0
+
+# A replica in one of these states is trying to come up and is not serving, so
+# its start time is worth measuring. Ray's own slow-start check covers exactly
+# this set (``_check_and_update_transitioning_replicas``). An allowlist, because
+# what it leaves out must not be measured: ``STOPPING`` keeps the start time of a
+# replica that already served — Ray stamps a separate shutdown time and never
+# clears ``start_time_s`` — so measuring it would report every idle scale-down as
+# a stall, and a state Ray adds later should read as unknown rather than as
+# stalled.
+_STARTING_REPLICA_STATES = frozenset({"STARTING", "UPDATING", "RECOVERING"})
+
+# Ray routes requests to both of these — ``_BROADCAST_STATES`` and
+# ``get_running_replica_infos`` group ``PENDING_MIGRATION`` with ``RUNNING`` —
+# so either one present means the deployment is serving, whatever else is
+# pending alongside it.
+_SERVING_REPLICA_STATES = frozenset({"RUNNING", "PENDING_MIGRATION"})
+
 
 # What ``get_app_status`` tells a caller who is neither a worker admin nor named
 # on the application's own roster.
@@ -326,6 +352,7 @@ PUBLIC_DEPLOYMENT_FIELDS = (
     "message",
     "replica_states",
     "replicas",
+    "stalled_for_s",
 )
 
 
@@ -1014,6 +1041,40 @@ class AppsManager:
             )
         return out
 
+    @staticmethod
+    def _stalled_for_seconds(replicas: List[Dict[str, Any]]) -> Optional[float]:
+        """Seconds this deployment has been at zero RUNNING replicas while a
+        replica tries to start, or ``None`` when that is not what is happening.
+
+        Keyed on replica start times rather than on the deployment status,
+        because the status a never-placed replica produces depends on how the
+        replica count was raised — ``UPSCALING`` when autoscaled up from
+        ``min_replicas: 0``, ``UPDATING`` on a deploy — and neither carries
+        elapsed time. Holding no replicas at all is the correct idle state under
+        ``min_replicas: 0`` and is never stalled, and neither is a scale-down:
+        a ``STOPPING`` replica's ``start_time_s`` dates from when it started
+        serving, so counting it would report every idle downscale of a
+        long-running app as a stall of however long it had been up.
+
+        Ray resets a replica's ``start_time_s`` when the controller recovers, so
+        this can only under-report across a controller restart.
+        """
+        if any(r.get("state") in _SERVING_REPLICA_STATES for r in replicas):
+            return None
+        # Falsy rather than ``is not None``: Ray builds a replica's details with
+        # ``start_time_s=0`` and only overwrites it when the actor is requested,
+        # so a replica caught in that window would otherwise date from the epoch
+        # and read as stalled for decades.
+        started = [
+            r["start_time_s"]
+            for r in replicas
+            if r.get("state") in _STARTING_REPLICA_STATES and r.get("start_time_s")
+        ]
+        if not started:
+            return None
+        elapsed = time.time() - min(started)
+        return round(elapsed, 1) if elapsed > _REPLICA_STALL_SECONDS else None
+
     async def _get_deployment_status(
         self,
         application_id: str,
@@ -1039,6 +1100,7 @@ class AppsManager:
                 "message": deployment_info.get("message", ""),
                 "replica_states": replica_states,
                 "replicas": replicas,
+                "stalled_for_s": self._stalled_for_seconds(replicas),
                 "logs": None,
             }
 
