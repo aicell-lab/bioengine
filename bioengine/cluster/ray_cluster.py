@@ -380,7 +380,7 @@ class RayCluster:
         # Co-tenancy warnings from the host census. Always present as a list so
         # UI code can render unconditionally; empty is the normal case, and is
         # also what an unmounted census directory produces.
-        status["co_tenancy_warnings"] = list(self._co_tenancy_warnings)
+        status["co_tenancy_warnings"] = list(getattr(self, "_co_tenancy_warnings", []))
 
         return status
 
