@@ -38,7 +38,7 @@ from bioengine.worker.worker import BioEngineWorker
 
 
 def test_deadline_scales_with_the_monitoring_interval():
-    assert heartbeat_stale_after_seconds(20, 0) == 2 * heartbeat_stale_after_seconds(
+    assert heartbeat_stale_after_seconds(20, 0) == 3 * heartbeat_stale_after_seconds(
         10, 0
     )
 
