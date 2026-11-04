@@ -50,6 +50,8 @@ def _make_manager() -> AppsManager:
 
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test.monitor")
+    # No Hypha client: the token renewal the monitor runs first returns at once.
+    manager.server = None
     manager._redeploy_backoff = {}
     manager._missing_from_status = {}
     manager._deleted_pending_redeploy = set()
