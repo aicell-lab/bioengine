@@ -414,3 +414,6 @@ async def test_failing_steps_keep_the_heartbeat_beating(tmp_path):
         assert is_fresh is True, reason
     finally:
         await _stop_loop(task)
+
+# Touched by backlog #0223 to prove the new test-suite gate reports GREEN on a
+# pull request that breaks nothing. Throwaway; this PR is closed, not merged.
