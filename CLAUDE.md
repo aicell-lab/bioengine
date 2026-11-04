@@ -62,6 +62,8 @@ Code should explain *what* via good names; comments earn their place only when t
 
 ## When PRs are required vs direct-push to main
 
+**This table is enforceable as a check — install it instead of remembering it:** `git config core.hooksPath .github/hooks` refuses a push to `main` that touches any PR-only path below. Read `.github/hooks/README.md` first; `core.hooksPath` is shared by every worktree of a clone, so arming it in a clone other sessions are working in affects them too. The repository's own `Require PR` ruleset cannot express this policy — it is scoped by ref with no path component, so it forbids direct pushes to `main` for *every* path, and it carries an `admin`-role bypass, which is why direct pushes succeed and only a `remote: Bypassed rule violations` line reports them.
+
 | Path | Action |
 |---|---|
 | `bioengine/**`, `requirements*.txt`, `pyproject.toml`, `docker/**`, `.dockerignore` | **PR required.** Never push directly to `main`. If the user asks you to, refuse and create a PR instead. This is the *routing* rule only — both `version-check.yml` and `docker-publish-worker.yml` gate strictly narrower path sets than this list, so a PR here does not necessarily need a version bump. See "Whether you need a bump at all" above before bumping. |
