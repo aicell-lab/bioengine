@@ -5,6 +5,10 @@ name: Test Suite
 # The breakage that prompted it existed only in the COMBINATION of two
 # individually sound PRs, which is what a suite run on the merge result catches
 # and what a version check cannot see.
+#
+# No `paths:` filter, on purpose. Once this is a required check in ruleset
+# 8130154, a check skipped by a path filter never REPORTS at all, so the PR
+# sits on "Expected — waiting for status" forever instead of passing.
 
 on:
   workflow_dispatch:
@@ -16,11 +20,15 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   test-suite:
     name: test-suite
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     # The published worker image, so the suite runs against the same Ray, Serve
     # and hypha-rpc the worker ships with instead of a resolved-today set. The
@@ -44,29 +52,6 @@ jobs:
         # the shape most easily mistaken for coverage.
         run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt
 
-      - name: Assert the suite still collects
-        # A suite that collected nothing reports no failures, which looks exactly
-        # like a suite that passed. pytest exits 5 on a total collection failure
-        # but 0 on a partial collapse, so the floor is checked explicitly.
-        # Measured 1159 collected on dbe737b; the floor is set well below that so
-        # legitimately deleted tests do not fail the build, and far above any
-        # plausible collapse.
-        #
-        # `-o addopts=` is load-bearing, not tidiness: pytest.ini's addopts carry
-        # `-v`, which overrides the `-q` here and makes --collect-only print a
-        # node TREE instead of one `file::test` line per test. Without it the
-        # grep matches nothing and this step reports collected=0 — measured.
-        run: |
-          collected=$(python -m pytest -o addopts= -p no:cacheprovider tests/ \
-            --ignore=tests/end_to_end \
-            --ignore=tests/apps/cellpose/test_ui_e2e.py \
-            --collect-only -q 2>/dev/null | grep -c '::')
-          echo "collected=$collected"
-          if [ "$collected" -lt 1000 ]; then
-            echo "::error::collected $collected tests, floor is 1000 — the suite collapsed rather than passed"
-            exit 1
-          fi
-
       - name: Run the suite
         # tests/end_to_end needs a live Hypha workspace and a real cluster.
         # tests/apps/cellpose/test_ui_e2e.py needs playwright and a browser.
@@ -79,4 +64,34 @@ jobs:
         run: |
           python -m pytest -p no:cacheprovider tests/ \
             --ignore=tests/end_to_end \
-            --ignore=tests/apps/cellpose/test_ui_e2e.py
+            --ignore=tests/apps/cellpose/test_ui_e2e.py \
+            --junitxml=junit.xml
+
+      - name: Assert the suite actually ran
+        # A run that collected nothing reports no failures, which looks exactly
+        # like a pass, and pytest exits 0 on a PARTIAL collapse. The count is
+        # read out of the JUnit report rather than parsed from pytest's summary
+        # line, which a deprecation wall can crowd out. `if: always()` so a
+        # suite that died before writing a report is a refusal rather than a
+        # step that silently did not run.
+        if: always()
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          FLOOR = 1000  # measured 1159 ran on 3689415; far above any collapse
+          try:
+              root = ET.parse("junit.xml").getroot()
+          except (OSError, ET.ParseError) as e:
+              sys.exit(f"REFUSE: no readable JUnit report, so nothing attests a run: {e}")
+          suites = root.findall("testsuite") or [root]
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          bad = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+          ran = total - skipped
+          print(f"collected={total} skipped={skipped} ran={ran} failures+errors={bad}")
+          if ran < FLOOR:
+              sys.exit(f"REFUSE: {ran} tests ran, below the floor of {FLOOR}")
+          if bad:
+              sys.exit(f"REFUSE: {bad} test(s) failed or errored")
+          print(f"OK: {ran} tests ran, {bad} failures")
+          PY
