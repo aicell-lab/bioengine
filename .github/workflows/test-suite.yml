@@ -1,0 +1,82 @@
+name: Test Suite
+
+# No workflow ran a test before this one, so the only gate on a merge was a
+# version comparison and a PR that broke the suite merged green (backlog #0223).
+# The breakage that prompted it existed only in the COMBINATION of two
+# individually sound PRs, which is what a suite run on the merge result catches
+# and what a version check cannot see.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+
+jobs:
+  test-suite:
+    name: test-suite
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    # The published worker image, so the suite runs against the same Ray, Serve
+    # and hypha-rpc the worker ships with instead of a resolved-today set. The
+    # package is public, so no registry credentials are needed. The cost is that
+    # a PR which changes requirements-worker.txt is still tested against the
+    # LAST PUBLISHED image rather than its own dependencies — that gap is real
+    # and is why docker-publish-worker.yml is still the thing that proves a
+    # dependency change builds.
+    container:
+      image: ghcr.io/aicell-lab/bioengine-worker:latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        # requirements-test.txt brings pytest, pytest-asyncio and pytest-xdist,
+        # which pytest.ini's addopts require. requirements-datasets.txt brings
+        # zarr, without which three dataset test modules fail to import — and a
+        # module that fails to IMPORT reports an error, not a failure, so it is
+        # the shape most easily mistaken for coverage.
+        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt
+
+      - name: Assert the suite still collects
+        # A suite that collected nothing reports no failures, which looks exactly
+        # like a suite that passed. pytest exits 5 on a total collection failure
+        # but 0 on a partial collapse, so the floor is checked explicitly.
+        # Measured 1159 collected on dbe737b; the floor is set well below that so
+        # legitimately deleted tests do not fail the build, and far above any
+        # plausible collapse.
+        #
+        # `-o addopts=` is load-bearing, not tidiness: pytest.ini's addopts carry
+        # `-v`, which overrides the `-q` here and makes --collect-only print a
+        # node TREE instead of one `file::test` line per test. Without it the
+        # grep matches nothing and this step reports collected=0 — measured.
+        run: |
+          collected=$(python -m pytest -o addopts= -p no:cacheprovider tests/ \
+            --ignore=tests/end_to_end \
+            --ignore=tests/apps/cellpose/test_ui_e2e.py \
+            --collect-only -q 2>/dev/null | grep -c '::')
+          echo "collected=$collected"
+          if [ "$collected" -lt 1000 ]; then
+            echo "::error::collected $collected tests, floor is 1000 — the suite collapsed rather than passed"
+            exit 1
+          fi
+
+      - name: Run the suite
+        # tests/end_to_end needs a live Hypha workspace and a real cluster.
+        # tests/apps/cellpose/test_ui_e2e.py needs playwright and a browser.
+        # A further 30 tests deselect themselves: tests/conftest.py detects a
+        # live test from its fixture closure and drops it unless --live is
+        # passed, so this gate covers 1159 of 1189 collected and says nothing
+        # about the 30 that need a real workspace.
+        # Everything else runs, and runs green on main: measured 1159 passed,
+        # 0 failed, 0 errors in about 2m20s.
+        run: |
+          python -m pytest -p no:cacheprovider tests/ \
+            --ignore=tests/end_to_end \
+            --ignore=tests/apps/cellpose/test_ui_e2e.py
