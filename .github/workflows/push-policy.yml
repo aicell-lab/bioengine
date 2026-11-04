@@ -1,0 +1,83 @@
+name: Push Policy
+
+# Reports a commit that reached main touching a PR-only path without a pull
+# request. It cannot PREVENT the push: the repository's only ruleset is scoped
+# by ref with no path component, so it forbids direct pushes to main for every
+# path, and it carries an admin-role bypass. This turns a violation into a
+# machine-detected failure instead of a sentence in CLAUDE.md.
+#
+# The path list is .github/hooks/pr-only-paths.txt, the same file the local
+# pre-push hook reads, so the two cannot drift apart.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-only-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check each pushed commit for PR-only paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -uo pipefail
+
+          # A first push to the branch, or a force-push past the old tip, leaves
+          # BEFORE unusable. Judge only the tip then rather than the whole history.
+          if [ -z "${BEFORE:-}" ] || [[ "$BEFORE" =~ ^0+$ ]] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            commits=$(git rev-parse HEAD)
+          else
+            commits=$(git rev-list "$BEFORE..$AFTER")
+          fi
+
+          if [ -z "$commits" ]; then
+            echo "No commits in this push; nothing to check."
+            exit 0
+          fi
+
+          violations=0
+          for sha in $commits; do
+            changed=$(git diff-tree --no-commit-id --name-only -r -m "$sha")
+            hit=$(printf '%s\n' "$changed" | bash .github/hooks/match-pr-only.sh)
+            [ -z "$hit" ] && continue
+
+            # A commit that came through a PR is fine — that IS the policy.
+            # Ask the API rather than pattern-matching the subject, because a
+            # subject convention is exactly the kind of rule this job replaces.
+            prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" \
+                    --jq 'length' 2>/dev/null || echo "unknown")
+
+            if [ "$prs" = "unknown" ]; then
+              echo "::warning title=Push policy::could not determine whether ${sha} came from a pull request; not counting it"
+              continue
+            fi
+            if [ "$prs" -gt 0 ]; then
+              echo "ok: ${sha} touches PR-only paths and has ${prs} associated pull request(s)"
+              continue
+            fi
+
+            violations=$((violations + 1))
+            echo "::error title=Push policy::${sha} reached main with no pull request, touching PR-only paths:"
+            printf '%s\n' "$hit" | sort -u | sed 's/^/    /'
+          done
+
+          if [ "$violations" -gt 0 ]; then
+            echo
+            echo "${violations} commit(s) bypassed the pull-request requirement."
+            echo "See .github/hooks/README.md — installing the pre-push hook catches this before the push."
+            exit 1
+          fi
+          echo "Push policy: clean."
