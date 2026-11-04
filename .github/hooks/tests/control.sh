@@ -23,7 +23,10 @@ setup() {
     git config core.hooksPath "$ROOT/hooks"
     mkdir -p "$ROOT/hooks"
     if [ "${1:-with-hook}" = "with-hook" ]; then
-        cp "$HOOK" "$ROOT/hooks/pre-push"; chmod +x "$ROOT/hooks/pre-push"
+        cp "$HOOK" "$ROOT/hooks/pre-push"
+        cp "$(dirname "$HOOK")/match-pr-only.sh" "$ROOT/hooks/"
+        cp "$(dirname "$HOOK")/pr-only-paths.txt" "$ROOT/hooks/"
+        chmod +x "$ROOT/hooks/pre-push" "$ROOT/hooks/match-pr-only.sh"
     else
         rm -f "$ROOT/hooks/pre-push"
     fi
@@ -42,7 +45,11 @@ arm() {
     git push origin "HEAD:$ref" >/dev/null 2>"$ROOT/err.txt"
     local rc=$?
     local got; [ $rc -eq 0 ] && got=ALLOW || got=REFUSE
-    if [ "$got" = "$expect" ]; then
+    if [ "$got" = "REFUSE" ] && [ "$expect" = "REFUSE" ] \
+       && ! grep -q "pre-push: REFUSED" "$ROOT/err.txt"; then
+        fail=$((fail+1)); note FAIL "$name" "-> refused, but NOT by the policy"
+        sed 's/^/        /' "$ROOT/err.txt" | head -3
+    elif [ "$got" = "$expect" ]; then
         pass=$((pass+1)); note ok "$name" "-> $got"
     else
         fail=$((fail+1)); note FAIL "$name" "-> $got (wanted $expect)"
@@ -62,6 +69,27 @@ arm "bioengine/** to a FEATURE branch is ALLOWED" "bioengine/x.py"           ref
 echo
 echo "=== control: the refusal must come from the HOOK ==="
 arm "bioengine/** to main, hook REMOVED -> allowed" "bioengine/x.py"         refs/heads/main    ALLOW   no-hook
+
+echo
+echo "=== matcher exit status (the CI half runs under bash -e) ==="
+MATCHER="$(dirname "$HOOK")/match-pr-only.sh"
+status_arm() {
+    local name="$1" input="$2" want="$3"
+    printf '%s\n' "$input" | bash "$MATCHER" >/dev/null 2>&1
+    local got=$?
+    if [ "$got" = "$want" ]; then pass=$((pass+1)); note ok "$name" "-> exit $got"
+    else fail=$((fail+1)); note FAIL "$name" "-> exit $got (wanted $want)"; fi
+}
+status_arm "a MATCH exits 0"                       "bioengine/x.py" 0
+# Finding nothing must be a result, not an error: every Actions `run:` block is
+# `bash -e`, so a 1 here aborts the job with no output whatsoever.
+status_arm "finding NOTHING exits 0, not 1"        "docs/g.md"      0
+
+if bash -e -c 'h=$(printf "docs/g.md\n" | bash "'"$MATCHER"'"); [ -z "$h" ]' 2>/dev/null; then
+    pass=$((pass+1)); note ok "a clean input does not abort a bash -e caller" "-> reached"
+else
+    fail=$((fail+1)); note FAIL "a clean input does not abort a bash -e caller" "-> aborted"
+fi
 
 echo
 echo "RESULT: $pass passed, $fail failed"

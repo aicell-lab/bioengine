@@ -1,53 +1,24 @@
 #!/usr/bin/env bash
 # Refuse a direct push to main that touches a path the project requires a PR for.
 #
-# The policy it enforces is CLAUDE.md's per-path table. That table is prose, and
-# prose is what an agent misreads; the repository's own ruleset cannot express it
-# because a branch ruleset is scoped by ref and has no per-path exemption, so this
-# hook is the only place the rule becomes a check.
+# The policy lives in pr-only-paths.txt and is interpreted by match-pr-only.sh,
+# which the CI detector also uses — so the local guard and the server-side check
+# cannot disagree. The repository's own ruleset cannot express this policy: a
+# branch ruleset is scoped by ref and has no per-path exemption.
 #
-# Scope, deliberately narrow: only pushes whose REMOTE ref is refs/heads/main are
-# considered. Pushing the same paths to a feature branch is the supported PR
-# workflow and must stay silent.
+# Scope, deliberately narrow: only pushes whose REMOTE ref is refs/heads/main.
+# Pushing the same paths to a feature branch is the supported PR workflow.
 set -uo pipefail
 
-# PR-only paths, as data rather than as branching logic. Globs are matched against
-# each changed path with bash's == inside [[ ]], so ** is not special — a trailing
-# /* plus a prefix test is what covers a subtree.
-PR_ONLY_PREFIXES=(
-    "bioengine/"
-    "docker/"
-    "apps/model-runner/"
-    "apps/model-finetune/"
-)
-PR_ONLY_EXACT=(
-    "pyproject.toml"
-    ".dockerignore"
-)
-PR_ONLY_GLOBS=(
-    "requirements*.txt"
-)
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MATCH="$HERE/match-pr-only.sh"
+[ -x "$MATCH" ] || { echo "pre-push: missing $MATCH" >&2; exit 2; }
 
 # git signals "ref absent" with an all-zero sha, whose width differs between
 # sha1 and sha256 repositories, so match the shape rather than a fixed string.
 is_absent() { [[ "$1" =~ ^0+$ ]]; }
 
-is_pr_only() {
-    local path="$1" p g
-    for p in "${PR_ONLY_PREFIXES[@]}"; do
-        [[ "$path" == "$p"* ]] && return 0
-    done
-    for p in "${PR_ONLY_EXACT[@]}"; do
-        [[ "$path" == "$p" ]] && return 0
-    done
-    for g in "${PR_ONLY_GLOBS[@]}"; do
-        # shellcheck disable=SC2053
-        [[ "$path" == $g ]] && return 0
-    done
-    return 1
-}
-
-violations=()
+violations=""
 
 while read -r _local_ref local_sha remote_ref remote_sha; do
     [ -z "${remote_ref:-}" ] && continue
@@ -55,28 +26,21 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
     is_absent "$local_sha" && continue   # branch deletion carries no paths
 
     if is_absent "$remote_sha"; then
-        # main does not exist on the remote yet; judge the whole history.
-        range="$local_sha"
-        changed=$(git diff-tree --no-commit-id --name-only -r "$range")
+        changed=$(git diff-tree --no-commit-id --name-only -r "$local_sha")
     else
-        range="$remote_sha..$local_sha"
-        changed=$(git diff --name-only "$range")
+        changed=$(git diff --name-only "$remote_sha..$local_sha")
     fi
 
-    while IFS= read -r path; do
-        [ -z "$path" ] && continue
-        if is_pr_only "$path"; then
-            violations+=("$path")
-        fi
-    done <<< "$changed"
+    hit=$(printf '%s\n' "$changed" | bash "$MATCH")
+    [ -n "$hit" ] && violations="$violations$hit"$'\n'
 done
 
-if [ "${#violations[@]}" -gt 0 ]; then
+if [ -n "${violations//[$'\n' ]/}" ]; then
     {
         echo
         echo "pre-push: REFUSED — this pushes PR-only paths straight to main."
         echo
-        printf '  %s\n' "${violations[@]}" | sort -u
+        printf '%s' "$violations" | sort -u | sed '/^$/d;s/^/  /'
         echo
         echo "These paths require a pull request (they drive the worker publish and"
         echo "version-check workflows, or are gated on a published app manifest)."
