@@ -184,3 +184,6 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list[str]:
     return sorted({"__version__", "datasets", "logger", *_LAZY_FROM_APP})
+
+# Throwaway control for backlog #0225: a gated path with no version bump, so
+# check-version MUST still refuse it after the three-dot fix.
