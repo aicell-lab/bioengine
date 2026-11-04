@@ -417,6 +417,20 @@ After the lede: how it was observed or reproduced, the evidence that localises i
 
 State a requirement as a requirement, in your own words. Never quote a person — not from chat, not relayed, not copied out of an internal tracker — and don't name who asked for the change. These repos are public, so a quote publishes private words; and a design that is only defensible because someone asked for it has a hole in it that citing them hides. Attributing a *finding* in an issue is still fine (§Issues above); requirements and design rationale are not.
 
+### Close evidence must assert an invariant, not close-day state
+
+An evidence item is re-run by whoever audits the close later, so it has to still mean something then. Assert the property the fix established, not the state of the world on the day you closed it:
+
+| instead of | write |
+|---|---|
+| a version pin — `version: 0.27.5` | a floor — `version >= 0.27.5` |
+| a message string — grep stderr for `mutually exclusive` | the exit status the guard produces |
+| a line being present — `export FOO` is in the script | absence-or-replacement — `export FOO` is gone **or** the replacement is wired |
+
+A snapshot assertion fails the moment later legitimate work moves past it, and a reviewer re-running it reads that failure as a close that was false. Four such items were measured on 2026-11-02: a version bumped ten times since, a config pin a later fix deliberately removed, a flag that got renamed, and a discrimination control that stopped discriminating because the cluster changed. None of the four closes was wrong; all four now exit non-zero.
+
+Where an assertion genuinely cannot be made durable — a live cluster reading, an ambient condition a control depends on — say so on the item and name the decay you expect, so a future re-run recognises it instead of discovering it as a regression.
+
 Previously-merged PRs and existing issues that violate this style stay as-is; apply going forward only.
 
 ## BioEngine skills
