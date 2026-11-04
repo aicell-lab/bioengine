@@ -14,3 +14,6 @@ Must stay in lock-step with ``pyproject.toml``'s ``version`` field.
 The ``version-check.yml`` CI workflow enforces the match.
 """
 __version__ = "0.16.86"
+
+# Throwaway control for backlog #0225: touches a gated path with no version bump,
+# so check-version MUST still fail after the three-dot fix.
