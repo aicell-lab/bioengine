@@ -27,6 +27,7 @@ from bioengine.heartbeat import (
     main,
     write_heartbeat,
 )
+from bioengine.utils import host_census
 from bioengine.worker.__main__ import create_parser
 from bioengine.worker.worker import BioEngineWorker
 
@@ -300,6 +301,39 @@ async def test_the_loop_wires_the_staleness_deadline_onto_the_worker(tmp_path):
         )
         assert worker._monitor_stale_after_seconds == heartbeat_stale_after_seconds(
             worker.monitoring_interval_seconds, _BACKOFF_MAX_SECONDS
+        )
+    finally:
+        await _stop_loop(task)
+
+
+async def test_the_loop_wires_the_census_deadline_onto_the_ray_cluster(tmp_path):
+    # Sibling of the test above, and unpinned for the same reason: the census
+    # ages a worker out on exactly the gap that marks it dead to the liveness
+    # probe, and the loop's prologue is the only place the two are joined.
+    #
+    # The failure mode here is worse than an absent value, which is why the
+    # fake is seeded rather than left bare. RayCluster.__init__ already sets
+    # this to the startup default, so deleting the wiring line does not leave
+    # the attribute missing — it leaves 1800s in place, which is a plausible
+    # number and the wrong one. Seeding the default and asserting it was
+    # REPLACED is what makes the deletion visible.
+    worker = _make_worker(tmp_path, _MonitoringSteps())
+    worker.ray_cluster.census_stale_after_seconds = (
+        host_census.STARTUP_STALE_AFTER_SECONDS
+    )
+
+    task = _start_loop(worker)
+    try:
+        await _wait_until(
+            lambda: worker.ray_cluster.census_stale_after_seconds
+            != host_census.STARTUP_STALE_AFTER_SECONDS,
+            10,
+            "the monitoring loop never replaced the census startup default",
+        )
+        assert worker.ray_cluster.census_stale_after_seconds == (
+            heartbeat_stale_after_seconds(
+                worker.monitoring_interval_seconds, _BACKOFF_MAX_SECONDS
+            )
         )
     finally:
         await _stop_loop(task)
