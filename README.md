@@ -242,3 +242,7 @@ MIT — see [LICENSE](LICENSE).
 
 BioEngine is built on [Ray](https://www.ray.io/), [Hypha](https://docs.amun.ai/#/), and [Zarr](https://zarr.readthedocs.io/).
 Supported by the SciLifeLab & Wallenberg Data Driven Life Science Program (KAW 2020.0239), the Göran Gustafsson Prize (2317), AI4Life (EU Horizon Europe grant 101057970), and RI-SCALE (EU grant 101188168).
+
+<!-- Throwaway for backlog #0225: a docs-only diff on a branch whose base is behind
+main. Under the two-dot comparison check-version demands a bump; under three dots it
+must not. Closed, not merged. -->
