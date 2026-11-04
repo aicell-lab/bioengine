@@ -346,6 +346,52 @@ def public_app_status(status: Dict[str, Any]) -> Dict[str, Any]:
     return public
 
 
+def _validate_scaling_map(
+    scaling: Optional[Dict[str, Any]],
+    user_deployment_names: Tuple[str, ...],
+    application_id: str,
+) -> None:
+    """Reject a ``scaling`` map before it reaches Ray Serve.
+
+    A pure helper so the boundary is testable without a cluster: once a bad value
+    is inside ``serve.run`` the caller gets Ray's own error from a replica build
+    rather than one naming the ``scaling`` entry they got wrong, which is the
+    whole reason this validation exists.
+    """
+    for dep_name, dep_scaling in (scaling or {}).items():
+        if dep_name not in user_deployment_names:
+            raise ValueError(
+                f"scaling key '{dep_name}' is not a user deployment in "
+                f"app '{application_id}'. Valid deployments: "
+                f"{user_deployment_names}."
+            )
+        if not isinstance(dep_scaling, dict):
+            raise ValueError(
+                f"scaling entry for '{dep_name}' must be a dict; got "
+                f"{type(dep_scaling).__name__}."
+            )
+        nr = dep_scaling.get("num_replicas")
+        asc = dep_scaling.get("autoscaling_config")
+        if nr is None and not asc:
+            raise ValueError(
+                f"scaling entry for '{dep_name}' must set exactly one "
+                f"of num_replicas or autoscaling_config; got neither."
+            )
+        if nr is not None and asc:
+            raise ValueError(
+                f"scaling entry for '{dep_name}' must set exactly one "
+                f"of num_replicas or autoscaling_config; got both."
+            )
+        # Ray's bound is >= 1, not >= 0: serve.deployment raises
+        # "num_replicas is expected to larger than 0" (measured on ray 2.55.1).
+        # 0 used to clear this check and fail inside the deploy instead.
+        if nr is not None and nr < 1:
+            raise ValueError(
+                f"scaling entry for '{dep_name}' has num_replicas="
+                f"{nr}; must be >= 1."
+            )
+
+
 class AppsManager:
     """
     Manages Ray Serve deployments using Hypha artifact manager integration.
@@ -2833,7 +2879,7 @@ class AppsManager:
         ),
         scaling: Optional[Dict[str, Dict[str, Any]]] = Field(
             None,
-            description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. Classes not in the map run at Ray Serve's default of one fixed replica. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
+            description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. A class absent from the map gets no override at all: it keeps whatever num_replicas or autoscaling_config its own @bioengine.app decorator declared, and runs at one fixed replica only if the decorator declares neither — so omitting an entry does NOT pin a class that autoscales itself. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
             examples=[
                 {"DemoApp": {"num_replicas": 3}},
                 {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_num_ongoing_requests_per_replica": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
@@ -3135,35 +3181,7 @@ class AppsManager:
                 meta["qualname"].split(".")[-1]
                 for meta in app.spec["classes"].values()
             )
-            for dep_name, dep_scaling in (scaling or {}).items():
-                if dep_name not in user_deployment_names:
-                    raise ValueError(
-                        f"scaling key '{dep_name}' is not a user deployment in "
-                        f"app '{application_id}'. Valid deployments: "
-                        f"{user_deployment_names}."
-                    )
-                if not isinstance(dep_scaling, dict):
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' must be a dict; got "
-                        f"{type(dep_scaling).__name__}."
-                    )
-                nr = dep_scaling.get("num_replicas")
-                asc = dep_scaling.get("autoscaling_config")
-                if nr is None and not asc:
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' must set exactly one "
-                        f"of num_replicas or autoscaling_config; got neither."
-                    )
-                if nr is not None and asc:
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' must set exactly one "
-                        f"of num_replicas or autoscaling_config; got both."
-                    )
-                if nr is not None and nr < 0:
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' has num_replicas="
-                        f"{nr}; must be >= 0."
-                    )
+            _validate_scaling_map(scaling, user_deployment_names, application_id)
 
             # A content change (new version, different artifact, or the same
             # version string re-staged with different files) must reach every
