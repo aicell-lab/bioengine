@@ -35,6 +35,13 @@ DEFAULT_WORKSPACE_DIR = Path.home() / ".bioengine"
 CONTAINER_WORKSPACE_DIR = "/.bioengine"
 DEFAULT_SHM_SIZE = "8g"
 
+# Workers on one host advertise their configured resources here so each can see
+# what its co-tenants were promised. A worker cannot read a sibling's cgroup or
+# argv from inside its own container, so this shared directory is the only way
+# those reservations become comparable. Sibling of the per-worker workspace
+# directory, so one host's workers share it however they name their own.
+DEFAULT_CENSUS_DIR = Path.home() / ".bioengine-hosts"
+CONTAINER_CENSUS_DIR = "/.bioengine-hosts"
 # Share of host memory the container may use when --memory is left at "auto".
 # Deliberately generous: the point of a default is to give Ray a cgroup number
 # to budget against instead of the host's total, which it gets at any cap. A
@@ -127,13 +134,29 @@ def _nvidia_device_flags() -> List[str]:
 _RUNTIME_PREFERENCE = ("docker", "podman", "apptainer", "singularity")
 
 
-def _passthrough_env(token: Optional[str], server_url: Optional[str]) -> dict:
+def _passthrough_env(
+    token: Optional[str],
+    server_url: Optional[str],
+    container_name: Optional[str] = None,
+    census: bool = False,
+) -> dict:
     """The variables the container needs, keyed by name.
 
     Built from the resolved option values, not from ``os.environ`` — ``--token``
     only reaches the environment later, in ``_subprocess_env``.
     """
-    resolved = (("HYPHA_TOKEN", token), ("BIOENGINE_SERVER_URL", server_url))
+    resolved = [
+        ("HYPHA_TOKEN", token),
+        ("BIOENGINE_SERVER_URL", server_url),
+    ]
+    if census:
+        # The container name is what an operator recognises in a co-tenancy
+        # warning; without it the worker falls back to its own hostname, which
+        # is the container id.
+        resolved += [
+            ("BIOENGINE_HOST_CENSUS_DIR", CONTAINER_CENSUS_DIR),
+            ("BIOENGINE_WORKER_ID", container_name),
+        ]
     return {name: value for name, value in resolved if value}
 
 
@@ -166,6 +189,7 @@ def build_command(
     tty: bool,
     token: Optional[str],
     server_url: Optional[str],
+    census_dir: Optional[Path] = None,
 ) -> List[str]:
     """Build the container invocation. Secrets travel in the environment, never argv."""
     entrypoint = ["python", "-m", "bioengine.worker", *worker_args]
@@ -178,6 +202,8 @@ def build_command(
         if gpus:
             command += _GPU_FLAGS[runtime]
         command += ["--bind", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
+        if census_dir:
+            command += ["--bind", f"{census_dir}:{CONTAINER_CENSUS_DIR}"]
         return command + [f"docker://{image}", *entrypoint]
 
     # ``--memory`` is docker/podman only. apptainer applies cgroups through a
@@ -196,7 +222,11 @@ def build_command(
         if runtime == "docker":
             command += _nvidia_device_flags()
     command += ["-v", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
-    for name in _passthrough_env(token, server_url):
+    if census_dir:
+        command += ["-v", f"{census_dir}:{CONTAINER_CENSUS_DIR}"]
+    for name in _passthrough_env(
+        token, server_url, container_name, census=bool(census_dir)
+    ):
         command += ["-e", name]
     return command + [image, *entrypoint]
 
@@ -236,8 +266,14 @@ def _container_exists(runtime: str, container_name: str) -> bool:
     return bool(result.stdout.strip())
 
 
-def _subprocess_env(runtime: str, token: Optional[str], server_url: Optional[str]) -> dict:
-    passthrough = _passthrough_env(token, server_url)
+def _subprocess_env(
+    runtime: str,
+    token: Optional[str],
+    server_url: Optional[str],
+    container_name: Optional[str] = None,
+    census: bool = False,
+) -> dict:
+    passthrough = _passthrough_env(token, server_url, container_name, census)
     env = dict(os.environ)
     env.update(passthrough)
     if runtime in _SIF_RUNTIMES:
@@ -270,6 +306,18 @@ def _resolve_runtime(runtime: str, require_available: bool = True) -> str:
     return detected
 
 
+def _create_option_dir(path: Path, option: str) -> None:
+    """Create a directory named by a CLI option, reporting which one on failure."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        error_exit(
+            f"{option} {path} could not be created: "
+            f"{exc.strerror or exc.__class__.__name__}.",
+            "Point it at a path this user can create, or create it beforehand.",
+        )
+
+
 @click.group("worker")
 def worker_group():
     """Start, stop and follow a BioEngine worker container."""
@@ -300,6 +348,22 @@ def worker_group():
     default=DEFAULT_WORKSPACE_DIR,
     show_default=True,
     help="Host directory mounted as the worker workspace.",
+)
+@click.option(
+    "--census-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=DEFAULT_CENSUS_DIR,
+    show_default=True,
+    help="Host directory where workers advertise their configured resources so "
+    "each can warn when this host has been promised more memory or the same GPU "
+    "twice. Shared by every worker on the host; pass --no-census to opt out.",
+)
+@click.option(
+    "--census/--no-census",
+    default=True,
+    show_default=True,
+    help="Join the host resource census. Advisory only — it adds startup "
+    "warnings and a worker-status field, and changes nothing about scheduling.",
 )
 @click.option(
     "--name",
@@ -350,6 +414,8 @@ def worker_start(
     runtime,
     image,
     workspace_dir,
+    census_dir,
+    census,
     container_name,
     shm_size,
     memory,
@@ -403,7 +469,12 @@ def worker_start(
 
     workspace_dir = workspace_dir.expanduser()
     if runtime != "native" and not dry_run:
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        _create_option_dir(workspace_dir, "--workspace-dir")
+
+    # Native runs read the host directly, so the census has nothing to bind.
+    census_dir = census_dir.expanduser() if census and runtime != "native" else None
+    if census_dir and not dry_run:
+        _create_option_dir(census_dir, "--census-dir")
 
     command = build_command(
         runtime=runtime,
@@ -418,6 +489,7 @@ def worker_start(
         tty=sys.stdin.isatty(),
         token=token,
         server_url=server_url,
+        census_dir=census_dir,
     )
 
     if dry_run:
@@ -431,7 +503,9 @@ def worker_start(
             f"or start this one under a different --name.",
         )
 
-    env = _subprocess_env(runtime, token, server_url)
+    env = _subprocess_env(
+        runtime, token, server_url, container_name, census=bool(census_dir)
+    )
     try:
         raise SystemExit(subprocess.call(command, env=env))
     except FileNotFoundError:
