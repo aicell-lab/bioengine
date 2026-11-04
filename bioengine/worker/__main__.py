@@ -436,8 +436,10 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         type=str,
         metavar="ARGS",
         help="Additional SLURM sbatch arguments for specialized cluster configurations, "
-        "passed as a single quoted, shell-style string. "
-        'Example: --further-slurm-args "--partition=gpu --qos=high-priority"',
+        "passed as a single shell-style string attached with '='. Quoting alone does "
+        "not work: the shell strips the quotes and a lone dash-leading value is then "
+        "read as the next flag. "
+        'Example: --further-slurm-args="--reservation=safe --partition=gpu"',
     )
     slurm_job_group.add_argument(
         "--gpu-slurm-flag",
@@ -454,8 +456,9 @@ For detailed documentation, visit: https://github.com/aicell-lab/bioengine
         type=str,
         metavar="ARGS",
         help="Additional CLI flags forwarded to the container runtime's 'exec' inside each "
-        "SLURM worker job, passed as a single quoted, shell-style string. "
-        'Example: --further-apptainer-args "--bind /proj/aicell:/proj/aicell".',
+        "SLURM worker job, passed as a single shell-style string attached with '=' "
+        "(see --further-slurm-args). "
+        'Example: --further-apptainer-args="--bind /proj/aicell:/proj/aicell".',
     )
 
     # Ray autoscaling configuration options
@@ -745,8 +748,10 @@ def split_slurm_string_args(group_configs):
     """Split shell-style string args into List[str] for SlurmWorkers.
 
     ``--further-slurm-args`` and ``--further-apptainer-args`` take a single
-    quoted string on the CLI (argparse rejects ``nargs="+"`` values that
-    look like flags). Split here so downstream code keeps its List[str] API.
+    ``--opt=value`` string on the CLI (argparse rejects ``nargs="+"`` values
+    that look like flags, and rejects a lone dash-leading value for a plain
+    ``store`` action too unless it happens to contain a space). Split here so
+    downstream code keeps its List[str] API.
     """
     slurm_options = group_configs.get("SLURM Job Options", {})
     for key in ("further_slurm_args", "further_apptainer_args"):
