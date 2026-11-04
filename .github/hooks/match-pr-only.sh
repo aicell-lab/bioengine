@@ -24,3 +24,9 @@ while IFS= read -r path; do
         fi
     done
 done
+
+# Finding nothing is a RESULT, not an error. Without this the script inherits the
+# exit status of the last pattern test, so a clean input exits 1 — which a caller
+# running under `set -e` (every GitHub Actions `run:` block) turns into a failed
+# job with no output at all. Exit status 2 above is reserved for a real fault.
+exit 0

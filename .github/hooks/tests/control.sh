@@ -71,5 +71,26 @@ echo "=== control: the refusal must come from the HOOK ==="
 arm "bioengine/** to main, hook REMOVED -> allowed" "bioengine/x.py"         refs/heads/main    ALLOW   no-hook
 
 echo
+echo "=== matcher exit status (the CI half runs under bash -e) ==="
+MATCHER="$(dirname "$HOOK")/match-pr-only.sh"
+status_arm() {
+    local name="$1" input="$2" want="$3"
+    printf '%s\n' "$input" | bash "$MATCHER" >/dev/null 2>&1
+    local got=$?
+    if [ "$got" = "$want" ]; then pass=$((pass+1)); note ok "$name" "-> exit $got"
+    else fail=$((fail+1)); note FAIL "$name" "-> exit $got (wanted $want)"; fi
+}
+status_arm "a MATCH exits 0"                       "bioengine/x.py" 0
+# Finding nothing must be a result, not an error: every Actions `run:` block is
+# `bash -e`, so a 1 here aborts the job with no output whatsoever.
+status_arm "finding NOTHING exits 0, not 1"        "docs/g.md"      0
+
+if bash -e -c 'h=$(printf "docs/g.md\n" | bash "'"$MATCHER"'"); [ -z "$h" ]' 2>/dev/null; then
+    pass=$((pass+1)); note ok "a clean input does not abort a bash -e caller" "-> reached"
+else
+    fail=$((fail+1)); note FAIL "a clean input does not abort a bash -e caller" "-> aborted"
+fi
+
+echo
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
