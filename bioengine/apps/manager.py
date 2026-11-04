@@ -14,6 +14,7 @@ from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
 from ray import serve
+from ray.serve.config import AutoscalingConfig
 
 from bioengine import __version__
 from bioengine.apps.builder import AppBuilder
@@ -420,6 +421,21 @@ def _validate_scaling_map(
                 f"scaling entry for '{dep_name}' has num_replicas="
                 f"{nr}; must be >= 1."
             )
+        if isinstance(asc, dict):
+            # AutoscalingConfig drops unknown keys instead of raising, so a
+            # renamed field reaches Serve and is lost with no warning, and the
+            # deployment silently runs on Serve's defaults. Non-dicts are left
+            # to Serve, as before: set() on one either raises TypeError or
+            # yields characters as key names.
+            valid_keys = set(AutoscalingConfig.model_fields)
+            unknown_keys = sorted(set(asc) - valid_keys)
+            if unknown_keys:
+                raise ValueError(
+                    f"scaling entry for '{dep_name}' has unknown "
+                    f"autoscaling_config key(s) {unknown_keys}; Ray "
+                    f"Serve would drop them silently. Valid keys: "
+                    f"{sorted(valid_keys)}."
+                )
 
 
 class AppsManager:
@@ -1014,9 +1030,11 @@ class AppsManager:
             user_id: ID of the user initiating the undeployment (for logging)
 
         Note:
-            This method handles errors gracefully and logs failures.
-            The application is removed from _deployed_applications even if
-            some cleanup steps fail.
+            This method handles errors gracefully and logs failures. The
+            application is removed from _deployed_applications only if
+            ``serve.delete`` succeeded — a failed delete leaves the app
+            running in Ray Serve, so its tracking entry is restored to keep
+            it visible to ``get_app_status`` and stoppable via ``stop_app``.
         """
         start_time = time.time()
         self.logger.info(
@@ -1029,11 +1047,12 @@ class AppsManager:
         # if the entry survived the serve.delete window, a monitor tick could
         # re-adopt the app mid-stop and re-deploy it, racing the stop. Popping
         # first makes the app invisible to the monitor for the rest of teardown.
-        self._deployed_applications.pop(application_id, None)
+        application_info = self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
         self._missing_from_status.pop(application_id, None)
         self._deleted_pending_redeploy.discard(application_id)
 
+        delete_failed = False
         try:
             await self.ray_cluster.call_with_reconnect(
                 serve.delete, application_id
@@ -1042,6 +1061,7 @@ class AppsManager:
                 f"Deleted Ray Serve application '{application_id}' in {time.time() - start_time:.2f} seconds."
             )
         except Exception as delete_err:
+            delete_failed = True
             self.logger.error(
                 f"Error deleting Ray Serve application '{application_id}' "
                 f"after {time.time() - start_time:.2f} seconds: {delete_err}"
@@ -1058,6 +1078,20 @@ class AppsManager:
             self.logger.error(
                 f"Error clearing application replica history for '{application_id}': {e}"
             )
+
+        if delete_failed and application_info is not None:
+            # The app is still running in Ray Serve. Leaving it untracked makes it
+            # invisible to get_app_status and unreachable by stop_app, so it holds
+            # its GPU forever with no API route to release it. auto_redeploy is
+            # forced off so monitor_applications still ignores it.
+            application_info["auto_redeploy"] = False
+            self._deployed_applications[application_id] = application_info
+            self.logger.error(
+                f"Undeployment of application '{application_id}' FAILED: it is still "
+                "running in Ray Serve. Keeping it tracked so it stays visible and "
+                "can be stopped again."
+            )
+            return
 
         # Remove from internal tracking after all cleanup operations complete
         self._deployed_applications.pop(application_id, None)
@@ -3051,7 +3085,7 @@ class AppsManager:
             description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. A class absent from the map gets no override at all: it keeps whatever num_replicas or autoscaling_config its own @bioengine.app decorator declared, and runs at one fixed replica only if the decorator declares neither — so omitting an entry does NOT pin a class that autoscales itself. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
             examples=[
                 {"DemoApp": {"num_replicas": 3}},
-                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_num_ongoing_requests_per_replica": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
+                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_ongoing_requests": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
             ],
         ),
         context: Dict[str, Any] = Field(
