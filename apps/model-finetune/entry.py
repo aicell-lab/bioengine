@@ -1517,6 +1517,9 @@ class EntryApp:
             metadata = pool.build_contribution_metadata(
                 contribution_id=cid,
                 model_type=model_type,
+                # Empty is the same as unset here: an exported-but-empty var
+                # would otherwise stamp "" and read as a known version.
+                app_version=os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None,
                 cellpose_version=info["cellpose_version"],
                 architecture_signature=signature,
                 base_checkpoint_id=base_checkpoint_id,
@@ -1682,7 +1685,7 @@ class EntryApp:
         self,
         pool_artifact_id: str = Field(..., description="Community pool artifact id."),
         pool_token: str = Field(..., description="COORDINATOR token with WRITE access to the pool. Scoped to the pool, never the app's own HYPHA_TOKEN."),
-        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images (public benchmark, disjoint from ALL contributor training data)."),
+        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images — disjoint from ALL contributor training data; a precondition the app cannot check."),
         gate_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Gate split A ground-truth instance label maps (0=background), one per image."),
         witness_val_images: List[Union[np.ndarray, str]] = Field(..., description="Witness split B images — disjoint from A AND from all training data; never influences selection."),
         witness_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Witness split B ground-truth instance label maps, one per image."),
@@ -1873,7 +1876,8 @@ class EntryApp:
                 cid = c["contribution_id"]
                 trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
                 included = trial_a >= (s_a - eps)
-                members_record.append({"contribution_id": cid, "gate_score": round(trial_a, 4), "included": bool(included)})
+                members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
+                                       "gate_score": round(trial_a, 4), "included": bool(included)})
                 if included:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)

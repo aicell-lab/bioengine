@@ -44,13 +44,19 @@ MANIFEST_NAME = "manifest.json"
 # pooled per-site average.
 METRIC_NAME = "mean instance F1 at IoU 0.5"
 _HOLDOUT = "campaign_holdout"
+# A basis string is published provenance, so it may only state what this app can
+# check. Split A and B arrive as caller-supplied arrays; their disjointness is a
+# precondition of aggregate(), never something verified here. Name the corpus by the
+# gate_split/witness_split hash on the same record and attribute the rest.
 SELECTION_BASIS = (
-    "the score the greedy gate admitted contributions against, on split A, a public "
-    "benchmark disjoint from every contributor's training data"
+    "the score the greedy gate admitted contributions against, on split A, the corpus "
+    "recorded as gate_split on this record and declared by the coordinator disjoint "
+    "from every contributor's training data"
 )
 WITNESS_BASIS = (
-    "scored on the disjoint witness split B, held back from the selection split and "
-    "from every contributor, the only number the improvement curve plots"
+    "scored on split B, the corpus recorded as witness_split on this record and declared "
+    "by the coordinator held back from split A and from every contributor, the only "
+    "number the improvement curve plots"
 )
 EMPTY_SELECTION_BASIS = (
     "the score the greedy gate required a contribution to beat on split A, which none "
@@ -142,6 +148,23 @@ def architecture_signature(state_dict: Dict[str, Any]) -> str:
     )
     payload = json.dumps(items, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def state_dict_digest(state_dict: Dict[str, Any]) -> str:
+    """sha256 over a state_dict's keys, shapes, dtypes and raw weight bytes.
+
+    Digests the TENSORS rather than a file ``torch.save`` wrote: torch's zip
+    container embeds the target file's stem in every record name, so hashing the
+    saved bytes makes the digest a function of the filename and two merges of
+    identical members can never agree. This is reproducible by construction and
+    independent of the container format.
+    """
+    h = hashlib.sha256()
+    for name in sorted(state_dict):
+        t = state_dict[name]
+        h.update(f"{name}|{tuple(t.shape)}|{t.dtype}|".encode("utf-8"))
+        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
 
 
 # Entries that live in a cpsam state_dict but are data statistics rather than
@@ -535,6 +558,7 @@ def build_contribution_metadata(
     *,
     contribution_id: str,
     model_type: str,
+    app_version: Optional[str],
     cellpose_version: str,
     architecture_signature: str,
     base_checkpoint_id: str,
@@ -550,11 +574,18 @@ def build_contribution_metadata(
     """A contribution's metadata.json. ``samples_seen`` and ``l2_from_base`` are
     recorded on every contribution but only become load-bearing under specific
     aggregation families (sample-weighting, drift bound) — recording them now
-    keeps the pool auditable regardless of which family Nils picks."""
+    keeps the pool auditable regardless of which family Nils picks.
+
+    ``app_version`` is written unconditionally, null included: a field that is
+    absent when unknown cannot be told apart from one written before versions
+    were stamped at all, which is the ambiguity it exists to remove.
+    ``schema_version`` does not cover it — 0.27.6 moved every ``l2_from_base``
+    value without changing the record's shape."""
     return {
         "schema_version": SCHEMA_VERSION,
         "contribution_id": contribution_id,
         "model_type": model_type,
+        "app_version": app_version,
         "cellpose_version": cellpose_version,
         "architecture_signature": architecture_signature,
         "base_checkpoint_id": base_checkpoint_id,
@@ -594,7 +625,8 @@ def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
 def append_merge(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append one merge event to the timeline. ``entry`` carries
     ``{published_version|None, baseline_version, members[{contribution_id,
-    gate_score, included}], selection_metric (RoundMetric role=selection),
+    marginal_score, gate_score, included}] (admission-ordered, see
+    ``community_manifest``), selection_metric (RoundMetric role=selection),
     witness_metric (RoundMetric role=witness, or None when nothing was admitted),
     global_sha256|None, transport, deferred[], created_at}``. A merge with
     ``published_version=None`` admitted nothing and projects to an empty_merge
@@ -657,11 +689,17 @@ def build_community_manifest(
     is the only number the improvement curve plots — reporting the selection metric
     as the curve would be circular. Both are role-tagged RoundMetric records, so the
     role is a property of the stored artifact, not an assignment the page makes.
-    ``members`` records every candidate weighed as ``{contribution_id, gate_score,
-    included}`` for internal audit (a rejected candidate reads "evaluated, not
-    included", never a failure); the per-member gate_score is audit-only and is
-    stripped from the wire projection. ``combine`` is "uniform" unless sample-
-    weighting was empirically justified for this version."""
+    ``members`` records every candidate weighed as ``{contribution_id,
+    marginal_score, gate_score, included}`` for internal audit (a rejected candidate
+    reads "evaluated, not included", never a failure), **in the order the gate
+    weighed them** — the admitted subsequence is the order ``uniform_soup``
+    accumulated in, and float addition is not associative, so reordering this list
+    loses the only record of which checkpoint was published. ``marginal_score`` is
+    what that ordering was sorted on (the candidate's score against the head as it
+    stood); ``gate_score`` is the cumulative score of the soup including it, so the
+    two are not interconvertible. Both are audit-only and stripped from the wire
+    projection. ``combine`` is "uniform" unless sample-weighting was empirically
+    justified for this version."""
     return {
         "schema_version": SCHEMA_VERSION,
         "community_version": community_version,
@@ -729,7 +767,7 @@ def assert_compatible(index: Dict[str, Any], *, model_type: str, signature: str)
 # The backend stores pool_index.json in its own shape; the campaign page reads the
 # subset below. This projection is where the page's data model is produced: it
 # partitions the merge timeline into published soups and empty merges, strips the
-# audit-only per-member gate_score (a per-candidate score in the wire payload is a
+# audit-only per-member scores (a per-candidate score in the wire payload is a
 # contract violation — assessed is IDs only), and surfaces the role-tagged metrics
 # straight from storage. Pure and torch-free so the contract is unit-testable.
 

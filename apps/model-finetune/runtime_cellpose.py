@@ -346,9 +346,10 @@ class CellposeRuntime:
         """GET a member checkpoint, retrying a truncated or dropped read.
 
         The URL is a presigned GET for an immutable pool ``weights_path``, so a
-        retry cannot return different bytes. ``read()`` on a response the server
-        cut short raises ``IncompleteRead`` only when a Content-Length was sent;
-        without one it returns short silently, so the length is re-checked here.
+        retry cannot return different bytes. ``read()`` raises ``IncompleteRead``
+        on a response the server cut short whether or not a Content-Length was
+        sent (measured: a truncated *chunked* body raises too), so the explicit
+        length check below is a second line of defence, not the only one.
         An ``HTTPError`` is a verdict (403 on an expired presign, 404 on a wrong
         key) and will not heal, so it is not retried.
         """
@@ -472,9 +473,12 @@ class CellposeRuntime:
         # are both released before the next merge starts allocating.
         async with self._soup_sem:
             soup = await asyncio.to_thread(self._build_soup, members)
+            # Digest the tensors, not the saved file: the random stem below lands in
+            # every torch zip record name, so a file digest would differ on every
+            # merge of the same members. The stem stays random for #0083.
+            sha = await asyncio.to_thread(pool.state_dict_digest, soup)
             path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
             await asyncio.to_thread(lambda: torch.save(soup, str(path)))
-            sha = await asyncio.to_thread(pool.sha256_file, str(path))
             n_bytes = path.stat().st_size
 
             def _put():
