@@ -11,6 +11,7 @@ try:
     )
 except ImportError:
     pass
+from . import host_census
 from .geo_location import fetch_centroid_coordinates, fetch_geolocation
 from .host_memory import head_memory_budget_warning, read_meminfo
 from .logger import (
