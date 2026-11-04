@@ -23,7 +23,10 @@ setup() {
     git config core.hooksPath "$ROOT/hooks"
     mkdir -p "$ROOT/hooks"
     if [ "${1:-with-hook}" = "with-hook" ]; then
-        cp "$HOOK" "$ROOT/hooks/pre-push"; chmod +x "$ROOT/hooks/pre-push"
+        cp "$HOOK" "$ROOT/hooks/pre-push"
+        cp "$(dirname "$HOOK")/match-pr-only.sh" "$ROOT/hooks/"
+        cp "$(dirname "$HOOK")/pr-only-paths.txt" "$ROOT/hooks/"
+        chmod +x "$ROOT/hooks/pre-push" "$ROOT/hooks/match-pr-only.sh"
     else
         rm -f "$ROOT/hooks/pre-push"
     fi
@@ -42,7 +45,11 @@ arm() {
     git push origin "HEAD:$ref" >/dev/null 2>"$ROOT/err.txt"
     local rc=$?
     local got; [ $rc -eq 0 ] && got=ALLOW || got=REFUSE
-    if [ "$got" = "$expect" ]; then
+    if [ "$got" = "REFUSE" ] && [ "$expect" = "REFUSE" ] \
+       && ! grep -q "pre-push: REFUSED" "$ROOT/err.txt"; then
+        fail=$((fail+1)); note FAIL "$name" "-> refused, but NOT by the policy"
+        sed 's/^/        /' "$ROOT/err.txt" | head -3
+    elif [ "$got" = "$expect" ]; then
         pass=$((pass+1)); note ok "$name" "-> $got"
     else
         fail=$((fail+1)); note FAIL "$name" "-> $got (wanted $expect)"
