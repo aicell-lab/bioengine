@@ -201,7 +201,9 @@ class SlurmWorkers:
                 '"$CONTAINER_CMD" exec',
                 "--nv",
                 "--cleanenv",
-                "--env=SLURM_JOB_ID='${SLURM_JOB_ID}'",
+                # Double quotes: single ones would forward the literal
+                # "${SLURM_JOB_ID}", which the runtime passes through as empty.
+                '--env=SLURM_JOB_ID="${SLURM_JOB_ID}"',
                 "--pwd /app",
                 f"--bind {self.worker_workspace_dir}:${{HOME}}/.bioengine",
             ]
@@ -239,8 +241,15 @@ class SlurmWorkers:
                 f"""
             VRAM_RESOURCE=""
             if [ {num_gpus} -eq 1 ] && command -v nvidia-smi >/dev/null 2>&1; then
+                MIG_MODE=$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '[:space:]')
                 VRAM_PER_GPU=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -dc '0-9')
-                if [ -n "$VRAM_PER_GPU" ] && [ "$VRAM_PER_GPU" -gt 0 ] 2>/dev/null; then
+                if [ "$MIG_MODE" = "Enabled" ]; then
+                    # On a MIG allocation nvidia-smi reports the parent device's memory,
+                    # not the slice the job may actually use, and no --query-gpu field
+                    # exposes the slice. Advertising the parent's figure would let a
+                    # replica claim several times the memory it can address.
+                    echo "MIG is enabled on this node; the slice's true memory is not discoverable. VRAM-based packing will be unavailable on this node."
+                elif [ -n "$VRAM_PER_GPU" ] && [ "$VRAM_PER_GPU" -gt 0 ] 2>/dev/null; then
                     VRAM_RESOURCE=", \\"VRAM_MB\\": $VRAM_PER_GPU"
                 else
                     echo "Could not detect GPU VRAM; VRAM-based packing will be unavailable on this node."
