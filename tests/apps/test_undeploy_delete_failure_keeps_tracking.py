@@ -40,6 +40,9 @@ def _make_manager(delete_raises: bool) -> AppsManager:
 
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test.undeploy")
+    # monitor_applications opens with _renew_proxy_tokens, which reads this and
+    # returns early when it is falsy. Nothing here is about token renewal.
+    manager.server = None
     manager._redeploy_backoff = {APP_ID: {"consecutive_failures": 1}}
     manager._missing_from_status = {APP_ID: 2}
     manager._deleted_pending_redeploy = {APP_ID}
