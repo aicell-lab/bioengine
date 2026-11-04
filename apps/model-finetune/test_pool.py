@@ -377,3 +377,51 @@ def test_cap_is_actually_enforced_not_just_approached(tmp_path):
     assert sum(p.stat().st_size for p in tmp_path.glob("member-*.pt")) <= 250
     # and it kept the NEWEST, not an arbitrary two
     assert remaining == ["member-8.pt", "member-9.pt"]
+
+
+# ── a deposit record must always name the app version that wrote it (#0116) ──
+#
+# 0.27.6 moved every ``l2_from_base`` value without touching ``schema_version``,
+# so the record's shape cannot date its own contents. These pin the field that
+# can. The null case is the load-bearing one: an ABSENT key is what a pre-0116
+# writer produces, so writing the key with None is the only thing that tells
+# "this writer did not know its version" apart from "this writer did not stamp".
+
+def _metadata(app_version):
+    return pool.build_contribution_metadata(
+        contribution_id="c-1",
+        model_type="cpsam",
+        app_version=app_version,
+        cellpose_version="4.0.1",
+        architecture_signature="sig",
+        base_checkpoint_id="stock-cpsam",
+        base_checkpoint_sha256=None,
+        samples_seen=10,
+        training_params={},
+        l2_from_base=None,
+        dataset_fingerprint=None,
+        solo_val_metric=None,
+        weights_sha256="deadbeef",
+        uploaded_at=0.0,
+    )
+
+
+def test_app_version_is_recorded():
+    assert _metadata("0.27.14")["app_version"] == "0.27.14"
+
+
+def test_app_version_key_is_present_even_when_unknown():
+    """The key, not the value, is what a consumer partitions on."""
+    assert "app_version" in _metadata(None)
+    assert _metadata(None)["app_version"] is None
+
+
+def test_app_version_does_not_collide_with_the_other_version_fields():
+    """Discrimination control: three distinct version-ish fields live in this
+    record and a fix that overwrote the wrong one would still pass the two
+    tests above. cellpose_version names the library, schema_version the record
+    shape, app_version the code that computed the values."""
+    m = _metadata("0.27.14")
+    assert m["cellpose_version"] == "4.0.1"
+    assert m["schema_version"] == pool.SCHEMA_VERSION
+    assert m["app_version"] != m["cellpose_version"] != m["schema_version"]
