@@ -26,6 +26,7 @@ import click
 
 from bioengine import __version__
 from bioengine.cli.utils import error_exit
+from bioengine.utils import read_meminfo
 
 DEFAULT_IMAGE_REPO = "ghcr.io/aicell-lab/bioengine-worker"
 DEFAULT_CONTAINER_NAME = "bioengine-worker"
@@ -33,6 +34,46 @@ DEFAULT_WORKSPACE_DIR = Path.home() / ".bioengine"
 # The path the image mounts the workspace at — see docs/deployment-guide.md.
 CONTAINER_WORKSPACE_DIR = "/.bioengine"
 DEFAULT_SHM_SIZE = "8g"
+
+# Workers on one host advertise their configured resources here so each can see
+# what its co-tenants were promised. A worker cannot read a sibling's cgroup or
+# argv from inside its own container, so this shared directory is the only way
+# those reservations become comparable. Sibling of the per-worker workspace
+# directory, so one host's workers share it however they name their own.
+DEFAULT_CENSUS_DIR = Path.home() / ".bioengine-hosts"
+CONTAINER_CENSUS_DIR = "/.bioengine-hosts"
+# Share of host memory the container may use when --memory is left at "auto".
+# Deliberately generous: the point of a default is to give Ray a cgroup number
+# to budget against instead of the host's total, which it gets at any cap. A
+# tight default would instead turn working single-machine deployments into
+# crash loops, because exceeding a cgroup limit kills processes inside the
+# container. Bounding BioEngine's share of a *shared* host is a separate
+# problem that a number chosen here cannot solve — see the co-tenancy census.
+DEFAULT_MEMORY_FRACTION = 0.9
+AUTO_MEMORY = "auto"
+_MEMORY_DISABLED = ("none", "0", "")
+
+
+def _auto_memory_limit() -> Optional[str]:
+    """Container limit for ``--memory auto``, or None if it can't be computed."""
+    try:
+        mem_total = read_meminfo()["MemTotal"]
+    except Exception:
+        # Advisory: a host whose meminfo cannot be read simply gets no limit,
+        # which is the behaviour from before this flag existed.
+        return None
+    gib = int(mem_total * DEFAULT_MEMORY_FRACTION) // (1024**3)
+    return f"{gib}g" if gib > 0 else None
+
+
+def resolve_memory(memory: str) -> Optional[str]:
+    """Turn the ``--memory`` option into a runtime value, or None for no limit."""
+    value = (memory or "").strip().lower()
+    if value in _MEMORY_DISABLED:
+        return None
+    if value == AUTO_MEMORY:
+        return _auto_memory_limit()
+    return memory.strip()
 
 # Only the GPU flag differs between docker and podman (deployment-guide.md).
 _GPU_FLAGS = {
@@ -93,13 +134,29 @@ def _nvidia_device_flags() -> List[str]:
 _RUNTIME_PREFERENCE = ("docker", "podman", "apptainer", "singularity")
 
 
-def _passthrough_env(token: Optional[str], server_url: Optional[str]) -> dict:
+def _passthrough_env(
+    token: Optional[str],
+    server_url: Optional[str],
+    container_name: Optional[str] = None,
+    census: bool = False,
+) -> dict:
     """The variables the container needs, keyed by name.
 
     Built from the resolved option values, not from ``os.environ`` — ``--token``
     only reaches the environment later, in ``_subprocess_env``.
     """
-    resolved = (("HYPHA_TOKEN", token), ("BIOENGINE_SERVER_URL", server_url))
+    resolved = [
+        ("HYPHA_TOKEN", token),
+        ("BIOENGINE_SERVER_URL", server_url),
+    ]
+    if census:
+        # The container name is what an operator recognises in a co-tenancy
+        # warning; without it the worker falls back to its own hostname, which
+        # is the container id.
+        resolved += [
+            ("BIOENGINE_HOST_CENSUS_DIR", CONTAINER_CENSUS_DIR),
+            ("BIOENGINE_WORKER_ID", container_name),
+        ]
     return {name: value for name, value in resolved if value}
 
 
@@ -126,11 +183,13 @@ def build_command(
     workspace_dir: Path,
     container_name: str,
     shm_size: str,
+    memory: Optional[str],
     gpus: bool,
     detach: bool,
     tty: bool,
     token: Optional[str],
     server_url: Optional[str],
+    census_dir: Optional[Path] = None,
 ) -> List[str]:
     """Build the container invocation. Secrets travel in the environment, never argv."""
     entrypoint = ["python", "-m", "bioengine.worker", *worker_args]
@@ -143,19 +202,31 @@ def build_command(
         if gpus:
             command += _GPU_FLAGS[runtime]
         command += ["--bind", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
+        if census_dir:
+            command += ["--bind", f"{census_dir}:{CONTAINER_CENSUS_DIR}"]
         return command + [f"docker://{image}", *entrypoint]
+
+    # ``--memory`` is docker/podman only. apptainer applies cgroups through a
+    # separate TOML file, so it is rejected in the command handler rather than
+    # silently dropped here.
 
     command = [runtime, "run", "--rm"]
     command += ["--detach"] if detach else ["-it" if tty else "-i"]
     command += ["--name", container_name]
     command += ["--user", f"{os.getuid()}:{os.getgid()}"]
     command += ["--shm-size", shm_size]
+    if memory:
+        command += ["--memory", memory]
     if gpus:
         command += _GPU_FLAGS[runtime]
         if runtime == "docker":
             command += _nvidia_device_flags()
     command += ["-v", f"{workspace_dir}:{CONTAINER_WORKSPACE_DIR}"]
-    for name in _passthrough_env(token, server_url):
+    if census_dir:
+        command += ["-v", f"{census_dir}:{CONTAINER_CENSUS_DIR}"]
+    for name in _passthrough_env(
+        token, server_url, container_name, census=bool(census_dir)
+    ):
         command += ["-e", name]
     return command + [image, *entrypoint]
 
@@ -195,8 +266,14 @@ def _container_exists(runtime: str, container_name: str) -> bool:
     return bool(result.stdout.strip())
 
 
-def _subprocess_env(runtime: str, token: Optional[str], server_url: Optional[str]) -> dict:
-    passthrough = _passthrough_env(token, server_url)
+def _subprocess_env(
+    runtime: str,
+    token: Optional[str],
+    server_url: Optional[str],
+    container_name: Optional[str] = None,
+    census: bool = False,
+) -> dict:
+    passthrough = _passthrough_env(token, server_url, container_name, census)
     env = dict(os.environ)
     env.update(passthrough)
     if runtime in _SIF_RUNTIMES:
@@ -227,6 +304,18 @@ def _resolve_runtime(runtime: str, require_available: bool = True) -> str:
             "Install one, or pass --runtime native to run the worker in this environment.",
         )
     return detected
+
+
+def _create_option_dir(path: Path, option: str) -> None:
+    """Create a directory named by a CLI option, reporting which one on failure."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        error_exit(
+            f"{option} {path} could not be created: "
+            f"{exc.strerror or exc.__class__.__name__}.",
+            "Point it at a path this user can create, or create it beforehand.",
+        )
 
 
 @click.group("worker")
@@ -261,6 +350,22 @@ def worker_group():
     help="Host directory mounted as the worker workspace.",
 )
 @click.option(
+    "--census-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=DEFAULT_CENSUS_DIR,
+    show_default=True,
+    help="Host directory where workers advertise their configured resources so "
+    "each can warn when this host has been promised more memory or the same GPU "
+    "twice. Shared by every worker on the host; pass --no-census to opt out.",
+)
+@click.option(
+    "--census/--no-census",
+    default=True,
+    show_default=True,
+    help="Join the host resource census. Advisory only — it adds startup "
+    "warnings and a worker-status field, and changes nothing about scheduling.",
+)
+@click.option(
     "--name",
     "container_name",
     default=DEFAULT_CONTAINER_NAME,
@@ -269,6 +374,21 @@ def worker_group():
 )
 @click.option(
     "--shm-size", default=DEFAULT_SHM_SIZE, show_default=True, help="Shared memory size."
+)
+@click.option(
+    "--memory",
+    default=AUTO_MEMORY,
+    show_default=True,
+    metavar="LIMIT",
+    help="Container memory limit, passed to the runtime as --memory. 'auto' is "
+    f"{DEFAULT_MEMORY_FRACTION:.0%} of this host's total memory; give a size "
+    "(e.g. 32g) to set it yourself, or 'none' for no limit. It exists because "
+    "Ray sizes its own memory monitor from the cgroup limit when there is one "
+    "and from the host's total when there is not — so an unlimited worker only "
+    "starts shedding its own tasks once the whole machine is nearly gone, by "
+    "which point the kernel's OOM killer has usually acted, and it kills Ray's "
+    "workers first. Keep the limit above --head-memory-in-gb, which is a Ray "
+    "scheduling reservation rather than a cap. Docker and podman only.",
 )
 @click.option(
     "--gpus/--no-gpus",
@@ -294,8 +414,11 @@ def worker_start(
     runtime,
     image,
     workspace_dir,
+    census_dir,
+    census,
     container_name,
     shm_size,
+    memory,
     gpus,
     detach,
     token,
@@ -317,6 +440,26 @@ def worker_start(
     """
     runtime = _resolve_runtime(runtime, require_available=not dry_run)
 
+    # Refuse rather than drop it: a memory limit that is silently ignored is
+    # the exact failure this option exists to prevent, and the operator would
+    # believe the worker was capped when it was not.
+    #
+    # Only an EXPLICIT limit is refused. The default must stay silent here, or
+    # every apptainer and native run would fail on an option its operator never
+    # typed.
+    requested = (memory or "").strip().lower()
+    cannot_apply_a_limit = runtime in (*_SIF_RUNTIMES, "native")
+    if cannot_apply_a_limit and requested not in (AUTO_MEMORY, *_MEMORY_DISABLED):
+        error_exit(
+            f"--memory is not supported with runtime '{runtime}'.",
+            "Docker and podman apply it as a cgroup limit; apptainer and "
+            "singularity take cgroups from a separate TOML file, and 'native' "
+            "has no container to limit. Drop --memory, or cap the worker from "
+            "outside (systemd MemoryMax=, or a cgroup you place it in).",
+        )
+
+    memory_limit = None if cannot_apply_a_limit else resolve_memory(memory)
+
     if gpus is None:
         gpus = _has_gpu()
 
@@ -326,7 +469,12 @@ def worker_start(
 
     workspace_dir = workspace_dir.expanduser()
     if runtime != "native" and not dry_run:
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        _create_option_dir(workspace_dir, "--workspace-dir")
+
+    # Native runs read the host directly, so the census has nothing to bind.
+    census_dir = census_dir.expanduser() if census and runtime != "native" else None
+    if census_dir and not dry_run:
+        _create_option_dir(census_dir, "--census-dir")
 
     command = build_command(
         runtime=runtime,
@@ -335,11 +483,13 @@ def worker_start(
         workspace_dir=workspace_dir,
         container_name=container_name,
         shm_size=shm_size,
+        memory=memory_limit,
         gpus=gpus,
         detach=detach,
         tty=sys.stdin.isatty(),
         token=token,
         server_url=server_url,
+        census_dir=census_dir,
     )
 
     if dry_run:
@@ -353,7 +503,9 @@ def worker_start(
             f"or start this one under a different --name.",
         )
 
-    env = _subprocess_env(runtime, token, server_url)
+    env = _subprocess_env(
+        runtime, token, server_url, container_name, census=bool(census_dir)
+    )
     try:
         raise SystemExit(subprocess.call(command, env=env))
     except FileNotFoundError:

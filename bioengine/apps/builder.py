@@ -817,6 +817,11 @@ class AppBuilder:
             "workspace": self.server.config.workspace,
             "worker_client_id": self.server.config.client_id,
             "proxy_service_token": proxy_service_token,
+            # The proxy renews its own token before this TTL runs out. Without
+            # these it has no way to know when that is: a deploy is the only
+            # thing that mints one, so an adopted app would 401 at 30 days.
+            "proxy_service_token_issued_at": proxy_service_token_issued_at,
+            "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
             "authorized_users": effective_authorized_users,
             "proxy_actor_name": self.proxy_actor_name,
             "debug": debug,
@@ -1003,6 +1008,7 @@ class BuiltApp:
         self.replica_env_vars = replica_env_vars
         self.proxy_memory_in_gb = proxy_memory_in_gb
         # Map of {user_deployment_class_name: {num_replicas, autoscaling_config}}.
-        # Empty default means every user deployment runs at Ray Serve's default
-        # of one replica with no autoscaling.
+        # An absent class gets no override, so it keeps what its own
+        # @bioengine.app decorator declared — an empty map is NOT "one replica
+        # with no autoscaling" for a class that declares autoscaling_config.
         self.scaling = dict(scaling or {})
