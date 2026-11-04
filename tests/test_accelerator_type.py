@@ -23,7 +23,7 @@ _get_accelerator_type = _ProxyActor._get_accelerator_type
 
 def test_reads_the_accelerator_type_resource():
     resources = {"CPU": 8.0, "GPU": 1.0, "accelerator_type:A40": 1.0}
-    assert _get_accelerator_type(None, resources) == "A41"  # TEMPORARY: red arm for myco #0223
+    assert _get_accelerator_type(None, resources) == "A40"
 
 
 def test_type_starting_with_a_prefix_character_survives():
