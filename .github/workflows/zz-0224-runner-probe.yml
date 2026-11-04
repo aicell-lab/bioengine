@@ -1,0 +1,75 @@
+name: 0224 runner probe
+
+# THROWAWAY. Measures, on ubuntu-latest, whether the suite goes green when the
+# dependencies come from the repository's own extras instead of the published
+# worker image — the open question on backlog #0224. Not a gate: it is
+# continue-on-error on purpose, so the probe reports numbers without blocking
+# the PR it rides on. Delete with the branch.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  runner-probe:
+    name: 0224-runner-probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install the package and its extras
+        id: install
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip
+          time pip install -e ".[cli,datasets,worker,dev]"
+
+      - name: Report what the install resolved
+        if: always()
+        run: |
+          echo "install outcome: ${{ steps.install.outcome }}"
+          python -c "import sys; print('python', sys.version)"
+          pip list 2>/dev/null | grep -Ei '^(ray|aiortc|zarr|hypha-rpc|pydantic|numpy|protobuf) ' || echo "none of the probed packages are installed"
+
+      - name: Run the same subset the real gate runs
+        id: suite
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python -m pytest -p no:cacheprovider tests/ \
+            --ignore=tests/end_to_end \
+            --ignore=tests/apps/cellpose/test_ui_e2e.py \
+            --junitxml=junit-runner.xml
+
+      - name: Numbers, whatever happened
+        if: always()
+        run: |
+          echo "install=${{ steps.install.outcome }} suite=${{ steps.suite.outcome }}"
+          python - <<'PY'
+          import xml.etree.ElementTree as ET, os
+          if not os.path.exists("junit-runner.xml"):
+              print("NO JUNIT REPORT — the suite did not reach the point of writing one")
+              raise SystemExit(0)
+          root = ET.parse("junit-runner.xml").getroot()
+          suites = root.findall("testsuite") or [root]
+          t = sum(int(s.get("tests", 0)) for s in suites)
+          sk = sum(int(s.get("skipped", 0)) for s in suites)
+          f = sum(int(s.get("failures", 0)) for s in suites)
+          e = sum(int(s.get("errors", 0)) for s in suites)
+          print(f"RUNNER-PROBE collected={t} skipped={sk} ran={t-sk} failures={f} errors={e}")
+          PY
