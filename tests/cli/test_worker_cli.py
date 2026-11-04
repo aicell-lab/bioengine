@@ -345,6 +345,69 @@ def test_a_free_container_name_starts_the_worker(monkeypatch, tmp_path):
     assert started and started[0][0][:3] == ["docker", "run", "--rm"]
 
 
+# ── An uncreatable directory names the option that carried it ────────────────
+#
+# `worker start` creates two directories from two different options, and an
+# operator with a typo got an uncaught OSError traceback: it said what the OS
+# refused but never which option held the bad path. Both options are covered
+# because routing one through the helper and not the other is the likely
+# regression, and a test of only the first would not see it.
+
+
+def test_a_bad_workspace_dir_names_the_option(monkeypatch, tmp_path):
+    started = _fake_runtime(monkeypatch, "")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+
+    result = _run(
+        [
+            "start",
+            "--runtime",
+            "docker",
+            "--workspace-dir",
+            str(blocker / "ws"),
+            "--",
+            "--mode",
+            "single-machine",
+        ]
+    )
+
+    assert not isinstance(result.exception, OSError), result.exception
+    assert result.exit_code == 1
+    assert "--workspace-dir" in result.output
+    assert str(blocker / "ws") in result.output
+    assert started == []
+
+
+def test_a_bad_census_dir_names_the_option(monkeypatch, tmp_path):
+    """The census directory is the second one, and it is created after the
+    workspace succeeds — so this fails if only the first site was routed."""
+    started = _fake_runtime(monkeypatch, "")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+
+    result = _run(
+        [
+            "start",
+            "--runtime",
+            "docker",
+            "--workspace-dir",
+            str(tmp_path / "ws"),
+            "--census-dir",
+            str(blocker / "hosts"),
+            "--",
+            "--mode",
+            "single-machine",
+        ]
+    )
+
+    assert not isinstance(result.exception, OSError), result.exception
+    assert result.exit_code == 1
+    assert "--census-dir" in result.output
+    assert str(blocker / "hosts") in result.output
+    assert started == []
+
+
 # ── The token reaches the container, however it was supplied ──────────────────
 #
 # Asserting on build_command or _subprocess_env alone passes on either side of
