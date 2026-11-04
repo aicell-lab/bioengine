@@ -246,3 +246,4 @@ Supported by the SciLifeLab & Wallenberg Data Driven Life Science Program (KAW 2
 <!-- Throwaway for backlog #0225: a docs-only diff on a branch whose base is behind
 main. Under the two-dot comparison check-version demands a bump; under three dots it
 must not. Closed, not merged. -->
+<!-- re-triggered after the three-dot fix landed as 7578b0b -->
