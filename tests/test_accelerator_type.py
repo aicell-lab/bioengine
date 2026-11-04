@@ -298,3 +298,5 @@ def test_an_unexpected_fetch_error_is_not_swallowed(monkeypatch):
 )
 def test_cli_label_names_the_schedulable_value(info, expected):
     assert _format_gpu_label(info) == expected
+
+# red arm for myco #0223: pushed while the PR is NON-draft
