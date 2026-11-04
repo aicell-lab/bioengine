@@ -70,6 +70,8 @@ def _make_manager(
 
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test.holes")
+    # No Hypha client: the token renewal the monitor runs first returns at once.
+    manager.server = None
     manager._redeploy_backoff = {}
     manager._identity_warned = set()
     # Bookkeeping the monitor keeps for its other branches; empty is the
