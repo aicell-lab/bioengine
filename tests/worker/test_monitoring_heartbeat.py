@@ -414,3 +414,6 @@ async def test_failing_steps_keep_the_heartbeat_beating(tmp_path):
         assert is_fresh is True, reason
     finally:
         await _stop_loop(task)
+
+# Throwaway for backlog #0223: confirms a DRAFT skips the test-suite gate and
+# that marking it ready FIRES the run. Closed, not merged.
