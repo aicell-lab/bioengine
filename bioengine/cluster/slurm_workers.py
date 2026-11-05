@@ -667,9 +667,12 @@ class SlurmWorkers:
                     )
 
                 # Check if the worker node has already been added to the Ray cluster
-                cluster_state = (
-                    await self.ray_cluster.proxy_actor_handle.get_cluster_state.remote()
-                )
+                # Bounded, like every other read of this call: an unbounded await here
+                # never returns and never raises, so the `finally` below never clears
+                # ``worker_creation_task``, and ``can_scale_up`` then refuses every
+                # future scale-up for the lifetime of the worker. The submitted job
+                # stays submitted and nothing logs, retries or recovers.
+                cluster_state = await self.ray_cluster._get_cluster_state_bounded()
                 node_id = None
                 for candidate_id, node_resources in cluster_state["nodes"].items():
                     if node_resources["slurm_job_id"] == submitted_job_id:

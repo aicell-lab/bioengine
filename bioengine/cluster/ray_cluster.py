@@ -20,6 +20,7 @@ from bioengine.cluster._ray_compat import RAY_PROCESSES, psutil
 from bioengine.cluster.proxy_actor import BioEngineProxyActor
 from bioengine.cluster.slurm_workers import SlurmWorkers
 from bioengine.utils import (
+    CLUSTER_STATE_TIMEOUT_S,
     RECONNECT_BUDGET_S,
     STARTUP_CONNECT_BUDGET_S,
     acquire_free_port,
@@ -1091,7 +1092,7 @@ class RayCluster:
             )
 
             # Test the connection by getting the cluster state
-            await self.proxy_actor_handle.get_cluster_state.remote()
+            await self._get_cluster_state_bounded()
             self.logger.info(
                 f"Connected to Ray cluster at '{self.address}' with Serve HTTP URL {self.serve_http_url}"
             )
@@ -1346,6 +1347,21 @@ class RayCluster:
             await self.reconnect()
             return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def _get_cluster_state_bounded(self):
+        """Fetch cluster state with a ceiling on the round trip.
+
+        A head node that has stopped answering without dying leaves this call
+        pending forever, and because the monitoring steps are sequential
+        awaits that one wait stops the whole pass — app recovery and
+        proxy-token renewal included. ``TimeoutError`` is not a stale-handle
+        error, so it propagates to the per-step error path and counts towards
+        ``_monitor_consecutive_errors`` rather than triggering a reconnect.
+        """
+        return await asyncio.wait_for(
+            self.proxy_actor_handle.get_cluster_state.remote(),
+            timeout=CLUSTER_STATE_TIMEOUT_S,
+        )
+
     async def _get_cluster_state_with_reconnect(self):
         """Fetch cluster state, recovering once from a stale proxy handle.
 
@@ -1354,7 +1370,7 @@ class RayCluster:
         ``get_if_exists=True`` so the retry lands on a live actor.
         """
         try:
-            return await self.proxy_actor_handle.get_cluster_state.remote()
+            return await self._get_cluster_state_bounded()
         except Exception as exc:
             if not _is_stale_handle_error(exc):
                 raise
@@ -1363,7 +1379,7 @@ class RayCluster:
                 f"Reconnecting and retrying once."
             )
             await self.reconnect()
-            return await self.proxy_actor_handle.get_cluster_state.remote()
+            return await self._get_cluster_state_bounded()
 
     async def monitor_cluster(self) -> None:
         """Monitor cluster status and update worker nodes history."""
