@@ -271,6 +271,58 @@ def stop_requested(session_id: str) -> bool:
     return _stop_path(session_id).exists()
 
 
+def exports_root() -> Path:
+    # Beside the sessions under the mounted ~/.bioengine, so an export handle
+    # outlives the entry replica that minted it and the entry can scale to zero.
+    root = Path.home() / ".bioengine" / "exports"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _export_path(export_id: str) -> Path:
+    return exports_root() / f"{export_id}.json"
+
+
+def read_export(export_id: str) -> Dict[str, Any]:
+    p = _export_path(export_id)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def write_export(export_id: str, **fields) -> Dict[str, Any]:
+    """Atomically merge fields into the export's record."""
+    cur = read_export(export_id)
+    cur.update(fields)
+    cur["export_id"] = export_id
+    cur["updated_at"] = time.time()
+    p = _export_path(export_id)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cur))
+    os.replace(tmp, p)
+    return cur
+
+
+def get_export(export_id: str) -> Dict[str, Any]:
+    """The export record, with an unattended one swept to FAILED.
+
+    Only the entry that is building an export advances its record, and nothing
+    awaits that build, so the entry can be scaled away mid-export. Without the
+    sweep such a record would poll at BUILDING forever; the entry heartbeats it
+    while the build is genuinely alive.
+    """
+    rec = read_export(export_id)
+    if rec and rec.get("status") in ("PENDING", "BUILDING") and \
+            time.time() - rec.get("updated_at", 0) > STATUS_STALE_SECONDS:
+        rec["status"] = "FAILED"
+        rec["message"] = "failed"
+        rec["error"] = "the export was interrupted before the package was staged"
+    return rec
+
+
 def _set_pdeathsig() -> None:
     """preexec_fn: ask the kernel to SIGKILL this child when its parent (the runtime
     replica) dies, so a training subprocess cannot outlive an OOM-killed supervisor
