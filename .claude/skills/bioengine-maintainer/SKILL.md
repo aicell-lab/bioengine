@@ -438,6 +438,18 @@ Where an assertion genuinely cannot be made durable — a live cluster reading, 
 
 Previously-merged PRs and existing issues that violate this style stay as-is; apply going forward only.
 
+### Finding a test that cannot fail — the discriminator, and why the obvious one does not work
+
+A test that re-implements a production predicate inside its own assertion is true by construction, so it reads as coverage of exactly the property it cannot test. The known instance is `test_the_private_package_dir_is_not_leaked_to_the_caller` at `536a767^`, which filtered underscore keys out itself and then asserted none were present — green no matter what `get_export_status` did.
+
+**"Look for a test that makes no call to the unit under test" does NOT find it.** Measured 2026-11-05 with `.dev/sweep-0233-instrument.py` against that exact file: the `no-prod-sourced-assert` arm scores **0 of 11**. The test calls `training.write_export` and `training.get_export`, so "calls no production symbol" is false for it — and the subject of its assertion *is* a value production code returned, so tightening the rule to "no production-sourced value in the asserted expression" scores 0 as well. The unit actually under test was `get_export_status`, named in the test's own name and never called. The rule has to be per-**unit** (does this test call the thing its name claims), not per-module (does it touch production at all) — and that mapping is a naming convention rather than a fact about the code, so it is not reliably mechanical.
+
+**What does find it: a comprehension carrying an `if` filter inside an `assert`** — that is where a re-implemented predicate hides. On the pre-fix file that arm flags **1 of 11**, the right one.
+
+**It is a candidate generator, not a verdict, and the false-positive rate is real.** The same arm flags the *fixed* version of that same test, which is legitimate because the thing it filters is what `get_export_status` returned. Across the #0233 sweep it produced **46 flags over 407 test functions**, every one of which had to be read. Budget the reading; do not expect an automated answer.
+
+**The decisive check is a mutation, not a static rule.** Delete or weaken the production guard and see whether any test reddens — a surviving mutant with an apparently-covering test is the signal, and the static arms only narrow where to look. See *Close evidence must assert an invariant* above for the same principle applied to evidence: name the mutation that must redden a test.
+
 ## BioEngine skills
 
 Skills live in `../bioimage.io/public/skills/bioengine/` (sibling repo). They're Markdown documents describing BioEngine to a user-facing AI agent, published at <https://bioimage.io/skills/bioengine/SKILL.md>.
