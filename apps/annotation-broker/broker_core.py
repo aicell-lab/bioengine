@@ -47,6 +47,8 @@ ROLE_LIST_KEYS: Dict[str, str] = {
     "annotator": "annotators",
 }
 
+_ANONYMOUS_IDS = {"", "anonymous", "http-anonymous"}
+
 
 def role_at_least(role: str, minimum: str) -> bool:
     """True if *role* meets or exceeds *minimum* in the role hierarchy."""
@@ -74,11 +76,7 @@ def _user_matches(
 
 
 def _is_logged_in(user_id: Optional[str]) -> bool:
-    # Anonymous callers are mapped to id=None upstream in BrokerApp._ctx_user
-    # (keyed on Hypha's is_anonymous flag, which covers every anonymous id form —
-    # e.g. anonymouz-http and anonymouz-<random>), so any truthy id reaching here
-    # is a real, logged-in identity.
-    return bool(user_id)
+    return bool(user_id) and str(user_id).strip().lower() not in _ANONYMOUS_IDS
 
 
 def resolve_role(
@@ -233,7 +231,786 @@ def user_label_dir(label: str, user_id: Optional[str]) -> str:
 
 
 def image_path(stem: str, ext: str = ".png") -> str:
+    """LEGACY. Only correct for datasets whose images are all ``.png``, which
+    stopped being guaranteed in 0.10.0. Every live call site now reads
+    ``entry["path"]`` from the image manifest instead; this remains for the
+    manifest-less fallback and for tests."""
     return f"images/{stem}{ext}"
+
+
+# ---------------------------------------------------------------------------
+# Image manifest (0.10.0)
+# ---------------------------------------------------------------------------
+#
+# Until 0.10.0 the image list *was* the ``images/`` directory listing, in two
+# independent places. That makes an image with no file under ``images/``
+# impossible to represent, which is exactly what a remote (not-yet-
+# materialised) image is. The manifest becomes the authoritative list and
+# ``images/`` becomes the materialised subset.
+#
+# Two rules govern it, and they are deliberately asymmetric:
+#
+#   * READ is a union. Stored entries plus any file in the listing that no
+#     entry covers. A file therefore never disappears from the dataset
+#     because a sync call was missed or the manifest was never written --
+#     which is also what makes the manifest-less legacy fallback the *same*
+#     code path rather than a second one.
+#   * WRITE (sync_image_manifest) is the union plus pruning of ``local``
+#     entries whose file has gone. ``remote`` entries are never pruned: they
+#     are not expected to have a file.
+
+IMAGE_MANIFEST_PATH = "images/manifest.json"
+IMAGE_MANIFEST_VERSION = 1
+
+IMAGE_STATE_LOCAL = "local"
+IMAGE_STATE_REMOTE = "remote"
+
+# The manifest lives inside the directory it describes, so the listing must
+# never be read as if it were an image.
+_IMAGE_MANIFEST_NAME = IMAGE_MANIFEST_PATH.split("/")[-1]
+
+
+def local_image_entry(
+    name: str, dims: Optional[List[int]] = None, **extra: Any
+) -> Dict[str, Any]:
+    """A ``local`` manifest entry for the file ``images/<name>``.
+
+    *dims* is the ``[width, height]`` shape the 0.8.0 ``image_dims`` cache
+    already uses, so a cache can be poured straight in.
+    """
+    entry: Dict[str, Any] = {"state": IMAGE_STATE_LOCAL, "path": f"images/{name}"}
+    if dims and len(dims) == 2 and dims[0] > 0 and dims[1] > 0:
+        entry["width"], entry["height"] = int(dims[0]), int(dims[1])
+    entry.update(extra)
+    return entry
+
+
+MATERIALISED_IMAGE_EXT = ".tif"
+
+
+def materialised_image_name(stem: str) -> str:
+    """Filename a materialised *stem* gets under ``images/``."""
+    return f"{stem}{MATERIALISED_IMAGE_EXT}"
+
+
+def materialise_image_entry(
+    entry: Dict[str, Any], name: str, levels: Optional[int] = None
+) -> Dict[str, Any]:
+    """*entry* rewritten as a ``local`` entry backed by ``images/<name>``.
+
+    The ``source`` block is carried over unchanged. Provenance has to survive
+    materialisation (design §2), and it is also what a later re-check against
+    ``content_hint`` would need to say "this copy is stale" rather than just
+    "this copy exists".
+
+    *levels* is the pyramid the encoder actually wrote, which is a property of
+    the file and not of the source, so a stale value from the remote entry is
+    dropped when the caller does not supply one.
+    """
+    materialised = dict(entry)
+    materialised["state"] = IMAGE_STATE_LOCAL
+    materialised["path"] = f"images/{name}"
+    if levels:
+        materialised["levels"] = int(levels)
+    else:
+        materialised.pop("levels", None)
+    return materialised
+
+
+def parse_image_manifest(doc: Any) -> Dict[str, Dict[str, Any]]:
+    """Entries out of a raw ``manifest.json`` document.
+
+    Returns ``{}`` for anything unusable -- absent, malformed, or written by
+    a newer broker than this one. Never raises: an unreadable manifest must
+    degrade to the listing-only fallback, not take the dataset down.
+    """
+    if not isinstance(doc, dict):
+        return {}
+    if doc.get("manifest_version") != IMAGE_MANIFEST_VERSION:
+        return {}
+    images = doc.get("images")
+    if not isinstance(images, dict):
+        return {}
+    return {
+        stem: dict(entry)
+        for stem, entry in images.items()
+        if stem and isinstance(entry, dict) and entry.get("state") in (
+            IMAGE_STATE_LOCAL, IMAGE_STATE_REMOTE,
+        )
+    }
+
+
+def build_image_manifest(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """The full document to write back to ``images/manifest.json``."""
+    return {
+        "manifest_version": IMAGE_MANIFEST_VERSION,
+        "images": {stem: entries[stem] for stem in sorted(entries)},
+    }
+
+
+def image_names_from_listing(entries: List[Any]) -> List[str]:
+    """Image filenames out of a ``list_files("images")`` result: no
+    directories, and never the manifest itself."""
+    names = []
+    for entry in entries:
+        name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
+        if not name or name == _IMAGE_MANIFEST_NAME:
+            continue
+        if isinstance(entry, dict) and (entry.get("type") == "directory" or entry.get("is_dir")):
+            continue
+        names.append(name)
+    return names
+
+
+def merge_image_manifest(
+    stored: Dict[str, Dict[str, Any]],
+    listing_names: List[str],
+    dims: Optional[Dict[str, List[int]]] = None,
+    prune: bool = False,
+) -> tuple:
+    """Reconcile *stored* entries against the ``images/`` listing.
+
+    Returns ``(entries, changed)``. See the module comment above for why the
+    read (``prune=False``) and write (``prune=True``) rules differ.
+
+    Stems are unique, so two files sharing one stem (``a.png`` and
+    ``a.tif``) collapse to a single entry, the alphabetically last. Before
+    0.10.0 they produced two identical-stem rows in the index, which no
+    caller handled sensibly.
+    """
+    dims = dims or {}
+    entries = {stem: dict(entry) for stem, entry in stored.items()}
+    changed = False
+
+    covered = {
+        entry["path"].split("/", 1)[-1]
+        for entry in entries.values()
+        if entry.get("state") == IMAGE_STATE_LOCAL and entry.get("path")
+    }
+    for name in sorted(listing_names):
+        if name in covered:
+            continue
+        stem = Path(name).stem
+        if not stem:
+            continue
+        prior = entries.get(stem)
+        if isinstance(prior, dict) and prior.get("state") == IMAGE_STATE_REMOTE:
+            # A file appeared under a stem that is still recorded as remote:
+            # a materialisation whose upload landed but whose manifest write
+            # did not. Promote rather than replace, so the ``source`` block,
+            # dtype and channel metadata survive the crash that produced this
+            # state. (A minted-but-unuploaded put_file does not show up in the
+            # listing, so a name here always means real bytes.)
+            entries[stem] = materialise_image_entry(prior, name)
+        else:
+            entries[stem] = local_image_entry(name, dims.get(stem))
+        changed = True
+
+    # Fill dims for entries that predate a successful probe.
+    for stem, entry in entries.items():
+        if "width" in entry or stem not in dims:
+            continue
+        d = dims[stem]
+        if d and len(d) == 2 and d[0] > 0 and d[1] > 0:
+            entry["width"], entry["height"] = int(d[0]), int(d[1])
+            changed = True
+
+    if prune:
+        present = set(listing_names)
+        for stem in list(entries):
+            entry = entries[stem]
+            if entry.get("state") != IMAGE_STATE_LOCAL:
+                continue
+            if entry.get("path", "").split("/", 1)[-1] not in present:
+                del entries[stem]
+                changed = True
+
+    return entries, changed
+
+
+# ---------------------------------------------------------------------------
+# Remote NGFF (OME-Zarr) sources (0.10.0)
+# ---------------------------------------------------------------------------
+#
+# An import records where the pixels live and nothing else: no copy, no pixel
+# read beyond one preflight chunk. Everything below is pure so the parsing and
+# the accept/reject rules can be tested without a network.
+#
+# The frontend mirrors part of this in ``ngffLayout.ts``. Where both parse the
+# same thing (``multiscales``, axis roles, level dimensions) they must agree,
+# because the broker's recorded width/height is what the UI shows before a
+# single chunk is fetched. The tests on either side pin the same cases.
+
+NGFF_SOURCE_KIND = "ngff"
+
+# What zarrita 0.6.1 can actually decode in a browser: its built-in codecs
+# plus the three numcodecs WASM builds it lazy-loads. Anything else (a
+# jpeg2k-compressed store, an ``imagecodecs``-only filter, a delta filter)
+# would import cleanly and then fail on every chunk, so it is rejected at
+# import instead. Keep this in step with zarrita's `create_default_registry`.
+NGFF_DECODABLE_CODECS = frozenset(
+    {"blosc", "lz4", "zstd", "gzip", "zlib", "transpose", "bytes", "crc32c"}
+)
+
+# zarrita maps these v2 dtype strings to JS typed arrays. i8/u8 (64-bit) are
+# deliberately absent: they decode to BigInt64Array, which the RGBA conversion
+# cannot scale. Same for the string dtypes.
+NGFF_NUMERIC_DTYPES = frozenset(
+    {"b1", "i1", "u1", "i2", "u2", "i4", "u4", "f2", "f4", "f8"}
+)
+
+# v3 spells a dtype out where v2 abbreviates it. Everything downstream works
+# in the v2 vocabulary, so this is the one translation table.
+NGFF_V3_TO_V2_DTYPE = {
+    "bool": "b1", "int8": "i1", "uint8": "u1", "int16": "i2",
+    "uint16": "u2", "int32": "i4", "uint32": "u4", "int64": "i8",
+    "uint64": "u8", "float16": "f2", "float32": "f4", "float64": "f8",
+}
+
+# Axis order implied by OME-NGFF before v0.4, which made `axes` optional.
+NGFF_IMPLICIT_AXES = ["t", "c", "z", "y", "x"]
+
+
+class NgffSourceError(ValueError):
+    """A remote source that cannot be used, with a message aimed at the person
+    who pasted the URL. Distinct from ValueError only so the transport layer
+    can tell "your URL is wrong" from "your request is wrong"."""
+
+
+def normalise_store_root(url: Any) -> str:
+    """Validate a pasted store root and return it with exactly one trailing
+    slash.
+
+    A Zarr client builds every chunk URL by appending the key to the root, so
+    a root carrying a query string would put ``?token=...`` *before* the key
+    and every chunk would 404 (design §7). That is a silent, per-chunk failure
+    rather than an obvious one, so it is refused here with the reason.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise NgffSourceError("Store root is required.")
+    root = url.strip()
+    if not root.lower().startswith(("http://", "https://")):
+        raise NgffSourceError(
+            f"Store root must be an http(s) URL, got {root!r}."
+        )
+    if "?" in root or "#" in root:
+        raise NgffSourceError(
+            "Store root must not contain a query string or fragment: a Zarr "
+            "client appends the chunk key to the root, so anything after '?' "
+            "would land in the middle of every chunk URL. Use a path-form "
+            "credential instead."
+        )
+    return root.rstrip("/") + "/"
+
+
+# omezarr-view's path-form credential: /t/<token>/zarr/<id>/
+_TOKEN_SEGMENT = re.compile(r"/t/([^/]+)/")
+
+
+def split_store_credential(root: str) -> tuple:
+    """``(untokened_root, credential)`` for a store root.
+
+    The manifest lives in an artifact that can be made public
+    (``set_public``), so a credential must never be written into it (design
+    §12, decided 2026-09-10). This splits the path-form token out; the broker
+    keeps it in its own PVC-backed metadata and splices it back in at
+    ``get_image_url`` time, after the role check.
+
+    Returns ``(root, None)`` unchanged for a store root with no credential,
+    which is every plain S3/IDR-style bucket.
+    """
+    match = _TOKEN_SEGMENT.search(root)
+    if not match:
+        return root, None
+    untokened = root[: match.start()] + "/" + root[match.end():]
+    return untokened, match.group(1)
+
+
+def apply_store_credential(root: str, credential: Optional[str]) -> str:
+    """Inverse of :func:`split_store_credential`.
+
+    Inserts ``/t/<credential>/`` ahead of the last path segment group, which
+    is where omezarr-view expects it. A falsy credential returns *root*
+    unchanged, so the local/public case costs nothing.
+    """
+    if not credential:
+        return root
+    scheme, _, rest = root.partition("://")
+    host, slash, path = rest.partition("/")
+    if not slash:
+        return f"{scheme}://{host}/t/{credential}/"
+    return f"{scheme}://{host}/t/{credential}/{path}"
+
+
+def parse_ngff_multiscales(
+    zattrs: Any, multiscale_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """``{"name", "dataset_paths", "axes"}`` from a group's attributes.
+
+    Mirrors ``parseMultiscales`` in ``ngffLayout.ts``. *multiscale_path*
+    selects one multiscale by name when a group holds several; the first is
+    used otherwise, which is what every OME-Zarr writer produces.
+    """
+    attrs = zattrs if isinstance(zattrs, dict) else {}
+    # A v3 store nests OME metadata one level down under "ome".
+    if isinstance(attrs.get("ome"), dict) and "multiscales" in attrs["ome"]:
+        attrs = attrs["ome"]
+    multiscales = attrs.get("multiscales")
+    if not isinstance(multiscales, list) or not multiscales:
+        raise NgffSourceError(
+            "Not an OME-Zarr group: no 'multiscales' in its attributes. Point "
+            "at the group that holds the pyramid, not at the array or the "
+            "bucket root."
+        )
+
+    chosen = None
+    if multiscale_path:
+        for entry in multiscales:
+            if isinstance(entry, dict) and str(entry.get("name")) == multiscale_path:
+                chosen = entry
+                break
+        if chosen is None:
+            names = [
+                str(e.get("name")) for e in multiscales if isinstance(e, dict)
+            ]
+            raise NgffSourceError(
+                f"No multiscale named {multiscale_path!r}; this store has: "
+                + (", ".join(n for n in names if n and n != "None") or "(unnamed)")
+            )
+    else:
+        chosen = next((e for e in multiscales if isinstance(e, dict)), None)
+    if chosen is None:
+        raise NgffSourceError("OME-Zarr 'multiscales' holds no usable entry.")
+
+    dataset_paths = []
+    for dataset in chosen.get("datasets") or []:
+        if isinstance(dataset, dict) and dataset.get("path"):
+            dataset_paths.append(str(dataset["path"]))
+        elif isinstance(dataset, str) and dataset:
+            dataset_paths.append(dataset)
+    if not dataset_paths:
+        raise NgffSourceError(
+            "OME-Zarr multiscale has no datasets, so there are no pyramid "
+            "levels to read."
+        )
+
+    raw_axes = chosen.get("axes")
+    if isinstance(raw_axes, list) and raw_axes:
+        axes = [
+            str(a.get("name", "")).lower() if isinstance(a, dict) else str(a).lower()
+            for a in raw_axes
+        ]
+    else:
+        # Pre-v0.4: `axes` was optional and the order was fixed.
+        axes = list(NGFF_IMPLICIT_AXES)
+
+    return {
+        "name": chosen.get("name"),
+        "dataset_paths": dataset_paths,
+        "axes": axes,
+    }
+
+
+def ngff_axis_roles(axes: List[str], rank: int) -> Dict[str, Any]:
+    """``{"y", "x", "c"}`` axis indices for an array of *rank* dimensions.
+
+    Mirrors ``axisRoles`` in ``ngffLayout.ts``, including the fallback: when
+    the declared axes cannot be trusted (wrong length, no y/x) Y and X are
+    taken to be the two fastest-varying dimensions, which is true of every
+    image layout in practice.
+    """
+    y = axes.index("y") if "y" in axes else -1
+    x = axes.index("x") if "x" in axes else -1
+    c = axes.index("c") if "c" in axes else -1
+    if not (len(axes) == rank and y >= 0 and x >= 0):
+        if rank < 2:
+            raise NgffSourceError(
+                f"OME-Zarr array has rank {rank}; need at least 2 dimensions."
+            )
+        y, x, c = rank - 2, rank - 1, -1
+    return {"y": y, "x": x, "c": c if c >= 0 else None}
+
+
+def ngff_level_dims(shape: List[int], roles: Dict[str, Any]) -> Dict[str, int]:
+    """``{"width", "height"}`` for one pyramid level."""
+    return {"width": int(shape[roles["x"]]), "height": int(shape[roles["y"]])}
+
+
+def parse_zarr_array_meta(doc: Any) -> Dict[str, Any]:
+    """Normalise a ``.zarray`` (v2) or ``zarr.json`` (v3) into
+    ``{"shape", "chunks", "dtype", "codecs", "separator", "zarr_format"}``.
+
+    The codec names come out in zarrita's vocabulary for both versions, so
+    :func:`undecodable_ngff_codecs` has one thing to check rather than two.
+    """
+    if not isinstance(doc, dict):
+        raise NgffSourceError("Array metadata is missing or not JSON.")
+
+    if doc.get("zarr_format") == 3:
+        grid = (doc.get("chunk_grid") or {}).get("configuration") or {}
+        encoding = doc.get("chunk_key_encoding") or {}
+        enc_config = encoding.get("configuration") or {}
+        key_encoding = str(encoding.get("name") or "default")
+        codecs = [
+            str(c.get("name"))
+            for c in doc.get("codecs") or []
+            if isinstance(c, dict) and c.get("name")
+        ]
+        return {
+            "zarr_format": 3,
+            "shape": [int(s) for s in doc.get("shape") or []],
+            "chunks": [int(s) for s in grid.get("chunk_shape") or []],
+            "dtype": str(doc.get("data_type") or ""),
+            "codecs": codecs,
+            # The default separator differs per encoding: "/" for the v3
+            # default, "." for a v3 store written with v2-style keys.
+            "separator": str(
+                enc_config.get("separator") or ("." if key_encoding == "v2" else "/")
+            ),
+            "key_encoding": key_encoding,
+        }
+
+    shape = [int(s) for s in doc.get("shape") or []]
+    chunks = [int(s) for s in doc.get("chunks") or []]
+    if not shape or not chunks:
+        raise NgffSourceError("Array metadata has no shape or chunk shape.")
+    codecs = []
+    for f in doc.get("filters") or []:
+        if isinstance(f, dict) and f.get("id"):
+            codecs.append(str(f["id"]))
+    compressor = doc.get("compressor")
+    if isinstance(compressor, dict) and compressor.get("id"):
+        codecs.append(str(compressor["id"]))
+    return {
+        "zarr_format": 2,
+        "shape": shape,
+        "chunks": chunks,
+        "dtype": str(doc.get("dtype") or ""),
+        "codecs": codecs,
+        "separator": str(doc.get("dimension_separator") or "."),
+        "key_encoding": "v2",
+    }
+
+
+def undecodable_ngff_codecs(meta: Dict[str, Any]) -> List[str]:
+    """Codec names in *meta* that the browser reader cannot handle."""
+    return sorted(
+        {c for c in meta.get("codecs") or [] if c not in NGFF_DECODABLE_CODECS}
+    )
+
+
+def normalise_ngff_dtype(dtype: Any) -> str:
+    """A Zarr dtype string in the v2 vocabulary (``u2``), byte order dropped.
+
+    Accepts either spelling: v2 dtypes carry a byte-order prefix (``<u2``),
+    v3 spells the type out (``uint16``). Returns ``""`` for anything empty
+    or non-string, so callers can treat "unknown" as one case.
+    """
+    if not dtype or not isinstance(dtype, str):
+        return ""
+    return NGFF_V3_TO_V2_DTYPE.get(dtype, dtype.lstrip("<>|="))
+
+
+def ngff_dtype_is_readable(dtype: str) -> bool:
+    """True if the frontend can turn this dtype into pixels.
+
+    Both spellings are accepted, and both reject 64-bit integers, which
+    decode to BigInt arrays the RGBA conversion cannot scale.
+    """
+    return normalise_ngff_dtype(dtype) in NGFF_NUMERIC_DTYPES
+
+
+def first_chunk_key(meta: Dict[str, Any]) -> str:
+    """Key of chunk (0, 0, ...) for the array described by *meta*.
+
+    This is what the preflight fetches: the coarsest level's first chunk is
+    the cheapest object in the store that proves the whole read path works
+    (reachable, CORS-open, decodable).
+    """
+    rank = max(1, len(meta.get("chunks") or meta.get("shape") or [1]))
+    zeros = ["0"] * rank
+    if meta.get("key_encoding") == "v2" or meta.get("zarr_format") == 2:
+        return meta.get("separator", ".").join(zeros)
+    return "c" + meta.get("separator", "/") + meta.get("separator", "/").join(zeros)
+
+
+def ngff_channel_names(zattrs: Any) -> Optional[List[str]]:
+    """Channel labels from an OMERO rendering block, when the store has one.
+
+    Purely cosmetic: the manifest records them so the UI can name channels
+    without a second fetch. Absent for most stores, and that is fine.
+    """
+    attrs = zattrs if isinstance(zattrs, dict) else {}
+    if isinstance(attrs.get("ome"), dict):
+        attrs = {**attrs, **attrs["ome"]}
+    channels = (attrs.get("omero") or {}).get("channels") if isinstance(attrs.get("omero"), dict) else None
+    if not isinstance(channels, list) or not channels:
+        return None
+    names = [
+        str(c.get("label") or c.get("name") or "").strip()
+        for c in channels
+        if isinstance(c, dict)
+    ]
+    names = [n for n in names if n]
+    return names or None
+
+
+_IMAGE_STEM_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def is_valid_image_stem(stem: Any) -> bool:
+    """A stem safe to use as a filename and as a manifest key.
+
+    Deliberately narrow. The stem becomes ``images/<stem>.tif`` at
+    materialisation and a path component in every annotation filename, so
+    slashes, spaces and dot-dot have to be impossible rather than merely
+    unlikely.
+    """
+    if not isinstance(stem, str) or not _IMAGE_STEM_RE.match(stem):
+        return False
+    return stem not in (".", "..")
+
+
+def default_stem_from_store_root(root: str) -> str:
+    """A stem guessed from the last meaningful segment of a store root.
+
+    ``…/zarr/my-sample.zarr/`` gives ``my-sample``. Returns ``""`` when
+    nothing usable is left, in which case the caller must ask for a name
+    rather than invent one.
+    """
+    path = root.split("://", 1)[-1]
+    segments = [s for s in path.split("/") if s]
+    # Drop the host, and any purely numeric level directory a user may have
+    # pasted along with the group root.
+    for segment in reversed(segments[1:]):
+        candidate = segment[:-5] if segment.lower().endswith(".zarr") else segment
+        candidate = re.sub(r"[^A-Za-z0-9._-]+", "-", candidate).strip("-")
+        if candidate and not candidate.isdigit() and is_valid_image_stem(candidate):
+            return candidate
+    return ""
+
+
+def normalise_region(
+    region: Any, store_width: int, store_height: int
+) -> Optional[Dict[str, int]]:
+    """A validated ``{x, y, width, height}`` patch, or ``None`` for the whole
+    store (design §2, §13 step 6).
+
+    ``None`` is returned for a region that covers the store entirely, not just
+    for an absent one. A whole-store patch and a whole-store import have to
+    produce byte-identical manifest entries, or every consumer grows a second
+    case that means the same thing as the first.
+
+    The far edge is **clamped** to the store's bounds while the origin is
+    **rejected** outside them. The asymmetry is deliberate: a picker drawing on
+    a scaled-down preview routinely rounds the far edge a pixel past the end,
+    and refusing that would make the last patch of a slide unselectable, but an
+    origin outside the store is a caller that has the wrong coordinate system
+    and must not be silently repaired into a valid-looking patch somewhere else.
+    """
+    if region is None:
+        return None
+    if not isinstance(region, dict):
+        raise ValueError("A region must be an object with x, y, width and height.")
+    try:
+        x, y = int(region["x"]), int(region["y"])
+        width, height = int(region["width"]), int(region["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "A region needs integer x, y, width and height, in pixels of the "
+            "store's full-resolution level."
+        ) from exc
+
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Region is empty: {width}x{height} pixels.")
+    if x < 0 or y < 0:
+        raise ValueError(f"Region starts outside the image at ({x}, {y}).")
+    if (store_width > 0 and x >= store_width) or (store_height > 0 and y >= store_height):
+        raise ValueError(
+            f"Region starts at ({x}, {y}), outside the "
+            f"{store_width}x{store_height} image."
+        )
+
+    if store_width > 0:
+        width = min(width, store_width - x)
+    if store_height > 0:
+        height = min(height, store_height - y)
+    if x == 0 and y == 0 and width >= store_width and height >= store_height:
+        return None
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def remote_image_entry(
+    store_root: str,
+    multiscale_path: Optional[str],
+    width: int,
+    height: int,
+    dtype: str = "",
+    channels: Optional[List[str]] = None,
+    levels: Optional[int] = None,
+    content_hint: Optional[str] = None,
+    fetched_at: Optional[str] = None,
+    region: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """A ``remote`` manifest entry.
+
+    No ``path``: there is no object in the artifact yet, and
+    ``_image_file_path`` raising on that is what keeps every "give me the
+    file" caller honest until materialisation (design §8) lands.
+
+    *store_root* must already be untokened -- see
+    :func:`split_store_credential`.
+    """
+    entry: Dict[str, Any] = {
+        "state": IMAGE_STATE_REMOTE,
+        "width": int(width),
+        "height": int(height),
+        "source": {
+            "kind": NGFF_SOURCE_KIND,
+            "store_root": store_root,
+            "multiscale_path": multiscale_path,
+            "region": region,
+            "fetched_at": fetched_at or now_iso(),
+            "content_hint": content_hint,
+        },
+    }
+    if dtype:
+        entry["dtype"] = dtype
+    if channels:
+        entry["channels"] = list(channels)
+    if levels:
+        entry["levels"] = int(levels)
+    return entry
+
+
+def image_entry_is_local(entry: Optional[Dict[str, Any]]) -> bool:
+    """True only for a materialised image with a file behind it.
+
+    ``state`` and ``path`` are checked together on purpose: a ``local`` entry
+    with no path is a bug, and treating it as local would push the failure
+    down to whoever tried to presign it.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("state") == IMAGE_STATE_LOCAL and bool(entry.get("path"))
+
+
+def non_local_stems(
+    entries: Dict[str, Dict[str, Any]], stems: List[str]
+) -> List[str]:
+    """Sorted stems in *stems* that are known but not materialised."""
+    return sorted(
+        {
+            s for s in stems
+            if s in entries and not image_entry_is_local(entries.get(s))
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Materialisation (0.11.0, design §8)
+# ---------------------------------------------------------------------------
+#
+# A remote entry becomes local by writing one OME-TIFF into the artifact and
+# flipping ``state``. The transition is one-way and the flip is the only
+# mutation, which is what makes a half-finished materialisation harmless: the
+# object sits at a deterministic path and its bytes are a pure function of the
+# source, so the next attempt simply overwrites it.
+
+# Bytes per sample, keyed by the normalised v2 dtype.
+_DTYPE_ITEMSIZE = {
+    "b1": 1, "i1": 1, "u1": 1,
+    "i2": 2, "u2": 2, "f2": 2,
+    "i4": 4, "u4": 4, "f4": 4,
+    "i8": 8, "u8": 8, "f8": 8,
+}
+
+# What one level-0 read is allowed to cost the annotator's browser, in bytes
+# of decoded samples.
+#
+# Materialisation reads level 0 whole, in the browser, and copies it into the
+# Pyodide kernel to be encoded; a gigapixel slide would exhaust the tab long
+# before it produced a file. 64 MiB covers 4096x4096 uint16 or 5792x5792
+# uint8, far above every dataset in use (median 0.26 MP, max 1.02 MP) and
+# still leaving room for the copy into Python and the encoder's own pyramid.
+#
+# Refusing here is not a failure mode. The image stays remote and stays
+# annotatable; only training is blocked (design §8, §9). A whole-slide source
+# is meant to reach this path as a region (§13 step 6), not whole.
+MAX_MATERIALISE_BYTES = 64 * 1024 * 1024
+
+# Widest image the OME-TIFF profile is verified for. ``_photometric_for`` in
+# colab_service.py picks ``rgb`` at 3 and 4 samples and ``minisblack`` below,
+# and was checked against both readers we depend on at each of those counts.
+# Nothing above 4 has a tested spelling.
+MAX_MATERIALISE_CHANNELS = 4
+
+
+def dtype_itemsize(dtype: Any) -> int:
+    """Bytes per sample for a Zarr dtype in either spelling, ``0`` if unknown."""
+    return _DTYPE_ITEMSIZE.get(normalise_ngff_dtype(dtype), 0)
+
+
+def materialisation_bytes(entry: Optional[Dict[str, Any]]) -> int:
+    """Decoded size of *entry*'s level 0, in bytes. ``0`` when unknown.
+
+    A **lower bound**, deliberately. A store with no omero metadata reports no
+    channel names, and this counts one channel rather than guessing; an
+    unrecognised dtype yields 0 rather than an invented itemsize. It exists to
+    refuse the obviously impossible before the browser tries, not to predict
+    the allocation exactly, so a zero has to read as "no opinion" and let the
+    attempt proceed.
+    """
+    if not isinstance(entry, dict):
+        return 0
+    width, height = entry.get("width") or 0, entry.get("height") or 0
+    itemsize = dtype_itemsize(entry.get("dtype"))
+    if width <= 0 or height <= 0 or itemsize <= 0:
+        return 0
+    channels = entry.get("channels")
+    samples = len(channels) if isinstance(channels, list) and channels else 1
+    return int(width) * int(height) * itemsize * samples
+
+
+def check_materialisable(
+    stem: str,
+    entry: Optional[Dict[str, Any]],
+    max_bytes: int = MAX_MATERIALISE_BYTES,
+) -> None:
+    """Raise unless *entry* is a remote image small enough to materialise.
+
+    Says nothing about a ``local`` entry: "already done" is the caller's to
+    report, not an error.
+    """
+    if not isinstance(entry, dict):
+        raise FileNotFoundError(f"'{stem}' is not an image of this dataset.")
+    if entry.get("state") != IMAGE_STATE_REMOTE:
+        raise ValueError(
+            f"'{stem}' is not a remote image, so there is nothing to "
+            f"materialise."
+        )
+    channels = entry.get("channels")
+    count = len(channels) if isinstance(channels, list) else 0
+    if count > MAX_MATERIALISE_CHANNELS:
+        # The OME-TIFF profile's photometric choice is verified for 1 to 4
+        # samples and nothing wider (design §4). Writing the first few
+        # channels of a 40-channel source instead would produce a file that
+        # quietly disagrees with the store it claims to copy, and the
+        # disagreement would only surface once a model was trained on it.
+        raise ValueError(
+            f"'{stem}' has {count} channels, over the "
+            f"{MAX_MATERIALISE_CHANNELS} the OME-TIFF profile covers. It "
+            f"stays browsable and annotatable as a remote source; only "
+            f"training needs a materialised copy."
+        )
+    size = materialisation_bytes(entry)
+    if size and size > max_bytes:
+        raise ValueError(
+            f"'{stem}' is {size // (1024 * 1024)} MB at full resolution, over "
+            f"the {max_bytes // (1024 * 1024)} MB the browser can materialise "
+            f"in one piece. It stays browsable and annotatable as a remote "
+            f"source; only training needs a materialised copy."
+        )
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -254,6 +1031,26 @@ def parse_png_dims(header: bytes) -> Optional[List[int]]:
     if width <= 0 or height <= 0:
         return None
     return [width, height]
+
+
+# Byte order and version, in the four combinations TIFF allows: "II" little /
+# "MM" big endian, then magic 42 (classic) or 43 (BigTIFF). The encoder emits
+# classic below 4 GiB and BigTIFF above it, so both have to pass.
+TIFF_SIGNATURES = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+
+
+def looks_like_tiff(header: bytes) -> bool:
+    """True if *header* starts like a TIFF file.
+
+    Only a signature check. It exists to catch the case where a presigned PUT
+    silently stored something other than the encoder's output (an error page,
+    a truncated body, a stale object), before the manifest is flipped to say a
+    readable image lives there. It cannot tell a valid pyramid from a corrupt
+    one, and does not try.
+    """
+    return isinstance(header, (bytes, bytearray)) and bytes(header).startswith(
+        TIFF_SIGNATURES
+    )
 
 
 def embedding_path(stem: str, model_type: str) -> str:
@@ -773,9 +1570,20 @@ def build_acl_permissions(metadata: Dict[str, Any]) -> Dict[str, str]:
 
 def is_stage_mode_error(exc: BaseException) -> bool:
     """True if *exc*'s message looks like Hypha's "artifact not in stage
-    mode" error (matched loosely on the substring "stage", per the
-    architecture plan, since the exact wording isn't pinned down)."""
-    return "stage" in str(exc).lower()
+    mode" error.
+
+    Matched loosely, because the exact wording is not pinned down by any
+    contract. The prefix is ``stag`` rather than ``stage`` deliberately:
+    Hypha's actual message is ``Artifact must be in staging mode.``, and
+    "staging" does *not* contain the substring "stage". Matching on the
+    longer form silently disabled the whole restage-and-retry path for the
+    one message it exists to catch, which surfaces as a hard failure on the
+    first write after a commit.
+
+    A false positive costs one redundant ``edit(stage=True)`` and a retry,
+    so erring wide is the cheap direction.
+    """
+    return "stag" in str(exc).lower()
 
 
 async def ensure_staged(
