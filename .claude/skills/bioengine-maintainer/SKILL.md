@@ -426,10 +426,15 @@ An evidence item is re-run by whoever audits the close later, so it has to still
 | a version pin — `version: 0.27.5` | a floor — `version >= 0.27.5` |
 | a message string — grep stderr for `mutually exclusive` | the exit status the guard produces |
 | a line being present — `export FOO` is in the script | absence-or-replacement — `export FOO` is gone **or** the replacement is wired |
+| a branch ref — `git show origin/fix/my-branch:file` | the landed state — `origin/main` contains the merge commit, and the twins agree on `main` |
+
+**The branch-ref row is the one that catches people, because the repo deletes the branch for you.** `delete_branch_on_merge: true` means every item naming a ref other than `origin/main` expires within hours of the merge — and a re-run then exits 128, which reads as a close that was false rather than as a ref that is gone. PR-readiness rows are where this bites hardest: the deliverable only ever lived on a branch, so naming the branch is the natural thing to write. So an item naming any ref other than `origin/main` must either be restated against `origin/main` once the merge lands, or carry a decay note saying the ref will be deleted. Measured 2026-11-05 across the 36 issues closed since this convention landed: 33 clean, two (#0216, #0217) naming a deleted branch and exiting 128 on all six items between them — and the convention's text above had not mentioned refs at all, so the gap was in what it said rather than in anyone's discipline.
 
 A snapshot assertion fails the moment later legitimate work moves past it, and a reviewer re-running it reads that failure as a close that was false. Four such items were measured on 2026-11-02: a version bumped ten times since, a config pin a later fix deliberately removed, a flag that got renamed, and a discrimination control that stopped discriminating because the cluster changed. None of the four closes was wrong; all four now exit non-zero.
 
 Where an assertion genuinely cannot be made durable — a live cluster reading, an ambient condition a control depends on — say so on the item and name the decay you expect, so a future re-run recognises it instead of discovering it as a regression.
+
+**The same rule applies to an issue's acceptance criterion, and the commonest way it breaks there is a line number.** A criterion that says `manager.py:3184` is unrunnable by whoever reads it next: measured 2026-11-05, every line number in one row's criterion had already moved — `manager.py:3184` was 3387, `manager.py:1047/1052` were 1157/1162, and `worker.py:1408` no longer carried the symbol at all. Name **file + symbol + the mutation that must redden a test**, never a line. A mutation survives renumbering because it is defined by behaviour rather than position, and it is also the only form that says what would have made the result RED.
 
 Previously-merged PRs and existing issues that violate this style stay as-is; apply going forward only.
 
