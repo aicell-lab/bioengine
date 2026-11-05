@@ -45,7 +45,12 @@ jobs:
         fi
 
         echo "Comparing $BASE_SHA...$HEAD_SHA"
-        CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+        # Three dots, not two: $BASE_SHA is the base branch's CURRENT tip, so a
+        # two-dot diff reports everything that landed on main since the branch
+        # point as well. Measured on PR #281, whose own diff was one README
+        # comment: two dots reported 5 files, three of them gated, and the check
+        # demanded a version bump the pull request had no reason to spend.
+        CHANGED_FILES=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
         echo "Changed files:" && echo "$CHANGED_FILES" | sed 's/^/ - /'
 
         # Match the file patterns that drive the published image builds.
