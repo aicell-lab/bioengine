@@ -136,16 +136,35 @@ async def test_push_export_recovers_the_package_dir_after_a_restart(tmp_path) ->
     assert pushed_to == [("https://example.invalid/put", "weights.pt")]
 
 
-def test_the_private_package_dir_is_not_leaked_to_the_caller() -> None:
+@pytest.mark.asyncio
+async def test_the_private_package_dir_is_not_leaked_to_the_caller() -> None:
     """Underscore-prefixed keys were filtered out of the old in-memory record;
-    moving the store to disk must not start exposing the worker's filesystem."""
+    moving the store to disk must not start exposing the worker's filesystem.
+
+    This asserts against what ``get_export_status`` RETURNS. The earlier form of
+    this test built its own set with ``if not k.startswith("_")`` and asserted no
+    underscore key was in it, which is true by construction whatever the method
+    does — it re-implemented the filter instead of exercising it, never called
+    ``get_export_status``, and so stayed green when the filter was deleted.
+    """
     training.write_export(
         "e-private", status="READY", _package_dir="/srv/secret",
+        files=[{"name": "weights.pt", "size": 16}],
     )
 
-    assert "_package_dir" not in {
-        k for k in training.get_export("e-private") if not k.startswith("_")
-    }
+    class _FreshReplica:
+        pass
+
+    out = await _method_of("get_export_status", _FreshReplica())("e-private")
+
+    # Positive control: we are looking at the real record, so absence below means
+    # filtered rather than not-found.
+    assert out["status"] == "READY"
+    assert out["files"] == [{"name": "weights.pt", "size": 16}]
+
+    assert "_package_dir" not in out
+    assert not [k for k in out if k.startswith("_")]
+    assert "/srv/secret" not in json.dumps(out)
 
 
 # --- an export nobody is driving must not poll forever --------------------
