@@ -450,6 +450,10 @@ A test that re-implements a production predicate inside its own assertion is tru
 
 **The decisive check is a mutation, not a static rule.** Delete or weaken the production guard and see whether any test reddens — a surviving mutant with an apparently-covering test is the signal, and the static arms only narrow where to look. See *Close evidence must assert an invariant* above for the same principle applied to evidence: name the mutation that must redden a test.
 
+**The repair has a shape, and it is three assertions rather than one.** Assert on what the function **returns**, not on a value the test built. Add a **positive control** — assert that some field you expect really is present — so that the absence you care about reads as *filtered* rather than *not-found*; without it, a method that returned `{}` or raised would pass. And assert over a serialisation of the whole result (`json.dumps`) so the value cannot come back under a different key. The fixed form of the instance above does all three.
+
+**Pin the sweep to a ref, and assert what it opened before you read what it found.** Scan `git archive <ref> …` into a temp dir rather than the working tree, and fail the run if the module count is not what you expect. A checkout a few commits behind presents *fewer and shorter* files, so the sweep returns a smaller answer that is internally consistent and wrong — measured 2026-11-05, the same sweep read 7 modules and a 943-line `test_broker_core.py` from a tree 3 commits behind, against 10 modules and 1758 lines on `origin/main`, and the stale numbers were briefly believed over the correct ones. For the same reason, a sweep tool that takes paths as arguments must refuse an empty argument list instead of reporting `TOTAL 0 tests` — a clean result from an instrument that opened nothing is the defect in this section applied to the search for it.
+
 ## BioEngine skills
 
 Skills live in `../bioimage.io/public/skills/bioengine/` (sibling repo). They're Markdown documents describing BioEngine to a user-facing AI agent, published at <https://bioimage.io/skills/bioengine/SKILL.md>.
