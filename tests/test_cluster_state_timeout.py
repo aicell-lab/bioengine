@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from bioengine.cluster import ray_cluster as rc_mod
+from bioengine.cluster import slurm_workers as sw_mod
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.heartbeat import MISSED_PASSES_BEFORE_STALE, heartbeat_stale_after_seconds
 
@@ -193,15 +194,9 @@ def test_the_bound_leaves_a_pass_inside_the_liveness_staleness_deadline():
     assert 3 * bound + RECONNECT_BOUNDED_COST_S < deadline
 
 
-def test_no_unbounded_get_cluster_state_await_is_left_in_ray_cluster():
-    """Every call site routes through the bounded helper.
-
-    The reported defect named two call sites, but the connection probe reached
-    from ``reconnect()`` is a third on the same monitoring pass. A line-oriented
-    grep would not notice a fourth being added, so this walks the AST.
-    """
-    source = Path(rc_mod.__file__).read_text()
-    tree = ast.parse(source)
+def _raw_call_sites(module):
+    """Every ``get_cluster_state.remote()`` in one module, as (function, lineno)."""
+    tree = ast.parse(Path(module.__file__).read_text())
 
     enclosing = {}
     for node in ast.walk(tree):
@@ -219,5 +214,27 @@ def test_no_unbounded_get_cluster_state_await_is_left_in_ray_cluster():
         inner = func.value
         if isinstance(inner, ast.Attribute) and inner.attr == "get_cluster_state":
             sites.append((enclosing.get(id(node), "<module>"), node.lineno))
+    return sites
 
-    assert [name for name, _ in sites] == ["_get_cluster_state_bounded"], sites
+
+def test_no_unbounded_get_cluster_state_await_is_left_anywhere():
+    """Every call site in EVERY module routes through the bounded helper.
+
+    The reported defect named two call sites and the connection probe reached from
+    ``reconnect()`` is a third, all in ``ray_cluster``. A line-oriented grep would
+    not notice a fourth being added, so this walks the AST — but the first version
+    of this test walked only ``ray_cluster`` while claiming "every call site", and
+    a fourth site that already existed in ``slurm_workers`` sat outside its field
+    of view the whole time. An honestly-scoped name and both modules, therefore.
+
+    ``slurm_workers`` is the one that matters most: its await sat inside the
+    scale-up loop's ``try``, so a hang there skipped the ``finally`` that clears
+    ``worker_creation_task`` and left ``can_scale_up`` refusing for ever.
+    """
+    rc_sites = _raw_call_sites(rc_mod)
+    assert [name for name, _ in rc_sites] == ["_get_cluster_state_bounded"], rc_sites
+
+    # Nothing outside ray_cluster may hold a raw call at all: the bounded helper
+    # lives there, so any other module must go through it.
+    sw_sites = _raw_call_sites(sw_mod)
+    assert sw_sites == [], sw_sites
