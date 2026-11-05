@@ -434,6 +434,8 @@ A snapshot assertion fails the moment later legitimate work moves past it, and a
 
 Where an assertion genuinely cannot be made durable — a live cluster reading, an ambient condition a control depends on — say so on the item and name the decay you expect, so a future re-run recognises it instead of discovering it as a regression.
 
+**The same rule applies to an issue's acceptance criterion, and the commonest way it breaks there is a line number.** A criterion that says `manager.py:3184` is unrunnable by whoever reads it next: measured 2026-11-05, every line number in one row's criterion had already moved — `manager.py:3184` was 3387, `manager.py:1047/1052` were 1157/1162, and `worker.py:1408` no longer carried the symbol at all. Name **file + symbol + the mutation that must redden a test**, never a line. A mutation survives renumbering because it is defined by behaviour rather than position, and it is also the only form that says what would have made the result RED.
+
 Previously-merged PRs and existing issues that violate this style stay as-is; apply going forward only.
 
 ## BioEngine skills
