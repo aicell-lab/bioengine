@@ -1,0 +1,97 @@
+name: Test Suite
+
+# No workflow ran a test before this one, so the only gate on a merge was a
+# version comparison and a PR that broke the suite merged green (backlog #0223).
+# The breakage that prompted it existed only in the COMBINATION of two
+# individually sound PRs, which is what a suite run on the merge result catches
+# and what a version check cannot see.
+#
+# No `paths:` filter, on purpose. Once this is a required check in ruleset
+# 8130154, a check skipped by a path filter never REPORTS at all, so the PR
+# sits on "Expected — waiting for status" forever instead of passing.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-suite:
+    name: test-suite
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # The published worker image, so the suite runs against the same Ray, Serve
+    # and hypha-rpc the worker ships with instead of a resolved-today set. The
+    # package is public, so no registry credentials are needed. The cost is that
+    # a PR which changes requirements-worker.txt is still tested against the
+    # LAST PUBLISHED image rather than its own dependencies — that gap is real
+    # and is why docker-publish-worker.yml is still the thing that proves a
+    # dependency change builds.
+    container:
+      image: ghcr.io/aicell-lab/bioengine-worker:latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        # requirements-test.txt brings pytest, pytest-asyncio and pytest-xdist,
+        # which pytest.ini's addopts require. requirements-datasets.txt brings
+        # zarr, without which three dataset test modules fail to import — and a
+        # module that fails to IMPORT reports an error, not a failure, so it is
+        # the shape most easily mistaken for coverage.
+        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt
+
+      - name: Run the suite
+        # tests/end_to_end needs a live Hypha workspace and a real cluster.
+        # tests/apps/cellpose/test_ui_e2e.py needs playwright and a browser.
+        # A further 30 tests deselect themselves: tests/conftest.py detects a
+        # live test from its fixture closure and drops it unless --live is
+        # passed, so this gate covers 1159 of 1189 collected and says nothing
+        # about the 30 that need a real workspace.
+        # Everything else runs, and runs green on main: measured 1159 passed,
+        # 0 failed, 0 errors in about 2m20s.
+        run: |
+          python -m pytest -p no:cacheprovider tests/ \
+            --ignore=tests/end_to_end \
+            --ignore=tests/apps/cellpose/test_ui_e2e.py \
+            --junitxml=junit.xml
+
+      - name: Assert the suite actually ran
+        # A run that collected nothing reports no failures, which looks exactly
+        # like a pass, and pytest exits 0 on a PARTIAL collapse. The count is
+        # read out of the JUnit report rather than parsed from pytest's summary
+        # line, which a deprecation wall can crowd out. `if: always()` so a
+        # suite that died before writing a report is a refusal rather than a
+        # step that silently did not run.
+        if: always()
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          FLOOR = 1000  # measured 1159 ran on 3689415; far above any collapse
+          try:
+              root = ET.parse("junit.xml").getroot()
+          except (OSError, ET.ParseError) as e:
+              sys.exit(f"REFUSE: no readable JUnit report, so nothing attests a run: {e}")
+          suites = root.findall("testsuite") or [root]
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          bad = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+          ran = total - skipped
+          print(f"collected={total} skipped={skipped} ran={ran} failures+errors={bad}")
+          if ran < FLOOR:
+              sys.exit(f"REFUSE: {ran} tests ran, below the floor of {FLOOR}")
+          if bad:
+              sys.exit(f"REFUSE: {bad} test(s) failed or errored")
+          print(f"OK: {ran} tests ran, {bad} failures")
+          PY
