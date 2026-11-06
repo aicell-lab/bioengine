@@ -19,3 +19,26 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+# Version control and agent scratch. This checkout carries 11 G of it on disk —
+# .dev 7.3 G, .claude 2.7 G, .svamp 626 M, .git 50 M — against 2.6 M of source.
+#
+# It is NOT 11 G of transfer. BuildKit's local source does an incremental
+# filesync: it walks the context for metadata, then sends only the paths the
+# COPY instructions reference. Measured on a --no-cache worker build:
+# `transferring context: 2.32MB`, which is bioengine/ plus the four named
+# files. Full-context tarring is the legacy builder's behaviour. What this
+# saves is the metadata walk over 11 G of paths, not bandwidth.
+#
+# The stronger reason is robustness. Nothing here reaches an image today only
+# because worker.Dockerfile and datasets.Dockerfile COPY named paths rather
+# than `COPY . .`. Agent transcripts can contain credentials, so that selective
+# COPY is load-bearing — and this file makes it a property of the context
+# instead of a property of two Dockerfiles nobody is required to keep careful.
+#
+# .git is safe to exclude: the version is a static literal in pyproject.toml,
+# there is no setuptools-scm, and the `git` in worker.Dockerfile is apt-get
+# installing the binary rather than reading this repo.
+.git/
+.dev/
+.claude/
+.svamp/
