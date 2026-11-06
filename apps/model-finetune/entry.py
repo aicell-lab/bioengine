@@ -1371,7 +1371,7 @@ class EntryApp:
         rec = training.get_export(export_id)
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
-        return {k: v for k, v in rec.items() if not k.startswith("_")}
+        return dict(rec)
 
     @bioengine.method
     async def push_export(
