@@ -130,7 +130,14 @@ async def test_get_status(
     ray_cluster_status = status["ray_cluster"]
 
     # Validate required Ray cluster fields
-    required_ray_fields = ["head_address", "start_time", "mode", "cluster", "nodes"]
+    required_ray_fields = [
+        "head_address",
+        "start_time",
+        "mode",
+        "cluster",
+        "nodes",
+        "last_cluster_update",
+    ]
     for field in required_ray_fields:
         assert (
             field in ray_cluster_status

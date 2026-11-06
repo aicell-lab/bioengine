@@ -23,6 +23,7 @@ module-level and the defect is file bookkeeping.
 from __future__ import annotations
 
 import os
+import stat
 import threading
 from pathlib import Path
 
@@ -43,6 +44,49 @@ def _atomic_write():
     import entry
 
     return entry._write_file_atomic
+
+
+def _entry_class():
+    """``EntryApp`` as written, behind the Ray Serve deployment the decorator returns."""
+    import entry
+
+    return entry.EntryApp.func_or_class
+
+
+class _Resp:
+    """``raise_for_status`` is modelled, not stubbed away.
+
+    The status is the thing under test in
+    ``test_an_error_response_never_reaches_the_cache``, so a no-op version would make
+    that test pass against the unfixed function.
+    """
+
+    def __init__(self, body: bytes, declared: int, status: int) -> None:
+        self.content = body
+        self.text = body.decode(errors="replace")
+        self.headers = {"Content-Length": str(declared)}
+        self.status_code = status
+
+    def raise_for_status(self) -> "_Resp":
+        if self.status_code >= 400:
+            import httpx
+
+            raise httpx.HTTPStatusError(
+                f"Server error '{self.status_code}'",
+                request=httpx.Request("GET", "https://example.invalid/w.pt"),
+                response=self,
+            )
+        return self
+
+
+class _Caller:
+    """Just enough of EntryApp: ``_get_verified`` consumes ``_http_retry``'s response."""
+
+    def __init__(self, body: bytes, declared: int, status: int = 200) -> None:
+        self._resp = _Resp(body, declared, status)
+
+    async def _http_retry(self, *args, **kwargs):
+        return self._resp
 
 
 def test_the_destination_is_never_opened_for_writing(tmp_path: Path) -> None:
@@ -78,6 +122,55 @@ def test_the_destination_is_never_opened_for_writing(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == [dest], "a temp file was left behind"
 
 
+def test_the_bytes_and_the_rename_are_both_fsynced(tmp_path: Path) -> None:
+    """The cross-node invariant: nothing is still buffered when the name goes live.
+
+    The reader is a GPU runtime replica on a *different* node than the writer, reaching
+    the file through shared HOME. An atomic rename gives it a whole file only if the
+    data is on disk before the rename and the rename itself is on disk after — otherwise
+    the name appears while the bytes are still in this client's page cache, and the
+    reader sees a prefix of a 1.2 GB checkpoint.
+
+    Asserted on the syscalls rather than on bytes, because a local reader cannot tell
+    the two cases apart: a same-machine read is served from the same page cache that
+    makes the remote read short.
+    """
+    dest = tmp_path / "community_v1.pt"
+    events: list = []
+    real_replace, real_fsync = os.replace, os.fsync
+
+    def recording_fsync(fd):
+        st = os.fstat(fd)
+        events.append(("dir" if stat.S_ISDIR(st.st_mode) else "file", st.st_ino))
+        return real_fsync(fd)
+
+    def recording_replace(src, dst):
+        events.append(("replace", os.stat(src).st_ino))
+        return real_replace(src, dst)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "fsync", recording_fsync)
+        mp.setattr(os, "replace", recording_replace)
+        _atomic_write()(dest, NEW)
+
+    kinds = [kind for kind, _ in events]
+    assert "replace" in kinds, "the write never renamed; it wrote in place"
+    at = kinds.index("replace")
+    tmp_inode = events[at][1]
+
+    synced_before = [ino for kind, ino in events[:at] if kind == "file"]
+    assert tmp_inode in synced_before, (
+        "the temp file's data was not fsynced before the rename, so a reader on "
+        f"another node can observe a prefix of the published name; saw {events}"
+    )
+    assert "dir" in kinds[at + 1 :], (
+        f"the directory was not fsynced after the rename, so the rename itself is "
+        f"not durable; saw {events}"
+    )
+    assert dest.read_bytes() == NEW
+    assert list(tmp_path.iterdir()) == [dest], "a temp file was left behind"
+
+
 def test_two_writers_do_not_share_a_temp_name(tmp_path: Path) -> None:
     """The path is keyed on (pool, version) only, so two writers DO collide on it.
 
@@ -96,6 +189,52 @@ def test_two_writers_do_not_share_a_temp_name(tmp_path: Path) -> None:
 
     assert len(names) == 2
     assert names[0] != names[1]
+
+
+def test_a_short_download_never_reaches_the_cache() -> None:
+    """The other way a prefix gets cached: the GET itself came back short.
+
+    Indistinguishable from the fsync case at the reader — both end in
+    ``failed finding central directory`` — so it has to be closed separately rather
+    than assumed to be the same bug. ``asyncio.run`` instead of an async test because
+    the runtime image has no pytest-asyncio, and a coroutine nobody awaits is reported
+    as a pass.
+    """
+    import asyncio
+    from http.client import IncompleteRead
+
+    get_verified = _entry_class()._get_verified
+
+    with pytest.raises(IncompleteRead):
+        asyncio.run(get_verified(_Caller(NEW[:17], len(NEW)), "https://example.invalid/w.pt"))
+
+    assert asyncio.run(get_verified(_Caller(NEW, len(NEW)), "https://example.invalid/w.pt")) == NEW
+
+
+def test_an_error_response_never_reaches_the_cache() -> None:
+    """A 403 body is WHOLE, so the length check passes it through as a checkpoint.
+
+    This is the input that discriminates: ``_http_retry`` keeps 403/404 in its retry
+    set and returns the last response unraised, and an S3 error document declares its
+    own length correctly — so ``len(content) == declared`` holds and a few hundred
+    bytes of XML get written as a ``.pt``. ``torch.load`` then reports
+    ``failed finding central directory``, the same symptom as a prefix, which is why
+    the length check reads like it already covers this and does not.
+
+    Worse for the zoo cache, whose hit branch gates on ``weights_path.exists() and
+    meta_path.exists()``: an error body satisfies that gate for every later caller
+    asking for the same ``model_id``, so one transient 403 poisons it until the file
+    is removed by hand.
+    """
+    import asyncio
+
+    import httpx
+
+    get_verified = _entry_class()._get_verified
+    xml = b"<?xml version='1.0'?><Error><Code>AccessDenied</Code></Error>"
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(get_verified(_Caller(xml, len(xml), status=403), "https://example.invalid/w.pt"))
 
 
 def test_a_concurrent_reader_never_observes_a_partial_file(tmp_path: Path) -> None:
