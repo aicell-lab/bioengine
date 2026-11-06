@@ -16,9 +16,11 @@ import ray
 from ray import serve
 
 import bioengine
+from bioengine.cluster._ray_compat import RAY_PROCESSES, psutil
 from bioengine.cluster.proxy_actor import BioEngineProxyActor
 from bioengine.cluster.slurm_workers import SlurmWorkers
 from bioengine.utils import (
+    CLUSTER_STATE_TIMEOUT_S,
     RECONNECT_BUDGET_S,
     STARTUP_CONNECT_BUDGET_S,
     acquire_free_port,
@@ -27,6 +29,7 @@ from bioengine.utils import (
     date_format,
     get_internal_ip,
     head_memory_budget_warning,
+    host_census,
     read_meminfo,
     stream_logging_format,
 )
@@ -215,6 +218,13 @@ class RayCluster:
         self.slurm_workers = None
         self._last_slurm_jobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
+        # Host co-tenancy census. The deadline is the same quantity as the
+        # liveness heartbeat's — both say "this long without a monitoring pass
+        # means gone" — so the worker sets it from the value it already
+        # computes for the heartbeat once the monitoring interval is known.
+        self.census_stale_after_seconds = host_census.STARTUP_STALE_AFTER_SECONDS
+        self._co_tenancy_warnings: List[str] = []
+
         # Base configuration for connecting to Ray cluster
         self.ray_cluster_config = {
             "head_node_address": str(head_node_address or get_internal_ip()),
@@ -368,6 +378,11 @@ class RayCluster:
             "queued": [],
             "running": [],
         }
+
+        # Co-tenancy warnings from the host census. Always present as a list so
+        # UI code can render unconditionally; empty is the normal case, and is
+        # also what an unmounted census directory produces.
+        status["co_tenancy_warnings"] = list(getattr(self, "_co_tenancy_warnings", []))
 
         return status
 
@@ -763,6 +778,74 @@ class RayCluster:
         if warning:
             self.logger.warning(warning)
 
+    def _own_advertisement(self) -> Dict[str, Any]:
+        """This worker's resource claim, as the census publishes it."""
+        return {
+            "head_memory_in_gb": self.ray_cluster_config["head_memory_in_gb"],
+            "shm_size_bytes": host_census.shm_size_bytes(),
+            "head_num_cpus": self.ray_cluster_config["head_num_cpus"],
+            "head_num_gpus": self.ray_cluster_config["head_num_gpus"],
+            "gpu_device_ids": host_census.visible_gpu_device_ids(),
+            "mode": self.mode,
+        }
+
+    def _publish_host_census(self, stale_after_seconds: float) -> None:
+        """Publish or refresh this worker's claim in the shared census.
+
+        Advisory: a census directory that is missing, read-only or not mounted
+        at all leaves the feature inert rather than failing the worker.
+        """
+        directory = host_census.census_dir()
+        if directory is None or self.mode == "external-cluster":
+            # In external-cluster mode the head is not ours to size, so this
+            # worker holds no host reservation worth advertising.
+            return
+        try:
+            host_census.write_advertisement(
+                directory=directory,
+                worker_id=host_census.worker_id(),
+                stale_after_seconds=stale_after_seconds,
+                resources=self._own_advertisement(),
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not publish the host census entry: {e}")
+
+    def _withdraw_host_census(self) -> None:
+        """Remove this worker's claim so co-tenants stop counting it."""
+        directory = host_census.census_dir()
+        if directory is None:
+            return
+        try:
+            host_census.remove_advertisement(directory, host_census.worker_id())
+        except Exception as e:
+            self.logger.debug(f"Could not withdraw the host census entry: {e}")
+
+    def _check_host_co_tenancy(self) -> List[str]:
+        """Warnings about workers on this host whose claims collide with ours.
+
+        Returns the warnings so the worker status can carry them too; logging
+        them is the caller's job, because the status read must not log on every
+        poll.
+        """
+        directory = host_census.census_dir()
+        if directory is None or self.mode == "external-cluster":
+            return []
+        try:
+            co_tenants = host_census.read_co_tenants(directory, host_census.worker_id())
+            if not co_tenants:
+                return []
+            return host_census.co_tenancy_warnings(
+                own=self._own_advertisement(),
+                co_tenants=co_tenants,
+                mem_total_bytes=read_meminfo()["MemTotal"],
+                budget_fraction=self.ray_cluster_config[
+                    "head_memory_budget_fraction"
+                ],
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not check host co-tenancy: {e}")
+            return []
+
     async def _start_cluster(self) -> None:
         """Start Ray cluster head node with configured ports and resources.
 
@@ -801,6 +884,12 @@ class RayCluster:
                 await self._generate_cdi_spec()
 
             self._check_head_memory_budget()
+
+            # Advertise before reading, so two workers starting at once still
+            # see each other rather than both finding an empty census.
+            self._publish_host_census(host_census.STARTUP_STALE_AFTER_SECONDS)
+            for warning in self._check_host_co_tenancy():
+                self.logger.warning(warning)
 
             # Start ray as the head node with the specified parameters
             args = [
@@ -1003,7 +1092,7 @@ class RayCluster:
             )
 
             # Test the connection by getting the cluster state
-            await self.proxy_actor_handle.get_cluster_state.remote()
+            await self._get_cluster_state_bounded()
             self.logger.info(
                 f"Connected to Ray cluster at '{self.address}' with Serve HTTP URL {self.serve_http_url}"
             )
@@ -1023,8 +1112,80 @@ class RayCluster:
             self.logger.error(f"Failed to connect to existing Ray cluster: {e}")
             raise e
 
+    def _find_cluster_processes(self) -> List[List["psutil.Process"]]:
+        """Ray processes belonging to THIS cluster, in Ray's own kill order.
+
+        Returns three buckets — raylet, everything else, gcs_server — because
+        Ray requires that order: the raylet has to exit before the agents that
+        fate-share with it, and the GCS has to exit last.
+
+        A process is claimed only if it both matches one of Ray's own
+        ``RAY_PROCESSES`` keywords and is attributable to this cluster. Ray's
+        processes name this cluster's temp dir on their command line; the
+        Ray client server names the GCS address instead; task and actor
+        workers are renamed ``ray::...`` and name neither, so they are claimed
+        through their parent raylet.
+        """
+        # Trailing separator on purpose: a bare prefix match would claim a
+        # sibling cluster at '<temp_dir>-other', and the second worker on a
+        # node is exactly the one named that way.
+        temp_dir = os.path.join(str(self.ray_cluster_config["ray_temp_dir"]), "")
+        gcs_argument = (
+            f"--address={self.ray_cluster_config['head_node_address']}:"
+            f"{self.ray_cluster_config['ports']['head_node']}"
+        )
+
+        candidates = []
+        for process in psutil.process_iter(["name", "cmdline", "ppid"]):
+            try:
+                name = process.info["name"] or ""
+                argv = process.info["cmdline"] or []
+            except psutil.Error:
+                continue
+            cmdline = subprocess.list2cmdline(argv)
+            for index, (keyword, filter_by_cmd) in enumerate(RAY_PROCESSES):
+                if keyword in (name if filter_by_cmd else cmdline):
+                    candidates.append((process, index, cmdline, argv))
+                    break
+
+        claimed = {
+            process.pid
+            for process, _, cmdline, argv in candidates
+            # Compared whole, not as a substring: ':6379' is a prefix of
+            # ':63790', and the Ray client server is the only process that
+            # identifies its cluster by address rather than by temp dir.
+            if temp_dir in cmdline or gcs_argument in argv
+        }
+        # Workers are renamed, so they identify no cluster themselves; the
+        # raylet that owns them does. Repeat until nothing new is claimed, so
+        # a worker that respawned a child is not left behind.
+        while True:
+            adopted = {
+                process.pid
+                for process, _, _, _ in candidates
+                if process.pid not in claimed
+                and process.info["ppid"] in claimed
+            }
+            if not adopted:
+                break
+            claimed |= adopted
+
+        buckets = [[], [], []]
+        last_index = len(RAY_PROCESSES) - 1
+        for process, index, _, _ in candidates:
+            if process.pid not in claimed:
+                continue
+            bucket = 0 if index == 0 else (2 if index == last_index else 1)
+            buckets[bucket].append(process)
+        return buckets
+
     async def _shutdown_head_node(self, grace_period: int = 30) -> None:
         """Shutdown the Ray cluster head node.
+
+        Only this cluster's processes are stopped. ``ray stop`` is deliberately
+        not used: it takes no cluster selector and kills every Ray process the
+        user owns on the node, which on a shared login node means stopping one
+        worker silently kills every other worker of the same account.
 
         Args:
             grace_period: Grace period in seconds for graceful shutdown.
@@ -1033,42 +1194,41 @@ class RayCluster:
         self.logger.info(
             f"Starting graceful shutdown of Ray head node (grace period: {grace_period}s)..."
         )
-        args = [self.ray_exec_path, "stop", "--grace-period", str(grace_period)]
+        buckets = await asyncio.to_thread(self._find_cluster_processes)
 
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            self.logger.error(
-                f"Ray stop command failed with error code {proc.returncode}:\n{error_msg}"
-            )
-            raise subprocess.CalledProcessError(
-                proc.returncode, " ".join(args), stderr=error_msg
-            )
-
-        output = stdout.decode()
-        if re.search(r"Stopped all \d+ Ray processes\.", output):
-            self.logger.info("All Ray processes stopped successfully")
-        elif "Did not find any active Ray processes." in output:
+        found = sum(len(bucket) for bucket in buckets)
+        if not found:
             self.logger.info("Did not find any active Ray processes.")
-        else:
-            message = re.search(
-                r"Stopped only (\d+) out of (\d+) Ray processes within the grace period (\d+) seconds\.",
-                output,
+            return
+
+        force = grace_period < 0
+        bucket_grace = max(grace_period, 0) / len(buckets)
+        remaining = []
+        for bucket in buckets:
+            for process in bucket:
+                try:
+                    process.kill() if force else process.terminate()
+                except psutil.Error:
+                    pass
+            _, alive = await asyncio.to_thread(
+                psutil.wait_procs, bucket, timeout=bucket_grace
             )
-            if message:
-                self.logger.warning(
-                    f"Some Ray processes could not be stopped: {message.group(0)}"
-                )
-            else:
-                self.logger.warning(
-                    f"Unknown message during Ray shutdown:\n----------\n{output}"
-                )
+            for process in alive:
+                try:
+                    process.kill()
+                except psutil.Error:
+                    pass
+            await asyncio.to_thread(psutil.wait_procs, alive, timeout=2)
+            remaining.extend(process for process in alive if process.is_running())
+
+        if remaining:
+            self.logger.warning(
+                f"Some Ray processes could not be stopped: "
+                f"{found - len(remaining)} of {found} exited within the grace "
+                f"period {grace_period}s; the rest were killed."
+            )
+        else:
+            self.logger.info("All Ray processes stopped successfully")
 
     async def check_connection(self) -> None:
         """Check if Ray cluster is initialized and connected.
@@ -1187,6 +1347,21 @@ class RayCluster:
             await self.reconnect()
             return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def _get_cluster_state_bounded(self):
+        """Fetch cluster state with a ceiling on the round trip.
+
+        A head node that has stopped answering without dying leaves this call
+        pending forever, and because the monitoring steps are sequential
+        awaits that one wait stops the whole pass — app recovery and
+        proxy-token renewal included. ``TimeoutError`` is not a stale-handle
+        error, so it propagates to the per-step error path and counts towards
+        ``_monitor_consecutive_errors`` rather than triggering a reconnect.
+        """
+        return await asyncio.wait_for(
+            self.proxy_actor_handle.get_cluster_state.remote(),
+            timeout=CLUSTER_STATE_TIMEOUT_S,
+        )
+
     async def _get_cluster_state_with_reconnect(self):
         """Fetch cluster state, recovering once from a stale proxy handle.
 
@@ -1195,7 +1370,7 @@ class RayCluster:
         ``get_if_exists=True`` so the retry lands on a live actor.
         """
         try:
-            return await self.proxy_actor_handle.get_cluster_state.remote()
+            return await self._get_cluster_state_bounded()
         except Exception as exc:
             if not _is_stale_handle_error(exc):
                 raise
@@ -1204,11 +1379,16 @@ class RayCluster:
                 f"Reconnecting and retrying once."
             )
             await self.reconnect()
-            return await self.proxy_actor_handle.get_cluster_state.remote()
+            return await self._get_cluster_state_bounded()
 
     async def monitor_cluster(self) -> None:
         """Monitor cluster status and update worker nodes history."""
         try:
+            # Refresh first: an unrefreshed advertisement ages out and this
+            # worker's claim silently stops counting for its co-tenants.
+            self._publish_host_census(self.census_stale_after_seconds)
+            self._co_tenancy_warnings = self._check_host_co_tenancy()
+
             # Get the current status of the cluster from the BioEngineProxy
             cluster_status = await self._get_cluster_state_with_reconnect()
 
@@ -1306,6 +1486,11 @@ class RayCluster:
         try:
             self.is_ready.clear()
             self.start_time = None
+
+            # Withdraw the census claim before the slow part of shutdown, so a
+            # co-tenant starting during it does not count memory we are giving
+            # back.
+            self._withdraw_host_census()
 
             # Shutdown all SLURM workers if running in SLURM mode
             if self.slurm_workers:
