@@ -262,6 +262,39 @@ def soup_admission(
     )
 
 
+def digest_provenance_error(contributions: List[Dict[str, Any]]) -> Optional[str]:
+    """Reject members whose weights cannot be identified, or None to proceed.
+
+    ``weights_sha256`` is the only field that says WHICH weights a contribution was,
+    and the current writer always records it (``contribution_metadata`` declares it
+    non-optional and ``entry.py`` reaches it by bare subscript, which raises rather
+    than writing null). But a pool artifact is append-only and outlives the version
+    that wrote each row, so a production pool holds records from every version it has
+    ever served — a live one measured 8 of 92 deposit rows with the key absent or
+    null. Nothing on the read side looked at the field, so those rows were loaded and
+    souped exactly like good ones, and the community manifest then asserted a sha256
+    over a soup whose own members' provenance was never established.
+
+    Checked once here rather than at each load site, and over the HEAD's members as
+    well as the new candidates: both are averaged into the published checkpoint, so
+    an undigested head member taints it just as an undigested candidate does.
+    """
+    bad = [
+        str(c.get("contribution_id") or "<unidentified>")
+        for c in contributions
+        if not str(c.get("weights_sha256") or "").strip()
+    ]
+    if not bad:
+        return None
+    return (
+        f"{len(bad)} member(s) carry no usable 'weights_sha256': {', '.join(sorted(set(bad)))}. "
+        f"That digest is the only record of which weights a contribution was, so a soup "
+        f"including them would publish a checkpoint digest over members whose own provenance "
+        f"cannot be established. Re-deposit them with the current app version, or drop them "
+        f"from the pool; a digest recovered after the fact must not be written as a recorded one."
+    )
+
+
 def split_provenance_error(
     gate_split: Dict[str, Any], witness_split: Dict[str, Any],
 ) -> Optional[str]:
