@@ -370,6 +370,11 @@ def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
     gpu_memory_mb=-1,
     memory_mb=12 * 1024,
     pip=_read_pip("requirements-runtime.txt"),
+    # Ray resolves this venv's pip install against the submitting account's
+    # ``~/.local`` (HOME at build time) while the replica runs with HOME
+    # rebound per app, so a dep already there is skipped and then missing at
+    # run time — ``rich`` installed without ``pygments`` on a SLURM worker.
+    env_vars={"PYTHONNOUSERSITE": "1"},
     # ``max_ongoing_requests=10`` intentionally lets requests queue at
     # the replica's asyncio queue behind ``_gpu_lock``. Ray Serve's
     # autoscaler only counts ongoing requests that reached a replica
