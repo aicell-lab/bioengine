@@ -61,21 +61,40 @@ jobs:
         # about the 30 that need a real workspace.
         # Everything else runs, and runs green on main: measured 1159 passed,
         # 0 failed, 0 errors in about 2m20s.
-        #
-        # apps/ is collected too. Each app ships its test files INSIDE the
-        # bundle that is published to the Hypha artifact, so they cannot move
-        # under tests/ without being taken away from the consumer who downloads
-        # a committed version — and until this line they ran nowhere, which let
-        # an app's own regression test stay green through the exact change it
-        # was written to catch (backlog #0247). Measured: 447 collected, 445
-        # ran, 0 errors in ~10s on top of the existing run.
-        # apps/model-finetune/test_soup_math.py contributes 0 of those: it is a
-        # module-level pytest.importorskip("torch") and this image has no torch.
         run: |
-          python -m pytest -p no:cacheprovider tests/ apps/ \
+          python -m pytest -p no:cacheprovider tests/ \
             --ignore=tests/end_to_end \
             --ignore=tests/apps/cellpose/test_ui_e2e.py \
             --junitxml=junit.xml
+
+      - name: Run each app's in-bundle suite
+        # Each app under apps/ ships its test files INSIDE the bundle published
+        # to the Hypha artifact, so they cannot move under tests/ without being
+        # taken away from the consumer who downloads a committed version. Until
+        # this step they ran nowhere, and an app's own regression test stayed
+        # green through the exact change it was written to catch (#0247).
+        #
+        # A SEPARATE pytest process, not another path on the step above, and
+        # that is not stylistic. Measured in one process, tests/ apps/ together
+        # gives 42 failed + 34 errors that neither half produces alone, in both
+        # directions:
+        #   - apps/model-finetune/entry.py is importable as top-level `entry`
+        #     and collides with the fixture module of the same name in
+        #     tests/_app/test_build_source_module_purge.py, which then reads the
+        #     app's module and fails on a missing attribute.
+        #   - the app suites stub `bioengine` so their modules import outside a
+        #     Ray runtime; once tests/ has imported the real package the stub is
+        #     correctly not installed, and constructing their deployments raises
+        #     "Deployments cannot be constructed directly".
+        # Separate processes share no sys.modules and no sys.path, so neither
+        # happens. Measured alone: 445 passed, 2 skipped, 0 errors in ~9s.
+        #
+        # `if: always()` so a red repo suite does not hide the app results —
+        # the job still fails, but you see both halves in one run.
+        if: always()
+        run: |
+          python -m pytest -p no:cacheprovider apps/ \
+            --junitxml=junit-apps.xml
 
       - name: Assert the suite actually ran
         # A run that collected nothing reports no failures, which looks exactly
@@ -88,23 +107,31 @@ jobs:
         run: |
           python - <<'PY'
           import sys, xml.etree.ElementTree as ET
-          # Must sit ABOVE what tests/ alone produces (1159), or a total
-          # collapse of the apps/ half still clears it and reports green —
-          # which is the defect #0247 fixed, re-entering through the floor.
-          FLOOR = 1500  # measured 1159 from tests/ + 445 from apps/ = 1604
-          try:
-              root = ET.parse("junit.xml").getroot()
-          except (OSError, ET.ParseError) as e:
-              sys.exit(f"REFUSE: no readable JUnit report, so nothing attests a run: {e}")
-          suites = root.findall("testsuite") or [root]
-          total = sum(int(s.get("tests", 0)) for s in suites)
-          skipped = sum(int(s.get("skipped", 0)) for s in suites)
-          bad = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
-          ran = total - skipped
-          print(f"collected={total} skipped={skipped} ran={ran} failures+errors={bad}")
-          if ran < FLOOR:
-              sys.exit(f"REFUSE: {ran} tests ran, below the floor of {FLOOR}")
-          if bad:
-              sys.exit(f"REFUSE: {bad} test(s) failed or errored")
-          print(f"OK: {ran} tests ran, {bad} failures")
+
+          # One floor per report, not one for the total. A combined floor lets
+          # either half collapse whenever the other over-delivers, which is the
+          # #0247 defect re-entering through the assertion meant to catch it.
+          REPORTS = [
+              ("junit.xml", 1000),       # measured 1159 ran on 3689415
+              ("junit-apps.xml", 300),   # measured 445 ran across 10 bundle files
+          ]
+
+          bad_total = 0
+          for name, floor in REPORTS:
+              try:
+                  root = ET.parse(name).getroot()
+              except (OSError, ET.ParseError) as e:
+                  sys.exit(f"REFUSE: no readable JUnit report at {name}, so nothing attests a run: {e}")
+              suites = root.findall("testsuite") or [root]
+              total = sum(int(s.get("tests", 0)) for s in suites)
+              skipped = sum(int(s.get("skipped", 0)) for s in suites)
+              bad = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+              ran = total - skipped
+              print(f"{name}: collected={total} skipped={skipped} ran={ran} failures+errors={bad}")
+              if ran < floor:
+                  sys.exit(f"REFUSE: {ran} tests ran in {name}, below the floor of {floor}")
+              bad_total += bad
+          if bad_total:
+              sys.exit(f"REFUSE: {bad_total} test(s) failed or errored")
+          print(f"OK: both reports cleared their floor, {bad_total} failures")
           PY
