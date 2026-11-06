@@ -13,3 +13,8 @@ pytest-mock>=3.10.0
 # Additional testing utilities that might be useful
 pytest-cov>=4.0.0  # Test coverage reporting
 pytest-xdist>=3.0.0  # Parallel test execution
+
+# Test-only. apps/annotation-broker/test_broker_core.py builds a PNG in memory
+# to exercise parse_png_dims; broker_core.py itself reads the header by hand and
+# does not import PIL, so this belongs here and not in requirements-broker.txt.
+pillow>=10.0.0
