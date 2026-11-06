@@ -17,6 +17,7 @@ time the test is run against the fresh corpus.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 
@@ -425,3 +426,41 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
     assert m["cellpose_version"] == "4.0.1"
     assert m["schema_version"] == pool.SCHEMA_VERSION
     assert m["app_version"] != m["cellpose_version"] != m["schema_version"]
+
+
+# ---------------------------------------------------------------------------
+# #0139: a soup member's bytes must hash to the digest the pool recorded.
+# ---------------------------------------------------------------------------
+
+def test_matching_bytes_are_accepted():
+    content = b"the tensors as attested"
+    assert pool.member_digest_refusal(
+        "c/good-0/weights.pt", hashlib.sha256(content).hexdigest(), content) is None
+
+
+def test_bytes_that_do_not_match_the_recorded_digest_are_refused():
+    content = b"not the tensors that were attested"
+    expected = hashlib.sha256(b"something else entirely").hexdigest()
+    refusal = pool.member_digest_refusal("c/good-0/weights.pt", expected, content)
+    assert refusal is not None
+    # An operator has to be able to act on this without re-deriving it: which member,
+    # what was promised, what arrived.
+    assert "c/good-0/weights.pt" in refusal
+    assert expected in refusal
+    assert hashlib.sha256(content).hexdigest() in refusal
+
+
+def test_an_empty_digest_is_refused_rather_than_skipped():
+    """The failure this guard exists to prevent is souping bytes nothing checked, so
+    the one thing it must never do is treat an unusable expectation as 'nothing to
+    verify'. An earlier draft returned None on a falsy digest and would pass every
+    other test here."""
+    assert pool.member_digest_refusal("c/good-0/weights.pt", "", b"anything") is not None
+
+
+def test_the_whole_digest_is_compared_and_not_a_prefix():
+    """Discrimination control: a prefix or startswith comparison passes both tests
+    above, because their two digests differ in the first character."""
+    content = b"the tensors as attested"
+    full = hashlib.sha256(content).hexdigest()
+    assert pool.member_digest_refusal("c/good-0/weights.pt", full[:32], content) is not None
