@@ -903,7 +903,10 @@ class EntryApp:
                     )
                 dest = training.session_dir(session_id) / "init_checkpoint.pt"
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(dest.write_bytes, resp.content)
+                # dest reaches a train worker as the params' checkpoint_path, so a
+                # plain write_bytes would publish the name at length zero and let
+                # that worker torch.load a prefix from another node.
+                await asyncio.to_thread(_write_file_atomic, dest, resp.content)
                 resolved["checkpoint_path"] = str(dest)
                 if params.get("pool_provenance"):
                     self._bump_transport(bytes_down=len(resp.content))
