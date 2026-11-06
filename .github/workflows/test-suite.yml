@@ -50,7 +50,12 @@ jobs:
         # zarr, without which three dataset test modules fail to import — and a
         # module that fails to IMPORT reports an error, not a failure, so it is
         # the shape most easily mistaken for coverage.
-        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt
+        # pillow is for the app bundle suites below, not for tests/: one
+        # annotation-broker case builds a PNG fixture with PIL, while the bundle
+        # deliberately declares no imaging deps ("Hypha/S3 transport only"). It is
+        # a test-only dependency, so it is installed here rather than added to the
+        # bundle, which would change what the published artifact ships.
+        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow
 
       - name: Run the suite
         # tests/end_to_end needs a live Hypha workspace and a real cluster.
@@ -94,4 +99,59 @@ jobs:
           if bad:
               sys.exit(f"REFUSE: {bad} test(s) failed or errored")
           print(f"OK: {ran} tests ran, {bad} failures")
+          PY
+
+      - name: Run the app bundle suites
+        # Each app under apps/ ships its own tests INSIDE the bundle that is
+        # published to Hypha, so a consumer who downloads a committed version gets
+        # them too. pytest never collected those: testpaths is ["tests"], so
+        # `pytest tests/` cannot see apps/<app>/test_*.py and an app's regression
+        # test could not fail a PR no matter how good it was. Measured on
+        # e16b63d: replacing get_export_status's private-key filter with
+        # `return dict(rec)` left the repo suite green at 1177 passed while the
+        # bundle's own suite reddened on a named case.
+        #
+        # Only these two apps ship in-bundle tests today (10 files). -o testpaths
+        # overrides the ["tests"] default; -o addopts clears pytest.ini's xdist
+        # flags, which fight the per-app run.
+        run: |
+          for app in model-finetune annotation-broker; do
+            echo "::group::$app"
+            python -m pytest -p no:cacheprovider "apps/$app" -q \
+              -o addopts="" -o testpaths="apps/$app" \
+              --junitxml="junit-app-$app.xml" || true
+            echo "::endgroup::"
+          done
+
+      - name: Assert the app suites actually ran
+        # Same reasoning as the step above for tests/: pytest exits 0 on a partial
+        # collapse and a suite that collected nothing reports no failures. Read the
+        # counts out of the JUnit reports and refuse below a floor. Floors are set
+        # well under the measured counts on e16b63d (100 and 345) so ordinary test
+        # additions do not trip them, but a collapse to zero does.
+        if: always()
+        run: |
+          python - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+          FLOOR = {"model-finetune": 90, "annotation-broker": 300}
+          reports = sorted(glob.glob("junit-app-*.xml"))
+          if len(reports) != len(FLOOR):
+              sys.exit(f"REFUSE: {len(reports)} app report(s), expected {len(FLOOR)}")
+          bad = 0
+          for p in reports:
+              app = p[len("junit-app-"):-len(".xml")]
+              root = ET.parse(p).getroot()
+              suites = root.findall("testsuite") or [root]
+              total = sum(int(s.get("tests", 0)) for s in suites)
+              skipped = sum(int(s.get("skipped", 0)) for s in suites)
+              f = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+              ran = total - skipped
+              print(f"{app}: collected={total} skipped={skipped} ran={ran} failures+errors={f}")
+              if app not in FLOOR:
+                  print(f"REFUSE: no floor recorded for {app}"); bad += 1; continue
+              if ran < FLOOR[app]:
+                  print(f"REFUSE: {app} ran {ran}, below the floor of {FLOOR[app]}"); bad += 1
+              if f:
+                  print(f"REFUSE: {app} had {f} failure(s) or error(s)"); bad += 1
+          sys.exit(1 if bad else 0)
           PY
