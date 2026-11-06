@@ -61,8 +61,18 @@ jobs:
         # about the 30 that need a real workspace.
         # Everything else runs, and runs green on main: measured 1159 passed,
         # 0 failed, 0 errors in about 2m20s.
+        #
+        # apps/ is collected too. Each app ships its test files INSIDE the
+        # bundle that is published to the Hypha artifact, so they cannot move
+        # under tests/ without being taken away from the consumer who downloads
+        # a committed version — and until this line they ran nowhere, which let
+        # an app's own regression test stay green through the exact change it
+        # was written to catch (backlog #0247). Measured: 447 collected, 445
+        # ran, 0 errors in ~10s on top of the existing run.
+        # apps/model-finetune/test_soup_math.py contributes 0 of those: it is a
+        # module-level pytest.importorskip("torch") and this image has no torch.
         run: |
-          python -m pytest -p no:cacheprovider tests/ \
+          python -m pytest -p no:cacheprovider tests/ apps/ \
             --ignore=tests/end_to_end \
             --ignore=tests/apps/cellpose/test_ui_e2e.py \
             --junitxml=junit.xml
@@ -78,7 +88,10 @@ jobs:
         run: |
           python - <<'PY'
           import sys, xml.etree.ElementTree as ET
-          FLOOR = 1000  # measured 1159 ran on 3689415; far above any collapse
+          # Must sit ABOVE what tests/ alone produces (1159), or a total
+          # collapse of the apps/ half still clears it and reports green —
+          # which is the defect #0247 fixed, re-entering through the floor.
+          FLOOR = 1500  # measured 1159 from tests/ + 445 from apps/ = 1604
           try:
               root = ET.parse("junit.xml").getroot()
           except (OSError, ET.ParseError) as e:
