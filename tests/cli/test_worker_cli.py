@@ -15,6 +15,7 @@ from click.testing import CliRunner
 
 from bioengine import __version__
 from bioengine.cli.worker import (
+    CONTAINER_CENSUS_DIR,
     CONTAINER_WORKSPACE_DIR,
     DEFAULT_IMAGE_REPO,
     DEFAULT_MEMORY_FRACTION,
@@ -342,6 +343,69 @@ def test_a_free_container_name_starts_the_worker(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert started and started[0][0][:3] == ["docker", "run", "--rm"]
+
+
+# ── An uncreatable directory names the option that carried it ────────────────
+#
+# `worker start` creates two directories from two different options, and an
+# operator with a typo got an uncaught OSError traceback: it said what the OS
+# refused but never which option held the bad path. Both options are covered
+# because routing one through the helper and not the other is the likely
+# regression, and a test of only the first would not see it.
+
+
+def test_a_bad_workspace_dir_names_the_option(monkeypatch, tmp_path):
+    started = _fake_runtime(monkeypatch, "")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+
+    result = _run(
+        [
+            "start",
+            "--runtime",
+            "docker",
+            "--workspace-dir",
+            str(blocker / "ws"),
+            "--",
+            "--mode",
+            "single-machine",
+        ]
+    )
+
+    assert not isinstance(result.exception, OSError), result.exception
+    assert result.exit_code == 1
+    assert "--workspace-dir" in result.output
+    assert str(blocker / "ws") in result.output
+    assert started == []
+
+
+def test_a_bad_census_dir_names_the_option(monkeypatch, tmp_path):
+    """The census directory is the second one, and it is created after the
+    workspace succeeds — so this fails if only the first site was routed."""
+    started = _fake_runtime(monkeypatch, "")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+
+    result = _run(
+        [
+            "start",
+            "--runtime",
+            "docker",
+            "--workspace-dir",
+            str(tmp_path / "ws"),
+            "--census-dir",
+            str(blocker / "hosts"),
+            "--",
+            "--mode",
+            "single-machine",
+        ]
+    )
+
+    assert not isinstance(result.exception, OSError), result.exception
+    assert result.exit_code == 1
+    assert "--census-dir" in result.output
+    assert str(blocker / "hosts") in result.output
+    assert started == []
 
 
 # ── The token reaches the container, however it was supplied ──────────────────
@@ -697,6 +761,80 @@ def test_every_detected_runtime_is_also_an_accepted_choice():
     assert {"auto", "native"} <= accepted
 
 
+# ── Host resource census (svamp #0066) ───────────────────────────────────────
+#
+# The census only works if every worker on the host mounts the SAME directory,
+# which is why the launcher owns it rather than each site's deployment template.
+
+
+CENSUS = Path("/home/someone/.bioengine-hosts")
+
+
+def test_the_census_directory_is_mounted_and_named():
+    command = _build("docker", census_dir=CENSUS)
+    assert f"{CENSUS}:{CONTAINER_CENSUS_DIR}" in command
+    # Named, never valued — the worker reads the path from its environment.
+    assert command[command.index("-e") + 1] == "BIOENGINE_HOST_CENSUS_DIR"
+    assert "BIOENGINE_WORKER_ID" in command
+
+
+def test_the_worker_advertises_under_its_container_name():
+    """The container name is what an operator recognises in a warning.
+
+    Without it the worker falls back to its hostname, which under docker is the
+    container id — unique, but unrecognisable in "co-tenant 8da84e16af4c".
+    """
+    env = _subprocess_env(
+        "docker", None, None, "bioengine-worker-europa", census=True
+    )
+    assert env["BIOENGINE_WORKER_ID"] == "bioengine-worker-europa"
+    assert env["BIOENGINE_HOST_CENSUS_DIR"] == CONTAINER_CENSUS_DIR
+
+
+def test_apptainer_needs_the_prefix_for_the_census_too():
+    """Same forwarding rule as the token: a bare name reaches nothing."""
+    env = _subprocess_env("apptainer", None, None, "worker-a", census=True)
+    assert env["APPTAINERENV_BIOENGINE_HOST_CENSUS_DIR"] == CONTAINER_CENSUS_DIR
+    assert env["APPTAINERENV_BIOENGINE_WORKER_ID"] == "worker-a"
+
+
+def test_apptainer_binds_the_census_directory():
+    command = _build("apptainer", census_dir=CENSUS)
+    assert f"{CENSUS}:{CONTAINER_CENSUS_DIR}" in command
+
+
+def test_no_census_leaves_the_command_untouched():
+    """Opting out must not mount or declare anything, so --no-census is a true
+    opt-out rather than a flag the worker ignores."""
+    command = _build("docker", census_dir=None)
+    assert CONTAINER_CENSUS_DIR not in " ".join(command)
+    assert "BIOENGINE_HOST_CENSUS_DIR" not in command
+    env = _subprocess_env("docker", None, None, "worker-a", census=False)
+    assert "BIOENGINE_HOST_CENSUS_DIR" not in env
+    assert "BIOENGINE_WORKER_ID" not in env
+
+
+def test_the_census_flag_reaches_the_command():
+    """The positive half of the two opt-out tests below, which pass unchanged if
+    the flag never wires anything at all."""
+    result = _run(["start", "--dry-run", "--runtime", "docker", "--", "--mode", "single-machine"])
+    assert result.exit_code == 0
+    assert CONTAINER_CENSUS_DIR in result.output
+
+
+def test_no_census_opts_out_from_the_flag():
+    result = _run(
+        ["start", "--dry-run", "--runtime", "docker", "--no-census", "--", "--mode", "single-machine"]
+    )
+    assert result.exit_code == 0
+    assert CONTAINER_CENSUS_DIR not in result.output
+
+
+def test_native_mode_has_no_census_mount():
+    """A native worker reads the host directly; there is no container to bind."""
+    result = _run(["start", "--dry-run", "--runtime", "native", "--", "--mode", "single-machine"])
+    assert result.exit_code == 0
+    assert CONTAINER_CENSUS_DIR not in result.output
 # ── Container memory limit (svamp #0125) ─────────────────────────────────────
 #
 # Ray sizes its memory monitor from `min(cgroup limit, host total)`. With no
