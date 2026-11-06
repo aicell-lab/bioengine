@@ -105,6 +105,27 @@ def test_record_with_no_runtime_env_is_unchanged():
     assert _mask_secret_env_vars(record) == record
 
 
+def test_an_empty_env_vars_block_is_left_alone():
+    """The boundary where a mask-everything implementation changes the SHAPE.
+
+    There is nothing to hide in an empty block, so it must come back as an
+    empty block — not as a masked string, and not dropped. Both are plausible
+    outcomes of rewriting the value rather than rewriting its entries, and
+    both would mislead whoever reads a stuck deploy's runtime env: a
+    ``"*****"`` there says a secret was withheld when none existed, and a
+    missing key says the deploy set no env vars at all.
+
+    Asserting the whole record rather than just the block is deliberate — it
+    fails on a dropped key, which an assertion about ``env_vars`` alone would
+    raise a KeyError for rather than report.
+    """
+    record = {"runtime_env": {"env_vars": {}, "pip": ["numpy"]}}
+
+    assert _mask_secret_env_vars(record) == {
+        "runtime_env": {"env_vars": {}, "pip": ["numpy"]}
+    }
+
+
 def _actor_state():
     return ActorState(
         actor_id="a1",
