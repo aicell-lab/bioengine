@@ -36,7 +36,7 @@ before opening a PR — sync first:
     | python3 -c "import json,sys; print('\n'.join(t for v in json.load(sys.stdin) for t in v.get('metadata',{}).get('container',{}).get('tags',[]) if t and t!='latest'))" \
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
   ```
-  One page is enough to answer *"what is the newest tag"*; it is not enough to answer *"how far back does the tag history go"* — that API paginates over digests, most of them untagged.
+  One page is enough to answer *"what is the newest tag"*; it is not enough to answer *"is version X published"*. That API paginates over **digests**, most of them untagged, so a short page drops tagged versions out of the middle while still showing the newest. Measured 2026-11-06 against this exact URL: `per_page=40` returned 8 semver tags and **no `0.16.75`**; `per_page=100` returned 20 and `0.16.75` was on page one. Both reported the same newest tag. So a short page never misleads you about the newest and will readily mislead you about **membership** — use `per_page=100` whenever the question is "does this version exist", and never read a short page's silence as absence.
 - **Before bumping `version` in `apps/<name>/manifest.yaml`**: check `get_app_status` on the live worker for the currently deployed version AND check `origin/main`'s copy. Bump from the higher of the two so the next CI publish strictly increases.
 
 ## Environment facts that would mislead you
