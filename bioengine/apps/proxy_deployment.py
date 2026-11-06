@@ -74,6 +74,13 @@ _USAGE_FLUSH_TIMEOUT_S = 10
 # it is mid-reconnect abandons the connection it is repairing and starts a
 # rebuild storm, so a drop only brings the next probe forward.
 _RECONNECT_GRACE_S = 30
+# How long the Serve controller gets to answer a status read before the read is
+# treated as wedged. A local controller call normally takes milliseconds, so
+# this is not a latency tolerance — it is the line past which "still running"
+# stops being a slow answer and starts being no answer. Comfortably longer than
+# the ~3 x health_check_period_s it takes Serve to condemn today, so a replica
+# that is merely slow is never caught by it.
+_SIBLING_READ_DEADLINE_S = 60.0
 
 # Hypha reports a workspace we may not use as a plain exception with no
 # error code, from two different call sites in hypha_rpc. The message is the
@@ -171,6 +178,11 @@ class ProxyDeployment:
         server_url: str,
         workspace: str,
         proxy_service_token: str,
+        # Required, not defaulted. A default would have to be a zero TTL, which
+        # disables renewal — so a caller that forgot to pass these would get a
+        # proxy that looks fine and expires in 30 days, which is the bug.
+        proxy_service_token_issued_at: float,
+        proxy_service_token_ttl_seconds: float,
         worker_client_id: str,
         authorized_users: Dict[str, List[str]],
         proxy_actor_name: str,
@@ -303,6 +315,8 @@ class ProxyDeployment:
         self.server_url = server_url
         self.workspace = workspace
         self.proxy_service_token = proxy_service_token
+        self._token_issued_at = float(proxy_service_token_issued_at)
+        self._token_ttl_seconds = float(proxy_service_token_ttl_seconds)
 
         # Deterministic client_id derived from the application_id — stable across
         # replica restarts so consumers holding a service handle auto-route to
@@ -321,6 +335,12 @@ class ProxyDeployment:
         # Per-sibling "seen serviceable at least once" latch, so a slow initial
         # start doesn't deregister a not-yet-ready app.
         self._dep_seen_ready: Dict[str, bool] = {}
+        # Single-in-flight guard for the controller read, plus enough state to
+        # tell a wedged read from a starved event loop. Ray never cancels an
+        # abandoned health check, so without this a wedged serve.status() parks
+        # one thread of the 5-slot user-code executor per probe period.
+        self._sibling_read_started_at: Optional[float] = None
+        self._sibling_read_job_running = False
 
         # Custom ICE servers for WebRTC (None means fetch from default URL)
         self.ice_servers = ice_servers
@@ -407,6 +427,10 @@ class ProxyDeployment:
                 application_id=self.application_id,
                 registered=registered,
                 replica_id=self._replica_id,
+                # The deploy-time issue time is the only one the worker has,
+                # and renewal makes it wrong — a renewed app would read as
+                # nearly expired and page a watcher that is working correctly.
+                token_issued_at=getattr(self, "_token_issued_at", None),
             )
         except Exception as e:
             logger.warning(
@@ -1428,6 +1452,52 @@ class ProxyDeployment:
             return True
         return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
 
+    async def _collect_renewed_token(self) -> None:
+        """Adopt a replacement Hypha token the worker has left for us.
+
+        The proxy cannot mint its own: ``generate_token`` requires admin on the
+        target workspace and this replica holds ``read_write``, so Hypha answers
+        ``PermissionError: Only admin can generate token.`` The worker decides
+        when a token is due and deposits the replacement in the proxy actor; all
+        that is left here is to collect it. See
+        ``BioEngineProxyActor.take_pending_token`` and
+        ``BioEngineAppsManager._renew_proxy_tokens``.
+
+        Advisory. A failure here leaves the existing token in place and the next
+        tick tries again, which is the right shape: there are days of margin,
+        and failing the replica over a renewal that can be retried would be a
+        worse outcome than the expiry this prevents.
+        """
+        handle = getattr(self, "_proxy_actor_handle", None)
+        if handle is None:
+            return
+
+        try:
+            pending = await handle.take_pending_token.remote(self.application_id)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not check for a renewed Hypha token for "
+                f"'{self.application_id}': {e}. Keeping the current token; the "
+                f"next tick retries."
+            )
+            return
+
+        if not pending:
+            return
+
+        self.proxy_service_token = pending["token"]
+        self._token_issued_at = pending["issued_at"]
+        self._token_ttl_seconds = pending["ttl_seconds"]
+        # The live client still holds the OLD token. Nothing re-authenticates an
+        # established connection, so the new one only takes effect on a rebuild
+        # — without this the renewal is recorded and never used.
+        self._connection_lost = True
+        logger.info(
+            f"🔑 Collected a renewed Hypha token for '{self.application_id}' "
+            f"(TTL {self._token_ttl_seconds / 86400:.0f} days); rebuilding the "
+            f"client so the new one is used."
+        )
+
     async def _maintenance_tick(self) -> None:
         """One pass of connection upkeep. Never raises.
 
@@ -1441,6 +1511,8 @@ class ProxyDeployment:
             # Not serviceable yet, or deregistered because a sibling went
             # down. check_health owns that gate; nothing to maintain.
             return
+
+        await self._collect_renewed_token()
 
         needs_registration = (
             self.server is None or self.websocket_service_id is None or self._connection_lost
@@ -1536,13 +1608,53 @@ class ProxyDeployment:
         collected state and never issues an in-band request, so a saturated app
         can't affect the reading or count against ``max_ongoing_requests``.
         Returns ``None`` when the status can't be determined (controller
-        mid-restart, app not yet in the view) — the caller treats ``None`` as
-        "unknown" and never deregisters on it.
+        mid-restart, app not yet in the view, or a previous read still
+        outstanding) — the caller treats ``None`` as "unknown" and never
+        deregisters on it.
 
         The status is carried because the replica count alone cannot separate a
         deployment idling at ``min_replicas: 0`` from one that crashed to zero.
+
+        At most one read is in flight at a time. ``serve.status()`` is sync and
+        runs in the user-code executor, which the proxy sizes at 5 threads
+        (``num_cpus: 0``), and Ray re-arms the health check without cancelling
+        the abandoned one — so an unguarded read parks a thread per probe period
+        until the pool is exhausted, after which later calls block in the
+        executor queue with no log signature at all.
+
+        Suppressing the duplicate dispatch alone would trade that for a silent
+        permanent failure: the next check would return "unknown" promptly, the
+        replica would pass its health check forever and never finish gating. So
+        an outstanding read is only tolerated while the executor job itself is
+        still running *and* inside ``_SIBLING_READ_DEADLINE_S``. Past that the
+        controller read is genuinely wedged and this raises, which is the same
+        outcome as today but bounded, named in the log, and reached without
+        exhausting the pool first.
+
+        A job that has *finished* while the coroutine has not resumed is the
+        other case entirely — the event loop is starved, the replica is fine,
+        and condemning it would destroy healthy capacity. That reports unknown
+        for as long as the starvation lasts and clears itself when the abandoned
+        coroutine finally resumes.
         """
         from ray import serve as _serve
+
+        if self._sibling_read_started_at is not None:
+            elapsed = time.monotonic() - self._sibling_read_started_at
+            if self._sibling_read_job_running and elapsed > _SIBLING_READ_DEADLINE_S:
+                raise RuntimeError(
+                    f"Serve controller status read for '{self.application_id}' "
+                    f"has been outstanding for {elapsed:.0f}s "
+                    f"(deadline {_SIBLING_READ_DEADLINE_S:.0f}s); the controller "
+                    f"is not answering."
+                )
+            logger.debug(
+                f"Sibling status read for '{self.application_id}' still "
+                f"outstanding after {elapsed:.1f}s (executor job "
+                f"{'running' if self._sibling_read_job_running else 'finished'}); "
+                f"reporting unknown rather than queueing another."
+            )
+            return None
 
         if self._own_deployment_name is None:
             try:
@@ -1569,13 +1681,21 @@ class ProxyDeployment:
 
         def _read() -> Optional[Dict[str, Tuple[int, str]]]:
             try:
-                return _query()
-            except Exception:
-                # A restarted Serve controller leaves serve.status() wedged on a
-                # dead cached client handle; drop it so the retry reconnects.
-                _serve.context._set_global_client(None)
-                return _query()
+                try:
+                    return _query()
+                except Exception:
+                    # A restarted Serve controller leaves serve.status() wedged
+                    # on a dead cached client handle; drop it so the retry
+                    # reconnects.
+                    _serve.context._set_global_client(None)
+                    return _query()
+            finally:
+                # Set from the executor thread; the guard above reads it to tell
+                # a wedged controller from a starved loop.
+                self._sibling_read_job_running = False
 
+        self._sibling_read_started_at = time.monotonic()
+        self._sibling_read_job_running = True
         try:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, _read)
@@ -1584,6 +1704,9 @@ class ProxyDeployment:
                 f"Could not read sibling status for '{self.application_id}': {e}"
             )
             return None
+        finally:
+            self._sibling_read_started_at = None
+            self._sibling_read_job_running = False
 
     async def check_health(self):
         """
@@ -1768,6 +1891,8 @@ if __name__ == "__main__":
             server_url=server_url,
             workspace=workspace,
             proxy_service_token=token,
+            proxy_service_token_issued_at=time.time(),
+            proxy_service_token_ttl_seconds=3600 * 24 * 30,
             worker_client_id=worker_client_id,
             authorized_users=["*"],
             proxy_actor_name="mock_actor",

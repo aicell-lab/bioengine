@@ -1,0 +1,13 @@
+# Paths that require a pull request, as DATA — read by .github/hooks/pre-push and by
+# .github/workflows/push-policy.yml, so the local guard and the server-side detector
+# cannot drift apart. One pattern per line; blank lines and # comments ignored.
+#
+# A pattern ending in / matches that prefix and everything under it.
+# Anything else is matched as a bash glob against the whole path.
+bioengine/
+docker/
+apps/model-runner/
+apps/model-finetune/
+pyproject.toml
+.dockerignore
+requirements*.txt

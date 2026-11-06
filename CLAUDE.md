@@ -24,6 +24,7 @@ before opening a PR — sync first:
 - **On `main`**: `git fetch origin && git log --oneline HEAD..origin/main` — if any commits are listed, `git pull --ff-only origin main` before touching anything else. If the fast-forward fails, stop and ask; never `git pull` with a merge.
 - **On an existing feature branch** (may have commits pushed from another machine): `git fetch origin && git log --oneline HEAD..origin/<branch>` — if commits exist, `git pull --rebase origin <branch>` before adding your own. Never push without fetching first; force-push only with explicit user approval.
 - **A worker version bump is TWO files**: `version` in `pyproject.toml` and `__version__` in `bioengine/_version.py`, edited in lock-step in the same commit. `version-check.yml` has a dedicated step that fails the required check when they differ. (`_version.py` exists because Ray Serve replicas import `bioengine` via `runtime_env.py_modules`, which ships module source but no `.dist-info`, so `importlib.metadata` has nothing to read replica-side.)
+- **Whether you need a bump at all is a narrower question than whether the path needs a PR.** `version-check.yml` only compares versions when the PR's diff matches `^(bioengine/|docker/worker\.Dockerfile$|docker/datasets\.Dockerfile$|requirements[^/]*\.txt$|pyproject\.toml$|\.dockerignore$)`. So under `docker/` only `worker.Dockerfile` and `datasets.Dockerfile` count — the overlay recipe and the per-app Dockerfiles do not — and the `requirements` pattern is anchored, so it matches root-level files only and never `apps/<name>/requirements-*.txt`. A PR matching none of them reports `check-version` as a **success** ("No relevant files changed. Skipping version check."), indistinguishable from a passed comparison, so nothing tells you the bump was unnecessary — and an unnecessary bump consumes the next free version, forcing a second bump on every other open PR that already reserved one. The lock-step assertion above is **not** conditional: `bioengine/_version.py` must match `pyproject.toml` on every PR, including one that needs no bump.
 - **Before bumping**: do NOT trust the local files. Another machine may already have merged a higher version. Two different checks compare against two different baselines, and only one of them runs on your PR:
   - `version-check.yml` — the required PR check — compares your branch's `pyproject.toml` against **`origin/main`'s**. GHCR is not involved.
   - `docker-publish-worker.yml` compares against the **newest published GHCR tag**, and it triggers on push to `main` — i.e. *after* merge. A version higher than `origin/main` but not higher than the newest GHCR tag passes the PR gate and then fails the publish on `main`.
@@ -35,50 +36,40 @@ before opening a PR — sync first:
     | python3 -c "import json,sys; print('\n'.join(t for v in json.load(sys.stdin) for t in v.get('metadata',{}).get('container',{}).get('tags',[]) if t and t!='latest'))" \
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
   ```
-  One page is enough to answer *"what is the newest tag"*; it is not enough to answer *"how far back does the tag history go"* — that API paginates over digests, most of them untagged.
+  One page is enough to answer *"what is the newest tag"*; it is not enough to answer *"is version X published"*. That API paginates over **digests**, most of them untagged, so a short page drops tagged versions out of the middle while still showing the newest. Measured 2026-11-06 against this exact URL: `per_page=40` returned 8 semver tags and **no `0.16.75`**; `per_page=100` returned 20 and `0.16.75` was on page one. Both reported the same newest tag. So a short page never misleads you about the newest and will readily mislead you about **membership** — use `per_page=100` whenever the question is "does this version exist", and never read a short page's silence as absence.
 - **Before bumping `version` in `apps/<name>/manifest.yaml`**: check `get_app_status` on the live worker for the currently deployed version AND check `origin/main`'s copy. Bump from the higher of the two so the next CI publish strictly increases.
 
-## Code conventions
+## Environment facts that would mislead you
 
-- **Simplicity First.** Make every change as minimal as possible.
-- **No Regressions.** Only change what's necessary; read before modifying.
-- **Prove It Works.** Test and verify before marking done.
-- **Grep before you write.** Before adding a helper, util, type, or pattern, search for one that already exists. Re-implementing what lives a few files over is the most common form of slop here.
-- **Fix the root cause, not the symptom.** A bug report names one broken path; before editing it, grep every caller of the function you are about to touch. One guard in the shared function is a smaller diff than a guard in every caller — and patching only the path the report names leaves every sibling caller still broken.
-- **Don't add features, refactors, abstractions, or error handling beyond what the task requires.** No designing for hypothetical futures. Three similar lines is better than a premature abstraction. No half-finished implementations.
-- **Trust internal code and framework guarantees.** Only validate at system boundaries (user input, external APIs). Don't add backwards-compat shims when you can just change the code.
-- **Don't bake in machine-specific paths/identifiers** (`/proj/aicell/users/x_nilme/...`, `/home/<user>/...`, SLURM allocation ids, private cluster names). The repo ships to other clusters; those strings leak local layout and rot. Use a generic placeholder or drop the path entirely if the surrounding code already explains the shape.
-
-### Comments — write almost none
-
-Code should explain *what* via good names; comments earn their place only when they explain *why* something non-obvious is true.
-
-- **Do not narrate** what the next line does (`# fetch the user`, `# loop over items`, `# now connect`). The line says it.
-- **Do not describe the PR / current task** in a comment (`# added for the geo location PR`, `# this fixes the timeout we hit yesterday`). That belongs in the commit message; in the file it just rots.
-- **Do not write multi-paragraph comments** unless the reader genuinely cannot reconstruct the reasoning. One short sentence is almost always enough; two if there's a real footgun. Prefer a one-line docstring over a wall of `#`.
-- **Do write a comment** when it captures a hidden constraint a future reader would otherwise re-discover the hard way: a workaround for a known bug, a non-obvious invariant, an external system's quirk, a reason for a counter-intuitive default. Make it as short as possible while still naming the *why*.
-- When in doubt: delete the comment, run the diff again, and ask whether the code is materially harder to understand. If not, the comment was not pulling its weight.
+- **Do not bake in machine-specific paths or identifiers** (`/proj/aicell/users/...`, `/home/<user>/...`, SLURM allocation ids, private cluster names). This repo ships to other clusters; those strings leak local layout and rot.
 
 ## When PRs are required vs direct-push to main
 
+**This table is enforceable as a check — install it instead of remembering it:** `git config core.hooksPath .github/hooks` refuses a push to `main` that touches any PR-only path below. Read `.github/hooks/README.md` first; `core.hooksPath` is shared by every worktree of a clone, so arming it in a clone other sessions are working in affects them too. The repository's own `Require PR` ruleset cannot express this policy — it is scoped by ref with no path component, so it forbids direct pushes to `main` for *every* path, and it carries an `admin`-role bypass, which is why direct pushes succeed and only a `remote: Bypassed rule violations` line reports them.
+
 | Path | Action |
 |---|---|
-| `bioengine/**`, `requirements*.txt`, `pyproject.toml`, `docker/**`, `.dockerignore` | **PR required.** These trigger `docker-publish-worker.yml` and `version-check.yml`. Never push directly to `main`. If the user asks you to, refuse and create a PR instead. |
+| `bioengine/**`, `requirements*.txt`, `pyproject.toml`, `docker/**`, `.dockerignore` | **PR required.** Never push directly to `main`. If the user asks you to, refuse and create a PR instead. This is the *routing* rule only — both `version-check.yml` and `docker-publish-worker.yml` gate strictly narrower path sets than this list, so a PR here does not necessarily need a version bump. See "Whether you need a bump at all" above before bumping. |
 | `apps/model-runner/**`, `apps/model-finetune/**` | **PR required** (backlog #0124). These two apps are published as Hypha artifacts and are gated by `app-version-check.yml`: on a non-draft PR, `version` in that app's `manifest.yaml` must be greater (PEP 440) than `origin/main`'s **and** must already exist in the published artifact's version list. So upload before you mark ready: open a draft PR, iterate on the live worker with `X.Y.Z-devN` pre-releases, upload the real `X.Y.Z`, then `gh pr ready`. |
 | `apps/**` (every other app) | **Push direct to `main`** — no PR. Then re-upload via the running worker so the Hypha artifact tracks main. An active GitHub ruleset actually forbids this and our PAT bypasses it silently (backlog #0112, still open for these paths). |
 | `docs/**`, `.github/**` (CI workflows), `.claude/skills/**`, `CLAUDE.md`, `README.md` | **Push direct to `main`** — no PR. |
 
 ## PR workflow (for paths above that require one)
 
+**A PR stays a DRAFT until the issue is cleared to land.** Ready does not mean "the code is finished"; it means "this goes to production now". A ready PR has to carry a version bump to pass `check-version`, so every ready PR reserves a rung and forces a merge order on all the others. Keep the number of ready PRs at one, or near it.
+
 1. Push the feature branch with the substantive changes only (NO version edit).
-2. `gh pr create --draft …` so it's visible for review but cannot be auto-merged. **Open as DRAFT.**
-3. **Bump the version just before marking ready.** Bumping early causes lost-bump collisions when a different PR merges first and ships the version you reserved — and because the bump touches exactly two one-line files, every other open PR that already bumped goes conflicted the moment one lands. Bump last, and land one at a time. Workflow:
-   - Re-check the latest published image tag on GHCR AND `origin/main`'s `pyproject.toml`.
-   - Bump from the higher of the two, editing **both** `pyproject.toml` and `bioengine/_version.py`, as a separate atomic commit: `chore(release): bump version to X.Y.Z`.
-   - Push, then `gh pr ready <number>`.
-4. `version-check.yml` listens for `ready_for_review`, so marking a draft PR ready fires the required status check without any manual re-trigger.
-5. **Always open the PR immediately after pushing the branch** using the GitHub PAT from `.env` so the user can see and review it without navigating to GitHub manually.
-6. **Never merge a PR** — that is always left to the user.
+2. `gh pr create --draft …` — **open as DRAFT**, and leave it there for the whole of the work.
+3. **Get the clearance the change needs.** An independent reviewer agent's APPROVE is enough for a fix, a test or a doc change. A new feature, anything user-facing on the bioimage.io pages, and anything added to the BioEngine workspace or the model zoo needs the user's go as well.
+4. **Only then** bump, mark ready and merge — in one sitting, not days apart:
+   - Re-check the newest published GHCR tag AND `origin/main`'s `pyproject.toml`; bump from the higher.
+   - Edit **both** `pyproject.toml` and `bioengine/_version.py` in one commit: `chore(release): bump version to X.Y.Z`.
+   - Push, `gh pr ready <number>`, wait for the required checks, merge.
+5. A draft reports every required check as `completed/skipped` — a green-looking conclusion that ran nothing. While drafting, the evidence is the issue's own harness, never the PR's checks.
+6. **Always open the PR immediately after pushing the branch** using the GitHub PAT from `.env` so the user can see and review it without navigating to GitHub manually.
+7. **Never merge your own PR.** A pull request is merged only after an **independent** agent has reviewed it and approved — never by the agent that wrote the code, and never on one agent's own judgement. The reviewer re-runs the evidence rather than reading it, and a review that cannot name what would have made the result RED is a refusal. Who plays which part is deployment-specific and is not recorded in this file: it is set by whatever agent team owns the checkout. If no such reviewer exists where you are, the merge is the user's.
+8. **Whoever does merge waits for every required check to REPORT.** "No checks reported" means *not yet queued*, not *nothing to wait for* — the run can take over a minute to appear. The PAT does NOT bypass every rule — measured 2026-11-06, `gh pr merge` refuses a branch that is not up to date with `main` outright — but nothing stops a merge issued while a required check is merely absent. A merge that races its own gate is unreviewed no matter what the versions happen to be. The evidence is `gh api repos/<org>/<repo>/commits/<head-sha>/check-runs` returning a non-zero `total_count` with each required check `completed/success`; `gh pr checks` alone does not distinguish *pending* from *absent*. This repo also sets `delete_branch_on_merge: true`, so a check that queues after the merge dies with `fatal: bad object <head-sha>` and leaves a permanent red run that never evaluated anything.
+9. **A green `check-version` is a point-in-time comparison, so re-read the versions yourself at merge time.** The check compares the branch against `origin/main` *as it was when the run executed*; it is never re-run when `main` advances, so a branch whose reserved rung `main` has since passed keeps a **stale green** that attests to a comparison which is no longer true. Merging on it passes the PR gate and then fails `docker-publish-worker.yml` on `main`, because that compares against the newest GHCR tag. Before merging, read the branch's `pyproject.toml` version and confirm it is strictly greater than **both** `origin/main`'s and the newest published GHCR tag — the two baselines of the previous bullet. Measured 2026-11-04 with `main` at 0.16.67: 8 of 18 open non-draft PRs reported `check-version: success` while sitting at or below it, the oldest reserving 0.16.52.
 
 For deployment-side PRs (changes under `bioengine/**`, `bioengine/cluster/**`, `bioengine/_app/**`, `bioengine/apps/builder.py`, runtime_env transport, Ray client/server plumbing) the **dev image testing workflow** in `.claude/skills/bioengine-maintainer/SKILL.md` applies: build `<next-version>-devN`, validate on a live cluster, only then mark the PR ready.
 
@@ -183,10 +174,3 @@ Don't duplicate this content here:
 | End-to-end deploy_app flow (14-step walkthrough) | `docs/deploy_app_flow.md` |
 | App authoring (`@bioengine.app`, manifest fields, deploying apps) | `../bioimage.io/public/skills/bioengine/SKILL.md` |
 | Hypha platform basics (tokens, workspaces, RPC, artifacts) | <https://hypha.aicell.io/ws/agent-skills/SKILL.md> |
-
-## Planning / files
-
-- Planning lives in model context — do NOT create planning files in the repo.
-- If the user asks for help or wants to give feedback inform them:
-  - `/help` — get help with using Claude Code
-  - Feedback: <https://github.com/anthropics/claude-code/issues>
