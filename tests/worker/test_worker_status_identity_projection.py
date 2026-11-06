@@ -64,12 +64,14 @@ def bare_worker(admin_users=None, **attrs) -> BioEngineWorker:
     worker.is_ready.set()
     worker._monitor_consecutive_errors = 0
     worker._monitor_degraded_threshold = 5
+    worker._monitor_stale_after_seconds = None
     worker.ray_cluster = SimpleNamespace(
         mode="slurm",
         status={
             "head_address": "10.0.0.7:6379",
             "mode": "slurm",
             "geo_location": {"country_name": "Sweden"},
+            "last_cluster_update": None,
             "cluster": {"total_cpu": 64, "total_gpu": 4},
             "nodes": {"node-1": {"total_gpu": 4}},
             "slurm_jobs": {"queued": [], "running": []},

@@ -417,7 +417,42 @@ After the lede: how it was observed or reproduced, the evidence that localises i
 
 State a requirement as a requirement, in your own words. Never quote a person — not from chat, not relayed, not copied out of an internal tracker — and don't name who asked for the change. These repos are public, so a quote publishes private words; and a design that is only defensible because someone asked for it has a hole in it that citing them hides. Attributing a *finding* in an issue is still fine (§Issues above); requirements and design rationale are not.
 
+### Close evidence must assert an invariant, not close-day state
+
+An evidence item is re-run by whoever audits the close later, so it has to still mean something then. Assert the property the fix established, not the state of the world on the day you closed it:
+
+| instead of | write |
+|---|---|
+| a version pin — `version: 0.27.5` | a floor — `version >= 0.27.5` |
+| a message string — grep stderr for `mutually exclusive` | the exit status the guard produces |
+| a line being present — `export FOO` is in the script | absence-or-replacement — `export FOO` is gone **or** the replacement is wired |
+| a branch ref — `git show origin/fix/my-branch:file` | the landed state — `origin/main` contains the merge commit, and the twins agree on `main` |
+
+**The branch-ref row is the one that catches people, because the repo deletes the branch for you.** `delete_branch_on_merge: true` means every item naming a ref other than `origin/main` expires within hours of the merge — and a re-run then exits 128, which reads as a close that was false rather than as a ref that is gone. PR-readiness rows are where this bites hardest: the deliverable only ever lived on a branch, so naming the branch is the natural thing to write. So an item naming any ref other than `origin/main` must either be restated against `origin/main` once the merge lands, or carry a decay note saying the ref will be deleted. Measured 2026-11-05 across the 36 issues closed since this convention landed: 33 clean, two (#0216, #0217) naming a deleted branch and exiting 128 on all six items between them — and the convention's text above had not mentioned refs at all, so the gap was in what it said rather than in anyone's discipline.
+
+A snapshot assertion fails the moment later legitimate work moves past it, and a reviewer re-running it reads that failure as a close that was false. Four such items were measured on 2026-11-02: a version bumped ten times since, a config pin a later fix deliberately removed, a flag that got renamed, and a discrimination control that stopped discriminating because the cluster changed. None of the four closes was wrong; all four now exit non-zero.
+
+Where an assertion genuinely cannot be made durable — a live cluster reading, an ambient condition a control depends on — say so on the item and name the decay you expect, so a future re-run recognises it instead of discovering it as a regression.
+
+**The same rule applies to an issue's acceptance criterion, and the commonest way it breaks there is a line number.** A criterion that says `manager.py:3184` is unrunnable by whoever reads it next: measured 2026-11-05, every line number in one row's criterion had already moved — `manager.py:3184` was 3387, `manager.py:1047/1052` were 1157/1162, and `worker.py:1408` no longer carried the symbol at all. Name **file + symbol + the mutation that must redden a test**, never a line. A mutation survives renumbering because it is defined by behaviour rather than position, and it is also the only form that says what would have made the result RED.
+
 Previously-merged PRs and existing issues that violate this style stay as-is; apply going forward only.
+
+### Finding a test that cannot fail — the discriminator, and why the obvious one does not work
+
+A test that re-implements a production predicate inside its own assertion is true by construction, so it reads as coverage of exactly the property it cannot test. The known instance is `test_the_private_package_dir_is_not_leaked_to_the_caller` at `536a767^`, which filtered underscore keys out itself and then asserted none were present — green no matter what `get_export_status` did.
+
+**"Look for a test that makes no call to the unit under test" does NOT find it.** Measured 2026-11-05 with `.dev/sweep-0233-instrument.py` against that exact file: the `no-prod-sourced-assert` arm scores **0 of 11**. The test calls `training.write_export` and `training.get_export`, so "calls no production symbol" is false for it — and the subject of its assertion *is* a value production code returned, so tightening the rule to "no production-sourced value in the asserted expression" scores 0 as well. The unit actually under test was `get_export_status`, named in the test's own name and never called. The rule has to be per-**unit** (does this test call the thing its name claims), not per-module (does it touch production at all) — and that mapping is a naming convention rather than a fact about the code, so it is not reliably mechanical.
+
+**What does find it: a comprehension carrying an `if` filter inside an `assert`** — that is where a re-implemented predicate hides. On the pre-fix file that arm flags **1 of 11**, the right one.
+
+**It is a candidate generator, not a verdict, and the false-positive rate is real.** The same arm flags the *fixed* version of that same test, which is legitimate because the thing it filters is what `get_export_status` returned. Across the #0233 sweep it produced **46 flags over 407 test functions**, every one of which had to be read. Budget the reading; do not expect an automated answer.
+
+**The decisive check is a mutation, not a static rule.** Delete or weaken the production guard and see whether any test reddens — a surviving mutant with an apparently-covering test is the signal, and the static arms only narrow where to look. See *Close evidence must assert an invariant* above for the same principle applied to evidence: name the mutation that must redden a test.
+
+**The repair has a shape, and it is three assertions rather than one.** Assert on what the function **returns**, not on a value the test built. Add a **positive control** — assert that some field you expect really is present — so that the absence you care about reads as *filtered* rather than *not-found*; without it, a method that returned `{}` or raised would pass. And assert over a serialisation of the whole result (`json.dumps`) so the value cannot come back under a different key. The fixed form of the instance above does all three.
+
+**Pin the sweep to a ref, and assert what it opened before you read what it found.** Scan `git archive <ref> …` into a temp dir rather than the working tree, and fail the run if the module count is not what you expect. A checkout a few commits behind presents *fewer and shorter* files, so the sweep returns a smaller answer that is internally consistent and wrong — measured 2026-11-05, the same sweep read 7 modules and a 943-line `test_broker_core.py` from a tree 3 commits behind, against 10 modules and 1758 lines on `origin/main`, and the stale numbers were briefly believed over the correct ones. For the same reason, a sweep tool that takes paths as arguments must refuse an empty argument list instead of reporting `TOTAL 0 tests` — a clean result from an instrument that opened nothing is the defect in this section applied to the search for it.
 
 ## BioEngine skills
 
