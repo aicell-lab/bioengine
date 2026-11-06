@@ -14,7 +14,9 @@ The four gates, all of which must pass before anything is removed:
 
   1. no commits absent from a freshly fetched ``origin/main``
   2. no uncommitted or untracked changes
-  3. no live session, running process or lock file owns it
+  3. no live session, running process or lock file owns it -- asked of EVERY
+     workspace this machine is attached to, because a session is invisible from
+     any other one, and refused outright if a workspace cannot be read
   4. no watcher script, workflow or crontab entry names it
 
 A run that removes nothing because every gate failed is a pass, not a failure.
@@ -96,16 +98,30 @@ GATE_WORKERS = int(os.environ.get("SWEEP_GATE_WORKERS", "8"))
 GATE_DEADLINE = float(os.environ.get("SWEEP_GATE_DEADLINE", "75"))
 STARTED = time.monotonic()
 
+# One `myco session list` per workspace, so gate 3 sees every owner (#0178).
+# Measured on europa: 0.2s for a workspace whose machines all answer, 6.3s for
+# one holding a parked machine (myco gives up on it and still exits 0, despite
+# offering to wait 45s). The timeout is generous because a workspace that is
+# merely slow must not be mistaken for one that cannot be read -- that reading
+# blocks every retirement. They are read concurrently, so the whole set costs
+# about what the slowest one does.
+SESSION_LIST_TIMEOUT = float(os.environ.get("SWEEP_SESSION_LIST_TIMEOUT", "60"))
+WORKSPACE_LABEL = re.compile(r"\bws-[a-z0-9-]+\b")
 
-def run(cmd, cwd=None, check=False):
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+
+def run(cmd, cwd=None, check=False, env=None, timeout=None):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The `timeout` binary's convention, so callers need no second branch.
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
     if check and p.returncode != 0:
         raise SystemExit(f"{' '.join(cmd)} failed ({p.returncode}): {p.stderr.strip()}")
     return p
 
 
-def json_cmd(cmd):
-    p = run(cmd)
+def json_cmd(cmd, env=None, timeout=None):
+    p = run(cmd, env=env, timeout=timeout)
     if p.returncode != 0:
         return None
     try:
@@ -157,21 +173,77 @@ def band_of(path, repo):
     return "sibling"
 
 
+def workspace_labels():
+    """Every workspace this machine is attached to, or None if that cannot be read."""
+    p = run(["myco", "workspaces"], timeout=SESSION_LIST_TIMEOUT)
+    if p.returncode != 0:
+        return None
+    labels = []
+    for m in WORKSPACE_LABEL.finditer(p.stdout):
+        if m.group(0) not in labels:
+            labels.append(m.group(0))
+    return labels or None
+
+
+def myco_sessions_in(label):
+    """(label, rows) for one workspace, or (label, None) if it could not be read."""
+    env = dict(os.environ, MYCOLAB_WORKSPACE=label) if label else None
+    return label, json_cmd(
+        ["myco", "session", "list", "--json"], env=env, timeout=SESSION_LIST_TIMEOUT
+    )
+
+
 def sessions():
-    """Every spawned session the two daemons know about, normalised."""
-    rows = []
-    for s in json_cmd(["myco", "session", "list", "--json"]) or []:
-        meta = s.get("metadata") or {}
-        rows.append(
-            {
-                "cli": "myco",
-                "id": s.get("sessionId"),
-                "directory": s.get("directory") or meta.get("path"),
-                "active": bool(s.get("active")),
-                "archived": meta.get("archived") is True,
-                "title": meta.get("customTitle") or meta.get("friendlyName"),
-            }
-        )
+    """Every spawned session the two daemons know about, and what could not be read.
+
+    Returns (rows, gaps). `myco session list` answers for ONE workspace -- the
+    ambient MYCOLAB_WORKSPACE -- and a session is invisible from every other
+    one, so asking a single workspace and treating the answer as complete makes
+    gate 3 clear a worktree whose owner simply lives elsewhere. Measured on
+    europa 2026-11-01: six sessions whose working directory is a worktree of
+    this repo resolve only in ws-bioimage-io-932fc61e and appear in no other
+    list, two of them not archived (#0178).
+
+    A workspace that cannot be read is reported as a gap rather than as an
+    empty answer, because the two are indistinguishable from the exit status
+    and only one of them is safe to retire against. A machine inside a
+    workspace that does not answer is NOT a gap: myco still exits 0, and a
+    session on another machine cannot hold a working directory on this one.
+    """
+    rows, gaps, seen = [], [], set()
+
+    labels = workspace_labels()
+    if labels is None:
+        gaps.append("`myco workspaces` could not be read, so the set of workspaces to ask is unknown")
+        labels = [None]  # the ambient one, so the session report is not empty
+
+    if len(labels) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(labels))) as pool:
+            answers = list(pool.map(myco_sessions_in, labels))
+    else:
+        answers = [myco_sessions_in(labels[0])]
+
+    for label, data in answers:
+        if data is None:
+            gaps.append(f"`myco session list` failed for {label or 'the ambient workspace'}")
+            continue
+        for s in data:
+            meta = s.get("metadata") or {}
+            sid = s.get("sessionId")
+            if sid and sid in seen:
+                continue
+            if sid:
+                seen.add(sid)
+            rows.append(
+                {
+                    "cli": "myco",
+                    "id": sid,
+                    "directory": s.get("directory") or meta.get("path"),
+                    "active": bool(s.get("active")),
+                    "archived": meta.get("archived") is True,
+                    "title": meta.get("customTitle") or meta.get("friendlyName"),
+                }
+            )
     for s in json_cmd(["svamp", "session", "list", "--json"]) or []:
         rows.append(
             {
@@ -183,7 +255,7 @@ def sessions():
                 "title": s.get("name"),
             }
         )
-    return rows
+    return rows, gaps
 
 
 # --------------------------------------------------------------------- gates
@@ -285,10 +357,20 @@ def process_cwds():
     return out
 
 
-def gate_unowned(row, sess, procs, self_cwd, owned_within):
+def gate_unowned(row, sess, procs, self_cwd, owned_within, session_gaps=()):
     """Gate 3 — no live session, process or lock claims the worktree."""
     path = os.path.realpath(row["path"])
     reasons = []
+
+    # An unread workspace can hold the session that works here, and nothing
+    # below can tell that apart from nobody owning it. Refusing is the only
+    # answer that is not a guess (#0178).
+    if session_gaps:
+        return False, (
+            "ownership could not be established: "
+            + "; ".join(session_gaps)
+            + " — a session in a workspace that was not read can be working here"
+        )
 
     if self_cwd == path or self_cwd.startswith(path + os.sep):
         reasons.append("this sweep is running inside it")
@@ -456,7 +538,7 @@ def session_verdict(s, self_id):
 
 
 def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots=None):
-    sess = sessions()
+    sess, session_gaps = sessions()
     procs = process_cwds()
     corpus = watcher_corpus(repo, watcher_roots)
     self_cwd = os.path.realpath(os.getcwd())
@@ -484,7 +566,7 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
         else:
             gates["1-merged"] = gate_merged(repo, row, baseline)
             gates["2-clean"] = gate_clean(row)
-            gates["3-unowned"] = gate_unowned(row, sess, procs, self_cwd, owned_within)
+            gates["3-unowned"] = gate_unowned(row, sess, procs, self_cwd, owned_within, session_gaps)
             gates["4-unwatched"] = gate_unwatched(row, corpus, sess)
             passed = all(ok for ok, _ in gates.values())
             row["verdict"] = "DONE" if passed else "NOT-DONE"
@@ -507,7 +589,11 @@ def evaluate(repo, baseline, owned_within=OWNED_IF_TOUCHED_WITHIN, watcher_roots
         verdict, why = session_verdict(s, self_id)
         srows.append(dict(s, verdict=verdict, why=why))
 
-    return rows, srows, {"watcher_files": len(corpus), "processes": len(procs)}
+    return rows, srows, {
+        "watcher_files": len(corpus),
+        "processes": len(procs),
+        "session_gaps": session_gaps,
+    }
 
 
 def render(rows, srows, baseline, counted):
@@ -517,6 +603,8 @@ def render(rows, srows, baseline, counted):
         f"{len(rows)} worktrees, {len(srows)} spawned sessions, "
         f"{counted['watcher_files']} watcher/workflow/cron files, {counted['processes']} processes inspected"
     )
+    for gap in counted.get("session_gaps") or []:
+        out.append(f"GATE 3 COULD NOT BE ESTABLISHED FOR ANY WORKTREE: {gap}")
     out.append("")
     for verdict in ("DONE", "STALE", "NOT-DONE", "UNKNOWN", "EXCLUDED"):
         band = [r for r in rows if r["verdict"] == verdict]
@@ -534,7 +622,7 @@ def render(rows, srows, baseline, counted):
     return "\n".join(out)
 
 
-def summarise(rows, srows, baseline):
+def summarise(rows, srows, baseline, counted=None):
     """The compact form a recurring reporter delivers, printed by --summary."""
     done = [r for r in rows if r["verdict"] == "DONE"]
     stale = [r for r in rows if r["verdict"] == "STALE"]
@@ -549,6 +637,13 @@ def summarise(rows, srows, baseline):
         f"{len(nd)} fail a gate, {len(ex)} excluded by band.",
         f"{len(srows)} spawned sessions: {len(sdone)} retirable (working directory gone).",
     ]
+    for gap in (counted or {}).get("session_gaps") or []:
+        lines.append(
+            f"GATE 3 COULD NOT BE ESTABLISHED: {gap}. No worktree is retirable this tick, "
+            "whatever the other gates say, because a session in a workspace that was not "
+            "read can be working in any of them. A stale registration whose directory is "
+            "already gone is unaffected."
+        )
     if unk:
         lines.append(
             f"INCOMPLETE: {len(unk)} worktree(s) were NOT checked — the sweep hit its "
@@ -650,7 +745,7 @@ def main():
     rows, srows, counted = evaluate(args.repo, baseline, args.owned_within, args.watcher_root)
 
     if args.summary:
-        print(summarise(rows, srows, baseline))
+        print(summarise(rows, srows, baseline, counted))
         return 0
 
     if args.json:

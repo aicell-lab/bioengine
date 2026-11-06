@@ -12,12 +12,20 @@ gate is the *only* thing standing between a worktree and removal, and proves:
   * a branch squash-landed under a different sha is still recognised as landed
   * a stale registration is pruned without taking its branch or its commits
   * --summary prints the digest and invokes no transport at all
+  * gate 3 asks every workspace, and refuses outright when one cannot be read
+
+`myco` and `svamp` are stubbed throughout, so the verdicts depend on the
+fixture and nothing else. They used to be the live ones, which made every
+assertion here a hostage of whatever the mesh happened to answer -- and gate 3
+reads the mesh, so a workspace that merely went slow could turn the whole suite
+red (#0178).
 
 Run it directly; it needs nothing but git and prints a line per assertion.
 
     scripts/test_sweep_agent_worktrees.py
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -143,11 +151,72 @@ def build_fixture(root):
     return repo, watchers, paths
 
 
-def sweep(repo, watchers, *extra):
+WS_A = "ws-sweep-alpha-0a0a0a"
+WS_B = "ws-sweep-beta-0b0b0b"
+
+
+def session_row(directory, sid, active=True, archived=False):
+    return {
+        "sessionId": sid,
+        "directory": directory,
+        "active": active,
+        "metadata": {"archived": archived, "friendlyName": sid},
+    }
+
+
+def myco_shim(root, tag, *, workspaces=(WS_A, WS_B), sessions=None, fail=()):
+    """A stub `myco`/`svamp` pair on PATH, and the env that reaches them.
+
+    Answers `workspaces` from a file and `session list --json` per
+    MYCOLAB_WORKSPACE, so a workspace the sweep does not ask for is a workspace
+    whose sessions it cannot see -- which is the behaviour under test. Every
+    call is logged as `<MYCOLAB_WORKSPACE>|<argv>`, so the log says both what
+    was asked and where.
+    """
+    bindir = os.path.join(root, tag)
+    os.makedirs(bindir, exist_ok=True)
+    log = os.path.join(bindir, "argv")
+    write(os.path.join(bindir, "workspaces.txt"),
+          "attached workspaces:\n" + "".join(f"  {w}  (europa)\n" for w in workspaces))
+    for ws in workspaces:
+        write(os.path.join(bindir, f"sessions-{ws}.json"),
+              json.dumps((sessions or {}).get(ws, [])))
+    for ws in fail:
+        write(os.path.join(bindir, f"fail-{ws}"), "")
+
+    shim = os.path.join(bindir, "myco")
+    write(shim, f"""#!/bin/sh
+D="{bindir}"
+echo "${{MYCOLAB_WORKSPACE:-none}}|$@" >> "{log}"
+if [ "$1" = "workspaces" ]; then cat "$D/workspaces.txt"; exit 0; fi
+if [ "$1" = "session" ] && [ "$2" = "list" ]; then
+  ws="${{MYCOLAB_WORKSPACE:-{workspaces[0] if workspaces else 'none'}}}"
+  if [ -f "$D/fail-$ws" ]; then echo "not attached to $ws" >&2; exit 1; fi
+  if [ -f "$D/sessions-$ws.json" ]; then cat "$D/sessions-$ws.json"; else echo '[]'; fi
+  exit 0
+fi
+exit 0
+""")
+    os.chmod(shim, 0o755)
+    svamp = os.path.join(bindir, "svamp")
+    write(svamp, '#!/bin/sh\necho "[]"\nexit 0\n')
+    os.chmod(svamp, 0o755)
+    return {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"]}, bindir
+
+
+def calls(bindir):
+    """(workspace, argv) for every stub call made, in order."""
+    log = os.path.join(bindir, "argv")
+    if not os.path.exists(log):
+        return []
+    return [tuple(l.split("|", 1)) for l in open(log).read().splitlines() if "|" in l]
+
+
+def sweep(repo, watchers, *extra, env=None):
     p = subprocess.run(
         [sys.executable, SWEEP, "--repo", repo, "--owned-within", "0",
          "--watcher-root", watchers, *extra],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     if p.returncode != 0:
         raise SystemExit(f"sweep exited {p.returncode}:\n{p.stdout}\n{p.stderr}")
@@ -168,36 +237,31 @@ def verdicts(report):
 
 
 def shimmed(root, repo, watchers, *extra, tag="shim"):
-    """Run the sweep against a `myco` that is a no-op recorder, not the real one.
+    """Run the sweep against a stub `myco` and return it plus every call made.
 
-    Returns the finished process and every argv the shim was handed. The sweep
-    must not deliver anything itself (#0171), and the only way to show that is
-    to make a transport available and prove it was never reached.
+    The sweep must not deliver anything itself (#0171), and the only way to
+    show that is to make a transport available and prove it was never reached.
+    The stub answers the session reads properly, because one that answers
+    nothing leaves gate 3 permanently gapped and every verdict NOT-DONE --
+    which a `Removable with` assertion cannot tell apart from a working sweep
+    as long as one stale registration is around to satisfy it (#0178).
     """
-    bindir = os.path.join(root, tag)
-    os.makedirs(bindir, exist_ok=True)
-    log = os.path.join(bindir, "argv")
-    shim = os.path.join(bindir, "myco")
-    write(shim, '#!/bin/sh\n'
-                f'echo "$@" >> "{log}"\n'
-                'exit 0\n')
-    os.chmod(shim, 0o755)
-    env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"]}
+    env, bindir = myco_shim(root, tag)
     p = subprocess.run(
         [sys.executable, SWEEP, "--repo", repo, "--owned-within", "0",
          "--watcher-root", watchers, *extra],
         capture_output=True, text=True, env=env,
     )
-    calls = open(log).read().splitlines() if os.path.exists(log) else []
-    return p, calls
+    return p, calls(bindir)
 
 
 def main():
     with tempfile.TemporaryDirectory(prefix="sweep-control-") as root:
         repo, watchers, paths = build_fixture(root)
+        base, base_bin = myco_shim(root, "myco-base")
 
         print("report (nothing should be removed yet)")
-        before = verdicts(sweep(repo, watchers))
+        before = verdicts(sweep(repo, watchers, env=base))
         expected = {
             "agent-clean": "DONE",
             "agent-squashed": "DONE",
@@ -219,13 +283,13 @@ def main():
         shutil.copyfile(os.path.join(watchers, "bundles", "20260101T000000-sweep.md"), decoy)
         check(
             "the same text OUTSIDE a generated-record dir still fails gate 4",
-            verdicts(sweep(repo, watchers)).get("agent-recorded") == "NOT-DONE",
+            verdicts(sweep(repo, watchers, env=base)).get("agent-recorded") == "NOT-DONE",
             "gate 4 ignored a bundle-shaped file sitting beside the watchers",
         )
         os.remove(decoy)
         check(
             "and removing it puts agent-recorded back to DONE",
-            verdicts(sweep(repo, watchers)).get("agent-recorded") == "DONE",
+            verdicts(sweep(repo, watchers, env=base)).get("agent-recorded") == "DONE",
             "the decoy left a residue",
         )
         check(
@@ -244,8 +308,88 @@ def main():
             "agent-stale" in git(repo, "worktree", "list"),
         )
 
+        print("gate 3 asks every workspace, not the ambient one (#0178)")
+        asked = {ws for ws, a in calls(base_bin) if a.startswith("session list")}
+        check(
+            "the baseline run asked every workspace myco lists",
+            asked == {WS_A, WS_B}, f"asked: {sorted(asked)}",
+        )
+
+        # The defect: a session working in the worktree, registered in a
+        # workspace that is not the ambient one. Gate 3 has to find it.
+        owner = {WS_B: [session_row(paths["agent-clean"], "owner-in-second-ws")]}
+        env, _ = myco_shim(root, "ws-owner", sessions=owner)
+        report = sweep(repo, watchers, env=env)
+        check(
+            "a session in the SECOND workspace holds agent-clean",
+            verdicts(report).get("agent-clean") == "NOT-DONE",
+            f"got {verdicts(report).get('agent-clean')!r}",
+        )
+        check(
+            "and the report names that session as the owner",
+            "owner-in-second-ws" in report and "works here" in report,
+            [l for l in report.splitlines() if "agent-clean" in l],
+        )
+        # The discriminator for that pass: with only one workspace in the
+        # registry -- the pre-#0178 reach -- the same session is invisible and
+        # the same worktree is cleared for removal.
+        env, _ = myco_shim(root, "ws-owner-unreachable", workspaces=(WS_A,), sessions=owner)
+        check(
+            "the same owner is invisible when only one workspace is read",
+            verdicts(sweep(repo, watchers, env=env)).get("agent-clean") == "DONE",
+            "something other than the second workspace is sparing agent-clean",
+        )
+        # ...and gate 3 must still be capable of clearing: an archived session
+        # in the same place does not block, so the control above is the session
+        # being found and not merely a session row existing.
+        env, _ = myco_shim(root, "ws-owner-archived", sessions={
+            WS_B: [session_row(paths["agent-clean"], "archived-in-second-ws", archived=True)]})
+        check(
+            "an ARCHIVED session in the second workspace does not block",
+            verdicts(sweep(repo, watchers, env=env)).get("agent-clean") == "DONE",
+            "gate 3 now blocks on any session row, archived or not",
+        )
+
+        # A workspace that cannot be read is the case that must not be guessed:
+        # it is indistinguishable from one holding the owner.
+        env, _ = myco_shim(root, "ws-unreadable", fail=(WS_B,))
+        report = sweep(repo, watchers, env=env)
+        v = verdicts(report)
+        check(
+            "an unreadable workspace makes every worktree NOT-DONE",
+            "DONE" not in set(v.values()), f"{v}",
+        )
+        check(
+            "and the report says gate 3 could not be established",
+            "could not be established" in report and WS_B in report,
+            [l for l in report.splitlines() if "ownership" in l][:2],
+        )
+        check(
+            "a stale registration is still reported when a workspace is unreadable",
+            v.get("agent-stale") == "STALE", f"got {v.get('agent-stale')!r}",
+        )
+        p, _ = shimmed(root, repo, watchers, "--summary", tag="shim-gap")
+        check(
+            "the healthy --summary does NOT carry the gate 3 warning",
+            "could not be established" not in p.stdout, p.stdout[:300],
+        )
+        env, _ = myco_shim(root, "ws-unreadable-summary", fail=(WS_B,))
+        gap = subprocess.run(
+            [sys.executable, SWEEP, "--repo", repo, "--owned-within", "0",
+             "--watcher-root", watchers, "--summary"],
+            capture_output=True, text=True, env=env,
+        )
+        check(
+            "--summary states the gap rather than reporting a clean tick",
+            "GATE 3 COULD NOT BE ESTABLISHED" in gap.stdout, gap.stdout[:300],
+        )
+        check(
+            "--summary with a gap offers no worktree for removal",
+            "all four gates pass" not in gap.stdout, gap.stdout[:300],
+        )
+
         print("summary (the digest is data on stdout, and nothing is delivered)")
-        p, calls = shimmed(root, repo, watchers, "--summary", tag="shim-summary")
+        p, made = shimmed(root, repo, watchers, "--summary", tag="shim-summary")
         check("--summary exits 0 and prints the digest",
               p.returncode == 0 and "worktrees against origin/main" in p.stdout,
               f"exit {p.returncode}: {p.stdout.strip()[:200]} {p.stderr.strip()[:200]}")
@@ -255,8 +399,8 @@ def main():
               "Removable with" in p.stdout, p.stdout[:200])
         # The point of the row: a transport was on PATH and the sweep never used it.
         check("--summary calls no transport at all",
-              not [c for c in calls if c.startswith("session send")],
-              f"myco was called with: {calls}")
+              not [a for _, a in made if a.startswith("session send")],
+              f"myco was called with: {made}")
         check("--summary removes nothing",
               all(os.path.isdir(x) for n, x in paths.items() if n != "agent-stale"))
         # A control for the control: the same shim DOES record a send when one is made,
@@ -279,7 +423,7 @@ def main():
               f"exit {p.returncode}: {p.stderr.strip()[:200]}")
 
         print("apply (only the three that pass every gate should go)")
-        sweep(repo, watchers, "--apply")
+        sweep(repo, watchers, "--apply", env=base)
         live = git(repo, "worktree", "list")
         branches = git(repo, "branch", "--format=%(refname:short)").split()
 
@@ -306,7 +450,7 @@ def main():
         )
 
         print("re-run (idempotent: nothing left to remove)")
-        after = verdicts(sweep(repo, watchers))
+        after = verdicts(sweep(repo, watchers, env=base))
         check(
             "nothing is removable on the second pass",
             not ({"DONE", "STALE"} & set(after.values())), f"{after}",
