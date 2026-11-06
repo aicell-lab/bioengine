@@ -39,26 +39,9 @@ before opening a PR — sync first:
   One page is enough to answer *"what is the newest tag"*; it is not enough to answer *"how far back does the tag history go"* — that API paginates over digests, most of them untagged.
 - **Before bumping `version` in `apps/<name>/manifest.yaml`**: check `get_app_status` on the live worker for the currently deployed version AND check `origin/main`'s copy. Bump from the higher of the two so the next CI publish strictly increases.
 
-## Code conventions
+## Environment facts that would mislead you
 
-- **Simplicity First.** Make every change as minimal as possible.
-- **No Regressions.** Only change what's necessary; read before modifying.
-- **Prove It Works.** Test and verify before marking done.
-- **Grep before you write.** Before adding a helper, util, type, or pattern, search for one that already exists. Re-implementing what lives a few files over is the most common form of slop here.
-- **Fix the root cause, not the symptom.** A bug report names one broken path; before editing it, grep every caller of the function you are about to touch. One guard in the shared function is a smaller diff than a guard in every caller — and patching only the path the report names leaves every sibling caller still broken.
-- **Don't add features, refactors, abstractions, or error handling beyond what the task requires.** No designing for hypothetical futures. Three similar lines is better than a premature abstraction. No half-finished implementations.
-- **Trust internal code and framework guarantees.** Only validate at system boundaries (user input, external APIs). Don't add backwards-compat shims when you can just change the code.
-- **Don't bake in machine-specific paths/identifiers** (`/proj/aicell/users/x_nilme/...`, `/home/<user>/...`, SLURM allocation ids, private cluster names). The repo ships to other clusters; those strings leak local layout and rot. Use a generic placeholder or drop the path entirely if the surrounding code already explains the shape.
-
-### Comments — write almost none
-
-Code should explain *what* via good names; comments earn their place only when they explain *why* something non-obvious is true.
-
-- **Do not narrate** what the next line does (`# fetch the user`, `# loop over items`, `# now connect`). The line says it.
-- **Do not describe the PR / current task** in a comment (`# added for the geo location PR`, `# this fixes the timeout we hit yesterday`). That belongs in the commit message; in the file it just rots.
-- **Do not write multi-paragraph comments** unless the reader genuinely cannot reconstruct the reasoning. One short sentence is almost always enough; two if there's a real footgun. Prefer a one-line docstring over a wall of `#`.
-- **Do write a comment** when it captures a hidden constraint a future reader would otherwise re-discover the hard way: a workaround for a known bug, a non-obvious invariant, an external system's quirk, a reason for a counter-intuitive default. Make it as short as possible while still naming the *why*.
-- When in doubt: delete the comment, run the diff again, and ask whether the code is materially harder to understand. If not, the comment was not pulling its weight.
+- **Do not bake in machine-specific paths or identifiers** (`/proj/aicell/users/...`, `/home/<user>/...`, SLURM allocation ids, private cluster names). This repo ships to other clusters; those strings leak local layout and rot.
 
 ## When PRs are required vs direct-push to main
 
@@ -191,10 +174,3 @@ Don't duplicate this content here:
 | End-to-end deploy_app flow (14-step walkthrough) | `docs/deploy_app_flow.md` |
 | App authoring (`@bioengine.app`, manifest fields, deploying apps) | `../bioimage.io/public/skills/bioengine/SKILL.md` |
 | Hypha platform basics (tokens, workspaces, RPC, artifacts) | <https://hypha.aicell.io/ws/agent-skills/SKILL.md> |
-
-## Planning / files
-
-- Planning lives in model context — do NOT create planning files in the repo.
-- If the user asks for help or wants to give feedback inform them:
-  - `/help` — get help with using Claude Code
-  - Feedback: <https://github.com/anthropics/claude-code/issues>
