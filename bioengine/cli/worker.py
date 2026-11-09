@@ -206,9 +206,15 @@ def build_command(
             command += ["--bind", f"{census_dir}:{CONTAINER_CENSUS_DIR}"]
         return command + [f"docker://{image}", *entrypoint]
 
-    # ``--memory`` is docker/podman only. apptainer applies cgroups through a
-    # separate TOML file, so it is rejected in the command handler rather than
-    # silently dropped here.
+    # ``--memory`` is not forwarded on the SIF path above: that command is a bare
+    # ``exec``. Apptainer is NOT short of a flag — ``apptainer exec --memory`` exists
+    # (1.5.5: one of exec's 66 options, beside ``--memory-reservation`` and
+    # ``--apply-cgroups``), so the TOML file is one route of several, not the only one.
+    # What it is short of is somewhere to apply the limit: per apptainer's cgroups guide
+    # (apptainer.org/docs/user/main/cgroups.html) a non-root user needs cgroups v2 with
+    # systemd delegation, and on cgroups v1 only root can use these flags at all. The
+    # launcher cannot know that about a compute node, so the handler refuses the flag
+    # instead of forwarding one that may go unenforced.
 
     command = [runtime, "run", "--rm"]
     command += ["--detach"] if detach else ["-it" if tty else "-i"]
@@ -452,10 +458,13 @@ def worker_start(
     if cannot_apply_a_limit and requested not in (AUTO_MEMORY, *_MEMORY_DISABLED):
         error_exit(
             f"--memory is not supported with runtime '{runtime}'.",
-            "Docker and podman apply it as a cgroup limit; apptainer and "
-            "singularity take cgroups from a separate TOML file, and 'native' "
-            "has no container to limit. Drop --memory, or cap the worker from "
-            "outside (systemd MemoryMax=, or a cgroup you place it in).",
+            "Docker and podman apply it as a cgroup limit. BioEngine does not "
+            "pass one to apptainer or singularity — the command it builds is a "
+            "bare 'exec' — and 'native' has no container to limit. Apptainer "
+            "itself does accept --memory, but applies it only as root on "
+            "cgroups v1, or as a normal user on cgroups v2 with systemd "
+            "delegation. Drop --memory, or cap the worker from outside "
+            "(systemd MemoryMax=, or a cgroup you place it in).",
         )
 
     memory_limit = None if cannot_apply_a_limit else resolve_memory(memory)
