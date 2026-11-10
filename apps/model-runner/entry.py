@@ -98,7 +98,16 @@ def _read_pip(name: str) -> List[str]:
     memory_mb=4 * 1024,
     pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=10,
-    max_queued_requests=30,
+    # 200, not 30: with 100 participants each holding one in-flight submit plus gated
+    # status polls, a 30-deep queue DROPS the excess with
+    # ``BackPressureError: Request dropped due to backpressure`` rather than making it
+    # wait. Measured 2026-11-10 on production KTH: 24 of 100 requests were dropped here
+    # once the proxy admission cap was raised past this deployment's own capacity
+    # (10 ongoing + 30 queued = 40). RuntimeDeployment sets no ``max_queued_requests``
+    # at all, so raising this one does not merely move the drop downstream. A queued
+    # request holds a file-path string on the upload route, not a decoded image, so the
+    # depth costs bookkeeping rather than memory against this deployment's 4 GiB.
+    max_queued_requests=200,
     autoscaling_config={
         "min_replicas": 1,
         "initial_replicas": 1,
