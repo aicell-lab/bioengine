@@ -12,6 +12,8 @@ Ray then rejected.
 
 import pytest
 
+from ray.serve.config import AutoscalingConfig
+
 from bioengine.apps.manager import _validate_scaling_map
 
 DEPLOYMENTS = ("CellposeRuntime", "EntryApp")
@@ -92,3 +94,52 @@ def test_autoscaling_config_alone_is_accepted():
 def test_an_empty_map_passes(empty):
     """An absent entry is legal — it means "no override", not "one replica"."""
     _validate_scaling_map(empty, DEPLOYMENTS, "my-app")
+
+
+def _a_field_info():
+    """Any real FieldInfo — the validator only reads the KEYS, never the values."""
+    return next(iter(AutoscalingConfig.model_fields.values()))
+
+
+def test_a_key_ray_adds_later_is_accepted_without_touching_this_file(monkeypatch):
+    """Site 6 of #0212, arm 1 of 2: ``valid_keys`` is derived, not enumerated.
+
+    The whole point of ``set(AutoscalingConfig.model_fields)`` is that a key Ray adds in
+    a future release is accepted the day it ships. A hardcoded list would reject it and
+    turn a Serve upgrade into a BioEngine bug, which is the opposite of what the guard
+    is for — it exists to catch keys Serve would DROP, not to freeze Serve's schema.
+
+    Pinning a forward-compat property normally means waiting for the future. It does not
+    here: ``model_fields`` is a plain dict, so a synthetic key can be injected and the
+    future simulated. Measured in the shipped image at Ray 2.55.1 / pydantic 2.12.0.
+    """
+    monkeypatch.setitem(AutoscalingConfig.model_fields, "zz_future_knob", _a_field_info())
+
+    _validate_scaling_map(
+        {"CellposeRuntime": {"autoscaling_config": {"zz_future_knob": 7}}},
+        DEPLOYMENTS,
+        "my-app",
+    )
+
+
+def test_a_key_ray_removes_stops_being_accepted(monkeypatch):
+    """Site 6 of #0212, arm 2 of 2 — and the arm that makes arm 1 non-vacuous.
+
+    Arm 1 passes against a mutant that unions a hardcoded set WITH ``model_fields``:
+    the synthetic key is in model_fields, so such a mutant accepts it too. Only removal
+    separates them. With a real key deleted, the derived form rejects it while any form
+    carrying its own hardcoded copy still accepts — so the two arms together pin
+    ``valid_keys`` to exactly ``set(model_fields)``, which neither does alone.
+
+    ``aggregation_function`` is a real Ray key; monkeypatch restores it afterwards.
+    """
+    monkeypatch.delitem(AutoscalingConfig.model_fields, "aggregation_function")
+
+    with pytest.raises(ValueError) as excinfo:
+        _validate_scaling_map(
+            {"CellposeRuntime": {"autoscaling_config": {"aggregation_function": "mean"}}},
+            DEPLOYMENTS,
+            "my-app",
+        )
+    # Named, not merely raised: the message is what tells a user which key was wrong.
+    assert "aggregation_function" in str(excinfo.value)

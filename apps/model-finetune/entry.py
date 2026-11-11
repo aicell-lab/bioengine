@@ -202,11 +202,25 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     reader of a 1.2 GB checkpoint then sees a prefix, and identical content is no
     defence because the problem is the length, not the bytes. The temp name carries
     a uuid so concurrent writers cannot share it either.
+
+    Both fsyncs are for the cross-node case rather than the same-process one: callers
+    hand ``path`` to a runtime replica on a different node, and ``os.replace`` publishes
+    the name immediately while the data may still sit in this client's page cache — so
+    the reader opens the new name and legitimately sees fewer bytes than were written.
+    Syncing the file before the rename and the directory after closes that window.
     """
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_bytes(content)
+        with open(tmp, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -216,10 +230,17 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     memory_mb=4 * 1024,
     pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=10,
+    # Scales to zero so an idle deployment holds nothing on an HPC login node;
+    # the proxy stays up and serves the service either way. Held at one replica
+    # because the training/export task maps and the GPU semaphore are
+    # replica-local; the records a caller polls are on disk, so a teardown
+    # between calls is invisible to the frontend.
     autoscaling_config={
-        "min_replicas": 1,
-        "initial_replicas": 1,
+        "min_replicas": 0,
+        "initial_replicas": 0,
         "max_replicas": 1,
+        "downscale_delay_s": 600.0,
+        "upscale_delay_s": 0.0,
     },
     health_check_period_s=30.0,
     health_check_timeout_s=30.0,
@@ -257,9 +278,6 @@ class EntryApp:
         self._s3 = None
         self._http: Optional[httpx.AsyncClient] = None
         self._training_tasks: Dict[str, asyncio.Task] = {}
-        # In-memory export registry (v1): export_id -> status record. Lost on
-        # replica restart — the frontend re-exports if a handle goes missing.
-        self._exports: Dict[str, Dict[str, Any]] = {}
         self._export_tasks: Dict[str, asyncio.Task] = {}
         # Bound concurrent GPU fine-tuning. Default 1 serializes training so
         # autoscaled replicas stay free to serve inference during a long run
@@ -409,6 +427,30 @@ class EntryApp:
                 await asyncio.sleep(delay)
                 continue
             return resp
+
+    async def _get_verified(self, url: str, **kwargs) -> bytes:
+        """GET a body whole, rejecting a short read.
+
+        httpx raises on a body cut short of its declared length, so this check is a
+        second line of defence — but the one that matters: a prefix reaching
+        ``_write_file_atomic`` is indistinguishable from a prefix a reader sees for
+        lack of an fsync, both surfacing as ``failed finding central directory`` from
+        ``torch.load`` far from the cause. Same contract as
+        ``runtime_cellpose._download_member``.
+        """
+        from http.client import IncompleteRead
+
+        resp = await self._http_retry("GET", url, **kwargs)
+        # The length check alone cannot catch an error response: 403/404 are in
+        # _http_retry's retry set and it returns the last one unraised, and an S3
+        # error body declares its own length correctly — so a few hundred bytes of
+        # XML passes as "whole" and gets written as a .pt.
+        resp.raise_for_status()
+        content = resp.content
+        declared = resp.headers.get("Content-Length")
+        if declared is not None and len(content) != int(declared):
+            raise IncompleteRead(content, int(declared) - len(content))
+        return content
 
     @staticmethod
     async def _file_chunks(fpath: Path, size: int = 1 << 20):
@@ -560,7 +602,14 @@ class EntryApp:
         weights_path = cache_dir / "weights.pt"
         meta_path = cache_dir / "kwargs.json"
         if weights_path.exists() and meta_path.exists():
-            return {"weights_path": str(weights_path), **json.loads(meta_path.read_text())}
+            meta = json.loads(meta_path.read_text())
+            # The recorded length, not the pair existing, is what says the weights are
+            # whole. Both files existing only proves they were written by a version that
+            # had ``_write_file_atomic``; versions before it wrote ``weights.pt`` in
+            # place, and this cache lives in an app HOME that outlives any one version.
+            # So an entry carrying no length is a MISS and re-downloads once.
+            if meta.pop("bytes", None) == weights_path.stat().st_size:
+                return {"weights_path": str(weights_path), **meta}
 
         caller_client = (
             await connect_to_server({"server_url": SERVER_URL, "token": model_token})
@@ -582,12 +631,14 @@ class EntryApp:
                 raise FileNotFoundError(
                     f"No RDF (bioimageio.yaml or rdf.yaml) found in artifact '{model_id}'."
                 )
-            rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
+            rdf_resp = await self._http_retry("GET", rdf_url)
+            rdf_resp.raise_for_status()
+            rdf = yaml.safe_load(rdf_resp.text)
             ps = rdf["weights"]["pytorch_state_dict"]
             model_type = ps["architecture"]["kwargs"]["model_type"]
 
             w_url = await am.get_file(model_id, file_path=ps["source"])
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
             cache_dir.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(_write_file_atomic, weights_path, content)
             meta = {"model_type": model_type}
@@ -595,7 +646,9 @@ class EntryApp:
             # gates on both files existing, so it must appear whole or not at all — a
             # plain write_text makes it exist (empty) before it has content, and the
             # reader then json.loads("").
-            _write_file_atomic(meta_path, json.dumps(meta).encode())
+            _write_file_atomic(
+                meta_path, json.dumps({**meta, "bytes": len(content)}).encode()
+            )
             return {"weights_path": str(weights_path), **meta}
         finally:
             if caller_client is not None:
@@ -850,7 +903,10 @@ class EntryApp:
                     )
                 dest = training.session_dir(session_id) / "init_checkpoint.pt"
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(dest.write_bytes, resp.content)
+                # dest reaches a train worker as the params' checkpoint_path, so a
+                # plain write_bytes would publish the name at length zero and let
+                # that worker torch.load a prefix from another node.
+                await asyncio.to_thread(_write_file_atomic, dest, resp.content)
                 resolved["checkpoint_path"] = str(dest)
                 if params.get("pool_provenance"):
                     self._bump_transport(bytes_down=len(resp.content))
@@ -878,8 +934,15 @@ class EntryApp:
                     session_id=session_id, model_type=model_type, params=params
                 )
         except asyncio.CancelledError:
-            training.write_status(session_id, status="STOPPED",
-                                   message="training task cancelled", terminated_by="user_stop")
+            # Only a user stop may claim rank-4 user_stop, which no later writer
+            # can correct. This task is also cancelled when the entry replica is
+            # torn down (it scales to zero), while the runtime subprocess keeps
+            # running and owns the real outcome — recording that as a user stop
+            # would discard the child's COMPLETED for good.
+            if training.stop_requested(session_id):
+                training.write_status(session_id, status="STOPPED",
+                                       message="training task cancelled",
+                                       terminated_by="user_stop")
             raise
         except Exception as e:
             logger.error(f"Training session {session_id} failed: {e}")
@@ -1289,41 +1352,61 @@ class EntryApp:
             "license": license,
             "provenance": provenance,
         }
-        self._exports[export_id] = {
-            "export_id": export_id, "status": "PENDING", "progress": 0.0,
-            "message": "queued", "download_url": None, "size_bytes": None, "error": None,
-        }
+        training.write_export(
+            export_id, status="PENDING", progress=0.0, message="queued",
+            download_url=None, size_bytes=None, error=None,
+        )
         self._export_tasks[export_id] = asyncio.create_task(
             self._run_export(export_id, session_id, request)
         )
         return {"export_id": export_id, "status": "PENDING"}
 
+    async def _export_heartbeat(self, export_id: str, interval: float = 60.0) -> None:
+        """Refresh the export record's ``updated_at`` while its build is alive.
+
+        Building the package and uploading it each run for minutes with no
+        progress write, which would exceed STATUS_STALE_SECONDS and have
+        get_export sweep a healthy export to FAILED. This dies with the replica,
+        which is what lets the sweep fire for a build nobody is driving.
+        """
+        import training
+
+        while True:
+            await asyncio.sleep(interval)
+            if training.read_export(export_id).get("status") not in ("PENDING", "BUILDING"):
+                return
+            training.write_export(export_id)
+
     async def _run_export(self, export_id: str, session_id: str, request: Dict[str, Any]) -> None:
         import training
 
-        rec = self._exports[export_id]
+        export_hb = asyncio.create_task(self._export_heartbeat(export_id))
         try:
-            rec.update(status="BUILDING", progress=0.1, message="building package")
+            training.write_export(export_id, status="BUILDING", progress=0.1,
+                                  message="building package")
             served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
             res = await self._runtime_for(served).export_bioimageio(
                 session_id=session_id, request=request
             )
-            rec["_package_dir"] = res["package_dir"]
-            rec.update(progress=0.8, message="staging package")
+            training.write_export(export_id, _package_dir=res["package_dir"],
+                                  progress=0.8, message="staging package")
             zip_path = Path(res["zip"])
             file_path = f"temp/{export_id}/{zip_path.name}"
             upload_url = await self._s3.put_file(file_path=file_path, ttl=6 * 3600)
             resp = await self._put_file(upload_url, zip_path, timeout=600.0)
             resp.raise_for_status()
             download_url = await self._get_download_url(file_path)
-            rec.update(
-                status="READY", progress=1.0, message="ready",
+            training.write_export(
+                export_id, status="READY", progress=1.0, message="ready",
                 download_url=download_url, size_bytes=res["zip_size"], files=res["files"],
                 resume_checkpoint_file=res.get("resume_checkpoint_file"),
             )
         except Exception as e:
             logger.exception(f"Export {export_id} failed")
-            rec.update(status="FAILED", progress=1.0, message="failed", error=str(e))
+            training.write_export(export_id, status="FAILED", progress=1.0,
+                                  message="failed", error=str(e))
+        finally:
+            export_hb.cancel()
 
     @bioengine.method
     async def get_export_status(
@@ -1335,8 +1418,10 @@ class EntryApp:
         can mirror them when creating the draft artifact and calling push_export.
         ``resume_checkpoint_file`` names the package's resumable weights file, to
         feed back into ``start_training(init_checkpoint=...)``."""
-        rec = self._exports.get(export_id)
-        if rec is None:
+        import training
+
+        rec = training.get_export(export_id)
+        if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         return {k: v for k, v in rec.items() if not k.startswith("_")}
 
@@ -1356,8 +1441,10 @@ class EntryApp:
         draft with the user's token, mints a presigned put_file URL per package
         file, then calls this. Draft-only: this app never creates, commits, or
         reads the artifact."""
-        rec = self._exports.get(export_id)
-        if rec is None:
+        import training
+
+        rec = training.get_export(export_id)
+        if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         if rec.get("status") != "READY":
             raise RuntimeError(f"Export '{export_id}' is not READY (status={rec.get('status')}).")
@@ -1707,12 +1794,17 @@ class EntryApp:
             else:
                 pool.assert_compatible(index, model_type=model_type, signature=signature)
 
+            # Resolved once and used by both the stored metadata and the value
+            # returned to the caller, so the two records cannot date the same
+            # contribution differently. Empty is the same as unset here: an
+            # exported-but-empty var would otherwise stamp "" and read as a
+            # known version.
+            app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
             metadata = pool.build_contribution_metadata(
                 contribution_id=cid,
                 model_type=model_type,
-                # Empty is the same as unset here: an exported-but-empty var
-                # would otherwise stamp "" and read as a known version.
-                app_version=os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None,
+                app_version=app_version,
                 cellpose_version=info["cellpose_version"],
                 architecture_signature=signature,
                 base_checkpoint_id=base_checkpoint_id,
@@ -1754,6 +1846,11 @@ class EntryApp:
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
             "schema_version": pool.SCHEMA_VERSION,
+            # The caller keeps this record, not the stored metadata.json, so it
+            # carries app_version too: schema_version does not cover a release
+            # that changes a value without changing the shape (0.27.6 moved
+            # every l2_from_base), which leaves a saved response undatable.
+            "app_version": app_version,
             "contribution_id": cid,
             "pool_artifact_id": pool_artifact_id,
             "architecture_signature": signature,
@@ -1830,7 +1927,7 @@ class EntryApp:
                     raise ValueError(f"pool '{pool_artifact_id}' has no community checkpoint to evaluate.")
                 weights_rel = cc["path"]
             w_url = await am.get_file(pool_artifact_id, file_path=weights_rel)
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)

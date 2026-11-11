@@ -1,4 +1,6 @@
-# Standing CPU app: Hypha/S3 transport only, no ML deps. Pins match the
-# bioengine root pyproject.toml's own dependency floors for consistency.
-httpx>=0.28.1
-hypha-rpc>=0.21.40
+# Standing CPU app: Hypha/S3 transport only, no ML deps. Pinned, not floored:
+# Ray resolves this list against PyPI on every runtime_env build, so a floor
+# lets the running version change with no commit behind it. Versions match
+# requirements-worker.txt so the app and the worker speak the same RPC.
+httpx==0.28.1
+hypha-rpc==0.21.40
