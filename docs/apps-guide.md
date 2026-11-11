@@ -856,6 +856,43 @@ You can also create and upload applications directly through the Hypha web inter
 
 The web interface provides a user-friendly way to manage your applications without needing command-line tools, and it automatically validates your manifest and files during the upload process.
 
+### What an upload can and cannot disturb
+
+Uploading a new version of an app does **not** touch a running deployment, and cannot change
+what any already-published version resolves to. It *can* change what the next deploy of an
+app that is not currently running picks up. The three mechanisms, each readable in the code:
+
+**An upload always creates a new version; it never writes into an existing one.**
+`_enforce_version_increases` (`bioengine/utils/artifact_utils.py`) rejects a manifest version
+that already exists, or that is not strictly greater than the highest existing one by PEP 440.
+It runs *inside* `stage_artifact`, before anything is staged, and `stage_artifact` always
+branches a fresh snapshot with `edit(version="new")`, committed later under the manifest
+version. Both paths in `scripts/upload_app.py` end there — through the worker's `upload_app`
+with `--worker-service-id`, through `create_application_from_files` without it.
+
+Hypha's own `put_file` *will* overwrite a committed path silently, so immutability here is an
+invariant of the upload path rather than a guarantee of the platform. Bypass `upload_app` and
+you lose it.
+
+**A running app redeployed without a version keeps the version it is running.**
+`deploy_app` resolves an omitted `version` to `"inherited"` for an `application_id` that is
+already running — not to `latest` — and returns that in `version_source`. So an upload cannot
+move a live deployment, and that holds for the auto-redeploy and monitoring paths too, not
+only because a started replica does not re-fetch its source.
+
+**An `application_id` that is *not* running resolves to `latest`.** This is the one case where
+a newly committed version is picked up: after a worker restart, a startup application whose
+config omits `version` deploys the newest committed version rather than the one that was
+running before. Pin it if that matters — `--startup-applications '{"artifact_id": ...,
+"application_id": ..., "version": "1.2.3"}'`. `get_app_status` reports the pin per application
+as `pinned_version`, which is the read-only reflection of the launch config, so it is also how
+you check an already-running worker.
+
+One asymmetry worth knowing if anyone has ever deleted a version: `latest` is the most
+recently *created* version, while the upload gate ranks by PEP 440. The two disagree for an
+artifact whose newest entry is not its highest version, which is reachable by deleting a
+version and re-adding a lower one.
+
 ## Deployment and Usage
 
 ### Deploying Applications
