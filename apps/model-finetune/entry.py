@@ -101,6 +101,83 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
+def _apply_clahe(img_array: np.ndarray) -> np.ndarray:
+    """Grayscale uint8 + CLAHE contrast enhancement. Accepts (H,W), (H,W,C) or
+    (C,H,W); returns a (H,W) uint8 array. Rescues low-contrast fluorescence that
+    Cellpose-SAM otherwise cannot segment (opt-in via preflight_training_dataset).
+    Pure numpy — NO cv2 — so the CPU entry's numpy ABI is never perturbed: adding
+    opencv dragged in an incompatible numpy and crashed EntryApp init at deploy
+    (numpy.dtype size mismatch vs the pandas imported at init; deNBI verify of 0.21.0)."""
+    arr = np.asarray(img_array)
+    if arr.ndim == 3 and arr.shape[0] in (1, 2, 3, 4) and arr.shape[0] < arr.shape[1]:
+        arr = arr.transpose(1, 2, 0)
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = arr[:, :, 0]
+        elif arr.shape[2] >= 3:
+            arr = (
+                0.299 * arr[:, :, 0].astype(np.float32)
+                + 0.587 * arr[:, :, 1].astype(np.float32)
+                + 0.114 * arr[:, :, 2].astype(np.float32)
+            ).astype(np.uint8)
+    if arr.dtype != np.uint8:
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi > lo:
+            arr = ((arr.astype(np.float32) - lo) / (hi - lo) * 255).astype(np.uint8)
+        else:
+            arr = np.zeros(arr.shape, dtype=np.uint8)
+    return _clahe_numpy(arr, clip_limit=3.0, grid=(16, 16))
+
+
+def _clahe_numpy(gray: np.ndarray, clip_limit: float = 3.0, grid=(16, 16)) -> np.ndarray:
+    """Contrast-limited adaptive histogram equalisation, bilinearly interpolated
+    between per-tile clipped-CDF LUTs — a numpy reimplementation of
+    ``cv2.createCLAHE(clipLimit, tileGridSize).apply()`` so no compiled dep is pulled
+    into the CPU entry. gray: (H,W) uint8 -> (H,W) uint8."""
+    g = np.asarray(gray, dtype=np.uint8)
+    h, w = g.shape
+    gy, gx = grid
+    ys = np.linspace(0, h, gy + 1).astype(int)
+    xs = np.linspace(0, w, gx + 1).astype(int)
+    luts = np.empty((gy, gx, 256), dtype=np.float32)
+    for i in range(gy):
+        for j in range(gx):
+            tile = g[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            n = tile.size
+            if n == 0:
+                luts[i, j] = np.arange(256, dtype=np.float32)
+                continue
+            hist = np.bincount(tile.ravel(), minlength=256).astype(np.float32)
+            limit = max(1.0, clip_limit * n / 256.0)
+            excess = np.maximum(hist - limit, 0.0).sum()
+            hist = np.minimum(hist, limit) + excess / 256.0
+            cdf = np.cumsum(hist)
+            lo, hi = cdf.min(), cdf.max()
+            luts[i, j] = (cdf - lo) / (hi - lo + 1e-9) * 255.0
+    cy = (ys[:-1] + ys[1:]) / 2.0
+    cx = (xs[:-1] + xs[1:]) / 2.0
+
+    def _iw(coords, centers):
+        idx = np.searchsorted(centers, coords)
+        i1 = np.clip(idx, 0, len(centers) - 1)
+        i0 = np.clip(idx - 1, 0, len(centers) - 1)
+        c0, c1 = centers[i0], centers[i1]
+        wt = np.where(i0 == i1, 0.0,
+                      np.clip((coords - c0) / np.where(c1 > c0, c1 - c0, 1.0), 0, 1))
+        return i0, i1, wt
+
+    ri0, ri1, rw = _iw(np.arange(h), cy)
+    ci0, ci1, cw = _iw(np.arange(w), cx)
+    R0 = np.repeat(ri0[:, None], w, 1); R1 = np.repeat(ri1[:, None], w, 1)
+    C0 = np.repeat(ci0[None, :], h, 0); C1 = np.repeat(ci1[None, :], h, 0)
+    gi = g.astype(np.int64)
+    v00 = luts[R0, C0, gi]; v01 = luts[R0, C1, gi]
+    v10 = luts[R1, C0, gi]; v11 = luts[R1, C1, gi]
+    RW = rw[:, None]; CW = cw[None, :]
+    out = (v00 * (1 - CW) + v01 * CW) * (1 - RW) + (v10 * (1 - CW) + v11 * CW) * RW
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def _is_missing_file(exc: BaseException) -> bool:
     """True only when an artifact-manager call failed because the file is absent.
 
@@ -126,11 +203,25 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     reader of a 1.2 GB checkpoint then sees a prefix, and identical content is no
     defence because the problem is the length, not the bytes. The temp name carries
     a uuid so concurrent writers cannot share it either.
+
+    Both fsyncs are for the cross-node case rather than the same-process one: callers
+    hand ``path`` to a runtime replica on a different node, and ``os.replace`` publishes
+    the name immediately while the data may still sit in this client's page cache — so
+    the reader opens the new name and legitimately sees fewer bytes than were written.
+    Syncing the file before the rename and the directory after closes that window.
     """
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_bytes(content)
+        with open(tmp, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -140,10 +231,17 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     memory_mb=4 * 1024,
     pip=_read_pip("requirements-entry.txt"),
     max_ongoing_requests=10,
+    # Scales to zero so an idle deployment holds nothing on an HPC login node;
+    # the proxy stays up and serves the service either way. Held at one replica
+    # because the training/export task maps and the GPU semaphore are
+    # replica-local; the records a caller polls are on disk, so a teardown
+    # between calls is invisible to the frontend.
     autoscaling_config={
-        "min_replicas": 1,
-        "initial_replicas": 1,
+        "min_replicas": 0,
+        "initial_replicas": 0,
         "max_replicas": 1,
+        "downscale_delay_s": 600.0,
+        "upscale_delay_s": 0.0,
     },
     health_check_period_s=30.0,
     health_check_timeout_s=30.0,
@@ -181,9 +279,6 @@ class EntryApp:
         self._s3 = None
         self._http: Optional[httpx.AsyncClient] = None
         self._training_tasks: Dict[str, asyncio.Task] = {}
-        # In-memory export registry (v1): export_id -> status record. Lost on
-        # replica restart — the frontend re-exports if a handle goes missing.
-        self._exports: Dict[str, Dict[str, Any]] = {}
         self._export_tasks: Dict[str, asyncio.Task] = {}
         # Bound concurrent GPU fine-tuning. Default 1 serializes training so
         # autoscaled replicas stay free to serve inference during a long run
@@ -333,6 +428,30 @@ class EntryApp:
                 await asyncio.sleep(delay)
                 continue
             return resp
+
+    async def _get_verified(self, url: str, **kwargs) -> bytes:
+        """GET a body whole, rejecting a short read.
+
+        httpx raises on a body cut short of its declared length, so this check is a
+        second line of defence — but the one that matters: a prefix reaching
+        ``_write_file_atomic`` is indistinguishable from a prefix a reader sees for
+        lack of an fsync, both surfacing as ``failed finding central directory`` from
+        ``torch.load`` far from the cause. Same contract as
+        ``runtime_cellpose._download_member``.
+        """
+        from http.client import IncompleteRead
+
+        resp = await self._http_retry("GET", url, **kwargs)
+        # The length check alone cannot catch an error response: 403/404 are in
+        # _http_retry's retry set and it returns the last one unraised, and an S3
+        # error body declares its own length correctly — so a few hundred bytes of
+        # XML passes as "whole" and gets written as a .pt.
+        resp.raise_for_status()
+        content = resp.content
+        declared = resp.headers.get("Content-Length")
+        if declared is not None and len(content) != int(declared):
+            raise IncompleteRead(content, int(declared) - len(content))
+        return content
 
     @staticmethod
     async def _file_chunks(fpath: Path, size: int = 1 << 20):
@@ -484,7 +603,14 @@ class EntryApp:
         weights_path = cache_dir / "weights.pt"
         meta_path = cache_dir / "kwargs.json"
         if weights_path.exists() and meta_path.exists():
-            return {"weights_path": str(weights_path), **json.loads(meta_path.read_text())}
+            meta = json.loads(meta_path.read_text())
+            # The recorded length, not the pair existing, is what says the weights are
+            # whole. Both files existing only proves they were written by a version that
+            # had ``_write_file_atomic``; versions before it wrote ``weights.pt`` in
+            # place, and this cache lives in an app HOME that outlives any one version.
+            # So an entry carrying no length is a MISS and re-downloads once.
+            if meta.pop("bytes", None) == weights_path.stat().st_size:
+                return {"weights_path": str(weights_path), **meta}
 
         caller_client = (
             await connect_to_server({"server_url": SERVER_URL, "token": model_token})
@@ -506,12 +632,14 @@ class EntryApp:
                 raise FileNotFoundError(
                     f"No RDF (bioimageio.yaml or rdf.yaml) found in artifact '{model_id}'."
                 )
-            rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
+            rdf_resp = await self._http_retry("GET", rdf_url)
+            rdf_resp.raise_for_status()
+            rdf = yaml.safe_load(rdf_resp.text)
             ps = rdf["weights"]["pytorch_state_dict"]
             model_type = ps["architecture"]["kwargs"]["model_type"]
 
             w_url = await am.get_file(model_id, file_path=ps["source"])
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
             cache_dir.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(_write_file_atomic, weights_path, content)
             meta = {"model_type": model_type}
@@ -519,7 +647,9 @@ class EntryApp:
             # gates on both files existing, so it must appear whole or not at all — a
             # plain write_text makes it exist (empty) before it has content, and the
             # reader then json.loads("").
-            _write_file_atomic(meta_path, json.dumps(meta).encode())
+            _write_file_atomic(
+                meta_path, json.dumps({**meta, "bytes": len(content)}).encode()
+            )
             return {"weights_path": str(weights_path), **meta}
         finally:
             if caller_client is not None:
@@ -774,7 +904,10 @@ class EntryApp:
                     )
                 dest = training.session_dir(session_id) / "init_checkpoint.pt"
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(dest.write_bytes, resp.content)
+                # dest reaches a train worker as the params' checkpoint_path, so a
+                # plain write_bytes would publish the name at length zero and let
+                # that worker torch.load a prefix from another node.
+                await asyncio.to_thread(_write_file_atomic, dest, resp.content)
                 resolved["checkpoint_path"] = str(dest)
                 if params.get("pool_provenance"):
                     self._bump_transport(bytes_down=len(resp.content))
@@ -802,8 +935,15 @@ class EntryApp:
                     session_id=session_id, model_type=model_type, params=params
                 )
         except asyncio.CancelledError:
-            training.write_status(session_id, status="STOPPED",
-                                   message="training task cancelled", terminated_by="user_stop")
+            # Only a user stop may claim rank-4 user_stop, which no later writer
+            # can correct. This task is also cancelled when the entry replica is
+            # torn down (it scales to zero), while the runtime subprocess keeps
+            # running and owns the real outcome — recording that as a user stop
+            # would discard the child's COMPLETED for good.
+            if training.stop_requested(session_id):
+                training.write_status(session_id, status="STOPPED",
+                                       message="training task cancelled",
+                                       terminated_by="user_stop")
             raise
         except Exception as e:
             logger.error(f"Training session {session_id} failed: {e}")
@@ -1022,6 +1162,122 @@ class EntryApp:
         return training.get_status(session_id)
 
     @bioengine.method
+    async def preflight_training_dataset(
+        self,
+        train_images: List[str] = Field(
+            ..., description="Raw training image sources to ingest from an external "
+            "store before a run: http(s) URLs (e.g. BioImage Archive FIRE files) or "
+            "get_upload_url paths, one per training pair."),
+        train_labels: List[str] = Field(
+            ..., description="Instance-label mask sources paired 1:1 with train_images "
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection)."),
+        val_images: Optional[List[str]] = Field(
+            None, description="Optional validation image sources."),
+        val_labels: Optional[List[str]] = Field(
+            None, description="Optional validation label sources, paired with val_images."),
+        enable_clahe: bool = Field(
+            False, description="Apply CLAHE (contrast-limited adaptive histogram "
+            "equalisation) to each image while staging — rescues low-contrast "
+            "fluorescence Cellpose-SAM otherwise cannot segment. Off by default; the "
+            "min-max rescale during training is unaffected. Forces staging on."),
+        stage: bool = Field(
+            True, description="Download, validate and RE-STAGE each prepared image+label "
+            "into the app's temp store, returning URL lists ready to pass straight into "
+            "start_training. If False, validate the sources in place and report only."),
+    ) -> Dict[str, Any]:
+        """Validate and ingest a training dataset from an external store before a run.
+
+        Resolves each (image, label) source, checks the pair is usable (readable,
+        matching H×W, a 2-D integer instance-label map with at least one object),
+        optionally applies CLAHE, and — when ``stage`` is set (forced on by
+        ``enable_clahe``) — re-stages the prepared arrays into the app's temp store so
+        the returned ``train_images``/``train_labels`` URL lists feed straight into
+        ``start_training``. Returns a per-pair report plus counts so a dataset can be
+        vetted before committing to a long run. Staged URLs are short-lived — call
+        start_training promptly.
+        """
+        if len(train_images) != len(train_labels):
+            raise ValueError("train_images and train_labels must have equal length.")
+        if (val_images is None) ^ (val_labels is None):
+            raise ValueError("val_images and val_labels must be provided together.")
+        if val_images is not None and len(val_images) != len(val_labels):
+            raise ValueError("val_images and val_labels must have equal length.")
+
+        do_stage = bool(stage or enable_clahe)
+
+        async def _prepare(split, img_sources, lbl_sources):
+            report, staged_imgs, staged_lbls = [], [], []
+            for i, (img_src, lbl_src) in enumerate(zip(img_sources, lbl_sources)):
+                item = {"split": split, "index": i,
+                        "image": str(img_src), "label": str(lbl_src)}
+                try:
+                    img = await self._resolve_image(img_src)
+                    lbl = np.squeeze(await self._resolve_label_array(lbl_src, img.shape))
+                    img_hw = tuple(int(x) for x in img.shape[:2])
+                    if lbl.ndim != 2:
+                        raise ValueError(f"label is not 2-D (shape {tuple(lbl.shape)}).")
+                    if tuple(int(x) for x in lbl.shape[:2]) != img_hw:
+                        raise ValueError(
+                            f"image/label shape mismatch: image H×W {img_hw} vs "
+                            f"label {tuple(int(x) for x in lbl.shape)}.")
+                    if not np.issubdtype(lbl.dtype, np.integer):
+                        lbl = lbl.astype(np.int64)
+                    n_inst = int(np.unique(lbl[lbl > 0]).size)
+                    if n_inst == 0:
+                        raise ValueError("label map has no foreground objects.")
+                    if enable_clahe:
+                        img = _apply_clahe(img)
+                    item.update(ok=True, image_shape=list(img.shape),
+                                label_shape=list(lbl.shape), n_instances=n_inst)
+                    if do_stage:
+                        staged_imgs.append(await self._save_npy_to_temp(np.asarray(img)))
+                        staged_lbls.append(await self._save_npy_to_temp(lbl))
+                except Exception as exc:
+                    item.update(ok=False, error=str(exc))
+                report.append(item)
+            return report, staged_imgs, staged_lbls
+
+        train_report, train_imgs, train_lbls = await _prepare(
+            "train", train_images, train_labels)
+        val_report, val_imgs, val_lbls = [], [], []
+        if val_images is not None:
+            val_report, val_imgs, val_lbls = await _prepare(
+                "val", val_images, val_labels)
+
+        pairs = train_report + val_report
+        n_bad = sum(1 for p in pairs if not p["ok"])
+        n_train_ok = sum(1 for p in train_report if p["ok"])
+        ok = n_bad == 0 and n_train_ok > 0
+
+        result = {
+            "ok": ok,
+            "train_pair_count": len(train_report),
+            "train_pair_ok": n_train_ok,
+            "val_pair_count": len(val_report),
+            "clahe_applied": bool(enable_clahe),
+            "staged": do_stage,
+            "pairs": pairs,
+        }
+        if do_stage and ok:
+            result["train_images"] = train_imgs
+            result["train_labels"] = train_lbls
+            if val_images is not None:
+                result["val_images"] = val_imgs
+                result["val_labels"] = val_lbls
+        if ok:
+            msg = f"Validated {n_train_ok} training pair(s)"
+            if val_report:
+                msg += f" and {sum(1 for p in val_report if p['ok'])} validation pair(s)"
+            result["message"] = (msg + "; staged for start_training.") if do_stage else (msg + ".")
+        elif n_bad:
+            result["message"] = (
+                f"{n_bad} of {len(pairs)} pair(s) failed validation; see 'pairs' for "
+                "per-pair errors.")
+        else:
+            result["message"] = "No usable training pairs resolved."
+        return result
+
+    @bioengine.method
     async def get_training_status(
         self, session_id: str = Field(..., description="Session id from start_training.")
     ) -> Dict[str, Any]:
@@ -1097,41 +1353,61 @@ class EntryApp:
             "license": license,
             "provenance": provenance,
         }
-        self._exports[export_id] = {
-            "export_id": export_id, "status": "PENDING", "progress": 0.0,
-            "message": "queued", "download_url": None, "size_bytes": None, "error": None,
-        }
+        training.write_export(
+            export_id, status="PENDING", progress=0.0, message="queued",
+            download_url=None, size_bytes=None, error=None,
+        )
         self._export_tasks[export_id] = asyncio.create_task(
             self._run_export(export_id, session_id, request)
         )
         return {"export_id": export_id, "status": "PENDING"}
 
+    async def _export_heartbeat(self, export_id: str, interval: float = 60.0) -> None:
+        """Refresh the export record's ``updated_at`` while its build is alive.
+
+        Building the package and uploading it each run for minutes with no
+        progress write, which would exceed STATUS_STALE_SECONDS and have
+        get_export sweep a healthy export to FAILED. This dies with the replica,
+        which is what lets the sweep fire for a build nobody is driving.
+        """
+        import training
+
+        while True:
+            await asyncio.sleep(interval)
+            if training.read_export(export_id).get("status") not in ("PENDING", "BUILDING"):
+                return
+            training.write_export(export_id)
+
     async def _run_export(self, export_id: str, session_id: str, request: Dict[str, Any]) -> None:
         import training
 
-        rec = self._exports[export_id]
+        export_hb = asyncio.create_task(self._export_heartbeat(export_id))
         try:
-            rec.update(status="BUILDING", progress=0.1, message="building package")
+            training.write_export(export_id, status="BUILDING", progress=0.1,
+                                  message="building package")
             served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
             res = await self._runtime_for(served).export_bioimageio(
                 session_id=session_id, request=request
             )
-            rec["_package_dir"] = res["package_dir"]
-            rec.update(progress=0.8, message="staging package")
+            training.write_export(export_id, _package_dir=res["package_dir"],
+                                  progress=0.8, message="staging package")
             zip_path = Path(res["zip"])
             file_path = f"temp/{export_id}/{zip_path.name}"
             upload_url = await self._s3.put_file(file_path=file_path, ttl=6 * 3600)
             resp = await self._put_file(upload_url, zip_path, timeout=600.0)
             resp.raise_for_status()
             download_url = await self._get_download_url(file_path)
-            rec.update(
-                status="READY", progress=1.0, message="ready",
+            training.write_export(
+                export_id, status="READY", progress=1.0, message="ready",
                 download_url=download_url, size_bytes=res["zip_size"], files=res["files"],
                 resume_checkpoint_file=res.get("resume_checkpoint_file"),
             )
         except Exception as e:
             logger.exception(f"Export {export_id} failed")
-            rec.update(status="FAILED", progress=1.0, message="failed", error=str(e))
+            training.write_export(export_id, status="FAILED", progress=1.0,
+                                  message="failed", error=str(e))
+        finally:
+            export_hb.cancel()
 
     @bioengine.method
     async def get_export_status(
@@ -1143,8 +1419,10 @@ class EntryApp:
         can mirror them when creating the draft artifact and calling push_export.
         ``resume_checkpoint_file`` names the package's resumable weights file, to
         feed back into ``start_training(init_checkpoint=...)``."""
-        rec = self._exports.get(export_id)
-        if rec is None:
+        import training
+
+        rec = training.get_export(export_id)
+        if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         return {k: v for k, v in rec.items() if not k.startswith("_")}
 
@@ -1164,8 +1442,10 @@ class EntryApp:
         draft with the user's token, mints a presigned put_file URL per package
         file, then calls this. Draft-only: this app never creates, commits, or
         reads the artifact."""
-        rec = self._exports.get(export_id)
-        if rec is None:
+        import training
+
+        rec = training.get_export(export_id)
+        if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         if rec.get("status") != "READY":
             raise RuntimeError(f"Export '{export_id}' is not READY (status={rec.get('status')}).")
@@ -1542,12 +1822,17 @@ class EntryApp:
                 else:
                     pool.assert_compatible(index, model_type=model_type, signature=signature)
 
+                # Resolved once and used by both the stored metadata and the value
+                # returned to the caller, so the two records cannot date the same
+                # contribution differently. Empty is the same as unset here: an
+                # exported-but-empty var would otherwise stamp "" and read as a
+                # known version.
+                app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
                 metadata = pool.build_contribution_metadata(
                     contribution_id=cid,
                     model_type=model_type,
-                    # Empty is the same as unset here: an exported-but-empty var
-                    # would otherwise stamp "" and read as a known version.
-                    app_version=os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None,
+                    app_version=app_version,
                     cellpose_version=info["cellpose_version"],
                     architecture_signature=signature,
                     base_checkpoint_id=base_checkpoint_id,
@@ -1589,6 +1874,11 @@ class EntryApp:
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
             "schema_version": pool.SCHEMA_VERSION,
+            # The caller keeps this record, not the stored metadata.json, so it
+            # carries app_version too: schema_version does not cover a release
+            # that changes a value without changing the shape (0.27.6 moved
+            # every l2_from_base), which leaves a saved response undatable.
+            "app_version": app_version,
             "contribution_id": cid,
             "pool_artifact_id": pool_artifact_id,
             "architecture_signature": signature,
@@ -1665,7 +1955,7 @@ class EntryApp:
                     raise ValueError(f"pool '{pool_artifact_id}' has no community checkpoint to evaluate.")
                 weights_rel = cc["path"]
             w_url = await am.get_file(pool_artifact_id, file_path=weights_rel)
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)

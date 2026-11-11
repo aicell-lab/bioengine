@@ -14,6 +14,7 @@ from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
 from ray import serve
+from ray.serve.config import AutoscalingConfig
 
 from bioengine import __version__
 from bioengine.apps.builder import AppBuilder
@@ -226,6 +227,23 @@ def _belongs_to_worker_workspace(
     return True
 
 
+def _token_expires_in_seconds(
+    issued_at: Optional[float], ttl_seconds: Optional[float]
+) -> Optional[float]:
+    """Seconds until the proxy token lapses; negative once it has.
+
+    None when either input is missing — an app deployed before these were
+    recorded has no issue time, and guessing one would turn "unknown" into a
+    confident wrong answer about whether it is about to 401.
+    """
+    if issued_at is None or ttl_seconds is None:
+        return None
+    try:
+        return float(ttl_seconds) - (time.time() - float(issued_at))
+    except (TypeError, ValueError):
+        return None
+
+
 def _entry_deployment_name(entry_id: Optional[str]) -> Optional[str]:
     """Ray Serve deployment name of an app's entry class.
 
@@ -272,6 +290,15 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
+# Mint a proxy's replacement Hypha token once this much of its life has passed.
+# It is a deploy-time credential with a 30-day TTL and a deploy is the only
+# thing that used to mint one, so an app the worker *adopted* rather than
+# deployed kept the original and died at 30 days with HTTP 401 — reported as
+# UNHEALTHY, which points at the app rather than at the credential. Renewed at
+# two thirds, so a worker down for a week still has ten days of margin when it
+# returns; the margin is the point rather than the cadence.
+_TOKEN_RENEW_AFTER_FRACTION = 2 / 3
+
 
 # What ``get_app_status`` tells a caller who is neither a worker admin nor named
 # on the application's own roster.
@@ -315,6 +342,10 @@ PUBLIC_APP_STATUS_FIELDS = (
     "deployed_by_worker_client_id",
     "proxy_service_token_issued_at",
     "proxy_service_token_ttl_seconds",
+    # Published deliberately, and it discloses nothing the two fields above it
+    # do not: it is their difference. Named here so a watcher can read "about
+    # to fail registration" instead of recomputing it from a timestamp.
+    "proxy_service_token_expires_in_seconds",
 )
 
 # Same, one level down. ``logs`` is verbatim replica stdout/stderr: its content
@@ -344,6 +375,67 @@ def public_app_status(status: Dict[str, Any]) -> Dict[str, Any]:
             for name, deployment in public["deployments"].items()
         }
     return public
+
+
+def _validate_scaling_map(
+    scaling: Optional[Dict[str, Any]],
+    user_deployment_names: Tuple[str, ...],
+    application_id: str,
+) -> None:
+    """Reject a ``scaling`` map before it reaches Ray Serve.
+
+    A pure helper so the boundary is testable without a cluster: once a bad value
+    is inside ``serve.run`` the caller gets Ray's own error from a replica build
+    rather than one naming the ``scaling`` entry they got wrong, which is the
+    whole reason this validation exists.
+    """
+    for dep_name, dep_scaling in (scaling or {}).items():
+        if dep_name not in user_deployment_names:
+            raise ValueError(
+                f"scaling key '{dep_name}' is not a user deployment in "
+                f"app '{application_id}'. Valid deployments: "
+                f"{user_deployment_names}."
+            )
+        if not isinstance(dep_scaling, dict):
+            raise ValueError(
+                f"scaling entry for '{dep_name}' must be a dict; got "
+                f"{type(dep_scaling).__name__}."
+            )
+        nr = dep_scaling.get("num_replicas")
+        asc = dep_scaling.get("autoscaling_config")
+        if nr is None and not asc:
+            raise ValueError(
+                f"scaling entry for '{dep_name}' must set exactly one "
+                f"of num_replicas or autoscaling_config; got neither."
+            )
+        if nr is not None and asc:
+            raise ValueError(
+                f"scaling entry for '{dep_name}' must set exactly one "
+                f"of num_replicas or autoscaling_config; got both."
+            )
+        # Ray's bound is >= 1, not >= 0: serve.deployment raises
+        # "num_replicas is expected to larger than 0" (measured on ray 2.55.1).
+        # 0 used to clear this check and fail inside the deploy instead.
+        if nr is not None and nr < 1:
+            raise ValueError(
+                f"scaling entry for '{dep_name}' has num_replicas="
+                f"{nr}; must be >= 1."
+            )
+        if isinstance(asc, dict):
+            # AutoscalingConfig drops unknown keys instead of raising, so a
+            # renamed field reaches Serve and is lost with no warning, and the
+            # deployment silently runs on Serve's defaults. Non-dicts are left
+            # to Serve, as before: set() on one either raises TypeError or
+            # yields characters as key names.
+            valid_keys = set(AutoscalingConfig.model_fields)
+            unknown_keys = sorted(set(asc) - valid_keys)
+            if unknown_keys:
+                raise ValueError(
+                    f"scaling entry for '{dep_name}' has unknown "
+                    f"autoscaling_config key(s) {unknown_keys}; Ray "
+                    f"Serve would drop them silently. Valid keys: "
+                    f"{sorted(valid_keys)}."
+                )
 
 
 class AppsManager:
@@ -938,9 +1030,11 @@ class AppsManager:
             user_id: ID of the user initiating the undeployment (for logging)
 
         Note:
-            This method handles errors gracefully and logs failures.
-            The application is removed from _deployed_applications even if
-            some cleanup steps fail.
+            This method handles errors gracefully and logs failures. The
+            application is removed from _deployed_applications only if
+            ``serve.delete`` succeeded — a failed delete leaves the app
+            running in Ray Serve, so its tracking entry is restored to keep
+            it visible to ``get_app_status`` and stoppable via ``stop_app``.
         """
         start_time = time.time()
         self.logger.info(
@@ -953,11 +1047,12 @@ class AppsManager:
         # if the entry survived the serve.delete window, a monitor tick could
         # re-adopt the app mid-stop and re-deploy it, racing the stop. Popping
         # first makes the app invisible to the monitor for the rest of teardown.
-        self._deployed_applications.pop(application_id, None)
+        application_info = self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
         self._missing_from_status.pop(application_id, None)
         self._deleted_pending_redeploy.discard(application_id)
 
+        delete_failed = False
         try:
             await self.ray_cluster.call_with_reconnect(
                 serve.delete, application_id
@@ -966,6 +1061,7 @@ class AppsManager:
                 f"Deleted Ray Serve application '{application_id}' in {time.time() - start_time:.2f} seconds."
             )
         except Exception as delete_err:
+            delete_failed = True
             self.logger.error(
                 f"Error deleting Ray Serve application '{application_id}' "
                 f"after {time.time() - start_time:.2f} seconds: {delete_err}"
@@ -982,6 +1078,20 @@ class AppsManager:
             self.logger.error(
                 f"Error clearing application replica history for '{application_id}': {e}"
             )
+
+        if delete_failed and application_info is not None:
+            # The app is still running in Ray Serve. Leaving it untracked makes it
+            # invisible to get_app_status and unreachable by stop_app, so it holds
+            # its GPU forever with no API route to release it. auto_redeploy is
+            # forced off so monitor_applications still ignores it.
+            application_info["auto_redeploy"] = False
+            self._deployed_applications[application_id] = application_info
+            self.logger.error(
+                f"Undeployment of application '{application_id}' FAILED: it is still "
+                "running in Ray Serve. Keeping it tracked so it stays visible and "
+                "can be stopped again."
+            )
+            return
 
         # Remove from internal tracking after all cleanup operations complete
         self._deployed_applications.pop(application_id, None)
@@ -1347,6 +1457,10 @@ class AppsManager:
             application_id
         )
 
+        token_issued_at = await self._reported_token_issued_at(
+            application_id, application_info.get("proxy_service_token_issued_at")
+        )
+
         # Report what the replicas actually loaded, not just the requested
         # version — a stale reused replica reads as "healthy" otherwise.
         # ``running_version`` shows the entry replica's baked version;
@@ -1422,13 +1536,54 @@ class AppsManager:
             "deployed_by_worker_client_id": application_info.get(
                 "deployed_by_worker_client_id"
             ),
-            "proxy_service_token_issued_at": application_info.get(
-                "proxy_service_token_issued_at"
-            ),
+            # The serving replica's own figure when it has reported one, because
+            # the proxy renews its token and the deploy-time value then
+            # describes a token that no longer exists. Reporting the stale one
+            # would make a renewed app read as nearly expired and page a
+            # watcher that is working correctly.
+            "proxy_service_token_issued_at": token_issued_at,
             "proxy_service_token_ttl_seconds": application_info.get(
                 "proxy_service_token_ttl_seconds"
             ),
+            # Derived so a watcher does not reimplement the arithmetic, and so
+            # "this app is about to fail Hypha registration" is readable rather
+            # than inferable. Negative once expired. None when either input is
+            # missing, which is the case for an app deployed before these were
+            # recorded.
+            "proxy_service_token_expires_in_seconds": _token_expires_in_seconds(
+                token_issued_at,
+                application_info.get("proxy_service_token_ttl_seconds"),
+            ),
         }
+
+    async def _reported_token_issued_at(
+        self, application_id: str, deployed_at: Optional[float]
+    ) -> Optional[float]:
+        """The serving replica's token issue time, falling back to deploy time.
+
+        The proxy renews its own token, so the deploy-time value describes a
+        token that may no longer exist. Preferring the replica's report is what
+        keeps ``proxy_service_token_expires_in_seconds`` describing the token
+        actually in use — otherwise a renewed app reads as nearly expired and
+        pages a watcher that is behaving correctly.
+
+        Advisory: any failure, or a replica too old to send the field, falls
+        back to the deploy-time value. That is stale rather than wrong — it
+        under-states the remaining life, which errs toward alerting.
+        """
+        try:
+            reported = (
+                await self.ray_cluster.proxy_actor_handle.get_reported_token_issued_at.remote(
+                    application_id
+                )
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not read the reported token issue time for "
+                f"'{application_id}': {exc}"
+            )
+            return deployed_at
+        return deployed_at if reported is None else reported
 
     async def complete_initialization(
         self, server: RemoteService, admin_users: List[str], worker_service_id: str
@@ -1786,6 +1941,72 @@ class AppsManager:
             self._startup_retry_task.cancel()
         self._startup_retry_task = None
 
+    async def _renew_proxy_tokens(self) -> None:
+        """Mint replacements for proxy tokens that are two-thirds spent.
+
+        The proxy cannot do this itself. Hypha's ``generate_token`` requires
+        admin on the target workspace and the proxy is given ``read_write``, so
+        it gets ``PermissionError: Only admin can generate token.`` — measured
+        against hypha.aicell.io on 2026-10-27, with a ``public`` arm refused for
+        a different reason and a nonexistent-workspace arm raising, so the
+        refusal is the permission check and not a dead client. The worker holds
+        the admin credential, so it mints here and leaves the result in the
+        proxy actor for the replica to collect.
+
+        Never raises: renewal has days of margin and the next tick retries, so a
+        failure must not cost the caller its own pass.
+        """
+        if not self.server:
+            return
+
+        handle = getattr(self.ray_cluster, "proxy_actor_handle", None)
+        if handle is None:
+            return
+
+        now = time.time()
+        for application_id, application_info in list(
+            self._deployed_applications.items()
+        ):
+            if not application_info["is_deployed"].is_set():
+                continue
+            ttl_seconds = application_info.get("proxy_service_token_ttl_seconds")
+            if not ttl_seconds or ttl_seconds <= 0:
+                continue
+
+            issued_at = None
+            try:
+                issued_at = await self._reported_token_issued_at(
+                    application_id,
+                    application_info.get("proxy_service_token_issued_at"),
+                )
+                if issued_at is None:
+                    continue
+                if now - issued_at < ttl_seconds * _TOKEN_RENEW_AFTER_FRACTION:
+                    continue
+                if await handle.has_pending_token.remote(application_id):
+                    continue
+
+                token = await self.server.generate_token(
+                    {
+                        "workspace": self.server.config.workspace,
+                        "permission": "read_write",
+                        "expires_in": int(ttl_seconds),
+                    }
+                )
+                await handle.set_pending_token.remote(
+                    application_id=application_id,
+                    token=token,
+                    issued_at=time.time(),
+                    ttl_seconds=ttl_seconds,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"Could not renew the proxy Hypha token for "
+                    f"'{application_id}' ({(now - (issued_at or now)) / 86400:.1f} "
+                    f"days into a {ttl_seconds / 86400:.0f}-day TTL): {exc}. "
+                    f"Keeping the current token; the next tick retries."
+                )
+
     async def monitor_applications(self) -> None:
         """Auto-redeploy unhealthy apps with per-app exponential backoff.
 
@@ -1819,6 +2040,11 @@ class AppsManager:
                 unreachable). The outer monitoring loop catches and applies
                 its own exponential backoff.
         """
+        # Ahead of the auto-redeploy filter and its early return: a proxy token
+        # expires whether or not the app opted into auto-redeploy, and the app
+        # that hit this first was an adopted one with the flag unset.
+        await self._renew_proxy_tokens()
+
         apps_to_redeploy = [
             app_id
             for app_id, app_info in self._deployed_applications.items()
@@ -2641,7 +2867,7 @@ class AppsManager:
         ),
         version: str = Field(
             ...,
-            description="Pre-release version to delete. Its tag must contain 'dev' (e.g. '1.2.3-dev1') — released versions are immutable and cannot be deleted through this method.",
+            description="Pre-release version to delete. Its tag must contain 'dev' (e.g. '1.2.3-dev1') — released versions are immutable and cannot be deleted through this method. It must also be the artifact's newest committed version, because deleting it would otherwise corrupt every version committed after it.",
         ),
         context: Dict[str, Any] = Field(
             ...,
@@ -2652,10 +2878,11 @@ class AppsManager:
         Delete a single PRE-RELEASE version of an application artifact.
 
         For the dev-iteration workflow: iterate on 'X.Y.Z-devN' pre-releases,
-        publish the verified bundle once as 'X.Y.Z', then drop the throwaway
-        pre-releases with this method. Only versions whose tag contains 'dev'
-        are deletable, so released versions stay permanent, and the version
-        must not be currently deployed on this worker.
+        drop the throwaway pre-releases with this method, and only then publish
+        the verified bundle as 'X.Y.Z'. Only versions whose tag contains 'dev'
+        are deletable, so released versions stay permanent; the version must not
+        be currently deployed on this worker; and nothing may have been committed
+        after it, so delete pre-releases newest-first and before the release.
 
         Args:
             artifact_id: The artifact whose version to delete (current workspace).
@@ -2663,7 +2890,8 @@ class AppsManager:
 
         Raises:
             ValueError: version isn't a 'dev' pre-release, is currently deployed,
-                or the artifact isn't in this workspace.
+                has later committed versions that the delete would corrupt, or
+                the artifact isn't in this workspace.
             PermissionError: If the caller lacks admin permissions.
             RuntimeError: If the worker is not initialized.
         """
@@ -2701,6 +2929,27 @@ class AppsManager:
                 raise ValueError(
                     f"Version '{version}' of '{artifact_id}' is currently deployed "
                     f"as application '{app_id}'. Stop it first with stop_app()."
+                )
+
+        # Hypha maps a version to its stored files by POSITION in this list, so
+        # deleting one shifts every later version's payload down a slot: the next
+        # version starts serving its predecessor's files under its own label, with
+        # a 200 and a version list that still looks right. Position is what decides
+        # that, not version ordering — the two disagree once a version has been
+        # deleted and a lower one re-added. Read failures propagate on purpose: an
+        # unverified delete is the one this guard exists to stop.
+        artifact = await self.artifact_manager.read(artifact_id)
+        committed = [v["version"] for v in (artifact.get("versions") or [])]
+        if str(version) in committed:
+            later = committed[committed.index(str(version)) + 1 :]
+            if later:
+                raise ValueError(
+                    f"Refusing to delete version '{version}' of '{artifact_id}': "
+                    f"{len(later)} version(s) were committed after it "
+                    f"({', '.join(later)}), and deleting it would make each of them "
+                    f"serve the preceding version's files under its own label, with "
+                    f"no error anywhere. Delete versions newest-first, and drop "
+                    f"pre-releases before publishing the release that follows them."
                 )
 
         await self.artifact_manager.delete(artifact_id, version=version)
@@ -2833,10 +3082,10 @@ class AppsManager:
         ),
         scaling: Optional[Dict[str, Dict[str, Any]]] = Field(
             None,
-            description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. Classes not in the map run at Ray Serve's default of one fixed replica. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
+            description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. A class absent from the map gets no override at all: it keeps whatever num_replicas or autoscaling_config its own @bioengine.app decorator declared, and runs at one fixed replica only if the decorator declares neither — so omitting an entry does NOT pin a class that autoscales itself. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
             examples=[
                 {"DemoApp": {"num_replicas": 3}},
-                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_num_ongoing_requests_per_replica": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
+                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_ongoing_requests": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
             ],
         ),
         context: Dict[str, Any] = Field(
@@ -3135,35 +3384,7 @@ class AppsManager:
                 meta["qualname"].split(".")[-1]
                 for meta in app.spec["classes"].values()
             )
-            for dep_name, dep_scaling in (scaling or {}).items():
-                if dep_name not in user_deployment_names:
-                    raise ValueError(
-                        f"scaling key '{dep_name}' is not a user deployment in "
-                        f"app '{application_id}'. Valid deployments: "
-                        f"{user_deployment_names}."
-                    )
-                if not isinstance(dep_scaling, dict):
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' must be a dict; got "
-                        f"{type(dep_scaling).__name__}."
-                    )
-                nr = dep_scaling.get("num_replicas")
-                asc = dep_scaling.get("autoscaling_config")
-                if nr is None and not asc:
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' must set exactly one "
-                        f"of num_replicas or autoscaling_config; got neither."
-                    )
-                if nr is not None and asc:
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' must set exactly one "
-                        f"of num_replicas or autoscaling_config; got both."
-                    )
-                if nr is not None and nr < 0:
-                    raise ValueError(
-                        f"scaling entry for '{dep_name}' has num_replicas="
-                        f"{nr}; must be >= 0."
-                    )
+            _validate_scaling_map(scaling, user_deployment_names, application_id)
 
             # A content change (new version, different artifact, or the same
             # version string re-staged with different files) must reach every

@@ -27,6 +27,7 @@ from bioengine.heartbeat import (
     main,
     write_heartbeat,
 )
+from bioengine.utils import host_census
 from bioengine.worker.__main__ import create_parser
 from bioengine.worker.worker import BioEngineWorker
 
@@ -238,10 +239,13 @@ def _make_worker(tmp_path: Path, steps: _MonitoringSteps) -> BioEngineWorker:
     return worker
 
 
+_BACKOFF_MAX_SECONDS = 0.5
+
+
 def _start_loop(worker: BioEngineWorker) -> asyncio.Task:
     return asyncio.create_task(
         worker._create_monitoring_task(
-            backoff_initial_seconds=0.01, backoff_max_seconds=0.5
+            backoff_initial_seconds=0.01, backoff_max_seconds=_BACKOFF_MAX_SECONDS
         )
     )
 
@@ -278,6 +282,61 @@ def test_startup_replaces_a_previous_runs_deadline(tmp_path):
 
     assert check_heartbeat(worker.heartbeat_file)[0] is True
     assert _beat(worker)["stale_after_seconds"] == STARTUP_STALE_AFTER_SECONDS
+
+
+async def test_the_loop_wires_the_staleness_deadline_onto_the_worker(tmp_path):
+    # Every other staleness test injects _monitor_stale_after_seconds by hand,
+    # so nothing exercises the one line in the loop's prologue that sets it on
+    # a real worker. Deleting that line leaves the whole suite green while
+    # get_status stops reporting a stalled cluster monitor in production.
+    worker = _make_worker(tmp_path, _MonitoringSteps())
+    assert not hasattr(worker, "_monitor_stale_after_seconds")
+
+    task = _start_loop(worker)
+    try:
+        await _wait_until(
+            lambda: getattr(worker, "_monitor_stale_after_seconds", None) is not None,
+            10,
+            "the monitoring loop never set the staleness deadline",
+        )
+        assert worker._monitor_stale_after_seconds == heartbeat_stale_after_seconds(
+            worker.monitoring_interval_seconds, _BACKOFF_MAX_SECONDS
+        )
+    finally:
+        await _stop_loop(task)
+
+
+async def test_the_loop_wires_the_census_deadline_onto_the_ray_cluster(tmp_path):
+    # Sibling of the test above, and unpinned for the same reason: the census
+    # ages a worker out on exactly the gap that marks it dead to the liveness
+    # probe, and the loop's prologue is the only place the two are joined.
+    #
+    # The failure mode here is worse than an absent value, which is why the
+    # fake is seeded rather than left bare. RayCluster.__init__ already sets
+    # this to the startup default, so deleting the wiring line does not leave
+    # the attribute missing — it leaves 1800s in place, which is a plausible
+    # number and the wrong one. Seeding the default and asserting it was
+    # REPLACED is what makes the deletion visible.
+    worker = _make_worker(tmp_path, _MonitoringSteps())
+    worker.ray_cluster.census_stale_after_seconds = (
+        host_census.STARTUP_STALE_AFTER_SECONDS
+    )
+
+    task = _start_loop(worker)
+    try:
+        await _wait_until(
+            lambda: worker.ray_cluster.census_stale_after_seconds
+            != host_census.STARTUP_STALE_AFTER_SECONDS,
+            10,
+            "the monitoring loop never replaced the census startup default",
+        )
+        assert worker.ray_cluster.census_stale_after_seconds == (
+            heartbeat_stale_after_seconds(
+                worker.monitoring_interval_seconds, _BACKOFF_MAX_SECONDS
+            )
+        )
+    finally:
+        await _stop_loop(task)
 
 
 async def test_a_hang_in_the_last_step_never_produces_a_beat(tmp_path):

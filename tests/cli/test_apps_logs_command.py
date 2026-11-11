@@ -335,3 +335,65 @@ def test_an_app_that_is_not_running_reports_why(invoke):
         },
     )
     assert "not currently deployed" in output
+
+
+OTHER_DEPLOYMENT = "RuntimeApp"
+
+
+def test_a_per_deployment_override_reaches_the_proxy_and_a_missing_one_falls_back():
+    """Site 4 of #0212: the per-deployment override has to arrive at the proxy call.
+
+    ``this_prev``/``this_tail`` are computed and then forwarded, and nothing in the
+    suite had ever looked at what the proxy was actually asked for — no test names
+    ``deployment_logs_overrides`` at all. That matters more than it sounds: every other
+    caller of this helper passes ``n_previous_replica=0``, which is also what a mutant
+    forwarding a hard zero sends, so the whole existing suite is blind to the mutation
+    by construction rather than by accident.
+
+    Two deployments in one call, because the line does two things: it honours an
+    override where one exists AND falls back to the top-level value where none does.
+    The four numbers are deliberately distinct and none is zero, so forwarding a
+    constant, or swapping tail with n_previous_replica, fails rather than coincides.
+    """
+    calls = []
+
+    async def _record(**kwargs):
+        calls.append(kwargs)
+        return {}
+
+    manager = object.__new__(AppsManager)
+    manager.logger = logging.getLogger("test")
+    ray_cluster = MagicMock()
+    ray_cluster.proxy_actor_handle.get_deployment_logs.remote = _record
+    manager.ray_cluster = ray_cluster
+
+    details = {
+        "status": "RUNNING",
+        "message": "",
+        "deployments": {
+            DEPLOYMENT: {"status": "HEALTHY", "message": "", "replicas": []},
+            OTHER_DEPLOYMENT: {"status": "HEALTHY", "message": "", "replicas": []},
+        },
+    }
+
+    asyncio.run(
+        manager._get_deployment_status(
+            application_id=APP_ID,
+            application_details=details,
+            n_previous_replica=2,
+            logs_tail=100,
+            deployment_logs_overrides={
+                DEPLOYMENT: {"n_previous_replica": 3, "logs_tail": 7}
+            },
+        )
+    )
+
+    by_dep = {c["deployment_name"]: c for c in calls}
+    assert set(by_dep) == {DEPLOYMENT, OTHER_DEPLOYMENT}, by_dep
+
+    # the overridden one
+    assert by_dep[DEPLOYMENT]["n_previous_replica"] == 3
+    assert by_dep[DEPLOYMENT]["tail"] == 7
+    # and the one with no override, which must still get the top-level defaults
+    assert by_dep[OTHER_DEPLOYMENT]["n_previous_replica"] == 2
+    assert by_dep[OTHER_DEPLOYMENT]["tail"] == 100

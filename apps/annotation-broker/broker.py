@@ -16,6 +16,7 @@ without Ray or a live Hypha connection.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -124,6 +125,9 @@ class AnnotationBroker:
         self._http: Optional[httpx.AsyncClient] = None
         # artifact_id -> (cached_at, name)
         self._manifest_name_cache: Dict[str, tuple] = {}
+        # artifact_id -> (cached_at, {stem: entry}); see _image_manifest
+        self._image_manifest_cache: Dict[str, tuple] = {}
+        self._image_manifest_locks: Dict[str, asyncio.Lock] = {}
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -208,6 +212,19 @@ class AnnotationBroker:
             )
         return meta, caller, role
 
+    def _require_logged_in(self, context: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+        """Caller identity for an RPC that hangs off no dataset.
+
+        ``_require_role`` cannot be used for those: it starts by loading a
+        dataset's metadata, and there is no dataset. This is the smaller
+        guarantee such a method still needs, which is simply that somebody is
+        on the other end.
+        """
+        caller = self._ctx_user(context)
+        if not caller["id"]:
+            raise PermissionError("This requires a logged-in user.")
+        return caller
+
     # === artifact-manager helpers ===
     # Call-shape notes (see colab_service.py / micro-sam's entry.py):
     #   - get_file needs KEYWORD args (artifact_id=..., file_path=...) — this
@@ -267,6 +284,79 @@ class AnnotationBroker:
         url = await self._am.put_file(artifact_id, file_path=file_path)
         resp = await self._http.put(url, content=content)
         resp.raise_for_status()
+
+    # === image manifest (0.10.0) ===
+    # The authoritative image list. See the module comment in broker_core for
+    # the read-is-a-union / write-prunes asymmetry.
+
+    def _image_manifest_lock(self, artifact_id: str) -> asyncio.Lock:
+        lock = self._image_manifest_locks.get(artifact_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._image_manifest_locks[artifact_id] = lock
+        return lock
+
+    async def _image_manifest(
+        self,
+        artifact_id: str,
+        dims: Optional[Dict[str, Any]] = None,
+        require_stem: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Every image in the dataset, keyed by stem.
+
+        Reads ``images/manifest.json`` and unions it with the ``images/``
+        listing, so a dataset whose manifest was never written (every dataset
+        before 0.10.0) still resolves through this one path.
+
+        Cached for ``MANIFEST_CACHE_TTL_S``, because ``get_image_url`` is the
+        annotate page's featherweight first call and must not grow two
+        round-trips. *require_stem* forces a refresh when the cache does not
+        contain it, so a just-uploaded image is never reported missing --
+        the cache can be stale, but only in the harmless direction.
+        """
+        cached = self._image_manifest_cache.get(artifact_id)
+        if (
+            cached is not None
+            and core.is_cache_fresh(cached[0], ttl_s=MANIFEST_CACHE_TTL_S)
+            and (require_stem is None or require_stem in cached[1])
+        ):
+            return cached[1]
+
+        doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+        listing = await self._list_files_safe(artifact_id, "images")
+        entries, _ = core.merge_image_manifest(
+            core.parse_image_manifest(doc),
+            core.image_names_from_listing(listing),
+            dims=dims,
+        )
+        self._image_manifest_cache[artifact_id] = (time.time(), entries)
+        return entries
+
+    async def _image_entry(self, artifact_id: str, stem: str) -> Dict[str, Any]:
+        entries = await self._image_manifest(artifact_id, require_stem=stem)
+        entry = entries.get(stem)
+        if entry is None:
+            raise FileNotFoundError(
+                f"Image '{stem}' is not in dataset '{artifact_id}'."
+            )
+        return entry
+
+    async def _image_file_path(self, artifact_id: str, stem: str) -> str:
+        """Path under the artifact for a *materialised* image.
+
+        Raises for a ``remote`` entry rather than inventing a path: until the
+        image is materialised there is no object to presign, and every caller
+        of this (image url, embedding source, training input) needs a real
+        file.
+        """
+        entry = await self._image_entry(artifact_id, stem)
+        path = entry.get("path")
+        if not path:
+            raise FileNotFoundError(
+                f"Image '{stem}' is not materialised in '{artifact_id}' "
+                f"(state={entry.get('state')!r}); no file to read."
+            )
+        return path
 
     async def _read_artifact_manifest(self, artifact_id: str) -> Dict[str, Any]:
         artifact = await self._am.read(artifact_id=artifact_id, stage=True)
@@ -444,15 +534,8 @@ class AnnotationBroker:
     # ------------------------------------------------------------------
 
     async def _image_stems(self, artifact_id: str) -> set:
-        """Stems of every file under images/."""
-        entries = await self._list_files_safe(artifact_id, "images")
-        stems = set()
-        for e in entries:
-            name = e.get("name", "") if isinstance(e, dict) else str(e)
-            if not name or (isinstance(e, dict) and (e.get("type") == "directory" or e.get("is_dir"))):
-                continue
-            stems.add(Path(name).stem)
-        return stems
+        """Stems of every image in the dataset, materialised or not."""
+        return set(await self._image_manifest(artifact_id))
 
     async def _annotation_counts(self, artifact_id: str, label: str) -> Dict[str, int]:
         """Complete (png+geojson) annotation saves per stem, summed across
@@ -490,11 +573,27 @@ class AnnotationBroker:
     async def _validate_split_stems_are_images(
         self, artifact_id: str, stems: List[str]
     ) -> None:
-        image_stems = await self._image_stems(artifact_id)
-        unknown = [s for s in stems if s not in image_stems]
+        """Every stem must be an image of this dataset *and* materialised.
+
+        The second half is a guard against an ordering violation, not a
+        routine rejection: annotating is what materialises an image and only
+        annotated images can enter a split, so a remote stem here means
+        something upstream went wrong (design §9). Catching it at split time
+        keeps the failure next to the decision instead of surfacing it much
+        later as an unusable training URL.
+        """
+        entries = await self._image_manifest(artifact_id)
+        unknown = [s for s in stems if s not in entries]
         if unknown:
             raise ValueError(
                 "Not images of this dataset: " + ", ".join(sorted(unknown))
+            )
+        unmaterialised = core.non_local_stems(entries, stems)
+        if unmaterialised:
+            raise ValueError(
+                "Not materialised, so they cannot be trained on: "
+                + ", ".join(unmaterialised)
+                + ". Open each one in the annotator to materialise it first."
             )
 
     @bioengine.method(context=True)
@@ -728,6 +827,26 @@ class AnnotationBroker:
                     "geojson_path": f"{dir_path}/{pair['geojson']}",
                 })
 
+        # model-finetune fetches each image URL whole and hands the buffer to
+        # imageio.imread, so a not-yet-materialised image has nothing that can
+        # be passed. Name the offenders here rather than minting a URL that
+        # fails downstream with an opaque unsupported-extension error.
+        # A stem whose image was deleted outright is caught by the same check:
+        # `non_local_stems` only names stems it knows, so the unknown ones are
+        # added here rather than left to KeyError at minting time.
+        manifest = await self._image_manifest(artifact_id)
+        stems = [p["stem"] for p in pairs]
+        unmaterialised = sorted(
+            set(core.non_local_stems(manifest, stems))
+            | {s for s in stems if s not in manifest}
+        )
+        if unmaterialised:
+            raise ValueError(
+                f"Split '{split_name}' contains {len(unmaterialised)} image(s) with no "
+                f"file in the artifact: {', '.join(unmaterialised)}. Open each one in "
+                f"the annotator once to materialise it, then retry."
+            )
+
         sem = asyncio.Semaphore(16)
 
         async def _mint(file_path: str) -> str:
@@ -737,7 +856,7 @@ class AnnotationBroker:
                 )
 
         image_urls, geojson_urls = await asyncio.gather(
-            asyncio.gather(*[_mint(core.image_path(p["stem"])) for p in pairs]),
+            asyncio.gather(*[_mint(manifest[p["stem"]]["path"]) for p in pairs]),
             asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs]),
         )
         train_out: List[Dict[str, str]] = []
@@ -1012,6 +1131,536 @@ class AnnotationBroker:
         return meta
 
     @bioengine.method(context=True)
+    async def sync_image_manifest(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Reconcile ``images/manifest.json`` against the ``images/`` listing.
+
+        Call this after adding or removing image files. Files present but not
+        in the manifest are added as ``local`` entries; ``local`` entries
+        whose file has gone are dropped. ``remote`` entries are never touched
+        -- having no file is their normal state.
+
+        Idempotent, and safe to skip: reads union the manifest with the
+        listing anyway, so a missed call costs the manifest's extra metadata
+        for those stems, never their visibility.
+        """
+        artifact_id = self._canonical_id(artifact_id)
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+
+        async with self._image_manifest_lock(artifact_id):
+            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            listing = await self._list_files_safe(artifact_id, "images")
+            entries, changed = core.merge_image_manifest(
+                core.parse_image_manifest(doc),
+                core.image_names_from_listing(listing),
+                dims=dict(meta.get("image_dims") or {}),
+                prune=True,
+            )
+            if changed:
+                async def _write():
+                    await self._write_json_file(
+                        artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                    )
+
+                await self._ensure_staged(artifact_id, _write)
+                # A staged-only write reappears as absent after a restage,
+                # the same trap delete_label and delete_annotation hit.
+                await self._commit_tolerating_pending_uploads(artifact_id)
+            self._image_manifest_cache[artifact_id] = (time.time(), entries)
+
+        return {
+            "changed": changed,
+            "images": len(entries),
+            "remote": sum(1 for e in entries.values() if e.get("state") == core.IMAGE_STATE_REMOTE),
+        }
+
+    # --- Remote NGFF import (0.10.0) --------------------------------------
+
+    async def _fetch_ngff_json(self, root: str, key: str) -> Optional[Any]:
+        """One JSON object out of a Zarr store, or ``None`` if it is absent.
+
+        404 is a normal answer here, not an error: probing ``.zattrs`` and
+        then ``zarr.json`` is how the store's Zarr version is discovered.
+        """
+        try:
+            resp = await self._http.get(root + key)
+        except Exception as exc:
+            raise core.NgffSourceError(
+                f"Could not reach {root + key}: {exc}"
+            ) from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise core.NgffSourceError(
+                f"{root + key} returned HTTP {resp.status_code}. Check the "
+                f"store root and, for a protected source, the token."
+            )
+        try:
+            return resp.json()
+        except Exception as exc:
+            raise core.NgffSourceError(f"{root + key} is not JSON.") from exc
+
+    async def _read_zarr_node(self, root: str, path: str = "") -> Dict[str, Any]:
+        """``{"attrs", "meta_doc"}`` for a group or array, either Zarr version.
+
+        v2 splits attributes and array metadata across ``.zattrs`` and
+        ``.zarray``; v3 puts both in one ``zarr.json``. Callers should not
+        have to care which, so this normalises the two.
+        """
+        prefix = f"{path.strip('/')}/" if path.strip("/") else ""
+        v3 = await self._fetch_ngff_json(root, prefix + "zarr.json")
+        if isinstance(v3, dict):
+            return {"attrs": v3.get("attributes") or {}, "meta_doc": v3}
+        attrs = await self._fetch_ngff_json(root, prefix + ".zattrs")
+        array_meta = await self._fetch_ngff_json(root, prefix + ".zarray")
+        if attrs is None and array_meta is None:
+            raise core.NgffSourceError(
+                f"No Zarr metadata at {root + prefix}. Expected .zattrs / "
+                f".zarray (v2) or zarr.json (v3)."
+            )
+        return {"attrs": attrs or {}, "meta_doc": array_meta}
+
+    async def _probe_ngff_source(
+        self, root: str, multiscale_path: Optional[str], origin: str
+    ) -> Dict[str, Any]:
+        """Read a remote store's metadata and prove the browser can read it.
+
+        This is the whole of §7's preflight. It runs **once**, at import, so
+        that a source the annotator's browser cannot actually decode is
+        rejected here with a reason, rather than importing cleanly and then
+        failing on every single image open.
+
+        Four things are checked, in the order that gives the most useful
+        message first: the group is OME-Zarr at all, its dtype maps to a JS
+        typed array, its codecs are ones zarrita ships, and one real chunk
+        comes back with a CORS header that lets *origin* read it.
+        """
+        group = await self._read_zarr_node(root)
+        parsed = core.parse_ngff_multiscales(group["attrs"], multiscale_path)
+
+        levels = await asyncio.gather(
+            *(self._read_zarr_node(root, p) for p in parsed["dataset_paths"])
+        )
+        metas = []
+        for path, node in zip(parsed["dataset_paths"], levels):
+            if node["meta_doc"] is None:
+                raise core.NgffSourceError(
+                    f"Multiscale level {path!r} has no array metadata; the "
+                    f"store advertises a level it does not contain."
+                )
+            metas.append(core.parse_zarr_array_meta(node["meta_doc"]))
+
+        full = metas[0]
+        roles = core.ngff_axis_roles(parsed["axes"], len(full["shape"]))
+        dims = core.ngff_level_dims(full["shape"], roles)
+
+        if not core.ngff_dtype_is_readable(full["dtype"]):
+            raise core.NgffSourceError(
+                f"Data type {full['dtype']!r} cannot be displayed in the "
+                f"browser. 8/16/32-bit integer and float stores are "
+                f"supported; 64-bit integers and string dtypes are not."
+            )
+        undecodable = core.undecodable_ngff_codecs(full)
+        if undecodable:
+            raise core.NgffSourceError(
+                f"This store uses codec(s) the browser cannot decode: "
+                f"{', '.join(undecodable)}. Supported: "
+                f"{', '.join(sorted(core.NGFF_DECODABLE_CODECS))}."
+            )
+
+        # The coarsest level's first chunk is the cheapest object in the
+        # store that exercises the real read path.
+        coarsest_index = min(
+            range(len(metas)),
+            key=lambda i: core.ngff_level_dims(
+                metas[i]["shape"], core.ngff_axis_roles(parsed["axes"], len(metas[i]["shape"]))
+            )["width"],
+        )
+        chunk_url = (
+            root
+            + parsed["dataset_paths"][coarsest_index].strip("/")
+            + "/"
+            + core.first_chunk_key(metas[coarsest_index])
+        )
+        try:
+            chunk = await self._http.get(chunk_url, headers={"Origin": origin})
+        except Exception as exc:
+            raise core.NgffSourceError(
+                f"Could not fetch a chunk from {chunk_url}: {exc}"
+            ) from exc
+        if chunk.status_code >= 400:
+            raise core.NgffSourceError(
+                f"Chunk {chunk_url} returned HTTP {chunk.status_code}. The "
+                f"metadata is readable but the data is not."
+            )
+        allow = chunk.headers.get("access-control-allow-origin", "")
+        if allow not in ("*", origin):
+            raise core.NgffSourceError(
+                f"{chunk_url} does not allow cross-origin reads from "
+                f"{origin} (Access-Control-Allow-Origin: {allow or 'absent'}). "
+                f"The browser reads chunks directly, so the store's CORS "
+                f"policy has to permit it."
+            )
+
+        return {
+            "width": dims["width"],
+            "height": dims["height"],
+            "dtype": full["dtype"],
+            "levels": len(metas),
+            "channels": core.ngff_channel_names(group["attrs"]),
+            "content_hint": hashlib.sha256(
+                json.dumps(group["attrs"], sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16],
+        }
+
+    @bioengine.method(context=True)
+    async def probe_ngff_source(
+        self,
+        store_root: str = Field(
+            ...,
+            description=(
+                "Root of the OME-Zarr group holding 'multiscales'. Same form "
+                "import_ngff_image accepts, credential included."
+            ),
+        ),
+        multiscale_path: Optional[str] = Field(
+            None, description="Name of the multiscale to use when the group holds several."
+        ),
+        origin: str = Field(
+            "https://bioimage.io",
+            description="Browser origin the CORS preflight is checked against.",
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Read a store's metadata and run §7's preflight, writing nothing.
+
+        Split out of ``import_ngff_image`` in 0.12.0 so the import dialog can
+        show the slide, and its dimensions, before the user chooses the patch
+        to take out of it. Nothing about a whole-slide source can be presented
+        for selection until its extent is known, and the extent is exactly
+        what this returns.
+
+        Not attached to a dataset, so there is no artifact to authorise
+        against. It is still login-gated, because it makes the broker fetch a
+        URL of the caller's choosing and the anonymous role must not have
+        that.
+
+        The preflight stays here rather than moving into the browser for the
+        reason §7 gives: a CORS rejection is opaque to JS, so only the broker
+        can turn one into a message worth reading.
+        """
+        self._require_logged_in(context)
+        root = core.normalise_store_root(store_root)
+        untokened, _credential = core.split_store_credential(root)
+        multiscale_path = multiscale_path or None
+        probe = await self._probe_ngff_source(root, multiscale_path, origin)
+        return {
+            "store_root": untokened,
+            "multiscale_path": multiscale_path,
+            "stem": core.default_stem_from_store_root(untokened),
+            "max_materialise_bytes": core.MAX_MATERIALISE_BYTES,
+            **probe,
+        }
+
+    @bioengine.method(context=True)
+    async def import_ngff_image(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        store_root: str = Field(
+            ...,
+            description=(
+                "Root of the OME-Zarr group holding 'multiscales'. For a "
+                "protected omezarr-view source use the path form, "
+                "https://host/t/<token>/zarr/<id>/, never a '?token=' query."
+            ),
+        ),
+        stem: Optional[str] = Field(
+            None,
+            description="Name for the image; derived from the store root when omitted.",
+        ),
+        multiscale_path: Optional[str] = Field(
+            None, description="Name of the multiscale to use when the group holds several."
+        ),
+        region: Optional[Dict[str, int]] = Field(
+            None,
+            description=(
+                "{x, y, width, height} in full-resolution pixels, to import a "
+                "patch of a whole-slide source rather than the whole of it. "
+                "Omit for the whole image."
+            ),
+        ),
+        origin: str = Field(
+            "https://bioimage.io",
+            description="Browser origin the CORS preflight is checked against.",
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Add a remote OME-Zarr source to the dataset without copying it.
+
+        No pixels are copied and none are read beyond a single preflight
+        chunk, so this is effectively instant regardless of how large the
+        source is. The image is immediately browsable and annotatable; it
+        becomes trainable only once it is materialised (design §8).
+
+        A path-form credential in *store_root* is **split off and kept in the
+        broker's own state**, never written to the artifact: the manifest
+        lives in something ``set_public`` can expose (design §12).
+
+        With a *region*, the image is a patch of the source rather than the
+        whole of it (design §13 step 6). The manifest entry then describes the
+        patch: its width and height are the crop's, and the store root is only
+        how those pixels are fetched. That is what makes a 100000x80000 slide
+        importable at all, since a whole one could never be materialised and
+        so could never be trained on.
+        """
+        artifact_id = self._canonical_id(artifact_id)
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+
+        root = core.normalise_store_root(store_root)
+        untokened, credential = core.split_store_credential(root)
+        multiscale_path = multiscale_path or None
+
+        stem = (stem or "").strip() or core.default_stem_from_store_root(untokened)
+        if not stem:
+            raise ValueError(
+                "Could not derive an image name from the store root; pass one."
+            )
+        if not core.is_valid_image_stem(stem):
+            raise ValueError(
+                f"Invalid image name {stem!r}: must match ^[A-Za-z0-9._-]+$."
+            )
+
+        probe = await self._probe_ngff_source(root, multiscale_path, origin)
+        region = core.normalise_region(region, probe["width"], probe["height"])
+        # The entry's dimensions are the *patch's*, not the slide's. That one
+        # choice is what makes a region cost nothing elsewhere: the 64 MiB
+        # materialisation gate, the dataset index dims, the OME-TIFF that gets
+        # written and the viewer extent all read width/height and are correct
+        # for the crop without knowing a crop happened.
+        entry = core.remote_image_entry(
+            untokened,
+            multiscale_path,
+            region["width"] if region else probe["width"],
+            region["height"] if region else probe["height"],
+            dtype=probe["dtype"],
+            channels=probe["channels"],
+            levels=probe["levels"],
+            content_hint=probe["content_hint"],
+            region=region,
+        )
+
+        async with self._image_manifest_lock(artifact_id):
+            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            listing = await self._list_files_safe(artifact_id, "images")
+            entries, _ = core.merge_image_manifest(
+                core.parse_image_manifest(doc),
+                core.image_names_from_listing(listing),
+                dims=dict(meta.get("image_dims") or {}),
+            )
+            if stem in entries:
+                raise ValueError(
+                    f"'{stem}' is already an image of this dataset. Pass a "
+                    f"different name."
+                )
+            entries[stem] = entry
+
+            async def _write():
+                await self._write_json_file(
+                    artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                )
+
+            await self._ensure_staged(artifact_id, _write)
+            # Staged-only writes reappear as absent after a restage, the same
+            # trap sync_image_manifest, delete_label and delete_annotation hit.
+            await self._commit_tolerating_pending_uploads(artifact_id)
+            self._image_manifest_cache[artifact_id] = (time.time(), entries)
+
+        if credential:
+            credentials = dict(meta.get("ngff_credentials") or {})
+            credentials[untokened] = credential
+            meta["ngff_credentials"] = credentials
+            core.write_metadata(meta, root=STATE_ROOT)
+
+        return {"stem": stem, **entry}
+
+    @bioengine.method(context=True)
+    async def forget_remote_image(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        stem: str = Field(..., description="Name of the remote image to drop."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Drop a ``remote`` manifest entry, undoing an ``import_ngff_image``.
+
+        There is no file to delete: the entry *is* the image. This is the
+        only way a remote entry ever leaves the manifest, because
+        ``sync_image_manifest`` deliberately never prunes one (a remote entry
+        is not expected to have a file, so absence proves nothing).
+
+        Refuses on a ``local`` entry: those are deleted by removing their
+        file and re-syncing, and silently unlisting one here would leave an
+        orphaned image file behind.
+        """
+        artifact_id = self._canonical_id(artifact_id)
+        _meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+
+        async with self._image_manifest_lock(artifact_id):
+            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            entries = core.parse_image_manifest(doc)
+            entry = entries.get(stem)
+            if entry is None:
+                raise FileNotFoundError(f"'{stem}' is not an image of this dataset.")
+            if entry.get("state") != core.IMAGE_STATE_REMOTE:
+                raise ValueError(
+                    f"'{stem}' is a local image, so it cannot be forgotten. "
+                    f"Delete its file instead."
+                )
+            del entries[stem]
+
+            async def _write():
+                await self._write_json_file(
+                    artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                )
+
+            await self._ensure_staged(artifact_id, _write)
+            await self._commit_tolerating_pending_uploads(artifact_id)
+            self._image_manifest_cache[artifact_id] = (time.time(), entries)
+
+        return {"stem": stem, "forgotten": True, "images": len(entries)}
+
+    # --- Materialisation (0.11.0) -----------------------------------------
+
+    async def _object_head(self, artifact_id: str, file_path: str, nbytes: int) -> bytes:
+        """First *nbytes* of an artifact file, or ``b""`` if it cannot be read.
+
+        A presigned GET is minted per call rather than cached: the URL is
+        short-lived and this runs once per materialisation.
+        """
+        try:
+            url = await self._am.get_file(
+                artifact_id=artifact_id, file_path=file_path, stage=True
+            )
+            resp = await self._http.get(url, headers={"Range": f"bytes=0-{nbytes - 1}"})
+            resp.raise_for_status()
+            return resp.content[:nbytes]
+        except Exception:
+            return b""
+
+    @bioengine.method(context=True)
+    async def materialise_image(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        stem: str = Field(..., description="Name of the remote image to materialise."),
+        done: bool = Field(
+            False,
+            description=(
+                "False to start (returns a presigned PUT URL), true to finish "
+                "(verifies the upload and flips the manifest entry)."
+            ),
+        ),
+        levels: Optional[int] = Field(
+            None, description="Pyramid levels the encoder wrote. Only read when done=true."
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Turn a ``remote`` image into a ``local`` one, in two calls.
+
+        The frontend does the work in between: it reads level 0 through the
+        same Zarr reader that renders the image, encodes an OME-TIFF pyramid
+        in the Pyodide kernel, and PUTs it to the URL this returns. The broker
+        never touches a pixel, which is what keeps a 200 MB read off the
+        worker (design §8).
+
+        Call once with ``done=False``:
+
+            {"already": false, "path", "put_url", "max_bytes"}
+            {"already": true,  "path"}   # someone else already did it
+
+        then, after the PUT lands, once with ``done=True`` and the level count
+        the encoder produced.
+
+        The PUT must send the body **bare, with no Content-Type header**: the
+        presigned signature covers that header, so setting it is a 403.
+
+        Both phases are safe to repeat. The object path is deterministic and
+        its bytes are a pure function of the source, so a retry overwrites
+        rather than duplicating, and a run that dies between the PUT and the
+        ``done=True`` call self-heals: the file shows up in the ``images/``
+        listing and the next manifest read promotes the entry, provenance
+        intact.
+
+        Requires the annotator role, not manager. Materialisation is triggered
+        by opening an image, and every annotator can open one.
+        """
+        artifact_id = self._canonical_id(artifact_id)
+        _meta, _caller, _role = self._require_role(context, artifact_id, "annotator")
+        name = core.materialised_image_name(stem)
+        path = f"images/{name}"
+
+        if not done:
+            # Read past the TTL cache: "has someone else already done this?"
+            # is exactly the question a cached answer gets wrong.
+            entry = core.parse_image_manifest(
+                await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            ).get(stem)
+            if isinstance(entry, dict) and core.image_entry_is_local(entry):
+                return {"already": True, "stem": stem, "path": entry.get("path")}
+            core.check_materialisable(stem, entry)
+
+            put_url_holder: Dict[str, str] = {}
+
+            async def _mint():
+                put_url_holder["url"] = await self._am.put_file(
+                    artifact_id, file_path=path
+                )
+
+            await self._ensure_staged(artifact_id, _mint)
+            return {
+                "already": False,
+                "stem": stem,
+                "path": path,
+                "put_url": put_url_holder["url"],
+                "max_bytes": core.MAX_MATERIALISE_BYTES,
+            }
+
+        # A presigned PUT reports success from S3, not from the artifact
+        # manager, so "the client says it uploaded" is not evidence the object
+        # is there. Read the first bytes back before the manifest starts
+        # claiming a readable image lives at this path.
+        head = await self._object_head(artifact_id, path, 8)
+        if not core.looks_like_tiff(head):
+            raise ValueError(
+                f"No OME-TIFF found at '{path}'. The upload did not land, or "
+                f"stored something else. '{stem}' stays remote."
+            )
+
+        async with self._image_manifest_lock(artifact_id):
+            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            entries = core.parse_image_manifest(doc)
+            entry = entries.get(stem)
+            if entry is None:
+                raise FileNotFoundError(f"'{stem}' is not an image of this dataset.")
+            if core.image_entry_is_local(entry):
+                # Lost the race, and the file is verified present either way.
+                return {"already": True, "stem": stem, "path": entry.get("path")}
+            entries[stem] = core.materialise_image_entry(entry, name, levels)
+
+            async def _write():
+                await self._write_json_file(
+                    artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                )
+
+            await self._ensure_staged(artifact_id, _write)
+            # Commits the OME-TIFF too: it was PUT into the same open stage.
+            await self._commit_tolerating_pending_uploads(artifact_id)
+            self._image_manifest_cache[artifact_id] = (time.time(), entries)
+
+        return {"already": False, "stem": stem, **entries[stem]}
+
+    @bioengine.method(context=True)
     async def create_label(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
@@ -1063,21 +1712,24 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, caller, role = self._require_role(context, artifact_id, "public")
 
-        image_entries = await self._list_files_safe(artifact_id, "images")
-        images = []
-        for entry in image_entries:
-            name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
-            if not name or (isinstance(entry, dict) and (entry.get("type") == "directory" or entry.get("is_dir"))):
-                continue
-            images.append({"stem": Path(name).stem})
+        dims_cache: Dict[str, Any] = dict(meta.get("image_dims") or {})
+        manifest = await self._image_manifest(artifact_id, dims=dims_cache)
+        images = [
+            {"stem": stem, "state": entry.get("state"), "path": entry.get("path")}
+            for stem, entry in sorted(manifest.items())
+        ]
 
         # Per-image width/height (0.8.0) so the frontend can flag images
         # below the segmentation models' input minimum without loading
-        # pixels. Each stem costs one 24-byte ranged read of the PNG IHDR
-        # header, done once and cached in the dataset's broker metadata;
-        # failed reads stay uncached and retry on a later index call.
-        dims_cache: Dict[str, Any] = dict(meta.get("image_dims") or {})
-        missing_dims = [img["stem"] for img in images if img["stem"] not in dims_cache]
+        # pixels. Since 0.10.0 the manifest carries the dimensions for any
+        # image imported with them known, and this ranged PNG-header read is
+        # the fallback for the ones that predate it. It costs 24 bytes per
+        # stem, is cached in the dataset's broker metadata, and failed reads
+        # stay uncached so a later index call retries them.
+        missing_dims = [
+            stem for stem, entry in manifest.items()
+            if "width" not in entry and stem not in dims_cache and entry.get("path")
+        ]
         if missing_dims:
             dims_sem = asyncio.Semaphore(16)
 
@@ -1085,7 +1737,9 @@ class AnnotationBroker:
                 async with dims_sem:
                     try:
                         url = await self._am.get_file(
-                            artifact_id=artifact_id, file_path=core.image_path(stem), stage=True
+                            artifact_id=artifact_id,
+                            file_path=manifest[stem]["path"],
+                            stage=True,
                         )
                         resp = await self._http.get(url, headers={"Range": "bytes=0-23"})
                         resp.raise_for_status()
@@ -1103,7 +1757,8 @@ class AnnotationBroker:
                 meta["image_dims"] = dims_cache
                 core.write_metadata(meta, root=STATE_ROOT)
         for img in images:
-            dims = dims_cache.get(img["stem"])
+            entry = manifest[img["stem"]]
+            dims = [entry["width"], entry["height"]] if "width" in entry else dims_cache.get(img["stem"])
             if dims:
                 img["width"], img["height"] = int(dims[0]), int(dims[1])
 
@@ -1171,15 +1826,49 @@ class AnnotationBroker:
         image_stem: str = Field(..., description="Image stem (filename without extension)."),
         context=None,
     ) -> Dict[str, Any]:
-        """Single presigned GET URL for one image. Featherweight first call
-        for the annotate page so the image renders before the full dataset
-        index (which mints URLs for every file) has been assembled."""
+        """Where to read one image from. Featherweight first call for the
+        annotate page so the image renders before the full dataset index
+        (which mints URLs for every file) has been assembled.
+
+        Two shapes, discriminated by ``kind``:
+
+        * ``{"stem", "kind": "file", "read_url"}`` -- a materialised image,
+          presigned as before. The pre-0.10.0 shape is a subset of this one,
+          so a stale frontend still renders local images.
+        * ``{"stem", "kind": "ngff", "store_root", "multiscale_path",
+          "region"}`` -- a remote OME-Zarr source the browser reads directly.
+          ``region`` is null unless the image was imported as a patch of a
+          whole-slide source, in which case it is the crop, in level-0 pixels,
+          that the reader must confine itself to.
+
+        For a remote source any credential is spliced in **here**, after the
+        role check, and never stored in the artifact (design §12).
+        """
         artifact_id = self._canonical_id(artifact_id)
-        self._require_role(context, artifact_id, "public")
+        meta, _caller, _role = self._require_role(context, artifact_id, "public")
+        entry = await self._image_entry(artifact_id, image_stem)
+
+        if not core.image_entry_is_local(entry):
+            source = entry.get("source") or {}
+            if source.get("kind") != core.NGFF_SOURCE_KIND:
+                raise FileNotFoundError(
+                    f"Image '{image_stem}' has no file and no readable source "
+                    f"(state={entry.get('state')!r})."
+                )
+            store_root = source.get("store_root") or ""
+            credential = (meta.get("ngff_credentials") or {}).get(store_root)
+            return {
+                "stem": image_stem,
+                "kind": "ngff",
+                "store_root": core.apply_store_credential(store_root, credential),
+                "multiscale_path": source.get("multiscale_path"),
+                "region": source.get("region"),
+            }
+
         read_url = await self._am.get_file(
-            artifact_id=artifact_id, file_path=core.image_path(image_stem), stage=True
+            artifact_id=artifact_id, file_path=entry["path"], stage=True
         )
-        return {"stem": image_stem, "read_url": read_url}
+        return {"stem": image_stem, "kind": "file", "read_url": read_url}
 
     @bioengine.method(context=True)
     async def get_embedding_urls(
@@ -1198,8 +1887,9 @@ class AnnotationBroker:
             read_url = await self._am.get_file(artifact_id=artifact_id, file_path=emb_path, stage=True)
             return {"exists": True, "read_url": read_url}
 
+        image_file_path = await self._image_file_path(artifact_id, image_stem)
         image_read_url = await self._am.get_file(
-            artifact_id=artifact_id, file_path=core.image_path(image_stem), stage=True
+            artifact_id=artifact_id, file_path=image_file_path, stage=True
         )
         embedding_put_url = await self._am.put_file(artifact_id, file_path=emb_path)
         return {
@@ -1297,4 +1987,6 @@ class AnnotationBroker:
         self._require_role(context, artifact_id, "owner")
         deleted = core.delete_metadata(artifact_id, root=STATE_ROOT)
         self._manifest_name_cache.pop(artifact_id, None)
+        self._image_manifest_cache.pop(artifact_id, None)
+        self._image_manifest_locks.pop(artifact_id, None)
         return {"deleted": deleted}
