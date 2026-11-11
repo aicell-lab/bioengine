@@ -71,7 +71,8 @@ RECONNECT_BUDGET_S = 15.0
 # A healthy call measured p95 33 ms / max 67 ms, with a 322 ms cold first call.
 # The ceiling is what sets the value: the worst path through
 # ``_get_cluster_state_with_reconnect`` crosses this bound three times either
-# side of a reconnect's own 30 s of bounded cost, and 3*20+30 still leaves the
+# side of a reconnect's own 30 s of BUDGETED cost (see #0229: the geo half is a
+# real ceiling, the connect half a retry budget), and 3*20+30 still leaves the
 # rest of the pass room inside the 120 s staleness deadline above.
 # This bound CAN cut a call that is still technically healthy, and that is
 # intended rather than impossible. In slurm mode ``check_pending_resources`` is
