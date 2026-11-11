@@ -23,9 +23,16 @@ from bioengine.cluster import ray_cluster as rc_mod
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.heartbeat import MISSED_PASSES_BEFORE_STALE, heartbeat_stale_after_seconds
 
-# The reconnect path's own bounded cost: a connect retry budget either side of
-# a geo lookup (RECONNECT_BUDGET_S + 15.0 in ray_cluster._connect_to_cluster).
-RECONNECT_BOUNDED_COST_S = 30.0
+# What a reconnect is EXPECTED to cost, which is not a ceiling on it (#0229).
+# Two terms, and only one is a bound: the geo lookup is a real
+# ``asyncio.wait_for(..., timeout=15.0)``, while RECONNECT_BUDGET_S = 15.0 is a
+# retry BUDGET — connect_with_retry starts no new attempt past it, but its own
+# docstring says "the last attempt may start just before it expires", and the
+# attempt is ``ray.init`` with no timeout of its own. So a single connect that
+# never returns overruns this figure without limit, and the inequality below is
+# a budget comparison rather than a worst-case proof. ``bioengine.heartbeat``
+# says reconnecting is untimed, and that is the accurate half of the pair.
+RECONNECT_BUDGETED_COST_S = 30.0
 # Defaults of Worker.monitoring_interval_seconds and the monitor loop's
 # backoff_max_seconds, which together set the liveness staleness deadline.
 DEFAULT_MONITORING_INTERVAL_S = 10.0
@@ -190,7 +197,7 @@ def test_the_bound_leaves_a_pass_inside_the_liveness_staleness_deadline():
 
     assert deadline == DEFAULT_BACKOFF_MAX_S + MISSED_PASSES_BEFORE_STALE * 10.0
     assert bound > MEASURED_COLD_CALL_S * 10
-    assert 3 * bound + RECONNECT_BOUNDED_COST_S < deadline
+    assert 3 * bound + RECONNECT_BUDGETED_COST_S < deadline
 
 
 def _raw_call_sites(path):
