@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -301,6 +302,85 @@ for line in sys.stdin:
     except Exception as e:
         _respond({"status": "error", "message": repr(e)})
 """
+
+
+_ARRAY_SHAPE_RE = re.compile(r"Array shape \((?P<shape>[^)]*)\) does not map to axes")
+_AXIS_INFO_RE = re.compile(
+    r"AxisInfo\(id='(?P<id>[^']*)', type='(?P<type>[^']*)', "
+    r"size=AxisSize\(min=(?P<min>\d+|None), max=(?P<max>\d+|None), "
+    r"step=(?P<step>\d+|None)\)\)"
+)
+
+
+def _axis_mismatch_hint(message: str) -> Optional[str]:
+    """Turn bioimageio's axis ValueError into a sentence naming the remedy.
+
+    The raw error is accurate and unactionable — it reprs the model's
+    ``AxisInfo`` objects and leaves the caller to work out which axis is
+    wrong and what to do. A participant hit exactly this in the 2026-11-11
+    workshop with a grayscale image against Cellpose-SAM, whose channel
+    axis is ``min=3, max=3`` (myco #0308).
+
+    Returns ``None`` whenever anything is unrecognised, so an unparsed
+    message falls through to the original text and is never made worse.
+    The shape and the axis list are paired BY POSITION, which is why a
+    length mismatch returns ``None``: bioimageio also tries permutations
+    and singleton insertions, so position is only meaningful when the two
+    sequences line up.
+    """
+    shape_m = _ARRAY_SHAPE_RE.search(message)
+    if not shape_m:
+        return None
+    try:
+        sizes = [
+            int(part.strip())
+            for part in shape_m.group("shape").split(",")
+            if part.strip()
+        ]
+    except ValueError:
+        return None
+
+    axes = [
+        (m.group("id"), m.group("min"), m.group("max"), m.group("step"))
+        for m in _AXIS_INFO_RE.finditer(message)
+    ]
+    if not axes or len(axes) != len(sizes):
+        return None
+
+    for (axis_id, lo, hi, step), got in zip(axes, sizes):
+        low = int(lo) if lo != "None" else None
+        high = int(hi) if hi != "None" else None
+        if (low is not None and got < low) or (high is not None and got > high):
+            break
+    else:
+        return None
+
+    if low is not None and low == high:
+        need = f"exactly {low}"
+    elif high is None:
+        need = f"at least {low}"
+    else:
+        need = f"between {low} and {high}"
+
+    remedy = ""
+    if axis_id == "channel" and got == 1 and low == high:
+        remedy = (
+            f" The image is single-channel (grayscale); this model wants "
+            f"{low}. Replicate the channel before calling infer, e.g. "
+            f"np.repeat(arr, {low}, axis={axes.index((axis_id, lo, hi, step))}) "
+            f"for an array in this axis order, or supply a {low}-channel image."
+        )
+    wanted = ", ".join(
+        f"{a}={lo_ if lo_ != 'None' else 1}"
+        if lo_ == hi_
+        else f"{a}>={lo_ if lo_ != 'None' else 1}"
+        for a, lo_, hi_, _ in axes
+    )
+    return (
+        f"the {axis_id!r} axis must be {need} but the array supplies {got}."
+        f"{remedy} Required axis sizes: {wanted}; array shape given: "
+        f"({', '.join(str(n) for n in sizes)}). Original error: {message}"
+    )
 
 
 def _read_pip(name: str) -> List[str]:
@@ -1112,6 +1192,9 @@ class RuntimeDeployment:
                 raise RuntimeError(
                     f"CUDA out of memory during inference: {message}"
                 )
+            hint = _axis_mismatch_hint(message)
+            if hint:
+                raise RuntimeError(f"Inference failed: {hint}")
             raise RuntimeError(f"Inference failed: {message}")
 
     def _evict_warm(self) -> None:
