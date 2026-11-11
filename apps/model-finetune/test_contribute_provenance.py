@@ -96,6 +96,9 @@ class _Stub:
             async def edit(self_inner, *a: Any, **k: Any) -> None:
                 return None
 
+            async def discard(self_inner, *a: Any, **k: Any) -> None:
+                return None
+
             async def put_file(self_inner, artifact_id: str, file_path: str) -> str:
                 if file_path.endswith("metadata.json"):
                     return _METADATA_URL
@@ -119,6 +122,17 @@ class _Stub:
 
     async def _commit_with_retry(self, am: Any, pool_artifact_id: str) -> None:
         return None
+
+    def _staged(self, am: Any, artifact_id: str):
+        """The REAL staging context manager, bound here rather than faked.
+
+        #0134 moved ``contribute``'s staging into ``_staged``; a hand-rolled double
+        would keep passing if it stopped discarding on failure, which is the whole
+        point of that change.
+        """
+        import entry
+
+        return entry.EntryApp.func_or_class._staged.__get__(self)(am, artifact_id)
 
     def _bump_transport(self, **kw: Any) -> None:
         return None
