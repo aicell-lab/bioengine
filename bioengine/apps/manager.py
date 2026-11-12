@@ -332,6 +332,8 @@ PUBLIC_APP_STATUS_FIELDS = (
     "application_resources",
     "available_methods",
     "max_ongoing_requests",
+    "max_queued_payloads",
+    "request_timeout_s",
     "scaling",
     "static_site_url",
     "service_ids",
@@ -1523,6 +1525,11 @@ class AppsManager:
             "authorized_users": application_info["authorized_users"],
             "available_methods": application_info["available_methods"],
             "max_ongoing_requests": application_info["max_ongoing_requests"],
+            # None for max_queued_payloads means "as deep as max_ongoing_requests",
+            # which is what the proxy resolves it to. Reported as None rather than
+            # resolved here so a reader can tell "unset" from "set to that number".
+            "max_queued_payloads": application_info.get("max_queued_payloads"),
+            "request_timeout_s": application_info.get("request_timeout_s", 600.0),
             "scaling": dict(application_info.get("scaling") or {}),
             "static_site_url": static_site_url,
             "service_ids": service_ids,
@@ -1769,6 +1776,11 @@ class AppsManager:
                     "hypha_token": None,
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
+                    # .get, and deliberately NOT added to required_keys above: an
+                    # app deployed before these existed has no such key, and a
+                    # worker upgrade must not make its app unrecoverable.
+                    "max_queued_payloads": app_data.get("max_queued_payloads"),
+                    "request_timeout_s": app_data.get("request_timeout_s", 600.0),
                     "proxy_memory_in_gb": app_data.get("proxy_memory_in_gb", 0.5),
                     "scaling": dict(app_data.get("scaling") or {}),
                     "application_resources": app_data["application_resources"],
@@ -3046,7 +3058,15 @@ class AppsManager:
         ),
         max_ongoing_requests: int = Field(
             None,
-            description="Maximum number of concurrent requests this application instance can handle simultaneously. Higher values allow more parallelism but use more memory. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
+            description="Maximum number of concurrent requests this application instance can handle simultaneously. Higher values allow more parallelism but use more memory. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified). Note this is the application instance's own admission limit, enforced in its proxy; it is not the same knob as the `max_ongoing_requests` an app's code may pass to `@bioengine.app`, which caps concurrency per replica of that app's entry deployment.",
+        ),
+        max_queued_payloads: int = Field(
+            None,
+            description="How many additional callers may WAIT for a slot once `max_ongoing_requests` are already in flight, instead of being refused. Each waiter holds its decoded request payload in the proxy's memory, which is why it is bounded rather than open-ended: raise it for apps whose calls are short and bursty, and keep it low for apps that take large uploads. A caller is only refused once both the concurrency limit and this queue are full. Set 0 to refuse as soon as `max_ongoing_requests` is reached. If not specified, defaults to the value of `max_ongoing_requests` for a new application, or preserves the previous value if updating an existing application (only when application_id is specified). This is NOT Ray Serve's `max_queued_requests`, which bounds Serve's own router queue in front of a deployment's replicas and can be set separately by an app's code through `@bioengine.app`; the two are independent and both can apply to one call.",
+        ),
+        request_timeout_s: float = Field(
+            None,
+            description="How long (in seconds) one admitted call may hold its slot before the proxy abandons it and frees the slot for the next caller. Raise it for apps whose calls legitimately run long (a finetune, a large inference) and lower it for interactive apps where a stuck call should fail fast. Pass 0 to wait indefinitely, which means one wedged call can hold a slot until the app is redeployed. If not specified, uses 600 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified). This bounds the proxy's wait on the application, so it does not shorten any timeout the Hypha client applies to the call itself.",
         ),
         proxy_memory_in_gb: float = Field(
             None,
@@ -3233,6 +3253,15 @@ class AppsManager:
                     disable_gpu = existing_app["disable_gpu"]
                 if max_ongoing_requests is None:
                     max_ongoing_requests = existing_app["max_ongoing_requests"]
+                # .get, not [], for both: an app deployed by a worker that predates
+                # these two parameters has no such key in its stored app_data, and
+                # inheriting from it must not raise. The fallbacks are the same
+                # values a new application gets, so an old app keeps behaving as it
+                # did until someone sets them.
+                if max_queued_payloads is None:
+                    max_queued_payloads = existing_app.get("max_queued_payloads")
+                if request_timeout_s is None:
+                    request_timeout_s = existing_app.get("request_timeout_s", 600.0)
                 if proxy_memory_in_gb is None:
                     proxy_memory_in_gb = existing_app.get("proxy_memory_in_gb", 0.5)
                 if auto_redeploy is None:
@@ -3266,6 +3295,11 @@ class AppsManager:
                     disable_gpu = False
                 if max_ongoing_requests is None:
                     max_ongoing_requests = 10
+                # max_queued_payloads stays None: the proxy reads that as "queue as
+                # deep as max_ongoing_requests", so leaving it unset here keeps one
+                # default in one place instead of copying the number.
+                if request_timeout_s is None:
+                    request_timeout_s = 600.0
                 if proxy_memory_in_gb is None:
                     proxy_memory_in_gb = 0.5
                 if auto_redeploy is None:
@@ -3364,6 +3398,8 @@ class AppsManager:
                 hypha_token=hypha_token,
                 disable_gpu=disable_gpu,
                 max_ongoing_requests=max_ongoing_requests,
+                max_queued_payloads=max_queued_payloads,
+                request_timeout_s=request_timeout_s,
                 proxy_memory_in_gb=proxy_memory_in_gb,
                 debug=debug,
                 started_at=started_at,
@@ -3463,6 +3499,8 @@ class AppsManager:
                 "hypha_token": hypha_token,
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,
+                "max_queued_payloads": max_queued_payloads,
+                "request_timeout_s": request_timeout_s,
                 "proxy_memory_in_gb": proxy_memory_in_gb,
                 "scaling": dict(app.scaling or {}),
                 "application_resources": app.metadata["resources"],

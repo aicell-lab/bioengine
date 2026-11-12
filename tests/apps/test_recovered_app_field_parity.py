@@ -69,6 +69,18 @@ LEGITIMATELY_NULL_AFTER_ADOPTION = {
     "ice_servers",
 }
 
+# Fields whose None is this parameter's documented default, not information
+# adoption lost — a deploy that was never given one records None too. Kept
+# apart from the set above because the reason is different and because the
+# membership here is *checked*: the deployed record must be None as well, so
+# this cannot be used to park a field adoption really does drop.
+NULL_ON_BOTH_PATHS_BY_DESIGN = {
+    # Unset means "queue as deep as max_ongoing_requests", resolved in the
+    # proxy. Reported rather than resolved at deploy time so a reader can tell
+    # "unset" from "set to that number".
+    "max_queued_payloads",
+}
+
 
 # ── the cluster both managers see ────────────────────────────────────────────
 
@@ -283,11 +295,50 @@ async def test_only_the_documented_fields_are_null_after_adoption(
         if value is None and key not in {"deployment_task", "undeployment_task"}
     }
 
+    # Earn the by-design exemption rather than asserting it: a field listed
+    # there must be None on a *deployed* record too, otherwise its None after
+    # adoption is exactly the loss this test exists to catch.
+    deployed_record = (await _deployed_manager())._deployed_applications[APP_ID]
+    not_actually_default = {
+        key
+        for key in NULL_ON_BOTH_PATHS_BY_DESIGN
+        if deployed_record.get(key) is not None
+    }
+    assert not not_actually_default, (
+        "NULL_ON_BOTH_PATHS_BY_DESIGN claims these are None by default, but a "
+        f"deploy fills them: {sorted(not_actually_default)}. Adoption dropping "
+        "them is a real defect, not a documented default."
+    )
+    nulled -= NULL_ON_BOTH_PATHS_BY_DESIGN
+
     assert nulled == LEGITIMATELY_NULL_AFTER_ADOPTION, (
         "Fields that go null on adoption must each have a recorded reason. "
         f"Unexplained: {sorted(nulled - LEGITIMATELY_NULL_AFTER_ADOPTION)}; "
         f"now recoverable: "
         f"{sorted(LEGITIMATELY_NULL_AFTER_ADOPTION - nulled)}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_blob_written_before_the_proxy_queue_keys_existed_still_recovers(
+    monkeypatch,
+) -> None:
+    # _app_data() carries no max_queued_payloads and no request_timeout_s, which
+    # is exactly what an app deployed by an older worker has stored. Adoption
+    # must read those back with a default rather than KeyError — a worker
+    # upgrade that makes a running app unrecoverable is the worst failure this
+    # path has, because the app is still serving while the worker disowns it.
+    recovered = await _recovered_manager(monkeypatch)
+    record = recovered._deployed_applications[APP_ID]
+
+    assert record["max_queued_payloads"] is None, (
+        "unset must stay unset: the proxy reads None as 'queue as deep as "
+        "max_ongoing_requests', so resolving it here would freeze a number an "
+        "old app never chose."
+    )
+    assert record["request_timeout_s"] == 600.0, (
+        "an old blob must inherit the same default a fresh deploy gets, or the "
+        "app's behaviour changes under it on a worker upgrade."
     )
 
 
