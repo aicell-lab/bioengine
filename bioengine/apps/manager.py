@@ -357,6 +357,9 @@ PUBLIC_DEPLOYMENT_FIELDS = (
     "message",
     "replica_states",
     "replicas",
+    # The per-replica cap the app's own source declares, and the top-level
+    # ``max_ongoing_requests`` it is so easily confused with is already public.
+    "max_ongoing_requests",
 )
 
 
@@ -1124,6 +1127,35 @@ class AppsManager:
             )
         return out
 
+    @staticmethod
+    def _per_replica_ongoing_limit(
+        deployment_name: str, deployment_info: Dict[str, Any]
+    ) -> Optional[int]:
+        """One replica's concurrent-request cap, as Ray Serve holds it.
+
+        This is the ``@bioengine.app(max_ongoing_requests=...)`` the app author
+        declared. The application's top-level ``max_ongoing_requests`` is a
+        different limit under the same name — how many callers the proxy admits
+        for the whole instance — so without this field a reader had no way to
+        tell which of the two a number referred to, and the decorator's value
+        was reported nowhere at all.
+
+        None for the ProxyDeployment: the author writes no decorator on it (it
+        is absent from the app spec and from the scaling map for the same
+        reason), and its Serve-level cap is not the bound that governs client
+        calls — the top-level field is.
+
+        None, too, for anything non-integral. An unset field in a dumped
+        ``DeploymentSchema`` is the ``DEFAULT.VALUE`` enum member, which is not
+        JSON-serializable and would break the whole status payload over RPC.
+        """
+        if deployment_name == "ProxyDeployment":
+            return None
+        limit = (deployment_info.get("deployment_config") or {}).get(
+            "max_ongoing_requests"
+        )
+        return limit if isinstance(limit, int) and not isinstance(limit, bool) else None
+
     async def _get_deployment_status(
         self,
         application_id: str,
@@ -1149,6 +1181,9 @@ class AppsManager:
                 "message": deployment_info.get("message", ""),
                 "replica_states": replica_states,
                 "replicas": replicas,
+                "max_ongoing_requests": self._per_replica_ongoing_limit(
+                    deployment_name, deployment_info
+                ),
                 "logs": None,
             }
 
@@ -3046,7 +3081,7 @@ class AppsManager:
         ),
         max_ongoing_requests: int = Field(
             None,
-            description="Maximum number of concurrent requests this application instance can handle simultaneously. Higher values allow more parallelism but use more memory. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
+            description="How many callers the application's ProxyDeployment admits at once, across the whole instance — the limit the 'at capacity' rejection is counted against. Higher values allow more parallelism but use more memory. This is NOT the per-replica cap: `@bioengine.app(max_ongoing_requests=...)` in the app's own source is a separate Ray Serve limit on one replica of one deployment, the two are independent, and setting either leaves the other at its default. get_app_status reports this one at the top level and each deployment's decorator value under `deployments.<ClassName>.max_ongoing_requests`. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
         ),
         proxy_memory_in_gb: float = Field(
             None,
