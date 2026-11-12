@@ -49,6 +49,18 @@ REAL = (
     "AxisInfo(id='x', type='space', size=AxisSize(min=256, max=None, step=None))]"
 )
 
+# The SAME capture, for a plain 2-D grayscale array — what ``iio.imread`` of a grayscale
+# PNG actually yields, and the shape this issue's own live arm logged on 2026-11-11.
+# Captured in the same run as REAL above, not derived from it; the integrity test below
+# asserts the two differ only in the shape tuple.
+REAL_2D = (
+    "Array shape (807, 696) does not map to axes ["
+    "AxisInfo(id='batch', type='batch', size=AxisSize(min=1, max=None, step=None)), "
+    "AxisInfo(id='channel', type='channel', size=AxisSize(min=3, max=3, step=None)), "
+    "AxisInfo(id='y', type='space', size=AxisSize(min=256, max=None, step=None)), "
+    "AxisInfo(id='x', type='space', size=AxisSize(min=256, max=None, step=None))]"
+)
+
 
 def _load(path, *names):
     """Exec just the named top-level defs/assignments out of ``path``."""
@@ -145,11 +157,56 @@ def test_the_step_field_is_parsed_but_does_not_change_the_verdict(hint):
     assert hint(stepped).split("Original error")[0] == hint(REAL).split("Original error")[0]
 
 
-def test_a_length_mismatch_between_shape_and_axes_returns_none(hint):
-    """Position only means something when the two sequences line up.
+def test_a_length_mismatch_names_no_axis_but_still_states_the_requirement(hint):
+    """Position only means something when the two sequences line up — but that only
+    forbids NAMING an axis, not saying anything at all.
 
     bioimageio tries permutations and singleton insertions before giving up, so pairing
-    a 3-entry shape against 4 axes would name an axis at random.
+    a 3-entry shape against 4 axes would name an axis at random. The required sizes and
+    the shape that arrived are still true, though, and they are the actionable half.
+
+    This test used to assert ``hint(ragged) is None`` and so pinned the gap shut: the
+    2-D grayscale upload — this issue's own reproduction — went through this branch and
+    came out byte-identical to the unfixed code. Keeping the "no axis is named" property
+    asserted preserves what the guard is actually for.
     """
     ragged = REAL.replace("Array shape (1, 1, 807, 696)", "Array shape (1, 807, 696)")
-    assert hint(ragged) is None
+    got = hint(ragged)
+    assert got is not None
+    assert "axis must be" not in got, "no axis may be named on a rank mismatch"
+    assert "3 dimensions but this model declares 4 axes" in got
+    assert "channel=3" in got and "y>=256" in got, "the requirement is still stated"
+    assert REAL.split("does not map")[1] in got, "the original error is still carried"
+
+
+def test_the_real_2d_grayscale_upload_is_given_the_requirement_and_a_remedy(hint):
+    """The variant the refusal was about: a grayscale file, uploaded the ordinary way.
+
+    ``imageio`` yields ``(H, W)`` for a grayscale PNG and nothing between the upload and
+    ``create_sample_for_model`` adds an axis, so this — not the 4-D form — is what the
+    workshop participant's own client produced. CAPTURED, not transcribed: run against
+    the live ``idealistic-eagle`` description inside ``ghcr.io/aicell-lab/model-runner:2.11.2``
+    (bioimageio.core 0.11.0, spec 0.5.12.0 — the versions all three ``requirements-*.txt``
+    pin), with ``(1, 3, 807, 696)`` as a control that the library does NOT raise for a
+    conforming array.
+    """
+    got = hint(REAL_2D)
+    assert got is not None, "the shape this issue actually reproduced was not recognised"
+    assert "axis must be" not in got, "2 sizes against 4 axes cannot name an axis"
+    assert "2 dimensions but this model declares 4 axes" in got
+    assert "carries no channel axis at all" in got
+    assert "np.repeat(arr[np.newaxis, np.newaxis], 3, axis=1)" in got, (
+        "the remedy must be runnable: two leading axes added, then the channel replicated"
+    )
+    assert REAL_2D in got
+
+
+def test_the_2d_fixture_differs_from_the_4d_one_only_in_the_shape(hint):
+    """An integrity check on the two captured strings, not a behavioural assertion.
+
+    Both were captured from the same call in the same image, so the axis list must be
+    identical; if a future recapture changes one and not the other, the two tests above
+    would be measuring different models and nothing would say so.
+    """
+    assert REAL_2D == REAL.replace("Array shape (1, 1, 807, 696)", "Array shape (807, 696)")
+    assert REAL_2D != REAL
