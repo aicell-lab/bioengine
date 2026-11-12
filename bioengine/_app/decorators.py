@@ -246,7 +246,13 @@ def app(
             ``--enable-container-runtime`` (single-machine mode only).
         env_vars: Static env vars baked into the replica's runtime_env.
             Secrets passed at deploy time are layered on top.
-        max_ongoing_requests: Concurrent request cap per replica.
+        max_ongoing_requests: Concurrent request cap per replica of THIS
+            deployment. ``deploy_app`` takes a parameter of the same name
+            that is a different limit — how many callers the application's
+            proxy admits in total — and the two are independent, so setting
+            this one does not change what the proxy admits. ``get_app_status``
+            reports this value under ``deployments.<ClassName>`` and the
+            proxy's at the top level.
         ray_actor_options: Escape hatch for advanced Ray Serve options
             (e.g. ``resources={"custom": 1}``). Deep-merged on top of the
             flat args above.
