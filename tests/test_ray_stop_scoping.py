@@ -168,3 +168,47 @@ def test_claims_nothing_when_no_ray_process_is_running(process_table):
     buckets, claimed = process_table([unrelated])
     assert claimed == set()
     assert buckets == [[], [], []]
+
+
+def test_does_not_claim_a_client_server_whose_port_merely_starts_with_ours(process_table):
+    """THE PREFIX CASE, and the one that pins ``gcs_argument in argv`` (#0212, site 5).
+
+    The address is compared against ``argv`` — a list, so an exact element match — and
+    not against ``cmdline``, which is a string where it would be a substring test. The
+    distinction is invisible to a decoy on an unrelated port: ``--address=10.0.0.1:6379``
+    is not a substring of ``--address=10.0.0.1:6380`` either, so the test above passes
+    just as well against the substring form.
+
+    ``:63790`` is the input that separates them, and it is the hazard the code comment
+    names: our address IS a substring of this one, so a substring comparison claims a
+    client server belonging to a different cluster — and ``_find_cluster_processes``
+    exists to stop exactly that, because what it feeds is a shutdown.
+    """
+    other = _FakeProcess(
+        31,
+        "python3.11",
+        "/usr/bin/python3.11 -m ray.util.client.server --address=10.0.0.1:63790 --port=10001",
+    )
+    _, claimed = process_table([other])
+    assert claimed == set()
+
+
+def test_the_prefix_case_still_claims_our_own_client_server(process_table):
+    """Positive control for the test above, run in the same shape.
+
+    Without this, a ``_find_cluster_processes`` that claimed NOTHING — a broken stub, a
+    config whose port never reached the comparison — would satisfy the prefix test while
+    measuring nothing at all.
+    """
+    ours = _FakeProcess(
+        32,
+        "python3.11",
+        "/usr/bin/python3.11 -m ray.util.client.server --address=10.0.0.1:6379 --port=10001",
+    )
+    theirs = _FakeProcess(
+        33,
+        "python3.11",
+        "/usr/bin/python3.11 -m ray.util.client.server --address=10.0.0.1:63790 --port=10001",
+    )
+    _, claimed = process_table([ours, theirs])
+    assert claimed == {32}

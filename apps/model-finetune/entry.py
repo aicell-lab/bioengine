@@ -18,6 +18,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -202,11 +203,25 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     reader of a 1.2 GB checkpoint then sees a prefix, and identical content is no
     defence because the problem is the length, not the bytes. The temp name carries
     a uuid so concurrent writers cannot share it either.
+
+    Both fsyncs are for the cross-node case rather than the same-process one: callers
+    hand ``path`` to a runtime replica on a different node, and ``os.replace`` publishes
+    the name immediately while the data may still sit in this client's page cache — so
+    the reader opens the new name and legitimately sees fewer bytes than were written.
+    Syncing the file before the rename and the directory after closes that window.
     """
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_bytes(content)
+        with open(tmp, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -414,6 +429,30 @@ class EntryApp:
                 continue
             return resp
 
+    async def _get_verified(self, url: str, **kwargs) -> bytes:
+        """GET a body whole, rejecting a short read.
+
+        httpx raises on a body cut short of its declared length, so this check is a
+        second line of defence — but the one that matters: a prefix reaching
+        ``_write_file_atomic`` is indistinguishable from a prefix a reader sees for
+        lack of an fsync, both surfacing as ``failed finding central directory`` from
+        ``torch.load`` far from the cause. Same contract as
+        ``runtime_cellpose._download_member``.
+        """
+        from http.client import IncompleteRead
+
+        resp = await self._http_retry("GET", url, **kwargs)
+        # The length check alone cannot catch an error response: 403/404 are in
+        # _http_retry's retry set and it returns the last one unraised, and an S3
+        # error body declares its own length correctly — so a few hundred bytes of
+        # XML passes as "whole" and gets written as a .pt.
+        resp.raise_for_status()
+        content = resp.content
+        declared = resp.headers.get("Content-Length")
+        if declared is not None and len(content) != int(declared):
+            raise IncompleteRead(content, int(declared) - len(content))
+        return content
+
     @staticmethod
     async def _file_chunks(fpath: Path, size: int = 1 << 20):
         with open(fpath, "rb") as fh:
@@ -564,7 +603,14 @@ class EntryApp:
         weights_path = cache_dir / "weights.pt"
         meta_path = cache_dir / "kwargs.json"
         if weights_path.exists() and meta_path.exists():
-            return {"weights_path": str(weights_path), **json.loads(meta_path.read_text())}
+            meta = json.loads(meta_path.read_text())
+            # The recorded length, not the pair existing, is what says the weights are
+            # whole. Both files existing only proves they were written by a version that
+            # had ``_write_file_atomic``; versions before it wrote ``weights.pt`` in
+            # place, and this cache lives in an app HOME that outlives any one version.
+            # So an entry carrying no length is a MISS and re-downloads once.
+            if meta.pop("bytes", None) == weights_path.stat().st_size:
+                return {"weights_path": str(weights_path), **meta}
 
         caller_client = (
             await connect_to_server({"server_url": SERVER_URL, "token": model_token})
@@ -586,12 +632,14 @@ class EntryApp:
                 raise FileNotFoundError(
                     f"No RDF (bioimageio.yaml or rdf.yaml) found in artifact '{model_id}'."
                 )
-            rdf = yaml.safe_load((await self._http_retry("GET", rdf_url)).text)
+            rdf_resp = await self._http_retry("GET", rdf_url)
+            rdf_resp.raise_for_status()
+            rdf = yaml.safe_load(rdf_resp.text)
             ps = rdf["weights"]["pytorch_state_dict"]
             model_type = ps["architecture"]["kwargs"]["model_type"]
 
             w_url = await am.get_file(model_id, file_path=ps["source"])
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
             cache_dir.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(_write_file_atomic, weights_path, content)
             meta = {"model_type": model_type}
@@ -599,7 +647,9 @@ class EntryApp:
             # gates on both files existing, so it must appear whole or not at all — a
             # plain write_text makes it exist (empty) before it has content, and the
             # reader then json.loads("").
-            _write_file_atomic(meta_path, json.dumps(meta).encode())
+            _write_file_atomic(
+                meta_path, json.dumps({**meta, "bytes": len(content)}).encode()
+            )
             return {"weights_path": str(weights_path), **meta}
         finally:
             if caller_client is not None:
@@ -854,7 +904,10 @@ class EntryApp:
                     )
                 dest = training.session_dir(session_id) / "init_checkpoint.pt"
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(dest.write_bytes, resp.content)
+                # dest reaches a train worker as the params' checkpoint_path, so a
+                # plain write_bytes would publish the name at length zero and let
+                # that worker torch.load a prefix from another node.
+                await asyncio.to_thread(_write_file_atomic, dest, resp.content)
                 resolved["checkpoint_path"] = str(dest)
                 if params.get("pool_provenance"):
                     self._bump_transport(bytes_down=len(resp.content))
@@ -1522,17 +1575,44 @@ class EntryApp:
         import pool
 
         try:
-            await am.edit(pool_artifact_id, stage=True)
-            url = await am.put_file(pool_artifact_id, file_path=pool.MERGE_JOURNAL)
-            (await self._http_retry(
-                "PUT", url, content=json.dumps(journal).encode("utf-8"), timeout=120.0
-            )).raise_for_status()
-            await self._commit_with_retry(am, pool_artifact_id)
+            async with self._staged(am, pool_artifact_id):
+                url = await am.put_file(pool_artifact_id, file_path=pool.MERGE_JOURNAL)
+                (await self._http_retry(
+                    "PUT", url, content=json.dumps(journal).encode("utf-8"), timeout=120.0
+                )).raise_for_status()
+                await self._commit_with_retry(am, pool_artifact_id)
         except Exception as e:
             logger.warning(f"could not persist the merge journal for "
                            f"'{pool_artifact_id}' ({e}); a kill now would lose the "
                            f"{len(journal.get('scores', {}))} scored pass(es) since "
                            f"the last successful write.")
+
+    @asynccontextmanager
+    async def _staged(self, am, artifact_id: str):
+        """Open a staged edit, discarding the stage if the body does not reach commit.
+
+        ``put_file`` records a manifest row when it mints the URL, not when the
+        bytes land, so an exception between staging and commit leaves a row with no
+        object behind it. ``list_files`` lists objects and cannot show it, while
+        every later ``commit`` raises ``File '<path>' does not exist in the
+        artifact`` — which ``_commit_with_retry`` below then misreads as the
+        read-after-write 404 and retries for ~62s before re-raising. Without the
+        discard the artifact is permanently uncommittable, so one failed upload
+        takes the whole pool down rather than just its own merge.
+        """
+        await am.edit(artifact_id, stage=True)
+        try:
+            yield
+        except BaseException:
+            try:
+                await am.discard(artifact_id)
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ could not discard the staged edit on '{artifact_id}' ({e}); "
+                    f"if a put_file row was minted without its bytes, every later "
+                    f"commit on this artifact fails until the stage is discarded."
+                )
+            raise
 
     async def _commit_with_retry(self, am, artifact_id: str, tries: int = 6, base: float = 2.0) -> None:
         """Commit a staged artifact, retrying the transient read-after-write 404 the
@@ -1725,61 +1805,66 @@ class EntryApp:
                 index = await self._read_pool_index(am, pool_artifact_id)
             except FileNotFoundError:
                 index = None  # uninitialized pool: the first contribution bootstraps it
-            await am.edit(pool_artifact_id, stage=True)
-            w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
-            # The checkpoint is torch + a runtime-local file, neither reachable from
-            # the torch-free CPU entry; the GPU runtime inspects it, PUTs the weights
-            # to the presigned URL, and returns the signature + hashes, so nothing
-            # large or torch-dependent crosses the entry.
-            info = await runtime.prepare_contribution(session_id, w_url)
-            signature = info["architecture_signature"]
-            if index is None:
-                # A fine-tune preserves the parameter layout, so the first
-                # contribution's signature is the pool's reference signature
-                # (equals stock cpsam). The pool artifact itself must already
-                # exist (created out-of-band with the pool_token's scope).
-                index = pool.empty_index(model_type, signature)
-            else:
-                pool.assert_compatible(index, model_type=model_type, signature=signature)
+            async with self._staged(am, pool_artifact_id):
+                w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
+                # The checkpoint is torch + a runtime-local file, neither reachable from
+                # the torch-free CPU entry; the GPU runtime inspects it, PUTs the weights
+                # to the presigned URL, and returns the signature + hashes, so nothing
+                # large or torch-dependent crosses the entry.
+                info = await runtime.prepare_contribution(session_id, w_url)
+                signature = info["architecture_signature"]
+                if index is None:
+                    # A fine-tune preserves the parameter layout, so the first
+                    # contribution's signature is the pool's reference signature
+                    # (equals stock cpsam). The pool artifact itself must already
+                    # exist (created out-of-band with the pool_token's scope).
+                    index = pool.empty_index(model_type, signature)
+                else:
+                    pool.assert_compatible(index, model_type=model_type, signature=signature)
 
-            metadata = pool.build_contribution_metadata(
-                contribution_id=cid,
-                model_type=model_type,
-                # Empty is the same as unset here: an exported-but-empty var
-                # would otherwise stamp "" and read as a known version.
-                app_version=os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None,
-                cellpose_version=info["cellpose_version"],
-                architecture_signature=signature,
-                base_checkpoint_id=base_checkpoint_id,
-                base_checkpoint_sha256=info["base_checkpoint_sha256"],
-                samples_seen=samples_seen,
-                training_params=params,
-                l2_from_base=info["l2_from_base"],
-                dataset_fingerprint=dataset_fingerprint,
-                solo_val_metric=solo_val_metric,
-                weights_sha256=info["weights_sha256"],
-                uploaded_at=uploaded_at,
-            )
-            m_url = await am.put_file(pool_artifact_id, file_path=paths["metadata"])
-            (await self._http_retry(
-                "PUT", m_url, content=json.dumps(metadata).encode("utf-8"), timeout=120.0
-            )).raise_for_status()
-            pool.append_contribution(index, {
-                "contribution_id": cid,
-                "weights_path": paths["weights"],
-                "metadata_path": paths["metadata"],
-                "weights_sha256": info["weights_sha256"],
-                "architecture_signature": signature,
-                "samples_seen": samples_seen,
-                "n_train_images": int(n_inputs),
-                "n_bytes": int(info["n_bytes"]),
-                "uploaded_at": uploaded_at,
-            })
-            i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
-            (await self._http_retry(
-                "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
-            )).raise_for_status()
-            await self._commit_with_retry(am, pool_artifact_id)
+                # Resolved once and used by both the stored metadata and the value
+                # returned to the caller, so the two records cannot date the same
+                # contribution differently. Empty is the same as unset here: an
+                # exported-but-empty var would otherwise stamp "" and read as a
+                # known version.
+                app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
+                metadata = pool.build_contribution_metadata(
+                    contribution_id=cid,
+                    model_type=model_type,
+                    app_version=app_version,
+                    cellpose_version=info["cellpose_version"],
+                    architecture_signature=signature,
+                    base_checkpoint_id=base_checkpoint_id,
+                    base_checkpoint_sha256=info["base_checkpoint_sha256"],
+                    samples_seen=samples_seen,
+                    training_params=params,
+                    l2_from_base=info["l2_from_base"],
+                    dataset_fingerprint=dataset_fingerprint,
+                    solo_val_metric=solo_val_metric,
+                    weights_sha256=info["weights_sha256"],
+                    uploaded_at=uploaded_at,
+                )
+                m_url = await am.put_file(pool_artifact_id, file_path=paths["metadata"])
+                (await self._http_retry(
+                    "PUT", m_url, content=json.dumps(metadata).encode("utf-8"), timeout=120.0
+                )).raise_for_status()
+                pool.append_contribution(index, {
+                    "contribution_id": cid,
+                    "weights_path": paths["weights"],
+                    "metadata_path": paths["metadata"],
+                    "weights_sha256": info["weights_sha256"],
+                    "architecture_signature": signature,
+                    "samples_seen": samples_seen,
+                    "n_train_images": int(n_inputs),
+                    "n_bytes": int(info["n_bytes"]),
+                    "uploaded_at": uploaded_at,
+                })
+                i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
+                (await self._http_retry(
+                    "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
+                )).raise_for_status()
+                await self._commit_with_retry(am, pool_artifact_id)
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
@@ -1789,6 +1874,11 @@ class EntryApp:
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
             "schema_version": pool.SCHEMA_VERSION,
+            # The caller keeps this record, not the stored metadata.json, so it
+            # carries app_version too: schema_version does not cover a release
+            # that changes a value without changing the shape (0.27.6 moved
+            # every l2_from_base), which leaves a saved response undatable.
+            "app_version": app_version,
             "contribution_id": cid,
             "pool_artifact_id": pool_artifact_id,
             "architecture_signature": signature,
@@ -1865,7 +1955,7 @@ class EntryApp:
                     raise ValueError(f"pool '{pool_artifact_id}' has no community checkpoint to evaluate.")
                 weights_rel = cc["path"]
             w_url = await am.get_file(pool_artifact_id, file_path=weights_rel)
-            content = (await self._http_retry("GET", w_url, timeout=600.0)).content
+            content = await self._get_verified(w_url, timeout=600.0)
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
@@ -2128,21 +2218,21 @@ class EntryApp:
                 # the old head), then repoint the index in a SECOND commit. The runtime
                 # builds the soup and PUTs it straight to the pool, so the head weights
                 # never traverse the CPU entry.
-                await am.edit(pool_artifact_id, stage=True)
-                w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
-                mat = _fold(await runtime.materialize_soup(await _specs(s_paths), w_url))
-                head_sha = mat["sha256"]
-                head_bytes_out = int(mat["n_bytes"])
-                manifest = pool.build_community_manifest(
-                    community_version=new_version, combine="uniform",
-                    selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
-                    selection_metric=sel_metric, witness_metric=wit_metric, members=members_record,
-                    architecture_signature=index.get("architecture_signature"),
-                    weights_sha256=head_sha, created_at=time.time(),
-                )
-                m_url = await am.put_file(pool_artifact_id, file_path=paths["manifest"])
-                (await self._http_retry("PUT", m_url, content=json.dumps(manifest).encode("utf-8"), timeout=120.0)).raise_for_status()
-                await self._commit_with_retry(am, pool_artifact_id)
+                async with self._staged(am, pool_artifact_id):
+                    w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
+                    mat = _fold(await runtime.materialize_soup(await _specs(s_paths), w_url))
+                    head_sha = mat["sha256"]
+                    head_bytes_out = int(mat["n_bytes"])
+                    manifest = pool.build_community_manifest(
+                        community_version=new_version, combine="uniform",
+                        selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
+                        selection_metric=sel_metric, witness_metric=wit_metric, members=members_record,
+                        architecture_signature=index.get("architecture_signature"),
+                        weights_sha256=head_sha, created_at=time.time(),
+                    )
+                    m_url = await am.put_file(pool_artifact_id, file_path=paths["manifest"])
+                    (await self._http_retry("PUT", m_url, content=json.dumps(manifest).encode("utf-8"), timeout=120.0)).raise_for_status()
+                    await self._commit_with_retry(am, pool_artifact_id)
                 self._bump_transport(bytes_up=head_bytes_out)
                 pool.set_current_community(index, community_version=new_version, weights_path=paths["weights"],
                                            sha256=head_sha, selection_metric=sel_metric, witness_metric=wit_metric)
@@ -2193,10 +2283,10 @@ class EntryApp:
                 "global_sha256": head_sha, "transport": merge_transport,
                 "deferred": deferred_ids, "created_at": time.time(),
             })
-            await am.edit(pool_artifact_id, stage=True)
-            i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
-            (await self._http_retry("PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0)).raise_for_status()
-            await self._commit_with_retry(am, pool_artifact_id)
+            async with self._staged(am, pool_artifact_id):
+                i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
+                (await self._http_retry("PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0)).raise_for_status()
+                await self._commit_with_retry(am, pool_artifact_id)
         finally:
             self._merges_in_flight -= 1
             lock.release()

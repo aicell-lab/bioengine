@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bioengine"
-version = "0.16.92"
+version = "0.16.95"
 description = "BioEngine — CLI and SDK for deploying and calling AI model services on BioEngine workers"
 requires-python = ">=3.11"
 authors = [
@@ -62,6 +62,11 @@ worker = [
     "aiortc==1.14.0",
     "cloudpickle>=3.1.1",
     "haikunator>=2.1.0",
+    # Ray Serve touches FieldDescriptor.label, which protobuf 7 removed —
+    # measured: present on the class in 6.33.1, absent in 7.36.2. Kept here as
+    # well as in requirements-worker.txt because pip only sees this one, and
+    # without it `pip install -e ".[worker]"` resolved protobuf 7.36.2 (#0231).
+    "protobuf>=4,<7",
     "pydantic~=2.12.0",
     "ray[client,serve]>=2.53.0,<3.0.0",
     "uv>=0.5.0",

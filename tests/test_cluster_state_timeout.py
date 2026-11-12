@@ -20,13 +20,19 @@ from pathlib import Path
 import pytest
 
 from bioengine.cluster import ray_cluster as rc_mod
-from bioengine.cluster import slurm_workers as sw_mod
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.heartbeat import MISSED_PASSES_BEFORE_STALE, heartbeat_stale_after_seconds
 
-# The reconnect path's own bounded cost: a connect retry budget either side of
-# a geo lookup (RECONNECT_BUDGET_S + 15.0 in ray_cluster._connect_to_cluster).
-RECONNECT_BOUNDED_COST_S = 30.0
+# What a reconnect is EXPECTED to cost, which is not a ceiling on it (#0229).
+# Two terms, and only one is a bound: the geo lookup is a real
+# ``asyncio.wait_for(..., timeout=15.0)``, while RECONNECT_BUDGET_S = 15.0 is a
+# retry BUDGET — connect_with_retry starts no new attempt past it, but its own
+# docstring says "the last attempt may start just before it expires", and the
+# attempt is ``ray.init`` with no timeout of its own. So a single connect that
+# never returns overruns this figure without limit, and the inequality below is
+# a budget comparison rather than a worst-case proof. ``bioengine.heartbeat``
+# says reconnecting is untimed, and that is the accurate half of the pair.
+RECONNECT_BUDGETED_COST_S = 30.0
 # Defaults of Worker.monitoring_interval_seconds and the monitor loop's
 # backoff_max_seconds, which together set the liveness staleness deadline.
 DEFAULT_MONITORING_INTERVAL_S = 10.0
@@ -191,12 +197,12 @@ def test_the_bound_leaves_a_pass_inside_the_liveness_staleness_deadline():
 
     assert deadline == DEFAULT_BACKOFF_MAX_S + MISSED_PASSES_BEFORE_STALE * 10.0
     assert bound > MEASURED_COLD_CALL_S * 10
-    assert 3 * bound + RECONNECT_BOUNDED_COST_S < deadline
+    assert 3 * bound + RECONNECT_BUDGETED_COST_S < deadline
 
 
-def _raw_call_sites(module):
-    """Every ``get_cluster_state.remote()`` in one module, as (function, lineno)."""
-    tree = ast.parse(Path(module.__file__).read_text())
+def _raw_call_sites(path):
+    """Every ``get_cluster_state.remote()`` in one source FILE, as (function, lineno)."""
+    tree = ast.parse(Path(path).read_text())
 
     enclosing = {}
     for node in ast.walk(tree):
@@ -217,24 +223,48 @@ def _raw_call_sites(module):
     return sites
 
 
+def _package_root():
+    """The installed ``bioengine`` package directory, derived from an already
+    imported module rather than from this file's location — the test may be run
+    from anywhere, and an installed copy is what the worker actually executes."""
+    return Path(rc_mod.__file__).resolve().parent.parent
+
+
 def test_no_unbounded_get_cluster_state_await_is_left_anywhere():
-    """Every call site in EVERY module routes through the bounded helper.
+    """EVERY module under ``bioengine/`` routes through the bounded helper.
 
-    The reported defect named two call sites and the connection probe reached from
-    ``reconnect()`` is a third, all in ``ray_cluster``. A line-oriented grep would
-    not notice a fourth being added, so this walks the AST — but the first version
-    of this test walked only ``ray_cluster`` while claiming "every call site", and
-    a fourth site that already existed in ``slurm_workers`` sat outside its field
-    of view the whole time. An honestly-scoped name and both modules, therefore.
+    Two earlier versions of this test were each too narrow by one step, and the
+    second one shipped. It first walked ``ray_cluster`` alone while claiming
+    "every call site", and a fourth site that already existed in
+    ``slurm_workers`` sat outside its field of view until #0137's second
+    refusal. Naming the pair fixed that case and left the shape: a raw await
+    added to any third module would have been just as invisible, and three
+    others hold the handle (``apps/manager``, ``apps/proxy_deployment``,
+    ``_app/mixin``).
 
-    ``slurm_workers`` is the one that matters most: its await sat inside the
-    scale-up loop's ``try``, so a hang there skipped the ``finally`` that clears
-    ``worker_creation_task`` and left ``can_scale_up`` refusing for ever.
+    So the module list is gone. This walks every ``.py`` in the package and
+    asserts the whole package holds exactly ONE raw call, the one inside the
+    helper itself.
+
+    Files on disk, deliberately, not imported modules: AST-walking a module
+    object needs ``__file__``, which needs the import, and importing all of
+    them to police one call shape would run every module's import side effects
+    inside a unit test. Reading sources costs nothing and imports nothing.
+
+    Discovery by grep would not have worked either: ``slurm_workers`` never
+    mentions ``proxy_actor_handle``, because it reached the handle as
+    ``self.ray_cluster.proxy_actor_handle`` — so the one site that motivated
+    all of this is exactly the one a textual search for the handle misses.
     """
-    rc_sites = _raw_call_sites(rc_mod)
-    assert [name for name, _ in rc_sites] == ["_get_cluster_state_bounded"], rc_sites
+    sources = sorted(_package_root().rglob("*.py"))
+    # A zero below has to mean "no raw call", never "walked nothing": if the
+    # discovery breaks, every assertion after it passes vacuously.
+    assert len(sources) > 20, f"only found {len(sources)} sources under {_package_root()}"
 
-    # Nothing outside ray_cluster may hold a raw call at all: the bounded helper
-    # lives there, so any other module must go through it.
-    sw_sites = _raw_call_sites(sw_mod)
-    assert sw_sites == [], sw_sites
+    found = {}
+    for path in sources:
+        sites = _raw_call_sites(path)
+        if sites:
+            found[str(path.relative_to(_package_root()))] = [n for n, _ in sites]
+
+    assert found == {"cluster/ray_cluster.py": ["_get_cluster_state_bounded"]}, found
