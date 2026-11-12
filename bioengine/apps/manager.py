@@ -1529,7 +1529,15 @@ class AppsManager:
             "authorized_users": application_info["authorized_users"],
             "available_methods": application_info["available_methods"],
             "max_ongoing_requests": application_info["max_ongoing_requests"],
-            "max_queued_requests": application_info.get("max_queued_requests"),
+            # Stored as None when the caller named no depth, so that the queue
+            # keeps tracking max_ongoing_requests across updates that raise it.
+            # Report the number the proxy actually enforces: a caller reading
+            # status to find its bound should not have to know that rule.
+            "max_queued_requests": (
+                application_info.get("max_queued_requests")
+                if application_info.get("max_queued_requests") is not None
+                else application_info["max_ongoing_requests"]
+            ),
             "request_timeout_s": application_info.get("request_timeout_s", 600.0),
             "scaling": dict(application_info.get("scaling") or {}),
             "static_site_url": static_site_url,

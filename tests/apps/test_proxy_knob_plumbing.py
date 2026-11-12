@@ -238,6 +238,35 @@ def _proxy_args_keys() -> set:
     raise AssertionError("no proxy_args dict literal found in builder.py")
 
 
+def test_the_proxy_still_falls_back_to_the_admission_cap() -> None:
+    # get_app_status reports max_ongoing_requests as the effective depth when a
+    # caller named none, which is only true while the proxy resolves it that
+    # way. Two expressions of one rule, in two files, free to drift apart
+    # silently — a fallback changed to a constant here would make the status
+    # payload report a bound nothing enforces.
+    source = Path(inspect.getsourcefile(pd_module)).read_text()
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Attribute) and t.attr == "max_queued_requests"
+                for t in node.targets
+            )
+            and isinstance(node.value, ast.IfExp)
+        ):
+            fallback = ast.get_source_segment(source, node.value)
+            assert "max_ongoing_requests" in fallback, (
+                "The proxy no longer defaults its queue depth to the admission "
+                f"cap: {fallback}. AppsManager._get_app_status reports "
+                "it as though it did."
+            )
+            return
+    raise AssertionError(
+        "no conditional assignment to self.max_queued_requests in "
+        "proxy_deployment.py — the fallback this pins has moved or gone"
+    )
+
+
 def test_every_proxy_arg_is_a_proxy_constructor_parameter() -> None:
     keys = _proxy_args_keys()
     assert "max_ongoing_requests" in keys, (
