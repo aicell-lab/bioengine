@@ -69,6 +69,18 @@ LEGITIMATELY_NULL_AFTER_ADOPTION = {
     "ice_servers",
 }
 
+# Fields whose None is this parameter's documented default, not information
+# adoption lost — a deploy that was never given one records None too. Kept
+# apart from the set above because the reason is different and because the
+# membership here is *checked*: the deployed record must be None as well, so
+# this cannot be used to park a field adoption really does drop.
+NULL_ON_BOTH_PATHS_BY_DESIGN = {
+    # Unset means "queue as deep as max_ongoing_requests", resolved in the
+    # proxy. Reported rather than resolved at deploy time so a reader can tell
+    # "unset" from "set to that number".
+    "max_queued_payloads",
+}
+
 
 # ── the cluster both managers see ────────────────────────────────────────────
 
@@ -283,12 +295,101 @@ async def test_only_the_documented_fields_are_null_after_adoption(
         if value is None and key not in {"deployment_task", "undeployment_task"}
     }
 
+    # Earn the by-design exemption rather than asserting it: a field listed
+    # there must be None on a *deployed* record too, otherwise its None after
+    # adoption is exactly the loss this test exists to catch.
+    deployed_record = (await _deployed_manager())._deployed_applications[APP_ID]
+    not_actually_default = {
+        key
+        for key in NULL_ON_BOTH_PATHS_BY_DESIGN
+        if deployed_record.get(key) is not None
+    }
+    assert not not_actually_default, (
+        "NULL_ON_BOTH_PATHS_BY_DESIGN claims these are None by default, but a "
+        f"deploy fills them: {sorted(not_actually_default)}. Adoption dropping "
+        "them is a real defect, not a documented default."
+    )
+    nulled -= NULL_ON_BOTH_PATHS_BY_DESIGN
+
     assert nulled == LEGITIMATELY_NULL_AFTER_ADOPTION, (
         "Fields that go null on adoption must each have a recorded reason. "
         f"Unexplained: {sorted(nulled - LEGITIMATELY_NULL_AFTER_ADOPTION)}; "
         f"now recoverable: "
         f"{sorted(LEGITIMATELY_NULL_AFTER_ADOPTION - nulled)}."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_blob_written_before_the_proxy_queue_keys_existed_still_recovers(
+    monkeypatch,
+) -> None:
+    # _app_data() carries no max_queued_payloads and no request_timeout_s, which
+    # is exactly what an app deployed by an older worker has stored. Adoption
+    # must read those back with a default rather than KeyError — a worker
+    # upgrade that makes a running app unrecoverable is the worst failure this
+    # path has, because the app is still serving while the worker disowns it.
+    recovered = await _recovered_manager(monkeypatch)
+    record = recovered._deployed_applications[APP_ID]
+
+    assert record["max_queued_payloads"] is None, (
+        "unset must stay unset: the proxy reads None as 'queue as deep as "
+        "max_ongoing_requests', so resolving it here would freeze a number an "
+        "old app never chose."
+    )
+    assert record["request_timeout_s"] == 600.0, (
+        "an old blob must inherit the same default a fresh deploy gets, or the "
+        "app's behaviour changes under it on a worker upgrade."
+    )
+
+
+@pytest.mark.asyncio
+async def test_adoption_carries_the_proxy_knobs_the_blob_recorded(
+    monkeypatch,
+) -> None:
+    # The other half of the test above, and the one the default-reading failure
+    # hides behind: both are settable per deployment, so adoption falling back
+    # to its own default instead of reading the blob would silently reset a
+    # deliberately-raised bound on the next redeploy. Neither the null-parity
+    # test nor the old-blob test can see that — one checks None and the other
+    # supplies no values to lose. The numbers here are deliberately neither
+    # None nor 600.0.
+    blob = _app_data()
+    blob["max_queued_payloads"] = 20
+    blob["request_timeout_s"] = 30.0
+
+    recovered = await _recovered_manager(monkeypatch, app_data=blob)
+    record = recovered._deployed_applications[APP_ID]
+
+    assert record["max_queued_payloads"] == 20
+    assert record["request_timeout_s"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_status_reports_the_queue_depth_the_proxy_actually_enforces() -> None:
+    # The record stores None when the caller named no depth, so that the queue
+    # keeps tracking max_ongoing_requests across an update that raises the cap.
+    # Reporting that None would hand a caller asking "what is my bound" a value
+    # it cannot act on, and the rule that resolves it lives in the proxy where
+    # no status reader can see it.
+    unset = await _deployed_manager(max_ongoing_requests=4)
+    status = (await unset.get_app_status(application_ids=[APP_ID], context=CONTEXT))[
+        APP_ID
+    ]
+
+    assert unset._deployed_applications[APP_ID]["max_queued_payloads"] is None, (
+        "control: the record must genuinely hold None here, or this test passes "
+        "without exercising the resolution at all"
+    )
+    assert status["max_queued_payloads"] == 4
+
+    # The other branch, so a resolution that ignored the stored value and always
+    # returned the cap would not pass: a named depth is reported as named.
+    named = await _deployed_manager(max_ongoing_requests=4, max_queued_payloads=9)
+    named_status = (
+        await named.get_app_status(application_ids=[APP_ID], context=CONTEXT)
+    )[APP_ID]
+
+    assert named_status["max_queued_payloads"] == 9
 
 
 # ── what the class cost, observed through the API ────────────────────────────

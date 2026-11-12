@@ -174,9 +174,15 @@ class ProxyDeployment:
     # zero queue depth means refuse as soon as the semaphore is full, and no timeout means wait
     # indefinitely. So a half-built instance degrades to what this file did before, never to
     # something new. The constructor overwrites both.
-    max_queued_requests = 0
+    #
+    # NOT named max_queued_requests, which Ray Serve already uses for the router queue in front
+    # of a deployment's replicas — including this one: ProxyDeployment._deployment_config
+    # .max_queued_requests is Serve's own bound (-1, unbounded) while this attribute is the
+    # in-actor cap on callers parked holding a decoded payload. Two meanings for one word on one
+    # object; "payloads" is what this one actually bounds and no Serve option claims the name.
+    max_queued_payloads = 0
     request_timeout_s = None
-    _queued_requests = 0
+    _queued_payloads = 0
 
     def __init__(
         self,
@@ -200,7 +206,7 @@ class ProxyDeployment:
         proxy_actor_name: str,
         debug: bool,
         ice_servers: Optional[List[Dict[str, Any]]] = None,
-        max_queued_requests: Optional[int] = None,
+        max_queued_payloads: Optional[int] = None,
         request_timeout_s: Optional[float] = 600.0,
     ):
         """
@@ -250,6 +256,15 @@ class ProxyDeployment:
                         the default URL. Example:
                         [{"urls": "stun:stun.example.com:19302"},
                          {"urls": "turn:turn.example.com:3478", "username": "u", "credential": "p"}]
+
+            max_queued_payloads: How many callers may wait for an admission slot, each holding
+                        its decoded payload in this actor's memory. None means use
+                        max_ongoing_requests. Zero refuses the moment the semaphore is full,
+                        which is the pre-queue behaviour.
+
+            request_timeout_s: How long one admitted call may hold its slot before the proxy
+                        gives up on it and releases the slot. None waits indefinitely, which
+                        lets a wedged deployment hold every slot forever.
         """
         logger.setLevel("DEBUG" if debug else "INFO")
         logger.info(
@@ -368,11 +383,11 @@ class ProxyDeployment:
         # Queue depth defaults to the concurrency cap rather than to a constant, so an app that
         # declares a big cap gets a proportionate queue and a small one does not get a backlog
         # many times its own size.
-        self.max_queued_requests = (
-            self.max_ongoing_requests if max_queued_requests is None else max_queued_requests
+        self.max_queued_payloads = (
+            self.max_ongoing_requests if max_queued_payloads is None else max_queued_payloads
         )
         self.request_timeout_s = request_timeout_s
-        self._queued_requests = 0
+        self._queued_payloads = 0
 
         # Hypha connection upkeep — owned by the background maintenance task,
         # never by check_health. ``_connection_lost`` is set when a reachability
@@ -613,15 +628,16 @@ class ProxyDeployment:
 
         The wait is counted separately from the slot because the two bounds answer different
         questions: ``max_ongoing_requests`` is how many calls may be in flight, and
-        ``max_queued_requests`` is how many callers may be parked holding a decoded payload in
-        this actor's memory. Decrementing in a ``finally`` keeps the count honest for a waiter
-        that never gets a slot.
+        ``max_queued_payloads`` is how many callers may be parked holding a decoded payload in
+        this actor's memory. Neither is Ray Serve's ``max_queued_requests``, which bounds the
+        router queue ahead of a replica and never sees these waiters at all. Decrementing in a
+        ``finally`` keeps the count honest for a waiter that never gets a slot.
         """
-        self._queued_requests += 1
+        self._queued_payloads += 1
         try:
             await self.service_semaphore.acquire()
         finally:
-            self._queued_requests -= 1
+            self._queued_payloads -= 1
         try:
             yield
         finally:
@@ -693,7 +709,7 @@ class ProxyDeployment:
             # actor's memory, so an open-ended backlog grows proxy memory without limit.
             if (
                 self.service_semaphore.locked()
-                and self._queued_requests >= self.max_queued_requests
+                and self._queued_payloads >= self.max_queued_payloads
             ):
                 # Counted, because attempted saturates at max_ongoing_requests
                 # once a deployment wedges — without this every further real
@@ -706,13 +722,13 @@ class ProxyDeployment:
                 logger.warning(
                     f"⚠️ '{self.application_id}' at capacity "
                     f"({self.max_ongoing_requests} concurrent requests) with "
-                    f"{self._queued_requests} queued (max {self.max_queued_requests}); "
+                    f"{self._queued_payloads} queued (max {self.max_queued_payloads}); "
                     f"rejecting '{method_name}'."
                 )
                 raise RuntimeError(
                     f"Application '{self.application_id}' has reached its maximum "
                     f"of {self.max_ongoing_requests} concurrent requests and its "
-                    f"queue of {self.max_queued_requests} is full. Please try "
+                    f"queue of {self.max_queued_payloads} is full. Please try "
                     f"again in a moment."
                 )
             async with self._admission_slot():

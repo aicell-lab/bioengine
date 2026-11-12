@@ -94,10 +94,10 @@ def _proxy(max_ongoing: int, max_queued: int, timeout_s, hold: float = 0.0) -> P
     p.workspace = "ws"
     p.authorized_users = {"*": ["*"]}
     p.max_ongoing_requests = max_ongoing
-    p.max_queued_requests = max_queued
+    p.max_queued_payloads = max_queued
     p.request_timeout_s = timeout_s
     p.service_semaphore = asyncio.Semaphore(max_ongoing)
-    p._queued_requests = 0
+    p._queued_payloads = 0
     p.entry_deployment_handle = _Handle(hold=hold)
     p.usage = []
 
@@ -183,19 +183,19 @@ async def test_the_queue_count_returns_to_zero_on_every_exit_path():
     p = _proxy(max_ongoing=1, max_queued=1, timeout_s=0.2, hold=0.0)
     fn = _fn(p)
     await fn(context=CTX)
-    assert p._queued_requests == 0, "answered path leaked a waiter"
+    assert p._queued_payloads == 0, "answered path leaked a waiter"
 
     p.entry_deployment_handle.hold = 30
     with pytest.raises(TimeoutError):
         await fn(context=CTX)
-    assert p._queued_requests == 0, "timeout path leaked a waiter"
+    assert p._queued_payloads == 0, "timeout path leaked a waiter"
 
     p.entry_deployment_handle.hold = 0.4
     settled = await asyncio.gather(
         fn(context=CTX), fn(context=CTX), fn(context=CTX), return_exceptions=True
     )
     assert any(isinstance(r, BaseException) for r in settled)
-    assert p._queued_requests == 0, "refused path leaked a waiter"
+    assert p._queued_payloads == 0, "refused path leaked a waiter"
 
 
 @pytest.mark.asyncio
