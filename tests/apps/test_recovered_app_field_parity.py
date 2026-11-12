@@ -342,6 +342,56 @@ async def test_a_blob_written_before_the_proxy_queue_keys_existed_still_recovers
     )
 
 
+@pytest.mark.asyncio
+async def test_adoption_carries_the_proxy_knobs_the_blob_recorded(
+    monkeypatch,
+) -> None:
+    # The other half of the test above, and the one the default-reading failure
+    # hides behind: both are settable per deployment, so adoption falling back
+    # to its own default instead of reading the blob would silently reset a
+    # deliberately-raised bound on the next redeploy. Neither the null-parity
+    # test nor the old-blob test can see that — one checks None and the other
+    # supplies no values to lose. The numbers here are deliberately neither
+    # None nor 600.0.
+    blob = _app_data()
+    blob["max_queued_payloads"] = 20
+    blob["request_timeout_s"] = 30.0
+
+    recovered = await _recovered_manager(monkeypatch, app_data=blob)
+    record = recovered._deployed_applications[APP_ID]
+
+    assert record["max_queued_payloads"] == 20
+    assert record["request_timeout_s"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_status_reports_the_queue_depth_the_proxy_actually_enforces() -> None:
+    # The record stores None when the caller named no depth, so that the queue
+    # keeps tracking max_ongoing_requests across an update that raises the cap.
+    # Reporting that None would hand a caller asking "what is my bound" a value
+    # it cannot act on, and the rule that resolves it lives in the proxy where
+    # no status reader can see it.
+    unset = await _deployed_manager(max_ongoing_requests=4)
+    status = (await unset.get_app_status(application_ids=[APP_ID], context=CONTEXT))[
+        APP_ID
+    ]
+
+    assert unset._deployed_applications[APP_ID]["max_queued_payloads"] is None, (
+        "control: the record must genuinely hold None here, or this test passes "
+        "without exercising the resolution at all"
+    )
+    assert status["max_queued_payloads"] == 4
+
+    # The other branch, so a resolution that ignored the stored value and always
+    # returned the cap would not pass: a named depth is reported as named.
+    named = await _deployed_manager(max_ongoing_requests=4, max_queued_payloads=9)
+    named_status = (
+        await named.get_app_status(application_ids=[APP_ID], context=CONTEXT)
+    )[APP_ID]
+
+    assert named_status["max_queued_payloads"] == 9
+
+
 # ── what the class cost, observed through the API ────────────────────────────
 
 
