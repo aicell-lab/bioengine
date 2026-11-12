@@ -1,11 +1,13 @@
 """``deploy_app`` must actually CALL the scaling validator (#0212).
 
 ``_validate_scaling_map`` is thoroughly unit-tested — ``tests/test_scaling_validation.py``
-names it eleven times — but nothing drove ``deploy_app`` and asserted that an invalid
-map is refused. Measured on ``origin/main`` at 1ecea12: deleting the call site in
-``deploy_app`` left all 16 cases across the two scaling suites green, so the wiring was
-reachable, correct, and unpinned. A future edit to that one line would have shipped
-silently.
+names it eleven times — but those cases import the helper directly, and none of them drives
+``deploy_app``. The call site is not wholly uncovered: measured at this branch's head,
+deleting it reddens two cases in ``tests/apps/test_scaling_autoscaling_config_keys.py``,
+which cross it incidentally on their way to asserting something else. That cover is real but
+accidental, and it disappears if the autoscaling-keys suite is ever rewritten. The two pins
+below are the direct cover that was missing: delete the call site and they fail naming the
+call site.
 
 The shape is worth naming because it recurred three times across one PR ladder: the
 surrounding tests import the helper directly, which is faster to write and is exactly
