@@ -201,6 +201,10 @@ def _app_data() -> dict:
         "application_env_vars": {},
         "disable_gpu": False,
         "max_ongoing_requests": 10,
+        # Deliberately neither the None nor the 600.0 that recovery falls back
+        # to, so a read that quietly substituted its default would show here.
+        "max_queued_requests": 20,
+        "request_timeout_s": 30.0,
         "proxy_memory_in_gb": 0.5,
         "scaling": {},
         "application_resources": {"num_cpus": 1},
@@ -289,6 +293,21 @@ async def test_only_the_documented_fields_are_null_after_adoption(
         f"now recoverable: "
         f"{sorted(LEGITIMATELY_NULL_AFTER_ADOPTION - nulled)}."
     )
+
+
+@pytest.mark.asyncio
+async def test_adoption_carries_the_proxy_knobs_the_blob_recorded(
+    monkeypatch,
+) -> None:
+    # Both are settable per deployment, so adoption reading its own fallback
+    # instead of the blob would silently reset a deliberately-raised bound on
+    # the next redeploy — and the null check above cannot see it, because a
+    # fallback of 600.0 is not None.
+    recovered = await _recovered_manager(monkeypatch)
+    record = recovered._deployed_applications[APP_ID]
+
+    assert record["max_queued_requests"] == _app_data()["max_queued_requests"]
+    assert record["request_timeout_s"] == _app_data()["request_timeout_s"]
 
 
 # ── what the class cost, observed through the API ────────────────────────────
