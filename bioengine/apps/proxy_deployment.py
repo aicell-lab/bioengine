@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ray
@@ -166,6 +167,17 @@ class ProxyDeployment:
                                            (Ray Cluster)             (Ray Cluster)
     """
 
+    # Admission defaults at CLASS level, not only in __init__, so an instance built without
+    # running the constructor still has a working admission path — the test doubles construct via
+    # __new__, and an AttributeError raised from inside the request path would surface as a failed
+    # call rather than as a missing attribute. The values chosen are the pre-queue behaviour:
+    # zero queue depth means refuse as soon as the semaphore is full, and no timeout means wait
+    # indefinitely. So a half-built instance degrades to what this file did before, never to
+    # something new. The constructor overwrites both.
+    max_queued_requests = 0
+    request_timeout_s = None
+    _queued_requests = 0
+
     def __init__(
         self,
         application_id: str,
@@ -188,6 +200,8 @@ class ProxyDeployment:
         proxy_actor_name: str,
         debug: bool,
         ice_servers: Optional[List[Dict[str, Any]]] = None,
+        max_queued_requests: Optional[int] = None,
+        request_timeout_s: Optional[float] = 600.0,
     ):
         """
         Initialize the BioEngine proxy deployment.
@@ -351,6 +365,14 @@ class ProxyDeployment:
         self.mcp_service_id: str = None
         self.rtc_service_id: str = None
         self.service_semaphore = asyncio.Semaphore(self.max_ongoing_requests)
+        # Queue depth defaults to the concurrency cap rather than to a constant, so an app that
+        # declares a big cap gets a proportionate queue and a small one does not get a backlog
+        # many times its own size.
+        self.max_queued_requests = (
+            self.max_ongoing_requests if max_queued_requests is None else max_queued_requests
+        )
+        self.request_timeout_s = request_timeout_s
+        self._queued_requests = 0
 
         # Hypha connection upkeep — owned by the background maintenance task,
         # never by check_health. ``_connection_lost`` is set when a reachability
@@ -585,6 +607,26 @@ class ProxyDeployment:
             f"'{method_name}' on application '{self.application_id}'"
         )
 
+    @asynccontextmanager
+    async def _admission_slot(self):
+        """Hold one admission slot, counting the wait so the queue can be bounded.
+
+        The wait is counted separately from the slot because the two bounds answer different
+        questions: ``max_ongoing_requests`` is how many calls may be in flight, and
+        ``max_queued_requests`` is how many callers may be parked holding a decoded payload in
+        this actor's memory. Decrementing in a ``finally`` keeps the count honest for a waiter
+        that never gets a slot.
+        """
+        self._queued_requests += 1
+        try:
+            await self.service_semaphore.acquire()
+        finally:
+            self._queued_requests -= 1
+        try:
+            yield
+        finally:
+            self.service_semaphore.release()
+
     def _create_deployment_function(
         self, method_schema: Dict[str, Any]
     ) -> Callable[..., Any]:
@@ -643,15 +685,16 @@ class ProxyDeployment:
             # they share this single wrapper, so a long-running call from either
             # transport consumes one slot until it returns.
             #
-            # Fail fast instead of queueing unboundedly when at capacity: a
-            # blocked caller still holds its decoded payload (e.g. an inference
-            # image) in this actor's memory while it waits, so an open-ended
-            # backlog grows proxy memory without limit. Because we reject rather
-            # than await, the semaphore never accumulates waiters — so
-            # ``.locked()`` means "no free slot", and there is no ``await``
-            # between this check and the acquire below, making the decision
-            # race-free.
-            if self.service_semaphore.locked():
+            # QUEUE FIRST, REFUSE ONLY WHEN THE QUEUE IS ALSO FULL. Refusing the moment the
+            # semaphore filled destroyed the only input Ray Serve's autoscaler reads: a refused
+            # request never becomes an ongoing request, so a saturated app never asked for a
+            # second replica. Waiting lets the request reach the entry handle and be counted.
+            # The queue stays BOUNDED because a waiter still holds its decoded payload in this
+            # actor's memory, so an open-ended backlog grows proxy memory without limit.
+            if (
+                self.service_semaphore.locked()
+                and self._queued_requests >= self.max_queued_requests
+            ):
                 # Counted, because attempted saturates at max_ongoing_requests
                 # once a deployment wedges — without this every further real
                 # call during the wedge leaves no trace at all.
@@ -662,15 +705,17 @@ class ProxyDeployment:
                 )
                 logger.warning(
                     f"⚠️ '{self.application_id}' at capacity "
-                    f"({self.max_ongoing_requests} concurrent requests); "
+                    f"({self.max_ongoing_requests} concurrent requests) with "
+                    f"{self._queued_requests} queued (max {self.max_queued_requests}); "
                     f"rejecting '{method_name}'."
                 )
                 raise RuntimeError(
                     f"Application '{self.application_id}' has reached its maximum "
-                    f"of {self.max_ongoing_requests} concurrent requests. Please "
-                    f"try again in a moment."
+                    f"of {self.max_ongoing_requests} concurrent requests and its "
+                    f"queue of {self.max_queued_requests} is full. Please try "
+                    f"again in a moment."
                 )
-            async with self.service_semaphore:
+            async with self._admission_slot():
                 try:
                     await self._check_permissions(context, method_name=method_name)
 
@@ -701,7 +746,32 @@ class ProxyDeployment:
                     # deployment leaves behind.
                     self._record_usage(method_name, caller_class, "attempted")
                     try:
-                        result = await method.remote(*args, **kwargs)
+                        # BOUNDED, because nothing outside this actor will ever end the wait.
+                        # Measured 2026-11-12 against the worker image's hypha_rpc 0.21.40: a
+                        # caller that times out does NOT cancel this coroutine, and neither does
+                        # one that disconnects outright — the slot stayed held for the full
+                        # observation window in both cases, well past the heartbeat interval that
+                        # could have cancelled it. So without a timeout here a wedged call keeps
+                        # its slot until the work finishes, which with queueing enabled above
+                        # would make saturation outlast every caller that caused it.
+                        if self.request_timeout_s:
+                            result = await asyncio.wait_for(
+                                method.remote(*args, **kwargs),
+                                timeout=self.request_timeout_s,
+                            )
+                        else:
+                            result = await method.remote(*args, **kwargs)
+                    except asyncio.TimeoutError:
+                        self._record_usage(method_name, caller_class, "failed")
+                        logger.error(
+                            f"❌ Method '{method_name}' on '{self.application_id}' exceeded "
+                            f"{self.request_timeout_s}s; releasing its slot."
+                        )
+                        raise TimeoutError(
+                            f"Method '{method_name}' on application "
+                            f"'{self.application_id}' did not complete within "
+                            f"{self.request_timeout_s} seconds."
+                        )
                     except RayTaskError as e:
                         self._record_usage(method_name, caller_class, "failed")
                         logger.error(
@@ -1145,12 +1215,14 @@ class ProxyDeployment:
         - answered: the application returned a result. This is application completion, not
           client receipt — a caller whose own RPC timed out still increments it.
         - failed: the application raised, or the call was cancelled
-        - rejected: the call was turned away at the concurrency limit and never dispatched
+        - rejected: the call was turned away because both the concurrency limit and the queue
+          behind it were full, and was never dispatched
 
         attempted minus answered minus failed is the number of calls that were dispatched and
         never came back — the signature of a deployment that wedged mid-request. attempted
         stops rising at max_ongoing_requests once that happens, so rejected is what carries
-        the size of the demand the wedge is refusing.
+        the size of the demand the wedge is refusing — now the demand beyond the queue, since a
+        call that waits and then runs is attempted rather than rejected.
 
         Caller classes are coarse by design, and no caller identity is ever recorded:
         - internal: the caller holds a grant on the workspace hosting the application, or is
