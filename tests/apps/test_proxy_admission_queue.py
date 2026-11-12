@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from ray.exceptions import RayTaskError
 
 from tests.apps._proxy_double import ProxyDouble
 
@@ -31,6 +32,7 @@ class _Handle:
         self.hold = hold
         self.calls = 0
         self.responses = []
+        self.raises: BaseException | None = None
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -57,6 +59,8 @@ class _Response:
 
     async def _run(self, seconds: float):
         await asyncio.sleep(seconds)
+        if self.handle.raises is not None:
+            raise self.handle.raises
         return "ok"
 
     def __await__(self):
@@ -223,6 +227,86 @@ async def test_a_completed_call_is_never_cancelled():
     p = _proxy(max_ongoing=1, max_queued=1, timeout_s=10, hold=0.0)
     fn = _fn(p)
     assert await fn(context=CTX) == "ok"
+    assert not p.entry_deployment_handle.responses[-1].cancelled
+
+
+def _remote_error(cause: BaseException):
+    """What Ray actually hands the proxy when the app raises ``cause``.
+
+    ``as_instanceof_cause`` is the real constructor rather than a hand-rolled subclass, because the
+    whole hazard is the dynamic class it builds: bases ``(RayTaskError, type(cause))``, so the
+    result satisfies ``isinstance`` for both — and on 3.11 ``asyncio.TimeoutError`` IS
+    ``builtins.TimeoutError``. A double that merely raised ``TimeoutError`` would miss the half of
+    the bug that comes from the RayTaskError side.
+
+    The traceback string carries the cause's text because that is the only way the app's message
+    reaches the caller: ``str(RayTaskError)`` returns ``traceback_str``, not the cause. A fixture
+    with a placeholder there cannot tell "the message survived" from "the message was discarded",
+    so it would report the bug fixed either way.
+    """
+    tb = "Traceback (most recent call last):\n  ...\n%s: %s" % (type(cause).__name__, cause)
+    return RayTaskError("slow", tb, cause).as_instanceof_cause()
+
+
+@pytest.mark.asyncio
+async def test_an_apps_own_timeout_error_is_not_claimed_by_the_proxy_bound():
+    """FAILS WITHOUT THE CLAUSE ORDER: ``except asyncio.TimeoutError`` first claims this one.
+
+    An app whose upstream read times out raises TimeoutError; Ray delivers it as a subclass of both
+    RayTaskError and TimeoutError, and Python takes the first matching clause. Written before the
+    RayTaskError clause, the proxy-bound handler discards the app's message and tells the caller a
+    bound expired — here 10 s, against a call that failed instantly. The caller then debugs the
+    wrong system.
+    """
+    p = _proxy(max_ongoing=1, max_queued=1, timeout_s=10, hold=0.0)
+    p.entry_deployment_handle.raises = _remote_error(TimeoutError("upstream read timed out"))
+    fn = _fn(p)
+    with pytest.raises(Exception) as got:
+        await fn(context=CTX)
+    assert isinstance(got.value, RayTaskError), (
+        "the app's error was replaced by a bare TimeoutError: %r" % (got.value,)
+    )
+    assert "upstream read timed out" in str(got.value), "the app's own message was discarded"
+    assert "did not complete within" not in str(got.value), (
+        "the caller was told the proxy bound expired, but it never did"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_apps_own_timeout_error_is_not_cancelled():
+    """FAILS WITHOUT THE INNER GUARD, and passes on the clause reorder alone — so it pins the
+    other half of the fix.
+
+    The reorder fixes the message; it leaves the inner handler calling ``cancel()`` on a call that
+    already finished, because that handler cannot tell the two kinds of TimeoutError apart either.
+    Harmless today only because the response is done; the guard is what makes the cancel mean
+    "our bound expired" rather than "something named TimeoutError happened".
+    """
+    p = _proxy(max_ongoing=1, max_queued=1, timeout_s=10, hold=0.0)
+    p.entry_deployment_handle.raises = _remote_error(TimeoutError("upstream read timed out"))
+    fn = _fn(p)
+    with pytest.raises(Exception):
+        await fn(context=CTX)
+    assert not p.entry_deployment_handle.responses[-1].cancelled, (
+        "a call that failed on its own was cancelled as if the proxy bound had expired"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_non_timeout_app_error_is_unaffected():
+    """The control for the two arms above: the chain must discriminate by TYPE.
+
+    Without this, a change that simply stopped raising the bound message for everything would
+    satisfy both — this arm is identical before and after the fix, so it isolates the regression
+    to TimeoutError-shaped causes.
+    """
+    p = _proxy(max_ongoing=1, max_queued=1, timeout_s=10, hold=0.0)
+    p.entry_deployment_handle.raises = _remote_error(ValueError("bad input"))
+    fn = _fn(p)
+    with pytest.raises(Exception) as got:
+        await fn(context=CTX)
+    assert isinstance(got.value, RayTaskError)
+    assert "bad input" in str(got.value)
     assert not p.entry_deployment_handle.responses[-1].cancelled
 
 

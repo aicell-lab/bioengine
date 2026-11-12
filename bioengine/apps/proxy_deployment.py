@@ -760,7 +760,15 @@ class ProxyDeployment:
                                 result = await asyncio.wait_for(
                                     response, timeout=self.request_timeout_s
                                 )
-                            except asyncio.TimeoutError:
+                            except asyncio.TimeoutError as timeout_exc:
+                                # An app that raises its OWN TimeoutError lands here too: Ray
+                                # delivers a remote exception as a dynamic subclass of both
+                                # RayTaskError and the cause's type, and on 3.11
+                                # asyncio.TimeoutError IS builtins.TimeoutError. That is the app
+                                # failing, not our bound expiring, so there is nothing to cancel
+                                # — the call already finished.
+                                if isinstance(timeout_exc, RayTaskError):
+                                    raise
                                 # Cancel the call, do not merely stop waiting for it. Measured
                                 # 2026-11-12 on Ray Serve 2.55.1: without this the replica runs
                                 # the abandoned work to completion — observed `CALL work OK
@@ -774,6 +782,16 @@ class ProxyDeployment:
                                 raise
                         else:
                             result = await method.remote(*args, **kwargs)
+                    # RayTaskError FIRST, and the order is load-bearing: a remote exception
+                    # satisfies isinstance for both clauses, so whichever is written first claims
+                    # an app's own TimeoutError. Behind asyncio.TimeoutError, the app's message is
+                    # discarded and the caller is told a bound expired that was never reached.
+                    except RayTaskError as e:
+                        self._record_usage(method_name, caller_class, "failed")
+                        logger.error(
+                            f"❌ Ray task error in method '{method_name}': {e}"
+                        )
+                        raise
                     except asyncio.TimeoutError:
                         self._record_usage(method_name, caller_class, "failed")
                         logger.error(
@@ -785,12 +803,6 @@ class ProxyDeployment:
                             f"'{self.application_id}' did not complete within "
                             f"{self.request_timeout_s} seconds."
                         )
-                    except RayTaskError as e:
-                        self._record_usage(method_name, caller_class, "failed")
-                        logger.error(
-                            f"❌ Ray task error in method '{method_name}': {e}"
-                        )
-                        raise
                     except BaseException:
                         self._record_usage(method_name, caller_class, "failed")
                         raise
