@@ -755,10 +755,23 @@ class ProxyDeployment:
                         # its slot until the work finishes, which with queueing enabled above
                         # would make saturation outlast every caller that caused it.
                         if self.request_timeout_s:
-                            result = await asyncio.wait_for(
-                                method.remote(*args, **kwargs),
-                                timeout=self.request_timeout_s,
-                            )
+                            response = method.remote(*args, **kwargs)
+                            try:
+                                result = await asyncio.wait_for(
+                                    response, timeout=self.request_timeout_s
+                                )
+                            except asyncio.TimeoutError:
+                                # Cancel the call, do not merely stop waiting for it. Measured
+                                # 2026-11-12 on Ray Serve 2.55.1: without this the replica runs
+                                # the abandoned work to completion — observed `CALL work OK
+                                # 8028.5ms` after the proxy gave up at 2 s. That matters here
+                                # specifically because the queue above frees slots faster, so
+                                # abandoned work would accumulate on a deployment nobody is
+                                # waiting for. Cancelling on a response ``wait_for`` has already
+                                # abandoned is safe and does reach the replica (`CALL work
+                                # CANCELLED`), so the timeout bounds the WORK, not just the wait.
+                                response.cancel()
+                                raise
                         else:
                             result = await method.remote(*args, **kwargs)
                     except asyncio.TimeoutError:

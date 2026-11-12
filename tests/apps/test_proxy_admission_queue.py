@@ -30,6 +30,7 @@ class _Handle:
     def __init__(self, hold: float = 0.0):
         self.hold = hold
         self.calls = 0
+        self.responses = []
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -37,15 +38,43 @@ class _Handle:
         return _Method(self, name)
 
 
+class _Response:
+    """Stands in for a Ray Serve ``DeploymentResponse``: awaitable, and cancellable.
+
+    A plain coroutine will not do. The production path calls ``.cancel()`` on whatever ``remote()``
+    returned, and a coroutine has no such method — so a coroutine-returning double makes the cancel
+    path raise ``AttributeError`` instead of exercising it, and the arm guarding that path would be
+    testing the double rather than the code. Measured 2026-11-12 on Ray Serve 2.55.1: the real
+    object is awaitable, accepted by ``asyncio.wait_for``, and ``cancel()`` after a ``wait_for``
+    timeout is safe and does reach the replica.
+    """
+
+    def __init__(self, handle: "_Handle", seconds: float):
+        self.handle = handle
+        self.cancelled = False
+        self._task = asyncio.ensure_future(self._run(seconds))
+        handle.responses.append(self)
+
+    async def _run(self, seconds: float):
+        await asyncio.sleep(seconds)
+        return "ok"
+
+    def __await__(self):
+        return self._task.__await__()
+
+    def cancel(self):
+        self.cancelled = True
+        self._task.cancel()
+
+
 class _Method:
     def __init__(self, handle: _Handle, name: str):
         self.handle = handle
         self.name = name
 
-    async def remote(self, *args, **kwargs):
+    def remote(self, *args, **kwargs):
         self.handle.calls += 1
-        await asyncio.sleep(self.handle.hold)
-        return "ok"
+        return _Response(self.handle, self.handle.hold)
 
 
 def _proxy(max_ongoing: int, max_queued: int, timeout_s, hold: float = 0.0) -> ProxyDouble:
@@ -163,6 +192,38 @@ async def test_the_queue_count_returns_to_zero_on_every_exit_path():
     )
     assert any(isinstance(r, BaseException) for r in settled)
     assert p._queued_requests == 0, "refused path leaked a waiter"
+
+
+@pytest.mark.asyncio
+async def test_the_timeout_cancels_the_call_and_not_only_the_wait():
+    """The timeout must bound the WORK, not just the proxy's wait.
+
+    Measured on Ray Serve 2.55.1: letting ``wait_for`` expire without cancelling leaves the replica
+    running the abandoned work to completion. That interacts badly with the queue above — freeing
+    admission slots faster admits more work onto a deployment still busy with calls nobody is
+    waiting for — so the cancel is part of the fix rather than a tidy-up.
+    """
+    p = _proxy(max_ongoing=1, max_queued=1, timeout_s=0.2, hold=30)
+    fn = _fn(p)
+    with pytest.raises(TimeoutError):
+        await fn(context=CTX)
+    assert p.entry_deployment_handle.responses, "no response object was created"
+    assert p.entry_deployment_handle.responses[-1].cancelled, (
+        "the call was abandoned but never cancelled, so the replica keeps working"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_completed_call_is_never_cancelled():
+    """The discriminator for the arm above: cancel must fire on the timeout path ONLY.
+
+    Without this, ``response.cancel()`` placed unconditionally would satisfy the previous test
+    while cancelling every successful call.
+    """
+    p = _proxy(max_ongoing=1, max_queued=1, timeout_s=10, hold=0.0)
+    fn = _fn(p)
+    assert await fn(context=CTX) == "ok"
+    assert not p.entry_deployment_handle.responses[-1].cancelled
 
 
 @pytest.mark.asyncio
