@@ -5,11 +5,27 @@ It is accurate and unactionable: it reprs the model's axis objects and leaves th
 work out which axis is wrong. A workshop participant hit exactly that on 2026-11-11 with a
 grayscale image against Cellpose-SAM (myco #0308).
 
-THE FIXTURE IS REPRODUCED, NOT TRANSCRIBED. The message below was produced by running
-``bioimageio.core.Tensor.from_numpy`` against a (1, 1, 807, 696) array with Cellpose-SAM's
-axis shape inside ``ghcr.io/aicell-lab/model-runner:2.11.2``. The production log that
-prompted this issue shows the same text elided with "..."; a parser written against the
-elided form would have been a guess, so it was not.
+THE FIXTURE IS REPRODUCED, NOT TRANSCRIBED. The production log that prompted this issue
+shows the message elided with "..."; a parser written against the elided form would have
+been a guess, so it was not. The text below is the full message as the real code path
+emits it, captured by running ``create_sample_for_model`` — the call ``runtime.py`` makes
+at the top of its dispatch — against a ``(1, 1, 807, 696)`` float32 array and the live
+``idealistic-eagle`` (Cellpose-SAM) description inside
+``ghcr.io/aicell-lab/model-runner:2.11.6`` (bioimageio.core 0.11.0, spec 0.5.12.0).
+
+Two details of that capture are worth keeping, because guessing either one wrong is how
+this fixture rots into fiction:
+
+* The space axes carry ``step=None``, not ``step=16``. Cellpose-SAM declares a bare
+  ``size: 256`` for ``y`` and ``x``, and bioimageio reprs a *fixed* size as
+  ``AxisSize(min=256, max=None, step=None)`` — a lower bound, so the error understates
+  its own constraint. An earlier revision of this fixture guessed ``step=16``; the parser
+  is insensitive to the value (it accepts ``\\d+|None``) and produced a byte-identical
+  hint either way, which is exactly why the error survived unnoticed.
+* A fixed ``size: 256`` still reprs *as* an ``AxisSize(...)``. Had it reprd as a bare
+  int, ``_AXIS_INFO_RE`` would have matched 2 of the 4 axes, the length check in
+  ``_axis_mismatch_hint`` would have returned ``None``, and the hint would never have
+  fired in production while every test here still passed.
 
 The helper is a pure function parsed out of ``runtime.py`` with the AST loader this
 directory already uses, so none of bioengine, ray or bioimageio is imported here.
@@ -23,14 +39,14 @@ import pytest
 APP = pathlib.Path(__file__).resolve().parents[3] / "apps" / "model-runner"
 RUNTIME = APP / "runtime.py"
 
-# The exact text, as reproduced in the image. Kept on one line because that is how it
+# The exact text, as captured in the image. Kept on one line because that is how it
 # arrives — reflowing it would be a different string from the one the parser must handle.
 REAL = (
     "Array shape (1, 1, 807, 696) does not map to axes ["
     "AxisInfo(id='batch', type='batch', size=AxisSize(min=1, max=None, step=None)), "
     "AxisInfo(id='channel', type='channel', size=AxisSize(min=3, max=3, step=None)), "
-    "AxisInfo(id='y', type='space', size=AxisSize(min=256, max=None, step=16)), "
-    "AxisInfo(id='x', type='space', size=AxisSize(min=256, max=None, step=16))]"
+    "AxisInfo(id='y', type='space', size=AxisSize(min=256, max=None, step=None)), "
+    "AxisInfo(id='x', type='space', size=AxisSize(min=256, max=None, step=None))]"
 )
 
 
@@ -111,6 +127,22 @@ def test_a_space_axis_below_its_minimum_is_reported_without_the_channel_remedy(h
     assert "'y' axis must be at least 256 but the array supplies 100" in got
     assert "grayscale" not in got
     assert "np.repeat" not in got
+
+
+def test_the_step_field_is_parsed_but_does_not_change_the_verdict(hint):
+    """Stated on purpose, because this insensitivity already hid a wrong fixture.
+
+    ``_AXIS_INFO_RE`` accepts ``step=<int>`` and ``step=None`` and the bounds check
+    ignores the value, so a guessed step produces a byte-identical hint — which is how
+    an earlier revision of this fixture carried ``step=16`` against a production
+    ``step=None`` without any arm here reddening. Keeping the property asserted means a
+    future change that *starts* reading ``step`` has to come past this test, and the
+    fixture's accuracy stops being load-bearing for the parser.
+    """
+    stepped = REAL.replace("min=256, max=None, step=None", "min=256, max=None, step=16")
+    assert stepped != REAL, "the substitution must actually change the string"
+    assert hint(stepped) is not None
+    assert hint(stepped).split("Original error")[0] == hint(REAL).split("Original error")[0]
 
 
 def test_a_length_mismatch_between_shape_and_axes_returns_none(hint):
