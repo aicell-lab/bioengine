@@ -36,6 +36,7 @@ GPU stack at all).
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -588,3 +589,237 @@ async def test_a_manifest_written_in_the_unstamped_window_is_undetermined():
     out = await _read_manifest_of(stub)(_AM(), POOL_ID, "v4")
     assert out["sha256_provenance"]["basis"] == pool.DIGEST_BASIS_UNDETERMINED
     assert out["sha256_provenance"]["reproducible_by_re_merge"] is None
+
+
+# ── the two WRITER surfaces: the merge record, and aggregate()'s own return ───
+# Neither passes through pool_wire_state or _read_community_manifest, so each is
+# attributed in aggregate() or nowhere — and until this block each was pinned by
+# nothing. That was measured, not supposed: deleting `global_sha256_basis` from the
+# append_merge call, and deleting `global_sha256_provenance` from the return, each
+# left the whole 199-case app suite GREEN.
+#
+# The gap was structural rather than an oversight. The only other harness that
+# drives the real aggregate (test_merge_serialisation.py) returns a pool whose
+# model_type is not cpsam on purpose, so the coroutine raises at its model_type
+# guard — which is upstream of both lines, and of everything else in the merge.
+#
+# So the merge is driven to completion here: every collaborator is a stub, every
+# pool.* helper is the real one. `head_sha` comes from the runtime, which is what
+# lets ONE harness reach both branches — a merge that publishes a head, and a merge
+# that admits nothing and publishes none. The second is the ``None`` half of the
+# stamp, and it is the half a test that only ever admits something cannot see.
+
+GATE_SPLIT = {"artifact_id": "bioimage-io/val-gate", "sha256": "c" * 64}
+WITNESS_SPLIT = {"artifact_id": "bioimage-io/val-witness", "sha256": "d" * 64}
+HEAD_SHA = "e" * 64
+
+# Large enough that pool.soup_admission never refuses: this harness is about the
+# attribution of a digest, and a refusal would exit before one exists.
+_BUDGET = {"declared_bytes": 64 * 1024 ** 3, "rss_bytes": 1024 ** 3}
+
+
+class _AggResp(_Resp):
+    """``_Resp`` plus the attribute the download path reads. Unused while the pool
+    has no current head, and present so that a change which starts downloading one
+    fails on a payload rather than on an AttributeError."""
+
+    content = b"{}"
+
+
+class _AggAM(_AM):
+    async def put_file(self, artifact_id: str, file_path: str) -> str:
+        return "https://example.invalid/put/" + file_path
+
+
+class _Runtime:
+    """The GPU deployment, reduced to the three calls aggregate() makes on it.
+
+    One constant score for every pass: whether a candidate is admitted is then a
+    pure function of ``f1`` against the recorded baseline, so a caller picks the
+    branch under test by choosing one number.
+    """
+
+    def __init__(self, f1: float, sha: Optional[str] = HEAD_SHA) -> None:
+        self._f1 = f1
+        self._sha = sha
+
+    async def soup_memory_budget(self) -> Dict[str, Any]:
+        return dict(_BUDGET)
+
+    async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
+        return {"f1": self._f1, "replica": "r0", "soup_dl_bytes": 0}
+
+    async def materialize_soup(self, specs, url) -> Dict[str, Any]:
+        return {"sha256": self._sha, "n_bytes": 2048,
+                "replica": "r0", "soup_dl_bytes": 0}
+
+
+class _Merging:
+    """Just enough of ``EntryApp`` for ``aggregate`` to run a merge end to end."""
+
+    def __init__(self, index: Dict[str, Any], runtime: _Runtime) -> None:
+        self._pool_locks: Dict[str, Any] = {}
+        self._merges_in_flight = 0
+        self.index = index
+        self._runtime = runtime
+        self.commits = 0
+
+    async def _check_runtime_available(self, model_type: str) -> None:
+        return None
+
+    def _runtime_for(self, model_type: str) -> _Runtime:
+        return self._runtime
+
+    async def _resolve_val_split(self, images, labels):
+        return list(images), list(labels)
+
+    async def _pool_service(self, pool_token: str):
+        class _Client:
+            async def disconnect(self_inner) -> None:
+                return None
+
+        return _AggAM(), _Client()
+
+    async def _read_pool_index(self, am, pool_artifact_id: str) -> Dict[str, Any]:
+        return self.index
+
+    async def _http_retry(self, method: str, url: str, **kw: Any) -> _AggResp:
+        return _AggResp({})
+
+    def _bump_transport(self, **kw: Any) -> None:
+        return None
+
+    @contextlib.asynccontextmanager
+    async def _staged(self, am, pool_artifact_id: str):
+        yield
+
+    async def _commit_with_retry(self, am, pool_artifact_id: str) -> None:
+        self.commits += 1
+
+    async def _read_merge_journal(self, am, pool_artifact_id: str) -> None:
+        return None
+
+    async def _write_merge_journal(self, am, pool_artifact_id: str, journal) -> None:
+        return None
+
+    async def _next_free_community_version(self, am, pool_artifact_id, index) -> str:
+        return "v2"
+
+
+def _aggregate_of(instance):
+    """The real ``aggregate`` coroutine bound to a stub instance."""
+    import entry
+
+    return entry.EntryApp.func_or_class.aggregate.__get__(instance)
+
+
+def _pool_index() -> Dict[str, Any]:
+    """A cpsam pool with one undecided contribution and a recorded baseline.
+
+    The baseline is pre-recorded deliberately: without it aggregate() first scores
+    stock cpsam on both splits, which is two more runtime calls and not one line
+    more coverage of the two surfaces under test.
+    """
+    return {
+        "model_type": "cpsam",
+        "architecture_signature": "sig-1",
+        "baseline": {
+            "model": "stock-cpsam",
+            "selection_metric": {"role": "selection", "aggregate": 0.50},
+            "witness_metric": {"role": "witness", "aggregate": 0.40},
+            "created_at": OLDEST_REAL_MERGE,
+        },
+        "contributions": [{
+            "contribution_id": "c-1",
+            "weights_path": "contributions/c-1/weights.pt",
+            "n_bytes": 4096,
+            "uploaded_at": OLDEST_REAL_MERGE,
+            "weights_sha256": OTHER_SHA,
+        }],
+    }
+
+
+async def _run_merge(f1: float):
+    """Drive the real aggregate() to completion. Returns ``(result, index)``.
+
+    ``f1 >= 0.50`` beats the recorded baseline and publishes a head; below it
+    nothing is admitted and no head exists to attribute.
+    """
+    index = _pool_index()
+    stub = _Merging(index, _Runtime(f1))
+    result = await _aggregate_of(stub)(
+        pool_artifact_id=POOL_ID,
+        pool_token="t",
+        gate_val_images=[], gate_val_labels=[],
+        witness_val_images=[], witness_val_labels=[],
+        gate_split=dict(GATE_SPLIT), witness_split=dict(WITNESS_SPLIT),
+    )
+    return result, index
+
+
+@pytest.mark.asyncio
+async def test_a_merge_record_this_build_writes_stamps_the_current_basis():
+    """The forward-looking half of the fix: the primary of the three writers, and
+    the thing that makes every FUTURE merge record self-describing so that no later
+    reader has to date-reason the way this module has to for pre-0.27.12 records."""
+    result, index = await _run_merge(0.90)
+
+    assert result["published_version"] == "v2", "this merge must have published a head"
+    record = index["merges"][-1]
+    assert record["global_sha256"] == HEAD_SHA
+    assert record["global_sha256_basis"] == pool.CURRENT_DIGEST_BASIS
+    # Read back cold, the record attributes itself with no reference to its date.
+    assert pool.digest_basis(record) == pool.DIGEST_BASIS_TENSORS
+
+    # The discrimination control, and the reason the stamp is load-bearing rather
+    # than decorative: this record is written NOW, which is after the cutoff, so
+    # its timestamp proves nothing. Strip the stamp and the same record is
+    # UNDETERMINED. That gap is exactly what the stamp buys.
+    unstamped = {k: v for k, v in record.items() if k != "global_sha256_basis"}
+    assert pool.digest_basis(unstamped) == pool.DIGEST_BASIS_UNDETERMINED
+
+
+@pytest.mark.asyncio
+async def test_a_merge_that_admitted_nothing_stamps_a_null_basis_not_an_absent_one():
+    """The ``None`` half of the stamp. Written unconditionally, null included: a
+    basis field absent because there is no digest reads identically to one absent
+    because the app predates the stamp, and that ambiguity is the whole reason the
+    field exists."""
+    result, index = await _run_merge(0.10)
+
+    assert result["published_version"] is None, "nothing should have been admitted"
+    record = index["merges"][-1]
+    assert record["global_sha256"] is None
+    # Present and null, NOT missing — an absent key and a null value read
+    # identically through .get(), so the key's existence is asserted first.
+    assert "global_sha256_basis" in record
+    assert record["global_sha256_basis"] is None
+    assert pool.digest_basis(record) == pool.DIGEST_BASIS_ABSENT
+
+
+@pytest.mark.asyncio
+async def test_aggregate_returns_the_attribution_of_the_digest_it_just_published():
+    """The moment the #0417 false alarm actually happens: a caller re-merges an
+    identical member set, gets a number, and compares it against a stored one. Both
+    numbers are in their hands HERE, so the attribution has to travel with the
+    return value and not only on a page they would have to go and read."""
+    result, _ = await _run_merge(0.90)
+
+    assert result["global_sha256"] == HEAD_SHA
+    prov = result["global_sha256_provenance"]
+    assert prov["basis"] == pool.DIGEST_BASIS_TENSORS
+    assert prov["reproducible_by_re_merge"] is True
+    assert prov["note"], "the sentence that explains a mismatch must travel too"
+
+
+@pytest.mark.asyncio
+async def test_aggregate_declines_to_attribute_a_head_it_did_not_publish():
+    """``no_digest``, not ``undetermined``: "there is no value to attribute" and
+    "the value cannot be attributed" are different answers, and a merge that
+    admitted nothing is the first."""
+    result, _ = await _run_merge(0.10)
+
+    assert result["global_sha256"] is None
+    prov = result["global_sha256_provenance"]
+    assert prov["basis"] == pool.DIGEST_BASIS_ABSENT
+    assert prov["reproducible_by_re_merge"] is None
