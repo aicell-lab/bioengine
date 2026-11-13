@@ -123,7 +123,11 @@ jobs:
         # two cannot drift apart. -o testpaths overrides the ["tests"] default;
         # -o addopts clears pytest.ini's xdist flags, which fight the per-app run.
         run: |
-          for app in $(python3 .github/scripts/app_bundle_suites.py list); do
+          # Captured on its own line on purpose: errexit does not fire on a failing
+          # command substitution inside a `for` word list, so inlining this would
+          # run the loop zero times and still exit 0.
+          apps=$(python3 .github/scripts/app_bundle_suites.py list)
+          for app in $apps; do
             echo "::group::$app"
             python -m pytest -p no:cacheprovider "apps/$app" -q \
               -o addopts="" -o testpaths="apps/$app" \

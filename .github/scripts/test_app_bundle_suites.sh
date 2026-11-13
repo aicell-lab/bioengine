@@ -70,12 +70,17 @@ ONE='{"run": {"alpha": 1}, "skip": {}}'
 echo "== the committed tree =="
 check "1a  reconcile accepts the repo as committed" 0 "OK:" \
   python3 "$GATE" reconcile
+# Derived from the registry, not pinned, so adding an app does not redden this.
+# It still discriminates: the expectation is an independent parse of the run
+# table, and `list` reaches sorted(run) by its own route. The -n guard keeps an
+# unreadable registry failing here even if the comparison is ever loosened.
+WANT=$(python3 -c 'import json; print(" ".join(sorted(json.load(open(".github/app-bundle-suites.json"))["run"])))' 2>/dev/null)
 LISTED=$(python3 "$GATE" list 2>/dev/null | tr '\n' ' ')
-if [ "$LISTED" = "annotation-broker model-finetune " ]; then
-  echo "ok    1b  list prints exactly the two apps CI runs"
+if [ -n "$WANT" ] && [ "$LISTED" = "$WANT " ]; then
+  echo "ok    1b  list prints exactly the apps the run table names ($WANT)"
   PASSED=$((PASSED + 1))
 else
-  echo "FAIL  1b  list printed '$LISTED'"
+  echo "FAIL  1b  list printed '$LISTED', run table says '$WANT'"
   FAILED=$((FAILED + 1))
 fi
 
@@ -166,6 +171,52 @@ check "15  a failing case refuses" 1 "failed or errored" \
 rm "$T/junit-app-beta.xml"
 check "16  a missing report refuses rather than passing on one" 1 "expected 2" \
   python3 "$GATE" assert-ran --root "$T" --reports-dir "$T"
+
+echo "== the workflow step that runs the suites =="
+# The step's shell is EXTRACTED from the shipped workflow rather than copied here,
+# so 17b cannot stay green while test-suite.yml goes back to a shape that swallows
+# a refusing `list` (backlog #0458). Run under the same `bash -e -o pipefail` that
+# GitHub Actions uses, against a tree whose only content is a stand-in gate.
+STEP=$WORK/loop-step.sh
+python3 - "$REPO/.github/workflows/test-suite.yml" "$STEP" <<'PY'
+import sys
+
+lines = open(sys.argv[1]).read().splitlines()
+i = next(n for n, l in enumerate(lines) if l.strip() == "- name: Run the app bundle suites")
+j = next(n for n in range(i, len(lines)) if lines[n].strip() == "run: |")
+indent = len(lines[j]) - len(lines[j].lstrip()) + 2
+body = []
+for line in lines[j + 1:]:
+    if line.strip() and len(line) - len(line.lstrip()) < indent:
+        break
+    body.append(line[indent:] if len(line) >= indent else line)
+open(sys.argv[2], "w").write("\n".join(body).rstrip() + "\n")
+PY
+if grep -q 'app_bundle_suites.py list' "$STEP" 2>/dev/null; then
+  echo "ok    17  the step's shell was extracted from test-suite.yml"
+  PASSED=$((PASSED + 1))
+else
+  echo "FAIL  17  extracted no run block - 17b and 17c then assert nothing"
+  FAILED=$((FAILED + 1))
+fi
+
+stub_gate() {
+  local dir
+  dir=$(mktemp -d "$WORK/step.XXXXXX")
+  mkdir -p "$dir/.github/scripts"
+  printf '%s\n' "$1" > "$dir/.github/scripts/app_bundle_suites.py"
+  echo "$dir"
+}
+
+T=$(stub_gate 'import sys
+sys.stderr.write("REFUSE: registry unreadable\n")
+sys.exit(2)')
+check "17b THE DISCRIMINATOR: a refusing list reddens the step" 2 "" \
+  env -C "$T" bash -e -o pipefail "$STEP"
+
+T=$(stub_gate 'print("alpha")')
+check "17c control: a list that succeeds leaves the step green" 0 "" \
+  env -C "$T" bash -e -o pipefail "$STEP"
 
 echo
 echo "passed=$PASSED failed=$FAILED"
