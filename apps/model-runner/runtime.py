@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -301,6 +302,125 @@ for line in sys.stdin:
     except Exception as e:
         _respond({"status": "error", "message": repr(e)})
 """
+
+
+_ARRAY_SHAPE_RE = re.compile(r"Array shape \((?P<shape>[^)]*)\) does not map to axes")
+_AXIS_INFO_RE = re.compile(
+    r"AxisInfo\(id='(?P<id>[^']*)', type='(?P<type>[^']*)', "
+    r"size=AxisSize\(min=(?P<min>\d+|None), max=(?P<max>\d+|None), "
+    r"step=(?P<step>\d+|None)\)\)"
+)
+
+
+def _axis_mismatch_hint(message: str) -> Optional[str]:
+    """Turn bioimageio's axis ValueError into a sentence naming the remedy.
+
+    The raw error is accurate and unactionable — it reprs the model's
+    ``AxisInfo`` objects and leaves the caller to work out which axis is
+    wrong and what to do. A participant hit exactly this in the 2026-11-11
+    workshop with a grayscale image against Cellpose-SAM, whose channel
+    axis is ``min=3, max=3`` (myco #0308).
+
+    Returns ``None`` whenever anything is unrecognised, so an unparsed
+    message falls through to the original text and is never made worse.
+
+    The shape and the axis list are paired BY POSITION, so no axis is
+    named when the two sequences have different lengths: bioimageio also
+    tries permutations and singleton insertions, and pairing a 2-entry
+    shape against 4 axes would name an axis at random. But "which axis"
+    is only half the deliverable — the required sizes and the shape that
+    arrived are still true on a rank mismatch, and that half is the
+    actionable one. A grayscale file uploaded the ordinary way is exactly
+    this case: ``imageio`` yields ``(H, W)`` and nothing between the
+    upload and ``create_sample_for_model`` adds an axis, so the caller
+    who prompted #0308 lands here rather than in the per-axis branch.
+    """
+    shape_m = _ARRAY_SHAPE_RE.search(message)
+    if not shape_m:
+        return None
+    try:
+        sizes = [
+            int(part.strip())
+            for part in shape_m.group("shape").split(",")
+            if part.strip()
+        ]
+    except ValueError:
+        return None
+
+    axes = [
+        (m.group("id"), m.group("type"), m.group("min"), m.group("max"))
+        for m in _AXIS_INFO_RE.finditer(message)
+    ]
+    if not axes:
+        return None
+
+    wanted = ", ".join(
+        f"{a}={lo_ if lo_ != 'None' else 1}"
+        if lo_ == hi_
+        else f"{a}>={lo_ if lo_ != 'None' else 1}"
+        for a, _t, lo_, hi_ in axes
+    )
+    tail = (
+        f" Required axis sizes: {wanted}; array shape given: "
+        f"({', '.join(str(n) for n in sizes)}). Original error: {message}"
+    )
+
+    if len(axes) != len(sizes):
+        missing = len(axes) - len(sizes)
+        chan = [
+            (i, int(lo_))
+            for i, (a, _t, lo_, hi_) in enumerate(axes)
+            if a == "channel" and lo_ == hi_ and lo_ != "None" and int(lo_) > 1
+        ]
+        remedy = ""
+        # Only prescribe a concrete reshape when the axes the array is
+        # missing are the LEADING ones — i.e. every axis it does supply is
+        # a space axis. Otherwise the missing axes could be trailing and
+        # ``arr[np.newaxis, ...]`` would put the data in the wrong place.
+        if missing > 0 and chan and all(t == "space" for _a, t, _lo, _hi in axes[missing:]):
+            c_idx, c_n = chan[0]
+            if c_idx < missing:
+                news = ", ".join(["np.newaxis"] * missing)
+                remedy = (
+                    f" A single-channel (grayscale) image sent as a plain "
+                    f"{len(sizes)}-D array carries no channel axis at all, and this "
+                    f"model wants {c_n}. Add the missing leading axes and replicate "
+                    f"the channel before calling infer, e.g. "
+                    f"np.repeat(arr[{news}], {c_n}, axis={c_idx}), or supply a "
+                    f"{c_n}-channel image."
+                )
+        return (
+            f"the array has {len(sizes)} dimensions but this model declares "
+            f"{len(axes)} axes, so no single axis can be named.{remedy}{tail}"
+        )
+
+    for idx, ((axis_id, _type, lo, hi), got) in enumerate(zip(axes, sizes)):
+        low = int(lo) if lo != "None" else None
+        high = int(hi) if hi != "None" else None
+        if (low is not None and got < low) or (high is not None and got > high):
+            break
+    else:
+        return None
+
+    if low is not None and low == high:
+        need = f"exactly {low}"
+    elif high is None:
+        need = f"at least {low}"
+    else:
+        need = f"between {low} and {high}"
+
+    remedy = ""
+    if axis_id == "channel" and got == 1 and low == high:
+        remedy = (
+            f" The image is single-channel (grayscale); this model wants "
+            f"{low}. Replicate the channel before calling infer, e.g. "
+            f"np.repeat(arr, {low}, axis={idx}) "
+            f"for an array in this axis order, or supply a {low}-channel image."
+        )
+    return (
+        f"the {axis_id!r} axis must be {need} but the array supplies {got}."
+        f"{remedy}{tail}"
+    )
 
 
 def _read_pip(name: str) -> List[str]:
@@ -1112,6 +1232,9 @@ class RuntimeDeployment:
                 raise RuntimeError(
                     f"CUDA out of memory during inference: {message}"
                 )
+            hint = _axis_mismatch_hint(message)
+            if hint:
+                raise RuntimeError(f"Inference failed: {hint}")
             raise RuntimeError(f"Inference failed: {message}")
 
     def _evict_warm(self) -> None:
