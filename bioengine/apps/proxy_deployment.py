@@ -78,8 +78,9 @@ _RECONNECT_GRACE_S = 30
 # treated as wedged. A local controller call normally takes milliseconds, so
 # this is not a latency tolerance — it is the line past which "still running"
 # stops being a slow answer and starts being no answer. Comfortably longer than
-# the ~3 x health_check_period_s it takes Serve to condemn today, so a replica
-# that is merely slow is never caught by it.
+# the three consecutive failed checks (~2 x health_check_period_s) it takes
+# Serve to condemn today, so a replica that is merely slow is never caught by
+# it.
 _SIBLING_READ_DEADLINE_S = 60.0
 
 # Hypha reports a workspace we may not use as a plain exception with no
@@ -1191,7 +1192,18 @@ class ProxyDeployment:
             ]:
                 if svc_id:
                     try:
-                        await self.server.unregister_service(svc_id)
+                        # hypha-rpc's unregister_service helper drops the
+                        # workspace and client id off the id it is given, so the
+                        # server resolves "<workspace>/*:<name>" and refuses with
+                        # "Multiple services found" as soon as a second worker
+                        # runs the same app. The manager accepts the fully
+                        # qualified id we registered under. Retries are bounded
+                        # because this also runs in the replica's destructor.
+                        manager = await self.server.rpc.get_manager_service(
+                            {"timeout": 20, "case_conversion": "snake"},
+                            max_retries=1,
+                        )
+                        await manager.unregister_service(svc_id)
                         logger.info(
                             f"🔌 Unregistered {svc_name} service '{svc_id}' "
                             f"for '{self.application_id}'"
