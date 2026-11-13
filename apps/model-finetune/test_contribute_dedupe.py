@@ -105,16 +105,20 @@ def test_empty_digest_never_matches() -> None:
     assert pool.find_contribution_by_digest(_index(_member(_FIRST_ID, "")), "") is None
 
 
-def test_metadata_differences_do_not_make_it_a_different_deposit() -> None:
-    """The case the row asks about explicitly: byte-identical weights deposited
-    twice with different sample counts and a different caller fingerprint. One
-    deposit — the soup averages the bytes."""
-    first = _member(_FIRST_ID, _DIGEST, samples_seen=10, n_train_images=5)
-    found = pool.find_contribution_by_digest(_index(first), _DIGEST)
-    assert found is first, (
-        "differing samples_seen/n_train_images must not defeat the match; the "
-        "uniform mean would weight those identical bytes 2:1 either way"
-    )
+def test_the_predicate_ignores_metadata_it_is_not_given() -> None:
+    """All the predicate can see is the digest, which is the whole of the rule — so
+    a member carrying any amount of extra metadata still matches on the digest.
+
+    This is deliberately NOT the decision-1 test. The predicate takes no metadata
+    argument, so no call of this shape can pin "identity is the digest ALONE": the
+    claim is about what ``contribute`` compares, and it is pinned end to end by
+    ``test_a_retry_reporting_different_metadata_is_still_one_deposit`` below. An
+    earlier version of this case asserted the decision in its docstring while
+    passing ``samples_seen=10, n_train_images=5`` — ``_member``'s own defaults —
+    so its "differences" differed from nothing and it could not fail for the
+    reason it gave."""
+    first = _member(_FIRST_ID, _DIGEST, samples_seen=777, n_train_images=99, dataset_fingerprint="dataset-A")
+    assert pool.find_contribution_by_digest(_index(first), _DIGEST) is first
 
 
 def test_an_already_merged_member_is_still_recognised() -> None:
@@ -288,12 +292,17 @@ class _Stub:
         self.transport.append(dict(kw))
 
 
-async def _deposit(stub: _Stub) -> Dict[str, Any]:
-    return await _contribute_of(stub)(
-        session_id=_SESSION,
-        pool_artifact_id="bioimage-io/cpsam-community-pool",
-        pool_token="t",
-    )
+async def _deposit(stub: _Stub, **over: Any) -> Dict[str, Any]:
+    """``**over`` so a case can vary what the CALLER reports — the optional
+    ``dataset_fingerprint`` is the field a retrying client controls outright, and
+    no case can pin decision 1 without being able to change it between deposits."""
+    kwargs: Dict[str, Any] = {
+        "session_id": _SESSION,
+        "pool_artifact_id": "bioimage-io/cpsam-community-pool",
+        "pool_token": "t",
+    }
+    kwargs.update(over)
+    return await _contribute_of(stub)(**kwargs)
 
 
 def _index_puts(stub: _Stub) -> List[bytes]:
@@ -336,6 +345,74 @@ async def test_a_redeposit_returns_the_first_deposits_id(fake_training: None) ->
     assert returned["contribution_id"] == _FIRST_ID
     assert returned["deduplicated"] is True
     assert returned["weights_sha256"] == _DIGEST
+
+
+@pytest.mark.asyncio
+async def test_a_retry_reporting_different_metadata_is_still_one_deposit(
+    fake_training: None,
+) -> None:
+    """Decision 1 — identity is the weights digest ALONE — pinned where the decision
+    is actually made, in ``contribute``.
+
+    The retry reports a different ``dataset_fingerprint`` than the deposit it is
+    retrying, and the member the pool already holds reports a different
+    ``samples_seen`` than this session computes (777 against ``5 * 2 = 10``). Both
+    are metadata; neither may make these identical bytes into a second deposit,
+    and the value handed back must be the pool's, not this call's.
+
+    ``dataset_fingerprint`` is the field that makes this more than hypothetical: it
+    is an optional RPC parameter the CALLER supplies, so a retrying client can
+    report anything at all. Folding it into identity is the bypass this file's
+    header warns about — a retry would defeat de-duplication by accident and the
+    uniform soup would weight that site 2:1."""
+    stored = _member(_FIRST_ID, _DIGEST, samples_seen=777, dataset_fingerprint="dataset-A")
+    idx = _index(stored)
+    stub = _Stub(idx, _DIGEST)
+
+    returned = await _deposit(stub, dataset_fingerprint="dataset-B")
+
+    assert len(idx["contributions"]) == 1, (
+        f"a retry reporting different metadata appended a second member for one "
+        f"checkpoint: {[c['contribution_id'] for c in idx['contributions']]}"
+    )
+    assert returned["deduplicated"] is True
+    assert returned["contribution_id"] == _FIRST_ID, (
+        "the retry must get the FIRST deposit's id back, not a fresh one"
+    )
+    assert returned["samples_seen"] == 777, (
+        f"samples_seen must be read back off the stored member ({stored['samples_seen']}), "
+        f"not recomputed from this call ({returned['samples_seen']}) — the stored member is "
+        f"the one the soup will weight"
+    )
+    assert stub.discards == ["bioimage-io/cpsam-community-pool"]
+    assert _index_puts(stub) == []
+
+
+@pytest.mark.asyncio
+async def test_two_real_deposits_of_one_checkpoint_leave_one_member(
+    fake_training: None,
+) -> None:
+    """The same decision again with nothing hand-built: both deposits go through the
+    real ``contribute``, so the member the second one matches against was written by
+    the first rather than assembled by ``_member``.
+
+    Every other case here models the retry by pre-loading an index, which cannot
+    catch a mismatch between the shape ``append_contribution`` writes and the shape
+    the predicate reads. This one can."""
+    idx = _index()
+    first = await _deposit(_Stub(idx, _DIGEST), dataset_fingerprint="dataset-A")
+    assert first["deduplicated"] is False, "the first deposit into an empty pool is fresh"
+
+    stub = _Stub(idx, _DIGEST)
+    retry = await _deposit(stub, dataset_fingerprint="dataset-B")
+
+    assert len(idx["contributions"]) == 1, (
+        f"two deposits of one checkpoint left {len(idx['contributions'])} members"
+    )
+    assert retry["deduplicated"] is True
+    assert retry["contribution_id"] == first["contribution_id"]
+    assert retry["samples_seen"] == first["samples_seen"]
+    assert stub.commits == [], "the retry must not commit a new pool version"
 
 
 @pytest.mark.asyncio
