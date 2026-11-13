@@ -2,8 +2,15 @@
 
 cellpose's ``train_seg`` takes a ``bsize`` (the square training tile side) that this
 app never passed, so every cellpose fine-tune ran at whatever its backbone defaults
-to. A smaller tile concentrates the signal for narrow or small-object data, where the
-foreground fills a tiny fraction of a default tile.
+to.
+
+The motivation this parameter was filed under -- that a smaller tile concentrates the
+signal for narrow or small-object data and so improves the fit -- was MEASURED and did
+not hold: on a synthetic trench corpus, AP rose monotonically with tile size (128 ->
+0.804, 256 -> 0.887, 384 stock -> 0.889 at IoU 0.5). What the measurement does support
+is a cost knob: 256 matched the 384 default to within noise at 6x less wall clock and
+27% less VRAM. The parameter is documented that way, and these tests pin the wiring and
+the boundary, which hold either way.
 
 The parameter is **not** free on every model, and that asymmetry is the whole reason a
 guard exists. cellpose/train.py (4.2.1.1, lines 360-363) reads:

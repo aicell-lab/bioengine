@@ -1058,8 +1058,11 @@ class EntryApp:
         train_tile_size: Optional[int] = Field(
             None, ge=16, description="cellpose only: square training tile side (cellpose "
             "'bsize'). Omit for the backbone's own default — 256 for cpsam, 384 for "
-            "cpdino. A smaller tile concentrates the signal for narrow or small-object "
-            "data, but cpsam accepts 256 and nothing else, so this is settable for "
+            "cpdino. A smaller tile trains faster and in less VRAM, at some cost in "
+            "accuracy: measured on synthetic narrow-object data, 256 matched the 384 "
+            "default to within noise while 128 scored below it, so lower this when "
+            "training cost is the constraint rather than to improve a narrow-data fit. "
+            "cpsam accepts 256 and nothing else, so this is settable for "
             "cpdino/cpdino-vitb only."),
         batch_size: int = Field(1, ge=1, description="Training batch size."),
         learning_rate: float = Field(1e-5, gt=0, description="AdamW learning rate."),
