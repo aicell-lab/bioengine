@@ -142,9 +142,16 @@ class RuntimeApp:
         This is deliberately a smoke test and not a deeper ``ping()``: the entry
         calls ``ping()`` with a 2 s timeout before every GPU call and importing
         torch exceeds that, while a per-poll import of a heavy stack is its own
-        defect. The framework runs a smoke test once after ``async_init`` and never
-        admits traffic if it raises, which is the shape this needs. The import is
-        not wasted work — the first real call would do it anyway.
+        defect. The framework runs a smoke test once after ``async_init`` and
+        fails the replica when it raises, which is the shape this needs. It does
+        **not** keep traffic off while that happens: ``check_health`` creates the
+        task and tests ``.done()`` in the same call, so poll 1 cannot fail, and
+        Ray Serve condemns a replica only after 3 consecutive failed checks
+        (``REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD``). At this deployment's
+        ``health_check_period_s=30.0`` a broken replica therefore serves real
+        traffic for ≈90 s before it is condemned — bounded and named in the
+        replica log, rather than HEALTHY forever. The import is not wasted work
+        — the first real call would do it anyway.
 
         Reports every missing module rather than the first, because a half-installed
         env usually lost more than one and the whole point is diagnosability.

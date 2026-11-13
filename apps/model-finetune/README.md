@@ -327,9 +327,17 @@ Two things worth knowing when you see it:
 - **pip's own output is not in the app's logs.** A failed or skipped install lands in
   `runtime_env_setup-*.log` on the node, so read that for the cause — the smoke test
   tells you *which* modules are missing, not why.
-- The smoke test runs in the background and its failure is read on the next health
-  poll, so with `health_check_period_s=30.0` a broken replica can read `HEALTHY` for
-  up to one period before flipping. Bounded, rather than forever.
+- **A broken replica still serves real traffic for about 90 s.** The smoke test runs
+  in the background and its failure is read on a *later* health poll: `check_health`
+  creates the task and tests `.done()` in the same call, so the first poll cannot
+  fail, and Ray Serve condemns a replica only after **3 consecutive** failed checks
+  (`REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD = 3`). At these deployments'
+  `health_check_period_s=30.0` that is poll 1 healthy and polls 2-4 failing, so
+  ≈90 s — roughly 3 periods, not one — during which the replica reads `HEALTHY`,
+  the deployment reads `RUNNING`, and calls are routed to it and fail. Bounded and
+  then named in the logs, rather than `HEALTHY` forever, which is what it was
+  before; but if you are debugging a fresh deploy, a replica that looks healthy for
+  the first minute and a half is expected.
 
 `ping()` stays shallow on purpose: the entry calls it with a 2 s timeout before every
 GPU call, which an import of torch does not fit, and importing a heavy stack on every

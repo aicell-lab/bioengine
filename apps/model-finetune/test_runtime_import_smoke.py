@@ -13,7 +13,12 @@ probe at all: Ray Serve never calls it. It is an entry-side pre-call gate
 (``entry.py``, ``_check_runtime_available``) with a 2 s timeout.
 
 The fix is a ``@bioengine.smoke_test`` on each runtime: the framework runs it once
-after ``async_init`` and never admits traffic if it raises. ``ping()`` stays shallow
+after ``async_init`` and fails the replica when it raises. It does **not** keep
+traffic off while that happens — ``check_health`` creates the task and tests
+``.done()`` in the same call, so poll 1 cannot fail, and Serve condemns only after 3
+consecutive failed checks, so at ``health_check_period_s=30.0`` a broken replica
+serves real traffic for ≈90 s first. That window is what ``_settle_check_health``
+below models, and it is the honest limit of this fix. ``ping()`` stays shallow
 on purpose and that is pinned here too — importing torch cannot fit a 2 s pre-call
 gate, and a per-poll import of a heavy stack is its own defect.
 
@@ -237,9 +242,17 @@ async def _settle_check_health(instance) -> None:
 
     The framework launches the smoke test as a background task and reads its
     exception on a *later* call, so one poll is not enough — and that lag is the
-    one honest limitation of this fix: with ``health_check_period_s=30.0`` a broken
-    replica can report HEALTHY for up to one period before it goes unhealthy.
-    Bounded, and visible, unlike reporting HEALTHY forever.
+    one honest limitation of this fix. Two periods make it up, not one: poll 1
+    creates the task and tests ``.done()`` in the same call, so it cannot fail,
+    and Serve condemns a replica only after 3 consecutive failed checks
+    (``REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD`` in
+    ``ray.serve._private.constants``). So with ``health_check_period_s=30.0`` a
+    broken replica reports HEALTHY on poll 1 and is routable across polls 2-4 —
+    ≈90 s, roughly 3 periods, not one. Bounded, and the missing modules are named
+    in the replica log, unlike reporting HEALTHY forever.
+
+    This function deliberately awaits the task between the two polls rather than
+    sleeping, so the test observes the raise without waiting out a real period.
     """
     await instance.check_health()
     if instance._bioengine_test_task is not None:
