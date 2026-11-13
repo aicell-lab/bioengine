@@ -78,8 +78,9 @@ _RECONNECT_GRACE_S = 30
 # treated as wedged. A local controller call normally takes milliseconds, so
 # this is not a latency tolerance — it is the line past which "still running"
 # stops being a slow answer and starts being no answer. Comfortably longer than
-# the ~3 x health_check_period_s it takes Serve to condemn today, so a replica
-# that is merely slow is never caught by it.
+# the three consecutive failed checks (~2 x health_check_period_s) it takes
+# Serve to condemn today, so a replica that is merely slow is never caught by
+# it.
 _SIBLING_READ_DEADLINE_S = 60.0
 
 # Hypha reports a workspace we may not use as a plain exception with no
