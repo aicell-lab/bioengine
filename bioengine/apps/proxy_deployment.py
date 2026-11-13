@@ -1191,7 +1191,18 @@ class ProxyDeployment:
             ]:
                 if svc_id:
                     try:
-                        await self.server.unregister_service(svc_id)
+                        # hypha-rpc's unregister_service helper drops the
+                        # workspace and client id off the id it is given, so the
+                        # server resolves "<workspace>/*:<name>" and refuses with
+                        # "Multiple services found" as soon as a second worker
+                        # runs the same app. The manager accepts the fully
+                        # qualified id we registered under. Retries are bounded
+                        # because this also runs in the replica's destructor.
+                        manager = await self.server.rpc.get_manager_service(
+                            {"timeout": 20, "case_conversion": "snake"},
+                            max_retries=1,
+                        )
+                        await manager.unregister_service(svc_id)
                         logger.info(
                             f"🔌 Unregistered {svc_name} service '{svc_id}' "
                             f"for '{self.application_id}'"
