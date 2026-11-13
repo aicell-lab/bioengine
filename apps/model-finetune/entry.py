@@ -1687,8 +1687,14 @@ class EntryApp:
             "version": manifest.get("community_version", community_version),
             "path": paths["weights"],
             "sha256": manifest.get("weights_sha256"),
-            "selection_metric": manifest.get("selection_metric"),
-            "witness_metric": manifest.get("witness_metric"),
+            # A published manifest is a SECOND stored surface carrying the basis
+            # wording 0.27.15 retracted, and it does not pass through
+            # pool_wire_state — so correcting only the pool index would leave a
+            # contributor reading a named community version the withdrawn claim.
+            # Corrected at this chokepoint because both callers come through here.
+            # #0418.
+            "selection_metric": pool.corrected_metric(manifest.get("selection_metric")),
+            "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
 
     async def _next_free_community_version(self, am, pool_artifact_id: str, index: Dict[str, Any]) -> str:
