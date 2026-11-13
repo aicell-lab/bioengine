@@ -1687,8 +1687,14 @@ class EntryApp:
             "version": manifest.get("community_version", community_version),
             "path": paths["weights"],
             "sha256": manifest.get("weights_sha256"),
-            "selection_metric": manifest.get("selection_metric"),
-            "witness_metric": manifest.get("witness_metric"),
+            # A published manifest is a SECOND stored surface carrying the basis
+            # wording 0.27.15 retracted, and it does not pass through
+            # pool_wire_state — so correcting only the pool index would leave a
+            # contributor reading a named community version the withdrawn claim.
+            # Corrected at this chokepoint because both callers come through here.
+            # #0418.
+            "selection_metric": pool.corrected_metric(manifest.get("selection_metric")),
+            "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
 
     async def _next_free_community_version(self, am, pool_artifact_id: str, index: Dict[str, Any]) -> str:
@@ -1934,7 +1940,7 @@ class EntryApp:
         pool_token: str = Field(..., description="Token with read access to the pool. Scoped to the pool, not the app's own token."),
     ) -> Dict[str, Any]:
         """The pool's state projected onto the campaign-page wire contract
-        (schema_version 0.13.0-draft): merge_trigger, baseline_metric (role=witness),
+        (schema_version 0.15.0-draft): merge_trigger, baseline_metric (role=witness),
         soups[] (published merges), empty_merges[] (merges that admitted nothing),
         and enriched contribution stubs. Role-tagged metrics come straight from
         storage — the role is a property of the artifact, not assigned here."""
