@@ -87,3 +87,48 @@ def test_non_pep440_different_string_passes():
         existing_versions=["demo", "v2"],
         artifact_id="ws/app",
     )
+
+
+def _collision_message(new_version, existing_versions):
+    with pytest.raises(ValueError) as exc:
+        _enforce_version_increases(
+            new_version=new_version,
+            existing_versions=existing_versions,
+            artifact_id="ws-user-github|49943582/nucleus-profiler",
+        )
+    return str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "new_version, existing_versions",
+    [
+        ("1.0.0", ["1.0.0", "2.0.1"]),  # PEP 440 branch
+        ("demo", ["demo", "v2"]),  # non-PEP-440 exact-match branch
+    ],
+)
+def test_collision_names_both_courses(new_version, existing_versions):
+    """Both collision branches must say what to do when the id is not yours.
+
+    "Bump the version" is right for your own artifact and wrong for a stranger's
+    — it publishes an unrelated bundle as the head of a lineage you do not own.
+    """
+    msg = _collision_message(new_version, existing_versions)
+    assert "If this artifact is yours, bump the version in manifest.yaml" in msg
+    assert "choose a different id" in msg
+    assert "a lineage you do not own" in msg
+    # The version history is what lets a reader notice an artifact isn't theirs.
+    for v in existing_versions:
+        assert v in msg
+
+
+def test_missing_version_does_not_carry_collision_advice():
+    """Discriminator: a missing version is not a collision, so it must not
+    inherit the collision advice. Without this, the assertions above would pass
+    on a message that appended the advice to everything."""
+    with pytest.raises(ValueError) as exc:
+        _enforce_version_increases(
+            new_version=None,
+            existing_versions=["1.0.0"],
+            artifact_id="ws/app",
+        )
+    assert "choose a different id" not in str(exc.value)
