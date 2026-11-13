@@ -256,6 +256,35 @@ def test_get_training_capabilities_explains_the_unavailable_it_reports(monkeypat
     assert "MODEL_FINETUNE_BACKENDS" in caps["placement"]["advice"]
 
 
+def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> None:
+    """The warning above is only worth writing if something writes it.
+
+    Measured 2026-11-13 on a one-GPU external-cluster worker with both backends
+    enabled: the unplaceable GPU runtime leaves the app in ``DEPLOYING``, and the
+    ProxyDeployment registers the app's Hypha service only once every sibling is
+    serviceable (``bioengine/apps/proxy_deployment.py``, ``_is_serviceable``) — so no
+    caller can reach ``get_training_capabilities`` in that state. With
+    ``initial_replicas: 0`` nothing wakes the entry either and the warning is never
+    written; the line only appeared after a replica was forced up by hand over a Serve
+    handle, which no operator can do. One CPU-only replica at deploy time is what puts
+    it into ``deployments.<entry>.logs``, which ``get_app_status`` returns throughout
+    ``DEPLOYING``.
+
+    ``min_replicas`` must stay 0: #0045's brief is that an idle entry holds nothing on
+    an HPC login node. Both halves are asserted, because satisfying one by breaking the
+    other is the easy mistake.
+    """
+    cfg = entry.EntryApp._deployment_config.autoscaling_config
+    assert cfg.min_replicas == 0, "#0045: an idle entry must still scale to zero"
+    assert cfg.initial_replicas == 1, (
+        "#0370: with 0 the placement warning is never written on the cluster it is for"
+    )
+    # CONTROL: this is the live resolved config, not a default-shaped object — these
+    # two values are set in the decorator and are not Ray Serve defaults.
+    assert cfg.max_replicas == 1
+    assert cfg.downscale_delay_s == 600.0
+
+
 def test_the_declaration_this_row_is_about_is_unchanged() -> None:
     """The recorded decision, pinned. Changing either runtime to a positive
     ``gpu_memory_mb`` opts it into VRAM packing (builder.py:518-536) with a figure

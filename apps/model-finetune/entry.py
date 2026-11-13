@@ -328,9 +328,20 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     # because the training/export task maps and the GPU semaphore are
     # replica-local; the records a caller polls are on disk, so a teardown
     # between calls is invisible to the frontend.
+    #
+    # initial_replicas is 1, not 0, so the entry can SPEAK at deploy time (#0370).
+    # Measured 2026-11-13 on a one-GPU external cluster with both backends on: a
+    # GPU runtime that cannot be placed leaves the app in DEPLOYING forever, the
+    # proxy registers its Hypha service only once every sibling is serviceable, so
+    # nothing can call the app — and with initial_replicas 0 nothing wakes the entry
+    # either, so the placement warning below is never written. One CPU-only replica
+    # at deploy time puts it in deployments.<entry>.logs, which get_app_status
+    # returns while the app is still DEPLOYING. min_replicas stays 0, so #0045's
+    # requirement ("should also scale down if not used") is untouched: this replica
+    # goes away after downscale_delay_s like any other.
     autoscaling_config={
         "min_replicas": 0,
-        "initial_replicas": 0,
+        "initial_replicas": 1,
         "max_replicas": 1,
         "downscale_delay_s": 600.0,
         "upscale_delay_s": 0.0,
