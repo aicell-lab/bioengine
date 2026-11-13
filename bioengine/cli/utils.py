@@ -232,8 +232,41 @@ def print_table(rows: list, headers: list) -> None:
         click.echo("  ".join(str(c).ljust(w) for c, w in zip(row, col_widths)))
 
 
+_TRACEBACK_MARKER = "Traceback (most recent call last):"
+
+
+def condense_traceback(msg: str) -> str:
+    """Replace any embedded traceback in ``msg`` with just the exception it ends on.
+
+    A remote failure reaches the CLI as one opaque string: hypha_rpc builds it
+    as ``"RemoteError:" + _rvalue + "\\n" + _rtrace`` where ``_rvalue`` is
+    already the whole server-side traceback and ``_rtrace`` is that same
+    traceback a second time, so the sentence the user has to act on lands tens
+    of frames below the ``Error:`` prefix, repeated. Python writes an
+    exception's message on the final line of its traceback, so keeping
+    everything after the *last* marker's frames keeps the cause — including a
+    multi-line one — and drops every copy of the frames.
+    """
+    if _TRACEBACK_MARKER not in msg:
+        return msg
+    head = msg.split("RemoteError:", 1)[0].split(_TRACEBACK_MARKER, 1)[0].rstrip()
+    tail = msg.rsplit(_TRACEBACK_MARKER, 1)[1].splitlines()
+    start = next(
+        (i for i, ln in enumerate(tail) if ln.strip() and not ln[:1].isspace()), None
+    )
+    if start is None:
+        return msg
+    cause = "\n".join(tail[start:]).strip()
+    return f"{head} {cause}" if head else cause
+
+
 def error_exit(msg: str, hint: str = "") -> None:
     """Print a human-readable error and exit with code 1."""
+    if not os.environ.get("BIOENGINE_CLI_TRACEBACK"):
+        condensed = condense_traceback(msg)
+        if condensed != msg:
+            msg = condensed
+            hint = hint or "set BIOENGINE_CLI_TRACEBACK=1 for the full traceback"
     click.echo(f"Error: {msg}", err=True)
     if hint:
         click.echo(f"Hint:  {hint}", err=True)
