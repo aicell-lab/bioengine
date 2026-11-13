@@ -18,9 +18,10 @@ assert. **It is not a traffic gate**, and the limit is not a bounded window:
 ``check_health`` creates the task and tests ``.done()`` in the same call, so poll 1
 cannot fail; Serve condemns only after 3 consecutive failed checks (≈90 s at
 ``health_check_period_s=30.0``); and Serve then *replaces* the condemned replica, so
-the cycle repeats indefinitely. Measured on ``#0387`` over 100 periods: 105 calls, 0
-failed, 84 answered by a replica that already knew its smoke test had failed, across
-22 distinct pids. What this fix buys is the missing modules being **named in the
+the cycle repeats indefinitely. Measured on ``#0387`` over 100 health-check periods —
+that probe ran at ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the
+30 s named above: 105 calls, 0 failed, 84 answered by a replica that already knew its
+smoke test had failed, across 22 distinct pids. What this fix buys is the missing modules being **named in the
 replica log on every cycle** rather than nothing being said at all; ``#0387`` owns
 the behaviour question and is a ``bioengine/**`` change in another lane.
 ``_settle_check_health`` below models one replica's two polls, which is the most a
@@ -258,7 +259,9 @@ async def _settle_check_health(instance) -> None:
     That ≈90 s is **one replica's** life, NOT the deployment's exposure, and this
     function cannot reach the difference. Serve replaces the condemned replica
     and the loop repeats indefinitely (``#0387``, measured end to end on a real
-    ``serve.run``: 0 failed calls across 100 periods, 22 distinct serving pids).
+    ``serve.run``: 0 failed calls across 100 health-check periods — that probe
+    ran at ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the
+    30 s this function models — and 22 distinct serving pids).
     What is asserted below is therefore that the failure is *reported*, not that
     traffic stops — the missing modules are named in the replica log on every
     cycle, unlike reporting HEALTHY in silence.

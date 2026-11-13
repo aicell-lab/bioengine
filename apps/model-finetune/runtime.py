@@ -153,9 +153,10 @@ class RuntimeApp:
         **replaces** the condemned replica and the cycle repeats indefinitely,
         because its circuit breaker ``_terminally_failed()`` is gated on ``not
         _replica_has_started``, which any successful start clears. Measured on
-        ``#0387`` over 100 periods: 105 calls, **0 failed**, 84 answered by a
-        replica that already knew its own smoke test had failed, across 22
-        distinct replica pids.
+        ``#0387`` over 100 health-check periods — that probe ran at
+        ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the 30 s
+        above: 105 calls, **0 failed**, 84 answered by a replica that already
+        knew its own smoke test had failed, across 22 distinct replica pids.
 
         So what this buys is that the missing modules are **named in the replica
         log on every cycle**, instead of nothing being said at all — not that
