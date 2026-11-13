@@ -858,12 +858,61 @@ def next_community_version(index: Dict[str, Any]) -> str:
         raise ValueError(f"cannot derive next version from '{cur.get('version')}'")
 
 
+def find_contribution_by_digest(
+    index: Dict[str, Any], weights_sha256: str
+) -> Optional[Dict[str, Any]]:
+    """The contribution already holding ``weights_sha256``, or None.
+
+    Identity is the digest ALONE — not the digest plus any metadata. What a soup
+    averages is the bytes, so two members carrying one digest weight that
+    checkpoint 2:1 in the uniform mean whatever metadata they carry; metadata can
+    only make the double-weighting harder to see. Comparing the digest against a
+    caller-supplied field as well would let a retry defeat de-duplication by
+    passing a different ``dataset_fingerprint``, which a retrying client can do by
+    accident.
+
+    Deliberately does NOT consult ``decided_contribution_ids``: a re-deposit of a
+    checkpoint that is already inside a published community soup is the case where
+    appending is *worst*, since the next merge would compound a weight that has
+    already shipped. The first member is returned there too.
+
+    Earliest match wins, so a pool that somehow already holds a duplicate (one
+    created before this check existed) resolves to the same member on every call
+    rather than drifting with list order.
+    """
+    if not weights_sha256:
+        return None
+    for entry in index.get("contributions", []) or []:
+        if entry.get("weights_sha256") == weights_sha256:
+            return entry
+    return None
+
+
 def append_contribution(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append a contribution stub to the index. ``entry`` carries the pointers +
     the audit fields a reader needs without opening each metadata.json:
     ``{contribution_id, weights_path, metadata_path, weights_sha256,
     architecture_signature, samples_seen, uploaded_at}``. Append-only: existing
-    entries are immutable."""
+    entries are immutable.
+
+    REFUSES a second member for a digest the index already holds (#0376). A client
+    that retries a deposit after a gateway 504 ate the response — the correct thing
+    for it to do, and 4 of 92 deposits on the r2 corpus needed it — otherwise
+    becomes two members and that site is silently weighted 2:1 in the uniform mean.
+    The refusal is the invariant stated where the write happens, so a later caller
+    cannot re-create the defect by forgetting to look first; on the retry path
+    ``contribute`` recognises the duplicate and returns before reaching here, so
+    this raise is a backstop rather than the mechanism.
+    """
+    existing = find_contribution_by_digest(index, entry.get("weights_sha256", ""))
+    if existing is not None:
+        raise ValueError(
+            f"contribution '{entry.get('contribution_id')}' carries weights_sha256 "
+            f"{entry.get('weights_sha256')}, which this pool already holds as "
+            f"'{existing.get('contribution_id')}' — appending it would weight that "
+            f"checkpoint twice in the uniform soup. Recognise the re-deposit and "
+            f"return the existing member instead."
+        )
     index.setdefault("contributions", []).append(entry)
     return index
 

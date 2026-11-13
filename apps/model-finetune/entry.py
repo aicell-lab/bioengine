@@ -368,6 +368,30 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+class _RecognisedRedeposit(Exception):
+    """Internal control flow: the weights just uploaded are already in the pool.
+
+    Raised from *inside* ``contribute``'s ``async with self._staged(...)`` block
+    and caught immediately outside it, so the duplicate's already-minted
+    ``put_file`` manifest row unwinds down ``_staged``'s discard path — the one
+    that is already proven and already tested. Returning normally from inside
+    that block instead would leave the stage open holding a row whose bytes
+    never landed, and ``_staged``'s own docstring says what follows: every
+    later ``commit`` raises ``File '<path>' does not exist in the artifact``,
+    which ``_commit_with_retry`` misreads as the read-after-write 404 and
+    retries for ~62 s before re-raising. One retried deposit would then take
+    the whole pool down rather than just its own merge — strictly worse than
+    the double-weighting this is fixing. Never crosses the RPC boundary: the
+    caller sees a normal return with ``deduplicated: true``. #0376.
+    """
+
+    def __init__(self, existing: Dict[str, Any]) -> None:
+        super().__init__(
+            f"weights already deposited as '{existing.get('contribution_id')}'"
+        )
+        self.existing = existing
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -465,7 +489,18 @@ class EntryApp:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._s3 = await self._hypha.get_service("public/s3-storage")
+        # Resolved once per replica and cached for its whole life, so a plain
+        # proxy pinned to a client id the server later forgets would hang every
+        # call to the full method timeout — and `_health` below tests `is None`,
+        # which a dead handle passes. `put_file`/`get_file` only mint a
+        # presigned URL, so both are safe to re-send after a call that may
+        # already have landed.
+        self._s3 = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/s3-storage",
+            repeatable=("put_file", "get_file"),
+            logger=logger,
+        )
         self._http = httpx.AsyncClient(timeout=60.0)
         self._busy.start()
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
@@ -1976,8 +2011,11 @@ class EntryApp:
         signature, samples_seen, L2 drift from the base it started from,
         provenance) and appends a stub to the pool index — one commit per
         contribution, so lineage is fully traceable. Averaging happens later, in
-        the coordinator's aggregate step; this only deposits. cpsam(cellpose)
-        sessions only for now."""
+        the coordinator's aggregate step; this only deposits. Idempotent by
+        weights digest: re-depositing a checkpoint the pool already holds
+        appends nothing and returns the first deposit's record with
+        deduplicated=true, so a client that lost its response to a gateway
+        timeout can safely retry. cpsam(cellpose) sessions only for now."""
         import time as _time
 
         import pool
@@ -2015,6 +2053,18 @@ class EntryApp:
         uploaded_at = _time.time()
         paths = pool.contribution_paths(cid)
 
+        # Resolved once and used by both the stored metadata and the value
+        # returned to the caller, so the two records cannot date the same
+        # contribution differently. Empty is the same as unset here: an
+        # exported-but-empty var would otherwise stamp "" and read as a known
+        # version. Read out here rather than mid-block because the recognised
+        # re-deposit below returns without reaching the metadata build.
+        app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
+        # Set by the except clause below, and the only thing that distinguishes
+        # the two return paths.
+        redeposited: Optional[Dict[str, Any]] = None
+
         am, client = await self._pool_service(pool_token)
         try:
             try:
@@ -2038,12 +2088,15 @@ class EntryApp:
                 else:
                     pool.assert_compatible(index, model_type=model_type, signature=signature)
 
-                # Resolved once and used by both the stored metadata and the value
-                # returned to the caller, so the two records cannot date the same
-                # contribution differently. Empty is the same as unset here: an
-                # exported-but-empty var would otherwise stamp "" and read as a
-                # known version.
-                app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+                # Earliest point a re-deposit is knowable: the digest is computed
+                # from the bytes by prepare_contribution, which has already PUT
+                # them. Identity is the digest alone — see
+                # pool.find_contribution_by_digest for why metadata is not part of
+                # it, and why decided_contribution_ids is not consulted. Leaving by
+                # raise, never by return: see _RecognisedRedeposit. #0376.
+                existing = pool.find_contribution_by_digest(index, info["weights_sha256"])
+                if existing is not None:
+                    raise _RecognisedRedeposit(existing)
 
                 metadata = pool.build_contribution_metadata(
                     contribution_id=cid,
@@ -2081,11 +2134,44 @@ class EntryApp:
                     "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
                 )).raise_for_status()
                 await self._commit_with_retry(am, pool_artifact_id)
+        except _RecognisedRedeposit as recognised:
+            # _staged has already discarded the stage on the way out, so the pool
+            # is left exactly as it was found: same members, no open edit, and no
+            # index PUT ever issued.
+            redeposited = recognised.existing
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
                 pass
+
+        if redeposited is not None:
+            # The bytes did cross the wire — prepare_contribution PUT them before
+            # anything could know they were a duplicate — so bytes_up counts them;
+            # that counter is "weight-bytes moved", and pretending they did not
+            # move would understate the cost of exactly the retries this handles.
+            # contributions does NOT move: the pool gained no member, and that is
+            # the number quoted as "deposits".
+            self._bump_transport(bytes_up=int(info["n_bytes"]))
+            return {
+                "schema_version": pool.SCHEMA_VERSION,
+                "app_version": app_version,
+                # The FIRST deposit's id, and the pool's own record of what it
+                # holds, so a client that lost its response to a gateway timeout
+                # ends up with the record it would have had. samples_seen is read
+                # back off the index for the same reason: if this retry reported a
+                # different count, the stored member is the one the soup will
+                # weight. l2_from_base comes from this call because the index does
+                # not carry it — it is recomputed from the same bytes against the
+                # same stock base, not read back from the first deposit.
+                "contribution_id": redeposited.get("contribution_id"),
+                "pool_artifact_id": pool_artifact_id,
+                "architecture_signature": redeposited.get("architecture_signature", signature),
+                "weights_sha256": info["weights_sha256"],
+                "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
+                "l2_from_base": info["l2_from_base"],
+                "deduplicated": True,
+            }
 
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
@@ -2101,6 +2187,11 @@ class EntryApp:
             "weights_sha256": info["weights_sha256"],
             "samples_seen": samples_seen,
             "l2_from_base": info["l2_from_base"],
+            # False, not absent, on the fresh path. A key present only when true
+            # cannot be dated: a client holding a response without it cannot tell
+            # "fresh deposit" from "a release that predates de-duplication" —
+            # the defect app_version exists to avoid (#0116, #0140). #0376.
+            "deduplicated": False,
         }
 
     @bioengine.method

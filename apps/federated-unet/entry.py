@@ -99,7 +99,25 @@ class FederatedUNetSite:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._artifact_manager = await self._hypha.get_service("public/artifact-manager")
+        # Cached for the replica's whole life and handed to every
+        # `CheckpointStore` (see `_store`), so a stale client id would hang
+        # every checkpoint read and write to the method timeout; this app has
+        # no `@bioengine.health_check` at all, so nothing else would notice.
+        # `CheckpointStore` calls `read`, `get_file`, `put_file` and `create`
+        # (checkpoints.py:98-129). Only the two reads are named: `repeatable`
+        # governs re-sending a call that MAY already have landed, and the
+        # worker's own wrapper for this same service deliberately does not
+        # replay `put_file` or `create` (`_RETRY_SAFE_READS` in
+        # `bioengine/apps/manager.py`), so neither is named here either. They
+        # still get the hang fixed — a failure that provably never left the
+        # process is replayed for every method, named or not — and give up only
+        # the retry on an ambiguous failure, which is today's behaviour.
+        self._artifact_manager = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/artifact-manager",
+            repeatable=("read", "get_file"),
+            logger=logger,
+        )
         logger.info(f"[{self.site_name}] ready on {self._device}")
 
     @bioengine.smoke_test

@@ -357,6 +357,67 @@ Notes:
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the
   C++ pieces `python-elf` used to need from conda-forge.
 
+### A replica whose `runtime_env` did not install now names the missing modules in its logs
+
+Each GPU runtime declares a `@bioengine.smoke_test` that imports its own ML stack
+once — `torch` + `cellpose` for the Cellpose runtime, `torch` + `micro_sam` +
+`segment_anything` + `onnxruntime` + `pooch` for micro-sam. If any of them is
+missing the replica is marked **unhealthy** and the reason is in the deployment's
+own logs (`get_app_status` → `deployments.<name>.logs`).
+
+The import runs in the background *after* the replica has started serving, so it
+does **not** gate traffic: a replica whose env is broken still starts, still reports
+`HEALTHY` on its first poll, and still receives calls. What it changes
+is visibility, not routing — see the second bullet below for how long a broken
+replica keeps receiving calls.
+
+That used to be invisible. Nothing on the health path imports the ML stack: the
+framework's `check_health` runs the one-shot `async_init` and retains a CUDA context
+through `libcuda.so.1`, which the NVIDIA container runtime injects regardless of what
+pip did, and the runtimes declared no health check of their own. So a replica with no
+`cellpose` installed reported `HEALTHY` under a `RUNNING` deployment while every call
+raised `ModuleNotFoundError`. Measured on the Berzelius worker, 31 Oct 2026.
+
+Two things worth knowing when you see it:
+
+- **pip's own output is not in the app's logs.** A failed or skipped install lands in
+  `runtime_env_setup-*.log` on the node, so read that for the cause — the smoke test
+  tells you *which* modules are missing, not why.
+- **The smoke test does NOT stop broken traffic — it only makes the cause visible.**
+  Do not read a failing smoke test as a deployment that has taken itself out of
+  rotation; it has not, and it will not.
+  - *Per replica, ≈90 s.* The smoke test runs in the background and its failure is
+    read on a *later* health poll: `check_health` creates the task and tests
+    `.done()` in the same call, so the first poll cannot fail, and Ray Serve
+    condemns a replica only after **3 consecutive** failed checks
+    (`REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD = 3`). At these deployments'
+    `health_check_period_s=30.0` that is poll 1 healthy and polls 2-4 failing — so
+    ≈90 s, roughly 3 periods, during which the replica reads `HEALTHY`, the
+    deployment reads `RUNNING`, and calls route to it and fail.
+  - *Per deployment, indefinitely.* Serve then **replaces** the condemned replica
+    and the cycle repeats, because its circuit breaker never trips for a version
+    whose replicas start successfully and fail only afterwards. Measured end to end
+    on a real `serve.run` (backlog `#0387`) over 100 health-check periods — that
+    probe ran at `health_check_period_s=1.0`, so ≈100 s in all, **not** 100 × the
+    30 s above: **105 calls, 0 failed, 84 of them answered by a replica that
+    already knew its own smoke test had failed, across 22 distinct replica pids.**
+    Read that as a measurement of *routing*, not of what your callers will see:
+    `#0387`'s handler imported nothing, so its calls succeeded. In this app they do
+    not — the micro-sam and Cellpose call paths import their own ML stack, so a
+    replica in this state raises `ModuleNotFoundError`, which is the very symptom
+    this section describes. What carries over is that calls keep arriving at a
+    replica whose smoke test has already failed.
+  - *So what you get from this fix:* the missing modules are **named in
+    `deployments.<name>.logs` on every cycle** instead of the replica reporting
+    `HEALTHY` in silence. Debugging a fresh deploy, expect a replica that looks
+    healthy for the first minute and a half and a deployment that keeps looking
+    `RUNNING` — check the logs, not the status. Changing the behaviour is a
+    framework question and is tracked on `#0387`, not here.
+
+`ping()` stays shallow on purpose: the entry calls it with a 2 s timeout before every
+GPU call, which an import of torch does not fit, and importing a heavy stack on every
+poll is its own defect.
+
 ### Prebuilt worker image (skip the deploy-time install)
 
 To avoid the slow first-deploy pip build entirely, launch the worker from a
