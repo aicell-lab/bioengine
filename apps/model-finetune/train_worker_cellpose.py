@@ -227,6 +227,9 @@ def main(session_id: str) -> None:
             n_epochs=p["n_epochs"], learning_rate=p["learning_rate"],
             weight_decay=p.get("weight_decay", 0.1), batch_size=p.get("batch_size", 1),
             min_train_masks=p.get("min_train_masks", 1),
+            # None keeps cellpose's own per-backbone default: 256 for cpsam,
+            # 384 for cpdino. cpsam rejects any other value outright.
+            bsize=p.get("train_tile_size"),
             normalize=True, rescale=False,
         )
         stop.set()
