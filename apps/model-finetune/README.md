@@ -282,11 +282,13 @@ GPU and never builds its (multi-GB) pip env. Its model types are reported
 clear error. Enabling both backends is a two-GPU deployment by design.
 
 **If you get it wrong, the app now tells you.** Asking for more GPUs than the
-cluster has used to be invisible: the unplaceable runtime sits in `UPSCALING`,
-which is not a failure state and never times out, so `deploy_app` returns
-successfully and `get_app_status` reads like a slow start forever while the
-backend reports `runtime unavailable`. The CPU-only entry deployment schedules on
-any node, so it is alive to say what the GPU deployments cannot (#0370):
+cluster has used to be invisible. Measured 2026-11-13 on a one-GPU
+`external-cluster` worker with both backends enabled: the unplaceable runtime
+stays `UPDATING` with its replica `STARTING`, the application stays `DEPLOYING`,
+none of it is a failure state and none of it times out — so `deploy_app` returns
+successfully and `get_app_status` reads like a slow first start forever. The
+CPU-only entry deployment schedules on any node, so it is alive to say what the
+GPU deployments cannot (#0370):
 
 - a `⚠ GPU placement: …` **warning in the entry's log**, which
   `get_app_status(application_ids=[...])` already returns under
@@ -296,6 +298,22 @@ any node, so it is alive to say what the GPU deployments cannot (#0370):
   `{backends_enabled, gpus_required, gpus_in_cluster, sufficient, detail,
   advice}` — so the diagnosis arrives in the same response as the
   `runtime unavailable` symptom.
+
+**Which of the two you can read depends on how bad it is**, and that is worth
+knowing before you go looking for the wrong one:
+
+| state | what to read |
+|---|---|
+| one backend over-subscribed, app serving | either — `get_training_capabilities()` is the convenient one |
+| every GPU runtime pending, app stuck `DEPLOYING` | **the log only.** The proxy registers the app's Hypha service only once every sibling deployment is serviceable, so nothing can call the app at all. `get_app_status` still returns the entry's log. |
+
+The entry therefore starts with `initial_replicas: 1` so the line is written
+without a caller; `min_replicas` stays `0`, so an idle entry still scales to zero.
+On a `single-machine` or `slurm` worker you will not reach this state at all — the
+worker's own resource check raises `ValueError: Insufficient resources …` and
+refuses the deploy. Only in `external-cluster` mode does it downgrade that to a
+warning (in the *worker's* log, assuming Ray autoscaling), and that is the mode
+KTH and deNBI run.
 
 `sufficient` is three-valued on purpose: `true` (enough GPUs), `false` (a real
 shortfall, and `advice` says what to set), or `null` when it cannot be told from

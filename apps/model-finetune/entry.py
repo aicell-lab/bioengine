@@ -90,10 +90,14 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     Exists because getting this wrong is otherwise INVISIBLE from the running
     system (#0370). Two enabled backends book two whole GPUs even to serve one
     request; on a cluster with one free GPU the second replica simply never
-    schedules, and Ray Serve reports that as ``UPSCALING`` — which is not a
-    failure state and never times out. So ``deploy_app`` returns successfully,
-    ``get_app_status`` reads like a slow first start forever, and nothing names
-    the mismatch or mentions ``MODEL_FINETUNE_BACKENDS``.
+    schedules. Measured 2026-11-13 on a one-GPU ``external-cluster`` worker: the
+    unplaceable runtime stays ``UPDATING`` with its replica ``STARTING``, the
+    application stays ``DEPLOYING``, and neither ever times out — so
+    ``deploy_app`` returns successfully, ``get_app_status`` reads like a slow
+    first start forever, and nothing names the mismatch or mentions
+    ``MODEL_FINETUNE_BACKENDS``. The worker's own resource check does say it, but
+    only in ``external-cluster`` mode does the deploy get that far, and it says it
+    in the WORKER's log — not in anything the app's caller can read.
 
     Answered from the CPU entry on purpose: the entry deployment asks for no GPU,
     so it is the one part of the app that is still alive to say why the rest is not.
@@ -156,9 +160,12 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     report["detail"] = (
         f"this cluster advertises {total:g} GPU(s) but the enabled backends "
         f"({', '.join(sorted(enabled))}) need {required} — each GPU runtime books "
-        "a WHOLE device. The GPU deployment(s) that cannot be placed will sit in "
-        "UPSCALING indefinitely: that is not a failure state and never times out, "
-        "so the app will look like it is still starting rather than stuck."
+        "a WHOLE device. The runtime(s) that cannot be placed stay UPDATING with a "
+        "replica STARTING and the application stays DEPLOYING, indefinitely: none "
+        "of that is a failure state and none of it times out, so the app looks "
+        "like it is still starting rather than stuck. Its Hypha service is never "
+        "registered while a sibling pends, so get_app_status is the only surface "
+        "that can answer — which is where you are reading this."
     )
     report["advice"] = (
         "Deploy one backend: pass "

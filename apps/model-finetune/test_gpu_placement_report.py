@@ -120,7 +120,12 @@ def test_too_few_gpus_reads_insufficient_and_names_the_remedy(monkeypatch) -> No
     assert report["gpus_required"] == 2
     # An operator reading this must be able to act without reading the source.
     assert "MODEL_FINETUNE_BACKENDS" in report["advice"]
-    assert "UPSCALING" in report["detail"]
+    # The states measured live on 2026-11-13, not the ones one would guess: Serve
+    # reports the unplaceable runtime as UPDATING (replica STARTING) and the app as
+    # DEPLOYING. A detail naming a state the operator will not see is a wrong answer
+    # dressed as a diagnosis.
+    assert "UPDATING" in report["detail"]
+    assert "DEPLOYING" in report["detail"]
     for name in ("cellpose", "microsam"):
         assert name in report["detail"]
 
