@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
 # record and every read method so the page can flag a backend/page mismatch
 # instead of silently mis-rendering. Bump in lock-step with the page's fixtures.
-SCHEMA_VERSION = "0.14.0-draft"
+SCHEMA_VERSION = "0.15.0-draft"
 
 POOL_INDEX = "pool_index.json"
 # Resume journal for aggregate(): scores already paid for, so a killed merge

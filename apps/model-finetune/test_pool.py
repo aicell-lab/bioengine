@@ -2,7 +2,7 @@
 
 Plain pytest, no torch, no numpy, no live Hypha — ``pool``'s heavy imports are all
 function-local, so the schema surface imports on stdlib alone. These pin the
-0.14.0-draft wire contract the campaign page reads (``pool.pool_wire_state``): the
+0.15.0-draft wire contract the campaign page reads (``pool.pool_wire_state``): the
 role-tagged RoundMetric shape, the soups/empty-merges partition, and — the guard
 that matters — that a SELECTION value can never surface on the witness curve. The
 directional test fails on a misplaced VALUE, not merely a mislabelled tag.
@@ -14,7 +14,7 @@ checks these constants against it when a path is supplied via
 ``MODEL_FINETUNE_CORPUS_DIR``, so a draft bump that moves a field is caught the next
 time the test is run against the fresh corpus.
 
-⚠ That corpus is still at 0.13.0-draft and the backend is now at 0.14.0-draft, so
+⚠ That corpus is still at 0.13.0-draft and the backend is now at 0.15.0-draft, so
 ``test_matches_fixture_corpus`` asserts a mismatch until the page regenerates it.
 That is the bump doing its job, not a regression: the contribution stub publishes
 ``n_bytes`` where it used to publish ``bytes_out``. Note the corpus check would NOT
