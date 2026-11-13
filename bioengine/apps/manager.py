@@ -1907,6 +1907,12 @@ class AppsManager:
                     # custom static list passed at deploy time, which is not
                     # recoverable here either way.
                     "ice_servers": None,
+                    # Stays None: the shortfall is what _check_resources saw of
+                    # the cluster at the ORIGINAL deploy, and app_data does not
+                    # carry it, so an adopting worker would need historical
+                    # cluster state. Measuring it fresh would answer a different
+                    # question under the same key.
+                    "resource_shortfall": None,
                     "debug": app_data["debug"],
                     "deployment_task": None,
                     "is_deployed": is_deployed,
