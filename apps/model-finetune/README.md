@@ -306,6 +306,35 @@ Notes:
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the
   C++ pieces `python-elf` used to need from conda-forge.
 
+### A replica whose `runtime_env` did not install now fails at startup
+
+Each GPU runtime declares a `@bioengine.smoke_test` that imports its own ML stack
+once, before Ray Serve admits traffic — `torch` + `cellpose` for the Cellpose
+runtime, `torch` + `micro_sam` + `segment_anything` + `onnxruntime` + `pooch` for
+micro-sam. If any of them is missing the replica is marked **unhealthy** and the
+reason is in the deployment's own logs (`get_app_status` →
+`deployments.<name>.logs`).
+
+That used to be invisible. Nothing on the health path imports the ML stack: the
+framework's `check_health` runs the one-shot `async_init` and retains a CUDA context
+through `libcuda.so.1`, which the NVIDIA container runtime injects regardless of what
+pip did, and the runtimes declared no health check of their own. So a replica with no
+`cellpose` installed reported `HEALTHY` under a `RUNNING` deployment while every call
+raised `ModuleNotFoundError`. Measured on the Berzelius worker, 31 Oct 2026.
+
+Two things worth knowing when you see it:
+
+- **pip's own output is not in the app's logs.** A failed or skipped install lands in
+  `runtime_env_setup-*.log` on the node, so read that for the cause — the smoke test
+  tells you *which* modules are missing, not why.
+- The smoke test runs in the background and its failure is read on the next health
+  poll, so with `health_check_period_s=30.0` a broken replica can read `HEALTHY` for
+  up to one period before flipping. Bounded, rather than forever.
+
+`ping()` stays shallow on purpose: the entry calls it with a 2 s timeout before every
+GPU call, which an import of torch does not fit, and importing a heavy stack on every
+poll is its own defect.
+
 ### Prebuilt worker image (skip the deploy-time install)
 
 To avoid the slow first-deploy pip build entirely, launch the worker from a

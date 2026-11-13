@@ -23,6 +23,7 @@ introspectable with only ``bioengine[worker]`` + the stdlib.
 
 import asyncio
 import gc
+import importlib
 import os
 import subprocess
 import sys
@@ -49,6 +50,16 @@ ZOO_MODELS = {
     "vit_l_em_organelles": ("humorous-crab", "1.2"),
 }
 _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
+
+# The third-party top-level modules this runtime's own method bodies import.
+# Imported once at replica startup by the smoke test below so a replica whose
+# runtime_env install did not take fails instead of being advertised as ready
+# (#0371). Keep this list equal to what the bodies actually import: it is a
+# readiness gate, not a restatement of requirements-runtime.txt, and a module
+# nothing imports would fail a replica that can serve every call. ``numpy`` is
+# absent on purpose — it is imported at module scope above, so a replica missing
+# it never constructs.
+_RUNTIME_IMPORTS = ("torch", "micro_sam", "segment_anything", "onnxruntime", "pooch")
 
 
 def _read_pip(name: str) -> List[str]:
@@ -113,6 +124,45 @@ class RuntimeApp:
     @bioengine.async_init
     async def _start_busy_log(self) -> None:
         self._busy.start()
+
+    @bioengine.smoke_test
+    async def _import_runtime_stack(self) -> None:
+        """Import this backend's ML stack once, at startup, and fail the replica if
+        it is not there (#0371).
+
+        A replica whose ``runtime_env`` install did not take answered the health
+        probe correctly and was advertised as ready while **every** call raised
+        ``ModuleNotFoundError``: nothing on the health path imports the ML stack.
+        ``check_health`` runs ``async_init`` (the busy log) and, because this
+        deployment declares a GPU, retains a CUDA context via ctypes on
+        ``libcuda.so.1`` — which the NVIDIA container runtime injects independently
+        of the pip layer, so it succeeds on a replica with no torch. This runtime
+        declares no ``@bioengine.health_check``, so nothing else ran.
+
+        This is deliberately a smoke test and not a deeper ``ping()``: the entry
+        calls ``ping()`` with a 2 s timeout before every GPU call and importing
+        torch exceeds that, while a per-poll import of a heavy stack is its own
+        defect. The framework runs a smoke test once after ``async_init`` and never
+        admits traffic if it raises, which is the shape this needs. The import is
+        not wasted work — the first real call would do it anyway.
+
+        Reports every missing module rather than the first, because a half-installed
+        env usually lost more than one and the whole point is diagnosability.
+        """
+        missing: List[str] = []
+        for name in _RUNTIME_IMPORTS:
+            try:
+                importlib.import_module(name)
+            except Exception as e:
+                missing.append(f"{name} ({type(e).__name__}: {e})")
+        if missing:
+            raise RuntimeError(
+                "micro-sam runtime dependencies are not importable in this "
+                "replica's environment — the runtime_env install did not take: "
+                + "; ".join(missing)
+                + ". pip's own output is not in this app's logs; read "
+                "runtime_env_setup-*.log on the node."
+            )
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check — not a Hypha method,
