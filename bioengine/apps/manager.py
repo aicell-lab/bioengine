@@ -3225,6 +3225,14 @@ class AppsManager:
             )
             user_id = context["user"]["id"]
 
+            # Ahead of check_connection below, so a wrong type is named even when
+            # the cluster is down: otherwise the caller is told "Ray cluster is not
+            # running" and never hears which argument of theirs was wrong. Placed
+            # after check_permissions so an unauthorised caller still gets
+            # PermissionError first. Re-checked at the call site below, which is
+            # where the key names are validated.
+            _require_deployment_map(scaling, "scaling")
+
             # Verify Ray is initialized
             await self.ray_cluster.check_connection()
 
@@ -3335,11 +3343,14 @@ class AppsManager:
             # Caller identity and admin users for injection into authorized_users by the builder
             user_email = context["user"].get("email", "")
 
-            # scaling's TYPE is checked here, not in _validate_scaling_map below:
-            # that one also checks the keys against the user @bioengine.app class
+            # scaling's TYPE is checked outside _validate_scaling_map below: that
+            # one also checks the keys against the user @bioengine.app class
             # names, which only exist after build() has minted a Hypha token and
             # run the introspect Ray task. A wrong type would otherwise cost all
-            # of that before raising.
+            # of that before raising. The binding check is the copy hoisted above
+            # check_connection; this one is kept so the refusal does not depend on
+            # a single call site surviving a later edit, and because the update
+            # branch above can rebind scaling between the two.
             _require_deployment_map(scaling, "scaling")
 
             # Validate application_kwargs

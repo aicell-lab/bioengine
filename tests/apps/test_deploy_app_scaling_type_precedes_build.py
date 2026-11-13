@@ -1,4 +1,4 @@
-"""A non-dict ``scaling`` must be refused before ``build()`` runs (#0406).
+"""A non-dict ``scaling`` must be refused before any Ray call (#0406).
 
 ``tests/apps/test_deploy_app_validates_scaling.py`` pins that ``deploy_app``
 calls ``_validate_scaling_map``. That validator cannot be the whole boundary for
@@ -9,14 +9,20 @@ introspect task") and submitted the introspect Ray task
 (``ray.remote(...).remote(introspect_app_in_ray_task)``). So a validator placed
 there refuses a wrong type only after paying for all of it.
 
-What makes the ordering testable without a cluster: ``build`` is the first thing
-in ``deploy_app`` that touches Ray or Hypha at all, so "build was not called" is
-a sufficient stand-in for "no Ray call was made", and it is the strongest
-assertion available to a unit test.
+What the ordering is measured with: ``ray_cluster.check_connection``, which is
+the FIRST Ray call in ``deploy_app`` and sits well ahead of ``build``. An earlier
+revision of this file asserted only ``build.assert_not_called()`` and claimed
+build was the first thing to touch Ray at all; that was wrong, and the gap it
+hid is the one this file now pins. With the check below ``check_connection``, a
+caller who passed ``scaling=True`` to a down cluster was told "Ray cluster is
+not running" and never heard which argument was wrong. ``build`` is still
+asserted alongside, because the two bars are different and the weaker one is
+free.
 
-Both directions are asserted. A bad type must raise WITHOUT building; a valid
-map must still reach the build and get past it. Asserting only the first would
-pass just as well against a ``deploy_app`` that never builds anything.
+Both directions are asserted. A bad type must raise WITHOUT any Ray call and
+without building; a valid map must still reach the build and get past it.
+Asserting only the first would pass just as well against a ``deploy_app`` that
+never builds anything.
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ async def test_a_truthy_non_dict_scaling_is_refused_before_the_build(bad, type_n
     message = str(caught.value)
     assert "scaling must be a dict" in message, message
     assert type_name in message, message
+    manager.ray_cluster.check_connection.assert_not_called()
     manager.app_builder.build.assert_not_called()
 
 
@@ -70,21 +77,26 @@ async def test_a_falsy_non_dict_scaling_is_refused_before_the_build(falsy):
     with pytest.raises(ValueError, match="scaling must be a dict"):
         await _deploy(manager, falsy)
 
+    manager.ray_cluster.check_connection.assert_not_called()
     manager.app_builder.build.assert_not_called()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("good", [None, {}, {"Entry": {"num_replicas": 1}}])
 async def test_a_valid_scaling_still_reaches_the_build(good):
-    """POSITIVE CONTROL. Without this, the cases above pass against a
-    ``deploy_app`` that refuses every ``scaling`` it is given, ``None``
-    included — which is what every existing caller passes.
+    """POSITIVE CONTROL, and the one that keeps the assertions above honest.
+    Without it they pass against a ``deploy_app`` that refuses every ``scaling``
+    it is given, ``None`` included — which is what every existing caller passes.
+    The ``check_connection`` assertion is the live-instrument half: delete that
+    call from ``deploy_app`` and every ``assert_not_called()`` above goes vacuous
+    while still reading green, so a presence assertion has to sit beside them.
     """
     manager = _make_manager()
 
     with pytest.raises(RuntimeError, match=PAST_THE_VALIDATOR):
         await _deploy(manager, good)
 
+    manager.ray_cluster.check_connection.assert_called_once()
     manager.app_builder.build.assert_called_once()
 
 
@@ -112,5 +124,6 @@ def test_the_imported_harness_is_the_one_being_asserted_against():
     manager = _make_manager()
 
     assert manager.app_builder.build.call_count == 0
+    assert manager.ray_cluster.check_connection.call_count == 0
     assert isinstance(manager.logger, logging.Logger)
     assert PAST_THE_VALIDATOR == "reached _check_resources"
