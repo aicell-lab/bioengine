@@ -8,9 +8,13 @@ The motivation this parameter was filed under -- that a smaller tile concentrate
 signal for narrow or small-object data and so improves the fit -- was MEASURED and did
 not hold: on a synthetic trench corpus, AP rose monotonically with tile size (128 ->
 0.804, 256 -> 0.887, 384 stock -> 0.889 at IoU 0.5). What the measurement does support
-is a cost knob: 256 matched the 384 default to within noise at 6x less wall clock and
-27% less VRAM. The parameter is documented that way, and these tests pin the wiring and
-the boundary, which hold either way.
+is a cost knob: 256 matched the 384 default to within noise at 27% less VRAM, and it ran
+faster -- but the wall-clock side of that is INDICATIVE only, not a measured multiplier.
+Those runs shared a GPU, and 890.9 s for 2.25x the pixels is superlinear, which points at
+contention rather than at the tile size, so no speed-up figure is quoted -- here or in
+the parameter's own description, which says only "trains faster and in less VRAM". The
+parameter is documented that way, and these tests pin the wiring and the boundary, which
+hold either way.
 
 The parameter is **not** free on every model, and that asymmetry is the whole reason a
 guard exists. cellpose/train.py (4.2.1.1, lines 360-363) reads:
