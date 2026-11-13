@@ -507,14 +507,22 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
 # reports AGREEMENT, falsely. The failure is silent, which is why it needs a
 # test rather than care.
 #
-# Every rung the page has committed, read out of that file's git history on
-# bioimage.io branch feat/federation-campaigns-page, measured 2026-11-13. The
-# date and sha are the page commit that DEFINED the rung. Re-measure with:
-#   git log --format='%h %ad' --date=short <branch> -- src/services/campaignService.ts
-# then read CAMPAIGN_SCHEMA_VERSION at each. (0.8 and 0.9 were never used.)
+# Every rung the page has committed, measured 2026-11-13 on bioimage.io branch
+# feat/federation-campaigns-page. The date and sha are the page commit that
+# DEFINED the rung — the FIRST one to carry that major.minor, not the last.
+#
+# Re-measure against the file that DEFINES the constant, which is NOT the file
+# quoted above: campaignService.ts only imports it (2 commits ever), while
+# src/types/campaign.ts is where it is declared (26 commits).
+#   for c in $(git log --format=%h <branch> -- src/types/campaign.ts); do
+#     git show $c:src/types/campaign.ts | grep -m1 CAMPAIGN_SCHEMA_VERSION; done
+# Read it oldest-first and keep the first sha per major.minor. Control: every
+# one of those commits must yield a constant — a commit that yields none means
+# the pattern has drifted, not that the rung is missing.
+# (0.8 and 0.9 were never used.)
 PAGE_RUNGS = {
     "0.1": ("0.1.0-draft", "2026-09-06", "86f381e"),
-    "0.2": ("0.2.5-draft", "2026-09-06", "1f37721"),
+    "0.2": ("0.2.0-draft", "2026-09-06", "1f37721"),
     "0.3": ("0.3.0-draft", "2026-09-07", "8485ce6"),
     "0.4": ("0.4.0-draft", "2026-09-07", "10307e8"),
     "0.5": ("0.5.0-draft", "2026-09-07", "fa7be54"),
