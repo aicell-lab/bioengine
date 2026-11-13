@@ -208,3 +208,35 @@ def test_the_two_parameters_each_say_which_layer_they_are() -> None:
     assert "per replica" in decorator_text
     assert "deploy_app" in decorator_text, "it does not point at the other layer"
     assert "independent" in decorator_text
+
+
+def test_independence_is_not_stated_as_a_claim_about_the_other_layers_value() -> None:
+    """Independence means neither knob writes the other, not that the other is
+    sitting at its default.
+
+    The description used to end that sentence with "and setting either leaves
+    the other at its default", which is false in both directions. On an update
+    the proxy cap is *preserved* rather than reset to 10 — ``deploy_app`` reads
+    the running application's value when the parameter is omitted — so a cap an
+    earlier call set to 150 stays 150. And the per-replica cap is whatever the
+    author wrote in source, which is the default only if they wrote nothing:
+    ``omezarr-view`` 0.2.4 declares 32.
+    """
+    import inspect
+
+    parameter = inspect.signature(AppsManager.deploy_app).parameters[
+        "max_ongoing_requests"
+    ]
+    text = getattr(parameter.default, "description", "") or ""
+
+    # Positive control, first: an emptied or renamed description satisfies every
+    # absence assertion below while saying nothing at all.
+    assert "independent" in text, f"the independence claim itself is gone: {text!r}"
+    assert "preserves the previous value if updating" in text, (
+        f"the update behaviour is no longer stated: {text!r}"
+    )
+
+    assert "at its default" not in text, (
+        "the description again promises a value for the other layer rather than "
+        f"only that the two do not affect each other: {text!r}"
+    )
