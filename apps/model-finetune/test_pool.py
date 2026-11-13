@@ -50,8 +50,8 @@ MERGE_TRIGGER_KEYS = {
 COMMUNITY_MODEL_KEYS = {"artifact_id", "version", "url", "n_contributions_cumulative"}
 TRANSPORT_KEYS = {"bytes_in", "bytes_out", "n_transfers", "sources_complete"}
 CONTRIBUTION_KEYS = {
-    "contribution_id", "received_at", "n_bytes", "n_train_images",
-    "samples_seen", "disposition", "merged_into",
+    "contribution_id", "received_at", "weights_sha256", "n_bytes",
+    "n_train_images", "samples_seen", "disposition", "merged_into",
 }
 
 POOL_ID = "bioimage-io/cellpose-sam-community"
