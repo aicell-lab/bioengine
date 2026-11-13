@@ -13,14 +13,20 @@ probe at all: Ray Serve never calls it. It is an entry-side pre-call gate
 (``entry.py``, ``_check_runtime_available``) with a 2 s timeout.
 
 The fix is a ``@bioengine.smoke_test`` on each runtime: the framework runs it once
-after ``async_init`` and fails the replica when it raises. It does **not** keep
-traffic off while that happens — ``check_health`` creates the task and tests
-``.done()`` in the same call, so poll 1 cannot fail, and Serve condemns only after 3
-consecutive failed checks, so at ``health_check_period_s=30.0`` a broken replica
-serves real traffic for ≈90 s first. That window is what ``_settle_check_health``
-below models, and it is the honest limit of this fix. ``ping()`` stays shallow
-on purpose and that is pinned here too — importing torch cannot fit a 2 s pre-call
-gate, and a per-poll import of a heavy stack is its own defect.
+after ``async_init`` and fails the replica when it raises, which is what these tests
+assert. **It is not a traffic gate**, and the limit is not a bounded window:
+``check_health`` creates the task and tests ``.done()`` in the same call, so poll 1
+cannot fail; Serve condemns only after 3 consecutive failed checks (≈90 s at
+``health_check_period_s=30.0``); and Serve then *replaces* the condemned replica, so
+the cycle repeats indefinitely. Measured on ``#0387`` over 100 periods: 105 calls, 0
+failed, 84 answered by a replica that already knew its smoke test had failed, across
+22 distinct pids. What this fix buys is the missing modules being **named in the
+replica log on every cycle** rather than nothing being said at all; ``#0387`` owns
+the behaviour question and is a ``bioengine/**`` change in another lane.
+``_settle_check_health`` below models one replica's two polls, which is the most a
+plain-pytest test can reach. ``ping()`` stays shallow on purpose and that is pinned
+here too — importing torch cannot fit a 2 s pre-call gate, and a per-poll import of a
+heavy stack is its own defect.
 
 Plain pytest. No GPU, no live cluster, no real torch/cellpose install: the imports are
 intercepted, which is the only way to exercise the missing-module arm at all.
@@ -241,15 +247,21 @@ async def _settle_check_health(instance) -> None:
     """Poll ``check_health`` the way Ray Serve does, until the smoke test is read.
 
     The framework launches the smoke test as a background task and reads its
-    exception on a *later* call, so one poll is not enough — and that lag is the
-    one honest limitation of this fix. Two periods make it up, not one: poll 1
-    creates the task and tests ``.done()`` in the same call, so it cannot fail,
-    and Serve condemns a replica only after 3 consecutive failed checks
+    exception on a *later* call, so one poll is not enough: poll 1 creates the
+    task and tests ``.done()`` in the same call, so it cannot fail, and Serve
+    condemns a replica only after 3 consecutive failed checks
     (``REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD`` in
     ``ray.serve._private.constants``). So with ``health_check_period_s=30.0`` a
     broken replica reports HEALTHY on poll 1 and is routable across polls 2-4 —
-    ≈90 s, roughly 3 periods, not one. Bounded, and the missing modules are named
-    in the replica log, unlike reporting HEALTHY forever.
+    ≈90 s, roughly 3 periods.
+
+    That ≈90 s is **one replica's** life, NOT the deployment's exposure, and this
+    function cannot reach the difference. Serve replaces the condemned replica
+    and the loop repeats indefinitely (``#0387``, measured end to end on a real
+    ``serve.run``: 0 failed calls across 100 periods, 22 distinct serving pids).
+    What is asserted below is therefore that the failure is *reported*, not that
+    traffic stops — the missing modules are named in the replica log on every
+    cycle, unlike reporting HEALTHY in silence.
 
     This function deliberately awaits the task between the two polls rather than
     sleeping, so the test observes the raise without waiting out a real period.

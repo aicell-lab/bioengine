@@ -143,15 +143,24 @@ class RuntimeApp:
         calls ``ping()`` with a 2 s timeout before every GPU call and importing
         torch exceeds that, while a per-poll import of a heavy stack is its own
         defect. The framework runs a smoke test once after ``async_init`` and
-        fails the replica when it raises, which is the shape this needs. It does
-        **not** keep traffic off while that happens: ``check_health`` creates the
-        task and tests ``.done()`` in the same call, so poll 1 cannot fail, and
-        Ray Serve condemns a replica only after 3 consecutive failed checks
-        (``REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD``). At this deployment's
-        ``health_check_period_s=30.0`` a broken replica therefore serves real
-        traffic for ≈90 s before it is condemned — bounded and named in the
-        replica log, rather than HEALTHY forever. The import is not wasted work
-        — the first real call would do it anyway.
+        fails the replica when it raises, which makes the failure *visible*.
+
+        It is **not** a traffic gate, and not a bounded one either. Two layers:
+        ``check_health`` creates the task and tests ``.done()`` in the same call,
+        so poll 1 cannot fail, and Serve condemns a replica only after 3
+        consecutive failed checks (``REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD``)
+        — ≈90 s at this deployment's ``health_check_period_s=30.0``. Serve then
+        **replaces** the condemned replica and the cycle repeats indefinitely,
+        because its circuit breaker ``_terminally_failed()`` is gated on ``not
+        _replica_has_started``, which any successful start clears. Measured on
+        ``#0387`` over 100 periods: 105 calls, **0 failed**, 84 answered by a
+        replica that already knew its own smoke test had failed, across 22
+        distinct replica pids.
+
+        So what this buys is that the missing modules are **named in the replica
+        log on every cycle**, instead of nothing being said at all — not that
+        broken traffic stops. The import is not wasted work — the first real
+        call would do it anyway.
 
         Reports every missing module rather than the first, because a half-installed
         env usually lost more than one and the whole point is diagnosability.
