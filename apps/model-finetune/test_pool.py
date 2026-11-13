@@ -2,7 +2,7 @@
 
 Plain pytest, no torch, no numpy, no live Hypha — ``pool``'s heavy imports are all
 function-local, so the schema surface imports on stdlib alone. These pin the
-0.13.0-draft wire contract the campaign page reads (``pool.pool_wire_state``): the
+0.15.0-draft wire contract the campaign page reads (``pool.pool_wire_state``): the
 role-tagged RoundMetric shape, the soups/empty-merges partition, and — the guard
 that matters — that a SELECTION value can never surface on the witness curve. The
 directional test fails on a misplaced VALUE, not merely a mislabelled tag.
@@ -13,6 +13,13 @@ page's artifact and rots on draft bumps); ``test_matches_fixture_corpus`` cross-
 checks these constants against it when a path is supplied via
 ``MODEL_FINETUNE_CORPUS_DIR``, so a draft bump that moves a field is caught the next
 time the test is run against the fresh corpus.
+
+⚠ That corpus is still at 0.13.0-draft and the backend is now at 0.15.0-draft, so
+``test_matches_fixture_corpus`` asserts a mismatch until the page regenerates it.
+That is the bump doing its job, not a regression: the contribution stub publishes
+``n_bytes`` where it used to publish ``bytes_out``. Note the corpus check would NOT
+have caught that rename on its own — it pins merge/transport field-sets, never the
+contribution stub, which is why ``CONTRIBUTION_KEYS`` is asserted here directly.
 """
 
 from __future__ import annotations
@@ -42,6 +49,10 @@ MERGE_TRIGGER_KEYS = {
 }
 COMMUNITY_MODEL_KEYS = {"artifact_id", "version", "url", "n_contributions_cumulative"}
 TRANSPORT_KEYS = {"bytes_in", "bytes_out", "n_transfers", "sources_complete"}
+CONTRIBUTION_KEYS = {
+    "contribution_id", "received_at", "n_bytes", "n_train_images",
+    "samples_seen", "disposition", "merged_into",
+}
 
 POOL_ID = "bioimage-io/cellpose-sam-community"
 
@@ -204,6 +215,30 @@ class TestWireShape:
 
     def test_weights_never_leave_the_site(self, wire):
         assert all(s["weights"] is None for s in wire["soups"])
+
+
+class TestContributionBytesAreGreppable:
+    """soup_admission fails OPEN when a pool never recorded ``n_bytes``, so the
+    operator's question is literally "does the view show n_bytes?". Publishing it
+    as ``bytes_out`` answered that question with the wrong word AND collided with
+    transport.bytes_out, which carries unrelated bytes one level up."""
+
+    def test_contribution_publishes_the_stored_name(self, wire):
+        for c in wire["contributions"]:
+            assert c["n_bytes"] == 1_300_000_000
+
+    def test_contribution_key_set(self, wire):
+        for c in wire["contributions"]:
+            assert set(c) == CONTRIBUTION_KEYS
+
+    def test_bytes_out_means_transport_only(self, wire):
+        # Paired with the presence assertions above on purpose: "bytes_out is
+        # absent" alone is also satisfied by the stub disappearing. And transport
+        # must still HAVE it, so renaming the wrong level fails here.
+        for c in wire["contributions"]:
+            assert "bytes_out" not in c
+        for soup in wire["soups"]:
+            assert "bytes_out" in soup["transport"]
 
 
 class TestAssessedIsIdsOnly:
