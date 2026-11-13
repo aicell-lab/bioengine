@@ -68,6 +68,43 @@ BASELINE_BASIS = (
     "scored on the witness split before the first merge"
 )
 
+# The two wordings 0.27.15 (commit e762a17b5af5) retracted, verbatim. Both asserted
+# disjointness as FACT — "a public benchmark disjoint from…", "the disjoint witness
+# split B, held back from…" — which this app cannot check, because split A and B
+# arrive as caller-supplied arrays. Records written before that release still carry
+# them and are still shown to contributors, so the read path below maps them onto the
+# current wording. They live here as constants, not as a substring search, because a
+# substring that drifts stops matching and a search that stops matching reports clean.
+#
+# Keep these byte-exact. They are historical record, not editable prose: changing one
+# character stops it matching the stored data it exists to recognise, and nothing
+# announces that — the projection just quietly resumes publishing the retracted claim.
+RETRACTED_SELECTION_BASIS = (
+    "the score the greedy gate admitted contributions against, on split A, a public "
+    "benchmark disjoint from every contributor's training data"
+)
+RETRACTED_WITNESS_BASIS = (
+    "scored on the disjoint witness split B, held back from the selection split and "
+    "from every contributor, the only number the improvement curve plots"
+)
+# Stored wording -> what it is corrected to on the way out. The value is the current
+# constant, so the two cannot drift apart: re-word SELECTION_BASIS and the correction
+# follows automatically rather than silently continuing to serve the older rewrite.
+_RETRACTED_BASIS = {
+    RETRACTED_SELECTION_BASIS: SELECTION_BASIS,
+    RETRACTED_WITNESS_BASIS: WITNESS_BASIS,
+}
+# Appended to a corrected record so the substitution is visible rather than seamless.
+# A contributor comparing what the page shows against a stored record they fetched
+# themselves would otherwise find a difference with no explanation, which is the same
+# "is this corrupt?" dead end #0417 describes for global_sha256.
+BASIS_CORRECTION_NOTE = (
+    "[corrected on read: the record as stored asserts this split's disjointness as "
+    "fact; that claim was withdrawn in app 0.27.15 because the splits arrive as "
+    "caller-supplied arrays and this app cannot verify them. The stored record is "
+    "unchanged — only this wording is restated as what the app can actually check.]"
+)
+
 
 def round_metric(
     *,
@@ -95,6 +132,17 @@ def round_metric(
         raise ValueError(f"role must be 'witness' or 'selection', not {role!r}")
     if aggregate_scope == _HOLDOUT and per_site is not None:
         raise ValueError("a campaign_holdout metric must not carry a per_site map")
+    # Refusing at the WRITE site, not just correcting at the read site. Correcting on
+    # read fixes the records that already exist; this stops a new one being written
+    # with wording the project has withdrawn — a caller passing a basis string copied
+    # from an old record, which is exactly how the retracted text would come back.
+    if aggregate_basis in _RETRACTED_BASIS:
+        raise ValueError(
+            "aggregate_basis is wording withdrawn in app 0.27.15 (commit e762a17b5af5): "
+            "it asserts the split's disjointness as fact, which this app cannot verify "
+            "because split A and B arrive as caller-supplied arrays. Use "
+            f"{'SELECTION_BASIS' if role == 'selection' else 'WITNESS_BASIS'} instead."
+        )
     return {
         "role": role,
         "name": name,
@@ -789,6 +837,54 @@ def _taken_ids(merge: Dict[str, Any]) -> List[str]:
     return [m["contribution_id"] for m in merge.get("members", []) if m.get("included")]
 
 
+def corrected_metric(metric: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A metric record whose ``aggregate_basis`` is retracted wording, restated — or
+    the record exactly as given.
+
+    Returns a **copy** when it corrects and the **same object** when it does not, so
+    "was this corrected?" is answerable by identity (``out is metric``) rather than by
+    re-comparing strings. Never mutates the argument: the stored index is the
+    historical record of what the campaign published, and this is the read path.
+
+    Anything that is not a dict carrying a known-retracted string passes through
+    untouched, including ``None`` — an empty or absent metric is a normal state here
+    (``witness_metric`` is None on a merge that admitted nothing) and must not become
+    an error on a path whose job is to render.
+    """
+    if not isinstance(metric, dict):
+        return metric
+    stored = metric.get("aggregate_basis")
+    if not isinstance(stored, str):
+        return metric
+    current = _RETRACTED_BASIS.get(stored)
+    if current is None:
+        return metric
+    out = dict(metric)
+    out["aggregate_basis"] = f"{current} {BASIS_CORRECTION_NOTE}"
+    return out
+
+
+def _corrected_community(community: Any) -> Any:
+    """``current_community`` with its two metric records corrected.
+
+    This one is easy to miss: ``current_community`` is projected through
+    ``pool_wire_state`` verbatim, so it carries its own ``selection_metric`` and
+    ``witness_metric`` that are NOT the merge records corrected alongside the soups.
+    Four of the six live pools have one.
+    """
+    if not isinstance(community, dict):
+        return community
+    out = dict(community)
+    changed = False
+    for field in ("selection_metric", "witness_metric"):
+        before = community.get(field)
+        after = corrected_metric(before)
+        if after is not before:
+            out[field] = after
+            changed = True
+    return out if changed else community
+
+
 def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str, Any]:
     """Project a stored pool_index.json onto the campaign-page wire contract.
 
@@ -822,8 +918,8 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
                 "merged_at": _iso(merge.get("created_at")),
                 "assessed": _assessed_ids(merge),
                 "contributions": taken,
-                "selection_metric": merge.get("selection_metric"),
-                "witness_metric": merge.get("witness_metric"),
+                "selection_metric": corrected_metric(merge.get("selection_metric")),
+                "witness_metric": corrected_metric(merge.get("witness_metric")),
                 "global_sha256": merge.get("global_sha256"),
                 "weights": None,
                 "transport": transport,
@@ -838,7 +934,7 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
             empty_merges.append({
                 "merged_at": _iso(merge.get("created_at")),
                 "assessed": _assessed_ids(merge),
-                "selection_metric": merge.get("selection_metric"),
+                "selection_metric": corrected_metric(merge.get("selection_metric")),
                 "transport": transport,
             })
 
@@ -871,9 +967,9 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         "schema_version": SCHEMA_VERSION,
         "model_type": index.get("model_type"),
         "architecture_signature": index.get("architecture_signature"),
-        "current_community": index.get("current_community"),
+        "current_community": _corrected_community(index.get("current_community")),
         "merge_trigger": merge_trigger(),
-        "baseline_metric": baseline.get("witness_metric"),
+        "baseline_metric": corrected_metric(baseline.get("witness_metric")),
         "soups": soups,
         "empty_merges": empty_merges,
         "contributions": contributions,
