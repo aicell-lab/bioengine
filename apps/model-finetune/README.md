@@ -281,6 +281,29 @@ GPU and never builds its (multi-GB) pip env. Its model types are reported
 `get_training_capabilities()` and rejected by `infer` / `start_training` with a
 clear error. Enabling both backends is a two-GPU deployment by design.
 
+**If you get it wrong, the app now tells you.** Asking for more GPUs than the
+cluster has used to be invisible: the unplaceable runtime sits in `UPSCALING`,
+which is not a failure state and never times out, so `deploy_app` returns
+successfully and `get_app_status` reads like a slow start forever while the
+backend reports `runtime unavailable`. The CPU-only entry deployment schedules on
+any node, so it is alive to say what the GPU deployments cannot (#0370):
+
+- a `⚠ GPU placement: …` **warning in the entry's log**, which
+  `get_app_status(application_ids=[...])` already returns under
+  `deployments.<entry>.logs`, naming the GPU count, the count required and
+  `MODEL_FINETUNE_BACKENDS`;
+- a **`placement` block** on `get_training_capabilities()`, carrying
+  `{backends_enabled, gpus_required, gpus_in_cluster, sufficient, detail,
+  advice}` — so the diagnosis arrives in the same response as the
+  `runtime unavailable` symptom.
+
+`sufficient` is three-valued on purpose: `true` (enough GPUs), `false` (a real
+shortfall, and `advice` says what to set), or `null` when it cannot be told from
+here — no GPU has reported into the cluster yet, which is the normal state on an
+elastic SLURM cluster until the autoscaler provides a GPU node, or Ray's view was
+unreadable. It is a diagnostic only: it never refuses a deploy and never raises,
+because an over-subscribed cluster still serves every CPU method correctly.
+
 Pass it as a deployment env var — the guaranteed vector, since it must be visible
 when the app is introspected (an `application_env_vars` entry, or baked into a
 purpose-built worker image):

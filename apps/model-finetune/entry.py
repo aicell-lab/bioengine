@@ -21,7 +21,7 @@ import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 import bioengine
 import busy
@@ -76,6 +76,98 @@ ModelType = Literal[
 ]
 # Model types served by the isolated Cellpose runtime rather than micro-sam.
 CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
+
+# Backends that cost a GPU. Each enabled one composes a runtime deployment
+# declaring gpu_memory_mb=-1, which the worker resolves to a WHOLE device
+# (bioengine/apps/builder.py), so the app's GPU floor is simply how many of
+# these are on. Named here because _gpu_placement_report has to count them.
+GPU_BACKENDS = ("microsam", "cellpose")
+
+
+def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
+    """Whether this cluster can place the GPU runtimes the enabled backends need.
+
+    Exists because getting this wrong is otherwise INVISIBLE from the running
+    system (#0370). Two enabled backends book two whole GPUs even to serve one
+    request; on a cluster with one free GPU the second replica simply never
+    schedules, and Ray Serve reports that as ``UPSCALING`` — which is not a
+    failure state and never times out. So ``deploy_app`` returns successfully,
+    ``get_app_status`` reads like a slow first start forever, and nothing names
+    the mismatch or mentions ``MODEL_FINETUNE_BACKENDS``.
+
+    Answered from the CPU entry on purpose: the entry deployment asks for no GPU,
+    so it is the one part of the app that is still alive to say why the rest is not.
+
+    Never raises and never blocks the deploy. ``sufficient`` is deliberately
+    three-valued, because "not enough" and "cannot tell" are different answers:
+
+    ``True``   the cluster advertises at least ``gpus_required``;
+    ``False``  it advertises fewer — the deployment will pend, and ``advice``
+               says what to set;
+    ``None``   unknown. Either no GPU node has reported in yet, which is the
+               NORMAL state on an elastic SLURM cluster before the autoscaler
+               provides one, or Ray's resource view could not be read at all.
+               Not an error either way: reporting a shortfall that is merely a
+               cold autoscaler would be a false alarm, which is the failure mode
+               this whole report exists to avoid repeating in the other direction.
+    """
+    enabled = set(enabled)
+    required = len([b for b in GPU_BACKENDS if b in enabled])
+    report: Dict[str, Any] = {
+        "backends_enabled": sorted(enabled),
+        "gpus_required": required,
+        "gpus_in_cluster": None,
+        "sufficient": None,
+        "detail": "",
+        "advice": "",
+    }
+    try:
+        import ray
+
+        total = float(ray.cluster_resources().get("GPU", 0.0))
+    except Exception as e:  # pragma: no cover - needs a Ray-less replica
+        report["detail"] = (
+            f"could not read the cluster's GPU capacity ({type(e).__name__}: {e})"
+        )
+        return report
+
+    report["gpus_in_cluster"] = total
+    if required == 0:
+        report["sufficient"] = True
+        report["detail"] = "no GPU backend is enabled, so no GPU is required"
+        return report
+    if total >= required:
+        report["sufficient"] = True
+        report["detail"] = (
+            f"{total:g} GPU(s) visible, {required} required by "
+            f"{', '.join(sorted(enabled))}"
+        )
+        return report
+    if total == 0:
+        report["detail"] = (
+            "no GPU has reported into the cluster yet, so whether the "
+            f"{required} required by {', '.join(sorted(enabled))} will be "
+            "placeable cannot be told from here. On an elastic (SLURM) cluster "
+            "this is the normal state until the autoscaler provides a GPU node."
+        )
+        return report
+
+    report["sufficient"] = False
+    report["detail"] = (
+        f"this cluster advertises {total:g} GPU(s) but the enabled backends "
+        f"({', '.join(sorted(enabled))}) need {required} — each GPU runtime books "
+        "a WHOLE device. The GPU deployment(s) that cannot be placed will sit in "
+        "UPSCALING indefinitely: that is not a failure state and never times out, "
+        "so the app will look like it is still starting rather than stuck."
+    )
+    report["advice"] = (
+        "Deploy one backend: pass "
+        'application_env_vars={"*": {"MODEL_FINETUNE_BACKENDS": "cellpose"}} '
+        "(or \"microsam\") to deploy_app, or launch the worker from an image that "
+        "bakes it. Each single backend has a 1-GPU floor. See the app README, "
+        "'Selecting backends'."
+    )
+    return report
 
 # Which backends each start_training parameter actually affects. The training UI
 # reads this (via get_training_capabilities) to show a control only for the
@@ -316,6 +408,24 @@ class EntryApp:
         self._http = httpx.AsyncClient(timeout=60.0)
         self._busy.start()
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
+        self._log_gpu_placement()
+
+    def _log_gpu_placement(self) -> None:
+        """Say in the entry's own log whether the GPU runtimes can be placed (#0370).
+
+        This is the signal that was missing. The entry replica reaches HEALTHY on
+        any node, so these lines are in ``deployments.<entry>.logs`` — which
+        ``get_app_status`` already returns — while the GPU deployments the operator
+        is actually staring at are still reporting ``UPSCALING`` with no reason
+        attached. A warning only: an over-subscribed cluster is a deployment
+        mistake to be told about, not a reason to refuse to serve the CPU methods
+        that work fine.
+        """
+        report = _gpu_placement_report(self._enabled_backends)
+        if report["sufficient"] is False:
+            logger.warning(f"⚠ GPU placement: {report['detail']} {report['advice']}")
+        else:
+            logger.info(f"GPU placement: {report['detail']}")
 
     @bioengine.health_check
     async def _health(self) -> None:
@@ -963,7 +1073,15 @@ class EntryApp:
         CPU-side without waking a GPU), ``detected`` (live runtime probe),
         ``unavailable`` (backend runtime down → ``trainable`` is None), or
         ``disabled`` (backend not deployed on this worker → ``trainable`` is
-        False)."""
+        False).
+
+        Also returns ``placement``, which says whether this cluster has enough
+        GPUs for the backends that are enabled — each GPU runtime books a whole
+        device, so two backends need two GPUs. When it does not,
+        ``placement.sufficient`` is False and ``placement.advice`` names
+        ``MODEL_FINETUNE_BACKENDS``; without it the only symptom is a backend
+        reading ``unavailable`` forever while the deployment reports
+        ``UPSCALING``, which never times out (#0370)."""
         import training
 
         microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
@@ -998,6 +1116,11 @@ class EntryApp:
             },
             "models": models,
             "parameters": self._training_parameter_schema(),
+            # Why a backend reads 'runtime unavailable' when nothing is broken
+            # (#0370): on a cluster with fewer GPUs than enabled backends the
+            # runtime never schedules, and the only other symptom is a permanent
+            # UPSCALING that never times out. Answered CPU-side; never wakes a GPU.
+            "placement": _gpu_placement_report(self._enabled_backends),
         }
 
     def _training_parameter_schema(self) -> List[Dict[str, Any]]:
