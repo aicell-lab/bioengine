@@ -20,6 +20,7 @@ unit-testable and free of transport concerns.
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -213,6 +214,157 @@ def state_dict_digest(state_dict: Dict[str, Any]) -> str:
         h.update(f"{name}|{tuple(t.shape)}|{t.dtype}|".encode("utf-8"))
         h.update(t.detach().cpu().contiguous().numpy().tobytes())
     return h.hexdigest()
+
+
+# ── which of the two digests a stored value is ───────────────────────────────
+# The published head digest (``merges[].global_sha256``, the
+# ``current_community.sha256`` copy of it and the ``weights_sha256`` copy in each
+# community manifest — one value written once, copied three ways) digested the FILE
+# ``torch.save`` wrote before commit d3040c4f8165 (app 0.27.12) and digests the
+# TENSORS after it. Same field name, same type, same 64-hex shape, so the value
+# alone does not say which. A contributor who re-merges an identical member set
+# gets a tensor digest, compares it against a stored file digest, and the only
+# conclusion available to them is that the community model is corrupt. It is not:
+# the two numbers were never answers to the same question. These constants make
+# both meanings nameable and ``digest_provenance`` attributes a stored value to one
+# of them — or declines to, which is the point.
+
+DIGEST_BASIS_TENSORS = "state_dict_tensors"
+DIGEST_BASIS_FILE = "torch_save_file"
+DIGEST_BASIS_UNDETERMINED = "undetermined"
+# A record with no digest at all (a merge that admitted nothing publishes no head).
+# Kept apart from "undetermined" on purpose: "there is no value to attribute" and
+# "the value cannot be attributed" are different answers and collapsing them would
+# hide the second behind the first.
+DIGEST_BASIS_ABSENT = "no_digest"
+
+# What ``state_dict_digest`` above computes TODAY, stamped onto every new record so
+# that a reader after the NEXT change to it never has to date-reason the way this
+# module has to for pre-0.27.12 records. Change this in the SAME commit that changes
+# ``state_dict_digest``: test_digest_basis.py pins that function's output against a
+# golden vector, so a change which forgets this constant fails there.
+CURRENT_DIGEST_BASIS = DIGEST_BASIS_TENSORS
+
+# 2026-10-26T08:43:26Z — commit d3040c4f8165, which introduced state_dict_digest.
+# Strictly BEFORE this instant the tensor-digest code did not exist anywhere, so a
+# record written then carries a file digest with certainty. At or after it nothing
+# follows: a pool can be served by a worker still running an older app build, so a
+# late timestamp is UNDETERMINED rather than evidence of the new meaning. The
+# asymmetry is deliberate — resolving the late side to the new meaning would be
+# exactly the silent default this exists to remove, one version later.
+# Read with `git show -s --format=%ct d3040c4f8165`, not by hand: a value derived by
+# re-parsing the date is a year out at a glance and still resolves every real stored
+# record to "undetermined", i.e. it looks like a working fix that attributes nothing.
+# test_digest_basis.py keeps an independent copy and pins the eight live records
+# against it, so a wrong constant here fails there rather than in production.
+TENSOR_DIGEST_SINCE = 1793004206.0
+TENSOR_DIGEST_SINCE_APP_VERSION = "0.27.12"
+
+# Published next to the digest. This is the text that stands between a contributor
+# and the conclusion that an intact community model is corrupt, so it says what the
+# number is, whether re-merging reproduces it, and what to do when it does not.
+DIGEST_BASIS_NOTES = {
+    DIGEST_BASIS_TENSORS: (
+        "sha256 over the checkpoint's keys, shapes, dtypes and raw weight bytes in "
+        "sorted key order. Reproducible by construction: re-merging the same members "
+        "in the same order yields this value again, so a mismatch is evidence about "
+        "the weights."
+    ),
+    DIGEST_BASIS_FILE: (
+        "sha256 over the .pt file torch.save wrote, which this app named "
+        "head-<random>.pt before version "
+        f"{TENSOR_DIGEST_SINCE_APP_VERSION}. torch's zip container embeds that random "
+        "stem in every record name, so the digest is a function of the filename: "
+        "re-merging the same members CANNOT reproduce it, and a mismatch against it "
+        "is not evidence about the weights. Compare the weights themselves, or "
+        "re-merge and compare against a digest recorded as "
+        f"'{DIGEST_BASIS_TENSORS}'."
+    ),
+    DIGEST_BASIS_UNDETERMINED: (
+        "this record does not say which digest the value is, and it was written late "
+        "enough that the timestamp cannot settle it either — the app may have been "
+        "running either build. Treat a mismatch against it as UNEXPLAINED, not as "
+        "evidence about the weights."
+    ),
+    DIGEST_BASIS_ABSENT: (
+        "no head digest on this record: this merge admitted nothing, so no community "
+        "checkpoint was published and there is no value to attribute."
+    ),
+}
+
+# Whether re-merging an identical member set reproduces the stored value. None is a
+# third state, not a false: "we do not know" must not render as "no".
+_DIGEST_REPRODUCIBLE = {
+    DIGEST_BASIS_TENSORS: True,
+    DIGEST_BASIS_FILE: False,
+    DIGEST_BASIS_UNDETERMINED: None,
+    DIGEST_BASIS_ABSENT: None,
+}
+
+
+def digest_basis(
+    record: Optional[Dict[str, Any]],
+    *,
+    digest_key: str = "global_sha256",
+    basis_key: Optional[str] = None,
+    created_at_key: str = "created_at",
+) -> str:
+    """Which of the two digests ``record[digest_key]`` is, from the record alone.
+
+    Resolution order, each step refusing rather than guessing:
+
+    1. no digest stored                       -> ``DIGEST_BASIS_ABSENT``
+    2. an explicit basis field this build
+       recognises                             -> that basis
+    3. an explicit basis field it does NOT
+       recognise (written by a newer app)     -> ``DIGEST_BASIS_UNDETERMINED``
+    4. no basis field, ``created_at`` finite
+       and strictly before TENSOR_DIGEST_SINCE-> ``DIGEST_BASIS_FILE``
+    5. anything else                          -> ``DIGEST_BASIS_UNDETERMINED``
+
+    Step 4 is one-directional by construction. A timestamp before the cutoff proves
+    the file meaning because the tensor-digest code did not yet exist; a timestamp
+    after it proves nothing, because deployment lags the commit. There is no input
+    for which this returns ``DIGEST_BASIS_TENSORS`` on timestamp evidence alone.
+    """
+    if not isinstance(record, dict):
+        return DIGEST_BASIS_UNDETERMINED
+    if basis_key is None:
+        basis_key = f"{digest_key}_basis"
+    if not record.get(digest_key):
+        return DIGEST_BASIS_ABSENT
+    stated = record.get(basis_key)
+    if stated in (DIGEST_BASIS_TENSORS, DIGEST_BASIS_FILE):
+        return stated
+    if stated is not None:
+        return DIGEST_BASIS_UNDETERMINED
+    try:
+        written_at = float(record.get(created_at_key))
+    except (TypeError, ValueError):
+        return DIGEST_BASIS_UNDETERMINED
+    if not math.isfinite(written_at):
+        return DIGEST_BASIS_UNDETERMINED
+    if written_at < TENSOR_DIGEST_SINCE:
+        return DIGEST_BASIS_FILE
+    return DIGEST_BASIS_UNDETERMINED
+
+
+def digest_provenance(
+    record: Optional[Dict[str, Any]], **kwargs: Any
+) -> Dict[str, Any]:
+    """``digest_basis`` plus the two things a reader needs to act on it: whether a
+    re-merge reproduces the value, and the sentence that explains a mismatch.
+
+    Published alongside every digest the app hands out, so the explanation travels
+    with the number instead of living in a document the reader has to already know
+    about. Takes the same keyword arguments as ``digest_basis``.
+    """
+    basis = digest_basis(record, **kwargs)
+    return {
+        "basis": basis,
+        "reproducible_by_re_merge": _DIGEST_REPRODUCIBLE[basis],
+        "note": DIGEST_BASIS_NOTES[basis],
+    }
 
 
 # Entries that live in a cpsam state_dict but are data statistics rather than
@@ -760,6 +912,11 @@ def build_community_manifest(
         "members": members,
         "architecture_signature": architecture_signature,
         "weights_sha256": weights_sha256,
+        # Stamped from the constant rather than taken as an argument: the app that
+        # writes the record is the only thing that knows which digest its own
+        # materialize_soup just computed, and a caller-supplied basis could disagree
+        # with the bytes. See CURRENT_DIGEST_BASIS for the lock-step rule.
+        "weights_sha256_basis": CURRENT_DIGEST_BASIS,
         "created_at": created_at,
     }
 
@@ -783,6 +940,10 @@ def set_current_community(
         "version": community_version,
         "path": weights_path,
         "sha256": sha256,
+        # This pointer is a copy of the merge's digest and carries no created_at of
+        # its own, so without this stamp it is the one surface of the three that
+        # cannot be attributed from the record alone. Written unconditionally.
+        "sha256_basis": CURRENT_DIGEST_BASIS,
         "selection_metric": selection_metric,
         "witness_metric": witness_metric,
     }
@@ -827,6 +988,32 @@ def _iso(ts: Optional[float]) -> Optional[str]:
         return None
     dt = datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _current_community_provenance(index: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Attribute ``current_community.sha256``, which carries no timestamp of its own.
+
+    The pointer is a copy of one merge's digest written by ``set_current_community``,
+    and before this change it recorded neither a basis nor a ``created_at`` — so it is
+    the one surface of the three that cannot be dated from itself. Borrow both from
+    the merge that published this version. If no merge matches, nothing is borrowed
+    and ``digest_basis`` reaches its own undetermined branch; the join is never
+    allowed to invent a basis the timeline does not support.
+    """
+    cur = index.get("current_community")
+    if not isinstance(cur, dict):
+        return None
+    record = dict(cur)
+    if record.get("sha256_basis") is None or record.get("created_at") is None:
+        for merge in index.get("merges") or []:
+            published = merge.get("published_version")
+            if published and published == record.get("version"):
+                if record.get("created_at") is None:
+                    record["created_at"] = merge.get("created_at")
+                if record.get("sha256_basis") is None:
+                    record["sha256_basis"] = merge.get("global_sha256_basis")
+                break
+    return digest_provenance(record, digest_key="sha256")
 
 
 def _assessed_ids(merge: Dict[str, Any]) -> List[str]:
@@ -898,6 +1085,13 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
     merges = index.get("merges", [])
 
     soups: List[Dict[str, Any]] = []
+    # Which of the two digests each published head's global_sha256 is. Kept BESIDE
+    # soups[] rather than inside it: the soup record's field set is the page's
+    # 0.13.0-draft contract, pinned key-for-key against its fixture corpus
+    # (test_pool.py::test_soup_key_set), and a backend that quietly widens it is the
+    # mismatch SCHEMA_VERSION exists to make visible. This is an additive top-level
+    # key the page can adopt without a draft bump, joined on soup_id.
+    digest_provenance_by_soup: Dict[str, Any] = {}
     empty_merges: List[Dict[str, Any]] = []
     merged_into: Dict[str, str] = {}
     cumulative = 0
@@ -907,6 +1101,7 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         }
         if merge.get("published_version"):
             soup_id = f"soup-{len(soups)}"
+            digest_provenance_by_soup[soup_id] = digest_provenance(merge)
             taken = _taken_ids(merge)
             cumulative += len(taken)
             for cid in taken:
@@ -963,14 +1158,38 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         })
 
     baseline = index.get("baseline") or {}
+    # Two independent corrections land on this one projection and both have to survive:
+    # _corrected_community (#0418) rewrites the pointer's own selection_metric and
+    # witness_metric, which are NOT the merge records corrected alongside the soups,
+    # while sha256_provenance (#0417) says which of the two digests the pointer's sha256
+    # is. They are orthogonal, and the order between them is interchangeable — measured,
+    # not assumed: reversing these two statements leaves the app suite identical at 229
+    # passed, 2 skipped, because _corrected_community copies with dict(community) and so
+    # carries an already-attributed key through. The order below is the one that needs a
+    # single isinstance guard: _corrected_community returns a non-dict unchanged, so
+    # correcting first lets one guard cover the spread, whereas attributing first needs
+    # its own guard before the spread and another pass afterwards.
+    current_community = _corrected_community(index.get("current_community"))
+    if isinstance(current_community, dict):
+        current_community = {
+            **current_community,
+            "sha256_provenance": _current_community_provenance(index),
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "model_type": index.get("model_type"),
         "architecture_signature": index.get("architecture_signature"),
-        "current_community": _corrected_community(index.get("current_community")),
+        "current_community": current_community,
         "merge_trigger": merge_trigger(),
         "baseline_metric": corrected_metric(baseline.get("witness_metric")),
         "soups": soups,
         "empty_merges": empty_merges,
         "contributions": contributions,
+        # Additive, outside every field set the page pins. ``soups`` is keyed by
+        # soup_id; empty merges are absent from it because they publish no head and
+        # their projection carries no digest to attribute.
+        "digest_provenance": {
+            "soups": digest_provenance_by_soup,
+            "current_community": _current_community_provenance(index),
+        },
     }

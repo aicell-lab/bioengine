@@ -1865,12 +1865,19 @@ class EntryApp:
             "version": manifest.get("community_version", community_version),
             "path": paths["weights"],
             "sha256": manifest.get("weights_sha256"),
-            # A published manifest is a SECOND stored surface carrying the basis
-            # wording 0.27.15 retracted, and it does not pass through
-            # pool_wire_state — so correcting only the pool index would leave a
-            # contributor reading a named community version the withdrawn claim.
-            # Corrected at this chokepoint because both callers come through here.
-            # #0418.
+            # A published manifest is the SECOND stored surface reached only from here —
+            # it does not pass through pool_wire_state — so both of the corrections that
+            # the pool index gets have to be repeated at this chokepoint or they are
+            # absent from every named community version. Both callers come through here.
+            #
+            # #0417: the manifest carries this digest too, so say which of the two it is.
+            # It has its own created_at, so no join is needed.
+            # #0418: the manifest also carries the basis wording 0.27.15 retracted, so
+            # correcting only the pool index would still leave a contributor reading the
+            # withdrawn claim off a named version.
+            "sha256_provenance": pool.digest_provenance(
+                manifest, digest_key="weights_sha256"
+            ),
             "selection_metric": pool.corrected_metric(manifest.get("selection_metric")),
             "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
@@ -2489,7 +2496,12 @@ class EntryApp:
                 "published_version": new_version, "baseline_version": baseline_version,
                 "members": members_record,
                 "selection_metric": sel_metric, "witness_metric": wit_metric,
-                "global_sha256": head_sha, "transport": merge_transport,
+                "global_sha256": head_sha,
+                # Written unconditionally, null included: a basis that is absent when
+                # there is no digest reads the same as one absent because the app
+                # predates the stamp, which is the ambiguity it exists to remove.
+                "global_sha256_basis": pool.CURRENT_DIGEST_BASIS if head_sha else None,
+                "transport": merge_transport,
                 "deferred": deferred_ids, "created_at": time.time(),
             })
             async with self._staged(am, pool_artifact_id):
@@ -2511,6 +2523,16 @@ class EntryApp:
             "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
+            # The digest of the head this call just published, and which of the two
+            # things it digests. This is the moment the #0417 false alarm happens —
+            # someone re-merges an identical member set, gets a number, compares it
+            # against a stored one and concludes corruption — so the attribution is
+            # returned here, where both numbers are in the caller's hands, and not
+            # only on a page they would have to go and read.
+            "global_sha256": head_sha,
+            "global_sha256_provenance": pool.digest_provenance(
+                {"global_sha256": head_sha, "global_sha256_basis": pool.CURRENT_DIGEST_BASIS}
+            ),
             "witness_metric": round(head_b, 4) if head_b is not None else None,
             "baseline": baseline,
             "n_members": len(s_ids),
