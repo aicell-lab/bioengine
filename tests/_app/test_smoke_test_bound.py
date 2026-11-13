@@ -127,6 +127,11 @@ def test_the_smoke_test_docstring_does_not_promise_a_traffic_gate() -> None:
     assert "two ``health_check_period_s``" in doc
     # Condemnation, not admission, is what the status change tracks.
     assert "still reads ``HEALTHY`` for that window" in doc
+    # That window bounds one replica, not the exposure: the replacement
+    # repeats the cycle, which is what an e2e probe measured (22 distinct
+    # serving pids over 100 periods). Dropping this sentence restores the
+    # "bounded window" reading the row was filed to remove.
+    assert "restart loop" in doc
 
     # ``async_init`` is the hook that really does gate traffic: Serve awaits
     # its first ``check_health`` inside replica initialisation, so the
