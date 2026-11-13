@@ -32,10 +32,8 @@ import logging
 import pytest
 from hypha_rpc.rpc import RemoteException
 
-from bioengine.apps.manager import (
-    _ReconnectingArtifactManager,
-    _stale_proxy_kind,
-)
+from bioengine.apps.manager import _ReconnectingArtifactManager
+from bioengine.utils.stale_service import stale_service_kind
 
 logger = logging.getLogger("test-artifact-manager")
 
@@ -123,29 +121,34 @@ def _remote_exception(rvalue: str, rtrace: str) -> RemoteException:
 
 def test_send_side_failures_are_known_to_have_never_landed():
     assert (
-        _stale_proxy_kind(RuntimeError("Failed to send the request when calling method"))
+        stale_service_kind(
+            RuntimeError("Failed to send the request when calling method")
+        )
         == "never_sent"
     )
     assert (
-        _stale_proxy_kind(RuntimeError("WebSocket reconnection timed out"))
+        stale_service_kind(RuntimeError("WebSocket reconnection timed out"))
         == "never_sent"
     )
 
 
 def test_failures_that_may_have_landed_are_classified_separately():
-    assert _stale_proxy_kind(asyncio.TimeoutError()) == "maybe_sent"
+    assert stale_service_kind(asyncio.TimeoutError()) == "maybe_sent"
     assert (
-        _stale_proxy_kind(ConnectionError("Client disconnected: ws/abc")) == "maybe_sent"
+        stale_service_kind(ConnectionError("Client disconnected: ws/abc"))
+        == "maybe_sent"
     )
     assert (
-        _stale_proxy_kind(RuntimeError("Method call timed out: ws/abc:services.x.read"))
+        stale_service_kind(
+            RuntimeError("Method call timed out: ws/abc:services.x.read")
+        )
         == "maybe_sent"
     )
 
 
 def test_ordinary_errors_are_not_stale_proxy_failures():
-    assert _stale_proxy_kind(ValueError("artifact not found")) is None
-    assert _stale_proxy_kind(PermissionError("denied")) is None
+    assert stale_service_kind(ValueError("artifact not found")) is None
+    assert stale_service_kind(PermissionError("denied")) is None
 
 
 def test_a_remote_failure_is_never_treated_as_unsent():
@@ -164,7 +167,7 @@ def test_a_remote_failure_is_never_treated_as_unsent():
         "(ws/other:services.x.notify)\n",
     )
 
-    assert _stale_proxy_kind(exc) is None
+    assert stale_service_kind(exc) is None
 
 
 # ===== pass-through =====
