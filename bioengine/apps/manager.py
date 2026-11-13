@@ -340,6 +340,26 @@ def public_app_status(status: Dict[str, Any]) -> Dict[str, Any]:
     return public
 
 
+def _require_deployment_map(value: Any, parameter: str) -> Dict[str, Any]:
+    """Return a public deployment-keyed map, refusing anything that is not one.
+
+    Replaces the ``value or {}`` idiom these parameters used to normalise with.
+    ``or {}`` only rescues the FALSY wrong types: a truthy non-dict passes
+    straight through and dies on the next ``.get()``/``.items()`` with an
+    AttributeError naming neither the parameter nor the value (#0406). The
+    ``@schema_method`` annotations document the shape but do not enforce it, so
+    this is the only check between an RPC caller and that crash.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{parameter} must be a dict keyed by deployment name, or None; "
+            f"got {type(value).__name__}."
+        )
+    return value
+
+
 def _validate_scaling_map(
     scaling: Optional[Dict[str, Any]],
     user_deployment_names: Tuple[str, ...],
@@ -352,15 +372,7 @@ def _validate_scaling_map(
     rather than one naming the ``scaling`` entry they got wrong, which is the
     whole reason this validation exists.
     """
-    # The map itself, before its entries: `(scaling or {}).items()` raises a bare
-    # AttributeError on a truthy non-dict and silently accepts a falsy one, so
-    # `scaling=0` used to clear every check below without being looked at.
-    if scaling is not None and not isinstance(scaling, dict):
-        raise ValueError(
-            f"scaling must be a dict of {{deployment_name: {{...}}}} or None; "
-            f"got {type(scaling).__name__}."
-        )
-    for dep_name, dep_scaling in (scaling or {}).items():
+    for dep_name, dep_scaling in _require_deployment_map(scaling, "scaling").items():
         if dep_name not in user_deployment_names:
             raise ValueError(
                 f"scaling key '{dep_name}' is not a user deployment in "
@@ -409,53 +421,43 @@ def _validate_scaling_map(
                 )
 
 
-_DEPLOYMENT_LOGS_OVERRIDE_KEYS = ("logs_tail", "n_previous_replica")
+_DEPLOYMENT_LOG_KEYS = ("logs_tail", "n_previous_replica")
 
 
-def _validate_deployment_logs_overrides(
-    deployment_logs: Optional[Dict[str, Any]],
+def _validate_deployment_logs_map(
+    deployment_logs: Optional[Dict[str, Dict[str, int]]],
 ) -> None:
-    """Reject a ``deployment_logs`` map before it reaches ``_get_deployment_status``.
+    """Reject a ``deployment_logs`` map before it reaches the proxy actor.
 
-    ``@schema_method`` publishes the declared ``Dict[str, Dict[str, int]]`` as a
-    schema but does not enforce it: hypha_rpc coerces an argument only when its
-    annotation is a pydantic model, so a bool arrives unchanged and surfaces three
-    frames in as ``AttributeError: 'bool' object has no attribute 'get'``, naming
-    neither the parameter nor the type. Entries are checked too, not just the map
-    — a non-dict entry crashes identically one frame later.
+    A pure helper so the boundary is testable without a cluster, like
+    ``_validate_scaling_map``. Unknown keys are refused rather than ignored for
+    the same reason unknown ``autoscaling_config`` keys are: ``override.get()``
+    drops them in silence, so ``{"logs_tails": 200}`` returns the default 30
+    lines and reads as the override having been applied.
     """
-    if deployment_logs is None:
-        return
-    if not isinstance(deployment_logs, dict):
-        raise ValueError(
-            f"deployment_logs must be a dict of {{deployment_name: "
-            f"{{logs_tail, n_previous_replica}}}} or None; got "
-            f"{type(deployment_logs).__name__}. Logs are already returned by "
-            f"default — pass it only to override logs_tail or "
-            f"n_previous_replica for a named deployment."
-        )
-    for deployment_name, override in deployment_logs.items():
+    for dep_name, override in _require_deployment_map(
+        deployment_logs, "deployment_logs"
+    ).items():
         if not isinstance(override, dict):
             raise ValueError(
-                f"deployment_logs entry for '{deployment_name}' must be a dict "
-                f"of {{logs_tail, n_previous_replica}}; got "
+                f"deployment_logs entry for '{dep_name}' must be a dict; got "
                 f"{type(override).__name__}."
             )
-        unknown_keys = sorted(set(override) - set(_DEPLOYMENT_LOGS_OVERRIDE_KEYS))
+        unknown_keys = sorted(set(override) - set(_DEPLOYMENT_LOG_KEYS))
         if unknown_keys:
             raise ValueError(
-                f"deployment_logs entry for '{deployment_name}' has unknown "
-                f"key(s) {unknown_keys}; they would be ignored silently and the "
-                f"top-level defaults used instead. Valid keys: "
-                f"{sorted(_DEPLOYMENT_LOGS_OVERRIDE_KEYS)}."
+                f"deployment_logs entry for '{dep_name}' has unknown key(s) "
+                f"{unknown_keys}; they would be ignored in silence. Valid "
+                f"keys: {list(_DEPLOYMENT_LOG_KEYS)}."
             )
         for key, value in override.items():
-            # bool is an int subclass, so `logs_tail=True` would pass an
-            # isinstance check and quietly request one line of logs.
-            if isinstance(value, bool) or not isinstance(value, int):
+            # No lower bound: proxy_actor.get_deployment_logs documents -1 as
+            # "the entire log" for tail and "all dead replicas" for
+            # n_previous_replica, so a >= 0 check would refuse a real feature.
+            if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(
-                    f"deployment_logs entry for '{deployment_name}' has "
-                    f"{key}={value!r}; must be an int."
+                    f"deployment_logs entry for '{dep_name}' has {key}="
+                    f"{value!r}; must be an int."
                 )
 
 
@@ -3333,6 +3335,13 @@ class AppsManager:
             # Caller identity and admin users for injection into authorized_users by the builder
             user_email = context["user"].get("email", "")
 
+            # scaling's TYPE is checked here, not in _validate_scaling_map below:
+            # that one also checks the keys against the user @bioengine.app class
+            # names, which only exist after build() has minted a Hypha token and
+            # run the introspect Ray task. A wrong type would otherwise cost all
+            # of that before raising.
+            _require_deployment_map(scaling, "scaling")
+
             # Validate application_kwargs
             if not isinstance(application_kwargs, dict):
                 raise ValueError(
@@ -3826,7 +3835,7 @@ class AppsManager:
             app = await get_app_status(application_ids=["app1"])
             # Returns: {...} (single app status, not {"app1": {...}})
         """
-        _validate_deployment_logs_overrides(deployment_logs)
+        _validate_deployment_logs_map(deployment_logs)
 
         # Determine which applications to check
         if application_ids is None:
