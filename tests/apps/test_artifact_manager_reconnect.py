@@ -170,6 +170,21 @@ def test_a_remote_failure_is_never_treated_as_unsent():
     assert stale_service_kind(exc) is None
 
 
+def test_the_servers_own_routing_refusal_is_classified():
+    """Measured against a live server (#0407): the shape this module exists for.
+
+    A handle resolved by name whose target client has gone fails neither
+    send-side nor by timeout — the server answers with an error envelope, so it
+    arrives as a ``RemoteException`` like the test above. It carries no remote
+    traceback, because nothing ran, and that is what tells the two apart.
+    """
+    refusal = RemoteException(
+        "RemoteError:Target peer bioimage-io/bdeNa83tqUgQbsxJLsSP2m is not connected\n"
+    )
+
+    assert stale_service_kind(refusal) == "never_sent"
+
+
 # ===== pass-through =====
 
 
@@ -235,6 +250,57 @@ async def test_a_send_side_failure_re_resolves_and_retries():
 
     assert server.resolutions == 1
     assert result["served_by"] == "fresh", "the retry must use the new proxy"
+
+
+@pytest.mark.asyncio
+async def test_the_servers_routing_refusal_re_resolves_and_retries():
+    """On ``origin/main`` this raised instead, and nothing was re-resolved.
+
+    The live counterpart was run against ``https://hypha.aicell.io`` for #0407:
+    the same refusal, the real ``public/artifact-manager`` re-resolved, and the
+    retry returned the artifact. This pins it without a server.
+    """
+    dead = _Proxy(
+        "dead",
+        fails_with=RemoteException(
+            "RemoteError:Target peer bioimage-io/bdeNa83tqUgQbsxJLsSP2m is not "
+            "connected\n"
+        ),
+    )
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    result = await am.read("ws/my-app")
+
+    assert server.resolutions == 1
+    assert result["served_by"] == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_a_routing_refusal_on_a_write_is_retried_because_nothing_ran():
+    """The counterpart to the timed-out-write guard below.
+
+    A refusal is ``never_sent``, so unlike a timeout it carries no risk of
+    double-execution — measured for #0407 from an invocation log that did not
+    move. Refusing to retry here would leave a write failing for a handle the
+    wrapper had already replaced.
+    """
+    dead = _Proxy(
+        "dead",
+        fails_with=RemoteException(
+            "RemoteError:Target peer bioimage-io/dead-client is not connected\n"
+        ),
+    )
+    fresh = _Proxy("fresh")
+    server = _Server(fresh)
+    am = _wrap(server, dead)
+
+    result = await am.commit("ws/my-app")
+
+    assert server.resolutions == 1
+    assert result["served_by"] == "fresh"
+    assert fresh.calls == [("commit", "ws/my-app")]
 
 
 @pytest.mark.asyncio
