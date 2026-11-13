@@ -29,16 +29,31 @@ import types
 
 import entry
 
+_SAME = object()
+"""Sentinel for "free == total", kept distinct from ``None``, which means the
+resource view omits the GPU key entirely — a different case with a different answer."""
 
-def _with_cluster_gpus(monkeypatch, total):
-    """Make ``import ray`` inside the report see a cluster with ``total`` GPUs.
+
+def _with_cluster_gpus(monkeypatch, total, free=_SAME):
+    """Make ``import ray`` inside the report see a cluster with ``total`` GPUs, of
+    which ``free`` are unbooked.
+
+    The two views are SEPARATE arguments on purpose: ``cluster_resources()`` is the
+    total and ``available_resources()`` is what is free, and the report keys its
+    verdict to the first while reporting the second. A harness that set only a total
+    could not express the shape the row was filed about — deNBI, 4 GPUs, 0 free —
+    which is the gap the re-review found (#0370). ``free`` defaults to ``total``,
+    i.e. an idle cluster, so a case that is not about the distinction stays short.
 
     ``entry`` does not import ray at module scope — the report imports it lazily so a
     diagnostic can never be what stops the app loading — so the stub goes in
     ``sys.modules`` and monkeypatch removes it again.
     """
+    if free is _SAME:
+        free = total
     fake = types.ModuleType("ray")
     fake.cluster_resources = lambda: ({"CPU": 8.0} if total is None else {"CPU": 8.0, "GPU": total})
+    fake.available_resources = lambda: ({"CPU": 8.0} if free is None else {"CPU": 8.0, "GPU": free})
     monkeypatch.setitem(sys.modules, "ray", fake)
 
 
@@ -73,6 +88,8 @@ def _ray_unimportable(monkeypatch):
             raise RuntimeError("ray is not initialised in this process")
 
     broken.cluster_resources = _Boom().__getattr__
+    # BOTH views, so the promise holds whichever of the two the report reads first.
+    broken.available_resources = _Boom().__getattr__
     monkeypatch.setitem(sys.modules, "ray", broken)
 
 
@@ -161,6 +178,67 @@ def test_a_cluster_advertising_no_gpu_key_is_unknown_too(monkeypatch) -> None:
     assert report["gpus_in_cluster"] == 0.0
 
 
+def test_a_cluster_that_owns_enough_but_has_none_free_names_the_free_count(monkeypatch) -> None:
+    """deNBI's measured shape, and the case the first version of this report got wrong.
+
+    4 GPUs owned, 0 free (read from that worker's own ``get_status()`` → the
+    ``ray_cluster.nodes`` block, 2026-11-13), both backends enabled. The report read
+    only ``cluster_resources()``, so it printed a reassuring *"4 GPU(s) visible, 2
+    required"* on exactly the cluster whose runtimes were pending — a true sentence
+    that answers the wrong question.
+
+    The two views are set DIFFERENTLY here, which is what makes this arm able to see
+    the defect at all: with ``free`` defaulted to ``total`` every other case in this
+    file passes either implementation.
+    """
+    _with_cluster_gpus(monkeypatch, 4.0, free=0.0)
+    report = entry._gpu_placement_report({"microsam", "cellpose"})
+
+    assert report["gpus_in_cluster"] == 4.0
+    assert report["gpus_free"] == 0.0
+    # The free figure must be IN the operator-facing sentence, not only in a key
+    # nobody reads: the log line is `detail` and nothing else.
+    assert "0 free" in report["detail"], (
+        f"detail does not name the free count, so the log line still reads as "
+        f"reassurance on a cluster whose runtimes pend: {report['detail']!r}"
+    )
+    assert "pend" in report["detail"]
+
+    # DELIBERATELY unchanged, and this is the half that is easy to get wrong in the
+    # other direction (#0370 re-review): a free shortfall is NOT a shortfall. The
+    # cluster owns enough, this app's own replicas are part of what books the
+    # devices, and an elastic cluster is momentarily 0-free between jobs. Escalating
+    # it would make the diagnostic fire at itself.
+    assert report["sufficient"] is True
+    assert report["advice"] == ""
+
+
+def test_a_real_shortfall_and_a_merely_busy_cluster_do_not_read_alike(monkeypatch) -> None:
+    """DISCRIMINATOR for the test above. Reporting the free count is only worth
+    anything if the two situations still come apart: owning too few is a configuration
+    mistake with a remedy, owning enough but being busy is neither."""
+    _with_cluster_gpus(monkeypatch, 1.0, free=0.0)
+    short = entry._gpu_placement_report({"microsam", "cellpose"})
+    _with_cluster_gpus(monkeypatch, 4.0, free=0.0)
+    busy = entry._gpu_placement_report({"microsam", "cellpose"})
+
+    assert short["sufficient"] is False and busy["sufficient"] is True
+    assert "MODEL_FINETUNE_BACKENDS" in short["advice"]
+    assert busy["advice"] == ""
+    assert short["detail"] != busy["detail"]
+
+
+def test_the_free_count_is_reported_on_a_cluster_with_room_to_spare(monkeypatch) -> None:
+    """The other arm of the same key: ``gpus_free`` is populated whenever the view was
+    readable, not only when it is short. A field present only on the bad path cannot be
+    read by anything that polls."""
+    _with_cluster_gpus(monkeypatch, 4.0, free=3.0)
+    report = entry._gpu_placement_report({"cellpose"})
+    assert report["sufficient"] is True
+    assert report["gpus_free"] == 3.0
+    assert "3 free" in report["detail"]
+
+
 def test_a_fractional_shortfall_still_reads_insufficient(monkeypatch) -> None:
     """A GPU already fractionally booked by another app leaves <1.0 advertised; the
     runtime needs a whole device, so this is a shortfall and not a near miss."""
@@ -182,6 +260,9 @@ def test_an_unreadable_ray_view_degrades_instead_of_raising(monkeypatch) -> None
     report = entry._gpu_placement_report({"microsam", "cellpose"})
     assert report["sufficient"] is None
     assert report["gpus_in_cluster"] is None
+    # Both keys present and null rather than absent — an absent key reads as a
+    # finding to anything that does `.get()` and compares.
+    assert report["gpus_free"] is None
     assert "could not read" in report["detail"]
     # The part that needs no cluster must still be answered.
     assert report["gpus_required"] == 2
@@ -196,6 +277,73 @@ def test_no_gpu_backend_enabled_needs_no_gpu(monkeypatch) -> None:
 
 
 # ── the two places it is surfaced ───────────────────────────────────────────
+
+
+def _async_init_source() -> str:
+    """The body of the entry's ``@bioengine.async_init`` coroutine, read off disk.
+
+    Text rather than ``inspect``, for the same reason
+    ``test_the_declaration_this_row_is_about_is_unchanged`` reads off disk: this must
+    hold in an environment where neither ML stack is installed, and
+    ``bioengine.async_init`` wraps the function so what is reachable through the class
+    is not guaranteed to be the source.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).parent / "entry.py").read_text()
+    marker = "@bioengine.async_init"
+    assert src.count(marker) == 1, (
+        f"CONTROL: expected exactly one {marker} in entry.py, found {src.count(marker)}"
+        " — this slice no longer identifies the startup coroutine"
+    )
+    rest = src[src.index(marker) + len(marker) :]
+    end = rest.index("\n    @")  # the next method decorator ends the block
+    return rest[:end]
+
+
+def test_the_placement_log_is_actually_called_at_startup() -> None:
+    """The warning is worth writing only if something writes it (#0370, re-review).
+
+    Replacing ``self._log_gpu_placement()`` in ``_connect`` with ``pass`` left the
+    whole suite green at 139 passed, while a comment-only control arm was also green
+    and six other mutation arms went red — so the harness discriminated and this was a
+    real hole, not a quiet arm.
+    ``test_the_entry_logs_a_warning_only_on_a_real_shortfall`` cannot see it: it binds
+    the method with ``__get__(inst)`` and so exercises the helper, never the wiring.
+    A grep for the call site existed, but outside the repo, where CI never runs it — and
+    a report nothing calls is indistinguishable from no report at all, which is this
+    row's whole subject.
+
+    Asserted against the startup coroutine specifically, not the file: the call
+    surviving somewhere else in ``entry.py`` is not the thing that makes it run.
+    """
+    body = _async_init_source()
+
+    # CONTROL first: the slice is the startup coroutine and is bounded. Without these
+    # a slice that silently became the empty string, or the whole file, would make the
+    # assertion below either vacuously red or vacuously green.
+    assert "connect_to_server" in body, "CONTROL: the slice is not _connect's body"
+    assert "def get_training_capabilities" not in body, (
+        "CONTROL: the slice ran past the end of _connect and covers the whole class"
+    )
+
+    assert "self._log_gpu_placement()" in body, (
+        "nothing calls _log_gpu_placement from the entry's startup path, so the "
+        "⚠ GPU placement line the README calls the ONLY readable surface in the hung "
+        "state is never written"
+    )
+    assert "def _log_gpu_placement" in entry_source(), (
+        "CONTROL: the method the call site names is gone, so the call above would "
+        "raise rather than log"
+    )
+
+
+def entry_source() -> str:
+    """``entry.py`` as text. Separate from the slice above so a control can check the
+    whole file without re-deriving the slice."""
+    from pathlib import Path
+
+    return (Path(__file__).parent / "entry.py").read_text()
 
 
 def test_the_entry_logs_a_warning_only_on_a_real_shortfall(monkeypatch) -> None:
@@ -258,6 +406,7 @@ def test_get_training_capabilities_explains_the_unavailable_it_reports(monkeypat
     assert caps["placement"]["sufficient"] is False
     assert caps["placement"]["gpus_required"] == 2
     assert caps["placement"]["gpus_in_cluster"] == 1.0
+    assert caps["placement"]["gpus_free"] == 1.0  # both views reach the RPC surface
     assert "MODEL_FINETUNE_BACKENDS" in caps["placement"]["advice"]
 
 

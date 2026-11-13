@@ -89,8 +89,8 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
 
     Exists because getting this wrong is otherwise INVISIBLE from the running
     system (#0370). Two enabled backends book two whole GPUs even to serve one
-    request; on a cluster with one free GPU the second replica simply never
-    schedules. Measured 2026-11-13 on a one-GPU ``external-cluster`` worker: the
+    request; on a cluster whose second GPU is never free the second replica simply
+    never schedules. Measured 2026-11-13 on a one-GPU ``external-cluster`` worker: the
     unplaceable runtime stays ``UPDATING`` with its replica ``STARTING``, the
     application stays ``DEPLOYING``, and neither ever times out — so
     ``deploy_app`` returns successfully, ``get_app_status`` reads like a slow
@@ -102,12 +102,34 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     Answered from the CPU entry on purpose: the entry deployment asks for no GPU,
     so it is the one part of the app that is still alive to say why the rest is not.
 
+    TWO different numbers, because the two questions they answer have different
+    remedies and only one of them is a configuration mistake:
+
+    ``gpus_in_cluster``  ``ray.cluster_resources()`` — the TOTAL the cluster owns,
+                         free or not. Whether this app can EVER place its runtimes
+                         here is a fact about the total, so ``sufficient`` is keyed
+                         to it and to nothing else.
+    ``gpus_free``        ``ray.available_resources()`` — what is unbooked at the
+                         instant of the call. Reported in ``detail`` and
+                         deliberately NOT escalated. A momentary zero is normal:
+                         the app's own placed replicas hold whole devices, so once
+                         this app is running its free count is legitimately short
+                         by exactly what it booked, and on an elastic cluster a
+                         neighbour's job finishing changes the answer a second
+                         later. Keying ``sufficient`` to it would make this
+                         diagnostic cry wolf at the app itself.
+
+    So a cluster that owns enough but has none free right now reads
+    ``sufficient: True`` with a ``detail`` that says the runtimes pend until a
+    device is released — which is the whole of the answer an operator needs, with
+    no alarm attached (#0370, re-review).
+
     Never raises and never blocks the deploy. ``sufficient`` is deliberately
     three-valued, because "not enough" and "cannot tell" are different answers:
 
-    ``True``   the cluster advertises at least ``gpus_required``;
-    ``False``  it advertises fewer — the deployment will pend, and ``advice``
-               says what to set;
+    ``True``   the cluster advertises at least ``gpus_required`` in TOTAL;
+    ``False``  it advertises fewer — the deployment will pend forever, and
+               ``advice`` says what to set;
     ``None``   unknown. Either no GPU node has reported in yet, which is the
                NORMAL state on an elastic SLURM cluster before the autoscaler
                provides one, or Ray's resource view could not be read at all.
@@ -121,6 +143,7 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
         "backends_enabled": sorted(enabled),
         "gpus_required": required,
         "gpus_in_cluster": None,
+        "gpus_free": None,
         "sufficient": None,
         "detail": "",
         "advice": "",
@@ -129,6 +152,7 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
         import ray
 
         total = float(ray.cluster_resources().get("GPU", 0.0))
+        free = float(ray.available_resources().get("GPU", 0.0))
     except Exception as e:  # pragma: no cover - needs a Ray-less replica
         report["detail"] = (
             f"could not read the cluster's GPU capacity ({type(e).__name__}: {e})"
@@ -136,16 +160,29 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
         return report
 
     report["gpus_in_cluster"] = total
+    report["gpus_free"] = free
     if required == 0:
         report["sufficient"] = True
         report["detail"] = "no GPU backend is enabled, so no GPU is required"
         return report
     if total >= required:
         report["sufficient"] = True
-        report["detail"] = (
-            f"{total:g} GPU(s) visible, {required} required by "
-            f"{', '.join(sorted(enabled))}"
-        )
+        if free < required:
+            # Reported, never escalated: `sufficient` stays True and `advice` stays
+            # empty. See the two-numbers block above — the alternative warns at the
+            # app's own replicas and at every elastic cluster between jobs.
+            report["detail"] = (
+                f"{total:g} GPU(s) visible but {free:g} free right now; {required} "
+                f"required by {', '.join(sorted(enabled))} — the runtime(s) that "
+                "cannot be placed pend until a device is released. Not a "
+                "configuration problem: this cluster owns enough. If this app is "
+                "already running, its own GPU replicas are part of what is booked."
+            )
+        else:
+            report["detail"] = (
+                f"{total:g} GPU(s) visible, {free:g} free, {required} required by "
+                f"{', '.join(sorted(enabled))}"
+            )
         return report
     if total == 0:
         report["detail"] = (

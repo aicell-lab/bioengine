@@ -295,9 +295,19 @@ GPU deployments cannot (#0370):
   `deployments.<entry>.logs`, naming the GPU count, the count required and
   `MODEL_FINETUNE_BACKENDS`;
 - a **`placement` block** on `get_training_capabilities()`, carrying
-  `{backends_enabled, gpus_required, gpus_in_cluster, sufficient, detail,
-  advice}` — so the diagnosis arrives in the same response as the
+  `{backends_enabled, gpus_required, gpus_in_cluster, gpus_free, sufficient,
+  detail, advice}` — so the diagnosis arrives in the same response as the
   `runtime unavailable` symptom.
+
+**`sufficient` answers the total, not the free count, and that is deliberate.**
+`gpus_in_cluster` is `ray.cluster_resources()` (what the cluster owns) and
+`gpus_free` is `ray.available_resources()` (what is unbooked at that instant).
+Whether these runtimes can EVER place here is a fact about the total, so only the
+total moves `sufficient`. A cluster that owns enough but has none free right now
+reads `sufficient: true` with a `detail` saying the runtimes pend until a device
+is released — reported, not alarmed. Keying the verdict to the free count would
+make it fire at this app's own placed replicas, which hold whole devices, and at
+every elastic cluster in the gap between two jobs.
 
 **Which of the two you can read depends on how bad it is**, and that is worth
 knowing before you go looking for the wrong one:
