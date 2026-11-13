@@ -150,6 +150,9 @@ def validate(app_dir):
     rejects legacy ``deployments:`` lists with a migration hint, and verifies
     that ``entry:`` matches ``package.module:ClassName``.
 
+    Offline: it opens no connection, so it cannot tell you whether ``id`` is
+    already taken in the workspace you upload to. The success output says so.
+
     \b
     Examples:
       bioengine apps validate ./my-app/
@@ -162,8 +165,19 @@ def validate(app_dir):
     if not manifest_path.exists():
         error_exit(f"No manifest.yaml found in '{app_dir}'.")
 
-    _validate_manifest_or_exit(manifest_path)
+    manifest = _validate_manifest_or_exit(manifest_path)
+    app_id = manifest.get("id")
+
     click.echo(f"OK: {manifest_path} is a valid v0.6.0 BioEngine app manifest.")
+    click.echo(
+        f"\nChecked locally: structure, required fields, and `entry`.\n"
+        f"NOT checked: whether the id '{app_id}' is free in the workspace you upload to. "
+        f"This command opens no connection, so it cannot know. If that id is already in use "
+        f"there, `bioengine apps upload` refuses the bundle unless the manifest version is "
+        f"higher than every version that id already carries — and if the lineage is not "
+        f"yours, the id itself is what has to change.\n"
+        f"To see which ids exist: bioengine apps list"
+    )
 
 
 # ── upload ─────────────────────────────────────────────────────────────────────
