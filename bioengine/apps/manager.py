@@ -352,6 +352,14 @@ def _validate_scaling_map(
     rather than one naming the ``scaling`` entry they got wrong, which is the
     whole reason this validation exists.
     """
+    # The map itself, before its entries: `(scaling or {}).items()` raises a bare
+    # AttributeError on a truthy non-dict and silently accepts a falsy one, so
+    # `scaling=0` used to clear every check below without being looked at.
+    if scaling is not None and not isinstance(scaling, dict):
+        raise ValueError(
+            f"scaling must be a dict of {{deployment_name: {{...}}}} or None; "
+            f"got {type(scaling).__name__}."
+        )
     for dep_name, dep_scaling in (scaling or {}).items():
         if dep_name not in user_deployment_names:
             raise ValueError(
@@ -398,6 +406,56 @@ def _validate_scaling_map(
                     f"autoscaling_config key(s) {unknown_keys}; Ray "
                     f"Serve would drop them silently. Valid keys: "
                     f"{sorted(valid_keys)}."
+                )
+
+
+_DEPLOYMENT_LOGS_OVERRIDE_KEYS = ("logs_tail", "n_previous_replica")
+
+
+def _validate_deployment_logs_overrides(
+    deployment_logs: Optional[Dict[str, Any]],
+) -> None:
+    """Reject a ``deployment_logs`` map before it reaches ``_get_deployment_status``.
+
+    ``@schema_method`` publishes the declared ``Dict[str, Dict[str, int]]`` as a
+    schema but does not enforce it: hypha_rpc coerces an argument only when its
+    annotation is a pydantic model, so a bool arrives unchanged and surfaces three
+    frames in as ``AttributeError: 'bool' object has no attribute 'get'``, naming
+    neither the parameter nor the type. Entries are checked too, not just the map
+    — a non-dict entry crashes identically one frame later.
+    """
+    if deployment_logs is None:
+        return
+    if not isinstance(deployment_logs, dict):
+        raise ValueError(
+            f"deployment_logs must be a dict of {{deployment_name: "
+            f"{{logs_tail, n_previous_replica}}}} or None; got "
+            f"{type(deployment_logs).__name__}. Logs are already returned by "
+            f"default — pass it only to override logs_tail or "
+            f"n_previous_replica for a named deployment."
+        )
+    for deployment_name, override in deployment_logs.items():
+        if not isinstance(override, dict):
+            raise ValueError(
+                f"deployment_logs entry for '{deployment_name}' must be a dict "
+                f"of {{logs_tail, n_previous_replica}}; got "
+                f"{type(override).__name__}."
+            )
+        unknown_keys = sorted(set(override) - set(_DEPLOYMENT_LOGS_OVERRIDE_KEYS))
+        if unknown_keys:
+            raise ValueError(
+                f"deployment_logs entry for '{deployment_name}' has unknown "
+                f"key(s) {unknown_keys}; they would be ignored silently and the "
+                f"top-level defaults used instead. Valid keys: "
+                f"{sorted(_DEPLOYMENT_LOGS_OVERRIDE_KEYS)}."
+            )
+        for key, value in override.items():
+            # bool is an int subclass, so `logs_tail=True` would pass an
+            # isinstance check and quietly request one line of logs.
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"deployment_logs entry for '{deployment_name}' has "
+                    f"{key}={value!r}; must be an int."
                 )
 
 
@@ -3768,6 +3826,8 @@ class AppsManager:
             app = await get_app_status(application_ids=["app1"])
             # Returns: {...} (single app status, not {"app1": {...}})
         """
+        _validate_deployment_logs_overrides(deployment_logs)
+
         # Determine which applications to check
         if application_ids is None:
             # Return status for all tracked applications

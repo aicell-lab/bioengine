@@ -96,6 +96,32 @@ def test_an_empty_map_passes(empty):
     _validate_scaling_map(empty, DEPLOYMENTS, "my-app")
 
 
+def test_a_truthy_non_dict_map_is_rejected():
+    """The map itself, not its entries — the same hole #0406 found in deployment_logs.
+
+    ``(scaling or {}).items()`` raised a bare ``AttributeError: 'bool' object has no
+    attribute 'items'`` here, from inside the validator whose entire purpose is naming
+    what the caller got wrong.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _validate_scaling_map(True, DEPLOYMENTS, "my-app")
+
+    message = str(excinfo.value)
+    assert "scaling must be a dict" in message
+    assert "got bool" in message
+
+
+def test_a_falsy_non_dict_map_is_rejected():
+    """The half that never raised at all, and so is the one worth pinning.
+
+    ``scaling=0`` became ``{}`` and cleared every check below it, so the deploy ran on
+    Serve's defaults while the caller believed they had set a replica count. A test
+    trying only ``True`` would report this boundary fixed while it was still open.
+    """
+    with pytest.raises(ValueError, match="got int"):
+        _validate_scaling_map(0, DEPLOYMENTS, "my-app")
+
+
 def _a_field_info():
     """Any real FieldInfo — the validator only reads the KEYS, never the values."""
     return next(iter(AutoscalingConfig.model_fields.values()))
