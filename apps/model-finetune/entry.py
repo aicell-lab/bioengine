@@ -232,6 +232,30 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+class _RecognisedRedeposit(Exception):
+    """Internal control flow: the weights just uploaded are already in the pool.
+
+    Raised from *inside* ``contribute``'s ``async with self._staged(...)`` block
+    and caught immediately outside it, so the duplicate's already-minted
+    ``put_file`` manifest row unwinds down ``_staged``'s discard path — the one
+    that is already proven and already tested. Returning normally from inside
+    that block instead would leave the stage open holding a row whose bytes
+    never landed, and ``_staged``'s own docstring says what follows: every
+    later ``commit`` raises ``File '<path>' does not exist in the artifact``,
+    which ``_commit_with_retry`` misreads as the read-after-write 404 and
+    retries for ~62 s before re-raising. One retried deposit would then take
+    the whole pool down rather than just its own merge — strictly worse than
+    the double-weighting this is fixing. Never crosses the RPC boundary: the
+    caller sees a normal return with ``deduplicated: true``. #0376.
+    """
+
+    def __init__(self, existing: Dict[str, Any]) -> None:
+        super().__init__(
+            f"weights already deposited as '{existing.get('contribution_id')}'"
+        )
+        self.existing = existing
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -1687,12 +1711,19 @@ class EntryApp:
             "version": manifest.get("community_version", community_version),
             "path": paths["weights"],
             "sha256": manifest.get("weights_sha256"),
-            # A published manifest is a SECOND stored surface carrying the basis
-            # wording 0.27.15 retracted, and it does not pass through
-            # pool_wire_state — so correcting only the pool index would leave a
-            # contributor reading a named community version the withdrawn claim.
-            # Corrected at this chokepoint because both callers come through here.
-            # #0418.
+            # A published manifest is the SECOND stored surface reached only from here —
+            # it does not pass through pool_wire_state — so both of the corrections that
+            # the pool index gets have to be repeated at this chokepoint or they are
+            # absent from every named community version. Both callers come through here.
+            #
+            # #0417: the manifest carries this digest too, so say which of the two it is.
+            # It has its own created_at, so no join is needed.
+            # #0418: the manifest also carries the basis wording 0.27.15 retracted, so
+            # correcting only the pool index would still leave a contributor reading the
+            # withdrawn claim off a named version.
+            "sha256_provenance": pool.digest_provenance(
+                manifest, digest_key="weights_sha256"
+            ),
             "selection_metric": pool.corrected_metric(manifest.get("selection_metric")),
             "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
@@ -1791,8 +1822,11 @@ class EntryApp:
         signature, samples_seen, L2 drift from the base it started from,
         provenance) and appends a stub to the pool index — one commit per
         contribution, so lineage is fully traceable. Averaging happens later, in
-        the coordinator's aggregate step; this only deposits. cpsam(cellpose)
-        sessions only for now."""
+        the coordinator's aggregate step; this only deposits. Idempotent by
+        weights digest: re-depositing a checkpoint the pool already holds
+        appends nothing and returns the first deposit's record with
+        deduplicated=true, so a client that lost its response to a gateway
+        timeout can safely retry. cpsam(cellpose) sessions only for now."""
         import time as _time
 
         import pool
@@ -1830,6 +1864,18 @@ class EntryApp:
         uploaded_at = _time.time()
         paths = pool.contribution_paths(cid)
 
+        # Resolved once and used by both the stored metadata and the value
+        # returned to the caller, so the two records cannot date the same
+        # contribution differently. Empty is the same as unset here: an
+        # exported-but-empty var would otherwise stamp "" and read as a known
+        # version. Read out here rather than mid-block because the recognised
+        # re-deposit below returns without reaching the metadata build.
+        app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
+        # Set by the except clause below, and the only thing that distinguishes
+        # the two return paths.
+        redeposited: Optional[Dict[str, Any]] = None
+
         am, client = await self._pool_service(pool_token)
         try:
             try:
@@ -1853,12 +1899,15 @@ class EntryApp:
                 else:
                     pool.assert_compatible(index, model_type=model_type, signature=signature)
 
-                # Resolved once and used by both the stored metadata and the value
-                # returned to the caller, so the two records cannot date the same
-                # contribution differently. Empty is the same as unset here: an
-                # exported-but-empty var would otherwise stamp "" and read as a
-                # known version.
-                app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+                # Earliest point a re-deposit is knowable: the digest is computed
+                # from the bytes by prepare_contribution, which has already PUT
+                # them. Identity is the digest alone — see
+                # pool.find_contribution_by_digest for why metadata is not part of
+                # it, and why decided_contribution_ids is not consulted. Leaving by
+                # raise, never by return: see _RecognisedRedeposit. #0376.
+                existing = pool.find_contribution_by_digest(index, info["weights_sha256"])
+                if existing is not None:
+                    raise _RecognisedRedeposit(existing)
 
                 metadata = pool.build_contribution_metadata(
                     contribution_id=cid,
@@ -1896,11 +1945,44 @@ class EntryApp:
                     "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
                 )).raise_for_status()
                 await self._commit_with_retry(am, pool_artifact_id)
+        except _RecognisedRedeposit as recognised:
+            # _staged has already discarded the stage on the way out, so the pool
+            # is left exactly as it was found: same members, no open edit, and no
+            # index PUT ever issued.
+            redeposited = recognised.existing
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
                 pass
+
+        if redeposited is not None:
+            # The bytes did cross the wire — prepare_contribution PUT them before
+            # anything could know they were a duplicate — so bytes_up counts them;
+            # that counter is "weight-bytes moved", and pretending they did not
+            # move would understate the cost of exactly the retries this handles.
+            # contributions does NOT move: the pool gained no member, and that is
+            # the number quoted as "deposits".
+            self._bump_transport(bytes_up=int(info["n_bytes"]))
+            return {
+                "schema_version": pool.SCHEMA_VERSION,
+                "app_version": app_version,
+                # The FIRST deposit's id, and the pool's own record of what it
+                # holds, so a client that lost its response to a gateway timeout
+                # ends up with the record it would have had. samples_seen is read
+                # back off the index for the same reason: if this retry reported a
+                # different count, the stored member is the one the soup will
+                # weight. l2_from_base comes from this call because the index does
+                # not carry it — it is recomputed from the same bytes against the
+                # same stock base, not read back from the first deposit.
+                "contribution_id": redeposited.get("contribution_id"),
+                "pool_artifact_id": pool_artifact_id,
+                "architecture_signature": redeposited.get("architecture_signature", signature),
+                "weights_sha256": info["weights_sha256"],
+                "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
+                "l2_from_base": info["l2_from_base"],
+                "deduplicated": True,
+            }
 
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
@@ -1916,6 +1998,11 @@ class EntryApp:
             "weights_sha256": info["weights_sha256"],
             "samples_seen": samples_seen,
             "l2_from_base": info["l2_from_base"],
+            # False, not absent, on the fresh path. A key present only when true
+            # cannot be dated: a client holding a response without it cannot tell
+            # "fresh deposit" from "a release that predates de-duplication" —
+            # the defect app_version exists to avoid (#0116, #0140). #0376.
+            "deduplicated": False,
         }
 
     @bioengine.method
@@ -2311,7 +2398,12 @@ class EntryApp:
                 "published_version": new_version, "baseline_version": baseline_version,
                 "members": members_record,
                 "selection_metric": sel_metric, "witness_metric": wit_metric,
-                "global_sha256": head_sha, "transport": merge_transport,
+                "global_sha256": head_sha,
+                # Written unconditionally, null included: a basis that is absent when
+                # there is no digest reads the same as one absent because the app
+                # predates the stamp, which is the ambiguity it exists to remove.
+                "global_sha256_basis": pool.CURRENT_DIGEST_BASIS if head_sha else None,
+                "transport": merge_transport,
                 "deferred": deferred_ids, "created_at": time.time(),
             })
             async with self._staged(am, pool_artifact_id):
@@ -2333,6 +2425,16 @@ class EntryApp:
             "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
+            # The digest of the head this call just published, and which of the two
+            # things it digests. This is the moment the #0417 false alarm happens —
+            # someone re-merges an identical member set, gets a number, compares it
+            # against a stored one and concludes corruption — so the attribution is
+            # returned here, where both numbers are in the caller's hands, and not
+            # only on a page they would have to go and read.
+            "global_sha256": head_sha,
+            "global_sha256_provenance": pool.digest_provenance(
+                {"global_sha256": head_sha, "global_sha256_basis": pool.CURRENT_DIGEST_BASIS}
+            ),
             "witness_metric": round(head_b, 4) if head_b is not None else None,
             "baseline": baseline,
             "n_members": len(s_ids),
