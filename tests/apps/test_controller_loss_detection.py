@@ -417,3 +417,72 @@ async def test_a_cooled_down_sweep_falls_back_to_the_per_app_path(
         "an adopted app must still be reported through the per-app path when "
         "the sweep is cooling down"
     )
+
+
+# --------------------------------------------------------------------------
+# The lookup is a blocking Ray RPC, so it must not run on the event loop
+# --------------------------------------------------------------------------
+
+# Stands in for the measured ~27.4 s a ray:// actor lookup takes against an
+# unreachable head. Short enough to keep the test fast, long enough that a loop
+# frozen for it cannot service the 10 ms heartbeat below even once.
+_BLOCK_SECONDS = 0.5
+_BEAT_INTERVAL = 0.01
+
+
+@pytest.mark.asyncio
+async def test_a_blocking_lookup_does_not_stop_the_heartbeat() -> None:
+    """A slow controller lookup may delay a tick; it may not freeze the worker.
+
+    ``_serve_controller_is_missing`` is a blocking Ray RPC, and called inline
+    from the async monitor it stalled the whole process for the ~27 s an actor
+    lookup takes against an unreachable head — measured 27.42 s max heartbeat
+    gap over 10 beats, against 0.10 s over 282 beats for the same call off the
+    loop. Everything else the worker owes, the heartbeat included, stopped with
+    it, so the symptom read as a dead worker rather than a slow lookup.
+
+    Three assertions, because any one alone passes for the wrong reason: that
+    the lookup ran at all, that the tick really waited for it, and that the loop
+    kept running meanwhile.
+    """
+    manager = _make_manager()
+    calls: list[float] = []
+
+    def blocking_lookup() -> bool:
+        calls.append(time.monotonic())
+        time.sleep(_BLOCK_SECONDS)
+        return True
+
+    # setattr, not monkeypatch, so the patch is plainly visible as the thing
+    # under test rather than as fixture setup.
+    original = manager_mod._serve_controller_is_missing
+    manager_mod._serve_controller_is_missing = blocking_lookup
+
+    beats = 0
+
+    async def heartbeat() -> None:
+        nonlocal beats
+        while True:
+            await asyncio.sleep(_BEAT_INTERVAL)
+            beats += 1
+
+    beat_task = asyncio.create_task(heartbeat())
+    try:
+        started = time.monotonic()
+        await _tick(manager)
+        elapsed = time.monotonic() - started
+    finally:
+        beat_task.cancel()
+        manager_mod._serve_controller_is_missing = original
+
+    assert len(calls) == 1, f"the lookup did not run exactly once: {calls}"
+    assert elapsed >= _BLOCK_SECONDS, (
+        f"the tick returned in {elapsed:.3f}s without waiting for a lookup "
+        f"that blocks {_BLOCK_SECONDS}s, so this test proved nothing"
+    )
+    # A frozen loop beats 0 times. Floor well under the ~50 a free loop manages,
+    # so a loaded machine cannot turn a real pass into a failure.
+    assert beats >= 20, (
+        f"the event loop serviced only {beats} heartbeats while the lookup "
+        f"blocked for {elapsed:.3f}s — it is still running on the loop"
+    )

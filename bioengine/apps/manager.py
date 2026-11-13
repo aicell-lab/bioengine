@@ -232,6 +232,29 @@ def _serve_controller_is_missing() -> bool:
         return False
 
 
+async def _controller_is_missing_off_loop() -> bool:
+    """``_serve_controller_is_missing`` without blocking the event loop.
+
+    The predicate is a blocking Ray RPC. Called inline from the async monitor it
+    froze the whole worker process for the ~27 s a ``ray://`` actor lookup takes
+    against an unreachable head, which stops the heartbeat as well as the
+    monitoring.
+
+    The timeout bounds the tick, not the lookup: abandoning the await leaves the
+    thread running until Ray returns. Timing out therefore has to answer, and it
+    answers "present" — the same answer the predicate gives for anything that is
+    not a clean not-found. A head too unreachable to look up is also too
+    unreachable for the ``serve.run`` a recovery sweep would need.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_serve_controller_is_missing),
+            timeout=_CONTROLLER_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return False
+
+
 def _belongs_to_worker_workspace(
     application_id: str,
     app_data: Dict[str, Any],
@@ -337,6 +360,12 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # enough for a redeploy's serve.run to bootstrap the controller before we'd
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
+
+# How long one monitor tick waits for the controller actor lookup. Measured
+# 0.10-0.12 s against a live head and 27.4 s against an unreachable one, so
+# this is ~100x the healthy case and still far inside the worker's 120 s
+# heartbeat budget.
+_CONTROLLER_LOOKUP_TIMEOUT_SECONDS = 10.0
 
 # Mint a proxy's replacement Hypha token once this much of its life has passed.
 # It is a deploy-time credential with a 30-day TTL and a deploy is the only
@@ -2141,7 +2170,10 @@ class AppsManager:
         try:
             serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
         except Exception as exc:
-            if _is_serve_controller_gone(exc) or _serve_controller_is_missing():
+            if (
+                _is_serve_controller_gone(exc)
+                or await _controller_is_missing_off_loop()
+            ):
                 # A Ray head restart wiped the Serve controller. The client
                 # reconnects (handles refreshed, cached Serve client dropped)
                 # but there is no controller until an app is (re)deployed, so
@@ -2159,7 +2191,7 @@ class AppsManager:
                 await self._recover_from_controller_loss(apps_to_redeploy)
             raise
 
-        if not serve_status.applications and _serve_controller_is_missing():
+        if not serve_status.applications and await _controller_is_missing_off_loop():
             # Controller lost, but serve.status reported it as an empty status
             # instead of raising, so the branch above never saw it. Left to the
             # per-app loop below, every tracked app looks individually "absent
