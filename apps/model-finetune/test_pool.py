@@ -515,10 +515,26 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
 # quoted above: campaignService.ts only imports it (2 commits ever), while
 # src/types/campaign.ts is where it is declared (26 commits).
 #   for c in $(git log --format=%h <branch> -- src/types/campaign.ts); do
-#     git show $c:src/types/campaign.ts | grep -m1 CAMPAIGN_SCHEMA_VERSION; done
+#     git show "${c}:src/types/campaign.ts" \
+#       | grep -m1 -E '^ *export +const +CAMPAIGN_SCHEMA_VERSION'; done
 # Read it oldest-first and keep the first sha per major.minor. Control: every
-# one of those commits must yield a constant — a commit that yields none means
-# the pattern has drifted, not that the rung is missing.
+# one of those commits must yield a DECLARATION, and 26 of 26 do.
+#
+# Both halves of that pipeline are written the way they are because the obvious
+# way fails toward a FALSE "the pattern has drifted", and a control that merely
+# tests for non-empty output passes in both cases. Measured 2026-11-13:
+#   - unanchored `grep -m1 CAMPAIGN_SCHEMA_VERSION` matches line 35 — a prose
+#     comment, "Bump CAMPAIGN_SCHEMA_VERSION on any breaking change…" — on all
+#     26 commits, never the declaration. It yields 26 identical non-version
+#     lines while the non-empty control reads 26/26 success.
+#   - unbraced `$c:src/types/campaign.ts` makes zsh read `:s` as a parameter
+#     modifier (substitute), which needs a pattern it does not find, so the
+#     word never expands: zsh 5.8 says `bad substitution`, rc=1, and `git show`
+#     is never handed a ref at all. Every iteration yields nothing, so the
+#     sweep reports 26/26 drifted. bash expands it fine, which is why the
+#     recipe can look correct in one shell and fail in the other.
+# Anchor the pattern and brace the ref, and assert the output parses as a
+# version string rather than merely being non-empty.
 # (0.8 and 0.9 were never used.)
 PAGE_RUNGS = {
     "0.1": ("0.1.0-draft", "2026-09-06", "86f381e"),
