@@ -21,6 +21,7 @@ decorator module stays introspectable with only ``bioengine[worker]`` + stdlib.
 import asyncio
 import gc
 import hashlib
+import importlib
 import os
 import subprocess
 import sys
@@ -35,6 +36,16 @@ import busy
 import numpy as np
 
 logger = bioengine.logger
+
+# The third-party top-level modules this runtime's own method bodies import.
+# Imported once at replica startup by the smoke test below so a replica whose
+# runtime_env install did not take fails instead of being advertised as ready
+# (#0371). Keep this list equal to what the bodies actually import: it is a
+# readiness gate, not a restatement of requirements-runtime-cellpose.txt, and a
+# module nothing imports would fail a replica that can serve every call.
+# ``numpy`` is absent on purpose — it is imported at module scope above, so a
+# replica missing it never constructs.
+_RUNTIME_IMPORTS = ("torch", "cellpose")
 
 # Match CellposeSAMWrapper's eval kwargs so served masks reproduce the exported
 # package's self-test output; diameter is cpsam's mean-diameter prior.
@@ -124,6 +135,62 @@ class CellposeRuntime:
     @bioengine.async_init
     async def _start_busy_log(self) -> None:
         self._busy.start()
+
+    @bioengine.smoke_test
+    async def _import_runtime_stack(self) -> None:
+        """Import this backend's ML stack once, at startup, and fail the replica if
+        it is not there (#0371).
+
+        A replica whose ``runtime_env`` install did not take answered the health
+        probe correctly and was advertised as ready while **every** call raised
+        ``ModuleNotFoundError: No module named 'cellpose'``: nothing on the health
+        path imports the ML stack. ``check_health`` runs ``async_init`` (the busy
+        log) and, because this deployment declares a GPU, retains a CUDA context
+        via ctypes on ``libcuda.so.1`` — which the NVIDIA container runtime injects
+        independently of the pip layer, so it succeeds on a replica with no torch.
+        This runtime declares no ``@bioengine.health_check``, so nothing else ran.
+
+        This is deliberately a smoke test and not a deeper ``ping()``: the entry
+        calls ``ping()`` with a 2 s timeout before every GPU call and importing
+        torch exceeds that, while a per-poll import of a heavy stack is its own
+        defect. The framework runs a smoke test once after ``async_init`` and
+        fails the replica when it raises, which makes the failure *visible*.
+
+        It is **not** a traffic gate, and not a bounded one either. Two layers:
+        ``check_health`` creates the task and tests ``.done()`` in the same call,
+        so poll 1 cannot fail, and Serve condemns a replica only after 3
+        consecutive failed checks (``REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD``)
+        — ≈90 s at this deployment's ``health_check_period_s=30.0``. Serve then
+        **replaces** the condemned replica and the cycle repeats indefinitely,
+        because its circuit breaker ``_terminally_failed()`` is gated on ``not
+        _replica_has_started``, which any successful start clears. Measured on
+        ``#0387`` over 100 health-check periods — that probe ran at
+        ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the 30 s
+        above: 105 calls, **0 failed**, 84 answered by a replica that already
+        knew its own smoke test had failed, across 22 distinct replica pids.
+
+        So what this buys is that the missing modules are **named in the replica
+        log on every cycle**, instead of nothing being said at all — not that
+        broken traffic stops. The import is not wasted work — the first real
+        call would do it anyway.
+
+        Reports every missing module rather than the first, because a half-installed
+        env usually lost more than one and the whole point is diagnosability.
+        """
+        missing: List[str] = []
+        for name in _RUNTIME_IMPORTS:
+            try:
+                importlib.import_module(name)
+            except Exception as e:
+                missing.append(f"{name} ({type(e).__name__}: {e})")
+        if missing:
+            raise RuntimeError(
+                "Cellpose runtime dependencies are not importable in this "
+                "replica's environment — the runtime_env install did not take: "
+                + "; ".join(missing)
+                + ". pip's own output is not in this app's logs; read "
+                "runtime_env_setup-*.log on the node."
+            )
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""
