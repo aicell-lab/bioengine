@@ -2,17 +2,28 @@
 
 Plain pytest, no torch, no numpy, no live Hypha — ``pool``'s heavy imports are all
 function-local, so the schema surface imports on stdlib alone. These pin the
-0.13.0-draft wire contract the campaign page reads (``pool.pool_wire_state``): the
+0.15.0-draft wire contract the campaign page reads (``pool.pool_wire_state``): the
 role-tagged RoundMetric shape, the soups/empty-merges partition, and — the guard
 that matters — that a SELECTION value can never surface on the witness curve. The
 directional test fails on a misplaced VALUE, not merely a mislabelled tag.
 
-The field-sets below were derived from the page's verified 0.13.0-draft fixture
-corpus (``cellpose-sam-community.json``). The corpus is not vendored (it is the
-page's artifact and rots on draft bumps); ``test_matches_fixture_corpus`` cross-
-checks these constants against it when a path is supplied via
-``MODEL_FINETUNE_CORPUS_DIR``, so a draft bump that moves a field is caught the next
-time the test is run against the fresh corpus.
+The field-sets below were first derived from the page's verified 0.13.0-draft fixture
+corpus (``cellpose-sam-community.json``) and re-verified unchanged against the
+regenerated 0.15.0-draft corpus (bioimage.io 6a7fac8, 2026-11-13). The corpus is not
+vendored (it is the page's artifact and rots on draft bumps);
+``test_matches_fixture_corpus`` cross-checks these constants against it when a path is
+supplied via ``MODEL_FINETUNE_CORPUS_DIR``, so a draft bump that moves a field is
+caught the next time the test is run against the fresh corpus.
+
+⚠ The corpus check covers the merge/transport field-sets and NOT the contribution
+stub, so it could not have caught the ``bytes_out`` → ``n_bytes`` rename that defines
+rung 0.15 — which is why ``CONTRIBUTION_KEYS`` is asserted here directly. It is also
+not merely an omission waiting to be filled: measured against the 0.15 corpus, the
+page's contribution record and this backend's stub do not carry the same fields (the
+page adds ``base_version``, ``contributor_id``, ``dataset_name`` and ``declared``;
+this backend publishes ``samples_seen``, which the page's does not). Asserting set
+equality here would be red on a question about what the backend ought to publish, not
+about the wire contract this file pins.
 """
 
 from __future__ import annotations
@@ -25,7 +36,8 @@ import pytest
 import pool
 
 
-# Field-sets pinned from the 0.13.0-draft fixture corpus.
+# Field-sets pinned from the fixture corpus; unchanged between 0.13.0-draft and
+# 0.15.0-draft, re-verified against the latter.
 ROUNDMETRIC_KEYS = {
     "role", "name", "aggregate", "aggregate_basis", "aggregate_scope",
     "higher_is_better", "n_sites_scored", "n_datasets_scored", "per_site",
@@ -42,6 +54,10 @@ MERGE_TRIGGER_KEYS = {
 }
 COMMUNITY_MODEL_KEYS = {"artifact_id", "version", "url", "n_contributions_cumulative"}
 TRANSPORT_KEYS = {"bytes_in", "bytes_out", "n_transfers", "sources_complete"}
+CONTRIBUTION_KEYS = {
+    "contribution_id", "received_at", "n_bytes", "n_train_images",
+    "samples_seen", "disposition", "merged_into",
+}
 
 POOL_ID = "bioimage-io/cellpose-sam-community"
 
@@ -206,6 +222,30 @@ class TestWireShape:
         assert all(s["weights"] is None for s in wire["soups"])
 
 
+class TestContributionBytesAreGreppable:
+    """soup_admission fails OPEN when a pool never recorded ``n_bytes``, so the
+    operator's question is literally "does the view show n_bytes?". Publishing it
+    as ``bytes_out`` answered that question with the wrong word AND collided with
+    transport.bytes_out, which carries unrelated bytes one level up."""
+
+    def test_contribution_publishes_the_stored_name(self, wire):
+        for c in wire["contributions"]:
+            assert c["n_bytes"] == 1_300_000_000
+
+    def test_contribution_key_set(self, wire):
+        for c in wire["contributions"]:
+            assert set(c) == CONTRIBUTION_KEYS
+
+    def test_bytes_out_means_transport_only(self, wire):
+        # Paired with the presence assertions above on purpose: "bytes_out is
+        # absent" alone is also satisfied by the stub disappearing. And transport
+        # must still HAVE it, so renaming the wrong level fails here.
+        for c in wire["contributions"]:
+            assert "bytes_out" not in c
+        for soup in wire["soups"]:
+            assert "bytes_out" in soup["transport"]
+
+
 class TestAssessedIsIdsOnly:
     """A per-candidate score in the wire payload is a contract violation:
     ``assessed`` is IDs only, and the audit-only per-member scores must not leak."""
@@ -290,7 +330,18 @@ class TestDirectionalGuard:
 
 @pytest.mark.skipif(
     not os.environ.get("MODEL_FINETUNE_CORPUS_DIR"),
-    reason="set MODEL_FINETUNE_CORPUS_DIR to the verified 0.13.0-draft fixture corpus to cross-check field-sets",
+    reason=(
+        "set MODEL_FINETUNE_CORPUS_DIR to a 0.15.0-draft fixture corpus to "
+        "cross-check field-sets. The corpus lives in the OTHER repo, which is "
+        "why this is opt-in rather than vendored: bioimage.io, branch "
+        "feat/federation-campaigns-page, src/services/__fixtures__/corpus. It "
+        "must be a corpus at THIS backend's rung — take it from the commit "
+        "that defined the rung (6a7fac8, 2026-11-13), and re-read the rung "
+        "from PAGE_RUNGS rather than assuming the branch tip still sits on "
+        "it. The rung itself is checked "
+        "unconditionally by test_schema_version_is_the_rung_this_backend_"
+        "targets, so this skip no longer hides a wrong SCHEMA_VERSION (#0419)"
+    ),
 )
 def test_matches_fixture_corpus():
     """Cross-check the pinned field-sets against the page's verified fixture, so a
@@ -302,6 +353,13 @@ def test_matches_fixture_corpus():
     doc = json.loads((d / "cellpose-sam-community.json").read_text())
     prog = doc["progress"]
     assert doc["schema_version"] == pool.SCHEMA_VERSION
+    # Guard against being handed a corpus from a different rung: the assertion
+    # above would then fail for a reason that looks like a backend bug.
+    assert _major_minor(doc["schema_version"]) == BACKEND_TARGETS_RUNG, (
+        f"the corpus at MODEL_FINETUNE_CORPUS_DIR declares "
+        f"{doc['schema_version']!r}, but this backend targets rung "
+        f"{BACKEND_TARGETS_RUNG!r} — wrong corpus, not a backend defect"
+    )
     assert set(prog["merge_trigger"]) == MERGE_TRIGGER_KEYS
     assert set(prog["baseline_metric"]) == ROUNDMETRIC_KEYS
     soup = prog["soups"][1]
@@ -424,4 +482,204 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
     m = _metadata("0.27.14")
     assert m["cellpose_version"] == "4.0.1"
     assert m["schema_version"] == pool.SCHEMA_VERSION
+    # ...and that the constant is itself the rung this backend targets. Without
+    # this line the assertion above is satisfied by both sides being wrong
+    # together, which is the whole of #0419.
+    assert _major_minor(m["schema_version"]) == BACKEND_TARGETS_RUNG
     assert m["app_version"] != m["cellpose_version"] != m["schema_version"]
+
+
+# ---------------------------------------------------------------------------
+# SCHEMA_VERSION must be a rung, and the right one
+# ---------------------------------------------------------------------------
+#
+# The page compares schema versions on MAJOR.MINOR ONLY:
+#
+#     const major = (v: string) => v.split('.').slice(0, 2).join('.');
+#     if (major(received) !== major(CAMPAIGN_SCHEMA_VERSION)) {
+#       throw new CampaignSchemaMismatchError(received);
+#     }
+#
+# (bioimage.io, src/services/campaignService.ts, assertSchema. The local name
+# says "major"; the slice takes TWO components.) So the patch number and the
+# "-draft" suffix are invisible to the page, and a backend that declares a
+# major.minor some earlier shape already used does not raise a mismatch — it
+# reports AGREEMENT, falsely. The failure is silent, which is why it needs a
+# test rather than care.
+#
+# Every rung the page has committed, measured 2026-11-13 on bioimage.io branch
+# feat/federation-campaigns-page. The date and sha are the page commit that
+# DEFINED the rung — the FIRST one to carry that major.minor, not the last.
+#
+# Re-measure against the file that DEFINES the constant, which is NOT the file
+# quoted above: campaignService.ts only imports it (2 commits ever), while
+# src/types/campaign.ts is where it is declared (26 commits).
+#   for c in $(git log --format=%h <branch> -- src/types/campaign.ts); do
+#     git show "${c}:src/types/campaign.ts" \
+#       | grep -m1 -E '^ *export +const +CAMPAIGN_SCHEMA_VERSION'; done
+# Read it oldest-first and keep the first sha per major.minor. Control: every
+# one of those commits must yield a DECLARATION, and 26 of 26 do.
+#
+# Both halves of that pipeline are written the way they are because the obvious
+# way fails toward a FALSE "the pattern has drifted", and a control that merely
+# tests for non-empty output passes in both cases. Measured 2026-11-13:
+#   - unanchored `grep -m1 CAMPAIGN_SCHEMA_VERSION` matches line 35 — a prose
+#     comment, "Bump CAMPAIGN_SCHEMA_VERSION on any breaking change…" — on all
+#     26 commits, never the declaration. It yields 26 identical non-version
+#     lines while the non-empty control reads 26/26 success.
+#   - unbraced `$c:src/types/campaign.ts` makes zsh read `:s` as a parameter
+#     modifier (substitute), which needs a pattern it does not find, so the
+#     word never expands: zsh 5.8 says `bad substitution`, rc=1, and `git show`
+#     is never handed a ref at all. Every iteration yields nothing, so the
+#     sweep reports 26/26 drifted. bash expands it fine, which is why the
+#     recipe can look correct in one shell and fail in the other.
+# Anchor the pattern and brace the ref, and assert the output parses as a
+# version string rather than merely being non-empty.
+# (0.8 and 0.9 were never used.)
+PAGE_RUNGS = {
+    "0.1": ("0.1.0-draft", "2026-09-06", "86f381e"),
+    "0.2": ("0.2.0-draft", "2026-09-06", "1f37721"),
+    "0.3": ("0.3.0-draft", "2026-09-07", "8485ce6"),
+    "0.4": ("0.4.0-draft", "2026-09-07", "10307e8"),
+    "0.5": ("0.5.0-draft", "2026-09-07", "fa7be54"),
+    "0.6": ("0.6.0-draft", "2026-09-07", "83692b4"),
+    "0.7": ("0.7.0-draft", "2026-09-07", "ffa8229"),
+    "0.10": ("0.10.0-draft", "2026-09-12", "3ea7449"),
+    "0.11": ("0.11.0-draft", "2026-09-12", "31adbc1"),
+    "0.12": ("0.12.0-draft", "2026-09-12", "4bf7b65"),
+    "0.13": ("0.13.0-draft", "2026-09-12", "a39d6a7"),
+    "0.14": ("0.14.0-draft", "2026-09-24", "9d5ef26"),
+    "0.15": ("0.15.0-draft", "2026-11-13", "6a7fac8"),
+}
+
+# The rung whose SHAPE this backend implements. This is NOT derived from
+# pool.SCHEMA_VERSION — that is the point. Deriving it would recreate the
+# self-referential assertion #0419 is about, where the fixture agrees with
+# whatever the constant happens to hold.
+#
+# Bumping the wire contract is therefore a TWO-SIDED edit, deliberately: move
+# pool.SCHEMA_VERSION and move this, in the same commit, after checking the
+# page has committed the rung you are moving to. A one-sided edit goes red, and
+# the message tells you which side you forgot.
+BACKEND_TARGETS_RUNG = "0.15"
+
+
+def _major_minor(value: str) -> str:
+    """Exactly what the page does: split on '.', keep the first two parts."""
+    return ".".join(value.split(".")[:2])
+
+
+def _rung_violation(schema_version: str) -> str | None:
+    """Why ``schema_version`` is wrong for this backend, or None if it is right.
+
+    Split out from the test so the CHECK can be exercised against known-bad
+    values without mutating the constant — a test that only ever sees the real
+    value cannot show it is able to reject anything.
+    """
+    got = _major_minor(schema_version)
+    if got == BACKEND_TARGETS_RUNG:
+        return None
+    if got in PAGE_RUNGS:
+        full, date, sha = PAGE_RUNGS[got]
+        return (
+            f"SCHEMA_VERSION is {schema_version!r}, whose major.minor is {got!r} — "
+            f"but {got!r} is a rung the campaign page already committed on {date} "
+            f"({sha}, {full}) to mean a DIFFERENT record shape. This backend "
+            f"implements rung {BACKEND_TARGETS_RUNG!r}. The page compares "
+            f"major.minor only, so it will report agreement with the {got!r} shape "
+            f"instead of raising a mismatch, and mis-render rather than refuse. "
+            f"Either restore {BACKEND_TARGETS_RUNG!r}, or — if this backend really "
+            f"did move to {got!r} — update BACKEND_TARGETS_RUNG in the same commit."
+        )
+    return (
+        f"SCHEMA_VERSION is {schema_version!r}, whose major.minor is {got!r}, but "
+        f"this backend targets rung {BACKEND_TARGETS_RUNG!r} and {got!r} is not a "
+        f"rung the page has ever committed. If this is a deliberate two-sided "
+        f"bump, add {got!r} to PAGE_RUNGS with the page commit that defines it "
+        f"and set BACKEND_TARGETS_RUNG to it, in the same commit."
+    )
+
+
+def test_schema_version_is_the_rung_this_backend_targets():
+    """The assertion #0419 found missing. Compares the constant against an
+    independently-recorded rung, not against itself."""
+    assert _rung_violation(pool.SCHEMA_VERSION) is None, _rung_violation(
+        pool.SCHEMA_VERSION
+    )
+
+
+def test_the_targeted_rung_is_one_the_page_actually_defined():
+    assert BACKEND_TARGETS_RUNG in PAGE_RUNGS, (
+        f"BACKEND_TARGETS_RUNG is {BACKEND_TARGETS_RUNG!r}, which the page has "
+        f"never committed. Known rungs: {sorted(PAGE_RUNGS)}"
+    )
+
+
+def _a_rung_the_page_has_never_defined() -> str:
+    """The lowest major.minor the page has not committed — DERIVED, never named.
+
+    A literal here would be true only until the page committed that rung, and
+    would then go red for a reason that has nothing to do with the backend —
+    which is the "next person to bump deletes the test" failure this whole file
+    exists to avoid. An earlier draft of this test did hardcode one, and the
+    mutation harness's legitimate-bump arm is what caught it.
+    """
+    for minor in range(1, 1000):
+        candidate = f"0.{minor}"
+        if candidate not in PAGE_RUNGS and candidate != BACKEND_TARGETS_RUNG:
+            return candidate
+    raise AssertionError("no undefined rung below 0.1000 — widen the search")
+
+
+def test_the_check_rejects_a_superseded_page_rung():
+    """#0114's actual defect, pinned so it cannot recur silently. 0.14.0-draft
+    is a real rung the page committed for the dropped-synchronous-arm shape."""
+    # The pin's premise, stated so a future bump to 0.14 fails with a reason
+    # rather than cryptically. A rung already committed stays committed, so
+    # this is the only way the historical fact below can stop applying.
+    assert BACKEND_TARGETS_RUNG != "0.14", (
+        "this test pins #0114's defect, whose premise is that the backend does "
+        "NOT target 0.14; if it now deliberately does, rewrite the pin against "
+        "whichever rung was superseded — do not delete it"
+    )
+    why = _rung_violation("0.14.0-draft")
+    assert why is not None, "0.14.0-draft was accepted — the check cannot go red"
+    assert "0.14" in why and "2026-09-24" in why and "9d5ef26" in why, (
+        f"the rejection does not NAME the collision, so a red run would not say "
+        f"what is wrong: {why!r}"
+    )
+
+
+def test_the_check_rejects_a_rung_the_page_never_defined():
+    """A backend that invents a rung is out of lock-step even though it collides
+    with nothing — the page raises a mismatch on it."""
+    rung = _a_rung_the_page_has_never_defined()
+    why = _rung_violation(f"{rung}.0-draft")
+    assert why is not None, f"{rung}.0-draft was accepted — the check cannot go red"
+    assert "not a rung the page has ever committed" in why, (
+        f"the rejection does not say WHY {rung} is wrong: {why!r}"
+    )
+    # ...and it must say so for a different reason than a collision does, or the
+    # two failure modes are indistinguishable in a red run.
+    assert "2026-" not in why
+
+
+def test_the_check_ignores_the_patch_and_the_draft_suffix():
+    """Discrimination control: the check must match the page's comparison, not
+    be stricter than it. Pinning the exact literal would make every patch bump
+    red, and the next person to hit that deletes the test."""
+    rung = PAGE_RUNGS[BACKEND_TARGETS_RUNG][0]
+    assert _rung_violation(rung) is None
+    assert _rung_violation(f"{BACKEND_TARGETS_RUNG}.7") is None
+    assert _rung_violation(f"{BACKEND_TARGETS_RUNG}.0-rc1") is None
+
+
+def test_the_check_is_not_self_referential(monkeypatch):
+    """The regression guard for #0419 itself. If someone later rewrites the
+    rung check to read pool.SCHEMA_VERSION on both sides, every test above
+    still passes and this one fails."""
+    monkeypatch.setattr(pool, "SCHEMA_VERSION", "0.14.0-draft")
+    assert _rung_violation(pool.SCHEMA_VERSION) is not None, (
+        "with SCHEMA_VERSION monkeypatched to a known-wrong rung the check still "
+        "passed, so it is comparing the constant against itself"
+    )
