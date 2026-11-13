@@ -450,6 +450,7 @@ class BioEngineWorker:
         # Dataset server configuration
         self.data_server: Optional[BioEngineDatasets] = None
         self.available_datasets = {}
+        self._data_server_unreachable = False
 
         try:
             # Attempt interactive login if no token provided
@@ -802,20 +803,20 @@ class BioEngineWorker:
 
         try:
             await self.data_server.ping_data_server()
+            self._data_server_unreachable = False
         except Exception as e:
-            self.logger.error(f"Error while pinging dataset server: {e}")
-            self.logger.info("Clearing dataset server configuration.")
+            # Only the local handle is dropped. The discovery file is written by
+            # the data server at startup and removed by it at shutdown; workers
+            # are readers, and every worker on this workspace directory shares
+            # the one file, so deleting it here would take a reachable server
+            # away from all of them. Keeping it lets _discover_data_server
+            # re-read it and reconnect once the server answers again, which is
+            # also why this logs on the transition rather than every pass.
+            if not self._data_server_unreachable:
+                self.logger.error(f"Error while pinging dataset server: {e}")
+                self.logger.info("Clearing dataset server configuration.")
+                self._data_server_unreachable = True
             self.data_server = None
-            
-            current_data_server_file = (
-                self.workspace_dir / "datasets" / "bioengine_current_server"
-            )
-            if current_data_server_file.exists():
-                try:
-                    current_data_server_file.unlink()
-                    self.logger.info("Removed outdated data server configuration file.")
-                except Exception as unlink_e:
-                    self.logger.error(f"Failed to remove data server configuration file: {unlink_e}")
 
     async def _discover_data_server(self) -> None:
         """
