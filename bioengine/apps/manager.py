@@ -3187,7 +3187,7 @@ class AppsManager:
         ),
         max_ongoing_requests: int = Field(
             None,
-            description="How many callers the application's ProxyDeployment admits at once, across the whole instance — the limit the 'at capacity' rejection is counted against. Higher values allow more parallelism but use more memory. This is NOT the per-replica cap: `@bioengine.app(max_ongoing_requests=...)` in the app's own source is a separate Ray Serve limit on one replica of one deployment, the two are independent, and setting either leaves the other at its default. get_app_status reports this one at the top level and each deployment's decorator value under `deployments.<ClassName>.max_ongoing_requests`. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
+            description="How many callers the application's ProxyDeployment admits at once, across the whole instance — the limit the 'at capacity' rejection is counted against. Higher values allow more parallelism but use more memory. This is NOT the per-replica cap: `@bioengine.app(max_ongoing_requests=...)` in the app's own source is a separate Ray Serve limit on one replica of one deployment, and the two are independent: setting either does not change the other. get_app_status reports this one at the top level and each deployment's decorator value under `deployments.<ClassName>.max_ongoing_requests`. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
         ),
         proxy_memory_in_gb: float = Field(
             None,
