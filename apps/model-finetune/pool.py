@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
 # record and every read method so the page can flag a backend/page mismatch
 # instead of silently mis-rendering. Bump in lock-step with the page's fixtures.
-SCHEMA_VERSION = "0.13.0-draft"
+SCHEMA_VERSION = "0.15.0-draft"
 
 POOL_INDEX = "pool_index.json"
 # Resume journal for aggregate(): scores already paid for, so a killed merge
@@ -904,7 +904,11 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         contributions.append({
             "contribution_id": cid,
             "received_at": _iso(c.get("uploaded_at")),
-            "bytes_out": c.get("n_bytes"),
+            # Published under the storage name on purpose: soup_admission fails
+            # open on a missing n_bytes, so the audit question is "did the pool
+            # record n_bytes?" and the view has to answer it under that word.
+            # bytes_out stays reserved for transport, one level up.
+            "n_bytes": c.get("n_bytes"),
             "n_train_images": c.get("n_train_images"),
             "samples_seen": c.get("samples_seen"),
             "disposition": disposition,
