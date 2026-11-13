@@ -1687,14 +1687,21 @@ class EntryApp:
             "version": manifest.get("community_version", community_version),
             "path": paths["weights"],
             "sha256": manifest.get("weights_sha256"),
-            # The manifest is the second stored surface carrying this digest, and it
-            # does not pass through pool_wire_state — so it is attributed here or
-            # nowhere. It has its own created_at, so no join is needed.
+            # A published manifest is the SECOND stored surface reached only from here —
+            # it does not pass through pool_wire_state — so both of the corrections that
+            # the pool index gets have to be repeated at this chokepoint or they are
+            # absent from every named community version. Both callers come through here.
+            #
+            # #0417: the manifest carries this digest too, so say which of the two it is.
+            # It has its own created_at, so no join is needed.
+            # #0418: the manifest also carries the basis wording 0.27.15 retracted, so
+            # correcting only the pool index would still leave a contributor reading the
+            # withdrawn claim off a named version.
             "sha256_provenance": pool.digest_provenance(
                 manifest, digest_key="weights_sha256"
             ),
-            "selection_metric": manifest.get("selection_metric"),
-            "witness_metric": manifest.get("witness_metric"),
+            "selection_metric": pool.corrected_metric(manifest.get("selection_metric")),
+            "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
 
     async def _next_free_community_version(self, am, pool_artifact_id: str, index: Dict[str, Any]) -> str:
