@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from haikunator import Haikunator
 from hypha_rpc import connect_to_server
-from hypha_rpc.rpc import RemoteException, RemoteService
+from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
@@ -32,32 +32,9 @@ from bioengine.utils import (
     ensure_applications_collection,
     get_static_site_url,
     latest_committed_version,
+    stale_service_kind,
 )
 
-
-# A hypha_rpc service proxy is pinned to ONE client instance of the remote
-# service. That instance can change client id at any time — the artifact manager
-# re-registered under a new one with nothing restarted — and hypha_rpc's own
-# websocket reconnect does not re-resolve cached proxies, so every later call
-# addresses a client that no longer exists and hangs to timeout. Split by whether
-# the call can have reached the server: a send-side failure provably did not, so
-# retrying it is safe even for a write; a timeout or a mid-call disconnect may
-# already have landed, so retrying those could double-execute a create or commit.
-#
-# hypha_rpc 0.21.40 does ship a stale-service retry, but it is installed by
-# ``RPC.get_remote_service`` and so reaches only the workspace-manager proxy and
-# services fetched by ``client_id:service_id`` URI. A service resolved by name
-# through ``server.get_service`` arrives off the ordinary decode path as a plain
-# ObjectProxy with no retry on it — this handle included.
-_PROXY_NEVER_SENT_MARKERS = (
-    "failed to send the request",
-    "websocket reconnection timed out",
-)
-_PROXY_MAYBE_SENT_MARKERS = (
-    "client disconnected",
-    "method call timed out",
-    "service not found",
-)
 
 # Reads are safe to repeat even when the first attempt may already have run, so
 # they are retried on either failure kind. This matters because the call that
@@ -73,23 +50,6 @@ _RETRY_SAFE_READS = frozenset(
 # only these three can be silenced, and only on the retry — the first attempt
 # should still count as a real view.
 _SILENCEABLE_READS = frozenset({"read", "list", "get_file"})
-
-
-def _stale_proxy_kind(exc: BaseException) -> Optional[str]:
-    """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
-    if isinstance(exc, RemoteException):
-        # Its message is ``"RemoteError:" + value + "\n" + remote traceback``, and
-        # the server runs hypha_rpc too, so any marker below can appear in that
-        # traceback. Arriving at all proves the remote handler ran.
-        return None
-    message = str(exc).lower()
-    if any(marker in message for marker in _PROXY_NEVER_SENT_MARKERS):
-        return "never_sent"
-    if isinstance(exc, asyncio.TimeoutError) or any(
-        marker in message for marker in _PROXY_MAYBE_SENT_MARKERS
-    ):
-        return "maybe_sent"
-    return None
 
 
 class _ReconnectingArtifactManager:
@@ -148,7 +108,7 @@ class _ReconnectingArtifactManager:
             try:
                 return await getattr(self._proxy, name)(*args, **kwargs)
             except Exception as exc:
-                kind = _stale_proxy_kind(exc)
+                kind = stale_service_kind(exc)
                 if kind is None:
                     raise
                 self._logger.warning(

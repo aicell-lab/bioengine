@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         ReservedMethodNameError,
     )
     from bioengine._app.runtime_handle import BioEngineRuntimeHandle
+    from bioengine.utils.stale_service import reconnecting_service
 
 
 def _install_replica_bootstrap_finder() -> None:
@@ -175,6 +176,10 @@ def __getattr__(name: str) -> Any:
         from bioengine._app.accessors import _LazyLogger
 
         return _LazyLogger()
+    if name == "reconnecting_service":
+        from bioengine.utils.stale_service import reconnecting_service
+
+        return reconnecting_service
     if name in _LAZY_FROM_APP:
         import bioengine._app as _app_module
 
@@ -183,4 +188,12 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted({"__version__", "datasets", "logger", *_LAZY_FROM_APP})
+    return sorted(
+        {
+            "__version__",
+            "datasets",
+            "logger",
+            "reconnecting_service",
+            *_LAZY_FROM_APP,
+        }
+    )

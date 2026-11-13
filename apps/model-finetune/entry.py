@@ -89,7 +89,13 @@ TRAINING_PARAM_BACKENDS = {
     "n_objects_per_batch": ["microsam"],
     "patch_size": ["microsam"],
     "diam_mean": ["cellpose"],
+    "train_tile_size": ["cellpose"],
 }
+
+# cellpose locks the training tile to its backbone: cpsam raises
+# ValueError for any bsize != 256 (cellpose/train.py), while cpdino is free and
+# defaults to 384. Keyed on the model_type the caller passes, not the backbone.
+CELLPOSE_FIXED_TILE_SIZE = {"cpsam": 256}
 
 
 def _read_pip(name: str) -> List[str]:
@@ -1049,6 +1055,15 @@ class EntryApp:
             "lower it on small GPUs, raise it on large ones (8 fits vit_b on 24GB)."),
         patch_size: int = Field(512, ge=16, description="micro-sam only: square training patch side (clamped to the smallest image)."),
         diam_mean: float = Field(30.0, gt=0, description="cellpose only (cpsam/cpdino): mean object diameter in pixels."),
+        train_tile_size: Optional[int] = Field(
+            None, ge=16, description="cellpose only: square training tile side (cellpose "
+            "'bsize'). Omit for the backbone's own default — 256 for cpsam, 384 for "
+            "cpdino. A smaller tile trains faster and in less VRAM, at some cost in "
+            "accuracy: measured on synthetic narrow-object data, 256 matched the 384 "
+            "default to within noise while 128 scored below it, so lower this when "
+            "training cost is the constraint rather than to improve a narrow-data fit. "
+            "cpsam accepts 256 and nothing else, so this is settable for "
+            "cpdino/cpdino-vitb only."),
         batch_size: int = Field(1, ge=1, description="Training batch size."),
         learning_rate: float = Field(1e-5, gt=0, description="AdamW learning rate."),
         val_fraction: float = Field(0.2, ge=0.0, le=0.9, description="Val split fraction when val is omitted."),
@@ -1112,6 +1127,16 @@ class EntryApp:
                 "init_from_pool."
             )
 
+        # Refuse here rather than let cellpose raise it: train_seg checks this only
+        # after data prep and after the run has taken the single GPU training slot.
+        fixed_tile = CELLPOSE_FIXED_TILE_SIZE.get(model_type)
+        if train_tile_size is not None and fixed_tile is not None and train_tile_size != fixed_tile:
+            raise ValueError(
+                f"{model_type} trains at a fixed tile size of {fixed_tile} — cellpose rejects "
+                f"any other value. Omit train_tile_size, or use a cpdino model type, which "
+                f"accepts it."
+            )
+
         pool_provenance = None
         if init_from_pool:
             init_checkpoint, pool_provenance = await self._resolve_pool_init(
@@ -1151,7 +1176,7 @@ class EntryApp:
             batch_size=batch_size, learning_rate=learning_rate, diam_mean=diam_mean,
             val_fraction=val_fraction, n_samples=n_samples,
             resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
-            pool_provenance=pool_provenance,
+            pool_provenance=pool_provenance, train_tile_size=train_tile_size,
             patch_shape=(patch_size, patch_size), num_workers=0,
             metrics=selected_metrics,
         )
@@ -1909,7 +1934,7 @@ class EntryApp:
         pool_token: str = Field(..., description="Token with read access to the pool. Scoped to the pool, not the app's own token."),
     ) -> Dict[str, Any]:
         """The pool's state projected onto the campaign-page wire contract
-        (schema_version 0.13.0-draft): merge_trigger, baseline_metric (role=witness),
+        (schema_version 0.15.0-draft): merge_trigger, baseline_metric (role=witness),
         soups[] (published merges), empty_merges[] (merges that admitted nothing),
         and enriched contribution stubs. Role-tagged metrics come straight from
         storage — the role is a property of the artifact, not assigned here."""
