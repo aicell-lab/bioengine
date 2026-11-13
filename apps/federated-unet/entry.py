@@ -99,7 +99,21 @@ class FederatedUNetSite:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._artifact_manager = await self._hypha.get_service("public/artifact-manager")
+        # Cached for the replica's whole life and handed to every
+        # `CheckpointStore` (see `_store`), so a stale client id would hang
+        # every checkpoint read and write to the method timeout; this app has
+        # no `@bioengine.health_check` at all, so nothing else would notice.
+        # `CheckpointStore` calls `read`, `get_file`, `put_file` and `create`
+        # (checkpoints.py:98-129); the first three are safe to re-send — the
+        # two file methods only mint a presigned URL — but `create` is left out
+        # on purpose, because re-sending a create that already landed is the
+        # one call here that could double-execute.
+        self._artifact_manager = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/artifact-manager",
+            repeatable=("read", "get_file", "put_file"),
+            logger=logger,
+        )
         logger.info(f"[{self.site_name}] ready on {self._device}")
 
     @bioengine.smoke_test

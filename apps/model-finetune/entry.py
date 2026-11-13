@@ -312,7 +312,18 @@ class EntryApp:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._s3 = await self._hypha.get_service("public/s3-storage")
+        # Resolved once per replica and cached for its whole life, so a plain
+        # proxy pinned to a client id the server later forgets would hang every
+        # call to the full method timeout — and `_health` below tests `is None`,
+        # which a dead handle passes. `put_file`/`get_file` only mint a
+        # presigned URL, so both are safe to re-send after a call that may
+        # already have landed.
+        self._s3 = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/s3-storage",
+            repeatable=("put_file", "get_file"),
+            logger=logger,
+        )
         self._http = httpx.AsyncClient(timeout=60.0)
         self._busy.start()
         logger.info(f"Connected to Hypha server at {SERVER_URL}")

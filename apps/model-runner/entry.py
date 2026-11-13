@@ -316,10 +316,30 @@ class EntryDeployment:
         if self._hypha_token:
             connect_config["token"] = self._hypha_token
         self.hypha_client = await connect_to_server(connect_config)
-        self.artifact_manager = await self.hypha_client.get_service(
-            "public/artifact-manager"
+        # Both handles are resolved once here and cached for the replica's whole
+        # life. A proxy pinned to a client id the server later forgets is not
+        # `None`, so `_health` below (which pings `hypha_client`, not these)
+        # keeps reporting healthy while every call hangs to its method timeout.
+        #
+        # `repeatable` names only the methods that are safe to re-send after a
+        # call that MAY already have landed. The staged-write sequence
+        # (`edit`/`create`/`commit`/`remove_file`, used around :3092-3143) is
+        # deliberately NOT in the set: whether re-sending a `commit` that
+        # already landed is safe is artifact-manager semantics, which nobody has
+        # measured, so those surface one failure and the next call uses the
+        # refreshed handle rather than risking a double-execute.
+        self.artifact_manager = await bioengine.reconnecting_service(
+            self.hypha_client,
+            "public/artifact-manager",
+            repeatable=("read", "list", "list_files", "get_file", "put_file"),
+            logger=logger,
         )
-        self.s3_controller = await self.hypha_client.get_service("public/s3-storage")
+        self.s3_controller = await bioengine.reconnecting_service(
+            self.hypha_client,
+            "public/s3-storage",
+            repeatable=("put_file", "get_file"),
+            logger=logger,
+        )
         logger.info(f"Connected to Hypha Server at {self.server_url}")
 
         # Per-request scratch directory on the shared PVC. Any request dir
