@@ -306,14 +306,19 @@ Notes:
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the
   C++ pieces `python-elf` used to need from conda-forge.
 
-### A replica whose `runtime_env` did not install now fails at startup
+### A replica whose `runtime_env` did not install now names the missing modules in its logs
 
 Each GPU runtime declares a `@bioengine.smoke_test` that imports its own ML stack
-once, before Ray Serve admits traffic — `torch` + `cellpose` for the Cellpose
-runtime, `torch` + `micro_sam` + `segment_anything` + `onnxruntime` + `pooch` for
-micro-sam. If any of them is missing the replica is marked **unhealthy** and the
-reason is in the deployment's own logs (`get_app_status` →
-`deployments.<name>.logs`).
+once — `torch` + `cellpose` for the Cellpose runtime, `torch` + `micro_sam` +
+`segment_anything` + `onnxruntime` + `pooch` for micro-sam. If any of them is
+missing the replica is marked **unhealthy** and the reason is in the deployment's
+own logs (`get_app_status` → `deployments.<name>.logs`).
+
+The import runs in the background *after* the replica has started serving, so it
+does **not** gate traffic: a replica whose env is broken still starts, still reports
+`HEALTHY` on its first poll, and still receives calls. What it changes
+is visibility, not routing — see the second bullet below for how long a broken
+replica keeps receiving calls.
 
 That used to be invisible. Nothing on the health path imports the ML stack: the
 framework's `check_health` runs the one-shot `async_init` and retains a CUDA context
@@ -341,10 +346,16 @@ Two things worth knowing when you see it:
   - *Per deployment, indefinitely.* Serve then **replaces** the condemned replica
     and the cycle repeats, because its circuit breaker never trips for a version
     whose replicas start successfully and fail only afterwards. Measured end to end
-    on a real `serve.run` (backlog `#0387`) over 100 health-check periods: **105
-    calls, 0 failed, 84 of them answered by a replica that already knew its own
-    smoke test had failed, across 22 distinct replica pids.** Callers see
-    successful-looking responses the whole time.
+    on a real `serve.run` (backlog `#0387`) over 100 health-check periods — that
+    probe ran at `health_check_period_s=1.0`, so ≈100 s in all, **not** 100 × the
+    30 s above: **105 calls, 0 failed, 84 of them answered by a replica that
+    already knew its own smoke test had failed, across 22 distinct replica pids.**
+    Read that as a measurement of *routing*, not of what your callers will see:
+    `#0387`'s handler imported nothing, so its calls succeeded. In this app they do
+    not — the micro-sam and Cellpose call paths import their own ML stack, so a
+    replica in this state raises `ModuleNotFoundError`, which is the very symptom
+    this section describes. What carries over is that calls keep arriving at a
+    replica whose smoke test has already failed.
   - *So what you get from this fix:* the missing modules are **named in
     `deployments.<name>.logs` on every cycle** instead of the replica reporting
     `HEALTHY` in silence. Debugging a fresh deploy, expect a replica that looks
