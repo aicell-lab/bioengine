@@ -389,6 +389,12 @@ Everything after the lede is for the reader who has already decided to act. Dens
 
 After the lede: how it was observed or reproduced, the evidence that localises it, and any candidate fix with its caveats. Attributing a finding to whoever made it is useful here.
 
+### In a backlog row, never write "blocked by #NNNN" about a row that isn't this one
+
+`myco issue list` and `issue pending` derive a row's `BLOCKED on #NNNN — not startable, NOT counted` annotation by scanning the row's own text for the literal phrase `blocked by #NNNN`, and attribute it to the row **containing** the sentence rather than to the row it names. Measured 2026-11-13: the set of rows whose text contained `blocked by #0298` and the set rendering `BLOCKED on #0298` were identical — two rows, neither of them blocked — while #0322, the row both sentences were actually about, was in neither set. There is no stored edge to correct afterwards: the issue schema has no `blockedBy` key, and `blocked` is a free-text string.
+
+A parenthetical in a related-rows list is the usual way in — "`#0322` (blocked by #0298)" — and the failure is silent: the row leaves the startable set with nothing recording that it was excluded. Write **"is held behind #NNNN"**, **"#NNNN is its blocker"**, or **"waits on #NNNN"** instead; all three read the same to a human and none is parsed. The genuine blocker of the row you are writing goes in its `blocked` field via `myco issue pause`, never in prose.
+
 ### PR descriptions
 
 **Include, after the lede:**
