@@ -2275,8 +2275,11 @@ class AppsManager:
         deploy task blocks alive on an event, so we can't gate on it being
         idle; instead a cooldown rate-limits sweeps so an in-flight serve.run
         isn't stomped every tick. Apps recovered from a previous worker carry
-        no cached ``built_app``; they can't be rebuilt from here and are
-        skipped, so they stay down until something redeploys them.
+        no cached ``built_app``; they can't be rebuilt from here and stay down
+        until something redeploys them. They still go through
+        ``_fire_redeploy`` so that skip is logged rather than silent — the
+        incident that motivated this lost an adopted app and left nothing in
+        the worker's own logs to say so.
         """
         now = time.time()
         if now - self._last_controller_recovery < _CONTROLLER_RECOVERY_COOLDOWN_SECONDS:
@@ -2284,12 +2287,13 @@ class AppsManager:
         self._last_controller_recovery = now
         for application_id in application_ids:
             info = self._deployed_applications.get(application_id)
-            if not info or info.get("built_app") is None:
+            if not info:
                 continue
-            self.logger.error(
-                f"Ray Serve controller lost (Ray head restart?); "
-                f"re-establishing application '{application_id}' in-place."
-            )
+            if info.get("built_app") is not None:
+                self.logger.error(
+                    f"Ray Serve controller lost (Ray head restart?); "
+                    f"re-establishing application '{application_id}' in-place."
+                )
             self._fire_redeploy(
                 application_id,
                 info,
