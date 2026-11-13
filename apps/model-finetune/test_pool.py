@@ -550,9 +550,33 @@ def test_the_targeted_rung_is_one_the_page_actually_defined():
     )
 
 
+def _a_rung_the_page_has_never_defined() -> str:
+    """The lowest major.minor the page has not committed — DERIVED, never named.
+
+    A literal here would be true only until the page committed that rung, and
+    would then go red for a reason that has nothing to do with the backend —
+    which is the "next person to bump deletes the test" failure this whole file
+    exists to avoid. An earlier draft of this test did hardcode one, and the
+    mutation harness's legitimate-bump arm is what caught it.
+    """
+    for minor in range(1, 1000):
+        candidate = f"0.{minor}"
+        if candidate not in PAGE_RUNGS and candidate != BACKEND_TARGETS_RUNG:
+            return candidate
+    raise AssertionError("no undefined rung below 0.1000 — widen the search")
+
+
 def test_the_check_rejects_a_superseded_page_rung():
     """#0114's actual defect, pinned so it cannot recur silently. 0.14.0-draft
     is a real rung the page committed for the dropped-synchronous-arm shape."""
+    # The pin's premise, stated so a future bump to 0.14 fails with a reason
+    # rather than cryptically. A rung already committed stays committed, so
+    # this is the only way the historical fact below can stop applying.
+    assert BACKEND_TARGETS_RUNG != "0.14", (
+        "this test pins #0114's defect, whose premise is that the backend does "
+        "NOT target 0.14; if it now deliberately does, rewrite the pin against "
+        "whichever rung was superseded — do not delete it"
+    )
     why = _rung_violation("0.14.0-draft")
     assert why is not None, "0.14.0-draft was accepted — the check cannot go red"
     assert "0.14" in why and "2026-09-24" in why and "9d5ef26" in why, (
@@ -564,10 +588,11 @@ def test_the_check_rejects_a_superseded_page_rung():
 def test_the_check_rejects_a_rung_the_page_never_defined():
     """A backend that invents a rung is out of lock-step even though it collides
     with nothing — the page raises a mismatch on it."""
-    why = _rung_violation("0.16.0-draft")
-    assert why is not None, "0.16.0-draft was accepted — the check cannot go red"
+    rung = _a_rung_the_page_has_never_defined()
+    why = _rung_violation(f"{rung}.0-draft")
+    assert why is not None, f"{rung}.0-draft was accepted — the check cannot go red"
     assert "not a rung the page has ever committed" in why, (
-        f"the rejection does not say WHY 0.16 is wrong: {why!r}"
+        f"the rejection does not say WHY {rung} is wrong: {why!r}"
     )
     # ...and it must say so for a different reason than a collision does, or the
     # two failure modes are indistinguishable in a red run.
