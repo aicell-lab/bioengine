@@ -162,15 +162,8 @@ def validate(app_dir):
     if not manifest_path.exists():
         error_exit(f"No manifest.yaml found in '{app_dir}'.")
 
-    manifest = _validate_manifest_or_exit(manifest_path)
+    _validate_manifest_or_exit(manifest_path)
     click.echo(f"OK: {manifest_path} is a valid v0.6.0 BioEngine app manifest.")
-    # `id` is a required field, so a green verdict here reads as clearance for the
-    # one thing that most often refuses the upload: the id already being taken.
-    click.echo(
-        f"Checked locally: structure and required fields. NOT checked: whether "
-        f"id '{manifest['id']}' is free in the target workspace. Run "
-        f"`bioengine apps upload {app_dir}` to find out — it refuses a taken id."
-    )
 
 
 # ── upload ─────────────────────────────────────────────────────────────────────
