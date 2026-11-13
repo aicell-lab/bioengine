@@ -7,19 +7,23 @@ role-tagged RoundMetric shape, the soups/empty-merges partition, and — the gua
 that matters — that a SELECTION value can never surface on the witness curve. The
 directional test fails on a misplaced VALUE, not merely a mislabelled tag.
 
-The field-sets below were derived from the page's verified 0.13.0-draft fixture
-corpus (``cellpose-sam-community.json``). The corpus is not vendored (it is the
-page's artifact and rots on draft bumps); ``test_matches_fixture_corpus`` cross-
-checks these constants against it when a path is supplied via
-``MODEL_FINETUNE_CORPUS_DIR``, so a draft bump that moves a field is caught the next
-time the test is run against the fresh corpus.
+The field-sets below were first derived from the page's verified 0.13.0-draft fixture
+corpus (``cellpose-sam-community.json``) and re-verified unchanged against the
+regenerated 0.15.0-draft corpus (bioimage.io 6a7fac8, 2026-11-13). The corpus is not
+vendored (it is the page's artifact and rots on draft bumps);
+``test_matches_fixture_corpus`` cross-checks these constants against it when a path is
+supplied via ``MODEL_FINETUNE_CORPUS_DIR``, so a draft bump that moves a field is
+caught the next time the test is run against the fresh corpus.
 
-⚠ That corpus is still at 0.13.0-draft and the backend is now at 0.15.0-draft, so
-``test_matches_fixture_corpus`` asserts a mismatch until the page regenerates it.
-That is the bump doing its job, not a regression: the contribution stub publishes
-``n_bytes`` where it used to publish ``bytes_out``. Note the corpus check would NOT
-have caught that rename on its own — it pins merge/transport field-sets, never the
-contribution stub, which is why ``CONTRIBUTION_KEYS`` is asserted here directly.
+⚠ The corpus check covers the merge/transport field-sets and NOT the contribution
+stub, so it could not have caught the ``bytes_out`` → ``n_bytes`` rename that defines
+rung 0.15 — which is why ``CONTRIBUTION_KEYS`` is asserted here directly. It is also
+not merely an omission waiting to be filled: measured against the 0.15 corpus, the
+page's contribution record and this backend's stub do not carry the same fields (the
+page adds ``base_version``, ``contributor_id``, ``dataset_name`` and ``declared``;
+this backend publishes ``samples_seen``, which the page's does not). Asserting set
+equality here would be red on a question about what the backend ought to publish, not
+about the wire contract this file pins.
 """
 
 from __future__ import annotations
@@ -32,7 +36,8 @@ import pytest
 import pool
 
 
-# Field-sets pinned from the 0.13.0-draft fixture corpus.
+# Field-sets pinned from the fixture corpus; unchanged between 0.13.0-draft and
+# 0.15.0-draft, re-verified against the latter.
 ROUNDMETRIC_KEYS = {
     "role", "name", "aggregate", "aggregate_basis", "aggregate_scope",
     "higher_is_better", "n_sites_scored", "n_datasets_scored", "per_site",
@@ -326,13 +331,14 @@ class TestDirectionalGuard:
 @pytest.mark.skipif(
     not os.environ.get("MODEL_FINETUNE_CORPUS_DIR"),
     reason=(
-        "set MODEL_FINETUNE_CORPUS_DIR to a 0.13.0-draft fixture corpus to "
+        "set MODEL_FINETUNE_CORPUS_DIR to a 0.15.0-draft fixture corpus to "
         "cross-check field-sets. The corpus lives in the OTHER repo, which is "
         "why this is opt-in rather than vendored: bioimage.io, branch "
         "feat/federation-campaigns-page, src/services/__fixtures__/corpus. It "
-        "must be a corpus at THIS backend's rung — the newest one there has "
-        "moved on, so take it from the last 0.13-era commit (b72d7e6, "
-        "2026-09-14), not from the branch tip. The rung itself is checked "
+        "must be a corpus at THIS backend's rung — take it from the commit "
+        "that defined the rung (6a7fac8, 2026-11-13), and re-read the rung "
+        "from PAGE_RUNGS rather than assuming the branch tip still sits on "
+        "it. The rung itself is checked "
         "unconditionally by test_schema_version_is_the_rung_this_backend_"
         "targets, so this skip no longer hides a wrong SCHEMA_VERSION (#0419)"
     ),
@@ -531,7 +537,7 @@ PAGE_RUNGS = {
 # pool.SCHEMA_VERSION and move this, in the same commit, after checking the
 # page has committed the rung you are moving to. A one-sided edit goes red, and
 # the message tells you which side you forgot.
-BACKEND_TARGETS_RUNG = "0.13"
+BACKEND_TARGETS_RUNG = "0.15"
 
 
 def _major_minor(value: str) -> str:
