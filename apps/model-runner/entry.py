@@ -322,16 +322,25 @@ class EntryDeployment:
         # keeps reporting healthy while every call hangs to its method timeout.
         #
         # `repeatable` names only the methods that are safe to re-send after a
-        # call that MAY already have landed. The staged-write sequence
-        # (`edit`/`create`/`commit`/`remove_file`, used around :3092-3143) is
-        # deliberately NOT in the set: whether re-sending a `commit` that
-        # already landed is safe is artifact-manager semantics, which nobody has
-        # measured, so those surface one failure and the next call uses the
-        # refreshed handle rather than risking a double-execute.
+        # call that MAY already have landed; a failure that provably never left
+        # the process is replayed for every method whether or not it is named.
+        # So the staged-write sequence (`edit`/`create`/`commit`/`remove_file`,
+        # used around :3092-3143) still gets the hang fixed by being unnamed,
+        # and gives up only the retry on an ambiguous failure — which is
+        # today's behaviour.
+        #
+        # `put_file` is excluded here even though it IS named for s3-storage
+        # below: against the artifact manager it writes, while against s3 it
+        # only mints a presigned URL. The worker draws the same line for the
+        # same service (`_RETRY_SAFE_READS` in `bioengine/apps/manager.py`).
+        #
+        # One known difference from that worker-side wrapper: it suppresses the
+        # view count on a retried read, this one does not, so a re-sent `read`
+        # or `list` counts the artifact view twice.
         self.artifact_manager = await bioengine.reconnecting_service(
             self.hypha_client,
             "public/artifact-manager",
-            repeatable=("read", "list", "list_files", "get_file", "put_file"),
+            repeatable=("read", "list", "list_files", "get_file"),
             logger=logger,
         )
         self.s3_controller = await bioengine.reconnecting_service(

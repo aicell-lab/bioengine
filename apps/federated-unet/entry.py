@@ -104,14 +104,18 @@ class FederatedUNetSite:
         # every checkpoint read and write to the method timeout; this app has
         # no `@bioengine.health_check` at all, so nothing else would notice.
         # `CheckpointStore` calls `read`, `get_file`, `put_file` and `create`
-        # (checkpoints.py:98-129); the first three are safe to re-send — the
-        # two file methods only mint a presigned URL — but `create` is left out
-        # on purpose, because re-sending a create that already landed is the
-        # one call here that could double-execute.
+        # (checkpoints.py:98-129). Only the two reads are named: `repeatable`
+        # governs re-sending a call that MAY already have landed, and the
+        # worker's own wrapper for this same service deliberately does not
+        # replay `put_file` or `create` (`_RETRY_SAFE_READS` in
+        # `bioengine/apps/manager.py`), so neither is named here either. They
+        # still get the hang fixed — a failure that provably never left the
+        # process is replayed for every method, named or not — and give up only
+        # the retry on an ambiguous failure, which is today's behaviour.
         self._artifact_manager = await bioengine.reconnecting_service(
             self._hypha,
             "public/artifact-manager",
-            repeatable=("read", "get_file", "put_file"),
+            repeatable=("read", "get_file"),
             logger=logger,
         )
         logger.info(f"[{self.site_name}] ready on {self._device}")
