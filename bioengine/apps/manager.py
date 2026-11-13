@@ -186,6 +186,10 @@ def _is_serve_controller_gone(exc: BaseException) -> bool:
     on the actor it names rather than on the death text, and only for an
     actual death: ``ActorUnavailableError`` means a live controller that is
     briefly unreachable, which must not trigger a re-bootstrap.
+
+    A worker that outlives a genuine head restart gets a bare ``Exception``
+    naming only an actor id, which nothing here can identify. That one is
+    decided by ``_serve_controller_is_missing`` at the call site.
     """
     msg = str(exc).lower()
     if isinstance(exc, ActorDiedError) and SERVE_CONTROLLER_NAME.lower() in msg:
@@ -205,6 +209,11 @@ def _serve_controller_is_missing() -> bool:
     controller makes it *return* an empty status rather than raise — and an
     empty status is also exactly what a healthy cluster with no applications
     returns. Asking Ray for the actor is what separates the two.
+
+    It is also the only reliable answer for the raising case: a worker that
+    survives a head restart gets a bare ``Exception`` reading "Failed to submit
+    task to actor … Can't find actor …", which names no controller and belongs
+    to no Serve-specific type, so nothing about the exception identifies it.
 
     Anything other than a clean "not found" reports the controller present, so
     an unrelated Ray failure can never trigger a recovery sweep.
@@ -2132,13 +2141,21 @@ class AppsManager:
         try:
             serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
         except Exception as exc:
-            if _is_serve_controller_gone(exc):
+            if _is_serve_controller_gone(exc) or _serve_controller_is_missing():
                 # A Ray head restart wiped the Serve controller. The client
                 # reconnects (handles refreshed, cached Serve client dropped)
                 # but there is no controller until an app is (re)deployed, so
                 # redeploy the tracked apps in-place: serve.run bootstraps a
                 # fresh controller and recreates the replicas without cycling
                 # the pod.
+                #
+                # The actor lookup is the second half because the exception
+                # alone does not always identify the loss: a worker that
+                # outlives a head restart gets a bare Exception naming only an
+                # actor id. Asking whether the controller exists answers it
+                # whatever was raised, and says "present" on anything that is
+                # not a clean not-found, so an unrelated Ray failure cannot
+                # trigger a sweep.
                 await self._recover_from_controller_loss(apps_to_redeploy)
             raise
 

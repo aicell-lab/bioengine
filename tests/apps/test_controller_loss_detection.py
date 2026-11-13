@@ -1,24 +1,31 @@
 """Pin that a lost Ray Serve controller is actually detected.
 
 ``_recover_from_controller_loss`` has exactly one trigger, and on Ray 2.55.1
-neither of the two shapes a real controller loss produces reached it — so the
+none of the three shapes a real controller loss produces reached it — so the
 whole recovery path, and every improvement made to it, was unreachable:
 
-* **cached Serve client** — ``serve.status`` raises ``ActorDiedError``, whose
-  message carries none of the three substrings the matcher looked for.
-* **fresh client, or a genuinely restarted head** — ``serve.status`` is the one
-  Serve API that passes ``raise_if_no_controller_running=False``, so it
-  *returns* ``ServeStatus(proxies={}, applications={})`` and the ``except``
-  branch is never entered at all.
+* **cached Serve client, controller killed** — ``serve.status`` raises
+  ``ActorDiedError``, whose message carries none of the three substrings the
+  matcher looked for.
+* **fresh client** — ``serve.status`` is the one Serve API that passes
+  ``raise_if_no_controller_running=False``, so it *returns*
+  ``ServeStatus(proxies={}, applications={})`` and the ``except`` branch is
+  never entered at all.
+* **a worker process that outlives a real head restart** — the production
+  event. ``serve.status`` raises a bare ``builtins.Exception`` reading "Failed
+  to submit task to actor … Can't find actor …", which names no controller and
+  has no Serve-specific type, so no matcher can identify it.
 
-Both shapes were measured in a throwaway container against the published worker
-image; the verbatim message below is that measurement, not a paraphrase.
+All three were measured in throwaway containers against the published worker
+image; the verbatim messages below are those measurements, not paraphrases.
 
-The second shape cannot be decided from the status object: an empty status is
-also exactly what a healthy cluster with no applications returns. Asking Ray
-whether the controller actor exists is what separates them, which is why a live
-controller is pinned here as hard as a dead one — a change that swept on every
-empty status would redeploy every app of every idle worker.
+Neither of the last two can be decided from what ``serve.status`` handed back:
+an empty status is also exactly what a healthy cluster with no applications
+returns, and the bare exception is indistinguishable from any other actor
+failure. Asking Ray whether the controller actor exists is what separates them,
+which is why a live controller is pinned here as hard as a dead one — a change
+that swept on every empty status, or on every exception, would redeploy every
+app of every idle or merely hiccuping worker.
 """
 
 from __future__ import annotations
@@ -55,6 +62,16 @@ MEASURED_ACTOR_DIED = (
     "\tnamespace: serve\n"
     "\tip: 172.17.0.8\n"
     "The actor is dead because it was killed by `ray.kill`."
+)
+
+# Measured verbatim on Ray 2.55.1: `ray stop --force` + `ray start --head` under
+# a worker process that reconnected, sampled at t=0/3/10/25 s — identical all
+# four times. Type is builtins.Exception; the mro is Exception -> BaseException.
+MEASURED_HEAD_RESTART = (
+    "Failed to submit task to actor "
+    "ActorID(e107fbe9e027d9447778c14802000000) due to "
+    "b\"Can't find actor e107fbe9e027d9447778c14802000000. "
+    "It might be dead or it's from a different cluster\""
 )
 
 
@@ -164,6 +181,65 @@ def test_the_previously_handled_shapes_still_match(message: str) -> None:
     # was measured to produce, but dropping them would narrow the fix into a
     # swap rather than an extension.
     assert _is_serve_controller_gone(RuntimeError(message)) is True
+
+
+# --------------------------------------------------------------------------
+# Shape 3: serve.status RAISES something unidentifiable — the real head restart
+# --------------------------------------------------------------------------
+
+
+def test_the_measured_head_restart_exception_names_nothing_to_match_on() -> None:
+    # Not a defect in the matcher — a statement of why the matcher cannot be the
+    # answer here. There is no controller name, no Serve type, nothing but an
+    # actor id, so widening the string list would only match this one id.
+    exc = Exception(MEASURED_HEAD_RESTART)
+    assert type(exc) is Exception
+    assert "serve" not in str(exc).lower()
+    assert _is_serve_controller_gone(exc) is False
+
+
+@pytest.mark.asyncio
+async def test_a_raising_status_with_a_missing_controller_still_sweeps(
+    monkeypatch, caplog
+) -> None:
+    # The production event: the exception identifies nothing, so the actor
+    # lookup has to carry it. Without this the tick just re-raises and the
+    # monitor wedges — the 14-consecutive-failed-ticks signature on the row.
+    manager = _make_manager()
+    manager.ray_cluster.call_with_reconnect = AsyncMock(
+        side_effect=Exception(MEASURED_HEAD_RESTART)
+    )
+    monkeypatch.setattr(manager_mod, "_serve_controller_is_missing", lambda: True)
+
+    with caplog.at_level(logging.INFO, logger="test.controller_loss"):
+        with pytest.raises(Exception, match="Can't find actor"):
+            await manager.monitor_applications()
+        await asyncio.sleep(0)
+
+    assert len(_controller_lost_lines(caplog)) == 1
+    manager._deploy_application.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_raising_status_with_a_live_controller_does_not_sweep(
+    monkeypatch, caplog
+) -> None:
+    # The control. Ray raises for plenty of reasons that are not a lost
+    # controller; sweeping on every one of them would redeploy every tracked app
+    # on any transient Ray failure.
+    manager = _make_manager()
+    manager.ray_cluster.call_with_reconnect = AsyncMock(
+        side_effect=Exception("Failed to submit task to actor ActorID(deadbeef)")
+    )
+    monkeypatch.setattr(manager_mod, "_serve_controller_is_missing", lambda: False)
+
+    with caplog.at_level(logging.INFO, logger="test.controller_loss"):
+        with pytest.raises(Exception, match="deadbeef"):
+            await manager.monitor_applications()
+        await asyncio.sleep(0)
+
+    assert _controller_lost_lines(caplog) == []
+    manager._deploy_application.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------
