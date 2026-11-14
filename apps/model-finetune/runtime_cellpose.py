@@ -707,6 +707,19 @@ class CellposeRuntime:
                 # of the amendment. Peak memory is unchanged either way: this branch holds
                 # `sd` plus the stock base, the branch above holds `sd` plus `base_sd`, so
                 # two state dicts in both cases and #0087's bound is not made worse.
+                #
+                # WHY A CONSTRUCTED NET IS CORRECT HERE AND NOT ABOVE. base_commitment
+                # records float(tensor[0]), so handing it a bfloat16 tensor would widen
+                # the value and write the widened number into pool_index.json ONCE, at
+                # creation, never recomputed -- bf16(32.9281082153) is exactly 33.0.
+                # Measured 2026-11-14 on cpsam_v2: the stock checkpoint FILE is a bare
+                # 348-key OrderedDict containing NO key matching /diam/, and
+                # diam_labels/diam_mean exist only on the constructed net, as bfloat16 at
+                # exactly 30.0 (and bf16(30.0) == 30.0 exactly). So for the stock base
+                # there is no float32 source to prefer -- torch.load cannot return a value
+                # the file does not hold -- and the constructed net loses nothing.
+                # The branch ABOVE must stay on torch.load: a fine-tuned base DOES carry a
+                # learned diam_labels, where the widening would be lossy.
                 stock = self._base_state_dict(model_type)
                 out["base_commitment"] = pool.base_commitment(
                     stock,

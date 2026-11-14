@@ -126,6 +126,34 @@ def test_the_runtime_builds_a_base_commitment():
     assert not _calls_to(tree, "zzz_not_a_function_name")
 
 
+def test_base_commitment_does_not_quantize_what_it_is_given():
+    """The builder must record the caller's value exactly; only the DTYPE handed in loses.
+
+    `base_commitment` stores `float(tensor[0])`, and the recorded value is written into
+    pool_index.json once at pool creation and never recomputed — so a widened value is
+    permanent. bf16 cannot hold 32.9281082153 and rounds it to exactly 33.0. This pins
+    that the builder itself is innocent: given float32 it records float32, which is why
+    the fine-tuned-base branch of `prepare_contribution` must read the checkpoint FILE
+    with torch.load rather than a constructed (bfloat16) net.
+    """
+    torch = pytest.importorskip("torch")
+    exact = 32.9281082153
+    f32 = {"diam_labels": torch.tensor([exact], dtype=torch.float32),
+           "net.weight": torch.zeros(2, dtype=torch.float32)}
+    rec = pool.base_commitment(f32, source="test:float32")
+    # float32 cannot hold the decimal exactly either, so compare against what float32
+    # itself round-trips to -- asserting the literal would test Python's parser, not this.
+    assert rec["non_learned"]["diam_labels"] == float(torch.tensor([exact], dtype=torch.float32)[0])
+
+    # CONTROL: the same value through bfloat16 is 33.0, so the assertion above is
+    # discriminating rather than true for any dtype.
+    bf16 = {"diam_labels": torch.tensor([exact], dtype=torch.bfloat16),
+            "net.weight": torch.zeros(2, dtype=torch.float32)}
+    rec_bf16 = pool.base_commitment(bf16, source="test:bfloat16")
+    assert rec_bf16["non_learned"]["diam_labels"] == 33.0
+    assert rec["non_learned"]["diam_labels"] != rec_bf16["non_learned"]["diam_labels"]
+
+
 def test_prepare_contribution_advertises_the_commitment_and_the_model_type():
     """The seam the entry depends on: the key it reads, and the argument it passes.
 
