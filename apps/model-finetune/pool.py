@@ -22,7 +22,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
 # record and every read method so the page can flag a backend/page mismatch
@@ -513,6 +513,94 @@ def inherited_non_learned(
     }
 
 
+def key_set_digest(keys: Iterable[str]) -> str:
+    """sha256 over a state_dict's sorted key list — the architecture's INVENTORY.
+
+    #0070 option (b), as amended by the ruling: two floats in ``pool_index.json`` record
+    the base's non-learned VALUES but carry no inventory, and without one the only
+    classification left is member-vs-member agreement, which cannot detect a
+    newly-added non-learned Parameter because every member has it — the exact
+    recurrence requirement 2 exists to catch. So the pool commits to the base's key set
+    as a digest, and the merge digests the sorted member keys and requires equality.
+
+    Keys only, deliberately: no shapes and no dtypes, because
+    ``architecture_signature`` already covers those and ``assert_compatible`` enforces
+    it. This answers the narrower question "is any key present that the base did not
+    have, or missing one it did", which is the one the carry-through needs.
+    """
+    payload = json.dumps(sorted(keys), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+BASE_COMMITMENT_FIELDS = ("non_learned", "key_set_sha256", "key_count", "source")
+
+
+def base_commitment(
+    state_dict: Dict[str, Any], *, source: str
+) -> Dict[str, Any]:
+    """The pool's record of the base it is anchored to — written ONCE, at pool creation.
+
+    Holds the base's non-learned values (requirement 3's operative value) and a
+    commitment to its key set (requirement 2's inventory), so the merge needs neither a
+    model load nor a base checkpoint download. ``source`` names the base, because an
+    inherited value with no named origin is not traceable.
+
+    A single dict rather than three arguments so the three cannot be recorded
+    inconsistently: a key count that disagrees with the digest it was taken from would
+    make the merge's equality check unfalsifiable.
+    """
+    if not state_dict:
+        raise ValueError("base_commitment requires a non-empty state_dict")
+    if not source:
+        raise ValueError("base_commitment requires a named source")
+    return {
+        "non_learned": {
+            key: float(value.detach().reshape(-1)[0])
+            for key, value in sorted(state_dict.items())
+            if is_non_weight_param(key)
+        },
+        "key_set_sha256": key_set_digest(state_dict.keys()),
+        "key_count": len(state_dict),
+        # The gate is the digest and the count, per the ruling. This list is carried so a
+        # REFUSAL can name the offending key: a digest proves inequality and says nothing
+        # about which key caused it, and the first version of this change regressed the
+        # old message from "carries key ['net.some_future_statistic']" to "has 5 keys,
+        # expected 4", which an operator cannot act on. NOT part of
+        # assert_base_commitment's required set, so an older commitment without it still
+        # merges and only loses the key name.
+        "key_set": sorted(state_dict.keys()),
+        "source": source,
+    }
+
+
+def assert_base_commitment(commitment: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Validate a pool's base record, or RAISE. There is no fallback, by ruling.
+
+    A pool that records no base cannot merge: falling back to loading a stock base would
+    make the field permanently optional, and a backfilled-on-the-fly base is a
+    provenance claim about a checkpoint nobody can re-derive. The census on #0533 counts
+    how many existing pools this blocks (measured 2026-11-14: all of them).
+    """
+    if not commitment:
+        raise ValueError(
+            "this pool records no base commitment, so the merge cannot classify its "
+            "keys or carry a non-learned value through — see #0533. There is no "
+            "fallback to a stock base load, deliberately: that would make the field "
+            "permanently optional"
+        )
+    missing = [f for f in BASE_COMMITMENT_FIELDS if commitment.get(f) is None]
+    if missing:
+        raise ValueError(
+            "this pool's base commitment is incomplete, missing %s" % (missing,)
+        )
+    if not isinstance(commitment["key_count"], int) or commitment["key_count"] <= 0:
+        raise ValueError(
+            "base commitment key_count must be a positive int, not %r"
+            % (commitment["key_count"],)
+        )
+    return commitment
+
+
 NON_LEARNED_UNREPORTED = "unreported_by_runtime"
 
 
@@ -767,7 +855,7 @@ def evict_lru_to_cap(
 def uniform_soup(
     loaders: Sequence[Callable[[], Dict[str, Any]]],
     *,
-    base: Callable[[], Dict[str, Any]],
+    base: Optional[Dict[str, Any]],
     member_non_learned: Optional[List[Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
     """Key-wise uniform mean of LEARNED tensors, with non-learned values taken from
@@ -827,18 +915,14 @@ def uniform_soup(
     if not n:
         raise ValueError("uniform_soup requires at least one state_dict")
 
-    base_sd = base()
-    if not base_sd:
-        raise ValueError("uniform_soup base loaded an empty state_dict")
-    base_keys = frozenset(base_sd)
-    # Detached clones, so the returned soup never aliases the base checkpoint's
-    # tensors and keeps each key's own dtype without a cast.
-    carried: Dict[str, Any] = {
-        key: value.detach().clone()
-        for key, value in base_sd.items()
-        if is_non_weight_param(key)
-    }
-    del base_sd
+    # The pool's RECORDED base (option (b), ruled 2026-11-14), not a loaded checkpoint:
+    # the merge reads two floats and a key-set commitment out of pool_index.json and
+    # never builds a model. Raises when absent — there is no fallback, by ruling.
+    commitment = assert_base_commitment(base)
+    base_non_learned = commitment["non_learned"]
+    expected_keys_sha = commitment["key_set_sha256"]
+    expected_key_count = int(commitment["key_count"])
+    carried: Dict[str, Any] = {}
 
     acc: Dict[str, Any] = {}
     dtypes: Dict[str, Any] = {}
@@ -848,22 +932,59 @@ def uniform_soup(
             raise ValueError(
                 f"uniform_soup member {index} loaded an empty state_dict"
             )
-        keys = frozenset(sd)
-        unclassifiable = sorted(keys - base_keys)
-        if unclassifiable:
-            raise ValueError(
-                f"uniform_soup member {index} carries {len(unclassifiable)} key(s) "
-                f"absent from the base checkpoint, so they can be classified neither "
-                f"learned nor non-learned and MUST NOT be averaged: "
-                f"{unclassifiable[:8]}"
+        # Requirement 2, fail-closed, against the pool's committed inventory. Both the
+        # digest AND the count are checked: the digest alone would be enough
+        # cryptographically, but the count makes the failure message actionable, and a
+        # count that disagreed with its own digest would mean the commitment itself was
+        # written inconsistently rather than the member being wrong.
+        got_sha = key_set_digest(sd.keys())
+        if got_sha != expected_keys_sha or len(sd) != expected_key_count:
+            # Name the keys when the commitment recorded its key list; fall back to the
+            # counts and digests when it did not.
+            detail = (
+                f"member has {len(sd)} keys, base commitment declares "
+                f"{expected_key_count} (member digest {got_sha[:12]}, base "
+                f"{expected_keys_sha[:12]})"
             )
-        missing = sorted(base_keys - keys)
-        if missing:
+            base_list = commitment.get("key_set")
+            if base_list:
+                base_keys = frozenset(base_list)
+                extra = sorted(frozenset(sd) - base_keys)
+                missing = sorted(base_keys - frozenset(sd))
+                if extra:
+                    detail = (
+                        f"member {index} carries {len(extra)} key(s) absent from the "
+                        f"base checkpoint, so they can be classified neither learned "
+                        f"nor non-learned and MUST NOT be averaged: {extra[:8]}"
+                    )
+                elif missing:
+                    detail = (
+                        f"member {index} is missing {len(missing)} key(s) the base "
+                        f"checkpoint declares: {missing[:8]}"
+                    )
             raise ValueError(
-                f"uniform_soup member {index} is missing {len(missing)} key(s) the "
-                f"base checkpoint declares: {missing[:8]}"
+                f"uniform_soup member {index} key set does not match this pool's base "
+                f"commitment: {detail}"
             )
         if not index:
+            # Carry the RECORDED non-learned values through, built at each key's own
+            # dtype and shape taken from the member, so the published checkpoint
+            # round-trips into cellpose unchanged. A value the commitment does not
+            # carry for a key the members DO have is a refusal, not a default.
+            for key in sorted(sd):
+                if not is_non_weight_param(key):
+                    continue
+                if key not in base_non_learned:
+                    raise ValueError(
+                        f"this pool's base commitment carries no value for "
+                        f"non-learned key {key!r}, so the merge cannot say what the "
+                        f"published checkpoint should hold for it"
+                    )
+                carried[key] = torch.full_like(
+                    sd[key], float(base_non_learned[key]))
+            # Built after `carried` is filled: the accumulator must exclude exactly the
+            # keys that are carried, and `key not in carried` only means that once the
+            # loop above has run.
             dtypes = {key: value.dtype for key, value in sd.items()
                       if key not in carried}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
@@ -1053,7 +1174,8 @@ def build_contribution_metadata(
     }
 
 
-def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
+def empty_index(model_type: str, architecture_signature: str,
+                base_commitment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """A fresh pool_index.json for a newly created pool artifact.
 
     ``baseline`` anchors the witness curve at stock cpsam (set on the first merge);
@@ -1064,6 +1186,13 @@ def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "model_type": model_type,
         "architecture_signature": architecture_signature,
+        # #0070 option (b): the base this pool is anchored to, recorded ONCE here. The
+        # merge reads its two floats and its key-set commitment and never loads a model.
+        # Optional at CREATION and fatal at MERGE, by ruling: a pool that records none
+        # cannot merge, and there is deliberately no fallback to loading a stock base,
+        # which would make the field permanently optional. #0533 carries the census of
+        # how many existing pools this blocks.
+        "base_commitment": base_commitment,
         "current_community": None,
         "contributions": [],
         "decided_contribution_ids": [],

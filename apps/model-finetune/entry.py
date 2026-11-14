@@ -2435,7 +2435,8 @@ class EntryApp:
                 # A journal hit returns above without folding, which is correct: that
                 # pass transported nothing on this run.
                 value = _fold(await runtime.score_soup(
-                    await _specs(member_paths), imgs, gts, diam_mean))["f1"]
+                    await _specs(member_paths), imgs, gts, diam_mean,
+                    base_commitment=index.get("base_commitment")))["f1"]
                 pool.record_score(journal, key, value)
                 await self._write_merge_journal(am, pool_artifact_id, journal)
                 return value
@@ -2529,7 +2530,9 @@ class EntryApp:
                 # never traverse the CPU entry.
                 async with self._staged(am, pool_artifact_id):
                     w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
-                    mat = _fold(await runtime.materialize_soup(await _specs(s_paths), w_url))
+                    mat = _fold(await runtime.materialize_soup(
+                        await _specs(s_paths), w_url,
+                        base_commitment=index.get("base_commitment")))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
                     # #0070 requirement 4: the contributors' own measured diameters go in
