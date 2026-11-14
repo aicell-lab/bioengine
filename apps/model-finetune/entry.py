@@ -2077,14 +2077,24 @@ class EntryApp:
                 # the torch-free CPU entry; the GPU runtime inspects it, PUTs the weights
                 # to the presigned URL, and returns the signature + hashes, so nothing
                 # large or torch-dependent crosses the entry.
-                info = await runtime.prepare_contribution(session_id, w_url)
+                info = await runtime.prepare_contribution(
+                    session_id, w_url, model_type=model_type)
                 signature = info["architecture_signature"]
                 if index is None:
                     # A fine-tune preserves the parameter layout, so the first
                     # contribution's signature is the pool's reference signature
                     # (equals stock cpsam). The pool artifact itself must already
                     # exist (created out-of-band with the pool_token's scope).
-                    index = pool.empty_index(model_type, signature)
+                    #
+                    # #0070: the base commitment is written HERE, once, at pool
+                    # creation. It is built on the runtime because a commitment needs
+                    # the base's state_dict and this entry is torch-free; passing it
+                    # through is what makes the pool mergeable at all, since
+                    # assert_base_commitment refuses a pool that records none and has
+                    # no fallback by ruling. A bootstrap that omitted it produced a
+                    # pool that could never merge.
+                    index = pool.empty_index(
+                        model_type, signature, info.get("base_commitment"))
                 else:
                     pool.assert_compatible(index, model_type=model_type, signature=signature)
 

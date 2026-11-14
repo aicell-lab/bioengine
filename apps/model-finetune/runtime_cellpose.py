@@ -648,12 +648,26 @@ class CellposeRuntime:
                 "member_non_learned": per_member,
             }
 
-    async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
+    async def prepare_contribution(self, session_id: str, weights_put_url: str,
+                                   model_type: str = "cpsam") -> Dict[str, Any]:
         """Inspect a finished session's local cpsam checkpoint (architecture
         signature + L2 drift from the base it started from), PUT its weights to the
-        pool's presigned URL, and return the signature, drift, sha256s, byte size and
-        cellpose version. The checkpoint is torch + a runtime-local file, neither of
-        which the torch-free CPU entry can touch, so all of it happens here."""
+        pool's presigned URL, and return the signature, drift, sha256s, byte size,
+        cellpose version and the base commitment a fresh pool is bootstrapped from.
+        The checkpoint is torch + a runtime-local file, neither of
+        which the torch-free CPU entry can touch, so all of it happens here.
+
+        ``base_commitment`` is produced HERE for exactly that reason (#0070). The entry
+        writes it into ``pool_index.json`` at pool creation but cannot build it: a
+        commitment needs the base's own state_dict, and a constant or manifest-derived
+        value would reinstate the key-set assumption the ruling's amendment removed.
+        It rides on the existing return rather than a second call, because the base is
+        already resident here.
+
+        ``model_type`` only selects the stock base for a session that has no
+        ``init_checkpoint.pt``; it defaults to the same ``"cpsam"`` as
+        ``_base_state_dict`` so an older caller that omits it is unchanged.
+        """
         import torch
 
         import pool
@@ -673,11 +687,32 @@ class CellposeRuntime:
                 "architecture_signature": pool.architecture_signature(sd),
                 "l2_from_base": None,
                 "base_checkpoint_sha256": None,
+                "base_commitment": None,
             }
             if base_path.exists():
                 base_sd = _state(str(base_path))
                 out["l2_from_base"] = pool.state_dict_l2_from_base(sd, base_sd)
                 out["base_checkpoint_sha256"] = pool.sha256_file(str(base_path))
+                # The base this session actually started from, named by its own digest so
+                # a reader can identify the checkpoint rather than trust the label.
+                out["base_commitment"] = pool.base_commitment(
+                    base_sd,
+                    source="session_init_checkpoint:%s" % out["base_checkpoint_sha256"],
+                )
+                del base_sd
+            else:
+                # A stock-initialised session keeps no init_checkpoint.pt (the same root
+                # cause as #0122), so the base it started from is stock cellpose. Loading
+                # it here is the REAL base, not an assumed one -- which is the whole point
+                # of the amendment. Peak memory is unchanged either way: this branch holds
+                # `sd` plus the stock base, the branch above holds `sd` plus `base_sd`, so
+                # two state dicts in both cases and #0087's bound is not made worse.
+                stock = self._base_state_dict(model_type)
+                out["base_commitment"] = pool.base_commitment(
+                    stock,
+                    source="cellpose:%s" % training.cellpose_base_model(model_type),
+                )
+                del stock
             return out
 
         info = await asyncio.to_thread(_inspect)

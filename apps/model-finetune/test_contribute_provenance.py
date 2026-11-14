@@ -63,7 +63,10 @@ def fake_training(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _Runtime:
-    async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
+    # model_type is accepted because the entry passes it (#0070): the base commitment is
+    # built on the runtime, so the entry has to say which stock base to fall back to.
+    async def prepare_contribution(self, session_id: str, weights_put_url: str,
+                                   model_type: str = "cpsam") -> Dict[str, Any]:
         return {
             "architecture_signature": "sig-1",
             "base_checkpoint_sha256": "b" * 64,
@@ -71,6 +74,12 @@ class _Runtime:
             "l2_from_base": 0.5,
             "weights_sha256": _DIGEST,
             "n_bytes": 1218617275,
+            "base_commitment": {
+                "non_learned": {"diam_labels": 30.0, "diam_mean": 30.0},
+                "key_set_sha256": "c" * 64,
+                "key_count": 350,
+                "source": "session_init_checkpoint:" + "b" * 64,
+            },
         }
 
 
