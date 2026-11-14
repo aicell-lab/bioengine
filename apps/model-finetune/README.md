@@ -281,6 +281,57 @@ GPU and never builds its (multi-GB) pip env. Its model types are reported
 `get_training_capabilities()` and rejected by `infer` / `start_training` with a
 clear error. Enabling both backends is a two-GPU deployment by design.
 
+**If you get it wrong, the app now tells you.** Asking for more GPUs than the
+cluster has used to be invisible. Measured 2026-11-13 on a one-GPU
+`external-cluster` worker with both backends enabled: the unplaceable runtime
+stays `UPDATING` with its replica `STARTING`, the application stays `DEPLOYING`,
+none of it is a failure state and none of it times out — so `deploy_app` returns
+successfully and `get_app_status` reads like a slow first start forever. The
+CPU-only entry deployment schedules on any node, so it is alive to say what the
+GPU deployments cannot (#0370):
+
+- a `⚠ GPU placement: …` **warning in the entry's log**, which
+  `get_app_status(application_ids=[...])` already returns under
+  `deployments.<entry>.logs`, naming the GPU count, the count required and
+  `MODEL_FINETUNE_BACKENDS`;
+- a **`placement` block** on `get_training_capabilities()`, carrying
+  `{backends_enabled, gpus_required, gpus_in_cluster, gpus_free, sufficient,
+  detail, advice}` — so the diagnosis arrives in the same response as the
+  `runtime unavailable` symptom.
+
+**`sufficient` answers the total, not the free count, and that is deliberate.**
+`gpus_in_cluster` is `ray.cluster_resources()` (what the cluster owns) and
+`gpus_free` is `ray.available_resources()` (what is unbooked at that instant).
+Whether these runtimes can EVER place here is a fact about the total, so only the
+total moves `sufficient`. A cluster that owns enough but has none free right now
+reads `sufficient: true` with a `detail` saying the runtimes pend until a device
+is released — reported, not alarmed. Keying the verdict to the free count would
+make it fire at this app's own placed replicas, which hold whole devices, and at
+every elastic cluster in the gap between two jobs.
+
+**Which of the two you can read depends on how bad it is**, and that is worth
+knowing before you go looking for the wrong one:
+
+| state | what to read |
+|---|---|
+| one backend over-subscribed, app serving | either — `get_training_capabilities()` is the convenient one |
+| every GPU runtime pending, app stuck `DEPLOYING` | **the log only.** The proxy registers the app's Hypha service only once every sibling deployment is serviceable, so nothing can call the app at all. `get_app_status` still returns the entry's log. |
+
+The entry therefore starts with `initial_replicas: 1` so the line is written
+without a caller; `min_replicas` stays `0`, so an idle entry still scales to zero.
+On a `single-machine` or `slurm` worker you will not reach this state at all — the
+worker's own resource check raises `ValueError: Insufficient resources …` and
+refuses the deploy. Only in `external-cluster` mode does it downgrade that to a
+warning (in the *worker's* log, assuming Ray autoscaling), and that is the mode
+KTH and deNBI run.
+
+`sufficient` is three-valued on purpose: `true` (enough GPUs), `false` (a real
+shortfall, and `advice` says what to set), or `null` when it cannot be told from
+here — no GPU has reported into the cluster yet, which is the normal state on an
+elastic SLURM cluster until the autoscaler provides a GPU node, or Ray's view was
+unreadable. It is a diagnostic only: it never refuses a deploy and never raises,
+because an over-subscribed cluster still serves every CPU method correctly.
+
 Pass it as a deployment env var — the guaranteed vector, since it must be visible
 when the app is introspected (an `application_env_vars` entry, or baked into a
 purpose-built worker image):
