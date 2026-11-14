@@ -509,14 +509,50 @@ class CellposeRuntime:
             torch.load(cached, map_location="cpu", weights_only=False)
         )
 
-    def _build_soup(self, members: List[Dict[str, str]]):
-        """Uniform mean of member state_dicts; None when empty (= stock base)."""
+    def _base_state_dict(self, model_type: str = "cpsam") -> Dict[str, Any]:
+        """The stock base checkpoint's state dict, for ``uniform_soup``'s ``base``.
+
+        ``uniform_soup`` reads exactly two things from it — the key set it classifies
+        every member key against, and the non-learned values it carries through
+        (#0070 requirements 2 and 3) — and releases it before allocating the
+        accumulator, so this costs one transient member rather than raising the
+        steady-state peak.
+
+        ⚠ PROVISIONAL WIRING, and the open half of #0070. Two things about it are
+        decisions rather than measurements, and both are recorded on the row:
+        (a) it loads the stock base through cellpose on the merge replica, where the
+        better shape is almost certainly to record the base's non-learned values in
+        ``pool_index.json`` at pool creation — two floats in JSON, no model load, no
+        key-set assumption — which is a schema change plus a backfill for existing
+        pools and so is not this lane's call to make unilaterally; and
+        (b) it ASSUMES a contributed member's keys, after ``_unwrap_sd``, are exactly
+        the bare net keys that ``model.net.state_dict()`` returns. That has NOT been
+        verified against a real pool from here. If it is wrong the merge FAILS naming
+        both sides rather than publishing a wrong checkpoint, which is the behaviour
+        the ruling asks for — but it fails every merge, so validate it on a live pool
+        before this leaves draft.
+        """
+        import training
+        from cellpose import models as cpmodels
+
+        base = training.cellpose_base_model(model_type)
+        model = cpmodels.CellposeModel(gpu=False, pretrained_model=base)
+        return self._unwrap_sd(model.net.state_dict())
+
+    def _build_soup(self, members: List[Dict[str, str]], model_type: str = "cpsam"):
+        """Uniform mean of member state_dicts; None when empty (= stock base).
+
+        Learned tensors are averaged; non-learned ones (``diam_labels``) are carried
+        from the base unchanged, and a key the base does not declare fails the merge
+        (#0070).
+        """
         import pool
 
         if not members:
             return None
         return pool.uniform_soup(
-            [partial(self._fetch_member, m["key"], m["url"]) for m in members]
+            [partial(self._fetch_member, m["key"], m["url"]) for m in members],
+            base=partial(self._base_state_dict, model_type),
         )
 
     async def score_soup(

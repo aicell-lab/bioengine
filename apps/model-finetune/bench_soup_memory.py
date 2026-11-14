@@ -86,7 +86,12 @@ def _run_point(member_file: str, n_members: int, mode: str) -> None:
     if mode == "before":
         merged = _old_uniform_soup([load() for _ in range(n_members)])
     else:
-        merged = pool.uniform_soup([load] * n_members)
+        # The benchmark measures peak RSS of the accumulation, so the base is one of
+        # the same synthetic members: uniform_soup reads only its key set and its
+        # non-learned values, and these members carry none, so the carried set is
+        # empty and the arithmetic matches what "before" measures. A differently
+        # shaped base would change the key set and be refused, which is the point.
+        merged = pool.uniform_soup([load] * n_members, base=load)
 
     peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(json.dumps({"peak_bytes": peak_kb * 1024, "checksum": _checksum(merged)}))

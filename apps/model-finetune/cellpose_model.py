@@ -75,8 +75,18 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
             self.net = CPSAM(dtype=dtype).to(self.device)
             self.backbone = "sam_vitl"
 
-        self.net.diam_labels = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
-        self.net.diam_mean = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
+        # Registered by iterating pool.NON_WEIGHT_PARAMS rather than by naming the
+        # two fields, so the set the federated merge EXCLUDES and the set this
+        # wrapper CREATES are one list (#0070 requirement 1). Adding a non-learned
+        # Parameter here without declaring it there is now impossible: there is
+        # nowhere else to add it. requires_grad=False is the declaration that these
+        # are not learned; it is not serialised into a state_dict, which is why the
+        # merge has to be told the names at all.
+        import pool
+
+        for _name in sorted(pool.NON_WEIGHT_PARAMS):
+            setattr(self.net, _name,
+                    nn.Parameter(torch.tensor([diam_mean]), requires_grad=False))
 
         self.nclasses = 3
         self.channel_axis = None

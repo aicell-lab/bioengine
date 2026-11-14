@@ -455,12 +455,22 @@ def contribution_digest_basis(record: Optional[Dict[str, Any]]) -> str:
 
 
 # Entries that live in a cpsam state_dict but are data statistics rather than
-# learned weights: cellpose_model.py:78-79 registers both as
-# nn.Parameter(requires_grad=False), so they are float32 scalars with matching
-# shapes and pass every dtype/shape filter. requires_grad is not serialised, so
-# a state_dict carries no way to tell them apart — the name is the only handle,
-# and it must come from the key (storage keys inside a .pt are bare positional
-# integers and position is not stable across writers).
+# learned weights. cellpose's own CPSAM/CPDINO do not declare these at all —
+# cellpose_model.py registers them, as nn.Parameter(requires_grad=False), so they
+# are float32 scalars with matching shapes and pass every dtype/shape filter.
+# requires_grad is not serialised, so a state_dict carries no way to tell them
+# apart — the name is the only handle, and it must come from the key (storage keys
+# inside a .pt are bare positional integers and position is not stable across
+# writers).
+#
+# ⚠ THIS IS THE SINGLE DECLARATION AND cellpose_model.py REGISTERS BY ITERATING IT
+# (#0070 requirement 1: classify from the model definition, not from a second
+# hardcoded list of names). It lives here, in the torch-free module, because
+# pool.py's import must stay stdlib-only — test_pool.py's contract — so the
+# dependency runs model -> pool and never the other way. Adding a non-learned
+# Parameter therefore means adding it HERE, which is what makes it excluded from
+# the soup in the same edit that registers it; test_soup_math.py asserts the two
+# agree, so the pair cannot drift.
 NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
 
 
@@ -687,8 +697,13 @@ def evict_lru_to_cap(
     return deleted
 
 
-def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, Any]:
-    """Key-wise uniform mean of full weight tensors — the AXIS-1 combine rule.
+def uniform_soup(
+    loaders: Sequence[Callable[[], Dict[str, Any]]],
+    *,
+    base: Callable[[], Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Key-wise uniform mean of LEARNED tensors, with non-learned values taken from
+    the base checkpoint — the AXIS-1 combine rule.
 
     Takes one zero-arg loader per member rather than materialised state dicts, and
     accumulates member-by-member, so peak memory is the running sum plus a single
@@ -696,11 +711,33 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
     pins every member in RAM at once: at 16 cpsam members that measured ~27 GB
     against the runtime's 12 GiB reservation and the replica was OOM-killed.
 
-    Still averages ``NON_WEIGHT_PARAMS``, which is wrong and deliberately left:
-    what a community checkpoint should carry for an object diameter instead of a
-    mean is a product decision, and "stop averaging it" has no defined output
-    until that is answered (#0070 requirement 3). Only the contributor-facing
-    ``state_dict_l2_from_base`` is fixed so far.
+    ``base`` is a loader for the checkpoint the pool started from, and it is
+    REQUIRED rather than defaulted, which is the whole point of #0070 requirement 2:
+    a caller that cannot say what the base is must fail, not silently average. It is
+    read once, reduced to its key set plus its non-learned values, and released
+    before the accumulation loop allocates, so it costs one transient member and
+    does not raise the steady-state peak.
+
+    #0070 requirement 3, RULED 2026-11-14: a non-learned key (``NON_WEIGHT_PARAMS``,
+    e.g. ``diam_labels``) is carried through from ``base`` UNCHANGED and is never
+    averaged. Averaging them produced 57.7405 for a four-member pool whose real
+    per-site diameters were 29.711 / 54.986 / 28.912 / 117.353 — a field asserting a
+    measurement nobody made, wrong by about a factor of two for three of the four.
+    The base value is the only traceable answer: it is the prior the soup inherited,
+    and the soup did not learn a diameter. The four real per-site numbers are not
+    discarded; they belong in the community manifest, because they are statistics
+    about contributors' DATA rather than parameters of the model.
+
+    #0070 requirement 2: classification is TOTAL and fail-closed. Every member key
+    must appear in ``base``, whose key set IS the architecture's own inventory, and a
+    key in neither the base nor the declared non-learned set raises rather than being
+    averaged. That is the property that stops this recurring: a future non-learned
+    ``nn.Parameter`` added to the architecture is a key the base of an existing pool
+    does not have, so it breaks the merge loudly instead of being quietly souped into
+    every community checkpoint. A name blacklist could not do this — the reason the
+    original defect survived review is that the docstring asked "are there persistent
+    buffers to reset?", correctly got zero, and read clean, while the thing needing
+    exclusion was a non-learned *Parameter*.
 
     Every member must share one parameter layout (``assert_compatible`` guards this
     at contribute + aggregate time), so the mean is well-defined per key. cpsam is
@@ -713,6 +750,20 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
     n = len(loaders)
     if not n:
         raise ValueError("uniform_soup requires at least one state_dict")
+
+    base_sd = base()
+    if not base_sd:
+        raise ValueError("uniform_soup base loaded an empty state_dict")
+    base_keys = frozenset(base_sd)
+    # Detached clones, so the returned soup never aliases the base checkpoint's
+    # tensors and keeps each key's own dtype without a cast.
+    carried: Dict[str, Any] = {
+        key: value.detach().clone()
+        for key, value in base_sd.items()
+        if is_non_weight_param(key)
+    }
+    del base_sd
+
     acc: Dict[str, Any] = {}
     dtypes: Dict[str, Any] = {}
     for index, load in enumerate(loaders):
@@ -721,15 +772,32 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
             raise ValueError(
                 f"uniform_soup member {index} loaded an empty state_dict"
             )
+        keys = frozenset(sd)
+        unclassifiable = sorted(keys - base_keys)
+        if unclassifiable:
+            raise ValueError(
+                f"uniform_soup member {index} carries {len(unclassifiable)} key(s) "
+                f"absent from the base checkpoint, so they can be classified neither "
+                f"learned nor non-learned and MUST NOT be averaged: "
+                f"{unclassifiable[:8]}"
+            )
+        missing = sorted(base_keys - keys)
+        if missing:
+            raise ValueError(
+                f"uniform_soup member {index} is missing {len(missing)} key(s) the "
+                f"base checkpoint declares: {missing[:8]}"
+            )
         if not index:
-            dtypes = {key: value.dtype for key, value in sd.items()}
+            dtypes = {key: value.dtype for key, value in sd.items()
+                      if key not in carried}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
-                   for key, value in sd.items()}
+                   for key, value in sd.items() if key not in carried}
         for key in acc:
             acc[key] += sd[key].detach().float()
         del sd
     for key in acc:
         acc[key] = (acc[key] / n).to(dtypes[key])
+    acc.update(carried)
     return acc
 
 
