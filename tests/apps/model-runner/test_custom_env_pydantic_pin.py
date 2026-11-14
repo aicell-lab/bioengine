@@ -385,6 +385,14 @@ REQ_OF_DEPLOYMENT = {
 #: serializer crash (myco #0497). Upstream fixed the call site in spec 0.5.14.3.
 PIN_MEASURED_AGAINST_CORE = "0.11.0"
 
+#: The ``bioimageio.spec`` that ``PIN_MEASURED_AGAINST_CORE`` requires, measured on PyPI
+#: 2026-11-14: ``bioimageio.core 0.11.0`` declares ``bioimageio.spec==0.5.12.0`` — an
+#: EXACT pin, read from ``requires_dist`` against 65 total entries as a control. Since
+#: myco #0550 both requirements files state this version explicitly rather than letting
+#: it arrive transitively, so the "equal core implies equal spec" inference is no longer
+#: load-bearing: pip refuses the install if the two ever disagree.
+SPEC_REQUIRED_BY_MEASURED_CORE = "0.5.12.0"
+
 
 def _exact_pin(requirements_text, distribution):
     """The version in a ``<distribution>==<version>`` line, or None.
@@ -408,6 +416,13 @@ def _core_pins(texts):
     """``{deployment: pinned bioimageio.core}`` for a mapping of deployment -> text."""
     return {
         name: _exact_pin(text, "bioimageio.core") for name, text in texts.items()
+    }
+
+
+def _spec_pins(texts):
+    """``{deployment: pinned bioimageio.spec}`` for a mapping of deployment -> text."""
+    return {
+        name: _exact_pin(text, "bioimageio.spec") for name, text in texts.items()
     }
 
 
@@ -536,3 +551,85 @@ def test_the_measured_core_constant_matches_what_the_pin_comment_claims():
         f"runtime.py no longer mentions {needle}, so PIN_MEASURED_AGAINST_CORE is "
         "keyed to a version the pin's own documentation has moved off"
     )
+
+
+# ------------------------- the spec pin is EXPLICIT now, not inferred from core (#0550)
+
+
+def test_both_deployments_pin_the_same_bioimageio_spec():
+    """The inference #0529 rested on is now a fact the files state (#0550).
+
+    #0529 asserted equal ``bioimageio.core`` and reasoned from there to equal
+    ``bioimageio.spec``, because core pinned spec exactly. That reasoning was true but
+    unguarded: a future core pinning spec as a RANGE would let two deployments resolve
+    different specs while the core guard kept passing, and the env-name hashes would
+    diverge silently.
+
+    Both files now pin spec explicitly, so the property is asserted rather than
+    inferred -- and a pin that disagrees with what core requires cannot even install.
+    Measured in the worker image: ``core==0.11.0`` with ``spec==0.5.12.0`` resolves
+    (pip exit 0), with ``spec==0.5.14.3`` it is ResolutionImpossible (pip exit 1).
+    """
+    texts = {name: path.read_text() for name, path in REQ_OF_DEPLOYMENT.items()}
+    pins = _spec_pins(texts)
+
+    missing = sorted(name for name, pin in pins.items() if pin is None)
+    assert not missing, (
+        f"{missing} do not pin bioimageio.spec to an exact == version. Since #0550 the "
+        "spec pin is explicit in both deployments precisely so that equality is "
+        "asserted rather than inferred from core's own requirement."
+    )
+    assert len(set(pins.values())) == 1, (
+        f"the deployments pin different bioimageio.spec versions: {pins}. Both hash the "
+        "env returned by pin_bioimageio_conda_env, so the pre-built env can never be "
+        "reused and every custom-env test pays a cold build."
+    )
+
+
+def test_the_explicit_spec_pin_matches_what_the_measured_core_requires():
+    """The explicit pin must not drift from the core it is paired with (#0550).
+
+    An explicit pin removes the inference, but it introduces its own failure mode: a
+    value that no longer matches what ``PIN_MEASURED_AGAINST_CORE`` actually requires.
+    pip would catch that at install time; this catches it at test time, which is
+    cheaper and names the reason.
+    """
+    texts = {name: path.read_text() for name, path in REQ_OF_DEPLOYMENT.items()}
+    for name, pin in sorted(_spec_pins(texts).items()):
+        assert pin == SPEC_REQUIRED_BY_MEASURED_CORE, (
+            f"{name} pins bioimageio.spec=={pin}, but bioimageio.core "
+            f"{PIN_MEASURED_AGAINST_CORE} requires {SPEC_REQUIRED_BY_MEASURED_CORE}. "
+            "Re-read core's requires_dist from PyPI and update BOTH, or the install "
+            "will fail as ResolutionImpossible. See myco #0550."
+        )
+
+
+def test_the_spec_guard_fails_when_the_two_files_diverge():
+    """Negative control for the two tests above (#0550 clause 2).
+
+    Clause 2 asks specifically that two files pinning DIFFERENT specs at the SAME core
+    fail the extended guard while the same-core-only case still passes -- i.e. that the
+    new assertion measures something the old one did not.
+    """
+    same_core_different_spec = {
+        "entry": "bioimageio.core==0.11.0\nbioimageio.spec==0.5.12.0",
+        "runtime": "bioimageio.core==0.11.0\nbioimageio.spec==0.5.13.0",
+    }
+    # The #0529 guard cannot see it: the cores agree.
+    cores = _core_pins(same_core_different_spec)
+    assert len(set(cores.values())) == 1, cores
+
+    # The #0550 guard can: the specs do not.
+    specs = _spec_pins(same_core_different_spec)
+    assert len(set(specs.values())) == 2, (
+        f"the spec helper cannot see a divergence the core helper misses, so this guard "
+        f"adds nothing: {specs}"
+    )
+
+    # And an absent spec pin must read as None rather than as agreement.
+    absent = _spec_pins({"entry": "bioimageio.core==0.11.0"})
+    assert absent["entry"] is None, absent
+
+    # A range must not read as an exact pin.
+    loose = _spec_pins({"entry": "bioimageio.spec>=0.5.12.0"})
+    assert loose["entry"] is None, loose
