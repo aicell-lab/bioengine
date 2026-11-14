@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -47,7 +48,7 @@ except ImportError:
 
 logger = logging.getLogger("ray.serve")
 
-# Hypha connection upkeep runs in a background task, never in check_health:
+# Hypha connection upkeep runs in a background task:
 # a slow or restarting Hypha server is a *server* problem and must not
 # condemn a Ray replica. The loop wakes on this interval to notice a lost
 # connection quickly, but only spends a Hypha round trip every
@@ -82,6 +83,11 @@ _RECONNECT_GRACE_S = 30
 # Serve to condemn today, so a replica that is merely slow is never caught by
 # it.
 _SIBLING_READ_DEADLINE_S = 60.0
+
+# How often the off-loop watchdog re-reads the two unrecoverable conditions.
+# Both are latched or timestamped state rather than a probe, so this only
+# bounds how long an already-doomed replica lingers.
+_LIVENESS_WATCHDOG_TICK_S = 2.0
 
 # Hypha reports a workspace we may not use as a plain exception with no
 # error code, from two different call sites in hypha_rpc. The message is the
@@ -353,10 +359,10 @@ class ProxyDeployment:
         self.rtc_service_id: str = None
         self.service_semaphore = asyncio.Semaphore(self.max_ongoing_requests)
 
-        # Hypha connection upkeep — owned by the background maintenance task,
-        # never by check_health. ``_connection_lost`` is set when a reachability
-        # probe fails and requests a client rebuild; ``_registration_failure``
-        # holds a permanent config/permission error for check_health to surface.
+        # Hypha connection upkeep — owned by the background maintenance task.
+        # ``_connection_lost`` is set when a reachability probe fails and
+        # requests a client rebuild; ``_registration_failure`` holds a permanent
+        # config/permission error for _liveness_watchdog to act on.
         self._maintenance_task: Optional[asyncio.Task] = None
         self._connection_lost = False
         self._registration_failure: Optional[BaseException] = None
@@ -384,6 +390,16 @@ class ProxyDeployment:
         # No Hypha service exists until _register_services succeeds, so open the
         # worker-visible record as unregistered rather than leaving it unknown.
         self._claim_service_registration()
+
+        # Both background workers used to be started by check_health, which no
+        # longer exists. Serve runs the constructor on the user-code event loop,
+        # so the task can be created here.
+        self._ensure_maintenance_task()
+        threading.Thread(
+            target=self._liveness_watchdog,
+            name=f"bioengine-liveness-{self.application_id}",
+            daemon=True,
+        ).start()
 
     def _claim_service_registration(self) -> None:
         """Take over the app's registration record for this replica.
@@ -981,7 +997,7 @@ class ProxyDeployment:
     async def _sweep_stale_peer_connections(self) -> None:
         """Close and drop WebRTC peers stuck in a transient state too long.
 
-        Called from ``check_health``. The state-change handler installed
+        Called from ``_rotate_webrtc_state``. The state-change handler installed
         in ``_on_webrtc_init`` cleans up on ``closed`` and ``failed``
         events, but the peer's browser tab (or mobile app, or Python
         client) can vanish without emitting either — the ICE connection
@@ -1510,6 +1526,76 @@ class ProxyDeployment:
             f"client so the new one is used."
         )
 
+    async def _apply_sibling_gate(self) -> None:
+        """Gate the Hypha service on every sibling deployment being serviceable.
+
+        The sibling status is read out-of-band from the Serve controller, so the
+        check never issues an in-band request and a saturated app can neither
+        block nor fail it.
+        """
+        states = await self._sibling_states()
+
+        if not self.entry_deployment_ready:
+            if states and all(_is_serviceable(*s) for s in states.values()):
+                self.entry_deployment_ready = True
+                for dep in states:
+                    self._dep_seen_ready[dep] = True
+                logger.info(
+                    f"✅ All deployments of app '{self.application_id}' are serviceable."
+                )
+            else:
+                pending = (
+                    [dep for dep, s in states.items() if not _is_serviceable(*s)]
+                    if states
+                    else "unknown"
+                )
+                logger.info(
+                    f"⏳ Waiting for app '{self.application_id}' deployments to run "
+                    f"(pending: {pending})."
+                )
+            return
+
+        if states is None:
+            return
+
+        # Deregister so the service disappears from Hypha, and re-gate. The
+        # outage stays visible in the app status via the down deployment
+        # itself, so the proxy need not fail its own health.
+        for dep, (running, status) in states.items():
+            if _is_serviceable(running, status):
+                self._dep_seen_ready[dep] = True
+            elif self._dep_seen_ready.get(dep):
+                logger.error(
+                    f"❌ Deployment '{dep}' of app '{self.application_id}' has "
+                    f"no RUNNING replica and is not serviceable (status: "
+                    f"{status}). Deregistering Hypha service until it recovers."
+                )
+                await self._deregister_services()
+                return
+
+    async def _rotate_webrtc_state(self) -> None:
+        """Rotate TURN credentials before they expire and sweep abandoned peers.
+
+        Both halves swallow their own failures: a stale ICE list or an
+        un-swept peer is better than taking the replica down, which is what
+        raising from here used to risk.
+        """
+        try:
+            await self._refresh_ice_if_expiring()
+        except Exception as e:
+            logger.warning(
+                f"⚠️ ICE credential refresh raised for '{self.application_id}': {e}. "
+                f"Existing credentials remain in place; will retry next tick."
+            )
+
+        try:
+            await self._sweep_stale_peer_connections()
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Peer-connection sweep raised for '{self.application_id}': {e}. "
+                f"Will retry next tick."
+            )
+
     async def _maintenance_tick(self) -> None:
         """One pass of connection upkeep. Never raises.
 
@@ -1519,12 +1605,15 @@ class ProxyDeployment:
         # must still reach disk.
         await self._flush_usage()
 
+        await self._apply_sibling_gate()
+
         if not self.entry_deployment_ready:
-            # Not serviceable yet, or deregistered because a sibling went
-            # down. check_health owns that gate; nothing to maintain.
+            # Not serviceable yet, or deregistered because a sibling went down.
             return
 
         await self._collect_renewed_token()
+
+        await self._rotate_webrtc_state()
 
         needs_registration = (
             self.server is None or self.websocket_service_id is None or self._connection_lost
@@ -1571,8 +1660,8 @@ class ProxyDeployment:
             # back. Having just confirmed the address resolves, we are the
             # replica entitled to say so.
             #
-            # Re-read the gate: check_health can deregister us while the probe
-            # above is in flight, and answering a question asked before that
+            # Re-read the gate: the sibling gate can deregister us while the
+            # probe above is in flight, and answering a question asked before that
             # would leave a deregistered app advertised with no path back —
             # every later tick returns at the gate.
             if self.entry_deployment_ready:
@@ -1635,13 +1724,13 @@ class ProxyDeployment:
         executor queue with no log signature at all.
 
         Suppressing the duplicate dispatch alone would trade that for a silent
-        permanent failure: the next check would return "unknown" promptly, the
-        replica would pass its health check forever and never finish gating. So
-        an outstanding read is only tolerated while the executor job itself is
-        still running *and* inside ``_SIBLING_READ_DEADLINE_S``. Past that the
-        controller read is genuinely wedged and this raises, which is the same
-        outcome as today but bounded, named in the log, and reached without
-        exhausting the pool first.
+        permanent failure: the replica would report "unknown" promptly forever
+        and never finish gating. So an outstanding read is only tolerated while
+        the executor job itself is still running *and* inside
+        ``_SIBLING_READ_DEADLINE_S``. Past that the controller read is genuinely
+        wedged, and ``_liveness_watchdog`` reads the same two attributes off the
+        event loop and ends the replica — bounded, named in the log, and reached
+        without exhausting the pool first.
 
         A job that has *finished* while the coroutine has not resumed is the
         other case entirely — the event loop is starved, the replica is fine,
@@ -1653,13 +1742,6 @@ class ProxyDeployment:
 
         if self._sibling_read_started_at is not None:
             elapsed = time.monotonic() - self._sibling_read_started_at
-            if self._sibling_read_job_running and elapsed > _SIBLING_READ_DEADLINE_S:
-                raise RuntimeError(
-                    f"Serve controller status read for '{self.application_id}' "
-                    f"has been outstanding for {elapsed:.0f}s "
-                    f"(deadline {_SIBLING_READ_DEADLINE_S:.0f}s); the controller "
-                    f"is not answering."
-                )
             logger.debug(
                 f"Sibling status read for '{self.application_id}' still "
                 f"outstanding after {elapsed:.1f}s (executor job "
@@ -1720,111 +1802,65 @@ class ProxyDeployment:
             self._sibling_read_started_at = None
             self._sibling_read_job_running = False
 
-    async def check_health(self):
+    def _unrecoverable_reason(self) -> Optional[str]:
+        """Why this replica can never serve again, or ``None`` while it can.
+
+        Read from the watchdog thread, so it must touch plain attributes only
+        and never await. Both conditions are latched or timestamped state
+        rather than a liveness probe: neither asks whether the event loop is
+        currently free, which is exactly why a saturated data path cannot
+        trigger them.
         """
-        Perform Ray Serve health check for this deployment.
-
-        This method is called by Ray Serve during deployment initialization and
-        periodically thereafter to ensure the deployment is healthy and ready
-        to serve requests.
-
-        The check reads local state only. Hypha is never contacted from here:
-        a slow or restarting Hypha server is a server-side problem, and
-        failing this check would tear down a replica that is perfectly able
-        to serve. Connecting, registering and reconnecting all happen in the
-        background maintenance task, which reports back through
-        ``_registration_failure``.
-
-        Health Check Process:
-        1. Surfaces a permanent Hypha registration failure (bad config or
-           rejected credentials), the one connection problem retrying cannot fix
-        2. Gates the Hypha service on every sibling deployment being serviceable
-        3. Rotates WebRTC TURN credentials and sweeps abandoned peer connections
-
-        Raises:
-            RuntimeError: If any health check fails, indicating the deployment is unhealthy
-        """
-        # Registration is retried indefinitely for anything that might clear on
-        # its own; reaching here means it never will, so fail loudly rather than
-        # sit registered-with-nobody.
         if self._registration_failure is not None:
-            raise RuntimeError(
+            return (
                 f"Hypha service registration for '{self.application_id}' failed "
                 f"permanently: {self._registration_failure}"
-            ) from self._registration_failure
-
-        self._ensure_maintenance_task()
-
-        # Read out-of-band from the Serve controller, so the probe never counts
-        # against any deployment's ``max_ongoing_requests`` and a saturated app
-        # can neither block nor fail it.
-        states = await self._sibling_states()
-
-        if not self.entry_deployment_ready:
-            if states and all(_is_serviceable(*s) for s in states.values()):
-                self.entry_deployment_ready = True
-                for dep in states:
-                    self._dep_seen_ready[dep] = True
-                logger.info(
-                    f"✅ All deployments of app '{self.application_id}' are serviceable."
-                )
-            else:
-                pending = (
-                    [dep for dep, s in states.items() if not _is_serviceable(*s)]
-                    if states
-                    else "unknown"
-                )
-                logger.info(
-                    f"⏳ Waiting for app '{self.application_id}' deployments to run "
-                    f"(pending: {pending})."
-                )
-                return
-        elif states is not None:
-            # Deregister so the service disappears from Hypha, and re-gate. The
-            # outage stays visible in the app status via the down deployment
-            # itself, so the proxy need not fail its own health.
-            for dep, (running, status) in states.items():
-                if _is_serviceable(running, status):
-                    self._dep_seen_ready[dep] = True
-                elif self._dep_seen_ready.get(dep):
-                    logger.error(
-                        f"❌ Deployment '{dep}' of app '{self.application_id}' has "
-                        f"no RUNNING replica and is not serviceable (status: "
-                        f"{status}). Deregistering Hypha service until it recovers."
-                    )
-                    await self._deregister_services()
-                    return
-
-        # Rotate WebRTC TURN credentials before they expire so long-
-        # running deployments don't silently drop TURN relay after ~1h
-        # (coturn's default TTL on hypha.aicell.io). See
-        # _refresh_ice_if_expiring for the mutate-in-place mechanism.
-        # Any exception is logged and swallowed — a stale ICE list is
-        # still better than a health-check failure at this point (the
-        # replica itself is fine).
-        try:
-            await self._refresh_ice_if_expiring()
-        except Exception as e:
-            logger.warning(
-                f"⚠️ ICE credential refresh raised for '{self.application_id}': {e}. "
-                f"Existing credentials remain in place; will retry next tick."
             )
 
-        # Sweep abandoned WebRTC peer connections. Same rationale as the
-        # ICE refresh: for long-running deployments the accumulation of
-        # ghost RTCPeerConnection objects is a real leak we've traced
-        # to peers vanishing without a clean state transition. See
-        # _sweep_stale_peer_connections.
-        try:
-            await self._sweep_stale_peer_connections()
-        except Exception as e:
-            logger.warning(
-                f"⚠️ Peer-connection sweep raised for '{self.application_id}': {e}. "
-                f"Will retry next tick."
-            )
+        started_at = self._sibling_read_started_at
+        if started_at is not None and self._sibling_read_job_running:
+            elapsed = time.monotonic() - started_at
+            if elapsed > _SIBLING_READ_DEADLINE_S:
+                return (
+                    f"Serve controller status read for '{self.application_id}' "
+                    f"has been outstanding for {elapsed:.0f}s "
+                    f"(deadline {_SIBLING_READ_DEADLINE_S:.0f}s); the controller "
+                    f"is not answering."
+                )
 
-        # All checks passed - deployment is healthy
-        logger.debug(f"🩺 Health check passed for '{self.application_id}'.")
+        return None
+
+    def _liveness_watchdog(self) -> None:
+        """Condemn this replica off the event loop, or not at all.
+
+        ``ProxyDeployment`` deliberately defines no ``check_health``. Ray Serve
+        dispatches a user health check onto the user-code event loop
+        (``asyncio.run_coroutine_threadsafe``), so while that loop relays a
+        WebRTC bulk transfer the check cannot be answered and the replica is
+        condemned for being busy -- measured, and independent of what the check
+        body does. With no user health check defined Serve skips the user
+        callable entirely and a saturated replica survives.
+
+        That leaves the app-level signal to this thread, which is not on the
+        loop and so is not starved by it. Termination skips ``__del__``, which
+        matches what a failed Serve health check already did.
+        """
+        while True:
+            time.sleep(_LIVENESS_WATCHDOG_TICK_S)
+            try:
+                reason = self._unrecoverable_reason()
+            except Exception:
+                continue
+            if reason is None:
+                continue
+            logger.error(f"\u274c {reason} Terminating replica.")
+            for handler in list(logger.handlers) + list(logging.root.handlers):
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+            os._exit(1)
+
 
     async def __del__(self) -> None:
         """Free the Hypha client_id before Ray Serve tears the replica down.
@@ -1911,7 +1947,7 @@ if __name__ == "__main__":
             debug=True,
         )
 
-        await deployment.check_health()
+        await deployment._maintenance_tick()
 
         print("Deployment is healthy and services are registered")
 

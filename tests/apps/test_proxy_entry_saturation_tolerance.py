@@ -1,6 +1,6 @@
 """Pin that ProxyDeployment gates its Hypha service off the data plane.
 
-The proxy no longer probes the entry in-band via ``check_health.remote()`` —
+The proxy no longer probes the entry in-band via a handle call —
 that call was routed through the entry's router and counted against its
 ``max_ongoing_requests``, so a saturated-but-healthy entry head-of-line-blocked
 the probe. Instead the proxy reads every sibling deployment's RUNNING replica
@@ -100,7 +100,7 @@ def _stub_states(value):
 
 
 async def _run(inst):
-    await inst.check_health()
+    await inst._apply_sibling_gate()
 
 
 @pytest.mark.asyncio
@@ -149,7 +149,7 @@ async def test_sibling_crash_deregisters() -> None:
 async def test_initial_gate_waits_for_all_siblings() -> None:
     """The service registers only once every sibling is serviceable.
 
-    check_health owns the gate; the background maintenance task does the
+    the maintenance tick owns the gate, and it also does the
     registering, and must stay idle until the gate opens.
     """
     registered = _Recorder()
@@ -477,17 +477,24 @@ async def test_wedged_read_fails_the_health_check(monkeypatch) -> None:
         _sibling_read_started_at=time.monotonic() - 1.0,
         _sibling_read_job_running=True,
     )
-    with pytest.raises(RuntimeError, match="controller is not answering"):
-        await inst.check_health()
+    # The condemnation moved off the event loop: the gate itself reports
+    # unknown and keeps the service, while the watchdog thread reads the same
+    # two attributes and is the thing that ends the replica.
+    await inst._apply_sibling_gate()
     assert inst._deregister_services.called is False, (
         "a controller that cannot be read says nothing about the siblings, so "
         "the service must not be pulled on the way out"
     )
+    reason = inst._unrecoverable_reason()
+    assert reason is not None and "controller is not answering" in reason, (
+        "a wedged controller read past its deadline must still be named as "
+        "unrecoverable, just off the event loop rather than in a health check"
+    )
 
 
 def test_probe_is_off_the_data_plane() -> None:
-    """check_health must read sibling status out-of-band, never in-band."""
-    src = inspect.getsource(_ProxyCls.check_health)
+    """The sibling gate must read status out-of-band, never in-band."""
+    src = inspect.getsource(_ProxyCls._apply_sibling_gate)
     assert "entry_deployment_handle.check_health.remote" not in src, (
         "the entry health probe must not be issued in-band — it counts against "
         "the entry's max_ongoing_requests and blocks under load."
