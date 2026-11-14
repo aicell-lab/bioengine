@@ -19,3 +19,14 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+# Version control and agent scratch. Nothing here reaches an image today only
+# because worker.Dockerfile and datasets.Dockerfile COPY named paths rather than
+# `COPY . .`; agent transcripts can contain credentials, so that selective COPY is
+# load-bearing. Excluding them here makes it a property of the context instead.
+# .git is safe to drop: the version is a static literal in pyproject.toml, there is
+# no setuptools-scm, and worker.Dockerfile's `git` is apt-get installing the binary.
+.git/
+.dev/
+.claude/
+.svamp/
