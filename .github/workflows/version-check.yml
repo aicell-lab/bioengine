@@ -103,6 +103,54 @@ jobs:
         fi
         echo "✅ Version updated from $PREVIOUS_VERSION to $NEW_VERSION."
 
+    - name: Ensure no other ready PR already claims this version
+      # The step above compares this branch against origin/main only, so two PRs
+      # that both bump past main pass independently and the collision surfaces
+      # only when the first merges — at which point the loser must re-bump,
+      # moving its head and voiding any review approval pinned to that SHA.
+      # Versions come from refs/pull/<n>/head because a PR head is not an
+      # ancestor of main and so is not readable from this checkout's branches.
+      # Drafts are excluded: their version is only compared at ready time, and
+      # most open PRs here sit far below main for long stretches.
+      if: env.RELEVANT_CHANGE == 'true' && github.event_name == 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SELF: ${{ github.event.pull_request.number }}
+      run: |
+        set -uo pipefail
+        if ! PEERS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
+             --json number,isDraft \
+             --jq ".[] | select(.isDraft == false) | select(.number != $SELF) | .number"); then
+          echo "❌ Could not enumerate open pull requests, so this step checked NOTHING."
+          echo "   Failing rather than passing: a rung guard that cannot see its siblings has no opinion, and silence here is indistinguishable from a clean result."
+          exit 1
+        fi
+        if [ -z "$PEERS" ]; then
+          echo "✅ No other open non-draft PR to compare against."
+          exit 0
+        fi
+        collide=""; unread=""
+        for n in $PEERS; do
+          if ! git fetch --quiet origin "refs/pull/$n/head"; then
+            unread="$unread #$n(fetch-failed)"; continue
+          fi
+          peer_version=$(git show FETCH_HEAD:pyproject.toml | grep -E '^version\s*=' | sed -E 's/version\s*=\s*"(.*)"/\1/')
+          if [ -z "$peer_version" ]; then
+            unread="$unread #$n(no-version)"; continue
+          fi
+          echo "  #$n -> $peer_version"
+          if [ "$peer_version" = "$NEW_VERSION" ]; then collide="$collide #$n"; fi
+        done
+        if [ -n "$unread" ]; then
+          echo "⚠ No version could be read from:$unread — a collision with those PRs would NOT have been seen below."
+        fi
+        if [ -n "$collide" ]; then
+          echo "❌ Version $NEW_VERSION is already claimed by open non-draft PR(s):$collide"
+          echo "   Both pass the comparison against main, so whichever merges second has to re-bump. Pick the next free version, or return this PR to draft until the other lands."
+          exit 1
+        fi
+        echo "✅ Version $NEW_VERSION is claimed by no other open non-draft PR."
+
     - name: Ensure bioengine/_version.py matches pyproject.toml
       # ``bioengine/_version.py`` is the version string that Ray Serve
       # replicas see (``pyproject.toml`` is not on the replica; only the
