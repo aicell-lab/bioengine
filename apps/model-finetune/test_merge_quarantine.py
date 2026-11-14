@@ -90,7 +90,18 @@ class _Runtime:
         }
 
     async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
-        return {"f1": self._f1, "replica": "r0", "soup_dl_bytes": 0}
+        """``{"f1": scalar, "per_image": vector}``, matching the real runtime.
+
+        ``per_image`` became part of this contract in #0121: ``aggregate()`` now
+        reads ``scored["per_image"]`` on every pass and banks it beside the
+        scalar, so a stub returning the scalar alone raises ``KeyError`` before
+        any quarantine assertion is reached. Two entries rather than one, each
+        equal to ``f1``: the mean is exactly ``f1`` with no floating-point
+        drift, and a length of two means a vector truncated to a single element
+        would still be visible to anything that looks.
+        """
+        return {"f1": self._f1, "per_image": [self._f1, self._f1],
+                "replica": "r0", "soup_dl_bytes": 0}
 
     async def materialize_soup(self, specs, url) -> Dict[str, Any]:
         return {"sha256": HEAD_SHA, "n_bytes": 2048,
