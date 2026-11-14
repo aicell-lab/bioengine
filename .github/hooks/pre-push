@@ -14,11 +14,39 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MATCH="$HERE/match-pr-only.sh"
 [ -x "$MATCH" ] || { echo "pre-push: missing $MATCH" >&2; exit 2; }
 
+# The version gates are the SAME scripts the pull-request and push workflows
+# call. They are invoked here rather than copied: two copies of a version
+# comparison that drift are worse than one gate that runs late.
+SCRIPTS="$(cd "$HERE/../scripts" && pwd)"
+WORKER_GATE="$SCRIPTS/check_worker_version.py"
+APP_GATE="$SCRIPTS/check_app_artifact_version.py"
+
+# Refuse rather than skip when the gate cannot be run at all. A pre-push hook
+# that passes because python is missing is the failure this guard exists to
+# prevent, one level up.
+run_gate() {   # run_gate <label> <script> <args...>
+    local label=$1 script=$2; shift 2
+    if [ ! -r "$script" ]; then
+        printf '%s: the gate script is missing at %s, so NO version was checked\n' "$label" "$script"
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '%s: python3 is not on PATH, so NO version was checked\n' "$label"
+        return 1
+    fi
+    local out rc
+    out=$(python3 "$script" "$@" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    printf '%s:\n%s\n' "$label" "$(printf '%s' "$out" | sed 's/^/    /')"
+    return 1
+}
+
 # git signals "ref absent" with an all-zero sha, whose width differs between
 # sha1 and sha256 repositories, so match the shape rather than a fixed string.
 is_absent() { [[ "$1" =~ ^0+$ ]]; }
 
 violations=""
+version_violations=""
 
 while read -r _local_ref local_sha remote_ref remote_sha; do
     [ -z "${remote_ref:-}" ] && continue
@@ -33,6 +61,24 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 
     hit=$(printf '%s\n' "$changed" | bash "$MATCH")
     [ -n "$hit" ] && violations="$violations$hit"$'\n'
+
+    # Version gates. Independent of the path check above on purpose: when the
+    # PR-only rule is softened the path check stops refusing, and this has to
+    # keep refusing a bad version on its own.
+    if is_absent "$remote_sha"; then
+        :   # a brand-new main has nothing to compare against
+    elif ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        # The remote is ahead of us, so git will reject this push anyway. Say so
+        # rather than passing a comparison that could not be made.
+        version_violations="${version_violations}the remote's commit ${remote_sha} is not in this clone, so no version could be compared (fetch first)"$'\n'
+    else
+        out=$(run_gate "worker version" "$WORKER_GATE" \
+                --base-ref "$remote_sha" --head-ref "$local_sha") \
+            || version_violations="$version_violations$out"$'\n'
+        out=$(run_gate "app manifest version" "$APP_GATE" \
+                --base-ref "$remote_sha" --head-ref "$local_sha" --main-ref "$remote_sha") \
+            || version_violations="$version_violations$out"$'\n'
+    fi
 done
 
 if [ -n "${violations//[$'\n' ]/}" ]; then
@@ -50,6 +96,28 @@ if [ -n "${violations//[$'\n' ]/}" ]; then
         echo "    git push origin HEAD"
         echo
     } >&2
+    refused=1
+fi
+
+if [ -n "${version_violations//[$'\n' ]/}" ]; then
+    {
+        echo
+        echo "pre-push: REFUSED — VERSION GATE. This push would land a version that is"
+        echo "not strictly greater than the one already on main, or two version files"
+        echo "that disagree."
+        echo
+        printf '%s' "$version_violations" | sed '/^$/d;s/^/  /'
+        echo
+        echo "Bump pyproject.toml and bioengine/_version.py together, or the app's"
+        echo "manifest.yaml, and push again. These are the same checks version-check.yml"
+        echo "and app-version-check.yml run; this one runs BEFORE the push, not after."
+        echo
+    } >&2
+    refused=1
+fi
+
+if [ "${refused:-0}" -ne 0 ]; then
+    echo "pre-push: nothing was pushed. \`git push --no-verify\` bypasses this guard." >&2
     exit 1
 fi
 
