@@ -2,8 +2,15 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# Running a script puts the SCRIPT'S directory on sys.path, not the caller's cwd, so `bioengine`
+# is unimportable from a plain `python3 scripts/upload_app.py` even in a perfectly good checkout —
+# and the resulting ModuleNotFoundError reads like a broken clone rather than a missing flag.
+# Appended, not inserted, so an installed bioengine still wins over the checkout.
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from hypha_rpc import connect_to_server, login
 
@@ -124,6 +131,12 @@ async def upload_app(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Create or update a deployment artifact",
+        epilog=(
+            "Before believing a success line, assert the workspace from the script's own log:\n"
+            "  Connected to workspace <WS> as user ...\n"
+            "  Successfully committed artifact '<WS>/<app>' (version=X.Y.Z)\n"
+            "If <WS> is not the workspace you meant, the version is already spent."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -143,12 +156,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workspace",
         type=str,
-        help="Hypha workspace to connect to",
+        help="Hypha workspace to publish into. OMIT THIS AND IT PUBLISHES TO THE WORKSPACE "
+        "THE TOKEN ITSELF CARRIES -- usually your personal one -- while reporting success. "
+        "An artifact version is immutable, so a version burned that way cannot be withdrawn.",
     )
     parser.add_argument(
         "--token",
         type=str,
-        help="Authentication token for Hypha server",
+        help="Authentication token. Falls back to $HYPHA_TOKEN and then to an interactive "
+        "login(); for a shared workspace you usually want that workspace's own token "
+        "(e.g. $BIOIMAGE_IO_TOKEN), not $HYPHA_TOKEN.",
     )
     parser.add_argument(
         "--worker-service-id",

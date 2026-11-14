@@ -296,12 +296,12 @@ For app-side changes (anything under `apps/<name>/**` that changes the deploymen
 ```sh
 cd <worktree-root>
 set -a; . /data/nmechtel/bioengine/.env; set +a
-PYTHONPATH="$(pwd -P)" python3 scripts/upload_app.py \
+python3 scripts/upload_app.py \
   -d apps/<name> --workspace bioimage-io --token "$BIOIMAGE_IO_TOKEN"
 ```
 
-1. **`PYTHONPATH="$(pwd -P)"` is required.** Without it the script dies with `ModuleNotFoundError: No module named 'bioengine'` even though `bioengine/` is right there — running a script puts the *script's* directory on `sys.path`, not the cwd, so `scripts/` is importable and the repo root is not. The error reads like a broken checkout and is a path problem; `hypha_rpc` and `packaging` are already in europa's system python3.
-2. **`--workspace bioimage-io` is required.** Omitted, the script connects with `server.config.workspace` — the token's own — and publishes to your PERSONAL workspace **while reporting success**. An artifact version is immutable, so a rung burned that way is silent and unrecoverable.
+1. **`PYTHONPATH="$(pwd -P)"` is NO LONGER NEEDED** — the script puts the repo root on `sys.path` itself (myco #0559). It used to be required, and the reason is worth keeping because it generalises to every other script here: running a script puts the *script's* directory on `sys.path`, not the cwd, so `scripts/` is importable and the repo root is not, and the resulting `ModuleNotFoundError: No module named 'bioengine'` reads like a broken checkout when it is a path problem. Setting `PYTHONPATH` anyway still works and still wins, because the script **appends** rather than inserts. `hypha_rpc` and `packaging` are already in europa's system python3.
+2. **`--workspace bioimage-io` is required.** Omitted, the script connects with `--workspace`'s default of `None` and only *then* rebinds `workspace = server.config.workspace` from the live connection — so it lands in whatever workspace the token itself carries, usually your PERSONAL one, **while reporting success**. An artifact version is immutable, so a rung burned that way is silent and unrecoverable.
 3. **Use `--token "$BIOIMAGE_IO_TOKEN"`,** not `HYPHA_TOKEN`. The script falls back to `os.environ["HYPHA_TOKEN"]` and then to an interactive `login()`, neither of which is what you want in a worktree.
 
 **Then assert the workspace from the script's own log** rather than trusting exit 0 — `INFO - Connected to workspace bioimage-io as user …`, followed by `Editing existing artifact 'bioimage-io/<name>' (new version: X.Y.Z)` and `Successfully committed artifact … (version=X.Y.Z)`.
