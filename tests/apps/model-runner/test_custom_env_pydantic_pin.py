@@ -242,7 +242,7 @@ def test_pydantic_core_survives_the_pin(ns):
 # ------------------------------------------- the two call sites must still agree on the hash
 
 
-def test_the_bound_is_a_literal_so_both_deployments_hash_the_same(ns):
+def test_the_pydantic_bound_is_a_literal_not_a_derived_version(ns):
     """``version("pydantic")`` here would break pre-built env reuse.
 
     The EntryApp and the RuntimeApp run in different deployments with different
@@ -251,6 +251,15 @@ def test_the_bound_is_a_literal_so_both_deployments_hash_the_same(ns):
     ``requirements-entry.txt`` resolves 2.14.3. A pin derived from the running
     interpreter would therefore differ between the two, the hashes would not match, and
     every custom-env test would pay the cold build the pre-build exists to avoid.
+
+    **Named for what it asserts, which is one of three inputs to that hash** (myco
+    #0529). ``pin_bioimageio_conda_env`` appends ``bioimageio.core==``,
+    ``bioimageio.spec==`` and this bound; only the third is a literal, and the other
+    two are parameters each call site fills from its OWN interpreter
+    (``runtime.py`` via ``version(...)``, ``entry.py`` via
+    ``_get_bioimageio_versions``). The test below covers those two. This one used to
+    be called ``test_the_bound_is_a_literal_so_both_deployments_hash_the_same``,
+    which promised the whole conjunction while checking a third of it.
     """
     assert isinstance(ns["CUSTOM_ENV_PYDANTIC_PIN"], str)
     tree = ast.parse(RUNTIME.read_text())
@@ -355,3 +364,175 @@ def test_the_pin_is_what_puts_pydantic_in_the_pip_section(ns):
     others = [p for p in pip if ns["_is_pydantic_req"](p) and p != ns["CUSTOM_ENV_PYDANTIC_PIN"]]
     assert others == [], others
     assert [p for p in pip if ns["_is_pydantic_req"](p)] == [ns["CUSTOM_ENV_PYDANTIC_PIN"]]
+
+
+# ------------------------------- the OTHER two inputs to the hash, and the pin's expiry
+#
+# myco #0529 and #0530. Everything here is derived from files in this repo and nothing
+# is imported from bioimageio: CI installs only requirements-test.txt and
+# requirements-datasets.txt into the worker image, so ``importlib.metadata`` cannot see
+# bioimageio.core at all and a metadata-based guard would skip rather than check.
+
+#: The requirements files of the two deployments that both call
+#: ``pin_bioimageio_conda_env`` and both compute the env-name hash.
+REQ_OF_DEPLOYMENT = {
+    "entry": APP / "requirements-entry.txt",
+    "runtime": APP / "requirements-runtime.txt",
+}
+
+#: The ``bioimageio.core`` release ``CUSTOM_ENV_PYDANTIC_PIN`` was measured against.
+#: It pins ``bioimageio.spec==0.5.12.0`` exactly, and that spec is the one carrying the
+#: serializer crash (myco #0497). Upstream fixed the call site in spec 0.5.14.3.
+PIN_MEASURED_AGAINST_CORE = "0.11.0"
+
+
+def _exact_pin(requirements_text, distribution):
+    """The version in a ``<distribution>==<version>`` line, or None.
+
+    Text in, value out, so the negative controls below can feed it a divergent pair
+    without writing to the repo. Comments and blank lines are ignored; anything that
+    is not an exact ``==`` pin returns None, which the callers treat as a failure
+    rather than as agreement.
+    """
+    for raw in requirements_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, sep, rest = line.partition("==")
+        if sep and name.strip() == distribution:
+            return rest.strip() or None
+    return None
+
+
+def _core_pins(texts):
+    """``{deployment: pinned bioimageio.core}`` for a mapping of deployment -> text."""
+    return {
+        name: _exact_pin(text, "bioimageio.core") for name, text in texts.items()
+    }
+
+
+def test_both_deployments_pin_the_same_bioimageio_core():
+    """The second input to the env-name hash, which no test used to cover (#0529).
+
+    ``pin_bioimageio_conda_env(conda_env, core_version, spec_version)`` takes the two
+    bioimageio versions as PARAMETERS, and each call site fills them from its own
+    interpreter: ``runtime.py`` with ``version("bioimageio.core")``, ``entry.py`` via
+    ``_get_bioimageio_versions``. Those are different deployments with different
+    requirement files, so the hashes agree only while both files install the same
+    core. Nothing asserted that, and a divergence would not fail anything -- it would
+    silently stop the pre-built env from ever being reused, which cost 909.9 s cold
+    against 85.2 s warm on #0497.
+
+    ``bioimageio.spec`` is not pinned directly in either file: it arrives transitively,
+    pinned exactly by core. So equal core implies equal spec, and core is the thing to
+    assert.
+    """
+    texts = {name: path.read_text() for name, path in REQ_OF_DEPLOYMENT.items()}
+    for name, path in REQ_OF_DEPLOYMENT.items():
+        assert path.is_file(), f"{path} is missing, so this guard measured nothing"
+
+    pins = _core_pins(texts)
+    missing = sorted(name for name, pin in pins.items() if pin is None)
+    assert not missing, (
+        f"{missing} do not pin bioimageio.core to an exact == version, so the two "
+        "deployments can resolve different cores and the env-name hashes will differ"
+    )
+    assert len(set(pins.values())) == 1, (
+        f"the deployments pin different bioimageio.core versions: {pins}. Both call "
+        "pin_bioimageio_conda_env and both hash the result, so the pre-built env can "
+        "never be reused and every custom-env test pays a cold build."
+    )
+
+
+def test_the_same_core_guard_fails_when_the_two_files_diverge():
+    """Negative control for the test above (#0529 clause 2).
+
+    A guard that cannot be made to go red is not a guard. Feeding the same helper a
+    divergent pair must produce a different answer, and an un-pinned pair must produce
+    None rather than quietly agreeing.
+    """
+    agree = _core_pins(
+        {"entry": "bioimageio.core==0.11.0", "runtime": "bioimageio.core==0.11.0"}
+    )
+    assert len(set(agree.values())) == 1, agree
+
+    diverge = _core_pins(
+        {"entry": "bioimageio.core==0.11.0", "runtime": "bioimageio.core==0.12.0"}
+    )
+    assert len(set(diverge.values())) == 2, (
+        f"the helper cannot see a divergence, so the guard above proves nothing: "
+        f"{diverge}"
+    )
+
+    # A range, not an exact pin, must NOT read as agreement with an exact one.
+    loose = _core_pins(
+        {"entry": "bioimageio.core==0.11.0", "runtime": "bioimageio.core>=0.11.0"}
+    )
+    assert loose["runtime"] is None, loose
+
+    # A comment mentioning the distribution must not be mistaken for a pin.
+    commented = _core_pins({"entry": "# bioimageio.core==9.9.9\nnumpy==2.0.0"})
+    assert commented["entry"] is None, commented
+
+
+def test_the_pydantic_pin_is_revisited_when_bioimageio_core_moves():
+    """The pin's retirement condition, made mechanical (#0530).
+
+    ``CUSTOM_ENV_PYDANTIC_PIN`` is a workaround for a serializer crash in
+    ``bioimageio.spec`` 0.5.12.0 under pydantic 2.14+. Upstream fixed the call site in
+    spec **0.5.14.3**, but that fix is unreachable while ``bioimageio.core==0.11.0``
+    requires spec ``==0.5.12.0`` exactly. So the pin retires when, and only when, this
+    app moves to a core release that pairs with spec >= 0.5.14.3.
+
+    That event is a change to these requirements files, which is exactly what this
+    asserts. It is deliberately NOT a dated marker: a date fires on a day nobody chose
+    and says nothing about upstream, whereas this cannot fire spuriously and cannot be
+    missed, because you cannot bump core without tripping it.
+
+    When it fails, do not just update the constant below. Check which
+    ``bioimageio.spec`` the new core pins; if that is >= 0.5.14.3, delete
+    ``CUSTOM_ENV_PYDANTIC_PIN`` and the tests above with it.
+    """
+    pins = _core_pins(
+        {name: path.read_text() for name, path in REQ_OF_DEPLOYMENT.items()}
+    )
+    for name, pin in sorted(pins.items()):
+        assert pin == PIN_MEASURED_AGAINST_CORE, (
+            f"{name} now pins bioimageio.core=={pin}, but CUSTOM_ENV_PYDANTIC_PIN was "
+            f"measured against {PIN_MEASURED_AGAINST_CORE} (which pins "
+            f"bioimageio.spec==0.5.12.0, the version carrying the crash). Check the "
+            f"spec pairing of {pin}: if it is >= 0.5.14.3 the serializer fix is in and "
+            f"the pydantic bound should be DELETED, not carried forward. See myco "
+            f"#0530."
+        )
+
+
+def test_the_retirement_guard_fails_on_a_moved_core():
+    """Negative control for the retirement guard (#0530).
+
+    The guard above is an equality against a constant, so it is only meaningful if a
+    moved core really does compare unequal -- otherwise it would keep passing forever,
+    which is the failure mode the row was filed about.
+    """
+    moved = _exact_pin("bioimageio.core==0.12.0", "bioimageio.core")
+    assert moved is not None and moved != PIN_MEASURED_AGAINST_CORE, moved
+
+    unchanged = _exact_pin(
+        f"bioimageio.core=={PIN_MEASURED_AGAINST_CORE}", "bioimageio.core"
+    )
+    assert unchanged == PIN_MEASURED_AGAINST_CORE, unchanged
+
+
+def test_the_measured_core_constant_matches_what_the_pin_comment_claims():
+    """Tie the constant above to the prose it is standing in for.
+
+    If someone edits runtime.py's comment block to name a different core without
+    touching this file, the retirement guard would be keyed to a version the pin no
+    longer claims -- so assert the two still agree.
+    """
+    runtime_text = RUNTIME.read_text()
+    needle = f"bioimageio.core=={PIN_MEASURED_AGAINST_CORE}"
+    assert needle in runtime_text, (
+        f"runtime.py no longer mentions {needle}, so PIN_MEASURED_AGAINST_CORE is "
+        "keyed to a version the pin's own documentation has moved off"
+    )
