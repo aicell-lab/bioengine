@@ -39,11 +39,22 @@ import pool
 
 # Field-sets pinned from the fixture corpus; unchanged between 0.13.0-draft and
 # 0.15.0-draft, re-verified against the latter.
-ROUNDMETRIC_KEYS = {
+#
+# WIRE_ROUNDMETRIC_KEYS is the page's own record at rung 0.15.0-draft — the eleven
+# fields the corpus carries. ROUNDMETRIC_KEYS is what THIS backend writes, which is
+# those eleven plus the per-image breakdown. The two are separate constants because
+# they answer different questions, and collapsing them is what makes an additive
+# backend field look like a schema break: the corpus genuinely does not carry
+# per_image, and asserting equality against it would go RED for a record that is
+# correct. The relation that holds, and that the corpus test asserts, is that the
+# backend writes every key the page's record has and the only extras are these.
+PER_IMAGE_KEYS = {"per_image", "per_image_basis"}
+WIRE_ROUNDMETRIC_KEYS = {
     "role", "name", "aggregate", "aggregate_basis", "aggregate_scope",
     "higher_is_better", "n_sites_scored", "n_datasets_scored", "per_site",
     "per_site_basis", "aggregate_withheld",
 }
+ROUNDMETRIC_KEYS = WIRE_ROUNDMETRIC_KEYS | PER_IMAGE_KEYS
 SOUP_KEYS = {
     "soup_id", "index", "merged_at", "assessed", "contributions",
     "selection_metric", "witness_metric", "global_sha256", "weights",
@@ -362,14 +373,27 @@ def test_matches_fixture_corpus():
         f"{BACKEND_TARGETS_RUNG!r} — wrong corpus, not a backend defect"
     )
     assert set(prog["merge_trigger"]) == MERGE_TRIGGER_KEYS
-    assert set(prog["baseline_metric"]) == ROUNDMETRIC_KEYS
     soup = prog["soups"][1]
     assert set(soup) == SOUP_KEYS
     assert set(soup["community_model"]) == COMMUNITY_MODEL_KEYS
     assert set(soup["transport"]) == TRANSPORT_KEYS
-    assert set(soup["selection_metric"]) == ROUNDMETRIC_KEYS
-    assert set(soup["witness_metric"]) == ROUNDMETRIC_KEYS
     assert set(prog["empty_merges"][0]) == EMPTY_MERGE_KEYS
+    # The metric records are checked by RELATION, not equality: the corpus is the
+    # page's record and does not carry the per-image breakdown this backend adds.
+    # Equality here would report an additive backend field as a corpus mismatch —
+    # and would equally hide a field this backend FAILED to write, since both
+    # directions collapse into one failing assertion.
+    for where, metric in (("baseline_metric", prog["baseline_metric"]),
+                          ("selection_metric", soup["selection_metric"]),
+                          ("witness_metric", soup["witness_metric"])):
+        keys = set(metric)
+        assert keys - ROUNDMETRIC_KEYS == set(), (
+            f"the corpus's {where} carries {sorted(keys - ROUNDMETRIC_KEYS)}, which "
+            f"this backend never writes — the page's record has moved")
+        assert ROUNDMETRIC_KEYS - keys <= PER_IMAGE_KEYS, (
+            f"this backend writes {sorted(ROUNDMETRIC_KEYS - keys - PER_IMAGE_KEYS)} "
+            f"on {where} and the corpus does not — a backend-only field that is not "
+            f"the per-image breakdown is a schema break, not an addition")
 
 
 # ── soup member cache eviction (pool.evict_lru_to_cap) ───────────────────────

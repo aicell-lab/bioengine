@@ -68,6 +68,29 @@ BASELINE_BASIS = (
     "0f1cc3f7ecdd8a037a57c6c48d9d8921391be4cbce3fa9f13c3e3a2e1253c667), "
     "scored on the witness split before the first merge"
 )
+# The per-IMAGE breakdown behind the aggregate. This is NOT per_site: per_site is a
+# participant map keyed by a declared KeySpace ('site' | 'dataset'), and a
+# campaign_holdout metric is refused for publishing one at all (round_metric below,
+# mirroring the page). A holdout split has no participants to key on — it has images,
+# in the order the caller supplied them — so this is an ordered vector under its own
+# field, additive to the record and ignored by a consumer that does not know it.
+#
+# The second sentence is the load-bearing one: it is enforced, not merely asserted.
+# round_metric refuses a record whose aggregate is not the mean of the vector beside
+# it, so "the gate decided on a scalar nobody can audit" cannot be answered with a
+# breakdown that was computed separately and happens to disagree.
+PER_IMAGE_BASIS = (
+    "one instance F1 at IoU 0.5 per image of the scored split, in the order the "
+    "split's arrays were supplied to this app; the aggregate on this record is the "
+    "arithmetic mean of exactly these numbers and is not measured independently of "
+    "them"
+)
+# Slack allowed between a record's aggregate and the mean of its per-image vector.
+# The call sites publish round(x, 4), which is 5e-5 of rounding on its own, and the
+# resume journal stores both halves at 6 decimal places, which adds ~1e-6. 1e-4 is
+# the smallest bound that admits every honest record and still refuses a vector that
+# belongs to a different scoring pass.
+PER_IMAGE_AGGREGATE_TOLERANCE = 1e-4
 
 # The two wordings 0.27.15 (commit e762a17b5af5) retracted, verbatim. Both asserted
 # disjointness as FACT — "a public benchmark disjoint from…", "the disjoint witness
@@ -120,19 +143,56 @@ def round_metric(
     per_site: Optional[Any] = None,
     per_site_basis: Optional[str] = None,
     aggregate_withheld: Optional[Any] = None,
+    per_image: Optional[Sequence[float]] = None,
+    per_image_basis: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """One role-tagged metric record — the page's RoundMetric (11 fields).
+    """One role-tagged metric record — the page's CampaignMetric, plus the per-image
+    breakdown this backend adds (13 fields).
 
     ``role`` is the load-bearing tag: the page refuses to plot anything whose
     ``role != 'witness'`` on the improvement curve, EVEN if it arrived through the
     ``witness_metric`` field. The field NAME and this tag are two carriers that must
     agree; keeping both makes a selection/witness swap detectable rather than silent.
     A ``campaign_holdout`` scope must not carry a ``per_site`` map (the page refuses
-    that combination), so both stay null for our curated splits."""
+    that combination), so both stay null for our curated splits.
+
+    ``per_image``/``per_image_basis`` are the two fields this app adds beyond the
+    page's record. They are the breakdown behind ``aggregate``, and the pairing is
+    enforced three ways: both or neither, a non-empty vector of finite numbers, and
+    ``aggregate`` within ``PER_IMAGE_AGGREGATE_TOLERANCE`` of its mean. Without that
+    last check a record could publish a breakdown of a DIFFERENT scoring pass, which
+    is worse than publishing no breakdown at all — it would read as an audit trail
+    while auditing nothing.
+    """
     if role not in ("witness", "selection"):
         raise ValueError(f"role must be 'witness' or 'selection', not {role!r}")
     if aggregate_scope == _HOLDOUT and per_site is not None:
         raise ValueError("a campaign_holdout metric must not carry a per_site map")
+    if (per_image is None) != (per_image_basis is None):
+        raise ValueError(
+            "per_image and per_image_basis are published together or not at all: a "
+            "vector with no basis does not say what its numbers are or how they are "
+            "ordered, and a basis with no vector describes nothing"
+        )
+    if per_image is not None:
+        per_image = [float(v) for v in per_image]
+        if not per_image:
+            raise ValueError("per_image must not be empty; omit it instead of publishing []")
+        if not all(math.isfinite(v) for v in per_image):
+            raise ValueError(f"per_image carries a non-finite score: {per_image!r}")
+        if aggregate is None:
+            raise ValueError(
+                "a record publishing per_image must publish the aggregate it is the "
+                "mean of; otherwise the vector cannot be checked against anything"
+            )
+        mean = mean_of_per_image(per_image)
+        if abs(float(aggregate) - mean) > PER_IMAGE_AGGREGATE_TOLERANCE:
+            raise ValueError(
+                f"aggregate {float(aggregate)!r} is not the mean of the per_image "
+                f"vector beside it (mean {mean!r} over {len(per_image)} image(s), "
+                f"tolerance {PER_IMAGE_AGGREGATE_TOLERANCE}). The breakdown belongs "
+                f"to a different scoring pass than the aggregate."
+            )
     # Refusing at the WRITE site, not just correcting at the read site. Correcting on
     # read fixes the records that already exist; this stops a new one being written
     # with wording the project has withdrawn — a caller passing a basis string copied
@@ -156,6 +216,8 @@ def round_metric(
         "per_site": per_site,
         "per_site_basis": per_site_basis,
         "aggregate_withheld": aggregate_withheld,
+        "per_image": per_image,
+        "per_image_basis": per_image_basis,
     }
 
 
@@ -610,13 +672,23 @@ def score_key(split_id: str, member_paths: Sequence[str]) -> str:
 
 
 def new_merge_journal(gate_split, witness_split, diam_mean: float) -> Dict[str, Any]:
-    """An empty resume journal stamped with everything a recorded score depends on."""
+    """An empty resume journal stamped with everything a recorded score depends on.
+
+    ``per_image_scores`` is keyed identically to ``scores`` and holds the breakdown
+    behind each scalar. It is not an optimisation: ``score_key`` hashes the split id
+    and the sorted member paths and nothing about what was ASKED for, so a journal
+    that banked only the scalar would serve a hit for a pass whose vector it does not
+    have — and the published record would then be missing its breakdown on exactly
+    the merges that were resumed, where the absence is indistinguishable from the
+    vector never having been measured.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "gate_split": split_identity(gate_split),
         "witness_split": split_identity(witness_split),
         "diam_mean": float(diam_mean),
         "scores": {},
+        "per_image_scores": {},
     }
 
 
@@ -640,19 +712,56 @@ def usable_merge_journal(
     if any(journal.get(field) != fresh[field]
            for field in ("schema_version", "gate_split", "witness_split", "diam_mean")):
         return fresh
+    # Prune to the entries that carry BOTH halves. An entry can be half-present in
+    # two ways: a journal written before this app banked vectors at all (the stamp
+    # fields do not move, because the breakdown is additive and the recorded SCALAR
+    # is still true), or a journal a mixed-version replica pair wrote into. Either
+    # way a half-entry would be served as a hit and publish a scalar with no
+    # breakdown. Dropping those entries costs their scoring passes; discarding the
+    # whole journal would cost every pass, and keeping them would publish an
+    # uninterpretable record — so this prunes rather than doing either.
+    vectors = journal.get("per_image_scores")
+    if not isinstance(vectors, dict):
+        vectors = {}
+    paired = {k: v for k, v in journal["scores"].items() if isinstance(vectors.get(k), list)}
+    journal["scores"] = paired
+    journal["per_image_scores"] = {k: vectors[k] for k in paired}
     return journal
 
 
-def record_score(journal: Dict[str, Any], key: str, value: float, cap: int = 512) -> None:
-    """Add a score, evicting oldest-first so the journal cannot grow without bound.
+def record_score(
+    journal: Dict[str, Any], key: str, value: float, *,
+    per_image: Sequence[float], cap: int = 512,
+) -> None:
+    """Add a score and the per-image vector it is the mean of, evicting oldest-first
+    so the journal cannot grow without bound.
 
     One merge records at most ``2 * max_batch + 3`` scores (67 at the default
     max_batch of 32), so the cap holds several merges' worth — enough for deferred
     candidates, which aggregate() re-scores on the next merge, to come back free.
+
+    ``per_image`` is keyword-only and required rather than defaulted to ``None``: a
+    caller that forgets it would otherwise bank a scalar whose breakdown is gone for
+    good, and the journal is precisely the place where re-measuring is not an option.
+    The two maps are written and evicted in lock-step, which is what lets
+    ``usable_merge_journal`` treat a half-entry as evidence of a foreign writer.
     """
+    vector = [round(float(v), 6) for v in per_image]
+    if not vector:
+        raise ValueError("record_score requires the per-image vector behind the score")
+    mean = mean_of_per_image(vector)
+    if abs(float(value) - mean) > PER_IMAGE_AGGREGATE_TOLERANCE:
+        raise ValueError(
+            f"record_score was given {float(value)!r} and a vector whose mean is "
+            f"{mean!r} over {len(vector)} image(s) — they are not the same scoring "
+            f"pass, and banking them together would make the journal lie on resume"
+        )
     journal["scores"][key] = round(float(value), 6)
+    journal.setdefault("per_image_scores", {})[key] = vector
     while len(journal["scores"]) > cap:
-        del journal["scores"][next(iter(journal["scores"]))]
+        oldest = next(iter(journal["scores"]))
+        del journal["scores"][oldest]
+        journal["per_image_scores"].pop(oldest, None)
 
 
 def evict_lru_to_cap(
@@ -824,13 +933,53 @@ def instance_f1(pred_labels: "np.ndarray", gt_labels: "np.ndarray", iou_thresh: 
     }
 
 
+def per_image_instance_f1(
+    pred_maps: List["np.ndarray"], gt_maps: List["np.ndarray"], iou_thresh: float = 0.5,
+) -> List[float]:
+    """One instance F1 per image of a split, in the order supplied — the breakdown
+    the gate's scalar is the mean of.
+
+    This list already existed inside ``mean_instance_f1`` and was discarded there, so
+    nothing new is measured here; it is the same numbers, kept. The gate admits a
+    contribution on a single scalar, and a scalar with no breakdown cannot be audited
+    against any admission rule: a soup that gained 0.02 by improving every image and
+    one that gained 0.02 by trading a collapse on two images against the rest are
+    indistinguishable in the record.
+
+    The length check is not defensive tidying. ``zip`` stops at the shorter argument,
+    so a caller passing mismatched lists would previously get a mean over a silently
+    truncated prefix; now that the vector is PUBLISHED, its length is read as the
+    size of the split and the truncation would misstate what was scored.
+    """
+    if not gt_maps:
+        raise ValueError("per_image_instance_f1 requires at least one image")
+    if len(pred_maps) != len(gt_maps):
+        raise ValueError(
+            f"per_image_instance_f1 got {len(pred_maps)} prediction map(s) for "
+            f"{len(gt_maps)} ground-truth map(s); zip would score only the shorter "
+            f"prefix and report it as the whole split"
+        )
+    return [instance_f1(p, g, iou_thresh=iou_thresh)["f1"] for p, g in zip(pred_maps, gt_maps)]
+
+
+def mean_of_per_image(per_image: Sequence[float]) -> float:
+    """The split's scalar from its per-image vector. One definition, used by
+    ``mean_instance_f1`` and by anything that already holds the vector, so the
+    published aggregate and the published breakdown cannot drift apart by being
+    reduced two different ways."""
+    if not per_image:
+        raise ValueError("mean_of_per_image requires at least one score")
+    return float(sum(per_image) / len(per_image))
+
+
 def mean_instance_f1(pred_maps: List["np.ndarray"], gt_maps: List["np.ndarray"], iou_thresh: float = 0.5) -> float:
     """Mean of per-image instance F1 over a split — the scalar the gate compares and
-    the witness curve plots. Empty split is undefined, so raise rather than invent 0."""
-    if not gt_maps:
-        raise ValueError("mean_instance_f1 requires at least one image")
-    scores = [instance_f1(p, g, iou_thresh=iou_thresh)["f1"] for p, g in zip(pred_maps, gt_maps)]
-    return float(sum(scores) / len(scores))
+    the witness curve plots. Empty split is undefined, so raise rather than invent 0.
+
+    Defined as the mean of ``per_image_instance_f1``'s output rather than computing
+    its own sum, so a record publishing both is publishing one measurement reduced
+    once, not two measurements that agree today."""
+    return mean_of_per_image(per_image_instance_f1(pred_maps, gt_maps, iou_thresh=iou_thresh))
 
 
 def sha256_file(path: str, chunk: int = 1 << 20) -> str:

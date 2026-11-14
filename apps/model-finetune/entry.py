@@ -2427,18 +2427,55 @@ class EntryApp:
             wit_id = pool.split_identity(witness_split)
             splits = {gate_id: (gate_imgs, gate_gts), wit_id: (wit_imgs, wit_gts)}
 
-            async def _score(member_paths: List[str], split_id: str) -> float:
+            async def _score(member_paths: List[str], split_id: str) -> Dict[str, Any]:
+                """One scoring pass as ``{"f1": scalar, "per_image": vector}``.
+
+                Both halves go through the journal together. Returning only the
+                scalar and re-deriving the vector later is not available: a resumed
+                merge never runs the pass again, so a vector that is not banked here
+                is gone, and the published record would be missing its breakdown on
+                exactly the merges that were interrupted.
+                """
                 key = pool.score_key(split_id, member_paths)
                 if key in journal["scores"]:
-                    return float(journal["scores"][key])
+                    # usable_merge_journal() prunes any entry missing its vector, so a
+                    # hit on `scores` is a hit on both maps.
+                    return {"f1": float(journal["scores"][key]),
+                            "per_image": list(journal["per_image_scores"][key])}
                 imgs, gts = splits[split_id]
                 # A journal hit returns above without folding, which is correct: that
                 # pass transported nothing on this run.
-                value = _fold(await runtime.score_soup(
-                    await _specs(member_paths), imgs, gts, diam_mean))["f1"]
-                pool.record_score(journal, key, value)
+                scored = _fold(await runtime.score_soup(
+                    await _specs(member_paths), imgs, gts, diam_mean))
+                value, per_image = float(scored["f1"]), list(scored["per_image"])
+                pool.record_score(journal, key, value, per_image=per_image)
                 await self._write_merge_journal(am, pool_artifact_id, journal)
-                return value
+                return {"f1": value, "per_image": per_image}
+
+            def _as_pass(metric: Dict[str, Any]) -> Dict[str, Any]:
+                """A previously published metric record read back as a scoring pass,
+                so a merge that reuses the baseline's number carries its breakdown too
+                rather than dropping to a bare scalar. A record written before this app
+                banked vectors has none, and ``.get`` is deliberate: an absent key and
+                a null value must read alike here, because they mean the same thing."""
+                return {"f1": float(metric["aggregate"]),
+                        "per_image": list(metric.get("per_image") or [])}
+
+            def _metric(role: str, scored: Dict[str, Any], basis: str) -> Dict[str, Any]:
+                """One metric record from one scoring pass, breakdown attached.
+
+                The vector and its basis are passed together or not at all, from one
+                place, so no call site can publish half the pair. It is empty only for
+                a number read back out of a pool written before this app measured
+                breakdowns; that publishes null rather than inventing a breakdown for
+                a number that was never measured with one.
+                """
+                vector = scored.get("per_image") or None
+                return pool.round_metric(
+                    role=role, aggregate=round(float(scored["f1"]), 4), aggregate_basis=basis,
+                    per_image=vector,
+                    per_image_basis=pool.PER_IMAGE_BASIS if vector else None,
+                )
 
             cc = pool.current_community(index)
             cur_member_ids: List[str] = []
@@ -2475,15 +2512,14 @@ class EntryApp:
                 stock_b = await _score([], wit_id)
                 baseline = {
                     "model": "stock-cpsam",
-                    "selection_metric": pool.round_metric(
-                        role="selection", aggregate=round(stock_a, 4), aggregate_basis=pool.SELECTION_BASIS),
-                    "witness_metric": pool.round_metric(
-                        role="witness", aggregate=round(stock_b, 4), aggregate_basis=pool.BASELINE_BASIS),
+                    "selection_metric": _metric("selection", stock_a, pool.SELECTION_BASIS),
+                    "witness_metric": _metric("witness", stock_b, pool.BASELINE_BASIS),
                     "created_at": time.time(),
                 }
 
-            cur_a = (await _score(cur_member_paths, gate_id)
-                     if cur_member_paths else baseline["selection_metric"]["aggregate"])
+            cur = (await _score(cur_member_paths, gate_id)
+                   if cur_member_paths else _as_pass(baseline["selection_metric"]))
+            cur_a = cur["f1"]
 
             # Best-first ordering: individual marginal of adding each candidate to the
             # current soup, on A. Re-scored against the CURRENT head (a stale solo
@@ -2491,17 +2527,23 @@ class EntryApp:
             marg = {}
             for c in batch:
                 cid = c["contribution_id"]
-                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_id)
+                marg[cid] = (await _score(cur_member_paths + [cand_path[cid]], gate_id))["f1"]
             ordered = sorted(batch, key=lambda c: marg[c["contribution_id"]], reverse=True)
 
             s_paths = list(cur_member_paths)
             s_ids = list(cur_member_ids)
             s_a = cur_a
+            # The admitted head's own scoring pass, carried alongside its scalar: the
+            # record published below must breakdown the number the gate actually
+            # decided on, and re-scoring the head afterwards to recover a vector would
+            # be a second pass that is not guaranteed to agree with the first.
+            s_pass = cur
             members_record: List[Dict[str, Any]] = []
             admitted: List[str] = []
             for c in ordered:
                 cid = c["contribution_id"]
-                trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
+                trial = await _score(s_paths + [cand_path[cid]], gate_id)
+                trial_a = trial["f1"]
                 included = trial_a >= (s_a - eps)
                 members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
                                        "gate_score": round(trial_a, 4), "included": bool(included)})
@@ -2509,6 +2551,7 @@ class EntryApp:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)
                     s_a = trial_a
+                    s_pass = trial
                     admitted.append(cid)
 
             changed = bool(admitted)
@@ -2517,11 +2560,10 @@ class EntryApp:
             if changed:
                 new_version = await self._next_free_community_version(am, pool_artifact_id, index)
                 head_a = s_a
-                head_b = await _score(s_paths, wit_id)
-                sel_metric = pool.round_metric(
-                    role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.SELECTION_BASIS)
-                wit_metric = pool.round_metric(
-                    role="witness", aggregate=round(head_b, 4), aggregate_basis=pool.WITNESS_BASIS)
+                wit_pass = await _score(s_paths, wit_id)
+                head_b = wit_pass["f1"]
+                sel_metric = _metric("selection", s_pass, pool.SELECTION_BASIS)
+                wit_metric = _metric("witness", wit_pass, pool.WITNESS_BASIS)
                 paths = pool.community_paths(new_version)
                 # Crash-safe: commit weights + manifest FIRST (index still points at
                 # the old head), then repoint the index in a SECOND commit. The runtime
@@ -2555,8 +2597,7 @@ class EntryApp:
                 head_bytes_out = 0
                 # Nothing admitted: the selection metric records the bar the assessed
                 # set failed to beat; there is no witness point (nothing re-measured).
-                sel_metric = pool.round_metric(
-                    role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.EMPTY_SELECTION_BASIS)
+                sel_metric = _metric("selection", cur, pool.EMPTY_SELECTION_BASIS)
                 wit_metric = None
 
             soup_bytes_down = sum(replica_dl.values())
