@@ -2,13 +2,15 @@
 :func:`bioengine._app.bootstrap.build_and_run_application`.
 
 The worker assembles ``replica_env_vars`` per-app (HYPHA_SERVER_URL,
-HYPHA_WORKSPACE, HYPHA_ARTIFACT_*, BIOENGINE_*, plus ``_BIOENGINE_SECRET_*``
-secrets including HYPHA_TOKEN). Without merging that dict into each
-deployment's ``runtime_env.env_vars`` at bind time, every user
-``@bioengine.app`` whose ``__init__`` reads ``os.getenv("HYPHA_TOKEN")``
-crashes the replica with ``RuntimeError: HYPHA_TOKEN environment variable
-is not set``. The same gap blocks ``bioengine.datasets`` (which needs
-``BIOENGINE_DATA_SERVER_URL``) from working inside user methods.
+HYPHA_WORKSPACE, HYPHA_ARTIFACT_*, BIOENGINE_*). Without merging that dict
+into each deployment's ``runtime_env.env_vars`` at bind time,
+``bioengine.datasets`` (which needs ``BIOENGINE_DATA_SERVER_URL``) stops
+working inside user methods.
+
+Secrets are the one thing that must *not* ride along, because everything in
+here is written verbatim to each node's ``runtime_env_agent.log``. They go
+to the proxy actor instead; ``replica_env_vars`` carries only their names, in
+``BIOENGINE_SECRET_KEYS``.
 
 These tests pin the merge semantics: every framework key must show up on
 the replica, and a key the author put in ``@bioengine.app(env_vars=…)``
@@ -100,20 +102,37 @@ def test_user_env_var_wins_against_framework_default() -> None:
     assert env["HYPHA_WORKSPACE"] == "ws-test"
 
 
-def test_secrets_are_propagated_exactly_as_stored() -> None:
-    """Secret env vars are stored as ``_BIOENGINE_SECRET_<KEY>=<value>``
-    and the framework's replica-side ``_unmask_secret_env_vars`` decodes
-    them back. The merge must preserve the underscore prefix verbatim."""
-    rt = _merge_via_with_pkg(
-        {"runtime_env": {}},
-        replica_env_vars={
+def test_no_secret_value_reaches_the_runtime_env() -> None:
+    """The invariant the proxy-actor delivery route exists for.
+
+    Driven through the real ``split_secret_env_vars`` rather than a
+    hand-written dict, so it fails if the worker ever starts putting secrets
+    back into what bootstrap merges. Asserted on values, not on the
+    ``_BIOENGINE_SECRET_`` prefix: a leak that arrived under some other name
+    would still be a leak, and a prefix check would call it clean.
+    """
+    from bioengine.apps.builder import split_secret_env_vars
+
+    replica_env_vars, secret_env_vars = split_secret_env_vars(
+        {
+            "HYPHA_SERVER_URL": "https://hypha.test",
             "_BIOENGINE_SECRET_HYPHA_TOKEN": "tok-1",
             "_BIOENGINE_SECRET_CUSTOM_API_KEY": "tok-2",
-        },
+        }
     )
+    # Positive control: the split really did find the secrets, so the
+    # absence asserted below is not an empty dict passing trivially.
+    assert secret_env_vars == {"HYPHA_TOKEN": "tok-1", "CUSTOM_API_KEY": "tok-2"}
+
+    rt = _merge_via_with_pkg({"runtime_env": {}}, replica_env_vars=replica_env_vars)
     env = rt["env_vars"]
-    assert env["_BIOENGINE_SECRET_HYPHA_TOKEN"] == "tok-1"
-    assert env["_BIOENGINE_SECRET_CUSTOM_API_KEY"] == "tok-2"
+
+    assert "tok-1" not in env.values()
+    assert "tok-2" not in env.values()
+    # The names still travel, so a replica whose fetch comes back short can
+    # name what it was missing.
+    assert env["BIOENGINE_SECRET_KEYS"] == "CUSTOM_API_KEY,HYPHA_TOKEN"
+    assert env["HYPHA_SERVER_URL"] == "https://hypha.test"
 
 
 def test_existing_user_env_vars_preserved_alongside_framework() -> None:
