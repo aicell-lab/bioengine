@@ -963,10 +963,12 @@ class _Runtime:
     async def soup_memory_budget(self) -> Dict[str, Any]:
         return dict(_BUDGET)
 
-    async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
+    async def score_soup(self, specs, imgs, gts, diam_mean,
+                         base_commitment=None) -> Dict[str, Any]:
         return {"f1": self._f1, "replica": "r0", "soup_dl_bytes": 0}
 
-    async def materialize_soup(self, specs, url) -> Dict[str, Any]:
+    async def materialize_soup(self, specs, url,
+                               base_commitment=None) -> Dict[str, Any]:
         return {"sha256": self._sha, "n_bytes": 2048,
                 "replica": "r0", "soup_dl_bytes": 0}
 
