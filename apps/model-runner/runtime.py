@@ -438,9 +438,62 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
+#: Upper bound on ``pydantic`` inside an ``as-described`` custom env.
+#:
+#: ``bioimageio.spec`` 0.5.12.0 (the version ``bioimageio.core==0.11.0`` pins
+#: exactly) calls the pydantic wrap handler as ``handler(value, info)`` in
+#: ``_internal/io_packaging.py:package_file_descr_serializer`` — and the second
+#: positional parameter of that handler is ``index_key``, not ``info``. The call
+#: even carries a ``pyright: ignore[reportArgumentType]``. pydantic tolerated the
+#: bogus argument through 2.13.x and VALIDATES it from 2.14.0, so every model
+#: whose description carries a packaged ``FileDescr`` then fails format
+#: validation with::
+#:
+#:     Error calling function `package_file_descr_serializer`:
+#:     TypeError: 'index_key' is expected to be an integer or a string, got
+#:     'SerializationInfo(...)'
+#:
+#: Measured 2026-11-14 on ``faithful-chicken``, one variable at a time, in the
+#: model-runner image (python 3.11, spec 0.5.12.0 fixed): 2.12.5 OK, 2.13.0 OK,
+#: 2.13.5 OK, **2.14.0 raises**, 2.14.3 raises. The standard runtime never hit
+#: this only by luck — ``careamics==0.0.16`` requires ``pydantic<=2.12,>=2.11``
+#: and so caps it there. A custom env has no careamics, declares only what the
+#: model asks for, and therefore solved pydantic 2.14.3 from conda-forge.
+#:
+#: Upstream fixed the call site in ``bioimageio.spec`` 0.5.14.3 (``handler(value)``;
+#: 0.5.14.2 and earlier are still affected), but that fix is UNREACHABLE here:
+#: ``bioimageio.core==0.11.0`` requires ``bioimageio.spec==0.5.12.0`` exactly and
+#: 0.11.0 is the newest core release. Drop this pin once a core release pairs with
+#: spec >= 0.5.14.3.
+#:
+#: It is a LITERAL and not ``version("pydantic")`` on purpose. The two call sites
+#: run in DIFFERENT deployments with different requirement files, and they must
+#: produce the same env-name hash. Measured: the RuntimeApp env resolves pydantic
+#: 2.12.0 (careamics-capped) while the EntryApp env resolves 2.14.3, so a derived
+#: pin would make the two hashes disagree and no pre-built env would ever be
+#: reused.
+CUSTOM_ENV_PYDANTIC_PIN = "pydantic<2.14"
+
+
+def _is_pydantic_req(dep) -> bool:
+    """True if ``dep`` pins the ``pydantic`` distribution itself.
+
+    Matches the exact name only, so ``pydantic-core`` and ``pydantic-settings``
+    are left alone — they are resolved by whatever ``pydantic`` is chosen, and a
+    model that names one explicitly should keep its own constraint.
+    """
+    if not isinstance(dep, str):
+        return False
+    name = dep.split("::", 1)[-1].strip()
+    for sep in (" ", "=", "<", ">", "!", "~", "["):
+        name = name.split(sep, 1)[0]
+    return name.lower() == "pydantic"
+
+
 def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
     """Return ``conda_env`` with ``bioimageio.core``/``.spec`` pinned to the
-    given versions in its pip section; the model's own deps are untouched.
+    given versions in its pip section, and ``pydantic`` bounded; the model's
+    other deps are untouched.
 
     An ``as-described`` custom env otherwise solves ``bioimageio.core>=0.9.4``
     fresh from conda-forge, so the harness the test actually runs under drifts
@@ -452,6 +505,11 @@ def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
     pre-built env is reused instead of cold-rebuilt. ``==`` on core also
     suppresses the upstream ``>=0.9.4`` floor; ``.spec`` is never touched by
     normalization.
+
+    ``pydantic`` is bounded by :data:`CUSTOM_ENV_PYDANTIC_PIN` for the same
+    reason the other two are pinned: it is part of the harness, not the model.
+    Pinned core/spec with a freely-solved pydantic is not a reproducible harness
+    — see that constant for the measured break and why the bound is a literal.
 
     The env ``name`` is dropped so the hash depends only on channels +
     dependencies: two models declaring the same deps (even under different
@@ -472,14 +530,23 @@ def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
             bare.startswith("bioimageio.core") or bare.startswith("bioimageio.spec")
         ):
             continue
+        # A conda-level ``pydantic`` would be solved by conda and would defeat
+        # the pip bound below, so it goes too.
+        if _is_pydantic_req(dep):
+            continue
         kept.append(dep)
 
     pip = [
         p
         for p in pip
         if not (p.startswith("bioimageio.core") or p.startswith("bioimageio.spec"))
+        and not _is_pydantic_req(p)
     ]
-    pip += [f"bioimageio.core=={core_version}", f"bioimageio.spec=={spec_version}"]
+    pip += [
+        f"bioimageio.core=={core_version}",
+        f"bioimageio.spec=={spec_version}",
+        CUSTOM_ENV_PYDANTIC_PIN,
+    ]
     kept.append({"pip": pip})
     data["dependencies"] = kept
     return BioimageioCondaEnv.model_validate(data)
