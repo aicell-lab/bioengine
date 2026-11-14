@@ -9,11 +9,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from haikunator import Haikunator
 from hypha_rpc import connect_to_server
-from hypha_rpc.rpc import RemoteException, RemoteService
+from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
 from ray import serve
+from ray.exceptions import ActorDiedError
+
+# Imported rather than hardcoded so a Ray upgrade that moves these fails loudly
+# here instead of silently never detecting a lost controller again.
+from ray.serve._private.constants import SERVE_CONTROLLER_NAME, SERVE_NAMESPACE
 from ray.serve.config import AutoscalingConfig
 
 from bioengine import __version__
@@ -27,32 +32,9 @@ from bioengine.utils import (
     ensure_applications_collection,
     get_static_site_url,
     latest_committed_version,
+    stale_service_kind,
 )
 
-
-# A hypha_rpc service proxy is pinned to ONE client instance of the remote
-# service. That instance can change client id at any time — the artifact manager
-# re-registered under a new one with nothing restarted — and hypha_rpc's own
-# websocket reconnect does not re-resolve cached proxies, so every later call
-# addresses a client that no longer exists and hangs to timeout. Split by whether
-# the call can have reached the server: a send-side failure provably did not, so
-# retrying it is safe even for a write; a timeout or a mid-call disconnect may
-# already have landed, so retrying those could double-execute a create or commit.
-#
-# hypha_rpc 0.21.40 does ship a stale-service retry, but it is installed by
-# ``RPC.get_remote_service`` and so reaches only the workspace-manager proxy and
-# services fetched by ``client_id:service_id`` URI. A service resolved by name
-# through ``server.get_service`` arrives off the ordinary decode path as a plain
-# ObjectProxy with no retry on it — this handle included.
-_PROXY_NEVER_SENT_MARKERS = (
-    "failed to send the request",
-    "websocket reconnection timed out",
-)
-_PROXY_MAYBE_SENT_MARKERS = (
-    "client disconnected",
-    "method call timed out",
-    "service not found",
-)
 
 # Reads are safe to repeat even when the first attempt may already have run, so
 # they are retried on either failure kind. This matters because the call that
@@ -68,23 +50,6 @@ _RETRY_SAFE_READS = frozenset(
 # only these three can be silenced, and only on the retry — the first attempt
 # should still count as a real view.
 _SILENCEABLE_READS = frozenset({"read", "list", "get_file"})
-
-
-def _stale_proxy_kind(exc: BaseException) -> Optional[str]:
-    """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
-    if isinstance(exc, RemoteException):
-        # Its message is ``"RemoteError:" + value + "\n" + remote traceback``, and
-        # the server runs hypha_rpc too, so any marker below can appear in that
-        # traceback. Arriving at all proves the remote handler ran.
-        return None
-    message = str(exc).lower()
-    if any(marker in message for marker in _PROXY_NEVER_SENT_MARKERS):
-        return "never_sent"
-    if isinstance(exc, asyncio.TimeoutError) or any(
-        marker in message for marker in _PROXY_MAYBE_SENT_MARKERS
-    ):
-        return "maybe_sent"
-    return None
 
 
 class _ReconnectingArtifactManager:
@@ -143,7 +108,7 @@ class _ReconnectingArtifactManager:
             try:
                 return await getattr(self._proxy, name)(*args, **kwargs)
             except Exception as exc:
-                kind = _stale_proxy_kind(exc)
+                kind = stale_service_kind(exc)
                 if kind is None:
                     raise
                 self._logger.warning(
@@ -175,13 +140,79 @@ def _is_serve_controller_gone(exc: BaseException) -> bool:
     or — when a cached client handle outlives the controller — "doesn't have
     a handle for <actor>". Both mean the controller must be re-bootstrapped
     by a fresh ``serve.run`` rather than merely reconnected.
+
+    A cached client whose controller is destroyed outright raises
+    ``ActorDiedError`` instead, carrying none of those strings. It is matched
+    on the actor it names rather than on the death text, and only for an
+    actual death: ``ActorUnavailableError`` means a live controller that is
+    briefly unreachable, which must not trigger a re-bootstrap.
+
+    A worker that outlives a genuine head restart gets a bare ``Exception``
+    naming only an actor id, which nothing here can identify. That one is
+    decided by ``_serve_controller_is_missing`` at the call site.
     """
     msg = str(exc).lower()
+    if isinstance(exc, ActorDiedError) and SERVE_CONTROLLER_NAME.lower() in msg:
+        return True
     return (
         "no serve instance running" in msg
         or "there is no serve instance" in msg
         or "doesn't have a handle for" in msg
     )
+
+
+def _serve_controller_is_missing() -> bool:
+    """Whether the Serve controller actor is absent from the Ray cluster.
+
+    ``serve.status`` is the only Serve API that passes
+    ``raise_if_no_controller_running=False`` (``ray/serve/api.py``), so a lost
+    controller makes it *return* an empty status rather than raise — and an
+    empty status is also exactly what a healthy cluster with no applications
+    returns. Asking Ray for the actor is what separates the two.
+
+    It is also the only reliable answer for the raising case: a worker that
+    survives a head restart gets a bare ``Exception`` reading "Failed to submit
+    task to actor … Can't find actor …", which names no controller and belongs
+    to no Serve-specific type, so nothing about the exception identifies it.
+
+    Anything other than a clean "not found" reports the controller present, so
+    an unrelated Ray failure can never trigger a recovery sweep.
+    """
+    if not ray.is_initialized():
+        # ray.get_actor would auto-start a local Ray instance here. A
+        # disconnected worker is check_connection's problem, not a lost
+        # controller, and a monitoring probe must not bring a cluster up.
+        return False
+    try:
+        ray.get_actor(SERVE_CONTROLLER_NAME, namespace=SERVE_NAMESPACE)
+        return False
+    except ValueError:
+        return True
+    except Exception:
+        return False
+
+
+async def _controller_is_missing_off_loop() -> bool:
+    """``_serve_controller_is_missing`` without blocking the event loop.
+
+    The predicate is a blocking Ray RPC. Called inline from the async monitor it
+    froze the whole worker process for the ~27 s a ``ray://`` actor lookup takes
+    against an unreachable head, which stops the heartbeat as well as the
+    monitoring.
+
+    The timeout bounds the tick, not the lookup: abandoning the await leaves the
+    thread running until Ray returns. Timing out therefore has to answer, and it
+    answers "present" — the same answer the predicate gives for anything that is
+    not a clean not-found. A head too unreachable to look up is also too
+    unreachable for the ``serve.run`` a recovery sweep would need.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_serve_controller_is_missing),
+            timeout=_CONTROLLER_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return False
 
 
 def _belongs_to_worker_workspace(
@@ -289,6 +320,12 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # enough for a redeploy's serve.run to bootstrap the controller before we'd
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
+
+# How long one monitor tick waits for the controller actor lookup. Measured
+# 0.10-0.12 s against a live head and 27.4 s against an unreachable one, so
+# this is ~100x the healthy case and still far inside the worker's 120 s
+# heartbeat budget.
+_CONTROLLER_LOOKUP_TIMEOUT_SECONDS = 10.0
 
 # Mint a proxy's replacement Hypha token once this much of its life has passed.
 # It is a deploy-time credential with a 30-day TTL and a deploy is the only
@@ -2093,15 +2130,38 @@ class AppsManager:
         try:
             serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
         except Exception as exc:
-            if _is_serve_controller_gone(exc):
+            if (
+                _is_serve_controller_gone(exc)
+                or await _controller_is_missing_off_loop()
+            ):
                 # A Ray head restart wiped the Serve controller. The client
                 # reconnects (handles refreshed, cached Serve client dropped)
                 # but there is no controller until an app is (re)deployed, so
                 # redeploy the tracked apps in-place: serve.run bootstraps a
                 # fresh controller and recreates the replicas without cycling
                 # the pod.
+                #
+                # The actor lookup is the second half because the exception
+                # alone does not always identify the loss: a worker that
+                # outlives a head restart gets a bare Exception naming only an
+                # actor id. Asking whether the controller exists answers it
+                # whatever was raised, and says "present" on anything that is
+                # not a clean not-found, so an unrelated Ray failure cannot
+                # trigger a sweep.
                 await self._recover_from_controller_loss(apps_to_redeploy)
             raise
+
+        if not serve_status.applications and await _controller_is_missing_off_loop():
+            # Controller lost, but serve.status reported it as an empty status
+            # instead of raising, so the branch above never saw it. Left to the
+            # per-app loop below, every tracked app looks individually "absent
+            # from the status report" and is only recovered once each has worn
+            # through _MISSING_FROM_STATUS_TOLERANCE, under a reason naming the
+            # symptom rather than the cause. Skip that loop only when the sweep
+            # actually ran: when it is cooling down, falling through preserves
+            # the per-app path exactly as it behaves today.
+            if await self._recover_from_controller_loss(apps_to_redeploy):
+                return
 
         try:
             instance_details = (
@@ -2265,7 +2325,7 @@ class AppsManager:
 
     async def _recover_from_controller_loss(
         self, application_ids: List[str]
-    ) -> None:
+    ) -> bool:
         """Re-establish Ray Serve in-place after the controller was lost.
 
         A Ray head restart destroys the Serve controller; ``reconnect`` has
@@ -2280,10 +2340,15 @@ class AppsManager:
         ``_fire_redeploy`` so that skip is logged rather than silent — the
         incident that motivated this lost an adopted app and left nothing in
         the worker's own logs to say so.
+
+        Returns:
+            Whether a sweep ran. ``False`` means the cooldown suppressed it,
+            which is what lets the caller fall back to the per-app path
+            instead of starving it.
         """
         now = time.time()
         if now - self._last_controller_recovery < _CONTROLLER_RECOVERY_COOLDOWN_SECONDS:
-            return
+            return False
         self._last_controller_recovery = now
         for application_id in application_ids:
             info = self._deployed_applications.get(application_id)
@@ -2300,6 +2365,7 @@ class AppsManager:
                 attempt=1,
                 reason="the Ray Serve controller was lost",
             )
+        return True
 
     def _fire_redeploy(
         self,
@@ -3085,7 +3151,7 @@ class AppsManager:
         ),
         max_ongoing_requests: int = Field(
             None,
-            description="How many callers the application's ProxyDeployment admits at once, across the whole instance — the limit the 'at capacity' rejection is counted against. Higher values allow more parallelism but use more memory. This is NOT the per-replica cap: `@bioengine.app(max_ongoing_requests=...)` in the app's own source is a separate Ray Serve limit on one replica of one deployment, the two are independent, and setting either leaves the other at its default. get_app_status reports this one at the top level and each deployment's decorator value under `deployments.<ClassName>.max_ongoing_requests`. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
+            description="How many callers the application's ProxyDeployment admits at once, across the whole instance — the limit the 'at capacity' rejection is counted against. Higher values allow more parallelism but use more memory. This is NOT the per-replica cap: `@bioengine.app(max_ongoing_requests=...)` in the app's own source is a separate Ray Serve limit on one replica of one deployment, and the two are independent: setting either does not change the other. get_app_status reports this one at the top level and each deployment's decorator value under `deployments.<ClassName>.max_ongoing_requests`. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
         ),
         proxy_memory_in_gb: float = Field(
             None,

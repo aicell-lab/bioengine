@@ -389,6 +389,23 @@ Everything after the lede is for the reader who has already decided to act. Dens
 
 After the lede: how it was observed or reproduced, the evidence that localises it, and any candidate fix with its caveats. Attributing a finding to whoever made it is useful here.
 
+### In a backlog row, never write "blocked by #NNNN" — or quote the annotation — about a row that isn't this one
+
+`myco issue list` and `issue pending` derive a row's `BLOCKED on #NNNN — not startable, NOT counted` annotation by scanning the row's own text and attributing any match to the row **containing** the sentence rather than to the row it names. There is no stored edge to correct afterwards: the issue schema has no `blockedBy` key, and `blocked` is a free-text string.
+
+**Two spellings are confirmed to trigger it, and removing only the first does not clear the annotation:**
+
+- `blocked by #NNNN`
+- `BLOCKED on #NNNN` — the annotation's own text, which means **quoting the rendered output while reporting this defect creates another instance of it**
+
+Measured 2026-11-13 on two rows that were being excluded from the startable count, each carrying both spellings. Single-variable edits with the other row held as a negative control: neutralising only `BLOCKED on #NNNN` cleared one row; restoring `blocked by #NNNN` alone brought both back; removing both cleared both. An arm/disarm pass on one row confirmed the instrument still fires, which the final all-clear snapshot cannot show on its own. The spelling set is a **floor, not a complete grammar** — case variants and other wordings were not tested.
+
+Only the description and comments are scanned; frontmatter is not, so the `original:` archive of a reworded body is harmless.
+
+A parenthetical in a related-rows list is the usual way in — "`#0322` (blocked by #0298)" — and the failure is silent: the row leaves the startable set with nothing recording that it was excluded. Write **"is held behind #NNNN"**, **"#NNNN is its blocker"**, or **"waits on #NNNN"** instead, and when quoting the renderer's output replace the id with "that row"; all of these read the same to a human and none is parsed. The genuine blocker of the row you are writing goes in its `blocked` field via `myco issue pause`, never in prose.
+
+**Get it right the first time**: the offending text is usually in a *comment*, and no `myco issue` verb can edit or delete a comment — `comment` only appends, `edit --body-file` replaces the description only. The sole remedy is a direct write to `.mycolab/issues/<id>.md`, which is an untracked store with no version-control safety net. Back the file up first.
+
 ### PR descriptions
 
 **Include, after the lede:**
