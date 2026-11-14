@@ -438,9 +438,98 @@ def _read_pip(name: str) -> List[str]:
     ]
 
 
+#: Upper bound on ``pydantic`` inside an ``as-described`` custom env.
+#:
+#: ``bioimageio.spec`` 0.5.12.0 (the version ``bioimageio.core==0.11.0`` pins
+#: exactly) calls the pydantic wrap handler as ``handler(value, info)`` in
+#: ``_internal/io_packaging.py:package_file_descr_serializer`` — and the second
+#: positional parameter of that handler is ``index_key``, not ``info``. The call
+#: even carries a ``pyright: ignore[reportArgumentType]``. pydantic tolerated the
+#: bogus argument through 2.13.x and VALIDATES it from 2.14.0, so every model
+#: whose description carries a packaged ``FileDescr`` then fails format
+#: validation with::
+#:
+#:     Error calling function `package_file_descr_serializer`:
+#:     TypeError: 'index_key' is expected to be an integer or a string, got
+#:     'SerializationInfo(...)'
+#:
+#: Measured 2026-11-14 on ``faithful-chicken``, one variable at a time, in the
+#: model-runner image (python 3.11, spec 0.5.12.0 fixed): 2.12.5 OK, 2.13.0 OK,
+#: 2.13.5 OK, **2.14.0 raises**, 2.14.3 raises. The standard runtime never hit
+#: this only by luck — ``careamics==0.0.16`` requires ``pydantic<=2.12,>=2.11``
+#: and so caps it there. A custom env has no careamics, declares only what the
+#: model asks for, and therefore solved pydantic 2.14.3 from conda-forge.
+#:
+#: Upstream fixed the call site in ``bioimageio.spec`` 0.5.14.3 (``handler(value)``;
+#: 0.5.14.2 and earlier are still affected), but that fix is UNREACHABLE here:
+#: ``bioimageio.core==0.11.0`` requires ``bioimageio.spec==0.5.12.0`` exactly and
+#: 0.11.0 is the newest core release. Drop this pin once a core release pairs with
+#: spec >= 0.5.14.3.
+#:
+#: It is a LITERAL and not ``version("pydantic")`` on purpose. The two call sites
+#: run in DIFFERENT deployments with different requirement files, and they must
+#: produce the same env-name hash. Measured: the RuntimeApp env resolves pydantic
+#: 2.12.0 (careamics-capped) while the EntryApp env resolves 2.14.3, so a derived
+#: pin would make the two hashes disagree and no pre-built env would ever be
+#: reused.
+CUSTOM_ENV_PYDANTIC_PIN = "pydantic<2.14"
+
+
+def _is_pydantic_req(dep) -> bool:
+    """True if ``dep`` pins the ``pydantic`` distribution itself.
+
+    Matches the exact name only, so ``pydantic-core`` and ``pydantic-settings``
+    are left alone — they are resolved by whatever ``pydantic`` is chosen, and a
+    model that names one explicitly should keep its own constraint.
+    """
+    if not isinstance(dep, str):
+        return False
+    name = dep.split("::", 1)[-1].strip()
+    for sep in (" ", "=", "<", ">", "!", "~", "["):
+        name = name.split(sep, 1)[0]
+    return name.lower() == "pydantic"
+
+
+#: Conda implementations a ``custom_environment=True`` test can be driven
+#: through, in preference order. ``mamba`` first for the libmamba solver;
+#: ``conda`` accepts the same ``env create`` / ``env remove`` / ``run -n`` /
+#: ``list -n`` / ``clean`` arguments this app passes, so either satisfies us.
+#: ``micromamba`` is deliberately absent — it takes ``create`` rather than
+#: ``env create`` and would need its own argv shapes, so claiming support for
+#: it here would be untested.
+CONDA_IMPLEMENTATIONS = ("mamba", "conda")
+
+
+def resolve_conda_binary() -> Optional[str]:
+    """Name of the first conda implementation on PATH, or ``None`` if neither is.
+
+    ``custom_environment=True`` is the only feature that needs one: it shells
+    out to build the model's declared env and to run ``bioimageio test``
+    inside it. **No image this repo builds installs one** —
+    ``docker/worker.Dockerfile`` and ``docker/model-runner.Dockerfile`` are
+    both ``FROM python:3.11-slim``, and measured in
+    ``ghcr.io/aicell-lab/bioengine-worker:0.16.112`` all three of ``conda``,
+    ``mamba`` and ``micromamba`` are absent (myco #0527). The code predates
+    that: it was written against a ``rayproject/ray`` base, which ships
+    anaconda at ``/home/ray/anaconda3`` — still visible in the recorded
+    output of ``tutorial_model_runner.ipynb``, where ``conda list`` reports
+    ``mamba 2.5.0`` in that prefix.
+
+    So resolve rather than assume. Returning ``None`` lets the caller refuse
+    the call naming what is missing, instead of spawning a binary that is not
+    there and rendering the resulting ``FileNotFoundError`` as a failed
+    validation report about the model.
+    """
+    for name in CONDA_IMPLEMENTATIONS:
+        if shutil.which(name):
+            return name
+    return None
+
+
 def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
     """Return ``conda_env`` with ``bioimageio.core``/``.spec`` pinned to the
-    given versions in its pip section; the model's own deps are untouched.
+    given versions in its pip section, and ``pydantic`` bounded; the model's
+    other deps are untouched.
 
     An ``as-described`` custom env otherwise solves ``bioimageio.core>=0.9.4``
     fresh from conda-forge, so the harness the test actually runs under drifts
@@ -452,6 +541,11 @@ def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
     pre-built env is reused instead of cold-rebuilt. ``==`` on core also
     suppresses the upstream ``>=0.9.4`` floor; ``.spec`` is never touched by
     normalization.
+
+    ``pydantic`` is bounded by :data:`CUSTOM_ENV_PYDANTIC_PIN` for the same
+    reason the other two are pinned: it is part of the harness, not the model.
+    Pinned core/spec with a freely-solved pydantic is not a reproducible harness
+    — see that constant for the measured break and why the bound is a literal.
 
     The env ``name`` is dropped so the hash depends only on channels +
     dependencies: two models declaring the same deps (even under different
@@ -472,14 +566,23 @@ def pin_bioimageio_conda_env(conda_env, core_version: str, spec_version: str):
             bare.startswith("bioimageio.core") or bare.startswith("bioimageio.spec")
         ):
             continue
+        # A conda-level ``pydantic`` would be solved by conda and would defeat
+        # the pip bound below, so it goes too.
+        if _is_pydantic_req(dep):
+            continue
         kept.append(dep)
 
     pip = [
         p
         for p in pip
         if not (p.startswith("bioimageio.core") or p.startswith("bioimageio.spec"))
+        and not _is_pydantic_req(p)
     ]
-    pip += [f"bioimageio.core=={core_version}", f"bioimageio.spec=={spec_version}"]
+    pip += [
+        f"bioimageio.core=={core_version}",
+        f"bioimageio.spec=={spec_version}",
+        CUSTOM_ENV_PYDANTIC_PIN,
+    ]
     kept.append({"pip": pip})
     data["dependencies"] = kept
     return BioimageioCondaEnv.model_validate(data)
@@ -626,11 +729,23 @@ class RuntimeDeployment:
 
         try:
             if env_names:
+                # Reached only from the custom-env path, which has already
+                # refused if nothing resolves — but this writes a *provenance*
+                # field, so say so plainly rather than spawning a missing
+                # binary and reporting its errno as the model's environment.
+                conda_bin = resolve_conda_binary()
+                if conda_bin is None:
+                    return (
+                        "could not list the model's environment: none of "
+                        f"{list(CONDA_IMPLEMENTATIONS)} is installed in this "
+                        "replica's image"
+                    )
                 # Each ``conda list`` already opens with its own
                 # "# packages in environment at <path>:" line, so that doubles as
                 # the section delimiter — nothing needs inventing.
                 return "\n\n".join(
-                    _run(["mamba", "list", "-n", name]) for name in sorted(env_names)
+                    _run([conda_bin, "list", "-n", name])
+                    for name in sorted(env_names)
                 )
             return _run([sys.executable, "-m", "pip", "list", "--format=freeze"])
         except Exception as e:
@@ -697,13 +812,19 @@ class RuntimeDeployment:
         """Scrubbed env with mamba's env-prefix + package cache
         redirected to the replica's writable HOME.
 
-        ``/home/ray/anaconda3/envs/`` and ``/home/ray/.mamba/pkgs``
-        are on a read-only mount inside the Ray worker pod. HOME is
+        A conda implementation's default env prefix and package cache
+        (``$CONDA_PREFIX/envs/``, ``~/.mamba/pkgs``) are not writable
+        cross-replica inside the Ray worker pod. HOME is
         set by ``bioengine._app.replica_init`` to
         ``<app_dir>/home/`` on the app's PVC, which is
         cross-replica RWX under the bioengine layout, so envs built
         by EntryDeployment are visible to this RuntimeDeployment on the same
         path.
+
+        This used to cite ``/home/ray/anaconda3/envs/`` as the prefix being
+        redirected away from. That is the ``rayproject/ray`` layout and no
+        image this repo builds has it (myco #0527) — the redirect is still
+        needed, just not for that reason.
         """
         env_vars = self._safe_subprocess_env()
         mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
@@ -741,10 +862,16 @@ class RuntimeDeployment:
             Delegates to
             ``test_description(runtime_env="as-described")`` which
             already shells out through ``run_command`` (env create,
-            env exec, ``bioimageio test`` inside the env). We swap
-            ``conda`` → ``mamba`` on the first arg for the faster
-            libmamba solver (both binaries ship in the replica image
-            at ``/home/ray/anaconda3/bin/``). Envs are pre-built and
+            env exec, ``bioimageio test`` inside the env). We rewrite
+            ``conda`` on the first arg to whatever
+            ``resolve_conda_binary()`` found — ``mamba`` when present,
+            for the faster libmamba solver, else ``conda`` itself.
+            **Neither is guaranteed:** this used to claim "both binaries
+            ship in the replica image at ``/home/ray/anaconda3/bin/``",
+            which was true of the ``rayproject/ray`` base and is false of
+            every image this repo builds (myco #0527). So the branch
+            raises up front when neither resolves, rather than spawning a
+            missing binary. Envs are pre-built and
             cached on the shared PVC by the EntryDeployment (LRU eviction under
             a size ceiling), so this side normally finds them present
             and does not create or remove them.
@@ -786,6 +913,29 @@ class RuntimeDeployment:
             # ``$HOME/.bioengine-conda/envs/`` so a second test of
             # the same model reuses the same env in seconds. No
             # auto-cleanup here — Entry decides lifecycle.
+            #
+            # Refuse before spawning anything. ``test_description`` shells out
+            # to the conda implementation for its own env probe, so with none
+            # installed the first thing that happens is
+            # ``FileNotFoundError: 'mamba'`` from deep inside the call — which
+            # the EntryDeployment then renders as a ``status="failed"``
+            # *validation report about the model*, carrying the traceback as its
+            # single unnamed detail. The model is not what failed. The
+            # EntryDeployment refuses this call earlier (``_execute_test``);
+            # this guard covers a direct ``runtime.test`` caller and keeps the
+            # precondition stated where it is actually needed (myco #0527).
+            conda_bin = resolve_conda_binary()
+            if conda_bin is None:
+                raise RuntimeError(
+                    "custom_environment=True needs a conda implementation on "
+                    f"PATH to build the model's declared environment, and none "
+                    f"of {list(CONDA_IMPLEMENTATIONS)} is installed in this "
+                    "replica's image. This is a limitation of the image, not a "
+                    "fault in the model: re-run with custom_environment=False "
+                    "to test in the serving runtime's own environment, or "
+                    "deploy on a worker image that ships one."
+                )
+
             from bioimageio.core import test_description
 
             mamba_env_vars = self._mamba_env_vars()
@@ -795,7 +945,7 @@ class RuntimeDeployment:
             def mamba_run_command(args):
                 args = list(args)
                 if args and args[0] == "conda":
-                    args[0] = "mamba"
+                    args[0] = conda_bin
                 # core passes its own "conda run -n <hash> ..." through here, so
                 # this is the only place the solved env's name is visible to us.
                 if "-n" in args and args.index("-n") + 1 < len(args):
