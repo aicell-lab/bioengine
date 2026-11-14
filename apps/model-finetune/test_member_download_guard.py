@@ -15,6 +15,7 @@ cellpose instead.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import sys
@@ -117,3 +118,109 @@ def test_two_members_do_not_share_a_cache_entry(tmp_path):
     b = rt._ensure_member("contrib/b/w.pt", "https://example.invalid/b", None)
     assert a != b
     assert a.read_bytes() == GOOD and b.read_bytes() == OTHER
+
+
+def _preflight_runtime(tmp_path: Path):
+    """The same no-``__init__`` runtime, wired for ``verify_members``.
+
+    Two extra collaborators over ``_runtime``: ``_soup_sem``, which the method
+    holds while hashing, and ``_replica_id``, whose real implementation calls
+    ``serve.get_replica_context()`` and raises outside a Ray Serve replica — it
+    is reporting metadata, not part of what these tests measure.
+    ``_download_member`` raises, so any test using this fixture proves it
+    exercised the CACHE HIT path rather than quietly re-downloading and hashing
+    fresh bytes.
+    """
+    import runtime_cellpose
+
+    rt = object.__new__(runtime_cellpose.CellposeRuntime.func_or_class)
+    rt._soup_dl_bytes = 0
+    rt._soup_dir = lambda: tmp_path
+    rt._evict_members = lambda incoming_bytes: None
+    rt._soup_sem = asyncio.Semaphore(1)
+    rt._replica_id = lambda: "replica-under-test"
+
+    def _no_download(url):
+        raise AssertionError(f"re-downloaded a cached member: {url}")
+
+    rt._download_member = _no_download
+    return rt
+
+
+def _seed_cache(rt, key: str, payload: bytes) -> Path:
+    """Put ``payload`` on disk where this replica caches ``key``."""
+    path = rt._member_cache_path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return path
+
+
+@pytest.mark.asyncio
+async def test_a_cached_member_is_hashed_from_its_BYTES_not_its_recorded_digest(tmp_path):
+    """The clause this row exists for: ``verify_members`` must hash what is on
+    disk, every merge, cache hit included.
+
+    The failure it guards is one line and ships green: returning ``m["sha256"]``
+    — the digest the POOL recorded — instead of hashing the file. The caller
+    (``entry.py``) admits a member when ``actual == recorded``, so a digest that
+    IS ``recorded`` compares a value with itself, can never disagree, and every
+    member is admitted — a substituted cached file souped, and the manifest
+    attesting a basis over bytes nothing hashed.
+
+    ``_ensure_member`` does not cover this: its guard fires on fresh download
+    only, by design, and ``test_a_cache_hit_is_not_re_downloaded`` above pins
+    that. The cache hit is precisely what this method is supposed to catch.
+    """
+    rt = _preflight_runtime(tmp_path)
+    key = "contrib/c-substituted/w.pt"
+    _seed_cache(rt, key, OTHER)          # on disk: OTHER
+    recorded = GOOD_SHA                  # what the pool recorded: sha of GOOD
+
+    out = await rt.verify_members(
+        [{"key": key, "url": "https://example.invalid/w", "sha256": recorded}])
+
+    got = out["digests"][key]
+    assert got == hashlib.sha256(OTHER).hexdigest(), (
+        "verify_members returned a digest that is not the sha256 of the bytes "
+        "on disk — the cached file was never hashed")
+    assert got != recorded, (
+        "verify_members echoed the pool's recorded digest back, so the caller's "
+        "actual-vs-recorded comparison compares a value with itself")
+    assert out["soup_dl_bytes"] == 0, "a cache hit must not be counted as transport"
+
+
+@pytest.mark.asyncio
+async def test_a_cached_member_whose_bytes_agree_reports_that_same_digest(tmp_path):
+    """Equivalence control for the test above.
+
+    Without it, an implementation that returned a constant, or raised, or hashed
+    the wrong file would satisfy the mismatch assertion. The honest member must
+    still come back with exactly its recorded digest.
+    """
+    rt = _preflight_runtime(tmp_path)
+    key = "contrib/c-honest/w.pt"
+    _seed_cache(rt, key, GOOD)
+
+    out = await rt.verify_members(
+        [{"key": key, "url": "https://example.invalid/w", "sha256": GOOD_SHA}])
+
+    assert out["digests"][key] == GOOD_SHA
+
+
+@pytest.mark.asyncio
+async def test_every_member_is_hashed_not_only_the_first(tmp_path):
+    """Two members, one honest and one substituted, in one call — so an
+    implementation that hashes the first and then reuses or trusts the rest is
+    caught. The substituted one is second deliberately."""
+    rt = _preflight_runtime(tmp_path)
+    honest, bad = "contrib/a/w.pt", "contrib/b/w.pt"
+    _seed_cache(rt, honest, GOOD)
+    _seed_cache(rt, bad, OTHER)
+
+    out = await rt.verify_members([
+        {"key": honest, "url": "https://example.invalid/a", "sha256": GOOD_SHA},
+        {"key": bad, "url": "https://example.invalid/b", "sha256": GOOD_SHA},
+    ])
+
+    assert out["digests"][honest] == GOOD_SHA
+    assert out["digests"][bad] == hashlib.sha256(OTHER).hexdigest()
