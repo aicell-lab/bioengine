@@ -472,6 +472,20 @@ def _read_pip(name: str) -> List[str]:
 #: 2.12.0 (careamics-capped) while the EntryApp env resolves 2.14.3, so a derived
 #: pin would make the two hashes disagree and no pre-built env would ever be
 #: reused.
+#:
+#: HOW THIS PIN RETIRES, mechanically rather than by someone re-reading this block
+#: (myco #0530). The condition above — "a core release that pairs with spec >=
+#: 0.5.14.3" — is only reachable by moving ``bioimageio.core`` off 0.11.0 in
+#: ``requirements-entry.txt`` and ``requirements-runtime.txt``, and
+#: ``tests/apps/model-runner/test_custom_env_pydantic_pin.py`` FAILS the moment either
+#: file does, naming this constant. So a core bump cannot land without someone being
+#: told to check the spec pairing and delete this pin if the fix is in. Do not silence
+#: that test by updating its constant: check the pairing first.
+#:
+#: The same test file also pins the OTHER two inputs to the env-name hash (myco
+#: #0529): ``core_version`` and ``spec_version`` are parameters, not literals, and
+#: each call site fills them from its own interpreter, so the hashes agree only while
+#: both deployments install the same core.
 CUSTOM_ENV_PYDANTIC_PIN = "pydantic<2.14"
 
 
