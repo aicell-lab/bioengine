@@ -2199,6 +2199,11 @@ class AppsManager:
         - The moment the app is observed healthy again, the per-app backoff
           state is dropped — the next failure restarts from the initial delay.
 
+        A worker with no opted-in app does not take that path, but still probes
+        for a lost Serve controller and reports one; detection is what every
+        recovery and logging path here sits behind, and losing it was how a
+        head restart went unmentioned in the one log an operator reads.
+
         With initial=10 s, max=600 s the retry schedule is
         10, 20, 40, 80, 160, 320, 600, 600, 600 s … — fast for transient
         crashes (controller restart, replica OOM), bounded for persistent
@@ -2223,6 +2228,36 @@ class AppsManager:
             if app_info["auto_redeploy"]
         ]
         if not apps_to_redeploy:
+            # Noticing is not redeploying. auto_redeploy defaults to False, so
+            # a worker tracking only opted-out apps used to return here and
+            # never read Serve's state at all, which made controller loss
+            # undetectable for it rather than merely unactioned. The actor
+            # lookup is the question being asked and costs a fraction of the
+            # serve.status RPC the path below makes, so detection is reported
+            # on it alone. No recovery sweep follows — an app that asked not to
+            # be redeployed still is not.
+            #
+            # The cooldown gates the probe, not just the line: the lookup runs
+            # in a thread that outlives its own timeout, so asking once per
+            # cooldown rather than once per tick bounds both the added call
+            # rate and how often a tick can wait on an unreachable head. The
+            # timestamp is written only when something is reported — consuming
+            # it on a healthy tick would suppress the first real sweep for an
+            # app deployed with auto_redeploy between two ticks.
+            if (
+                self._deployed_applications
+                and time.time() - self._last_controller_recovery
+                >= _CONTROLLER_RECOVERY_COOLDOWN_SECONDS
+                and await _controller_is_missing_off_loop()
+            ):
+                self._last_controller_recovery = time.time()
+                self.logger.error(
+                    f"Ray Serve controller lost (Ray head restart?); "
+                    f"{len(self._deployed_applications)} tracked "
+                    f"application(s), none with auto_redeploy enabled, so this "
+                    f"worker will not re-establish any of them: "
+                    f"{sorted(self._deployed_applications)}."
+                )
             return
 
         # Get status of actively running deployments
@@ -2435,8 +2470,11 @@ class AppsManager:
         deploy task blocks alive on an event, so we can't gate on it being
         idle; instead a cooldown rate-limits sweeps so an in-flight serve.run
         isn't stomped every tick. Apps recovered from a previous worker carry
-        no cached ``built_app``; they can't be rebuilt from here and are
-        skipped, so they stay down until something redeploys them.
+        no cached ``built_app``; they can't be rebuilt from here and stay down
+        until something redeploys them. They still go through
+        ``_fire_redeploy`` so that skip is logged rather than silent — the
+        incident that motivated this lost an adopted app and left nothing in
+        the worker's own logs to say so.
 
         Returns:
             Whether a sweep ran. ``False`` means the cooldown suppressed it,
@@ -2449,12 +2487,13 @@ class AppsManager:
         self._last_controller_recovery = now
         for application_id in application_ids:
             info = self._deployed_applications.get(application_id)
-            if not info or info.get("built_app") is None:
+            if not info:
                 continue
-            self.logger.error(
-                f"Ray Serve controller lost (Ray head restart?); "
-                f"re-establishing application '{application_id}' in-place."
-            )
+            if info.get("built_app") is not None:
+                self.logger.error(
+                    f"Ray Serve controller lost (Ray head restart?); "
+                    f"re-establishing application '{application_id}' in-place."
+                )
             self._fire_redeploy(
                 application_id,
                 info,
