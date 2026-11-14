@@ -2099,6 +2099,11 @@ class AppsManager:
         - The moment the app is observed healthy again, the per-app backoff
           state is dropped — the next failure restarts from the initial delay.
 
+        A worker with no opted-in app does not take that path, but still probes
+        for a lost Serve controller and reports one; detection is what every
+        recovery and logging path here sits behind, and losing it was how a
+        head restart went unmentioned in the one log an operator reads.
+
         With initial=10 s, max=600 s the retry schedule is
         10, 20, 40, 80, 160, 320, 600, 600, 600 s … — fast for transient
         crashes (controller restart, replica OOM), bounded for persistent
@@ -2123,6 +2128,36 @@ class AppsManager:
             if app_info["auto_redeploy"]
         ]
         if not apps_to_redeploy:
+            # Noticing is not redeploying. auto_redeploy defaults to False, so
+            # a worker tracking only opted-out apps used to return here and
+            # never read Serve's state at all, which made controller loss
+            # undetectable for it rather than merely unactioned. The actor
+            # lookup is the question being asked and costs a fraction of the
+            # serve.status RPC the path below makes, so detection is reported
+            # on it alone. No recovery sweep follows — an app that asked not to
+            # be redeployed still is not.
+            #
+            # The cooldown gates the probe, not just the line: the lookup runs
+            # in a thread that outlives its own timeout, so asking once per
+            # cooldown rather than once per tick bounds both the added call
+            # rate and how often a tick can wait on an unreachable head. The
+            # timestamp is written only when something is reported — consuming
+            # it on a healthy tick would suppress the first real sweep for an
+            # app deployed with auto_redeploy between two ticks.
+            if (
+                self._deployed_applications
+                and time.time() - self._last_controller_recovery
+                >= _CONTROLLER_RECOVERY_COOLDOWN_SECONDS
+                and await _controller_is_missing_off_loop()
+            ):
+                self._last_controller_recovery = time.time()
+                self.logger.error(
+                    f"Ray Serve controller lost (Ray head restart?); "
+                    f"{len(self._deployed_applications)} tracked "
+                    f"application(s), none with auto_redeploy enabled, so this "
+                    f"worker will not re-establish any of them: "
+                    f"{sorted(self._deployed_applications)}."
+                )
             return
 
         # Get status of actively running deployments
