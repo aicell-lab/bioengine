@@ -524,7 +524,8 @@ class CellposeRuntime:
         labels: List[np.ndarray], diam_mean: float = 30.0,
     ) -> Dict[str, Any]:
         """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split,
-        with the serving replica and the bytes this one call downloaded.
+        the per-image breakdown it is the mean of, and the serving replica plus the
+        bytes this one call downloaded.
         ``members`` is a list of ``{"key": weights_path, "url": presigned_get}``;
         empty scores the stock cpsam base. Downloads happen off-lock; the soup build
         is single-flight per replica, and segmentation holds the shared GPU lock — so
@@ -561,8 +562,13 @@ class CellposeRuntime:
         finally:
             if ckpt and ckpt.exists():
                 ckpt.unlink()
+        # Score once, reduce once. The caller publishes both halves and the pool
+        # refuses a record whose aggregate is not the mean of its vector, so these
+        # must be one measurement rather than two calls that agree today.
+        per_image = pool.per_image_instance_f1(masks, [np.asarray(lbl) for lbl in labels])
         return {
-            "f1": pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels]),
+            "f1": pool.mean_of_per_image(per_image),
+            "per_image": per_image,
             "replica": self._replica_id(),
             "soup_dl_bytes": self._soup_dl_bytes - dl_before,
         }
