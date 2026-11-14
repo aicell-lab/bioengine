@@ -474,6 +474,73 @@ def contribution_digest_basis(record: Optional[Dict[str, Any]]) -> str:
 NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
 
 
+# #0070 requirement 3+4: the basis strings a community manifest uses to say WHERE its
+# non-learned values came from. The ruling is explicit that reporting the float alone is
+# not enough — "the manifest must record that the soup's diam_labels was INHERITED and
+# name its source, or the original defect reappears in the manifest instead of the state
+# dict". So the value never travels without this label beside it.
+NON_LEARNED_INHERITED = "inherited_from_base_checkpoint"
+NON_LEARNED_NOTE = (
+    "A federated checkpoint has no single learned object diameter. These values are the "
+    "base checkpoint's, carried through unchanged: the soup averaged its learned weights "
+    "and did not learn a diameter, so an average over the contributors' diameters would "
+    "describe no contributor. The contributors' own measured diameters are recorded "
+    "per member under 'member_non_learned'."
+)
+
+
+def inherited_non_learned(
+    values: Dict[str, float], *, source: str
+) -> Dict[str, Any]:
+    """The manifest's provenance block for the non-learned values the soup inherited.
+
+    ``source`` names the base the values came from (e.g. the cellpose base model
+    identifier), because "inherited" without a named source is the same unfalsifiable
+    claim the row was filed about — a reader could not tell an inherited 30.0 from a
+    coincidental one. Built here rather than inline at the call site so the wording and
+    the basis constant cannot drift apart across writers.
+    """
+    if not source:
+        raise ValueError(
+            "inherited_non_learned requires a named source: an 'inherited' label with "
+            "no source is not traceable, which is the defect #0070 was filed about"
+        )
+    return {
+        "basis": NON_LEARNED_INHERITED,
+        "source": source,
+        "values": {key: float(value) for key, value in sorted(values.items())},
+        "note": NON_LEARNED_NOTE,
+    }
+
+
+NON_LEARNED_UNREPORTED = "unreported_by_runtime"
+
+
+def unreported_non_learned(*, reason: str) -> Dict[str, Any]:
+    """Provenance block for a merge whose runtime did not report its non-learned values.
+
+    ``entry`` and the Cellpose runtime are separate Ray deployments and can sit at
+    different app versions during a rolling update, so a runtime that predates #0070
+    returns a ``materialize_soup`` payload without them. That case gets a block SAYING
+    SO rather than a bare null, because a reader must be able to tell "this runtime did
+    not supply them" from "this soup had no contributor diameters" — collapsing the two
+    is the same false silence the row was filed about. The published checkpoint is still
+    correct: the carry-through happens inside ``uniform_soup``, so the tensor holds the
+    base's value whether or not the runtime reported it; only the RECORD is poorer.
+    """
+    return {
+        "basis": NON_LEARNED_UNREPORTED,
+        "source": None,
+        "values": None,
+        "note": (
+            "This merge's runtime did not report the checkpoint's non-learned values, so "
+            "the manifest cannot name them. Reason: " + reason + ". The published "
+            "weights are unaffected — uniform_soup carries the base's value through "
+            "regardless — but the diameter cannot be read from this record."
+        ),
+    }
+
+
 def is_non_weight_param(key: str) -> bool:
     """True for a state_dict key holding a data statistic, not a learned weight.
 
@@ -701,6 +768,7 @@ def uniform_soup(
     loaders: Sequence[Callable[[], Dict[str, Any]]],
     *,
     base: Callable[[], Dict[str, Any]],
+    member_non_learned: Optional[List[Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
     """Key-wise uniform mean of LEARNED tensors, with non-learned values taken from
     the base checkpoint — the AXIS-1 combine rule.
@@ -727,6 +795,14 @@ def uniform_soup(
     and the soup did not learn a diameter. The four real per-site numbers are not
     discarded; they belong in the community manifest, because they are statistics
     about contributors' DATA rather than parameters of the model.
+
+    ``member_non_learned``, when a list is passed, collects one dict per member in
+    LOADER ORDER — the caller zips it against the member specs it supplied, because
+    this function is given loaders and never learns a contribution id. That ordering is
+    the whole contract: an unordered map would lose which diameter belonged to whom,
+    which is the half of #0070 requirement 4 that makes the numbers worth keeping.
+    Collected as plain floats off the tensor while the member is already resident, so
+    it adds no second pass and retains nothing after ``del sd``.
 
     #0070 requirement 2: classification is TOTAL and fail-closed. Every member key
     must appear in ``base``, whose key set IS the architecture's own inventory, and a
@@ -792,6 +868,16 @@ def uniform_soup(
                       if key not in carried}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
                    for key, value in sd.items() if key not in carried}
+        # #0070 requirement 4: the contributors' OWN diameters are not discarded, they
+        # are recorded in the community manifest. Collected here, in loader order, so
+        # the caller gets them without a second pass over every member's weights — the
+        # merge already holds this state dict and will not hold it again. Scalars only,
+        # converted off the tensor, so nothing is retained once `sd` is released.
+        if member_non_learned is not None:
+            member_non_learned.append(
+                {key: float(sd[key].detach().reshape(-1)[0])
+                 for key in sorted(sd) if is_non_weight_param(key)}
+            )
         for key in acc:
             acc[key] += sd[key].detach().float()
         del sd
@@ -1119,6 +1205,8 @@ def build_community_manifest(
     architecture_signature: str,
     weights_sha256: str,
     created_at: float,
+    non_learned: Optional[Dict[str, Any]] = None,
+    member_non_learned: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """A community checkpoint's manifest.json (one per ``community/<version>/``).
 
@@ -1155,6 +1243,17 @@ def build_community_manifest(
         # materialize_soup just computed, and a caller-supplied basis could disagree
         # with the bytes. See CURRENT_DIGEST_BASIS for the lock-step rule.
         "weights_sha256_basis": CURRENT_DIGEST_BASIS,
+        # #0070 requirements 3 and 4. ``non_learned`` says what the published checkpoint's
+        # diameter IS and that it was inherited rather than learned (build it with
+        # ``inherited_non_learned`` so the basis label travels with the float).
+        # ``member_non_learned`` is where the contributors' OWN measured diameters live —
+        # the ruling's "one operative value in the tensor, four honest values in the
+        # record". Both default to None rather than to {} or [], because an empty map and
+        # an absent one must stay distinguishable: a merge written before this field
+        # existed carries null, and reading that as "this soup had no contributor
+        # diameters" would be the same false-silence the row was filed about.
+        "non_learned": non_learned,
+        "member_non_learned": member_non_learned,
         "created_at": created_at,
     }
 

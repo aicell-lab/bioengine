@@ -509,6 +509,21 @@ class CellposeRuntime:
             torch.load(cached, map_location="cpu", weights_only=False)
         )
 
+    @staticmethod
+    def _base_source(model_type: str = "cpsam") -> str:
+        """The base identifier the soup's non-learned values were inherited FROM.
+
+        Recorded in the community manifest beside the value, because #0070's ruling is
+        that reporting the float alone reproduces the defect in the manifest: a reader
+        cannot tell an inherited 30.0 from a coincidental one without knowing what it was
+        inherited from. Resolved through the same ``training.cellpose_base_model`` the
+        loader uses, so the name in the record and the checkpoint actually read cannot
+        disagree.
+        """
+        import training
+
+        return f"cellpose:{training.cellpose_base_model(model_type)}"
+
     def _base_state_dict(self, model_type: str = "cpsam") -> Dict[str, Any]:
         """The stock base checkpoint's state dict, for ``uniform_soup``'s ``base``.
 
@@ -539,7 +554,8 @@ class CellposeRuntime:
         model = cpmodels.CellposeModel(gpu=False, pretrained_model=base)
         return self._unwrap_sd(model.net.state_dict())
 
-    def _build_soup(self, members: List[Dict[str, str]], model_type: str = "cpsam"):
+    def _build_soup(self, members: List[Dict[str, str]], model_type: str = "cpsam",
+                    member_non_learned: Optional[List[Dict[str, float]]] = None):
         """Uniform mean of member state_dicts; None when empty (= stock base).
 
         Learned tensors are averaged; non-learned ones (``diam_labels``) are carried
@@ -553,6 +569,7 @@ class CellposeRuntime:
         return pool.uniform_soup(
             [partial(self._fetch_member, m["key"], m["url"]) for m in members],
             base=partial(self._base_state_dict, model_type),
+            member_non_learned=member_non_learned,
         )
 
     async def score_soup(
@@ -603,19 +620,54 @@ class CellposeRuntime:
             "soup_dl_bytes": self._soup_dl_bytes - dl_before,
         }
 
-    async def materialize_soup(self, members: List[Dict[str, str]], put_url: str) -> Dict[str, Any]:
+    async def materialize_soup(
+        self, members: List[Dict[str, str]], put_url: str, model_type: str = "cpsam",
+    ) -> Dict[str, Any]:
         """Build the uniform soup of ``members``, PUT it to the pool's presigned URL,
         and return its sha256 + byte size — so the head weights never traverse the
-        CPU entry. ``members`` must be non-empty (a published head always has one)."""
+        CPU entry. ``members`` must be non-empty (a published head always has one).
+
+        Also returns what the community manifest needs for #0070 requirement 4, because
+        this is the only place the members' weights are resident and reading them again
+        would mean re-downloading every one:
+
+        ``non_learned_inherited`` — the published checkpoint's own non-learned values,
+        read back off the SOUP rather than off the base, so the record reports what was
+        actually published rather than what was intended;
+        ``non_learned_source`` — the base those values came from, named, because
+        "inherited" with no source is not traceable;
+        ``member_non_learned`` — one entry per member, carrying the member's weights
+        ``key`` so the caller can map it to a contribution id (this runtime is given
+        paths and never learns contribution ids). Aligned with ``members`` by index and
+        asserted to be, since a silent misalignment would attribute a contributor's
+        diameter to the wrong contributor, which is worse than not recording it.
+        """
         import torch
 
         import pool
 
         dl_before = self._soup_dl_bytes
+        collected: List[Dict[str, float]] = []
         # Returns from inside the semaphore so the soup and the PUT's own copy of it
         # are both released before the next merge starts allocating.
         async with self._soup_sem:
-            soup = await asyncio.to_thread(self._build_soup, members)
+            soup = await asyncio.to_thread(
+                partial(self._build_soup, members, model_type,
+                        member_non_learned=collected))
+            # Read the non-learned values off the published soup while it is resident.
+            inherited = {
+                key: float(soup[key].detach().reshape(-1)[0])
+                for key in sorted(soup) if pool.is_non_weight_param(key)
+            }
+            if len(collected) != len(members):
+                raise RuntimeError(
+                    f"member_non_learned has {len(collected)} entries for "
+                    f"{len(members)} members, so a diameter cannot be attributed"
+                )
+            per_member = [
+                {"key": spec["key"], **vals}
+                for spec, vals in zip(members, collected)
+            ]
             # Digest the tensors, not the saved file: the random stem below lands in
             # every torch zip record name, so a file digest would differ on every
             # merge of the same members. The stem stays random for #0083.
@@ -632,6 +684,9 @@ class CellposeRuntime:
                 "sha256": sha, "n_bytes": n_bytes,
                 "replica": self._replica_id(),
                 "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+                "non_learned_inherited": inherited,
+                "non_learned_source": self._base_source(model_type),
+                "member_non_learned": per_member,
             }
 
     async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:

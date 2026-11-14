@@ -2532,12 +2532,49 @@ class EntryApp:
                     mat = _fold(await runtime.materialize_soup(await _specs(s_paths), w_url))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
+                    # #0070 requirement 4: the contributors' own measured diameters go in
+                    # the manifest. The runtime is given weights PATHS and never learns a
+                    # contribution id, so the mapping is made here, where s_paths and
+                    # s_ids are the parallel lists the gate built. An unmapped key RAISES
+                    # rather than recording a null id: a diameter attributed to the wrong
+                    # contributor, or to nobody, is worse than one not recorded, and this
+                    # is the only place the correspondence is checkable.
+                    # A runtime that predates #0070 returns no such keys. entry and the
+                    # Cellpose runtime are SEPARATE Ray deployments and can sit at
+                    # different app versions during a rolling update, so this must not
+                    # KeyError — and must not quietly write null either, because a reader
+                    # has to tell "this runtime did not report them" from "this soup had
+                    # no contributor diameters". The published weights are correct either
+                    # way: the carry-through happens inside uniform_soup.
+                    if "non_learned_inherited" in mat:
+                        _cid_of = dict(zip(s_paths, s_ids))
+                        member_nl = []
+                        for _nl in (mat.get("member_non_learned") or []):
+                            _cid = _cid_of.get(_nl.get("key"))
+                            if _cid is None:
+                                raise RuntimeError(
+                                    "materialize_soup returned a member key that is not "
+                                    f"among the admitted paths: {_nl.get('key')!r}")
+                            member_nl.append({
+                                "contribution_id": _cid,
+                                **{k: v for k, v in _nl.items() if k != "key"},
+                            })
+                        non_learned_block = pool.inherited_non_learned(
+                            mat["non_learned_inherited"],
+                            source=mat["non_learned_source"])
+                    else:
+                        member_nl = None
+                        non_learned_block = pool.unreported_non_learned(
+                            reason="the Cellpose runtime serving this merge returned no "
+                                   "non_learned_inherited field, so it predates #0070")
                     manifest = pool.build_community_manifest(
                         community_version=new_version, combine="uniform",
                         selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
                         selection_metric=sel_metric, witness_metric=wit_metric, members=members_record,
                         architecture_signature=index.get("architecture_signature"),
                         weights_sha256=head_sha, created_at=time.time(),
+                        non_learned=non_learned_block,
+                        member_non_learned=member_nl,
                     )
                     m_url = await am.put_file(pool_artifact_id, file_path=paths["manifest"])
                     (await self._http_retry("PUT", m_url, content=json.dumps(manifest).encode("utf-8"), timeout=120.0)).raise_for_status()

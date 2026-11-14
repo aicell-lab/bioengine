@@ -273,6 +273,82 @@ def test_the_soup_does_not_alias_the_base_tensors() -> None:
     assert float(base_sd["diam_labels"][0]) == pytest.approx(BASE_DIAM, rel=1e-9)
 
 
+# ── requirement 4: the contributors' own diameters are RECORDED, not discarded ──
+
+
+def test_member_diameters_are_collected_in_loader_order() -> None:
+    """Requirement 4. Order is the contract: the caller zips this against the member
+    specs it supplied, because uniform_soup is given loaders and never learns a
+    contribution id. An unordered map would lose which diameter belonged to whom.
+    """
+    collected: list = []
+    pool.uniform_soup(_pool_loaders(), base=lambda: _ckpt(0.0, BASE_DIAM),
+                      member_non_learned=collected)
+
+    assert [c["diam_labels"] for c in collected] == pytest.approx(list(POOL_DIAMS))
+    assert len(collected) == len(POOL_DIAMS)
+
+
+def test_collected_diameters_are_the_members_own_not_the_base() -> None:
+    """Discrimination control for the test above. If the collector read the carried
+    value instead of each member's, every entry would equal BASE_DIAM and the test
+    above would still have four entries in the right order."""
+    collected: list = []
+    pool.uniform_soup(_pool_loaders(), base=lambda: _ckpt(0.0, BASE_DIAM),
+                      member_non_learned=collected)
+
+    assert all(c["diam_labels"] != pytest.approx(BASE_DIAM) for c in collected)
+    # And the published tensor is still the base's, so the two really are different
+    # readings of the same merge rather than one value reported twice.
+    out = pool.uniform_soup(_pool_loaders(), base=lambda: _ckpt(0.0, BASE_DIAM))
+    assert float(out["diam_labels"][0]) == pytest.approx(BASE_DIAM)
+
+
+def test_collecting_is_opt_in_and_changes_nothing() -> None:
+    """The collector must not alter the soup: a caller that passes no list gets the
+    same bytes as one that does."""
+    a = pool.uniform_soup(_pool_loaders(), base=lambda: _ckpt(0.0, BASE_DIAM))
+    sink: list = []
+    b = pool.uniform_soup(_pool_loaders(), base=lambda: _ckpt(0.0, BASE_DIAM),
+                          member_non_learned=sink)
+
+    assert pool.state_dict_digest(a) == pool.state_dict_digest(b)
+    assert sink, "the collector was passed but filled nothing"
+
+
+def test_an_inherited_block_must_name_its_source() -> None:
+    """#0070's ruling: reporting the float alone reproduces the defect in the manifest.
+    A reader cannot tell an inherited 30.0 from a coincidental one."""
+    with pytest.raises(ValueError, match="named source"):
+        pool.inherited_non_learned({"diam_labels": 30.0}, source="")
+
+
+def test_the_inherited_block_carries_basis_source_and_values() -> None:
+    block = pool.inherited_non_learned(
+        {"diam_labels": 30.0, "diam_mean": 30.0}, source="cellpose:cpsam_v2")
+
+    assert block["basis"] == pool.NON_LEARNED_INHERITED
+    assert block["source"] == "cellpose:cpsam_v2"
+    assert block["values"] == {"diam_labels": 30.0, "diam_mean": 30.0}
+    assert "no single learned object diameter" in block["note"]
+
+
+def test_an_unreported_block_is_distinguishable_from_an_inherited_one() -> None:
+    """entry and the runtime are separate Ray deployments and can differ in version, so
+    "the runtime did not report them" must not read as "this soup had no contributor
+    diameters". Different basis, and the reason is carried."""
+    inh = pool.inherited_non_learned({"diam_labels": 30.0}, source="cellpose:cpsam_v2")
+    unr = pool.unreported_non_learned(reason="runtime predates #0070")
+
+    assert unr["basis"] != inh["basis"]
+    assert unr["basis"] == pool.NON_LEARNED_UNREPORTED
+    assert unr["values"] is None and unr["source"] is None
+    assert "runtime predates #0070" in unr["note"]
+    # The weights are not in question either way, and the note must say so, or an
+    # operator reading an unreported block will suspect the checkpoint.
+    assert "weights are unaffected" in unr["note"]
+
+
 # ── requirement 2: unclassifiable keys FAIL the merge, never get averaged ────
 
 
