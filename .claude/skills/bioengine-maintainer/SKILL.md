@@ -291,18 +291,18 @@ Don't blanket-delete: dev tags + `:latest` move-tags are intentional. Only purge
 
 For app-side changes (anything under `apps/<name>/**` that changes the deployment's API surface or behaviour — e.g. a new method signature, changed return shape, a new dependency), validate on a live cluster by running the dev version SIDE-BY-SIDE with production, not by replacing it. The pattern:
 
-### Running `scripts/upload_app.py` — the three things that are not in `--help`
+### Running `scripts/upload_app.py` — the two things that are not in `--help`
 
 ```sh
-cd <worktree-root>
 set -a; . /data/nmechtel/bioengine/.env; set +a
-PYTHONPATH="$(pwd -P)" python3 scripts/upload_app.py \
+python3 scripts/upload_app.py \
   -d apps/<name> --workspace bioimage-io --token "$BIOIMAGE_IO_TOKEN"
 ```
 
-1. **`PYTHONPATH="$(pwd -P)"` is required.** Without it the script dies with `ModuleNotFoundError: No module named 'bioengine'` even though `bioengine/` is right there — running a script puts the *script's* directory on `sys.path`, not the cwd, so `scripts/` is importable and the repo root is not. The error reads like a broken checkout and is a path problem; `hypha_rpc` and `packaging` are already in europa's system python3.
-2. **`--workspace bioimage-io` is required.** Omitted, the script connects with `server.config.workspace` — the token's own — and publishes to your PERSONAL workspace **while reporting success**. An artifact version is immutable, so a rung burned that way is silent and unrecoverable.
-3. **Use `--token "$BIOIMAGE_IO_TOKEN"`,** not `HYPHA_TOKEN`. The script falls back to `os.environ["HYPHA_TOKEN"]` and then to an interactive `login()`, neither of which is what you want in a worktree.
+**`PYTHONPATH` is no longer needed since PR #341** (myco `#0559`) — the script appends the repo root to `sys.path` itself, and runs from any cwd. Before that it died with `ModuleNotFoundError: No module named 'bioengine'` even in a good checkout, because running a script puts the *script's* directory on `sys.path` and not the cwd. If you meet that error, you are on an older checkout; the workaround was `PYTHONPATH="$(pwd -P)"`.
+
+1. **`--workspace bioimage-io` is required.** The flag is passed to `connect_to_server`, and the script then rebinds `workspace = server.config.workspace` from the live connection and publishes *there*. The workspace is **encoded in the token**, so the flag does not select a destination — it **asserts** one, and a mismatch is refused before anything is written: `Current workspace encoded in the token (ws-user-…) does not match the specified workspace (bioimage-io)`. Omit it and you silently publish into whatever workspace the token carries, **while reporting success**. With `$BIOIMAGE_IO_TOKEN` that happens to be `bioimage-io` and no harm is done; with `$HYPHA_TOKEN` it is your personal workspace. An artifact version is immutable, so a rung burned that way is unrecoverable — which is why you pass the flag every time rather than reasoning about which token you have.
+2. **Use `--token "$BIOIMAGE_IO_TOKEN"`,** not `HYPHA_TOKEN`. The script falls back to `os.environ["HYPHA_TOKEN"]` and then to an interactive `login()`, neither of which is what you want in a worktree. Together with (1) this is belt and braces: the wrong token alone fails loudly, and the missing flag alone is harmless with the right token — it takes *both* mistakes to publish to the wrong place quietly.
 
 **Then assert the workspace from the script's own log** rather than trusting exit 0 — `INFO - Connected to workspace bioimage-io as user …`, followed by `Editing existing artifact 'bioimage-io/<name>' (new version: X.Y.Z)` and `Successfully committed artifact … (version=X.Y.Z)`.
 
