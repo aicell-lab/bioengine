@@ -1311,6 +1311,23 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
 
     decided = set(index.get("decided_contribution_ids", []))
     contributions = []
+    # Which of the digests each published ``weights_sha256`` is. Kept BESIDE
+    # contributions[] for the same reason soups[] is: that record's field set is
+    # pinned key-for-key by test_pool.py::test_contribution_key_set, and a backend
+    # that quietly widens it is the mismatch SCHEMA_VERSION exists to make visible.
+    # Joined on contribution_id.
+    #
+    # #0523: without this, the wire published the number with no basis beside it, so
+    # from outside the pool two digests computed under different bases were
+    # indistinguishable — the harm #0509's lede described, surviving #0509's fix
+    # because #0509 stamped what is STORED and this is what is PUBLISHED.
+    #
+    # The absent case is DECIDED here rather than defaulted: ``digest_basis`` maps a
+    # record with no digest to DIGEST_BASIS_ABSENT ("no_digest") and a post-cutoff
+    # record carrying a digest but no stamp to the UNDETERMINED basis — two different
+    # answers, neither of them a guess at CONTRIBUTION_DIGEST_BASIS. A silent default
+    # to the file basis is exactly the defect #0509 was filed for.
+    digest_provenance_by_contribution: Dict[str, Any] = {}
     for c in index.get("contributions", []):
         cid = c.get("contribution_id")
         if cid in merged_into:
@@ -1319,6 +1336,9 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
             disposition = "excluded"
         else:
             disposition = "pending"
+        digest_provenance_by_contribution[cid] = digest_provenance(
+            c, digest_key="weights_sha256", created_at_key="uploaded_at"
+        )
         contributions.append({
             "contribution_id": cid,
             "received_at": _iso(c.get("uploaded_at")),
@@ -1364,9 +1384,14 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         "contributions": contributions,
         # Additive, outside every field set the page pins. ``soups`` is keyed by
         # soup_id; empty merges are absent from it because they publish no head and
-        # their projection carries no digest to attribute.
+        # their projection carries no digest to attribute. ``contributions`` is keyed
+        # by contribution_id and carries one entry per published contribution,
+        # including those whose basis is absent or undetermined — a contribution
+        # missing from this map would be indistinguishable from one the pool does not
+        # hold, which is the ambiguity the map exists to remove.
         "digest_provenance": {
             "soups": digest_provenance_by_soup,
+            "contributions": digest_provenance_by_contribution,
             "current_community": _current_community_provenance(index),
         },
     }
