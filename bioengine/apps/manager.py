@@ -367,6 +367,7 @@ PUBLIC_APP_STATUS_FIELDS = (
     "deployments",
     "gpu_enabled",
     "application_resources",
+    "resource_shortfall",
     "available_methods",
     "max_ongoing_requests",
     "scaling",
@@ -778,7 +779,7 @@ class AppsManager:
 
     async def _check_resources(
         self, application_id: str, required_resources: Dict[str, int]
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         """
         Verify that sufficient resources are available for deploying an application.
 
@@ -801,12 +802,20 @@ class AppsManager:
             application_id: ID of the application being deployed (for logging)
             required_resources: Dictionary containing 'num_cpus', 'num_gpus', and 'memory' requirements
 
+        Returns:
+            None when a node has room. On an external cluster with no such node,
+            a report of the shortfall the deployment is proceeding in spite of,
+            for the caller to store and expose through ``get_app_status``.
+
         Raises:
             ValueError: If insufficient resources are available and cluster cannot scale
 
         Note:
             External clusters are assumed to have autoscaling capabilities, so only
-            warnings are issued rather than blocking deployment.
+            warnings are issued rather than blocking deployment. That assumption is
+            unverified at deploy time and false on a KubeRay cluster with in-tree
+            autoscaling disabled, where the deployment then waits for a node that
+            will never arrive — hence the returned report.
         """
         self.logger.debug(
             f"Checking resources for application '{application_id}': {required_resources}"
@@ -829,9 +838,13 @@ class AppsManager:
         # Wait for Ray cluster to be ready
         await self.ray_cluster.is_ready.wait()
 
-        for node_resource in self.ray_cluster.status["nodes"].values():
-            # TODO: This currently assumes one application fits on one node.
-            # For multi-node applications, replace this with aggregate placement-aware checks.
+        free_per_node = {}
+        for node_id, node_resource in self.ray_cluster.status["nodes"].items():
+            # Per-node is deliberate, not an unfinished aggregate check: an
+            # aggregate would loosen SLURM admission, the only mode that raises
+            # on this verdict, trading a clean rejection for a deployment that
+            # hangs with no failure state. The other modes gain nothing from it
+            # — one node on single-machine, and no gating on external-cluster.
             # For updates, add back the resources that will be freed
             used_cpu = max(
                 0, node_resource["used_cpu"] - current_resources["num_cpus"]
@@ -846,6 +859,12 @@ class AppsManager:
             free_cpu = max(0, node_resource["total_cpu"] - used_cpu)
             free_gpu = max(0, node_resource["total_gpu"] - used_gpu)
             free_memory = max(0, node_resource["total_memory"] - used_memory)
+
+            free_per_node[node_id] = {
+                "num_cpus": free_cpu,
+                "num_gpus": free_gpu,
+                "memory": free_memory,
+            }
 
             if (
                 free_cpu >= required_resources["num_cpus"]
@@ -904,6 +923,15 @@ class AppsManager:
                     "Assuming Ray autoscaling is available. "
                     f"Requested resources: {required_resources}"
                 )
+                return {
+                    "requested": dict(required_resources),
+                    "free_per_node": free_per_node,
+                    "cluster_free": {
+                        key: sum(node[key] for node in free_per_node.values())
+                        for key in ("num_cpus", "num_gpus", "memory")
+                    },
+                    "detected_at": time.time(),
+                }
 
     async def _deploy_application(
         self,
@@ -1592,6 +1620,12 @@ class AppsManager:
             ),
             "gpu_enabled": not application_info["disable_gpu"],
             "application_resources": application_info["application_resources"],
+            # Non-None only when no node had room at deploy time and the worker
+            # proceeded anyway on the autoscaling assumption. That state has no
+            # failure status and the app's own service never registers, so this
+            # is the only surface a caller has for it. ``.get`` because a
+            # recovered app's state dict predates the field.
+            "resource_shortfall": application_info.get("resource_shortfall"),
             "authorized_users": application_info["authorized_users"],
             "available_methods": application_info["available_methods"],
             "max_ongoing_requests": application_info["max_ongoing_requests"],
@@ -1873,6 +1907,12 @@ class AppsManager:
                     # custom static list passed at deploy time, which is not
                     # recoverable here either way.
                     "ice_servers": None,
+                    # Stays None: the shortfall is what _check_resources saw of
+                    # the cluster at the ORIGINAL deploy, and app_data does not
+                    # carry it, so an adopting worker would need historical
+                    # cluster state. Measuring it fresh would answer a different
+                    # question under the same key.
+                    "resource_shortfall": None,
                     "debug": app_data["debug"],
                     "deployment_task": None,
                     "is_deployed": is_deployed,
@@ -3576,7 +3616,7 @@ class AppsManager:
                         )
 
             # Check resources before creating deployment task
-            await self._check_resources(
+            resource_shortfall = await self._check_resources(
                 application_id=application_id,
                 required_resources=app.metadata["resources"],
             )
@@ -3606,6 +3646,7 @@ class AppsManager:
                 "proxy_memory_in_gb": proxy_memory_in_gb,
                 "scaling": dict(app.scaling or {}),
                 "application_resources": app.metadata["resources"],
+                "resource_shortfall": resource_shortfall,
                 "authorized_users": app.metadata["authorized_users"],
                 "available_methods": app.metadata["available_methods"],
                 "static_site_url": static_site_url,
