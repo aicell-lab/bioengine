@@ -281,6 +281,57 @@ GPU and never builds its (multi-GB) pip env. Its model types are reported
 `get_training_capabilities()` and rejected by `infer` / `start_training` with a
 clear error. Enabling both backends is a two-GPU deployment by design.
 
+**If you get it wrong, the app now tells you.** Asking for more GPUs than the
+cluster has used to be invisible. Measured 2026-11-13 on a one-GPU
+`external-cluster` worker with both backends enabled: the unplaceable runtime
+stays `UPDATING` with its replica `STARTING`, the application stays `DEPLOYING`,
+none of it is a failure state and none of it times out — so `deploy_app` returns
+successfully and `get_app_status` reads like a slow first start forever. The
+CPU-only entry deployment schedules on any node, so it is alive to say what the
+GPU deployments cannot (#0370):
+
+- a `⚠ GPU placement: …` **warning in the entry's log**, which
+  `get_app_status(application_ids=[...])` already returns under
+  `deployments.<entry>.logs`, naming the GPU count, the count required and
+  `MODEL_FINETUNE_BACKENDS`;
+- a **`placement` block** on `get_training_capabilities()`, carrying
+  `{backends_enabled, gpus_required, gpus_in_cluster, gpus_free, sufficient,
+  detail, advice}` — so the diagnosis arrives in the same response as the
+  `runtime unavailable` symptom.
+
+**`sufficient` answers the total, not the free count, and that is deliberate.**
+`gpus_in_cluster` is `ray.cluster_resources()` (what the cluster owns) and
+`gpus_free` is `ray.available_resources()` (what is unbooked at that instant).
+Whether these runtimes can EVER place here is a fact about the total, so only the
+total moves `sufficient`. A cluster that owns enough but has none free right now
+reads `sufficient: true` with a `detail` saying the runtimes pend until a device
+is released — reported, not alarmed. Keying the verdict to the free count would
+make it fire at this app's own placed replicas, which hold whole devices, and at
+every elastic cluster in the gap between two jobs.
+
+**Which of the two you can read depends on how bad it is**, and that is worth
+knowing before you go looking for the wrong one:
+
+| state | what to read |
+|---|---|
+| one backend over-subscribed, app serving | either — `get_training_capabilities()` is the convenient one |
+| every GPU runtime pending, app stuck `DEPLOYING` | **the log only.** The proxy registers the app's Hypha service only once every sibling deployment is serviceable, so nothing can call the app at all. `get_app_status` still returns the entry's log. |
+
+The entry therefore starts with `initial_replicas: 1` so the line is written
+without a caller; `min_replicas` stays `0`, so an idle entry still scales to zero.
+On a `single-machine` or `slurm` worker you will not reach this state at all — the
+worker's own resource check raises `ValueError: Insufficient resources …` and
+refuses the deploy. Only in `external-cluster` mode does it downgrade that to a
+warning (in the *worker's* log, assuming Ray autoscaling), and that is the mode
+KTH and deNBI run.
+
+`sufficient` is three-valued on purpose: `true` (enough GPUs), `false` (a real
+shortfall, and `advice` says what to set), or `null` when it cannot be told from
+here — no GPU has reported into the cluster yet, which is the normal state on an
+elastic SLURM cluster until the autoscaler provides a GPU node, or Ray's view was
+unreadable. It is a diagnostic only: it never refuses a deploy and never raises,
+because an over-subscribed cluster still serves every CPU method correctly.
+
 Pass it as a deployment env var — the guaranteed vector, since it must be visible
 when the app is introspected (an `application_env_vars` entry, or baked into a
 purpose-built worker image):
@@ -305,6 +356,67 @@ Notes:
   in a few GB of VRAM.
 - micro-sam is pip-installable (no conda/mamba) — `bioimage-cpp` supplies the
   C++ pieces `python-elf` used to need from conda-forge.
+
+### A replica whose `runtime_env` did not install now names the missing modules in its logs
+
+Each GPU runtime declares a `@bioengine.smoke_test` that imports its own ML stack
+once — `torch` + `cellpose` for the Cellpose runtime, `torch` + `micro_sam` +
+`segment_anything` + `onnxruntime` + `pooch` for micro-sam. If any of them is
+missing the replica is marked **unhealthy** and the reason is in the deployment's
+own logs (`get_app_status` → `deployments.<name>.logs`).
+
+The import runs in the background *after* the replica has started serving, so it
+does **not** gate traffic: a replica whose env is broken still starts, still reports
+`HEALTHY` on its first poll, and still receives calls. What it changes
+is visibility, not routing — see the second bullet below for how long a broken
+replica keeps receiving calls.
+
+That used to be invisible. Nothing on the health path imports the ML stack: the
+framework's `check_health` runs the one-shot `async_init` and retains a CUDA context
+through `libcuda.so.1`, which the NVIDIA container runtime injects regardless of what
+pip did, and the runtimes declared no health check of their own. So a replica with no
+`cellpose` installed reported `HEALTHY` under a `RUNNING` deployment while every call
+raised `ModuleNotFoundError`. Measured on the Berzelius worker, 31 Oct 2026.
+
+Two things worth knowing when you see it:
+
+- **pip's own output is not in the app's logs.** A failed or skipped install lands in
+  `runtime_env_setup-*.log` on the node, so read that for the cause — the smoke test
+  tells you *which* modules are missing, not why.
+- **The smoke test does NOT stop broken traffic — it only makes the cause visible.**
+  Do not read a failing smoke test as a deployment that has taken itself out of
+  rotation; it has not, and it will not.
+  - *Per replica, ≈90 s.* The smoke test runs in the background and its failure is
+    read on a *later* health poll: `check_health` creates the task and tests
+    `.done()` in the same call, so the first poll cannot fail, and Ray Serve
+    condemns a replica only after **3 consecutive** failed checks
+    (`REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD = 3`). At these deployments'
+    `health_check_period_s=30.0` that is poll 1 healthy and polls 2-4 failing — so
+    ≈90 s, roughly 3 periods, during which the replica reads `HEALTHY`, the
+    deployment reads `RUNNING`, and calls route to it and fail.
+  - *Per deployment, indefinitely.* Serve then **replaces** the condemned replica
+    and the cycle repeats, because its circuit breaker never trips for a version
+    whose replicas start successfully and fail only afterwards. Measured end to end
+    on a real `serve.run` (backlog `#0387`) over 100 health-check periods — that
+    probe ran at `health_check_period_s=1.0`, so ≈100 s in all, **not** 100 × the
+    30 s above: **105 calls, 0 failed, 84 of them answered by a replica that
+    already knew its own smoke test had failed, across 22 distinct replica pids.**
+    Read that as a measurement of *routing*, not of what your callers will see:
+    `#0387`'s handler imported nothing, so its calls succeeded. In this app they do
+    not — the micro-sam and Cellpose call paths import their own ML stack, so a
+    replica in this state raises `ModuleNotFoundError`, which is the very symptom
+    this section describes. What carries over is that calls keep arriving at a
+    replica whose smoke test has already failed.
+  - *So what you get from this fix:* the missing modules are **named in
+    `deployments.<name>.logs` on every cycle** instead of the replica reporting
+    `HEALTHY` in silence. Debugging a fresh deploy, expect a replica that looks
+    healthy for the first minute and a half and a deployment that keeps looking
+    `RUNNING` — check the logs, not the status. Changing the behaviour is a
+    framework question and is tracked on `#0387`, not here.
+
+`ping()` stays shallow on purpose: the entry calls it with a 2 s timeout before every
+GPU call, which an import of torch does not fit, and importing a heavy stack on every
+poll is its own defect.
 
 ### Prebuilt worker image (skip the deploy-time install)
 
