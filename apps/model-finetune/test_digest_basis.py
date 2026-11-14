@@ -964,7 +964,13 @@ class _Runtime:
         return dict(_BUDGET)
 
     async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
-        return {"f1": self._f1, "replica": "r0", "soup_dl_bytes": 0}
+        # One per-image score per image of the split, as the real runtime returns
+        # (#0121). Uniform, so the mean is exactly the ``f1`` the caller chose —
+        # aggregate() refuses a record whose aggregate is not the mean of the
+        # vector beside it, so a stub returning an arbitrary vector would make
+        # every branch below fail for a reason that is not under test here.
+        return {"f1": self._f1, "per_image": [self._f1] * max(len(gts), 1),
+                "replica": "r0", "soup_dl_bytes": 0}
 
     async def materialize_soup(self, specs, url) -> Dict[str, Any]:
         return {"sha256": self._sha, "n_bytes": 2048,
