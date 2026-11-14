@@ -402,6 +402,176 @@ class TestWritersStampTheBasis:
         assert pool.digest_basis(cur, digest_key="sha256") == pool.DIGEST_BASIS_TENSORS
 
 
+# ── #0509: the contribution surface ──────────────────────────────────────────
+#
+# The third writer. ``append_contribution`` stamped nothing, so a contribution's
+# ``weights_sha256`` was the one published digest with no attribution at all — a
+# client whose upload predates the cut-over re-hashes its own file, gets a
+# different value from the one the pool publishes, and has no way to tell "the
+# pool measured something else" from "my upload is corrupt".
+#
+# Deliberately NOT asserted through the writer's own return value or its argument
+# dict: the row asks for the STORED entry read back out of the index, because a
+# stamp applied to the caller's dict and then dropped on the way in would satisfy
+# any assertion made on the dict.
+
+CONTRIB_SHA = "d" * 64
+CONTRIB_OTHER_SHA = "e" * 64
+# Two DISTINCT pre-cutoff instants. Both before the cut-off on purpose: the
+# stamped record must resolve to the tensor meaning even though its own date would
+# say "file", which is the only way to show the answer comes from the stamp rather
+# than from the clock.
+UPLOADED_OLD = OLDEST_REAL_MERGE
+UPLOADED_NEW = OLDEST_REAL_MERGE + 3600.0
+
+
+def _contribution(cid: str, digest: str, uploaded_at: Any, basis: Any = "<omit>") -> Dict[str, Any]:
+    """A contribution stub in the stored shape. ``basis='<omit>'`` writes no basis
+    key at all — what every record written before #0509 looks like, and distinct
+    from a key present and null."""
+    rec: Dict[str, Any] = {
+        "contribution_id": cid,
+        "weights_path": f"contributions/{cid}/weights.pt",
+        "metadata_path": f"contributions/{cid}/metadata.json",
+        "weights_sha256": digest,
+        "architecture_signature": "sig",
+        "samples_seen": 10,
+        "n_train_images": 5,
+        "n_bytes": 1218617275,
+        "uploaded_at": uploaded_at,
+    }
+    if basis != "<omit>":
+        rec["weights_sha256_basis"] = basis
+    return rec
+
+
+class TestContributionsStampTheBasis:
+    def test_a_new_contribution_carries_the_basis_on_the_stored_entry(self):
+        """Clause 1, read back out of the index rather than off the writer."""
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = index["contributions"][-1]
+        assert stored["weights_sha256_basis"] == pool.CURRENT_DIGEST_BASIS
+        assert pool.contribution_digest_basis(stored) == pool.DIGEST_BASIS_TENSORS
+
+    def test_a_stamped_contribution_resolves_with_no_timestamp_at_all(self):
+        """The point of the stamp: attribution without date-reasoning."""
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = dict(index["contributions"][-1])
+        del stored["uploaded_at"]
+        assert pool.contribution_digest_basis(stored) == pool.DIGEST_BASIS_TENSORS
+
+    def test_two_contributions_under_different_bases_are_distinguishable(self):
+        """THE discrimination this row is for, and the test with teeth.
+
+        One legacy member (no stamp, pre-cutoff date) and one newly appended
+        member. Both dates are pre-cutoff and the two differ, so:
+
+          * a resolver hardcoding the tensor meaning reads the legacy member wrong;
+          * a resolver hardcoding the file meaning reads the new member wrong;
+          * a resolver leaking a sibling's basis gives both the SAME answer;
+          * a resolver that ignored the stamp and dated the record would call the
+            new member "file", because its own date says so.
+
+        Only reading each record's own stamp first, then its own date, passes.
+        """
+        index: Dict[str, Any] = {
+            "contributions": [
+                _contribution("c-legacy", CONTRIB_OTHER_SHA, UPLOADED_OLD)
+            ]
+        }
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        legacy, new = index["contributions"]
+
+        assert legacy["contribution_id"] == "c-legacy"
+        assert new["contribution_id"] == "c-new"
+        assert legacy["weights_sha256"] != new["weights_sha256"]
+        assert legacy["uploaded_at"] != new["uploaded_at"]
+        assert legacy["uploaded_at"] < CUTOFF and new["uploaded_at"] < CUTOFF
+
+        assert pool.contribution_digest_basis(legacy) == pool.DIGEST_BASIS_FILE
+        assert pool.contribution_digest_basis(new) == pool.DIGEST_BASIS_TENSORS
+        assert pool.contribution_digest_basis(legacy) != pool.contribution_digest_basis(new)
+
+    def test_a_post_cutoff_unstamped_contribution_is_undetermined_not_tensors(self):
+        """Clause 2's decision, as the behaviour rather than as prose: an absent
+        basis is NOT quietly read as the current one. This is the case where a
+        silent default would look most like success."""
+        legacy = _contribution("c-late", CONTRIB_SHA, AFTER_CUTOFF)
+        assert "weights_sha256_basis" not in legacy
+        assert pool.contribution_digest_basis(legacy) == pool.DIGEST_BASIS_UNDETERMINED
+        assert pool.contribution_digest_basis(legacy) != pool.DIGEST_BASIS_TENSORS
+
+    def test_an_unrecognised_stamp_is_undetermined_not_passed_through(self):
+        """A record written by a NEWER app than this one. Shaped like a real basis,
+        so a check loose enough to accept any string would accept it."""
+        rec = _contribution("c-future", CONTRIB_SHA, UPLOADED_NEW, basis=NEVER_WRITTEN_BASIS)
+        assert pool.contribution_digest_basis(rec) == pool.DIGEST_BASIS_UNDETERMINED
+
+    def test_a_contribution_with_no_digest_says_so_rather_than_undetermined(self):
+        """``no_digest`` and ``undetermined`` are different answers — "nothing to
+        attribute" vs "cannot attribute" — and collapsing them hides the second."""
+        rec = _contribution("c-empty", "", UPLOADED_NEW)
+        assert pool.contribution_digest_basis(rec) == pool.DIGEST_BASIS_ABSENT
+
+    def test_the_default_keys_misattribute_a_contribution_two_different_ways(self):
+        """Why ``contribution_digest_basis`` exists rather than three keyword
+        arguments at each call site. A contribution is the one record shape whose
+        digest key AND timestamp key both differ from the defaults, so there are two
+        wrong answers available and neither raises.
+
+        The second is the dangerous one: "undetermined" for a record whose date
+        proves the file meaning is indistinguishable from the honest refusal."""
+        legacy = _contribution("c-legacy", CONTRIB_OTHER_SHA, UPLOADED_OLD)
+
+        assert pool.digest_basis(legacy) == pool.DIGEST_BASIS_ABSENT
+        assert (
+            pool.digest_basis(legacy, digest_key="weights_sha256")
+            == pool.DIGEST_BASIS_UNDETERMINED
+        )
+        # The named resolver is the only one of the three that is right.
+        assert pool.contribution_digest_basis(legacy) == pool.DIGEST_BASIS_FILE
+
+    def test_appending_back_fills_nothing_and_does_not_mutate_the_caller(self):
+        """Clause 5. Existing stored records keep having no basis — they resolve by
+        date, the one direction that is a proof — and the dict the caller passed in
+        is left alone, so nothing it might also be holding is rewritten."""
+        legacy = _contribution("c-legacy", CONTRIB_OTHER_SHA, UPLOADED_OLD)
+        index: Dict[str, Any] = {"contributions": [legacy]}
+        before = dict(legacy)
+
+        fresh = _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        pool.append_contribution(index, fresh)
+
+        assert index["contributions"][0] is legacy, "the stored record was replaced"
+        assert legacy == before, "the stored record was rewritten"
+        assert "weights_sha256_basis" not in index["contributions"][0]
+        assert "weights_sha256_basis" not in fresh, "the caller's dict was mutated"
+        # Paired with the above so "nothing was written" cannot pass: the new entry
+        # DID get the stamp, which is the whole change.
+        assert index["contributions"][1]["weights_sha256_basis"] == pool.CURRENT_DIGEST_BASIS
+
+    def test_the_refused_duplicate_append_stamps_nothing(self):
+        """The #0376 dedupe backstop still fires, and the stamp does not reach the
+        index on the path that raises."""
+        index: Dict[str, Any] = {
+            "contributions": [_contribution("c-first", CONTRIB_SHA, UPLOADED_OLD)]
+        }
+        with pytest.raises(ValueError):
+            pool.append_contribution(
+                index, _contribution("c-retry", CONTRIB_SHA, UPLOADED_NEW)
+            )
+        assert len(index["contributions"]) == 1
+        assert "weights_sha256_basis" not in index["contributions"][0]
+
+
 # ── the wire projection ──────────────────────────────────────────────────────
 
 # An INDEPENDENT copy of the page's 0.13.0-draft soup field set. test_pool.py has

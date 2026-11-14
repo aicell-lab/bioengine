@@ -367,6 +367,40 @@ def digest_provenance(
     }
 
 
+def contribution_digest_basis(record: Optional[Dict[str, Any]]) -> str:
+    """Which of the two digests a CONTRIBUTION's ``weights_sha256`` is.
+
+    The same resolver, named for this surface rather than spelled out at each call
+    site, because a contribution stub is the one record shape whose keys BOTH differ
+    from the defaults: its digest is ``weights_sha256`` (not ``global_sha256``) and
+    its timestamp is ``uploaded_at`` (not ``created_at``). So there are two ways to
+    get it wrong and neither raises:
+
+      * full defaults -> "no_digest", i.e. "this record stores no digest", said of
+        a record that stores one;
+      * ``digest_key`` corrected and ``created_at_key`` forgotten, which is the
+        half-right call a reader actually makes -> no timestamp is found, the
+        TypeError branch is taken, and the answer is "undetermined" for a record
+        whose date PROVES the file meaning.
+
+    The second is the dangerous one: it is indistinguishable from the honest refusal
+    this module exists to give, so it reads as the fix working. Both are pinned in
+    test_digest_basis.py, which is what keeps this function from being a pointless
+    alias.
+
+    It also states, in code rather than in prose, what an ABSENT basis field means
+    here: whatever ``digest_basis`` resolves it to, which is the FILE meaning only
+    when ``uploaded_at`` is strictly before ``TENSOR_DIGEST_SINCE`` (a proof — the
+    tensor code did not exist) and "undetermined" in every other case, including
+    every post-cutoff record. There is no path on which an absent field becomes the
+    tensor meaning, and ``append_contribution`` stamps the basis onto every new
+    record so the undetermined set stops growing.
+    """
+    return digest_basis(
+        record, digest_key="weights_sha256", created_at_key="uploaded_at"
+    )
+
+
 # Entries that live in a cpsam state_dict but are data statistics rather than
 # learned weights: cellpose_model.py:78-79 registers both as
 # nn.Parameter(requires_grad=False), so they are float32 scalars with matching
@@ -895,6 +929,20 @@ def append_contribution(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[st
     architecture_signature, samples_seen, uploaded_at}``. Append-only: existing
     entries are immutable.
 
+    Stamps ``weights_sha256_basis`` from ``CURRENT_DIGEST_BASIS``, which is what
+    makes the stored record attributable from itself — read it back with
+    ``contribution_digest_basis``. Stamped here rather than accepted as a field on
+    ``entry`` for the reason ``build_community_manifest`` records at its own stamp:
+    the app that writes the record is the only thing that knows which digest it just
+    computed (``prepare_contribution`` computes ``weights_sha256`` in this process,
+    so the client never supplies it), and a caller-supplied basis could disagree
+    with the bytes. Unconditional, like the other two writers.
+
+    Written onto a COPY, so the caller's dict is not mutated: entries already in the
+    index are never touched and nothing stored is back-filled. A pre-existing record
+    with no basis keeps having none and resolves by date, which is the one direction
+    that is a proof rather than a guess.
+
     REFUSES a second member for a digest the index already holds (#0376). A client
     that retries a deposit after a gateway 504 ate the response — the correct thing
     for it to do, and 4 of 92 deposits on the r2 corpus needed it — otherwise
@@ -913,7 +961,9 @@ def append_contribution(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[st
             f"checkpoint twice in the uniform soup. Recognise the re-deposit and "
             f"return the existing member instead."
         )
-    index.setdefault("contributions", []).append(entry)
+    index.setdefault("contributions", []).append(
+        {**entry, "weights_sha256_basis": CURRENT_DIGEST_BASIS}
+    )
     return index
 
 
