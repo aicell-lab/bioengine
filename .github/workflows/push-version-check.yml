@@ -1,0 +1,103 @@
+name: Push Version Check
+
+# Runs the worker and app version gates over the commits a push added to main.
+#
+# version-check.yml and app-version-check.yml are both `pull_request`-triggered,
+# so a commit that reaches main without a pull request is checked by neither.
+# This workflow closes that gap. It CANNOT refuse the push -- by the time it
+# runs the commit is already on main -- so it is a backstop that makes a bad
+# version loud, not a gate. The thing that prevents the push is the local
+# pre-push hook (.github/hooks/README.md), which is opt-in; the two are
+# deliberately belt and braces and neither is sufficient alone.
+#
+# The comparison is github.event.before -> github.event.after, i.e. what this
+# push actually added, not a comparison against main's tip: on a push to main
+# the tip IS the pushed commit, which would make the check compare a ref with
+# itself and pass unconditionally.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Range start (default: HEAD^)'
+        required: false
+      head_ref:
+        description: 'Range end (default: HEAD)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  push-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --quiet packaging pyyaml
+
+      - name: Resolve the commit range this push added
+        id: range
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          IN_BASE: ${{ inputs.base_ref }}
+          IN_HEAD: ${{ inputs.head_ref }}
+        run: |
+          set -uo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            base="${IN_BASE:-HEAD^}"
+            head="${IN_HEAD:-HEAD}"
+          # A first push to the branch, or a force-push past the old tip, leaves
+          # BEFORE unusable. Fall back to the tip's parent and say so, rather
+          # than skipping: skipping here is the fail-open this workflow exists
+          # to remove.
+          elif [ -z "${BEFORE:-}" ] || [[ "$BEFORE" =~ ^0+$ ]] \
+               || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "::warning title=Push version check::github.event.before is unusable (new branch or force-push); comparing HEAD^..HEAD instead"
+            base="HEAD^"
+            head="HEAD"
+          else
+            base="$BEFORE"
+            head="$AFTER"
+          fi
+
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "The tip has no parent to compare against; nothing this push can be judged against."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Range: $base..$head"
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "base=$base" >> $GITHUB_OUTPUT
+          echo "head=$head" >> $GITHUB_OUTPUT
+
+      - name: Worker version (pyproject.toml + bioengine/_version.py)
+        if: steps.range.outputs.skip == 'false'
+        run: |
+          python3 .github/scripts/check_worker_version.py \
+            --base-ref "${{ steps.range.outputs.base }}" \
+            --head-ref "${{ steps.range.outputs.head }}"
+
+      - name: App manifest versions (model-runner, model-finetune)
+        if: steps.range.outputs.skip == 'false'
+        # --main-ref is the base of this push: the manifest version must exceed
+        # what main held before the push, which on this path is the same ref the
+        # diff starts from. The published-artifact membership leg is unchanged
+        # from the pull-request path -- it is the same script.
+        run: |
+          python3 .github/scripts/check_app_artifact_version.py \
+            --base-ref "${{ steps.range.outputs.base }}" \
+            --head-ref "${{ steps.range.outputs.head }}" \
+            --main-ref "${{ steps.range.outputs.base }}"
