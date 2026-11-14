@@ -485,29 +485,110 @@ class CellposeRuntime:
             )
             time.sleep(_WEIGHTS_PUT_BACKOFF_S * 2**attempt)
 
-    def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
-        """Load a member state_dict, downloading on first use.
+    def _member_cache_path(self, key: str) -> Path:
+        """Where this replica caches the member at pool path ``key``."""
+        return self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+
+    def _ensure_member(self, key: str, url: str, expected_sha256: Optional[str]) -> Path:
+        """The member's file on local disk, downloading it on first use.
 
         The download is cached as a file, not as tensors: one download per member
         per replica, but no member stays resident between uses. Keyed by the
         immutable pool weights_path (content-addressed → no staleness). Written
         via a temporary name so an interrupted download cannot leave a truncated
-        file that every later aggregate would then fail to unpickle."""
-        import torch
+        file that every later aggregate would then fail to unpickle.
 
-        cached = self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+        A FRESH download is hashed here, against the digest the pool recorded, and
+        the bytes are discarded rather than cached if they disagree. That check is
+        on this path and not on the cache hit for two reasons. It is nearly free —
+        the bytes are already in memory, and hashing them again on every one of the
+        ~35 scoring passes a merge makes would add minutes of CPU to each merge for
+        a file nothing can have modified. And it is where the gap actually is:
+        ``verify_members`` hashes every member once per merge before any soup is
+        built, but the cache is evicted under memory pressure, so a member verified
+        in the preflight can be re-downloaded mid-merge. Without this, those bytes
+        would enter the soup having been checked only in an earlier incarnation.
+
+        ``expected_sha256`` may be None — a member quarantined for having no digest
+        never reaches here, but ``score_soup`` is also called directly by tests and
+        by the stock-base path, and inventing a digest for those would be worse than
+        recording that there was nothing to check against.
+        """
+        import pool
+
+        cached = self._member_cache_path(key)
         if cached.exists():
             os.utime(cached)  # mark as most-recently-used for _evict_members
-        else:
-            content = self._download_member(url)
-            self._soup_dl_bytes += len(content)
-            self._evict_members(incoming_bytes=len(content))
-            partial_file = cached.with_suffix(".part")
-            partial_file.write_bytes(content)
-            partial_file.rename(cached)
+            return cached
+        content = self._download_member(url)
+        if expected_sha256 is not None:
+            got = hashlib.sha256(content).hexdigest()
+            if got.lower() != str(expected_sha256).lower():
+                raise ValueError(
+                    f"member '{key}' downloaded as {len(content)} bytes hashing to "
+                    f"{got}, but the pool recorded {expected_sha256} for it. "
+                    f"Discarding the download rather than caching it: these are not "
+                    f"the bytes the contribution attested to."
+                )
+        self._soup_dl_bytes += len(content)
+        self._evict_members(incoming_bytes=len(content))
+        partial_file = cached.with_suffix(".part")
+        partial_file.write_bytes(content)
+        partial_file.rename(cached)
+        assert pool.sha256_file(cached) == hashlib.sha256(content).hexdigest(), (
+            f"member '{key}' does not read back as the bytes just written to "
+            f"{cached}; the member cache is not trustworthy on this replica."
+        )
+        return cached
+
+    def _fetch_member(
+        self, key: str, url: str, expected_sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Load a member state_dict, downloading on first use."""
+        import torch
+
+        cached = self._ensure_member(key, url, expected_sha256)
         return self._unwrap_sd(
             torch.load(cached, map_location="cpu", weights_only=False)
         )
+
+    async def verify_members(self, members: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Hash every member's bytes as they actually land on this replica.
+
+        Returns ``{"digests": {key: sha256}, ...}`` — the measurement only. It
+        decides nothing: the caller compares these against what the pool recorded
+        and owns what happens to a member that disagrees, which on the CPU entry is
+        a quarantine rather than an exception.
+
+        Every member is hashed on every merge, a cache hit included. That is the
+        literal reading of "verify on load" and it is the one worth paying for: the
+        cheaper version — trust the cache, hash only fresh downloads — makes the
+        guard's coverage depend on how warm the replica happens to be, so the first
+        merge after a deploy checks everything and the next one checks nothing, and
+        the difference is invisible in the output either way. The cost is one
+        sha256 per member per merge (~0.35 s for a 320 MB cpsam checkpoint),
+        against a merge that already spends minutes per scoring pass.
+
+        No extra download: the runtime has to fetch every member for the soup
+        anyway, and this populates the same cache those passes read.
+        """
+        import pool
+
+        digests: Dict[str, str] = {}
+        dl_before = self._soup_dl_bytes
+        async with self._soup_sem:
+            for m in members:
+                key = m["key"]
+                if key in digests:
+                    continue
+                path = await asyncio.to_thread(
+                    self._ensure_member, key, m["url"], m.get("sha256"))
+                digests[key] = await asyncio.to_thread(pool.sha256_file, path)
+        return {
+            "digests": digests,
+            "replica": self._replica_id(),
+            "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+        }
 
     def _build_soup(self, members: List[Dict[str, str]]):
         """Uniform mean of member state_dicts; None when empty (= stock base)."""
@@ -516,7 +597,8 @@ class CellposeRuntime:
         if not members:
             return None
         return pool.uniform_soup(
-            [partial(self._fetch_member, m["key"], m["url"]) for m in members]
+            [partial(self._fetch_member, m["key"], m["url"], m.get("sha256"))
+             for m in members]
         )
 
     async def score_soup(

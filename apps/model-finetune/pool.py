@@ -22,7 +22,9 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import (
+    Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple,
+)
 
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
 # record and every read method so the page can flag a backend/page mismatch
@@ -942,6 +944,222 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sorted(pending, key=lambda c: c.get("uploaded_at", 0.0))
 
 
+# ---------------------------------------------------------------------------
+# #0139: a member whose provenance cannot be established is QUARANTINED, not
+# souped and not fatal.
+#
+# The two findings below are deliberately SEPARATE reason codes and must stay
+# separate. ``no_digest`` is a legacy-writer artifact: a record written before
+# ``weights_sha256`` was required carries none, and nothing can ever be done about
+# that record. ``digest_mismatch`` is the opposite — the digest IS recorded and the
+# bytes in the pool do not hash to it, which means the bytes on disk are not the
+# bytes that were deposited. One is expected and boring; the other is a possible
+# integrity incident that a human has to look at. A single code for both would
+# bury the second inside the first, which is exactly the "no digest" versus
+# "digest not checked" confusion this row was filed about.
+# ---------------------------------------------------------------------------
+QUARANTINE_NO_DIGEST = "no_digest"
+QUARANTINE_DIGEST_MISMATCH = "digest_mismatch"
+QUARANTINE_REASONS = (QUARANTINE_NO_DIGEST, QUARANTINE_DIGEST_MISMATCH)
+assert len(set(QUARANTINE_REASONS)) == len(QUARANTINE_REASONS), (
+    "the quarantine reasons must be distinct strings: a reader that cannot tell "
+    "a missing digest from a wrong one has lost the whole point of recording one."
+)
+
+
+def is_usable_digest(value: Any) -> bool:
+    """Whether ``value`` can be compared against a sha256 of some bytes at all.
+
+    A digest is usable iff it is 64 hex characters. Everything else — absent, None,
+    empty string, a truncated prefix, a non-string — is unusable and means the same
+    thing operationally: there is nothing here to check the bytes against.
+
+    Case-insensitive, because ``hexdigest()`` is lowercase but a digest that
+    travelled through a shell, a spreadsheet or another tool may not be, and
+    refusing an upper-case copy of the right digest would quarantine a member whose
+    provenance is in fact established.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdefABCDEF" for c in value)
+    )
+
+
+def quarantine_record(
+    *,
+    contribution_id: str,
+    weights_path: Optional[str],
+    reason: str,
+    expected_sha256: Any,
+    actual_sha256: Optional[str],
+) -> Dict[str, Any]:
+    """One quarantined member, as recorded in the community manifest and the merge.
+
+    ``reason`` is machine-readable and validated here rather than at the call site,
+    so a typo cannot reach a published manifest as a reason nothing can match on.
+    ``expected_sha256`` is stored verbatim — including ``None`` — because "what the
+    pool recorded" is the evidence, and normalising it to a string would erase the
+    difference between a record that carried nothing and one that carried junk.
+    """
+    if reason not in QUARANTINE_REASONS:
+        raise ValueError(
+            f"'{reason}' is not a quarantine reason; expected one of "
+            f"{list(QUARANTINE_REASONS)}. The reason is published in the community "
+            f"manifest and is what a reader filters on, so it cannot be free text."
+        )
+    return {
+        "contribution_id": contribution_id,
+        "weights_path": weights_path,
+        "reason": reason,
+        "expected_sha256": expected_sha256,
+        "actual_sha256": actual_sha256,
+    }
+
+
+def members_to_hash(records: Sequence[Dict[str, Any]]) -> List[str]:
+    """The ``weights_path``s whose bytes this merge must hash, de-duplicated.
+
+    A record with no usable digest is excluded: it is quarantined on the strength of
+    the index alone, and downloading a gigabyte to hash it would only produce a
+    number with nothing to compare against.
+    """
+    seen, out = set(), []
+    for r in records:
+        path = r.get("weights_path")
+        if not is_usable_digest(r.get("weights_sha256")) or path is None or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def digest_quarantine(
+    records: Sequence[Dict[str, Any]], actual_by_path: Mapping[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split contribution records into ``(admitted, quarantined)`` on provenance.
+
+    ``actual_by_path`` maps ``weights_path`` to the sha256 of the bytes that were
+    actually loaded for it on this merge — ``members_to_hash`` says which paths must
+    be in it.
+
+    RAISES rather than admitting a member whose bytes it was not shown. That is the
+    load-bearing line in this function: the failure this row exists to prevent is
+    souping bytes nothing checked, and a version of this that treated an unhashed
+    member as "nothing to compare, carry on" would restore that failure exactly
+    while every test below still passed. A missing entry is a caller bug, not a
+    property of the pool, so it is an exception and not a quarantine.
+    """
+    admitted: List[Dict[str, Any]] = []
+    quarantined: List[Dict[str, Any]] = []
+    for r in records:
+        cid = r.get("contribution_id")
+        path = r.get("weights_path")
+        recorded = r.get("weights_sha256")
+        if not is_usable_digest(recorded):
+            quarantined.append(quarantine_record(
+                contribution_id=cid, weights_path=path,
+                reason=QUARANTINE_NO_DIGEST, expected_sha256=recorded,
+                actual_sha256=actual_by_path.get(path) if path is not None else None,
+            ))
+            continue
+        if path not in actual_by_path:
+            raise ValueError(
+                f"contribution '{cid}' was about to be admitted without its bytes "
+                f"ever being hashed (weights_path '{path}' is absent from the "
+                f"verification map). Admitting it would be the unverified soup this "
+                f"check exists to prevent; hash it with members_to_hash() first."
+            )
+        actual = actual_by_path[path]
+        if not is_usable_digest(actual):
+            raise ValueError(
+                f"the verifier returned '{actual}' as the sha256 of contribution "
+                f"'{cid}' bytes, which is not a sha256. Refusing to decide anything "
+                f"about this member on it."
+            )
+        if actual.lower() != str(recorded).lower():
+            quarantined.append(quarantine_record(
+                contribution_id=cid, weights_path=path,
+                reason=QUARANTINE_DIGEST_MISMATCH, expected_sha256=recorded,
+                actual_sha256=actual,
+            ))
+            continue
+        admitted.append(r)
+    return admitted, quarantined
+
+
+def quarantine_counts(quarantined: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """``{reason: n}`` over every defined reason, zeros included.
+
+    Every reason is always present, so a reader testing ``counts["digest_mismatch"]``
+    gets 0 rather than a KeyError on the overwhelmingly common merge where nothing
+    was quarantined — and an absent key and a zero stop being the same read.
+    """
+    counts = {reason: 0 for reason in QUARANTINE_REASONS}
+    for q in quarantined:
+        counts[q["reason"]] = counts.get(q["reason"], 0) + 1
+    return counts
+
+
+def head_integrity_refusal(
+    *,
+    head_version: Optional[str],
+    head_member_ids: Sequence[str],
+    quarantined_ids: Collection[str],
+    floor: int,
+) -> Optional[str]:
+    """Reason to abandon the merge because the CURRENT head cannot be reconstituted.
+
+    A quarantined head member is not a thinner soup, it is a different one: every
+    number this merge would then report about "the current head" — its gate score,
+    the bar a candidate has to clear, the witness point carried forward — would
+    describe a soup that is not the checkpoint the pool is publishing. There is no
+    honest way to continue, so this fails the merge rather than quarantining its way
+    into a quieter wrong answer. Nothing is published and nothing is lost: the
+    members stay in the pool and the next merge sees the same state.
+
+    Returns None when there is no head at all — a first merge has no composition to
+    preserve.
+    """
+    if not head_member_ids:
+        return None
+    surviving = [cid for cid in head_member_ids if cid not in set(quarantined_ids)]
+    if len(surviving) >= floor:
+        return None
+    lost = [cid for cid in head_member_ids if cid in set(quarantined_ids)]
+    return (
+        f"the published head '{head_version}' has {len(head_member_ids)} member(s) "
+        f"and {len(lost)} of them cannot be verified ({', '.join(sorted(lost))}), "
+        f"leaving {len(surviving)} against a floor of {floor}. Refusing to merge: "
+        f"every score this merge would report for the head describes the soup of its "
+        f"members, and that soup can no longer be rebuilt. Nothing has been "
+        f"published and no contribution has been removed from the pool."
+    )
+
+
+def publish_floor_refusal(
+    *, member_ids: Sequence[str], floor: int, quarantined: Sequence[Dict[str, Any]],
+) -> Optional[str]:
+    """Reason not to publish a soup thinner than the caller's floor, or None.
+
+    Separate from ``head_integrity_refusal`` because it answers a different question:
+    that one asks whether the head survived, this one asks whether what is about to
+    be published is big enough to be worth publishing. With the default floor the two
+    coincide; with an explicit ``min_members`` they do not.
+    """
+    if len(member_ids) >= floor:
+        return None
+    counts = quarantine_counts(quarantined)
+    return (
+        f"this merge would publish a {len(member_ids)}-member community checkpoint "
+        f"against a floor of {floor}, after quarantining "
+        f"{sum(counts.values())} member(s) ({counts}). Refusing to publish: a "
+        f"checkpoint whose composition shrank because members were excluded is a "
+        f"different checkpoint, and nobody should meet that by seeing it happen. "
+        f"Pass min_members explicitly to publish it deliberately."
+    )
+
+
 def next_community_version(index: Dict[str, Any]) -> str:
     """Monotonic ``vN`` for the next community checkpoint, derived from the current
     pointer so no separate counter can drift out of sync with it."""
@@ -1048,6 +1266,7 @@ def build_community_manifest(
     selection_metric: Dict[str, Any],
     witness_metric: Dict[str, Any],
     members: List[Dict[str, Any]],
+    quarantined: Sequence[Dict[str, Any]],
     architecture_signature: str,
     weights_sha256: str,
     created_at: float,
@@ -1069,7 +1288,17 @@ def build_community_manifest(
     stood); ``gate_score`` is the cumulative score of the soup including it, so the
     two are not interconvertible. Both are audit-only and stripped from the wire
     projection. ``combine`` is "uniform" unless sample-weighting was empirically
-    justified for this version."""
+    justified for this version.
+
+    ``quarantined`` records every member excluded because its provenance could not
+    be established (see ``digest_quarantine``), as ``quarantine_record`` rows. It is
+    a REQUIRED argument with no default, deliberately: an omitted list and an empty
+    one would publish the identical manifest, so a caller that forgot to thread the
+    quarantine through would attest "nothing was excluded" for a merge that excluded
+    members. Separate from ``members`` because the two say different things — a
+    ``members`` row reads "evaluated, not included" and carries the scores that
+    decision was made on, and a quarantined member was never evaluated and has no
+    such scores."""
     return {
         "schema_version": SCHEMA_VERSION,
         "community_version": community_version,
@@ -1080,6 +1309,8 @@ def build_community_manifest(
         "selection_metric": selection_metric,
         "witness_metric": witness_metric,
         "members": members,
+        "quarantined": list(quarantined),
+        "quarantine_counts": quarantine_counts(quarantined),
         "architecture_signature": architecture_signature,
         "weights_sha256": weights_sha256,
         # Stamped from the constant rather than taken as an argument: the app that
