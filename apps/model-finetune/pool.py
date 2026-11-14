@@ -454,6 +454,106 @@ def contribution_digest_basis(record: Optional[Dict[str, Any]]) -> str:
     )
 
 
+# ``DIGEST_BASIS_NOTES`` above is written about the COMMUNITY head, and three of its
+# sentences are false of a contribution: the file note says the app chose the filename
+# and offers "re-merge and compare" as the remedy, which is not an operation that
+# produces a contribution digest at all; the absent note says "this merge admitted
+# nothing", said of a record that is not a merge; and the undetermined note blames the
+# timestamp, which this surface never consults. A wrong explanation travelling with
+# the number is worse than the bare number #0523 set out to fix, so the contribution
+# surface carries its own notes rather than borrowing the head's.
+#
+# Every note here says what the value is a digest OF, and the file note names the one
+# operation a contributor can actually perform: re-hash the file you uploaded.
+CONTRIBUTION_DIGEST_BASIS_NOTES = {
+    DIGEST_BASIS_FILE: (
+        "sha256 over the checkpoint file you uploaded, exactly as it arrived — the "
+        "value sha256_file computed at deposit. Reproducible by re-hashing that same "
+        "file, so a mismatch is evidence that the bytes the pool holds are not the "
+        "bytes that were sent. It is not a digest of merged weights: re-merging is "
+        "not an operation that reproduces it, in either direction."
+    ),
+    DIGEST_BASIS_TENSORS: (
+        "this record states that its value is a digest over the checkpoint's keys, "
+        "shapes, dtypes and raw weight bytes rather than over the uploaded file. No "
+        "build of this app has ever computed a contribution digest that way, so "
+        "re-hashing the uploaded file will NOT reproduce it and whatever wrote the "
+        "stamp is the only thing that knows what it covers."
+    ),
+    DIGEST_BASIS_UNDETERMINED: (
+        "this record states a basis this build does not recognise, so what the value "
+        "covers is unknown — most likely a newer app wrote it. The deposit date is "
+        "not consulted here and could not settle it: the contribution digest function "
+        "never changed, so an ABSENT basis on this surface is the file basis with "
+        "certainty and only a stated-but-unrecognised one is undetermined. Treat a "
+        "mismatch against it as UNEXPLAINED, not as evidence about the weights."
+    ),
+    DIGEST_BASIS_ABSENT: (
+        "this contribution record carries no digest, so there is no value to "
+        "attribute and nothing to compare against. The pool holds the contribution; "
+        "it says nothing either way about the checkpoint's contents."
+    ),
+}
+
+
+def contribution_digest_provenance(record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``contribution_digest_basis`` plus the two things a reader needs to act on it.
+
+    Exists so the half-right call has no site left to recur at. ``digest_provenance``
+    forwards ``**kwargs`` to ``digest_basis``, so publishing contribution provenance
+    through it requires remembering BOTH ``digest_key="weights_sha256"`` and
+    ``absent_basis=CONTRIBUTION_DIGEST_BASIS`` at every call site; forgetting the
+    second answers "undetermined" for a record whose code path proves the file
+    meaning, which reads exactly like this module's honest refusal. #0523 shipped that
+    exact call to the wire and a reviewer caught it. Call this instead.
+
+    ``reproducible_by_re_merge`` is ``None`` for every basis here, and that is not the
+    "we do not know" of ``_DIGEST_REPRODUCIBLE``: a contribution digest covers one
+    uploaded file, so re-merging is not an operation that bears on it and the question
+    does not apply. ``False`` would answer it, and the field is a tri-state bool with
+    no fourth value to mean "not applicable" — so the note carries that sentence, and
+    says what a contributor CAN do instead. The key is kept rather than dropped so a
+    client can join this map and ``soups`` without branching on which it is reading.
+    """
+    basis = contribution_digest_basis(record)
+    return {
+        "basis": basis,
+        "reproducible_by_re_merge": None,
+        "note": CONTRIBUTION_DIGEST_BASIS_NOTES[basis],
+    }
+
+
+CONTRIBUTION_ID_COLLISION_NOTE = (
+    "the pool holds more than one contribution under this id and they do not agree on "
+    "what their digests cover, so nothing here can say which record the value beside it "
+    "belongs to. Contribution ids are unique by construction — prepare_contribution "
+    "requires one and append_contribution writes it — so reaching this is a caller bug "
+    "upstream of the wire rather than anything about the deposit. Re-hash the file you "
+    "uploaded and ask the pool which contribution_id it landed under."
+)
+
+
+def colliding_contribution_provenance() -> Dict[str, Any]:
+    """The entry published at a contribution_id that more than one record claims.
+
+    A map keyed by contribution_id has one slot per id, so when two records claim one id
+    the map cannot carry both answers. The alternative to this is that whichever record
+    renders last silently overwrites the others — measured on this surface before the
+    guard existed: a pool holding a correctly stamped contribution and a second record
+    under the same id published the stamped one as ``undetermined``, which is exactly the
+    wrong attribution #0509 exists to prevent, arrived at by accident of ordering.
+
+    Published only when the colliding records actually DISAGREE. Two records under one id
+    that resolve to the same basis are attributed with that basis, because the answer the
+    map gives is then right for both and downgrading it would lose a true statement.
+    """
+    return {
+        "basis": DIGEST_BASIS_UNDETERMINED,
+        "reproducible_by_re_merge": None,
+        "note": CONTRIBUTION_ID_COLLISION_NOTE,
+    }
+
+
 # Entries that live in a cpsam state_dict but are data statistics rather than
 # learned weights: cellpose_model.py:78-79 registers both as
 # nn.Parameter(requires_grad=False), so they are float32 scalars with matching
@@ -1311,6 +1411,35 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
 
     decided = set(index.get("decided_contribution_ids", []))
     contributions = []
+    # Which of the digests each published ``weights_sha256`` is. Kept BESIDE
+    # contributions[] for the same reason soups[] is: that record's field set is
+    # pinned key-for-key by test_pool.py::test_contribution_key_set, and a backend
+    # that quietly widens it is the mismatch SCHEMA_VERSION exists to make visible.
+    # Joined on contribution_id.
+    #
+    # #0523: without this, the wire published the number with no basis beside it, so
+    # from outside the pool two digests computed under different bases were
+    # indistinguishable — the harm #0509's lede described, surviving #0509's fix
+    # because #0509 stamped what is STORED and this is what is PUBLISHED.
+    #
+    # Resolved by ``contribution_digest_provenance`` and NOT by the community-head
+    # resolver, which is the one thing this loop can get wrong invisibly. The first
+    # version of this code called ``digest_provenance(c, digest_key="weights_sha256",
+    # created_at_key="uploaded_at")`` and reasoned that answering "undetermined" for
+    # an unstamped record was the conservative choice. It is the opposite: on THIS
+    # surface the digest function never changed, so an absent stamp is the file basis
+    # as a PROOF (the history is quoted at CONTRIBUTION_DIGEST_BASIS), and refusing to
+    # attribute it tells a contributor their value cannot be explained when the code
+    # path explains it with certainty — #0509's harm in mirror image, and the option
+    # #0509 explicitly rejected. Passing ``uploaded_at`` made it worse: it split one
+    # unchanged code path into two answers on nothing but a deposit date.
+    #
+    # The absent case is still DECIDED rather than defaulted — a record with no digest
+    # at all resolves to DIGEST_BASIS_ABSENT ("no_digest"), never to the file basis —
+    # and that is a different question from an absent STAMP on a digest that exists.
+    # test_wire_basis_per_contribution.py pins both, and pins that reverting this call
+    # to the community-style one goes RED.
+    digest_provenance_by_contribution: Dict[str, Any] = {}
     for c in index.get("contributions", []):
         cid = c.get("contribution_id")
         if cid in merged_into:
@@ -1319,6 +1448,11 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
             disposition = "excluded"
         else:
             disposition = "pending"
+        attribution = contribution_digest_provenance(c)
+        already = digest_provenance_by_contribution.get(cid)
+        if already is not None and already["basis"] != attribution["basis"]:
+            attribution = colliding_contribution_provenance()
+        digest_provenance_by_contribution[cid] = attribution
         contributions.append({
             "contribution_id": cid,
             "received_at": _iso(c.get("uploaded_at")),
@@ -1364,9 +1498,18 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         "contributions": contributions,
         # Additive, outside every field set the page pins. ``soups`` is keyed by
         # soup_id; empty merges are absent from it because they publish no head and
-        # their projection carries no digest to attribute.
+        # their projection carries no digest to attribute. ``contributions`` is keyed
+        # by contribution_id and carries one entry per DISTINCT published id, including
+        # those whose basis is absent or undetermined — a contribution missing from this
+        # map would be indistinguishable from one the pool does not hold, which is the
+        # ambiguity the map exists to remove. "Per distinct id" rather than "per
+        # published contribution": the two are the same count only while ids are unique,
+        # which is the pool's own invariant and not something this projection can
+        # enforce, and claiming the stronger property here is what let a collision
+        # publish one record's basis for another (colliding_contribution_provenance).
         "digest_provenance": {
             "soups": digest_provenance_by_soup,
+            "contributions": digest_provenance_by_contribution,
             "current_community": _current_community_provenance(index),
         },
     }
