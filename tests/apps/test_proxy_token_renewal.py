@@ -123,6 +123,7 @@ def _manager(
     manager._missing_from_status = {}
     manager._deleted_pending_redeploy = set()
     manager._identity_warned = set()
+    manager._last_controller_recovery = 0.0
     manager._deploy_application = AsyncMock()
     manager._deployed_applications = {
         APP_ID: {
