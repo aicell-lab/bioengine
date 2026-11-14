@@ -371,7 +371,7 @@ class TestWritersStampTheBasis:
             community_version="v1", combine="uniform", selected_contribution_ids=["c-1"],
             gate_split={"sha256": "ab"}, witness_split={"sha256": "cd"},
             selection_metric={"role": "selection"}, witness_metric={"role": "witness"},
-            members=[], architecture_signature="sig", weights_sha256=SHA,
+            members=[], quarantined=[], architecture_signature="sig", weights_sha256=SHA,
             created_at=AFTER_CUTOFF,
         )
         assert man["weights_sha256_basis"] == pool.CURRENT_DIGEST_BASIS
@@ -382,7 +382,7 @@ class TestWritersStampTheBasis:
         man = pool.build_community_manifest(
             community_version="v1", combine="uniform", selected_contribution_ids=[],
             gate_split={}, witness_split={}, selection_metric={}, witness_metric={},
-            members=[], architecture_signature="sig", weights_sha256=SHA,
+            members=[], quarantined=[], architecture_signature="sig", weights_sha256=SHA,
             created_at=AFTER_CUTOFF,
         )
         del man["created_at"]
@@ -962,6 +962,17 @@ class _Runtime:
 
     async def soup_memory_budget(self) -> Dict[str, Any]:
         return dict(_BUDGET)
+
+    async def verify_members(self, specs) -> Dict[str, Any]:
+        """Every member hashes to what the pool recorded for it.
+
+        This harness is about how a digest is ATTRIBUTED once it exists, so it
+        deliberately presents a pool with nothing to quarantine; the quarantine
+        behaviour itself is driven end to end in ``test_merge_quarantine.py``,
+        where the runtime is allowed to disagree with the index.
+        """
+        return {"digests": {s["key"]: s["sha256"] for s in specs},
+                "replica": "r0", "soup_dl_bytes": 0}
 
     async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
         return {"f1": self._f1, "replica": "r0", "soup_dl_bytes": 0}
