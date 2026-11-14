@@ -245,6 +245,37 @@ DIGEST_BASIS_ABSENT = "no_digest"
 # golden vector, so a change which forgets this constant fails there.
 CURRENT_DIGEST_BASIS = DIGEST_BASIS_TENSORS
 
+# What a CONTRIBUTION's ``weights_sha256`` is — and it is NOT CURRENT_DIGEST_BASIS.
+# The cut-over above moved the COMMUNITY head digest only. A contribution's digest is
+# computed by ``sha256_file`` over the checkpoint the client uploaded, and it always
+# has been. Measured 2026-11-14 over runtime_cellpose.py with `git log -G`:
+#
+#   :586  sha = await asyncio.to_thread(pool.state_dict_digest, soup)   <- the soup
+#   :634  weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)  <- this
+#
+#   the soup line:         changed by d3040c4f ("digest the soup tensors, not the
+#                          file torch wrote") — the cut-over itself
+#   the contribution line: 6eec9581 (app 0.20.0) only, i.e. the commit that
+#                          INTRODUCED it. d3040c4f did not touch it; it reads
+#                          sha256_file at 6eec9581 and at d3040c4f alike.
+#
+# So this surface has exactly one basis over its whole history and no cut-over
+# instant applies to it. Two consequences, both load-bearing:
+#   * stamping CURRENT_DIGEST_BASIS here would assert "sha256 over keys, shapes,
+#     dtypes and raw weight bytes" over a number produced by hashing a file. Worse
+#     than the absence it replaces: digest_basis honours an explicit basis above
+#     every other signal, so a wrong explicit value is BELIEVED, while an absent one
+#     at least resolves to a refusal.
+#   * an absent field on a contribution means the file basis as a PROOF, not as a
+#     dated inference — the code that could have written anything else never existed
+#     on this path. That is why contribution_digest_basis passes ``absent_basis``
+#     instead of date-reasoning: one unchanged code path must not answer two ways
+#     depending on when a deposit happened.
+# Lock-step rule, same as the constant above: change this in the SAME commit that
+# changes which digest function ``prepare_contribution`` calls. A grep for
+# ``sha256_file, ckpt`` in runtime_cellpose.py is the thing that must still match.
+CONTRIBUTION_DIGEST_BASIS = DIGEST_BASIS_FILE
+
 # 2026-10-26T08:43:26Z — commit d3040c4f8165, which introduced state_dict_digest.
 # Strictly BEFORE this instant the tensor-digest code did not exist anywhere, so a
 # record written then carries a file digest with certainty. At or after it nothing
@@ -308,6 +339,7 @@ def digest_basis(
     digest_key: str = "global_sha256",
     basis_key: Optional[str] = None,
     created_at_key: str = "created_at",
+    absent_basis: Optional[str] = None,
 ) -> str:
     """Which of the two digests ``record[digest_key]`` is, from the record alone.
 
@@ -318,15 +350,38 @@ def digest_basis(
        recognises                             -> that basis
     3. an explicit basis field it does NOT
        recognise (written by a newer app)     -> ``DIGEST_BASIS_UNDETERMINED``
-    4. no basis field, ``created_at`` finite
+    4. no basis field and ``absent_basis``
+       given by the caller                    -> ``absent_basis``
+    5. no basis field, ``created_at`` finite
        and strictly before TENSOR_DIGEST_SINCE-> ``DIGEST_BASIS_FILE``
-    5. anything else                          -> ``DIGEST_BASIS_UNDETERMINED``
+    6. anything else                          -> ``DIGEST_BASIS_UNDETERMINED``
 
-    Step 4 is one-directional by construction. A timestamp before the cutoff proves
+    Step 5 is one-directional by construction. A timestamp before the cutoff proves
     the file meaning because the tensor-digest code did not yet exist; a timestamp
     after it proves nothing, because deployment lags the commit. There is no input
     for which this returns ``DIGEST_BASIS_TENSORS`` on timestamp evidence alone.
+
+    ``absent_basis`` is for a surface whose digest function NEVER changed, where the
+    date is not evidence of anything because there was never a second meaning to
+    choose between — see ``CONTRIBUTION_DIGEST_BASIS``. It is deliberately not the
+    default: passing it asserts that a code path's whole history was checked, which
+    is true of the contribution path and false of the community head. It cannot
+    override a basis the record states (steps 2 and 3 come first), so it adds no way
+    for a caller to contradict stored data; it only says what an absence means.
+    An unrecognised value raises rather than resolving to "undetermined" — that
+    would be a typo'd constant reading exactly like the honest refusal this module
+    exists to give.
     """
+    if absent_basis is not None and absent_basis not in (
+        DIGEST_BASIS_TENSORS,
+        DIGEST_BASIS_FILE,
+    ):
+        raise ValueError(
+            f"absent_basis={absent_basis!r} is not one of {DIGEST_BASIS_TENSORS!r} "
+            f"or {DIGEST_BASIS_FILE!r}. It states what a MISSING field means, so an "
+            f"unrecognised value would silently become 'undetermined' and read as "
+            f"this function working."
+        )
     if not isinstance(record, dict):
         return DIGEST_BASIS_UNDETERMINED
     if basis_key is None:
@@ -338,6 +393,8 @@ def digest_basis(
         return stated
     if stated is not None:
         return DIGEST_BASIS_UNDETERMINED
+    if absent_basis is not None:
+        return absent_basis
     try:
         written_at = float(record.get(created_at_key))
     except (TypeError, ValueError):
@@ -365,6 +422,36 @@ def digest_provenance(
         "reproducible_by_re_merge": _DIGEST_REPRODUCIBLE[basis],
         "note": DIGEST_BASIS_NOTES[basis],
     }
+
+
+def contribution_digest_basis(record: Optional[Dict[str, Any]]) -> str:
+    """Which of the two digests a CONTRIBUTION's ``weights_sha256`` is.
+
+    Always the FILE basis unless the record itself says otherwise, because
+    ``prepare_contribution`` has computed this value with ``sha256_file`` on every
+    build that ever wrote one — the history is quoted at
+    ``CONTRIBUTION_DIGEST_BASIS``. So an absent field is a proof here, and no
+    timestamp is consulted: ``uploaded_at`` is NOT passed, and that omission is the
+    point rather than an oversight. Dating a record whose code path never changed
+    would make one deposit resolve "file" and another "undetermined" on nothing but
+    when it arrived.
+
+    Named for this surface rather than spelled out at each call site because a
+    contribution is the one record shape whose digest key differs from the default,
+    so a plain ``digest_basis(record)`` is wrong in a way that does not raise: it
+    looks up ``global_sha256``, finds nothing, and answers "no_digest" — "this
+    record stores no digest", said of a record that stores one. The half-right call
+    (``digest_key`` corrected, ``absent_basis`` forgotten) answers "undetermined"
+    for a record whose code path PROVES the file meaning, and that one is the
+    dangerous one: it is indistinguishable from the honest refusal this module
+    exists to give, so it reads as the fix working. Both are pinned in
+    test_digest_basis.py, which is what keeps this function from being an alias.
+    """
+    return digest_basis(
+        record,
+        digest_key="weights_sha256",
+        absent_basis=CONTRIBUTION_DIGEST_BASIS,
+    )
 
 
 # Entries that live in a cpsam state_dict but are data statistics rather than
@@ -780,7 +867,15 @@ def build_contribution_metadata(
     absent when unknown cannot be told apart from one written before versions
     were stamped at all, which is the ambiguity it exists to remove.
     ``schema_version`` does not cover it — 0.27.6 moved every ``l2_from_base``
-    value without changing the record's shape."""
+    value without changing the record's shape.
+
+    ``weights_sha256_basis`` says what ``weights_sha256`` is a digest OF, from
+    ``CONTRIBUTION_DIGEST_BASIS``, so the number is reproducible by whoever reads
+    this file. Stamped here as well as on the index entry on purpose: both records
+    carry the same digest, and stamping only one would make the absence on the other
+    newly ambiguous — a reader would have to know which writer ran to know whether
+    "no field" means "old record" or "this writer does not stamp". Additive, so
+    ``SCHEMA_VERSION`` is unchanged: no existing field moves or changes meaning."""
     return {
         "schema_version": SCHEMA_VERSION,
         "contribution_id": contribution_id,
@@ -799,6 +894,7 @@ def build_contribution_metadata(
         "dataset_fingerprint": dataset_fingerprint,
         "solo_val_metric": solo_val_metric,
         "weights_sha256": weights_sha256,
+        "weights_sha256_basis": CONTRIBUTION_DIGEST_BASIS,
         "uploaded_at": uploaded_at,
     }
 
@@ -895,6 +991,28 @@ def append_contribution(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[st
     architecture_signature, samples_seen, uploaded_at}``. Append-only: existing
     entries are immutable.
 
+    Stamps ``weights_sha256_basis`` from ``CONTRIBUTION_DIGEST_BASIS`` — the FILE
+    basis, NOT ``CURRENT_DIGEST_BASIS``, which is the community head's and would
+    assert a tensor digest over a number this process produced by hashing a file.
+    That is what makes the stored record attributable from itself; read it back with
+    ``contribution_digest_basis``. Stamped here rather than accepted as a field on
+    ``entry`` for the reason ``build_community_manifest`` records at its own stamp:
+    the app that writes the record is the only thing that knows which digest it just
+    computed (``prepare_contribution`` computes ``weights_sha256`` in this process,
+    so the client never supplies it), and a caller-supplied basis could disagree
+    with the bytes — and would be believed, since an explicit field outranks every
+    other signal.
+
+    Stamped only when the entry carries a digest. A basis on a record with no digest
+    would be an assertion about a value that is not there, and ``digest_basis``
+    answers ``no_digest`` for it before ever reading the field, so writing one buys
+    nothing and claims something.
+
+    Written onto a COPY, so the caller's dict is not mutated: entries already in the
+    index are never touched and nothing stored is back-filled. A pre-existing record
+    with no basis keeps having none and resolves by date, which is the one direction
+    that is a proof rather than a guess.
+
     REFUSES a second member for a digest the index already holds (#0376). A client
     that retries a deposit after a gateway 504 ate the response — the correct thing
     for it to do, and 4 of 92 deposits on the r2 corpus needed it — otherwise
@@ -913,7 +1031,10 @@ def append_contribution(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[st
             f"checkpoint twice in the uniform soup. Recognise the re-deposit and "
             f"return the existing member instead."
         )
-    index.setdefault("contributions", []).append(entry)
+    stored = dict(entry)
+    if stored.get("weights_sha256"):
+        stored["weights_sha256_basis"] = CONTRIBUTION_DIGEST_BASIS
+    index.setdefault("contributions", []).append(stored)
     return index
 
 

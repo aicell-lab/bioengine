@@ -402,6 +402,323 @@ class TestWritersStampTheBasis:
         assert pool.digest_basis(cur, digest_key="sha256") == pool.DIGEST_BASIS_TENSORS
 
 
+# ── #0509: the contribution surface ──────────────────────────────────────────
+#
+# The third writer. ``append_contribution`` stamped nothing, so a contribution's
+# ``weights_sha256`` was the one published digest with no attribution at all — a
+# client re-hashes its own uploaded file, gets a different value from the one the
+# pool publishes, and has no way to tell "the pool digested something else" from
+# "my upload is corrupt".
+#
+# The basis here is the FILE one, and that is NOT CURRENT_DIGEST_BASIS. Measured
+# 2026-11-14 over runtime_cellpose.py: the contribution digest is sha256_file at
+# :634 and has been at every commit that ever touched the line (6eec9581, app
+# 0.20.0, which introduced it), while the cut-over d3040c4f moved only the SOUP
+# digest at :586. The two surfaces were never under one basis, so stamping the
+# community constant here would assert a tensor digest over a hashed file — and be
+# worse than the absence, because digest_basis honours an explicit basis above
+# every other signal. These cases pin the constant that is correct AND that the
+# wrong one is not used.
+#
+# Deliberately NOT asserted through the writer's own return value or its argument
+# dict: the row asks for the STORED entry read back out of the index, because a
+# stamp applied to the caller's dict and then dropped on the way in would satisfy
+# any assertion made on the dict.
+
+CONTRIB_SHA = "d" * 64
+CONTRIB_OTHER_SHA = "e" * 64
+# Two DISTINCT instants that STRADDLE the cut-over. The contribution path's digest
+# function never changed, so both must resolve the same way — which is how these
+# cases show the answer comes from the code path rather than from the clock. A
+# resolver that date-reasoned here would split them.
+UPLOADED_OLD = OLDEST_REAL_MERGE
+UPLOADED_NEW = AFTER_CUTOFF
+
+
+def _contribution(cid: str, digest: str, uploaded_at: Any, basis: Any = "<omit>") -> Dict[str, Any]:
+    """A contribution stub in the stored shape. ``basis='<omit>'`` writes no basis
+    key at all — what every record written before #0509 looks like, and distinct
+    from a key present and null."""
+    rec: Dict[str, Any] = {
+        "contribution_id": cid,
+        "weights_path": f"contributions/{cid}/weights.pt",
+        "metadata_path": f"contributions/{cid}/metadata.json",
+        "weights_sha256": digest,
+        "architecture_signature": "sig",
+        "samples_seen": 10,
+        "n_train_images": 5,
+        "n_bytes": 1218617275,
+        "uploaded_at": uploaded_at,
+    }
+    if basis != "<omit>":
+        rec["weights_sha256_basis"] = basis
+    return rec
+
+
+class TestContributionsStampTheBasis:
+    def test_a_new_contribution_carries_the_basis_on_the_stored_entry(self):
+        """Clause 1, read back out of the index rather than off the writer."""
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = index["contributions"][-1]
+        assert stored["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
+        assert pool.contribution_digest_basis(stored) == pool.DIGEST_BASIS_FILE
+
+    def test_the_stamp_is_the_file_basis_and_NOT_the_community_head_constant(self):
+        """The regression test for the obvious wrong fix.
+
+        ``CURRENT_DIGEST_BASIS`` is right at the community builder and wrong here:
+        a contribution's digest comes from ``sha256_file``, so stamping the tensor
+        meaning would assert "sha256 over keys, shapes, dtypes and raw weight
+        bytes" over a hashed file — and it would be BELIEVED, because an explicit
+        basis outranks every other signal in ``digest_basis``. That makes the wrong
+        stamp strictly worse than the absence it replaces, which is why this is
+        pinned rather than left to the constant's name.
+
+        The inequality of the two constants is asserted first: without it, every
+        ``!=`` below would pass vacuously the day they happened to coincide.
+        """
+        assert pool.CONTRIBUTION_DIGEST_BASIS == pool.DIGEST_BASIS_FILE
+        assert pool.CURRENT_DIGEST_BASIS == pool.DIGEST_BASIS_TENSORS
+        assert pool.CONTRIBUTION_DIGEST_BASIS != pool.CURRENT_DIGEST_BASIS
+
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = index["contributions"][-1]
+        assert stored["weights_sha256_basis"] != pool.CURRENT_DIGEST_BASIS
+        assert pool.contribution_digest_basis(stored) != pool.DIGEST_BASIS_TENSORS
+
+    def test_a_stamped_contribution_resolves_with_no_timestamp_at_all(self):
+        """The point of the stamp: attribution without date-reasoning."""
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = dict(index["contributions"][-1])
+        del stored["uploaded_at"]
+        assert pool.contribution_digest_basis(stored) == pool.DIGEST_BASIS_FILE
+
+    def test_two_contributions_under_different_bases_are_distinguishable(self):
+        """THE discrimination this row is for, and the test with teeth.
+
+        One record explicitly stamped with the TENSOR meaning — what a future build
+        whose ``prepare_contribution`` switched digest functions would write — and
+        one appended by today's writer, which is the FILE meaning. Both dates are
+        POST-cutoff and the two differ, so:
+
+          * a resolver hardcoding either meaning reads one of the two wrong;
+          * a resolver leaking a sibling's basis gives both the SAME answer;
+          * a resolver that ignored the stamps and dated the records would call
+            BOTH "undetermined", since neither date is evidence of anything.
+
+        Only reading each record's own stamp first passes.
+        """
+        index: Dict[str, Any] = {
+            "contributions": [
+                _contribution(
+                    "c-tensors",
+                    CONTRIB_OTHER_SHA,
+                    UPLOADED_OLD,
+                    basis=pool.DIGEST_BASIS_TENSORS,
+                )
+            ]
+        }
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        tensors, new = index["contributions"]
+
+        assert tensors["contribution_id"] == "c-tensors"
+        assert new["contribution_id"] == "c-new"
+        assert tensors["weights_sha256"] != new["weights_sha256"]
+        assert tensors["uploaded_at"] != new["uploaded_at"]
+
+        assert pool.contribution_digest_basis(tensors) == pool.DIGEST_BASIS_TENSORS
+        assert pool.contribution_digest_basis(new) == pool.DIGEST_BASIS_FILE
+        assert pool.contribution_digest_basis(tensors) != pool.contribution_digest_basis(new)
+
+    def test_an_unstamped_contribution_is_the_file_basis_on_BOTH_sides_of_the_cutoff(self):
+        """Clause 2's decision, as behaviour rather than prose: an absent basis
+        means the FILE basis here, and it means it as a PROOF rather than as a
+        dated inference — ``prepare_contribution`` has never computed this value
+        any other way.
+
+        The two records straddle the cut-over instant, which is the discrimination:
+        a resolver that reached this answer by date would call the late one
+        "undetermined", and a reader would then be told a record cannot be
+        attributed when its own code path attributes it with certainty. The
+        cut-over applies to the community head, not to this surface, and these two
+        assertions are what say so in code.
+        """
+        early = _contribution("c-early", CONTRIB_SHA, OLDEST_REAL_MERGE)
+        late = _contribution("c-late", CONTRIB_OTHER_SHA, AFTER_CUTOFF)
+        assert "weights_sha256_basis" not in early
+        assert "weights_sha256_basis" not in late
+        assert early["uploaded_at"] < CUTOFF <= late["uploaded_at"]
+
+        assert pool.contribution_digest_basis(early) == pool.DIGEST_BASIS_FILE
+        assert pool.contribution_digest_basis(late) == pool.DIGEST_BASIS_FILE
+        assert pool.contribution_digest_basis(late) != pool.DIGEST_BASIS_UNDETERMINED
+        assert pool.contribution_digest_basis(late) != pool.DIGEST_BASIS_TENSORS
+
+    def test_the_community_head_still_date_reasons_and_is_untouched(self):
+        """Over-reach control for the new ``absent_basis`` keyword. It is opt-in, so
+        the community surface — whose digest function DID change — must still refuse
+        a post-cutoff record rather than inheriting a default from this change."""
+        late = {"global_sha256": SHA, "created_at": AFTER_CUTOFF}
+        early = {"global_sha256": SHA, "created_at": OLDEST_REAL_MERGE}
+        assert pool.digest_basis(late) == pool.DIGEST_BASIS_UNDETERMINED
+        assert pool.digest_basis(early) == pool.DIGEST_BASIS_FILE
+
+    def test_an_unrecognised_absent_basis_raises_rather_than_degrading(self):
+        """A typo'd constant must not resolve to "undetermined", which is exactly
+        what this module's honest refusal looks like — it would read as working."""
+        rec = _contribution("c-x", CONTRIB_SHA, UPLOADED_NEW)
+        with pytest.raises(ValueError):
+            pool.digest_basis(
+                rec, digest_key="weights_sha256", absent_basis="torch_save_fil"
+            )
+        # Control: the two recognised values do NOT raise on the same call shape.
+        for good in (pool.DIGEST_BASIS_FILE, pool.DIGEST_BASIS_TENSORS):
+            assert (
+                pool.digest_basis(rec, digest_key="weights_sha256", absent_basis=good)
+                == good
+            )
+
+    def test_a_stored_basis_outranks_absent_basis(self):
+        """``absent_basis`` says what a MISSING field means and must not be able to
+        contradict a record that states one — otherwise it would become a way for a
+        caller to overwrite stored data on read."""
+        rec = _contribution(
+            "c-stamped", CONTRIB_SHA, UPLOADED_NEW, basis=pool.DIGEST_BASIS_TENSORS
+        )
+        assert (
+            pool.digest_basis(
+                rec,
+                digest_key="weights_sha256",
+                absent_basis=pool.DIGEST_BASIS_FILE,
+            )
+            == pool.DIGEST_BASIS_TENSORS
+        )
+
+    def test_the_metadata_record_carries_the_same_basis_as_the_index_entry(self):
+        """Both stored records hold the same digest, so both say what it is of. If
+        only one did, the absence on the other would newly mean "written by a build
+        that does not stamp" — the ambiguity this row exists to remove, moved one
+        file sideways."""
+        meta = pool.build_contribution_metadata(
+            contribution_id="c-new",
+            model_type="cpsam",
+            app_version="0.30.6",
+            cellpose_version="4.0.1",
+            architecture_signature="sig",
+            base_checkpoint_id="stock-cpsam",
+            base_checkpoint_sha256=None,
+            samples_seen=10,
+            training_params={},
+            l2_from_base=None,
+            dataset_fingerprint=None,
+            solo_val_metric=None,
+            weights_sha256=CONTRIB_SHA,
+            uploaded_at=UPLOADED_NEW,
+        )
+        assert meta["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
+        assert pool.contribution_digest_basis(meta) == pool.DIGEST_BASIS_FILE
+
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = index["contributions"][-1]
+        assert meta["weights_sha256_basis"] == stored["weights_sha256_basis"]
+        # Additive: the field the schema version would have to cover is new, and no
+        # existing one moved.
+        assert meta["schema_version"] == pool.SCHEMA_VERSION
+
+    def test_an_unrecognised_stamp_is_undetermined_not_passed_through(self):
+        """A record written by a NEWER app than this one. Shaped like a real basis,
+        so a check loose enough to accept any string would accept it."""
+        rec = _contribution("c-future", CONTRIB_SHA, UPLOADED_NEW, basis=NEVER_WRITTEN_BASIS)
+        assert pool.contribution_digest_basis(rec) == pool.DIGEST_BASIS_UNDETERMINED
+
+    def test_a_contribution_with_no_digest_says_so_rather_than_undetermined(self):
+        """``no_digest`` and ``undetermined`` are different answers — "nothing to
+        attribute" vs "cannot attribute" — and collapsing them hides the second.
+
+        The writer also leaves such an entry unstamped: a basis on a record with no
+        digest asserts something about a value that is not there, and the resolver
+        answers ``no_digest`` before it ever reads the field, so it buys nothing."""
+        rec = _contribution("c-empty", "", UPLOADED_NEW)
+        assert pool.contribution_digest_basis(rec) == pool.DIGEST_BASIS_ABSENT
+
+        index: Dict[str, Any] = {}
+        pool.append_contribution(index, rec)
+        stored = index["contributions"][-1]
+        assert "weights_sha256_basis" not in stored
+        # Paired control, so "the writer stamps nothing at all" cannot pass here:
+        # the same writer DOES stamp an entry that carries a digest.
+        pool.append_contribution(
+            index, _contribution("c-full", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        assert index["contributions"][-1]["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
+
+    def test_the_default_keys_misattribute_a_contribution_two_different_ways(self):
+        """Why ``contribution_digest_basis`` exists rather than keyword arguments
+        spelled out at each call site. A contribution's digest key differs from the
+        default AND its absence means something the default does not know, so there
+        are two wrong answers available and neither raises.
+
+        The second is the dangerous one: "undetermined" for a record whose own code
+        path proves the file meaning is indistinguishable from the honest refusal
+        this module exists to give, so it reads as the fix working."""
+        legacy = _contribution("c-legacy", CONTRIB_OTHER_SHA, UPLOADED_OLD)
+
+        assert pool.digest_basis(legacy) == pool.DIGEST_BASIS_ABSENT
+        assert (
+            pool.digest_basis(legacy, digest_key="weights_sha256")
+            == pool.DIGEST_BASIS_UNDETERMINED
+        )
+        # The named resolver is the only one of the three that is right.
+        assert pool.contribution_digest_basis(legacy) == pool.DIGEST_BASIS_FILE
+
+    def test_appending_back_fills_nothing_and_does_not_mutate_the_caller(self):
+        """Clause 5. Existing stored records keep having no basis — they resolve to
+        the file meaning from the code path on every read, where the inference stays
+        visible as one — and the dict the caller passed in is left alone, so nothing
+        it might also be holding is rewritten."""
+        legacy = _contribution("c-legacy", CONTRIB_OTHER_SHA, UPLOADED_OLD)
+        index: Dict[str, Any] = {"contributions": [legacy]}
+        before = dict(legacy)
+
+        fresh = _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        pool.append_contribution(index, fresh)
+
+        assert index["contributions"][0] is legacy, "the stored record was replaced"
+        assert legacy == before, "the stored record was rewritten"
+        assert "weights_sha256_basis" not in index["contributions"][0]
+        assert "weights_sha256_basis" not in fresh, "the caller's dict was mutated"
+        # Paired with the above so "nothing was written" cannot pass: the new entry
+        # DID get the stamp, which is the whole change.
+        assert index["contributions"][1]["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
+
+    def test_the_refused_duplicate_append_stamps_nothing(self):
+        """The #0376 dedupe backstop still fires, and the stamp does not reach the
+        index on the path that raises."""
+        index: Dict[str, Any] = {
+            "contributions": [_contribution("c-first", CONTRIB_SHA, UPLOADED_OLD)]
+        }
+        with pytest.raises(ValueError):
+            pool.append_contribution(
+                index, _contribution("c-retry", CONTRIB_SHA, UPLOADED_NEW)
+            )
+        assert len(index["contributions"]) == 1
+        assert "weights_sha256_basis" not in index["contributions"][0]
+
+
 # ── the wire projection ──────────────────────────────────────────────────────
 
 # An INDEPENDENT copy of the page's 0.13.0-draft soup field set. test_pool.py has
