@@ -1245,6 +1245,19 @@ The `get_app_status()` method provides comprehensive information about your depl
 - Service IDs for WebSocket/WebRTC connections
 - Deployment details and replica states
 - **Logs from active and previous replicas**
+- **`resource_shortfall`**: non-`None` only when no node had room for the application at deploy time and the worker proceeded anyway, on the assumption that the cluster autoscales
+
+**`resource_shortfall: None` means two different things, and `recovered_app` is
+what tells them apart.** On an application this worker deployed, `None` means
+every requested resource fitted. On an **adopted** application — one reporting
+`recovered_app: true` — it means the shortfall is simply not knowable: the
+observation belongs to whichever worker originally placed the app, the recovery
+blob does not carry it, and measuring again would answer a different question
+under the same key, because it would describe today's cluster rather than the
+one the app was placed on. So a caller that reads `None` as "no shortfall"
+without also reading `recovered_app` will read an application that may never
+have been placeable as a healthy one. `hypha_token` and `built_app` are `None`
+after adoption for the same reason.
 
 **Authentication widens the response.** The worker service is public and anyone
 may read an application's health, version and service ids — that is how you

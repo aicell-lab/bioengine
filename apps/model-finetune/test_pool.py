@@ -28,6 +28,7 @@ about the wire contract this file pins.
 
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
 
@@ -484,7 +485,11 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
     assert m["schema_version"] == pool.SCHEMA_VERSION
     # ...and that the constant is itself the rung this backend targets. Without
     # this line the assertion above is satisfied by both sides being wrong
-    # together, which is the whole of #0419.
+    # together, which is the whole of #0419. This line carries no weight of its
+    # own unless BACKEND_TARGETS_RUNG is independent of pool.SCHEMA_VERSION —
+    # see test_the_targeted_rung_is_written_down_and_not_derived (#0442), which
+    # is what keeps it so. It is the quieter of the two sites a derivation
+    # silences, and the one nobody had reported.
     assert _major_minor(m["schema_version"]) == BACKEND_TARGETS_RUNG
     assert m["app_version"] != m["cellpose_version"] != m["schema_version"]
 
@@ -682,6 +687,152 @@ def test_the_check_is_not_self_referential(monkeypatch):
     assert _rung_violation(pool.SCHEMA_VERSION) is not None, (
         "with SCHEMA_VERSION monkeypatched to a known-wrong rung the check still "
         "passed, so it is comparing the constant against itself"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ...and the target must be WRITTEN DOWN, not computed (#0442)
+# ---------------------------------------------------------------------------
+#
+# The test above monkeypatches pool.SCHEMA_VERSION AFTER import, so it can only
+# see a self-reference that happens at call time. Derive BACKEND_TARGETS_RUNG
+# from pool.SCHEMA_VERSION at module level instead — a one-line change that
+# reads like a tidy-up — and the derived value FREEZES at import, before any
+# monkeypatch runs. The comparison is the constant against itself again, one
+# level up from where #0419 removed it, and the test above can only redden when
+# the frozen value already IS the rung it patches to.
+#
+# Measured 2026-11-13, sweeping the derivation over all thirteen rungs PAGE_RUNGS
+# records (harness .dev/verify/0442/sweep-rung-derivation.sh): exactly ONE goes
+# red (0.14, and only because test_the_check_rejects_a_superseded_page_rung
+# hardcodes that rung as its premise). Twelve stay fully GREEN, of which eleven
+# are wrong values a revert could land on. That 1-of-13 is an artefact of one
+# hardcoded literal, not a property of the check.
+#
+# So the assertion below is deliberately about the target's INDEPENDENCE and not
+# about its value. "The target equals this specific table" is the shape that just
+# failed — it pins a literal, goes red on the next legitimate rung bump, and gets
+# deleted by whoever hits it. "The target is not derived from the constant it
+# guards" survives a bump, because a bump rewrites the literal and leaves it a
+# literal. ast.literal_eval asks exactly that question: a literal is written
+# down, and anything it refuses is computed.
+#
+# One assertion covers every consumer, since they all read the same constant:
+# _rung_violation's `got == BACKEND_TARGETS_RUNG`, the line in
+# test_app_version_does_not_collide_with_the_other_version_fields, and the two
+# page-table tests.
+
+_THIS_FILE = pathlib.Path(__file__).resolve()
+
+
+def _module_level_value_node(name: str) -> ast.expr:
+    """The right-hand side of this file's own module-level ``name = ...``.
+
+    Reading the source rather than the imported object is the point: by the time
+    a test runs, a derived value and a written-down one are the same string.
+    """
+    tree = ast.parse(_THIS_FILE.read_text())
+    found = [
+        stmt.value
+        for stmt in tree.body
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None
+        for target in (
+            stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        )
+        if isinstance(target, ast.Name) and target.id == name
+    ]
+    # Exactly one, because grading the first of two would silently grade the
+    # wrong line, and zero means the assignment moved inside an `if` or a
+    # function where this check cannot see it.
+    assert len(found) == 1, (
+        f"expected exactly one module-level assignment to {name} in "
+        f"{_THIS_FILE.name}, found {len(found)} — this guard reads the source, "
+        f"so {name} has to be assigned once, at module level, unconditionally"
+    )
+    return found[0]
+
+
+def _written_down(node: ast.expr) -> tuple[bool, object]:
+    """``(True, value)`` if ``node`` writes its value down, ``(False, None)`` if
+    it computes it.
+
+    Split out from the tests so the predicate can be exercised against a
+    known-derived expression — see
+    test_this_guard_can_actually_refuse_a_derivation.
+    """
+    try:
+        return True, ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError):
+        return False, None
+
+
+def _not_written_down(name: str, live_value: object) -> str | None:
+    """Why ``name`` is not an independent literal in this file, or None if it is."""
+    node = _module_level_value_node(name)
+    is_literal, literal = _written_down(node)
+    if not is_literal:
+        return (
+            f"{name} is COMPUTED, not written down: {_THIS_FILE.name} assigns it "
+            f"`{ast.unparse(node)}`. A computed target cannot discriminate — if it "
+            f"is derived from pool.SCHEMA_VERSION, directly or through a helper, "
+            f"the rung check compares the constant against itself and goes quiet "
+            f"for every value except the one or two that some other test happens "
+            f"to hardcode (measured: 1 of the 13 rungs the page has committed). "
+            f"Write the rung down as a literal and bump it in the same commit as "
+            f"pool.SCHEMA_VERSION — the two-sided edit is the mechanism, not an "
+            f"inconvenience."
+        )
+    if literal != live_value:
+        return (
+            f"{name} is a literal in the source but the imported value differs "
+            f"(source {literal!r}, imported {live_value!r}), so something rebinds "
+            f"it after assignment and this guard is reading a line that no longer "
+            f"decides anything"
+        )
+    return None
+
+
+def test_the_targeted_rung_is_written_down_and_not_derived():
+    """#0442. The new check is "the target is not derived from the constant it
+    guards" — NOT "the target equals this specific table". Only the first
+    survives a legitimate rung bump; the second is the shape that just failed."""
+    why = _not_written_down("BACKEND_TARGETS_RUNG", BACKEND_TARGETS_RUNG)
+    assert why is None, why
+
+
+def test_the_rung_table_is_written_down_and_not_derived():
+    """The same hole one level further out. If PAGE_RUNGS were computed from
+    pool.SCHEMA_VERSION then test_the_targeted_rung_is_one_the_page_actually
+    _defined becomes self-referential too, and _a_rung_the_page_has_never_defined
+    starts handing out rungs the page has in fact committed."""
+    why = _not_written_down("PAGE_RUNGS", PAGE_RUNGS)
+    assert why is None, why
+
+
+def test_this_guard_can_actually_refuse_a_derivation():
+    """Discrimination control, and the reason the two tests above are evidence.
+
+    They assert an absence, so on their own they are equally consistent with
+    "nothing is derived" and "the instrument cannot see a derivation". This runs
+    the same predicate over the exact one-line derivation #0442 is about and
+    requires it to come back refused, naming the expression it refused.
+    """
+    derivation = 'BACKEND_TARGETS_RUNG = ".".join(pool.SCHEMA_VERSION.split(".")[:2])'
+    is_literal, _ = _written_down(ast.parse(derivation).body[0].value)
+    assert not is_literal, (
+        f"the predicate accepted {derivation!r} as written down, so it cannot "
+        f"refuse the derivation #0442 is about and the two tests above are green "
+        f"for no reason"
+    )
+    # ...and it must still ACCEPT a plain literal, or it refuses everything and
+    # is equally useless — an always-red guard gets deleted as fast as a
+    # never-red one.
+    is_literal, value = _written_down(
+        ast.parse('BACKEND_TARGETS_RUNG = "0.15"').body[0].value
+    )
+    assert is_literal and value == "0.15", (
+        "the predicate refused a plain string literal, so it would refuse every "
+        "legitimate rung too"
     )
 
 

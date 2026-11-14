@@ -23,6 +23,12 @@ if TYPE_CHECKING:
 # through ``server.get_service`` arrives off the ordinary decode path as a plain
 # ObjectProxy with no retry on it — every handle below included.
 _PROXY_NEVER_SENT_MARKERS = (
+    # The server's own reply when it will not route to a client that is already
+    # gone: ``"Target peer {ws}/{client_id} is not connected"``. Measured against
+    # a live server (#0407), the handler does not run for this one, so it belongs
+    # on the never-sent side. Also covers the ``"Peer {id} is not connected"``
+    # that hypha_rpc's own peer_not_found handler rejects pending calls with.
+    "is not connected",
     "failed to send the request",
     "websocket reconnection timed out",
 )
@@ -33,6 +39,19 @@ _PROXY_MAYBE_SENT_MARKERS = (
 )
 
 
+def _remote_traceback(exc: BaseException) -> str:
+    """The remote traceback carried by a ``RemoteException``, empty if it has none.
+
+    hypha_rpc builds the message as ``"RemoteError:" + value + "\\n" + traceback``
+    and fills that traceback in ``RPC._handle_method`` for anything the remote
+    handler raised. A refusal the SERVER generated instead — it would not route to
+    a client that is no longer connected — has nothing to trace, so the traceback
+    is empty. That is the only thing measured to separate the two (#0407).
+    """
+    _, _, traceback = str(exc).partition("\n")
+    return traceback.strip()
+
+
 def stale_service_kind(exc: BaseException) -> Optional[str]:
     """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
     # Deferred because this module is reachable from ``bioengine.utils``, which
@@ -41,10 +60,14 @@ def stale_service_kind(exc: BaseException) -> Optional[str]:
     # in bioengine/_app/decorators.py).
     from hypha_rpc.rpc import RemoteException
 
-    if isinstance(exc, RemoteException):
-        # Its message is ``"RemoteError:" + value + "\n" + remote traceback``, and
-        # the server runs hypha_rpc too, so any marker below can appear in that
-        # traceback. Arriving at all proves the remote handler ran.
+    if isinstance(exc, RemoteException) and _remote_traceback(exc):
+        # A handler error and a routing refusal both arrive as RemoteException,
+        # and the message does not separate them: measured (#0407), a handler
+        # raising "Target peer … is not connected" itself is indistinguishable
+        # from the server's refusal by value line alone, and a handler
+        # propagating a real stale error puts the marker in the traceback — the
+        # case this short-circuit was written for. The traceback is what
+        # separates them, so it is the test rather than the text.
         return None
     message = str(exc).lower()
     if any(marker in message for marker in _PROXY_NEVER_SENT_MARKERS):

@@ -21,7 +21,7 @@ import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 import bioengine
 import busy
@@ -76,6 +76,142 @@ ModelType = Literal[
 ]
 # Model types served by the isolated Cellpose runtime rather than micro-sam.
 CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
+
+# Backends that cost a GPU. Each enabled one composes a runtime deployment
+# declaring gpu_memory_mb=-1, which the worker resolves to a WHOLE device
+# (bioengine/apps/builder.py), so the app's GPU floor is simply how many of
+# these are on. Named here because _gpu_placement_report has to count them.
+GPU_BACKENDS = ("microsam", "cellpose")
+
+
+def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
+    """Whether this cluster can place the GPU runtimes the enabled backends need.
+
+    Exists because getting this wrong is otherwise INVISIBLE from the running
+    system (#0370). Two enabled backends book two whole GPUs even to serve one
+    request; on a cluster whose second GPU is never free the second replica simply
+    never schedules. Measured 2026-11-13 on a one-GPU ``external-cluster`` worker: the
+    unplaceable runtime stays ``UPDATING`` with its replica ``STARTING``, the
+    application stays ``DEPLOYING``, and neither ever times out — so
+    ``deploy_app`` returns successfully, ``get_app_status`` reads like a slow
+    first start forever, and nothing names the mismatch or mentions
+    ``MODEL_FINETUNE_BACKENDS``. The worker's own resource check does say it, but
+    only in ``external-cluster`` mode does the deploy get that far, and it says it
+    in the WORKER's log — not in anything the app's caller can read.
+
+    Answered from the CPU entry on purpose: the entry deployment asks for no GPU,
+    so it is the one part of the app that is still alive to say why the rest is not.
+
+    TWO different numbers, because the two questions they answer have different
+    remedies and only one of them is a configuration mistake:
+
+    ``gpus_in_cluster``  ``ray.cluster_resources()`` — the TOTAL the cluster owns,
+                         free or not. Whether this app can EVER place its runtimes
+                         here is a fact about the total, so ``sufficient`` is keyed
+                         to it and to nothing else.
+    ``gpus_free``        ``ray.available_resources()`` — what is unbooked at the
+                         instant of the call. Reported in ``detail`` and
+                         deliberately NOT escalated. A momentary zero is normal:
+                         the app's own placed replicas hold whole devices, so once
+                         this app is running its free count is legitimately short
+                         by exactly what it booked, and on an elastic cluster a
+                         neighbour's job finishing changes the answer a second
+                         later. Keying ``sufficient`` to it would make this
+                         diagnostic cry wolf at the app itself.
+
+    So a cluster that owns enough but has none free right now reads
+    ``sufficient: True`` with a ``detail`` that says the runtimes pend until a
+    device is released — which is the whole of the answer an operator needs, with
+    no alarm attached (#0370, re-review).
+
+    Never raises and never blocks the deploy. ``sufficient`` is deliberately
+    three-valued, because "not enough" and "cannot tell" are different answers:
+
+    ``True``   the cluster advertises at least ``gpus_required`` in TOTAL;
+    ``False``  it advertises fewer — the deployment will pend forever, and
+               ``advice`` says what to set;
+    ``None``   unknown. Either no GPU node has reported in yet, which is the
+               NORMAL state on an elastic SLURM cluster before the autoscaler
+               provides one, or Ray's resource view could not be read at all.
+               Not an error either way: reporting a shortfall that is merely a
+               cold autoscaler would be a false alarm, which is the failure mode
+               this whole report exists to avoid repeating in the other direction.
+    """
+    enabled = set(enabled)
+    required = len([b for b in GPU_BACKENDS if b in enabled])
+    report: Dict[str, Any] = {
+        "backends_enabled": sorted(enabled),
+        "gpus_required": required,
+        "gpus_in_cluster": None,
+        "gpus_free": None,
+        "sufficient": None,
+        "detail": "",
+        "advice": "",
+    }
+    try:
+        import ray
+
+        total = float(ray.cluster_resources().get("GPU", 0.0))
+        free = float(ray.available_resources().get("GPU", 0.0))
+    except Exception as e:  # pragma: no cover - needs a Ray-less replica
+        report["detail"] = (
+            f"could not read the cluster's GPU capacity ({type(e).__name__}: {e})"
+        )
+        return report
+
+    report["gpus_in_cluster"] = total
+    report["gpus_free"] = free
+    if required == 0:
+        report["sufficient"] = True
+        report["detail"] = "no GPU backend is enabled, so no GPU is required"
+        return report
+    if total >= required:
+        report["sufficient"] = True
+        if free < required:
+            # Reported, never escalated: `sufficient` stays True and `advice` stays
+            # empty. See the two-numbers block above — the alternative warns at the
+            # app's own replicas and at every elastic cluster between jobs.
+            report["detail"] = (
+                f"{total:g} GPU(s) visible but {free:g} free right now; {required} "
+                f"required by {', '.join(sorted(enabled))} — the runtime(s) that "
+                "cannot be placed pend until a device is released. Not a "
+                "configuration problem: this cluster owns enough. If this app is "
+                "already running, its own GPU replicas are part of what is booked."
+            )
+        else:
+            report["detail"] = (
+                f"{total:g} GPU(s) visible, {free:g} free, {required} required by "
+                f"{', '.join(sorted(enabled))}"
+            )
+        return report
+    if total == 0:
+        report["detail"] = (
+            "no GPU has reported into the cluster yet, so whether the "
+            f"{required} required by {', '.join(sorted(enabled))} will be "
+            "placeable cannot be told from here. On an elastic (SLURM) cluster "
+            "this is the normal state until the autoscaler provides a GPU node."
+        )
+        return report
+
+    report["sufficient"] = False
+    report["detail"] = (
+        f"this cluster advertises {total:g} GPU(s) but the enabled backends "
+        f"({', '.join(sorted(enabled))}) need {required} — each GPU runtime books "
+        "a WHOLE device. The runtime(s) that cannot be placed stay UPDATING with a "
+        "replica STARTING and the application stays DEPLOYING, indefinitely: none "
+        "of that is a failure state and none of it times out, so the app looks "
+        "like it is still starting rather than stuck. Its Hypha service is never "
+        "registered while a sibling pends, so get_app_status is the only surface "
+        "that can answer — which is where you are reading this."
+    )
+    report["advice"] = (
+        "Deploy one backend: pass "
+        'application_env_vars={"*": {"MODEL_FINETUNE_BACKENDS": "cellpose"}} '
+        "(or \"microsam\") to deploy_app, or launch the worker from an image that "
+        "bakes it. Each single backend has a 1-GPU floor. See the app README, "
+        "'Selecting backends'."
+    )
+    return report
 
 # Which backends each start_training parameter actually affects. The training UI
 # reads this (via get_training_capabilities) to show a control only for the
@@ -232,6 +368,30 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+class _RecognisedRedeposit(Exception):
+    """Internal control flow: the weights just uploaded are already in the pool.
+
+    Raised from *inside* ``contribute``'s ``async with self._staged(...)`` block
+    and caught immediately outside it, so the duplicate's already-minted
+    ``put_file`` manifest row unwinds down ``_staged``'s discard path — the one
+    that is already proven and already tested. Returning normally from inside
+    that block instead would leave the stage open holding a row whose bytes
+    never landed, and ``_staged``'s own docstring says what follows: every
+    later ``commit`` raises ``File '<path>' does not exist in the artifact``,
+    which ``_commit_with_retry`` misreads as the read-after-write 404 and
+    retries for ~62 s before re-raising. One retried deposit would then take
+    the whole pool down rather than just its own merge — strictly worse than
+    the double-weighting this is fixing. Never crosses the RPC boundary: the
+    caller sees a normal return with ``deduplicated: true``. #0376.
+    """
+
+    def __init__(self, existing: Dict[str, Any]) -> None:
+        super().__init__(
+            f"weights already deposited as '{existing.get('contribution_id')}'"
+        )
+        self.existing = existing
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -242,9 +402,20 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     # because the training/export task maps and the GPU semaphore are
     # replica-local; the records a caller polls are on disk, so a teardown
     # between calls is invisible to the frontend.
+    #
+    # initial_replicas is 1, not 0, so the entry can SPEAK at deploy time (#0370).
+    # Measured 2026-11-13 on a one-GPU external cluster with both backends on: a
+    # GPU runtime that cannot be placed leaves the app in DEPLOYING forever, the
+    # proxy registers its Hypha service only once every sibling is serviceable, so
+    # nothing can call the app — and with initial_replicas 0 nothing wakes the entry
+    # either, so the placement warning below is never written. One CPU-only replica
+    # at deploy time puts it in deployments.<entry>.logs, which get_app_status
+    # returns while the app is still DEPLOYING. min_replicas stays 0, so #0045's
+    # requirement ("should also scale down if not used") is untouched: this replica
+    # goes away after downscale_delay_s like any other.
     autoscaling_config={
         "min_replicas": 0,
-        "initial_replicas": 0,
+        "initial_replicas": 1,
         "max_replicas": 1,
         "downscale_delay_s": 600.0,
         "upscale_delay_s": 0.0,
@@ -318,10 +489,39 @@ class EntryApp:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._s3 = await self._hypha.get_service("public/s3-storage")
+        # Resolved once per replica and cached for its whole life, so a plain
+        # proxy pinned to a client id the server later forgets would hang every
+        # call to the full method timeout — and `_health` below tests `is None`,
+        # which a dead handle passes. `put_file`/`get_file` only mint a
+        # presigned URL, so both are safe to re-send after a call that may
+        # already have landed.
+        self._s3 = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/s3-storage",
+            repeatable=("put_file", "get_file"),
+            logger=logger,
+        )
         self._http = httpx.AsyncClient(timeout=60.0)
         self._busy.start()
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
+        self._log_gpu_placement()
+
+    def _log_gpu_placement(self) -> None:
+        """Say in the entry's own log whether the GPU runtimes can be placed (#0370).
+
+        This is the signal that was missing. The entry replica reaches HEALTHY on
+        any node, so these lines are in ``deployments.<entry>.logs`` — which
+        ``get_app_status`` already returns — while the GPU deployments the operator
+        is actually staring at are still reporting ``UPSCALING`` with no reason
+        attached. A warning only: an over-subscribed cluster is a deployment
+        mistake to be told about, not a reason to refuse to serve the CPU methods
+        that work fine.
+        """
+        report = _gpu_placement_report(self._enabled_backends)
+        if report["sufficient"] is False:
+            logger.warning(f"⚠ GPU placement: {report['detail']} {report['advice']}")
+        else:
+            logger.info(f"GPU placement: {report['detail']}")
 
     @bioengine.health_check
     async def _health(self) -> None:
@@ -969,7 +1169,15 @@ class EntryApp:
         CPU-side without waking a GPU), ``detected`` (live runtime probe),
         ``unavailable`` (backend runtime down → ``trainable`` is None), or
         ``disabled`` (backend not deployed on this worker → ``trainable`` is
-        False)."""
+        False).
+
+        Also returns ``placement``, which says whether this cluster has enough
+        GPUs for the backends that are enabled — each GPU runtime books a whole
+        device, so two backends need two GPUs. When it does not,
+        ``placement.sufficient`` is False and ``placement.advice`` names
+        ``MODEL_FINETUNE_BACKENDS``; without it the only symptom is a backend
+        reading ``unavailable`` forever while the deployment reports
+        ``UPSCALING``, which never times out (#0370)."""
         import training
 
         microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
@@ -1004,6 +1212,11 @@ class EntryApp:
             },
             "models": models,
             "parameters": self._training_parameter_schema(),
+            # Why a backend reads 'runtime unavailable' when nothing is broken
+            # (#0370): on a cluster with fewer GPUs than enabled backends the
+            # runtime never schedules, and the only other symptom is a permanent
+            # UPSCALING that never times out. Answered CPU-side; never wakes a GPU.
+            "placement": _gpu_placement_report(self._enabled_backends),
         }
 
     def _training_parameter_schema(self) -> List[Dict[str, Any]]:
@@ -1687,12 +1900,19 @@ class EntryApp:
             "version": manifest.get("community_version", community_version),
             "path": paths["weights"],
             "sha256": manifest.get("weights_sha256"),
-            # A published manifest is a SECOND stored surface carrying the basis
-            # wording 0.27.15 retracted, and it does not pass through
-            # pool_wire_state — so correcting only the pool index would leave a
-            # contributor reading a named community version the withdrawn claim.
-            # Corrected at this chokepoint because both callers come through here.
-            # #0418.
+            # A published manifest is the SECOND stored surface reached only from here —
+            # it does not pass through pool_wire_state — so both of the corrections that
+            # the pool index gets have to be repeated at this chokepoint or they are
+            # absent from every named community version. Both callers come through here.
+            #
+            # #0417: the manifest carries this digest too, so say which of the two it is.
+            # It has its own created_at, so no join is needed.
+            # #0418: the manifest also carries the basis wording 0.27.15 retracted, so
+            # correcting only the pool index would still leave a contributor reading the
+            # withdrawn claim off a named version.
+            "sha256_provenance": pool.digest_provenance(
+                manifest, digest_key="weights_sha256"
+            ),
             "selection_metric": pool.corrected_metric(manifest.get("selection_metric")),
             "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
@@ -1791,8 +2011,11 @@ class EntryApp:
         signature, samples_seen, L2 drift from the base it started from,
         provenance) and appends a stub to the pool index — one commit per
         contribution, so lineage is fully traceable. Averaging happens later, in
-        the coordinator's aggregate step; this only deposits. cpsam(cellpose)
-        sessions only for now."""
+        the coordinator's aggregate step; this only deposits. Idempotent by
+        weights digest: re-depositing a checkpoint the pool already holds
+        appends nothing and returns the first deposit's record with
+        deduplicated=true, so a client that lost its response to a gateway
+        timeout can safely retry. cpsam(cellpose) sessions only for now."""
         import time as _time
 
         import pool
@@ -1830,6 +2053,18 @@ class EntryApp:
         uploaded_at = _time.time()
         paths = pool.contribution_paths(cid)
 
+        # Resolved once and used by both the stored metadata and the value
+        # returned to the caller, so the two records cannot date the same
+        # contribution differently. Empty is the same as unset here: an
+        # exported-but-empty var would otherwise stamp "" and read as a known
+        # version. Read out here rather than mid-block because the recognised
+        # re-deposit below returns without reaching the metadata build.
+        app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
+        # Set by the except clause below, and the only thing that distinguishes
+        # the two return paths.
+        redeposited: Optional[Dict[str, Any]] = None
+
         am, client = await self._pool_service(pool_token)
         try:
             try:
@@ -1853,12 +2088,15 @@ class EntryApp:
                 else:
                     pool.assert_compatible(index, model_type=model_type, signature=signature)
 
-                # Resolved once and used by both the stored metadata and the value
-                # returned to the caller, so the two records cannot date the same
-                # contribution differently. Empty is the same as unset here: an
-                # exported-but-empty var would otherwise stamp "" and read as a
-                # known version.
-                app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+                # Earliest point a re-deposit is knowable: the digest is computed
+                # from the bytes by prepare_contribution, which has already PUT
+                # them. Identity is the digest alone — see
+                # pool.find_contribution_by_digest for why metadata is not part of
+                # it, and why decided_contribution_ids is not consulted. Leaving by
+                # raise, never by return: see _RecognisedRedeposit. #0376.
+                existing = pool.find_contribution_by_digest(index, info["weights_sha256"])
+                if existing is not None:
+                    raise _RecognisedRedeposit(existing)
 
                 metadata = pool.build_contribution_metadata(
                     contribution_id=cid,
@@ -1896,11 +2134,44 @@ class EntryApp:
                     "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
                 )).raise_for_status()
                 await self._commit_with_retry(am, pool_artifact_id)
+        except _RecognisedRedeposit as recognised:
+            # _staged has already discarded the stage on the way out, so the pool
+            # is left exactly as it was found: same members, no open edit, and no
+            # index PUT ever issued.
+            redeposited = recognised.existing
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
                 pass
+
+        if redeposited is not None:
+            # The bytes did cross the wire — prepare_contribution PUT them before
+            # anything could know they were a duplicate — so bytes_up counts them;
+            # that counter is "weight-bytes moved", and pretending they did not
+            # move would understate the cost of exactly the retries this handles.
+            # contributions does NOT move: the pool gained no member, and that is
+            # the number quoted as "deposits".
+            self._bump_transport(bytes_up=int(info["n_bytes"]))
+            return {
+                "schema_version": pool.SCHEMA_VERSION,
+                "app_version": app_version,
+                # The FIRST deposit's id, and the pool's own record of what it
+                # holds, so a client that lost its response to a gateway timeout
+                # ends up with the record it would have had. samples_seen is read
+                # back off the index for the same reason: if this retry reported a
+                # different count, the stored member is the one the soup will
+                # weight. l2_from_base comes from this call because the index does
+                # not carry it — it is recomputed from the same bytes against the
+                # same stock base, not read back from the first deposit.
+                "contribution_id": redeposited.get("contribution_id"),
+                "pool_artifact_id": pool_artifact_id,
+                "architecture_signature": redeposited.get("architecture_signature", signature),
+                "weights_sha256": info["weights_sha256"],
+                "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
+                "l2_from_base": info["l2_from_base"],
+                "deduplicated": True,
+            }
 
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
@@ -1916,6 +2187,11 @@ class EntryApp:
             "weights_sha256": info["weights_sha256"],
             "samples_seen": samples_seen,
             "l2_from_base": info["l2_from_base"],
+            # False, not absent, on the fresh path. A key present only when true
+            # cannot be dated: a client holding a response without it cannot tell
+            # "fresh deposit" from "a release that predates de-duplication" —
+            # the defect app_version exists to avoid (#0116, #0140). #0376.
+            "deduplicated": False,
         }
 
     @bioengine.method
@@ -2313,7 +2589,12 @@ class EntryApp:
                 "published_version": new_version, "baseline_version": baseline_version,
                 "members": members_record,
                 "selection_metric": sel_metric, "witness_metric": wit_metric,
-                "global_sha256": head_sha, "transport": merge_transport,
+                "global_sha256": head_sha,
+                # Written unconditionally, null included: a basis that is absent when
+                # there is no digest reads the same as one absent because the app
+                # predates the stamp, which is the ambiguity it exists to remove.
+                "global_sha256_basis": pool.CURRENT_DIGEST_BASIS if head_sha else None,
+                "transport": merge_transport,
                 "deferred": deferred_ids, "created_at": time.time(),
             })
             async with self._staged(am, pool_artifact_id):
@@ -2335,6 +2616,16 @@ class EntryApp:
             "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
+            # The digest of the head this call just published, and which of the two
+            # things it digests. This is the moment the #0417 false alarm happens —
+            # someone re-merges an identical member set, gets a number, compares it
+            # against a stored one and concludes corruption — so the attribution is
+            # returned here, where both numbers are in the caller's hands, and not
+            # only on a page they would have to go and read.
+            "global_sha256": head_sha,
+            "global_sha256_provenance": pool.digest_provenance(
+                {"global_sha256": head_sha, "global_sha256_basis": pool.CURRENT_DIGEST_BASIS}
+            ),
             "witness_metric": round(head_b, 4) if head_b is not None else None,
             "baseline": baseline,
             "n_members": len(s_ids),
