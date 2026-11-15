@@ -761,6 +761,59 @@ def split_slurm_string_args(group_configs):
     return group_configs
 
 
+def create_option_dirs(group_configs):
+    """Create the directory options this process owns, naming the option on failure.
+
+    Without this, an uncreatable directory surfaced only as the OS reason -- e.g.
+    ``Failed to start BioEngine worker: [Errno 2] No such file or directory:
+    '/proc/x'`` -- which tells the reader what went wrong but not WHICH of the
+    options they typed produced it (#0583). The click surface already does this
+    via ``_create_option_dir`` in ``bioengine/cli/worker.py``; this is the same
+    behaviour on the ``python -m bioengine.worker`` surface, which is the one
+    most agents actually invoke.
+
+    ONLY ``--workspace-dir`` is handled here, and the omission of the other two
+    directory options is deliberate and measured, not an oversight:
+
+        --ray-workspace-dir      the workspace the REMOTE Ray cluster should use,
+                                 explicitly "a different workspace directory than
+                                 the local machine" (external-cluster mode only)
+        --worker-workspace-dir   mounted into worker containers in SLURM jobs and
+                                 "must be accessible from compute nodes"; SLURM
+                                 creates it remotely inside the sbatch script
+                                 (bioengine/cluster/slurm_workers.py)
+
+    Both name paths on a filesystem this process may not have, so pre-creating
+    them here would refuse a value that is perfectly valid at the far end and
+    break external-cluster and SLURM startup. Measured 2026-11-15 on the unfixed
+    code, with a control: a bad ``--ray-workspace-dir`` and a bad
+    ``--worker-workspace-dir`` both start normally and proceed past init, while a
+    bad ``--workspace-dir`` fails -- so the local process really does create only
+    the one.
+
+    ``--workspace-dir`` is safe to create early because the worker already does
+    it unconditionally: ``BioEngineWorker.__init__`` builds
+    ``<workspace_dir>/logs`` before any mode branching. So this moves WHO reports
+    the failure, not WHETHER it fails.
+    """
+    core_options = group_configs.get("Core Options", {})
+    workspace_dir = core_options.get("workspace_dir")
+    # An absent key and an explicit None are the same here: get_args_by_group
+    # filters None values out so component defaults survive, and a default the
+    # user did not type is not an option this message should blame.
+    if workspace_dir:
+        path = Path(workspace_dir).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(
+                f"--workspace-dir {path} could not be created: "
+                f"{exc.strerror or exc.__class__.__name__}. "
+                "Point it at a path this user can create, or create it beforehand."
+            )
+    return group_configs
+
+
 async def main(group_configs):
     """Main function to initialize and register BioEngine worker"""
     # Create BioEngine worker instance
@@ -819,6 +872,10 @@ if __name__ == "__main__":
 
         # Split shell-style SLURM args into List[str]
         group_configs = split_slurm_string_args(group_configs)
+
+        # Create the directory options this process owns, so a path that cannot
+        # be created names the option that carried it (#0583).
+        group_configs = create_option_dirs(group_configs)
 
         # Start the main worker process
         asyncio.run(main(group_configs))
