@@ -56,27 +56,83 @@ def _resolving_method(**_kw):
     return decorate
 
 
-def _install_runtime_stubs() -> list:
-    inserted = []
-    if "bioengine" not in sys.modules:
-        stub = types.ModuleType("bioengine")
-        stub.logger = logging.getLogger("test-broker")
-        stub.app = lambda **_kw: (lambda cls: cls)
-        stub.method = _resolving_method
-        stub.async_init = lambda fn: fn
-        stub.health_check = lambda fn: fn
-        sys.modules["bioengine"] = stub
-        inserted.append("bioengine")
-    if "hypha_rpc" not in sys.modules:
-        stub = types.ModuleType("hypha_rpc")
+#: Marks a module object as one of this file's stubs, so the assertion after the
+#: ``broker`` import can tell a stub from the real package by identity rather than
+#: by guessing from attributes.
+_STUB_SENTINEL = "_broker_ngff_test_stub"
 
-        async def _connect(*_a, **_kw):  # pragma: no cover - never called
-            raise AssertionError("tests must not connect to Hypha")
+#: Distinguishes "was not in sys.modules" from "was there holding None".
+_ABSENT = object()
 
-        stub.connect_to_server = _connect
-        sys.modules["hypha_rpc"] = stub
-        inserted.append("hypha_rpc")
-    return inserted
+
+def _build_bioengine_stub() -> types.ModuleType:
+    stub = types.ModuleType("bioengine")
+    stub.logger = logging.getLogger("test-broker")
+    stub.app = lambda **_kw: (lambda cls: cls)
+    stub.method = _resolving_method
+    stub.async_init = lambda fn: fn
+    stub.health_check = lambda fn: fn
+    setattr(stub, _STUB_SENTINEL, True)
+    return stub
+
+
+def _build_hypha_rpc_stub() -> types.ModuleType:
+    stub = types.ModuleType("hypha_rpc")
+
+    async def _connect(*_a, **_kw):  # pragma: no cover - never called
+        raise AssertionError("tests must not connect to Hypha")
+
+    stub.connect_to_server = _connect
+    setattr(stub, _STUB_SENTINEL, True)
+    return stub
+
+
+def _install_runtime_stubs() -> dict:
+    """Force the stubs into ``sys.modules``, remembering exactly what they displaced.
+
+    **Unconditional on purpose.** An earlier version installed a stub only when the
+    module was ABSENT, which made this file's result depend on which app's tests were
+    collected first into the same pytest process (`#0598`): the real ``bioengine`` is
+    installed in the worker image, so a suite that imported it first left this file
+    importing ``broker`` against the real package. ``broker`` uses
+    ``@bioengine.method(context=True)`` at class-definition time and the real decorator
+    does not resolve pydantic ``Field`` defaults the way `_resolving_method` does, so the
+    whole file failed -- 23 failures and 34 collection errors, against 0 in the other
+    order. Testing against whichever ``bioengine`` happened to be imported first is not a
+    weaker test, it is a different and unintended one.
+
+    Returns the displaced entries for `_restore_runtime_stubs`, which is the half that
+    keeps `#0147`'s guarantee.
+    """
+    saved = {}
+    for name, build in (
+        ("bioengine", _build_bioengine_stub),
+        ("hypha_rpc", _build_hypha_rpc_stub),
+    ):
+        saved[name] = sys.modules.get(name, _ABSENT)
+        sys.modules[name] = build()
+    return saved
+
+
+def _restore_runtime_stubs(saved: dict) -> None:
+    """Put ``sys.modules`` back exactly as it was before the stubs went in.
+
+    This is `#0147`'s invariant and it is load-bearing: leaving a fake ``bioengine``
+    behind breaks every other app suite collected into the same pytest process, which
+    imports the stub instead of the real package.
+
+    Restoring is strictly stronger than the delete-what-I-inserted version it replaces.
+    That one was correct only because it never displaced anything; now that the install
+    is unconditional it would evict a real ``bioengine`` an earlier suite had imported
+    and legitimately still needs. The two harms pull in opposite directions -- leak a
+    stub forward, or destroy a real module someone else owns -- and restoring the prior
+    value is the only move that avoids both.
+    """
+    for name, previous in saved.items():
+        if previous is _ABSENT:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
 
 
 _stubbed = _install_runtime_stubs()
@@ -86,11 +142,22 @@ os.environ.setdefault("HYPHA_TOKEN", "test-token")
 
 import broker as bk  # noqa: E402  (must follow the stubs)
 
-# ``broker`` holds its own references now, so take the stubs back out. Leaving a
-# fake ``bioengine`` in sys.modules breaks every other app suite collected into
-# the same pytest process -- it imports the stub instead of the real package.
-for _name in _stubbed:
-    del sys.modules[_name]
+# ``broker`` holds its own references now, so put sys.modules back as we found it.
+_restore_runtime_stubs(_stubbed)
+
+# The stubs are what this file tests ``broker`` against, so assert it actually bound
+# them rather than trusting the ordering above. Without this, a future suite that
+# imports ``broker`` BEFORE this file runs would hand us a cached module built against
+# the real package, and the symptom would again be ~23 unexplained failures somewhere
+# below instead of one named error here. `sys.modules` is already restored at this
+# point, so this reads what ``broker`` bound, not what is installed now.
+assert getattr(
+    bk.bioengine, _STUB_SENTINEL, False
+), (
+    "broker was imported against the real `bioengine`, not this file's stub, so every "
+    "test below would be exercising the wrong decorator (#0598). This happens when "
+    "`broker` is already in sys.modules before this module is imported."
+)
 
 
 # ---------------------------------------------------------------------------
