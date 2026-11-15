@@ -974,16 +974,21 @@ class _Runtime:
         return {"digests": {s["key"]: s["sha256"] for s in specs},
                 "replica": "r0", "soup_dl_bytes": 0}
 
-    async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
+    async def score_soup(self, specs, imgs, gts, diam_mean,
+                         base_commitment=None) -> Dict[str, Any]:
         # One per-image score per image of the split, as the real runtime returns
         # (#0121). Uniform, so the mean is exactly the ``f1`` the caller chose —
         # aggregate() refuses a record whose aggregate is not the mean of the
         # vector beside it, so a stub returning an arbitrary vector would make
         # every branch below fail for a reason that is not under test here.
+        # ``base_commitment`` is accepted and ignored: #0070 made it part of the
+        # call, and a stub that rejected it would fail on the signature rather
+        # than on anything this file is about.
         return {"f1": self._f1, "per_image": [self._f1] * max(len(gts), 1),
                 "replica": "r0", "soup_dl_bytes": 0}
 
-    async def materialize_soup(self, specs, url) -> Dict[str, Any]:
+    async def materialize_soup(self, specs, url,
+                               base_commitment=None) -> Dict[str, Any]:
         return {"sha256": self._sha, "n_bytes": 2048,
                 "replica": "r0", "soup_dl_bytes": 0}
 
