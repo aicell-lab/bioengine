@@ -291,6 +291,29 @@ Don't blanket-delete: dev tags + `:latest` move-tags are intentional. Only purge
 
 For app-side changes (anything under `apps/<name>/**` that changes the deployment's API surface or behaviour — e.g. a new method signature, changed return shape, a new dependency), validate on a live cluster by running the dev version SIDE-BY-SIDE with production, not by replacing it. The pattern:
 
+### Running `scripts/upload_app.py` — the two things that are not in `--help`
+
+```sh
+set -a; . /data/nmechtel/bioengine/.env; set +a
+python3 scripts/upload_app.py \
+  -d apps/<name> --workspace bioimage-io --token "$BIOIMAGE_IO_TOKEN"
+```
+
+**`PYTHONPATH` is no longer needed since PR #341** (myco `#0559`) — the script appends the repo root to `sys.path` itself, and runs from any cwd. Before that it died with `ModuleNotFoundError: No module named 'bioengine'` even in a good checkout, because running a script puts the *script's* directory on `sys.path` and not the cwd. If you meet that error, you are on an older checkout; the workaround was `PYTHONPATH="$(pwd -P)"`.
+
+1. **`--workspace bioimage-io` is required.** The flag is passed to `connect_to_server`, and the script then rebinds `workspace = server.config.workspace` from the live connection and publishes *there*. The workspace is **encoded in the token**, so the flag does not select a destination — it **asserts** one, and a mismatch is refused before anything is written: `Current workspace encoded in the token (ws-user-…) does not match the specified workspace (bioimage-io)`. Omit it and you silently publish into whatever workspace the token carries, **while reporting success**. With `$BIOIMAGE_IO_TOKEN` that happens to be `bioimage-io` and no harm is done; with `$HYPHA_TOKEN` it is your personal workspace. An artifact version is immutable, so a rung burned that way is unrecoverable — which is why you pass the flag every time rather than reasoning about which token you have.
+2. **Use `--token "$BIOIMAGE_IO_TOKEN"`,** not `HYPHA_TOKEN`. The script falls back to `os.environ["HYPHA_TOKEN"]` and then to an interactive `login()`, neither of which is what you want in a worktree. Together with (1) this is belt and braces: the wrong token alone fails loudly, and the missing flag alone is harmless with the right token — it takes *both* mistakes to publish to the wrong place quietly.
+
+**Then assert the workspace from the script's own log** rather than trusting exit 0 — `INFO - Connected to workspace bioimage-io as user …`, followed by `Editing existing artifact 'bioimage-io/<name>' (new version: X.Y.Z)` and `Successfully committed artifact … (version=X.Y.Z)`.
+
+**And verify the publish by CONTENT, not by the version string** — sha256 each published file against the tree, *with the previous version as a discriminating control*, because equal hashes prove nothing if `?version=` is being ignored:
+
+```sh
+curl -sL "https://hypha.aicell.io/bioimage-io/artifacts/<name>/files/<file>?version=<v>"
+```
+
+`upload_app.py` has **no `--version` flag** — the version comes from the manifest, so edit `apps/<name>/manifest.yaml` FIRST and upload second. (myco #0557)
+
 **Always build the `files` list by directory glob, never by hand.** The canonical `scripts/upload_app.py` calls `create_file_list_from_directory(apps/<name>)` (then strips `__pycache__`), so it picks up every file — including nested subpackages like `model_cache/`. A hand-curated `files=[...]` list passed straight to `worker.upload_app` silently omits whatever you forget, and this bites hard because **`upload_app` commits the version without importing it** — the import/introspection check only runs later at `deploy_app`. So a partial upload lands as a real, permanent artifact version and the failure surfaces one step too late (this is how a broken `model-runner` 1.15.6 missing `model_cache/` got committed, forcing a skip to 1.15.7). Use `scripts/upload_app.py`, or replicate its `create_file_list_from_directory` glob in an ad-hoc script — don't enumerate files manually.
 
 1. **One artifact, many versions.** `bioimage-io/<app>` holds every version the artifact has ever shipped. `worker.upload_app` appends a new committed version to the same artifact — it does not create a separate artifact per version. Never make a `bioimage-io/<app>-v2` or `bioimage-io/<app>-dev` artifact; that fragments history and breaks the version-comparison stories consumers rely on.

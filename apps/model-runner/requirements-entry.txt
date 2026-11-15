@@ -1,5 +1,11 @@
 aiofiles>=23.0.0
 bioimageio.core==0.11.0
+# Pinned EXPLICITLY, not left transitive (myco #0550). This deployment and the
+# RuntimeApp both feed their installed core/spec into pin_bioimageio_conda_env
+# and both hash the result, so a divergence silently stops the pre-built custom
+# env from ever being reused. It must equal what bioimageio.core pins, so a
+# core bump that changes the pairing fails loudly at install instead.
+bioimageio.spec==0.5.12.0
 imageio>=2.37.0
 numpy==1.26.4
 tqdm>=4.64.0
