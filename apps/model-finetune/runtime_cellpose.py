@@ -774,12 +774,16 @@ class CellposeRuntime:
             out: Dict[str, Any] = {
                 "architecture_signature": pool.architecture_signature(sd),
                 "l2_from_base": None,
+                # #0122. Set in BOTH branches below, so a null here reaching the
+                # record means neither ran — not that this writer does not label.
+                "l2_from_base_basis": None,
                 "base_checkpoint_sha256": None,
                 "base_commitment": None,
             }
             if base_path.exists():
                 base_sd = _state(str(base_path))
                 out["l2_from_base"] = pool.state_dict_l2_from_base(sd, base_sd)
+                out["l2_from_base_basis"] = pool.L2_BASIS_SESSION_INIT
                 out["base_checkpoint_sha256"] = pool.sha256_file(str(base_path))
                 # The base this session actually started from, named by its own digest so
                 # a reader can identify the checkpoint rather than trust the label.
@@ -809,6 +813,13 @@ class CellposeRuntime:
                 # The branch ABOVE must stay on torch.load: a fine-tuned base DOES carry a
                 # learned diam_labels, where the widening would be lossy.
                 stock = self._base_state_dict(model_type)
+                # #0122 half 1: measure against the stock base that was actually
+                # used, so the field stops being null for exactly these deposits.
+                # The stock dict is already loaded here for base_commitment, so
+                # this adds no load and no second resident copy — the memory bound
+                # argued above is unchanged and #0087's is not made worse.
+                out["l2_from_base"] = pool.state_dict_l2_from_base(sd, stock)
+                out["l2_from_base_basis"] = pool.L2_BASIS_STOCK
                 out["base_commitment"] = pool.base_commitment(
                     stock,
                     source="cellpose:%s" % training.cellpose_base_model(model_type),
