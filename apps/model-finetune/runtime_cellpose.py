@@ -796,9 +796,19 @@ class CellposeRuntime:
                 # A stock-initialised session keeps no init_checkpoint.pt (the same root
                 # cause as #0122), so the base it started from is stock cellpose. Loading
                 # it here is the REAL base, not an assumed one -- which is the whole point
-                # of the amendment. Peak memory is unchanged either way: this branch holds
-                # `sd` plus the stock base, the branch above holds `sd` plus `base_sd`, so
-                # two state dicts in both cases and #0087's bound is not made worse.
+                # of the amendment.
+                #
+                # CORRECTION (#0087, ruled 2026-11-15). This comment used to read "Peak
+                # memory is unchanged either way ... two state dicts in both cases and
+                # #0087's bound is not made worse". That was FALSE and it is worth saying
+                # why, because the mistake is easy to repeat: it compared this `else`
+                # branch to the sibling `if` branch, when the right comparator is what
+                # THIS path did before. Before #0070 there was no `else` at all, so a
+                # stock-initialised deposit held exactly ONE state dict. It now holds two.
+                # Reusing this row's own FU1 figures (one cpsam dict 1.1348 GiB, two
+                # 2.3060 GiB -- a REUSE, not a fresh measurement), this path went from
+                # ~1.13 GiB to ~2.31 GiB. #0087's bound was made worse, by this branch.
+                # That is why the whole computation now runs under `_soup_sem` below.
                 #
                 # WHY A CONSTRUCTED NET IS CORRECT HERE AND NOT ABOVE. base_commitment
                 # records float(tensor[0]), so handing it a bfloat16 tensor would widen
@@ -815,9 +825,12 @@ class CellposeRuntime:
                 stock = self._base_state_dict(model_type)
                 # #0122 half 1: measure against the stock base that was actually
                 # used, so the field stops being null for exactly these deposits.
-                # The stock dict is already loaded here for base_commitment, so
-                # this adds no load and no second resident copy — the memory bound
-                # argued above is unchanged and #0087's is not made worse.
+                # The stock dict is already loaded here for base_commitment, so THIS
+                # line adds no load and no second resident copy. That much is true and
+                # stays; what was struck from the correction above is the further claim
+                # that the branch as a whole left #0087's bound untouched. Loading the
+                # stock base at all is what moved it; reusing it here does not move it
+                # again.
                 out["l2_from_base"] = pool.state_dict_l2_from_base(sd, stock)
                 out["l2_from_base_basis"] = pool.L2_BASIS_STOCK
                 out["base_commitment"] = pool.base_commitment(
@@ -827,7 +840,28 @@ class CellposeRuntime:
                 del stock
             return out
 
-        info = await asyncio.to_thread(_inspect)
+        # #0087, Option A (ruled 2026-11-15): the inspection holds up to TWO full cpsam
+        # state dicts, and until now it ran outside every lock and past every admission
+        # gate -- so a deposit's peak could sum with a concurrent merge's, and the replica
+        # could breach `memory_mb` with no merge of its own running at all.
+        #
+        # `_soup_sem` is the runtime's existing single-permit semaphore around the merge
+        # build. Taking it HERE makes the deposit and the merge mutually exclusive, so the
+        # replica's peak becomes max(merge, contribute) rather than their sum.
+        #
+        # What this does NOT do, stated because the close has to record the bound rather
+        # than an improvement: it does not reduce the single-path peak. Reusing this row's
+        # FU1 figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
+        # measurement), contribute alone still peaks at ~2.31 GiB. If max(merge,
+        # contribute) is still above what the admission gate assumes, that is a separate
+        # row, not a reason to widen this one.
+        #
+        # The cost is latency: the deposit RPC now waits for any in-flight merge before it
+        # starts its own torch load. That is the trade the ruling accepted -- a measured
+        # memory bound over an unmeasured latency improvement -- and the measurement of
+        # what it adds is on the row.
+        async with self._soup_sem:
+            info = await asyncio.to_thread(_inspect)
         weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)
         n_bytes = Path(ckpt).stat().st_size
 
