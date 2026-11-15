@@ -221,6 +221,16 @@ class BioEngineProxyActor:
         #                      "ttl_seconds": float}}
         self._pending_tokens: Dict[str, Dict[str, Any]] = {}
 
+        # Deploy-time secret env vars, held here so they never have to travel
+        # in a replica's runtime_env — Ray writes a runtime_env verbatim into
+        # every node's runtime_env_agent.log, which outlives the replica.
+        # Unlike _pending_tokens this is read without consuming, because every
+        # replica of the app needs it and a restarting replica needs it again;
+        # get_app_secret_env_vars is the only reader and no status getter
+        # touches it.
+        # Structure: {app_id: {"HYPHA_TOKEN": str, ...}}
+        self._app_secret_env_vars: Dict[str, Dict[str, str]] = {}
+
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
         # Last successful per-node GPU read (memory and device names) from the
@@ -935,6 +945,7 @@ class BioEngineProxyActor:
         self.service_registrations.pop(application_id, None)
         # An undeployed app has nobody left to collect its token.
         self._pending_tokens.pop(application_id, None)
+        self._app_secret_env_vars.pop(application_id, None)
         logger.info(
             f"Cleared all registered replicas for application '{application_id}'."
         )
@@ -1102,6 +1113,41 @@ class BioEngineProxyActor:
         time, so the worker's next pass mints again.
         """
         return self._pending_tokens.pop(application_id, None)
+
+    @_touch_on_call
+    def set_app_secret_env_vars(
+        self, application_id: str, secret_env_vars: Dict[str, str]
+    ) -> None:
+        """Hold an app's deploy-time secrets for its replicas to fetch at startup.
+
+        The worker calls this instead of putting them in the replicas'
+        ``runtime_env``: Ray's runtime_env_agent writes every runtime_env it
+        materialises into a plaintext log on each node, so a credential
+        delivered that way is readable by anything that can read the log and
+        outlives the replica that used it.
+
+        Overwrites, so a redeploy's secrets replace the previous ones; the
+        replicas holding the old values are being replaced along with them.
+        """
+        self._app_secret_env_vars[application_id] = dict(secret_env_vars)
+        # Names only. These logs are readable through get_app_status.
+        logger.info(
+            f"Stored {len(secret_env_vars)} secret env var(s) for application "
+            f"'{application_id}', awaiting collection by its replicas: "
+            f"{sorted(secret_env_vars)}."
+        )
+
+    @_touch_on_call
+    def get_app_secret_env_vars(self, application_id: str) -> Dict[str, str]:
+        """Hand an app's secrets to one of its starting replicas.
+
+        Read without consuming, unlike ``take_pending_token``: every replica
+        of the app needs these at ``__init__``, and one that restarts needs
+        them again. An empty dict means the worker deployed the app without
+        secrets — the caller decides whether that is a failure, since only it
+        knows what it was told to expect.
+        """
+        return dict(self._app_secret_env_vars.get(application_id) or {})
 
     @_touch_on_call
     def get_replica_identities(
