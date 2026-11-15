@@ -281,6 +281,70 @@ def state_dict_digest(state_dict: Dict[str, Any]) -> str:
     return h.hexdigest()
 
 
+# ── what a stored ``l2_from_base`` was measured AGAINST ──────────────────────
+# #0122. ``l2_from_base`` is a distance, and a distance is meaningless without
+# naming the point it is measured from. Two different bases are in use:
+#
+#   * a session that carries ``init_checkpoint.pt`` is measured against THAT file
+#     — the checkpoint the contributor actually started from;
+#   * a stock-initialised session keeps no such file, so it is measured against
+#     the stock cellpose base the session was constructed with.
+#
+# Before #0122 the second case stored NULL rather than a number, so "this
+# contributor did not move" and "nobody measured" were the same reading. Filling
+# it in without naming the base would replace one ambiguity with a worse one: two
+# contributions with the same number, measured from different points, would look
+# comparable. These constants make the base nameable and ``l2_basis`` attributes a
+# stored value to one of them — or declines to, which is the point.
+L2_BASIS_SESSION_INIT = "session_init_checkpoint"
+L2_BASIS_STOCK = "stock_base"
+# No value stored at all. Its own answer, deliberately NOT folded into
+# "undetermined": "the pool holds no distance for this record" and "the pool holds
+# a distance whose origin is unknown" are different facts about the record.
+L2_BASIS_ABSENT = "no_l2"
+# A value with no label. Spelled the same as the digest vocabulary's undetermined
+# on purpose — one word for one concept, so a reader meeting it on either field
+# learns it once. 0.27.6 moved every ``l2_from_base`` without changing the record's
+# shape, so an unlabelled value could have been written under either meaning and
+# this build must refuse to guess between them.
+L2_BASIS_UNDETERMINED = "undetermined"
+
+_L2_BASES = (L2_BASIS_SESSION_INIT, L2_BASIS_STOCK, L2_BASIS_ABSENT)
+
+
+def l2_basis(
+    record: Optional[Dict[str, Any]],
+    *,
+    value_key: str = "l2_from_base",
+    basis_key: str = "l2_from_base_basis",
+) -> str:
+    """What ``record[value_key]`` was measured against, from the record alone.
+
+    Resolution order, each step refusing rather than guessing:
+
+    1. not a record                          -> ``L2_BASIS_UNDETERMINED``
+    2. no distance stored (absent or None)   -> ``L2_BASIS_ABSENT``
+    3. an explicit basis this build knows    -> that basis
+    4. an explicit basis it does NOT know
+       (written by a newer app)              -> ``L2_BASIS_UNDETERMINED``
+    5. a distance with NO basis field        -> ``L2_BASIS_UNDETERMINED``
+
+    Step 5 is the one that matters and the one a shortcut would get wrong. Every
+    record written before #0122 carries a distance and no label, and the tempting
+    default — "unlabelled means the session-init base, because that was the only
+    one that produced a number" — is exactly the inference 0.27.6 makes unsafe. An
+    unlabelled value reads as undetermined, never as a base and never as zero.
+    """
+    if not isinstance(record, dict):
+        return L2_BASIS_UNDETERMINED
+    if record.get(value_key) is None:
+        return L2_BASIS_ABSENT
+    stated = record.get(basis_key)
+    if stated is None:
+        return L2_BASIS_UNDETERMINED
+    return stated if stated in _L2_BASES else L2_BASIS_UNDETERMINED
+
+
 # ── which of the two digests a stored value is ───────────────────────────────
 # The published head digest (``merges[].global_sha256``, the
 # ``current_community.sha256`` copy of it and the ``weights_sha256`` copy in each
@@ -1284,6 +1348,7 @@ def build_contribution_metadata(
     solo_val_metric: Optional[float],
     weights_sha256: str,
     uploaded_at: float,
+    l2_from_base_basis: Optional[str] = None,
 ) -> Dict[str, Any]:
     """A contribution's metadata.json. ``samples_seen`` and ``l2_from_base`` are
     recorded on every contribution but only become load-bearing under specific
@@ -1318,6 +1383,12 @@ def build_contribution_metadata(
         "learning_rate": training_params.get("learning_rate"),
         "diam_mean": training_params.get("diam_mean"),
         "l2_from_base": l2_from_base,
+        # #0122. Written UNCONDITIONALLY, null included, for the same reason
+        # ``app_version`` is: a label that is absent when unknown cannot be told
+        # apart from one written before labels existed at all. A reader resolves it
+        # with ``l2_basis``, which maps a null label beside a real distance to
+        # UNDETERMINED rather than guessing a base.
+        "l2_from_base_basis": l2_from_base_basis,
         "dataset_fingerprint": dataset_fingerprint,
         "solo_val_metric": solo_val_metric,
         "weights_sha256": weights_sha256,

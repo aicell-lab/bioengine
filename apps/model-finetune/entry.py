@@ -2119,6 +2119,10 @@ class EntryApp:
                     samples_seen=samples_seen,
                     training_params=params,
                     l2_from_base=info["l2_from_base"],
+                    # #0122. .get, not ["…"]: an older runtime replica that predates
+                    # the label still answers this call, and it should write a null
+                    # label — which reads as undetermined — rather than raise.
+                    l2_from_base_basis=info.get("l2_from_base_basis"),
                     dataset_fingerprint=dataset_fingerprint,
                     solo_val_metric=solo_val_metric,
                     weights_sha256=info["weights_sha256"],
@@ -2180,6 +2184,10 @@ class EntryApp:
                 "weights_sha256": info["weights_sha256"],
                 "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
                 "l2_from_base": info["l2_from_base"],
+                # #0122. The caller keeps THIS record, so it carries the label for
+                # the same reason the stored one does: a distance whose origin is
+                # not named is not comparable with anyone else's.
+                "l2_from_base_basis": info.get("l2_from_base_basis"),
                 "deduplicated": True,
             }
 
@@ -2197,6 +2205,7 @@ class EntryApp:
             "weights_sha256": info["weights_sha256"],
             "samples_seen": samples_seen,
             "l2_from_base": info["l2_from_base"],
+            "l2_from_base_basis": info.get("l2_from_base_basis"),
             # False, not absent, on the fresh path. A key present only when true
             # cannot be dated: a client holding a response without it cannot tell
             # "fresh deposit" from "a release that predates de-duplication" —
