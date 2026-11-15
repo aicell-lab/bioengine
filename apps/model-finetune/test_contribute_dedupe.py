@@ -208,7 +208,8 @@ class _Runtime:
     def __init__(self, digest: str) -> None:
         self._digest = digest
 
-    async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
+    async def prepare_contribution(self, session_id: str, weights_put_url: str,
+                                   model_type: str = "cpsam") -> Dict[str, Any]:
         return {
             "architecture_signature": _SIG,
             "base_checkpoint_sha256": "b" * 64,
@@ -216,6 +217,14 @@ class _Runtime:
             "l2_from_base": 0.5,
             "weights_sha256": self._digest,
             "n_bytes": 1218617275,
+            # #0070: the bootstrap writes this into a fresh pool_index.json. Present here
+            # so the dedupe fixtures exercise the same shape production now takes.
+            "base_commitment": {
+                "non_learned": {"diam_labels": 30.0, "diam_mean": 30.0},
+                "key_set_sha256": "c" * 64,
+                "key_count": 350,
+                "source": "session_init_checkpoint:" + "b" * 64,
+            },
         }
 
 

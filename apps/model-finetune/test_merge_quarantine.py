@@ -89,8 +89,14 @@ class _Runtime:
             "replica": "r0", "soup_dl_bytes": 0,
         }
 
-    async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
+    async def score_soup(self, specs, imgs, gts, diam_mean,
+                         base_commitment=None) -> Dict[str, Any]:
         """``{"f1": scalar, "per_image": vector}``, matching the real runtime.
+
+        ``base_commitment`` is accepted and ignored. #0070 made it part of the
+        call, and this file merged cleanly past that change — which is exactly
+        why it broke: a stub whose signature is never in conflict is never
+        reviewed against the contract it is standing in for.
 
         ``per_image`` became part of this contract in #0121: ``aggregate()`` now
         reads ``scored["per_image"]`` on every pass and banks it beside the
@@ -103,7 +109,18 @@ class _Runtime:
         return {"f1": self._f1, "per_image": [self._f1, self._f1],
                 "replica": "r0", "soup_dl_bytes": 0}
 
-    async def materialize_soup(self, specs, url) -> Dict[str, Any]:
+    async def materialize_soup(self, specs, url,
+                               base_commitment=None) -> Dict[str, Any]:
+        """``base_commitment`` accepted and ignored, as in ``score_soup`` above.
+
+        The real method also returns ``non_learned_inherited``,
+        ``non_learned_source`` and ``member_non_learned`` for #0070's
+        requirement 4. They are deliberately NOT invented here: ``aggregate()``
+        reads them with ``.get()``, so omitting them is tolerated, and a stub
+        that made them up would let a requirement-4 assertion pass against
+        values no runtime produced. Requirement 4 is driven in the #0070 suite,
+        against the real builder.
+        """
         return {"sha256": HEAD_SHA, "n_bytes": 2048,
                 "replica": "r0", "soup_dl_bytes": 0}
 
