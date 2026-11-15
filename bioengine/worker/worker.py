@@ -522,11 +522,29 @@ class BioEngineWorker:
             raise e
 
     def __del__(self):
-        if self.start_time:
-            self.logger.warning(
-                "BioEngineWorker is being garbage collected with partially/completely initialized components. "
-                "Consider calling stop() explicitly for proper cleanup."
-            )
+        # Read both attributes DEFENSIVELY, because __init__ can raise before either exists.
+        # When it does, CPython still calls __del__ on the half-constructed object, the bare
+        # `self.start_time` raises AttributeError, and Python prints `Exception ignored in:`
+        # plus a full traceback AFTER the real error. That traceback is the last thing the
+        # reader sees, so it reads as the diagnosis while the actual cause has scrolled past
+        # (#0584). Nothing is left broken by it -- the exit code is still the real failure --
+        # which is exactly why it misleads rather than announcing itself as noise.
+        #
+        # `getattr(..., None)` and not hasattr: it keeps the ORIGINAL truthiness test intact
+        # for the case that matters, so an object that HAS start_time behaves exactly as before
+        # and this guard cannot silently swallow the warning it exists to emit. `logger` is
+        # guarded for the same reason and is not hypothetical -- it is assigned during __init__
+        # too, so a failure early enough leaves it unset as well, and reaching for it here
+        # would re-raise from inside the handler for the first problem.
+        if not getattr(self, "start_time", None):
+            return
+        logger = getattr(self, "logger", None)
+        if logger is None:
+            return
+        logger.warning(
+            "BioEngineWorker is being garbage collected with partially/completely initialized components. "
+            "Consider calling stop() explicitly for proper cleanup."
+        )
 
     def _set_parameter(
         self,
