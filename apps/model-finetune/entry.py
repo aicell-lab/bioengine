@@ -2330,6 +2330,7 @@ class EntryApp:
         witness_split: Dict[str, Any] = Field(..., description="{artifact_id, sha256} provenance of split B."),
         eps: float = Field(0.0, ge=0.0, description="Pre-registered non-degradation tolerance on split A (0 = strict). Do NOT tune post-hoc to hit an inclusion rate."),
         max_batch: int = Field(32, ge=1, description="Max newly-arrived candidates weighed at this merge; overflow is deferred (and re-scored) to the next."),
+        min_members: Optional[int] = Field(None, ge=1, description="Refuse to publish a head with fewer members than this. Default: the published head's own member count (1 if there is no head), so quarantining can never silently thin the soup."),
         diam_mean: float = Field(30.0, gt=0, description="Mean object diameter in pixels for auto-segmentation."),
     ) -> Dict[str, Any]:
         """Coordinator-only greedy merge — grow the community soup by full-weight
@@ -2408,12 +2409,26 @@ class EntryApp:
                     replica_dl.get(result["replica"], 0) + int(result["soup_dl_bytes"]))
                 return result
 
+            # What the pool recorded for each member's bytes, by path. Carried on
+            # every spec so the runtime can reject a bad FRESH download at the point
+            # it arrives — the preflight below hashes every member once per merge,
+            # but the member cache is evicted under memory pressure, so a member can
+            # be re-fetched mid-merge after it was verified.
+            sha_by_path: Dict[str, Any] = {
+                c.get("weights_path"): c.get("weights_sha256")
+                for c in index.get("contributions", [])
+            }
+
             async def _specs(paths: List[str]) -> List[Dict[str, str]]:
                 out = []
                 for p in paths:
                     if p not in url_cache:
                         url_cache[p] = await am.get_file(pool_artifact_id, file_path=p)
-                    out.append({"key": p, "url": url_cache[p]})
+                    spec = {"key": p, "url": url_cache[p]}
+                    recorded = sha_by_path.get(p)
+                    if pool.is_usable_digest(recorded):
+                        spec["sha256"] = recorded
+                    out.append(spec)
                 return out
 
             # Resume journal. A merge is 2*len(batch)+3 scoring passes and each pass
@@ -2437,19 +2452,56 @@ class EntryApp:
             wit_id = pool.split_identity(witness_split)
             splits = {gate_id: (gate_imgs, gate_gts), wit_id: (wit_imgs, wit_gts)}
 
-            async def _score(member_paths: List[str], split_id: str) -> float:
+            async def _score(member_paths: List[str], split_id: str) -> Dict[str, Any]:
+                """One scoring pass as ``{"f1": scalar, "per_image": vector}``.
+
+                Both halves go through the journal together. Returning only the
+                scalar and re-deriving the vector later is not available: a resumed
+                merge never runs the pass again, so a vector that is not banked here
+                is gone, and the published record would be missing its breakdown on
+                exactly the merges that were interrupted.
+                """
                 key = pool.score_key(split_id, member_paths)
                 if key in journal["scores"]:
-                    return float(journal["scores"][key])
+                    # usable_merge_journal() prunes any entry missing its vector, so a
+                    # hit on `scores` is a hit on both maps.
+                    return {"f1": float(journal["scores"][key]),
+                            "per_image": list(journal["per_image_scores"][key])}
                 imgs, gts = splits[split_id]
                 # A journal hit returns above without folding, which is correct: that
                 # pass transported nothing on this run.
-                value = _fold(await runtime.score_soup(
+                scored = _fold(await runtime.score_soup(
                     await _specs(member_paths), imgs, gts, diam_mean,
-                    base_commitment=index.get("base_commitment")))["f1"]
-                pool.record_score(journal, key, value)
+                    base_commitment=index.get("base_commitment")))
+                value, per_image = float(scored["f1"]), list(scored["per_image"])
+                pool.record_score(journal, key, value, per_image=per_image)
                 await self._write_merge_journal(am, pool_artifact_id, journal)
-                return value
+                return {"f1": value, "per_image": per_image}
+
+            def _as_pass(metric: Dict[str, Any]) -> Dict[str, Any]:
+                """A previously published metric record read back as a scoring pass,
+                so a merge that reuses the baseline's number carries its breakdown too
+                rather than dropping to a bare scalar. A record written before this app
+                banked vectors has none, and ``.get`` is deliberate: an absent key and
+                a null value must read alike here, because they mean the same thing."""
+                return {"f1": float(metric["aggregate"]),
+                        "per_image": list(metric.get("per_image") or [])}
+
+            def _metric(role: str, scored: Dict[str, Any], basis: str) -> Dict[str, Any]:
+                """One metric record from one scoring pass, breakdown attached.
+
+                The vector and its basis are passed together or not at all, from one
+                place, so no call site can publish half the pair. It is empty only for
+                a number read back out of a pool written before this app measured
+                breakdowns; that publishes null rather than inventing a breakdown for
+                a number that was never measured with one.
+                """
+                vector = scored.get("per_image") or None
+                return pool.round_metric(
+                    role=role, aggregate=round(float(scored["f1"]), 4), aggregate_basis=basis,
+                    per_image=vector,
+                    per_image_basis=pool.PER_IMAGE_BASIS if vector else None,
+                )
 
             cc = pool.current_community(index)
             cur_member_ids: List[str] = []
@@ -2479,6 +2531,90 @@ class EntryApp:
             if refusal:
                 raise ValueError(f"aggregate() refused this merge: {refusal}")
 
+            # ---- Provenance, before a single byte is souped (#0139) ----------
+            #
+            # Until now nothing checked that a member's bytes were the bytes its
+            # contribution attested to. The digest was written at upload and then
+            # never read, so a member with no digest and a member whose digest was
+            # simply never checked produced the same published checkpoint, and
+            # neither was visible in anything the merge returned.
+            #
+            # A member that fails here is QUARANTINED, not fatal: it is excluded
+            # from the soup, left in the pool, and recorded with a machine-readable
+            # reason. The merge of the rest proceeds. Two deliberate consequences:
+            #
+            # - This runs AFTER soup_admission. Admission is a memory bound computed
+            #   from recorded sizes and nothing is downloaded to evaluate it;
+            #   verifying first would pull tens of gigabytes to the replica before
+            #   the check that says the merge cannot fit in RAM. Admission over the
+            #   unquarantined set is conservative — it refuses a superset — so the
+            #   order is safe in the direction that matters.
+            # - A quarantined CANDIDATE is still marked decided below, with the rest
+            #   of the batch. Leaving it undecided would re-download and re-flag it
+            #   on every future merge, and because undecided_contributions is
+            #   chronological and max_batch caps the batch, a growing head of
+            #   permanently-quarantined rows would starve real candidates out of
+            #   every batch forever. "Kept in the pool" means its record and its
+            #   weights stay in the artifact, not that it is re-weighed each time.
+            verify_records = [by_id[cid] for cid in cur_member_ids] + list(batch)
+            to_hash = pool.members_to_hash(verify_records)
+            actual_by_path: Dict[str, str] = {}
+            if to_hash:
+                actual_by_path = _fold(
+                    await runtime.verify_members(await _specs(to_hash)))["digests"]
+            _, quarantined = pool.digest_quarantine(verify_records, actual_by_path)
+            quarantined_ids = {q["contribution_id"] for q in quarantined}
+            q_counts = pool.quarantine_counts(quarantined)
+            floor = int(min_members) if min_members is not None else max(1, len(cur_member_ids))
+
+            for q in quarantined:
+                if q["reason"] == pool.QUARANTINE_DIGEST_MISMATCH:
+                    # Not a skip. The digest IS recorded and the bytes in the pool do
+                    # not hash to it, which means what is stored is not what was
+                    # deposited. Logged at error with everything a human needs to
+                    # open it as its own incident: which pool, which contribution,
+                    # and both hashes.
+                    logger.error(
+                        f"🚨 INTEGRITY: pool '{pool_artifact_id}' contribution "
+                        f"'{q['contribution_id']}' ({q['weights_path']}) hashes to "
+                        f"{q['actual_sha256']} but the pool recorded "
+                        f"{q['expected_sha256']}. Quarantined from this merge. The "
+                        f"stored bytes are not the bytes that were contributed; this "
+                        f"needs a human, not a retry."
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ Quarantined contribution '{q['contribution_id']}' "
+                        f"({q['weights_path']}): {q['reason']} — the pool records "
+                        f"{q['expected_sha256']!r} as its digest, which is not a "
+                        f"sha256, so its bytes cannot be checked against anything."
+                    )
+
+            # The head's own members are checked too, and a head that cannot be
+            # reconstituted stops the merge rather than quietly becoming a different
+            # soup under the same name. See head_integrity_refusal for why this one
+            # is fatal where a candidate's failure is not.
+            head_refusal = pool.head_integrity_refusal(
+                head_version=(cc or {}).get("version"),
+                head_member_ids=cur_member_ids,
+                quarantined_ids=quarantined_ids,
+                floor=floor,
+            )
+            if head_refusal:
+                raise ValueError(f"aggregate() refused this merge: {head_refusal}")
+
+            batch_all_ids = [c["contribution_id"] for c in batch]
+            cur_member_ids = [cid for cid in cur_member_ids if cid not in quarantined_ids]
+            cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
+            batch = [c for c in batch if c["contribution_id"] not in quarantined_ids]
+            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
+            if quarantined:
+                logger.info(
+                    f"🔒 {len(quarantined)} member(s) quarantined from this merge "
+                    f"({q_counts}); {len(cur_member_ids)} head member(s) and "
+                    f"{len(batch)} candidate(s) carry a verified digest."
+                )
+
             # Stock baseline on A and B (anchor of the witness curve — the level to beat).
             baseline = index.get("baseline")
             if baseline is None:
@@ -2486,15 +2622,14 @@ class EntryApp:
                 stock_b = await _score([], wit_id)
                 baseline = {
                     "model": "stock-cpsam",
-                    "selection_metric": pool.round_metric(
-                        role="selection", aggregate=round(stock_a, 4), aggregate_basis=pool.SELECTION_BASIS),
-                    "witness_metric": pool.round_metric(
-                        role="witness", aggregate=round(stock_b, 4), aggregate_basis=pool.BASELINE_BASIS),
+                    "selection_metric": _metric("selection", stock_a, pool.SELECTION_BASIS),
+                    "witness_metric": _metric("witness", stock_b, pool.BASELINE_BASIS),
                     "created_at": time.time(),
                 }
 
-            cur_a = (await _score(cur_member_paths, gate_id)
-                     if cur_member_paths else baseline["selection_metric"]["aggregate"])
+            cur = (await _score(cur_member_paths, gate_id)
+                   if cur_member_paths else _as_pass(baseline["selection_metric"]))
+            cur_a = cur["f1"]
 
             # Best-first ordering: individual marginal of adding each candidate to the
             # current soup, on A. Re-scored against the CURRENT head (a stale solo
@@ -2502,17 +2637,23 @@ class EntryApp:
             marg = {}
             for c in batch:
                 cid = c["contribution_id"]
-                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_id)
+                marg[cid] = (await _score(cur_member_paths + [cand_path[cid]], gate_id))["f1"]
             ordered = sorted(batch, key=lambda c: marg[c["contribution_id"]], reverse=True)
 
             s_paths = list(cur_member_paths)
             s_ids = list(cur_member_ids)
             s_a = cur_a
+            # The admitted head's own scoring pass, carried alongside its scalar: the
+            # record published below must breakdown the number the gate actually
+            # decided on, and re-scoring the head afterwards to recover a vector would
+            # be a second pass that is not guaranteed to agree with the first.
+            s_pass = cur
             members_record: List[Dict[str, Any]] = []
             admitted: List[str] = []
             for c in ordered:
                 cid = c["contribution_id"]
-                trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
+                trial = await _score(s_paths + [cand_path[cid]], gate_id)
+                trial_a = trial["f1"]
                 included = trial_a >= (s_a - eps)
                 members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
                                        "gate_score": round(trial_a, 4), "included": bool(included)})
@@ -2520,19 +2661,28 @@ class EntryApp:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)
                     s_a = trial_a
+                    s_pass = trial
                     admitted.append(cid)
 
             changed = bool(admitted)
             baseline_version = cc["version"] if (cc and cc.get("path")) else "stock-cpsam"
 
             if changed:
+                # Last gate before anything is written: a merge does not publish a
+                # thinner soup than it was told to, and it says so rather than
+                # shipping one quietly. With the default floor this cannot fire —
+                # the head's survivors already cleared it above and admitting only
+                # adds — so it is the explicit min_members that this enforces.
+                thin = pool.publish_floor_refusal(
+                    member_ids=s_ids, floor=floor, quarantined=quarantined)
+                if thin:
+                    raise ValueError(f"aggregate() refused this merge: {thin}")
                 new_version = await self._next_free_community_version(am, pool_artifact_id, index)
                 head_a = s_a
-                head_b = await _score(s_paths, wit_id)
-                sel_metric = pool.round_metric(
-                    role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.SELECTION_BASIS)
-                wit_metric = pool.round_metric(
-                    role="witness", aggregate=round(head_b, 4), aggregate_basis=pool.WITNESS_BASIS)
+                wit_pass = await _score(s_paths, wit_id)
+                head_b = wit_pass["f1"]
+                sel_metric = _metric("selection", s_pass, pool.SELECTION_BASIS)
+                wit_metric = _metric("witness", wit_pass, pool.WITNESS_BASIS)
                 paths = pool.community_paths(new_version)
                 # Crash-safe: commit weights + manifest FIRST (index still points at
                 # the old head), then repoint the index in a SECOND commit. The runtime
@@ -2584,6 +2734,7 @@ class EntryApp:
                         community_version=new_version, combine="uniform",
                         selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
                         selection_metric=sel_metric, witness_metric=wit_metric, members=members_record,
+                        quarantined=quarantined,
                         architecture_signature=index.get("architecture_signature"),
                         weights_sha256=head_sha, created_at=time.time(),
                         non_learned=non_learned_block,
@@ -2605,8 +2756,7 @@ class EntryApp:
                 head_bytes_out = 0
                 # Nothing admitted: the selection metric records the bar the assessed
                 # set failed to beat; there is no witness point (nothing re-measured).
-                sel_metric = pool.round_metric(
-                    role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.EMPTY_SELECTION_BASIS)
+                sel_metric = _metric("selection", cur, pool.EMPTY_SELECTION_BASIS)
                 wit_metric = None
 
             soup_bytes_down = sum(replica_dl.values())
@@ -2619,7 +2769,9 @@ class EntryApp:
             self._bump_transport(bytes_down=soup_bytes_down)
 
             index["baseline"] = baseline
-            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + [c["contribution_id"] for c in batch]
+            # batch_all_ids, not batch: a quarantined candidate is decided too. See
+            # the quarantine block above for why it is not left to be re-weighed.
+            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + batch_all_ids
             # bytes_in counts the assessed set (the batch weighed at this merge);
             # bytes_out is the published head, 0 when nothing was admitted. n_bytes is
             # written per contribution in a different function, so if any assessed member
@@ -2638,6 +2790,12 @@ class EntryApp:
             pool.append_merge(index, {
                 "published_version": new_version, "baseline_version": baseline_version,
                 "members": members_record,
+                # Kept out of "members": a members row reads "evaluated, not
+                # included" and carries the gate scores that decision rests on. A
+                # quarantined member was never evaluated and has no such scores, so
+                # filing it there would report an integrity failure as a rejection.
+                "quarantined": quarantined,
+                "quarantine_counts": q_counts,
                 "selection_metric": sel_metric, "witness_metric": wit_metric,
                 "global_sha256": head_sha,
                 # Written unconditionally, null included: a basis that is absent when
@@ -2664,6 +2822,14 @@ class EntryApp:
             "published_version": new_version,
             "admitted": admitted,
             "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
+            # Reported separately from "rejected" and from "admitted", and always
+            # present even when empty: a caller that wants to know whether this
+            # merge excluded anything on provenance grounds must not have to infer
+            # it from a count that only appears when it is non-zero.
+            "quarantined": quarantined,
+            "quarantine_counts": q_counts,
+            "n_admitted_members": len(s_ids),
+            "n_quarantined": len(quarantined),
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
             # The digest of the head this call just published, and which of the two

@@ -55,7 +55,15 @@ jobs:
         # deliberately declares no imaging deps ("Hypha/S3 transport only"). It is
         # a test-only dependency, so it is installed here rather than added to the
         # bundle, which would change what the published artifact ships.
-        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow
+        # aiofiles is the opposite case: model-runner's bundle DOES declare it
+        # (requirements-entry.txt), but the worker image this job runs in does
+        # not ship it, and `_execute_test` imports it inside the function body —
+        # so the module imports fine and the failure only appears once a test
+        # actually calls it. Installing the one name keeps this step honest about
+        # what it is for; installing the whole entry requirements file would drag
+        # in bioimageio.core==0.11.0 and numpy==1.26.4 and re-resolve the image's
+        # own pins underneath the rest of the suite.
+        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow aiofiles
 
       - name: Run the suite
         # tests/end_to_end needs a live Hypha workspace and a real cluster.

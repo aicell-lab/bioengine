@@ -69,7 +69,7 @@ def test_score_key_separates_the_two_splits():
 ])
 def test_each_stamp_invalidates_the_journal(field, value):
     saved = pool.new_merge_journal(GATE, WITNESS, DIAM)
-    pool.record_score(saved, "k", 0.5)
+    pool.record_score(saved, "k", 0.5, per_image=[0.4, 0.6])
     saved[field] = value
 
     fresh = pool.usable_merge_journal(saved, GATE, WITNESS, DIAM)
@@ -80,7 +80,7 @@ def test_matching_stamps_keep_the_journal():
     """Positive control for the four above: if nothing kept a journal, they would
     all pass for a function that always returned empty."""
     saved = pool.new_merge_journal(GATE, WITNESS, DIAM)
-    pool.record_score(saved, "k", 0.5)
+    pool.record_score(saved, "k", 0.5, per_image=[0.4, 0.6])
 
     kept = pool.usable_merge_journal(saved, GATE, WITNESS, DIAM)
     assert kept["scores"] == {"k": 0.5}
@@ -95,7 +95,7 @@ def test_unusable_journals_degrade_to_empty(junk):
 def test_record_score_evicts_oldest_first_at_the_cap():
     journal = pool.new_merge_journal(GATE, WITNESS, DIAM)
     for i in range(10):
-        pool.record_score(journal, f"k{i}", i / 10, cap=4)
+        pool.record_score(journal, f"k{i}", i / 10, per_image=[i / 10], cap=4)
 
     assert list(journal["scores"]) == ["k6", "k7", "k8", "k9"]
 
@@ -123,7 +123,9 @@ def _merge(members, journal, killed_at=None):
         # A real score; deterministic here so resume and restart are comparable.
         value = round(0.5 + len(paths) / 100, 6)
         paid.append(key)
-        pool.record_score(journal, key, value)
+        # The vector a real pass would carry: two images whose mean IS the scalar,
+        # so the journal's own pairing check is exercised on every replayed pass.
+        pool.record_score(journal, key, value, per_image=[value - 0.01, value + 0.01])
         return value
 
     score([], gate)

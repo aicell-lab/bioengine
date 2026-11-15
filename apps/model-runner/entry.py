@@ -43,7 +43,13 @@ from pydantic import Field
 from bioengine import __version__
 
 from model_cache import BioimageioPackage, ModelCache
-from runtime import SINGLE_INPUT_KEY, RuntimeDeployment, pin_bioimageio_conda_env
+from runtime import (
+    CONDA_IMPLEMENTATIONS,
+    SINGLE_INPUT_KEY,
+    RuntimeDeployment,
+    pin_bioimageio_conda_env,
+    resolve_conda_binary,
+)
 
 
 logger = logging.getLogger("ray.serve")
@@ -562,12 +568,16 @@ class EntryDeployment:
         """Scrubbed env with mamba's env-prefix + package cache
         redirected to the replica's writable HOME.
 
-        ``/home/ray/anaconda3/envs/`` and ``/home/ray/.mamba/pkgs``
-        are on a read-only mount inside the Ray worker pod. HOME is
+        A conda implementation's default env prefix and package cache
+        (``$CONDA_PREFIX/envs/``, ``~/.mamba/pkgs``)
+        are not writable cross-replica inside the Ray worker pod. HOME is
         set by ``bioengine._app.replica_init`` to
         ``<app_dir>/home/`` on the app's PVC, which is
         cross-replica RWX under the bioengine layout, so envs built
         by EntryDeployment are visible to RuntimeDeployment on the same path.
+
+        This used to cite ``/home/ray/anaconda3/envs/``, the
+        ``rayproject/ray`` layout no image this repo builds has (myco #0527).
         """
         env_vars = self._safe_subprocess_env()
         mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
@@ -621,10 +631,17 @@ class EntryDeployment:
         conda hardlinks package files from ``pkgs/`` into each env, so
         removing an env frees almost nothing until the now-unreferenced
         packages go too. Best-effort; never raises.
+
+        A no-op when no conda implementation is installed: there is then no
+        package cache to clean, and spawning a missing binary would only log a
+        confusing ``FileNotFoundError`` from the housekeeping path (#0527).
         """
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            return
         try:
             proc = await asyncio.create_subprocess_exec(
-                "mamba",
+                conda_bin,
                 "clean",
                 "--packages",
                 "--tarballs",
@@ -647,10 +664,16 @@ class EntryDeployment:
         warnings on failure but never raises, since the caller
         (sweep + LRU eviction) shouldn't fail the whole test call
         because one stale env couldn't be reaped.
+
+        A no-op when no conda implementation is installed — nothing built the
+        env, so nothing here can reap it (#0527).
         """
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            return
         try:
             proc = await asyncio.create_subprocess_exec(
-                "mamba",
+                conda_bin,
                 "env",
                 "remove",
                 "-n",
@@ -1656,14 +1679,21 @@ class EntryDeployment:
         *inside* their own prefix, then marked so the probe runs once. Every
         env built here has ``bioimageio.core`` pinned into its pip section by
         ``pin_bioimageio_conda_env``, so the console script is always expected.
+
+        With no conda implementation installed an unmarked directory is
+        reported as NOT existing: the completeness probe cannot be run, and an
+        unverifiable env must not be admitted as usable (#0527).
         """
         env_dir = self._conda_envs_dir() / env_name
         if (env_dir / self._ENV_COMPLETE_MARKER).exists():
             return True
         if not env_dir.is_dir():
             return False
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            return False
         proc = await asyncio.create_subprocess_exec(
-            "mamba",
+            conda_bin,
             "run",
             "-n",
             env_name,
@@ -1733,8 +1763,21 @@ class EntryDeployment:
         ``--file=<path>``, not stdin) and awaits the child. On non-zero
         exit, raises either a translated explanation or the last ~1 KB of
         the child's stderr.
+
+        Raises a named error, rather than ``FileNotFoundError: 'mamba'`` from
+        the spawn, when no conda implementation is installed (#0527).
+        ``_execute_test`` refuses the whole call before reaching here; this
+        keeps the precondition stated at the spawn site too.
         """
         import tempfile
+
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            raise RuntimeError(
+                f"cannot build the conda env for weight format {wf!r}: none of "
+                f"{list(CONDA_IMPLEMENTATIONS)} is installed in this replica's "
+                "image, so custom_environment=True cannot be served here"
+            )
 
         with tempfile.NamedTemporaryFile(
             mode="wb", suffix=".yaml", delete=False
@@ -1753,9 +1796,9 @@ class EntryDeployment:
                 await self._mamba_env_remove(env_name, env_vars)
                 shutil.rmtree(env_dir, ignore_errors=True)
 
-            logger.info(f"🐍 mamba env create ({wf!r}) → {env_name}")
+            logger.info(f"🐍 {conda_bin} env create ({wf!r}) → {env_name}")
             proc = await asyncio.create_subprocess_exec(
-                "mamba",
+                conda_bin,
                 "env",
                 "create",
                 "--yes",
@@ -2346,7 +2389,7 @@ class EntryDeployment:
         ),
         custom_environment: Optional[bool] = Field(
             None,
-            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False, run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference. If left None (default), inherit the environment of the model's prior report for the matching slot (staged report for stage=True, published for stage=False) — so a model last tested in its custom env is re-tested in the custom env automatically — falling back to False when no prior report exists.",
+            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` or ``conda`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). Requires one of those to be installed in the deployed image: where neither is, the call is refused with an error saying so and no test report is produced, rather than returning a failed report that looks like a verdict on the model. If False, run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference. If left None (default), inherit the environment of the model's prior report for the matching slot (staged report for stage=True, published for stage=False) — so a model last tested in its custom env is re-tested in the custom env automatically — falling back to False when no prior report exists.",
         ),
         cache: Literal["skip", "check", "reuse"] = Field(
             "check",
@@ -2548,6 +2591,35 @@ class EntryDeployment:
             )
             custom_environment = False
             job["custom_environment"] = False
+
+        # Refuse a custom-env run this image cannot serve, instead of letting
+        # it fail as a verdict on the model (myco #0527).
+        #
+        # Without this, the first thing to happen is
+        # ``FileNotFoundError: 'mamba'`` from the env build below — inside the
+        # ``try`` that turns any exception into a *fallback test report*:
+        # ``status="failed"``, ``name="bioimageio format validation"``, the
+        # traceback as its one unnamed detail. That object is shaped like a
+        # verdict on the model and is not one. It is already kept out of the
+        # collection and the cache by ``report_is_trustworthy=False``, but it
+        # is still what the caller is handed and what the UI renders.
+        #
+        # Deliberately AFTER the downgrade above, so the check runs on the
+        # *effective* mode: a model declaring no environment.yaml falls back to
+        # standard and must keep working on an image with no conda at all.
+        # Also before ``_prebuild_conda_envs``, so nothing is spent on an env
+        # solve that cannot start.
+        if custom_environment and resolve_conda_binary() is None:
+            raise RuntimeError(
+                f"Cannot test '{model_id}' with custom_environment=True: this "
+                f"model-runner image installs none of "
+                f"{list(CONDA_IMPLEMENTATIONS)}, so the conda environment the "
+                f"model declares cannot be built. This is a limitation of the "
+                f"deployment, not a fault in the model — no test was run and "
+                f"no report was produced. Re-run with "
+                f"custom_environment=False to test in the serving runtime's "
+                f"own environment."
+            )
 
         # Use context manager to track access and prevent eviction during test
         async with package:

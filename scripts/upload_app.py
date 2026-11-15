@@ -2,8 +2,14 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# Running a script puts the SCRIPT'S directory on sys.path, not the caller's cwd, so `bioengine`
+# is unimportable from a plain `python3 scripts/upload_app.py` even in a perfectly good checkout.
+# Appended, not inserted, so an installed bioengine still wins over this checkout.
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from hypha_rpc import connect_to_server, login
 

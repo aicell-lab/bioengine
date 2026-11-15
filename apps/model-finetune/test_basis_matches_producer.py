@@ -191,3 +191,70 @@ def test_a_contribution_is_not_published_as_reproducible_by_re_merge() -> None:
         "a contribution's digest is a file digest, so a re-merge cannot reproduce "
         f"it; provenance published {prov['reproducible_by_re_merge']!r}"
     )
+
+
+# A value no code path in this repo produces. Not a basis constant, not a digest, and
+# not a timestamp — so an assertion that the stored record does NOT carry it cannot be
+# satisfied by some other mechanism happening to write the right answer.
+_FORGED_BASIS = "caller_supplied_basis_0524_no_code_path_produces_this"
+
+
+def test_the_forged_basis_is_not_a_real_one() -> None:
+    """Control for the test below. If ``_FORGED_BASIS`` ever collided with a real
+    constant, "the stored record does not carry the forged value" would be satisfied
+    by the writer stamping normally, and the override would stop being tested."""
+    real = {
+        pool.CONTRIBUTION_DIGEST_BASIS,
+        pool.CURRENT_DIGEST_BASIS,
+        pool.DIGEST_BASIS_ABSENT,
+        pool.DIGEST_BASIS_FILE,
+        pool.DIGEST_BASIS_TENSORS,
+    }
+    assert _FORGED_BASIS not in real, (
+        f"{_FORGED_BASIS!r} collides with a real basis constant {real!r}, so the "
+        "override test below would pass for the wrong reason"
+    )
+
+
+def test_a_caller_supplied_basis_is_overridden_not_preserved() -> None:
+    """#0524. ``append_contribution``'s docstring says the basis is "Stamped here
+    rather than accepted as a field on ``entry``", and gives the reason: the writer is
+    the only thing that knows which digest it just computed, so a caller-supplied
+    basis could disagree with the number beside it.
+
+    That claim was NOT enforced. Replacing the stamping assignment with a
+    ``setdefault`` — leaving a caller's value in place — was measured GREEN on the
+    ``apps/model-finetune`` suite, the ``tests/`` suite and #0370's own gate during the
+    #0509 review ("Arm E"). A control arm that stamps the WRONG constant at the same
+    site is caught by 10 tests, so the suite discriminated the VALUE and not its
+    PROVENANCE. This test pins the provenance.
+
+    Latent today — no current caller supplies the field, because
+    ``prepare_contribution`` computes ``weights_sha256`` in this process and the client
+    never sends it. The point is that the invariant is stated at the write site and so
+    must hold for a caller who has not read the docstring.
+    """
+    entry = _entry("c-forged", "d" * 64, pool.TENSOR_DIGEST_SINCE + 86_400.0)
+    entry["weights_sha256_basis"] = _FORGED_BASIS
+
+    index: Dict[str, Any] = {}
+    pool.append_contribution(index, entry)
+    stored = index["contributions"][-1]
+
+    assert stored["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS, (
+        "append_contribution must IMPOSE the basis it computed, not accept the "
+        f"caller's: stored {stored['weights_sha256_basis']!r}, expected "
+        f"{pool.CONTRIBUTION_DIGEST_BASIS!r}. A setdefault at the stamping site "
+        "produces exactly this failure."
+    )
+    # Stated separately: the first assertion alone would also pass if the forged value
+    # happened to equal the constant, which the control above forbids.
+    assert stored["weights_sha256_basis"] != _FORGED_BASIS
+
+    # The override must happen on the stored COPY. If append_contribution mutated the
+    # caller's dict instead, a caller reusing that dict would silently carry the
+    # writer's basis into a second, differently-computed record.
+    assert entry["weights_sha256_basis"] == _FORGED_BASIS, (
+        "append_contribution overwrote the caller's own entry dict; it is supposed to "
+        "copy with dict(entry) and stamp the copy"
+    )
