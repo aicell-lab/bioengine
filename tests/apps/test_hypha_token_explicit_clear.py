@@ -24,13 +24,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from bioengine._app.mixin import _unmask_secret_env_vars
-from bioengine.apps.builder import AppBuilder
+from bioengine._app.mixin import _install_secret_env_vars
+from bioengine.apps.builder import AppBuilder, split_secret_env_vars
 from bioengine.apps.manager import AppsManager
 
 ARTIFACT_ID = "bioimage-io/nuclei-seg"
@@ -178,7 +179,13 @@ def _invoke(monkeypatch, state: str, extra_args: list) -> dict:
 
 
 def _replica_env(env_vars: Dict[str, str], monkeypatch) -> Dict[str, str]:
-    """What the replica's ``os.environ`` holds after the setup hook unmasks.
+    """What the replica's ``os.environ`` holds once its secrets are installed.
+
+    Drives the real chain both halves of it: the worker's
+    ``split_secret_env_vars`` keeps secret *values* out of what the replica
+    receives in its runtime_env, and the replica fetches them back from the
+    proxy actor. A fake handle stands in for the actor, since the delivery
+    route is what these tests are about and not Ray's RPC.
 
     ``env_vars`` stands in for the real environment rather than being merged
     into it. Merging meant the ambient HYPHA_TOKEN had to be cleared to keep
@@ -187,9 +194,24 @@ def _replica_env(env_vars: Dict[str, str], monkeypatch) -> Dict[str, str]:
     """
     import os
 
-    replica_environ = dict(env_vars)
+    import ray
+
+    replica_env_vars, secret_env_vars = split_secret_env_vars(env_vars)
+
+    class _FakeSecretsMethod:
+        @staticmethod
+        def remote(application_id: str) -> Dict[str, str]:
+            assert application_id == APP_ID
+            return secret_env_vars
+
+    class _FakeProxyHandle:
+        get_app_secret_env_vars = _FakeSecretsMethod()
+
+    instance = SimpleNamespace(_bioengine_proxy_handle=_FakeProxyHandle())
+    replica_environ = dict(replica_env_vars)
     monkeypatch.setattr(os, "environ", replica_environ)
-    _unmask_secret_env_vars()
+    monkeypatch.setattr(ray, "get", lambda value: value)
+    _install_secret_env_vars(instance, logging.getLogger("test-replica"))
     return replica_environ
 
 

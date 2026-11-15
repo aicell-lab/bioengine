@@ -32,7 +32,8 @@ def _setup_replica(instance: Any) -> None:
     * ``BIOENGINE_PROXY_ACTOR_NAME`` — Ray named-actor for replica tracking
     * ``BIOENGINE_DATA_SERVER_URL`` — for ``bioengine.datasets``
     * ``HOME`` — the application's isolated working directory
-    * keys prefixed with ``_BIOENGINE_SECRET_`` — secret env vars to unmask
+    * ``BIOENGINE_SECRET_KEYS`` — names of the secrets to fetch from the
+      proxy actor; the values never ride in the runtime_env
 
     All state added to ``instance`` is namespaced under ``_bioengine_*`` so
     user code can use the rest of the attribute namespace freely.
@@ -57,7 +58,9 @@ def _setup_replica(instance: Any) -> None:
     _register_with_proxy_actor(instance, logger)
     _ensure_working_directory(logger)
     _purge_stale_app_modules(logger)
-    _unmask_secret_env_vars()
+    # Must stay after _register_with_proxy_actor: the handle it stores is how
+    # the secrets are fetched.
+    _install_secret_env_vars(instance, logger)
 
 
 def _baked_identity(cls: type) -> Dict[str, Optional[str]]:
@@ -218,17 +221,66 @@ def _ensure_working_directory(logger: logging.Logger) -> None:
     logger.info(f"📁 Working directory: {workdir}/")
 
 
-def _unmask_secret_env_vars() -> None:
-    """Restore real values for env vars the worker stored under ``_BIOENGINE_SECRET_``.
+def _install_secret_env_vars(instance: Any, logger: logging.Logger) -> None:
+    """Put the app's deploy-time secrets into this replica's environment.
 
-    The worker writes secrets to ``runtime_env.env_vars`` as
-    ``_BIOENGINE_SECRET_<KEY>=<value>`` so the unprefixed key shows as
-    ``*****`` in Ray's actor config UI. We reverse that here.
+    Fetched from the ``BioEngineProxyActor`` rather than read out of
+    ``runtime_env.env_vars``: Ray's runtime_env_agent writes every runtime_env
+    it materialises into a plaintext per-node log, so a credential delivered
+    that way is readable by anything that can read the log and outlives the
+    replica that used it. Masking in the actor-config UI never covered that.
+
+    The worker names what it sent in ``BIOENGINE_SECRET_KEYS``, so a failed
+    fetch raises here instead of letting the user's ``__init__`` run without
+    the credential it asked for — or, worse, run as whatever stale identity a
+    reused Ray worker process left in ``os.environ``.
+
+    The ``_BIOENGINE_SECRET_`` loop stays for a replica still being handed
+    env vars by a pre-0.16.113 worker; such a worker sets no
+    ``BIOENGINE_SECRET_KEYS``, so nothing is fetched and the old path is the
+    only one that runs.
     """
     prefix = "_BIOENGINE_SECRET_"
     for key, value in list(os.environ.items()):
         if key.startswith(prefix):
             os.environ[key[len(prefix) :]] = value
+
+    expected = [
+        key for key in os.environ.get("BIOENGINE_SECRET_KEYS", "").split(",") if key
+    ]
+    if not expected:
+        return
+
+    application_id = os.environ.get("BIOENGINE_APPLICATION_ID")
+    proxy_handle = getattr(instance, "_bioengine_proxy_handle", None)
+    if proxy_handle is None or not application_id:
+        raise RuntimeError(
+            f"This replica was told to expect {len(expected)} secret env var(s) "
+            f"({', '.join(expected)}) but the BioEngineProxyActor that holds "
+            "them is unreachable, so they cannot be delivered."
+        )
+
+    import ray
+
+    secret_env_vars = ray.get(
+        proxy_handle.get_app_secret_env_vars.remote(application_id=application_id)
+    )
+    missing = [key for key in expected if key not in secret_env_vars]
+    if missing:
+        raise RuntimeError(
+            f"The BioEngineProxyActor holds no value for {', '.join(missing)}, "
+            f"which this replica was told to expect. The actor was restarted or "
+            f"evicted between the deploy and this replica's start; redeploy "
+            f"'{application_id}' to store them again."
+        )
+
+    os.environ.update(secret_env_vars)
+    # Names only, never values: replica logs are readable through
+    # get_app_status.
+    logger.info(
+        f"🔑 Installed {len(secret_env_vars)} secret env var(s) from the "
+        f"BioEngineProxyActor: {sorted(secret_env_vars)}"
+    )
 
 
 def _wrap_runtime_handles(

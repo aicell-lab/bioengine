@@ -216,6 +216,11 @@ def _bare_actor() -> object:
     actor.replica_identities = {}
     actor.service_registrations = {}
     actor._pending_tokens = {}
+    # clear_application_replicas pops this too, and object.__new__ skips __init__, so without it
+    # both clearing tests raise AttributeError rather than asserting anything. Set here beside the
+    # other five rather than guarded at the pop: a defensive pop would let production tolerate the
+    # attribute being genuinely absent, which is a real bug worth crashing on.
+    actor._app_secret_env_vars = {}
     return actor
 
 
