@@ -33,10 +33,20 @@ from bioengine.worker.worker import BioEngineWorker
 
 
 class _DeadServer:
-    """Post-auth-failure shape: the object is alive, its RPC methods are gone."""
+    """Post-auth-failure shape, MEASURED rather than assumed.
 
-    generate_token = None
-    parse_token = None
+    The first version of this fake set `generate_token = None`, which is NOT what happens:
+    measured 2026-11-18 against a real disconnected Hypha client, `generate_token` is still a
+    live `function` and `callable()` returns True -- the None is deeper inside hypha_rpc and
+    surfaces only when the call is MADE. That fake let a liveness-guard fix pass the unit arms
+    and then fail the live reproduction, so it is written here the way the system really behaves.
+    """
+
+    async def generate_token(self, _config=None):
+        raise TypeError("'NoneType' object is not callable")
+
+    async def parse_token(self, _token):
+        raise TypeError("'NoneType' object is not callable")
 
 
 class _LiveServer:

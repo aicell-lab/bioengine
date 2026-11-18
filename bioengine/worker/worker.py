@@ -1242,55 +1242,50 @@ class BioEngineWorker:
             f"Re-registered BioEngine worker service '{self.full_service_id}'."
         )
 
-    def _can_mint_token(self) -> bool:
-        """Is the connection actually able to mint a token right now?
-
-        `self.server` is NOT a usable signal on its own: after an authentication failure it
-        remains set while its RPC methods are gone, so `self.server.generate_token` resolves
-        to None and CALLING it raises `'NoneType' object is not callable` (#0632, measured on
-        deNBI 2026-11-18, 25 crashes in 30 minutes). Checking the attribute is callable is the
-        difference between a handled condition and a traceback.
-        """
-        return callable(getattr(self.server, "generate_token", None))
-
     async def _check_token_expiry(self) -> None:
         if self._token_expires_at - time.time() < 3600:
-            if not self._can_mint_token():
+            # ATTEMPT the mint and fall back on failure, rather than trying to PREDICT whether
+            # the connection is alive. Predicting does not work and the first version of this
+            # fix got it wrong: measured 2026-11-18, `self.server.generate_token` is still a
+            # live callable after the connection dies -- `callable(getattr(...))` returns True
+            # in exactly the broken case -- and the None is deeper inside hypha_rpc, surfacing
+            # only when the call is made. A liveness guard is a presence check that survives
+            # the meaning inversion; only the call itself can tell you.
+            try:
+                self.logger.info(
+                    "Generating a new Hypha token with expiration time set to 3 hours."
+                )
+                self._token = await self.server.generate_token(
+                    {
+                        "workspace": self.workspace,
+                        "client_id": self.client_id,
+                        "permission": "admin",
+                        "expires_in": 3600 * 3,
+                    }
+                )
+
+                user_info = await self.server.parse_token(self._token)
+                self._token_expires_at = user_info.expires_at
+            except Exception as mint_error:
                 # Minting requires the very connection that is down, so the two preconditions
-                # are each other's and nothing in the monitoring loop can break the cycle.
-                # Fall back to the credential we started with: it is long-lived, it is still
-                # held, and the next _check_service_registration tick reconnects with it.
-                # Setting expires_at to 0 is deliberate -- once the connection is back this
-                # step runs again and mints a fresh short-lived token in the normal way.
+                # are each other's and nothing in the monitoring loop can break the cycle
+                # (#0632). Fall back to the credential this worker started with: it is
+                # long-lived, still held, and the next _check_service_registration tick
+                # reconnects with it. expires_at = 0 is deliberate -- once the connection is
+                # back this step runs again and mints a fresh short-lived token normally.
                 if self._bootstrap_token and self._token != self._bootstrap_token:
                     self.logger.warning(
-                        "Cannot mint a Hypha token while the connection is down. Falling "
-                        "back to the token this worker started with so the next reconnect "
-                        "has a usable credential."
+                        f"Could not mint a Hypha token ({mint_error}). Falling back to the "
+                        "token this worker started with so the next reconnect has a usable "
+                        "credential."
                     )
                     self._token = self._bootstrap_token
                     self._token_expires_at = 0
                 else:
                     self.logger.debug(
-                        "Token refresh skipped: no usable connection, and the bootstrap "
-                        "token is already in use."
+                        f"Token refresh failed ({mint_error}) and the bootstrap token is "
+                        "already in use; leaving it in place."
                     )
-                return
-            # Renew token if it's about to expire
-            self.logger.info(
-                "Generating a new Hypha token with expiration time set to 3 hours."
-            )
-            self._token = await self.server.generate_token(
-                {
-                    "workspace": self.workspace,
-                    "client_id": self.client_id,
-                    "permission": "admin",
-                    "expires_in": 3600 * 3,
-                }
-            )
-
-            user_info = await self.server.parse_token(self._token)
-            self._token_expires_at = user_info.expires_at
 
     async def _cleanup(self) -> None:
         """
