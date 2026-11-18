@@ -406,6 +406,13 @@ class BioEngineWorker:
         self.server: Optional[RemoteService] = None
         self.workspace = workspace
         self._token = token or os.environ.get("HYPHA_TOKEN")
+        # The credential the worker STARTED with, kept so it is never lost. _token below is
+        # overwritten by each short-lived token the worker mints for itself, and before #0632
+        # that overwrite destroyed the only copy of this one: a worker whose minted token
+        # expired while disconnected could not mint a replacement (minting needs the
+        # connection) and had nothing valid left to reconnect WITH. A restart cured it purely
+        # by re-reading this value from the environment, which is what proved it was still good.
+        self._bootstrap_token = self._token
         self._token_expires_at = 0
         self.client_id = client_id
         self.service_id = "bioengine-worker"
@@ -1235,8 +1242,40 @@ class BioEngineWorker:
             f"Re-registered BioEngine worker service '{self.full_service_id}'."
         )
 
+    def _can_mint_token(self) -> bool:
+        """Is the connection actually able to mint a token right now?
+
+        `self.server` is NOT a usable signal on its own: after an authentication failure it
+        remains set while its RPC methods are gone, so `self.server.generate_token` resolves
+        to None and CALLING it raises `'NoneType' object is not callable` (#0632, measured on
+        deNBI 2026-11-18, 25 crashes in 30 minutes). Checking the attribute is callable is the
+        difference between a handled condition and a traceback.
+        """
+        return callable(getattr(self.server, "generate_token", None))
+
     async def _check_token_expiry(self) -> None:
         if self._token_expires_at - time.time() < 3600:
+            if not self._can_mint_token():
+                # Minting requires the very connection that is down, so the two preconditions
+                # are each other's and nothing in the monitoring loop can break the cycle.
+                # Fall back to the credential we started with: it is long-lived, it is still
+                # held, and the next _check_service_registration tick reconnects with it.
+                # Setting expires_at to 0 is deliberate -- once the connection is back this
+                # step runs again and mints a fresh short-lived token in the normal way.
+                if self._bootstrap_token and self._token != self._bootstrap_token:
+                    self.logger.warning(
+                        "Cannot mint a Hypha token while the connection is down. Falling "
+                        "back to the token this worker started with so the next reconnect "
+                        "has a usable credential."
+                    )
+                    self._token = self._bootstrap_token
+                    self._token_expires_at = 0
+                else:
+                    self.logger.debug(
+                        "Token refresh skipped: no usable connection, and the bootstrap "
+                        "token is already in use."
+                    )
+                return
             # Renew token if it's about to expire
             self.logger.info(
                 "Generating a new Hypha token with expiration time set to 3 hours."
