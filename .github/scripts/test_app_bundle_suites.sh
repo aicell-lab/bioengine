@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-runnable demonstration of the app-bundle discovery gate (backlog #0423).
+# Re-runnable demonstration of the app-bundle discovery gate.
 #
 # Case 2 is the one this gate exists for: a third app that ships in-bundle
 # tests and is named in neither table REFUSES, where the hardcoded two-app loop
@@ -175,7 +175,7 @@ check "16  a missing report refuses rather than passing on one" 1 "expected 2" \
 echo "== the workflow step that runs the suites =="
 # The step's shell is EXTRACTED from the shipped workflow rather than copied here,
 # so 17b cannot stay green while test-suite.yml goes back to a shape that swallows
-# a refusing `list` (backlog #0458). Run under the same `bash -e -o pipefail` that
+# a refusing `list`. Run under the same `bash -e -o pipefail` that
 # GitHub Actions uses, against a tree whose only content is a stand-in gate.
 STEP=$WORK/loop-step.sh
 python3 - "$REPO/.github/workflows/test-suite.yml" "$STEP" <<'PY'

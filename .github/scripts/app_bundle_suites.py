@@ -3,13 +3,13 @@
 
 Each app under ``apps/`` ships its tests inside the bundle published to Hypha,
 and ``pytest.ini`` sets ``testpaths = tests``, so ``pytest tests/`` never
-collects them (backlog #0247). The apps CI runs cannot simply be ``apps/*``:
+collects them. The apps CI runs cannot simply be ``apps/*``:
 some apps' suites need that app's own image, which the CI runner does not have.
 
 So the set is declared in ``.github/app-bundle-suites.json`` and RECONCILED
 against what is on disk. An app that ships ``test_*.py`` and is named in
 neither table fails the job, rather than having its tests collected by nobody
-while every step reports success (backlog #0423). The registry is one file, so
+while every step reports success. The registry is one file, so
 the list CI iterates and the floors it asserts cannot drift apart.
 
   reconcile   refuse unless the registry and the tree agree
@@ -94,7 +94,7 @@ def reconcile(root: str) -> list[str]:
             f"{', '.join(undeclared)} ship(s) in-bundle {TEST_GLOB} that no CI step "
             f"runs. Add each to {REGISTRY}: to 'run' with a floor on the number of "
             "tests that must execute (measure it), or to 'skip' with the reason CI "
-            "cannot run it. This refusal is the point of backlog #0423 — without it "
+            "cannot run it. This refusal is the point of this gate — without it "
             "those tests are collected by nobody and the job still reports success."
         )
 
