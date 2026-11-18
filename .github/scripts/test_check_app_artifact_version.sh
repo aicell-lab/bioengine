@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-runnable demonstration of the apps/ version gate (backlog #0124).
+# Re-runnable demonstration of the apps/ version gate.
 #
 # Each case builds throwaway commits with ``git commit-tree`` — no index, no
 # hooks, no branch, nothing pushed — then runs the real gate script against
