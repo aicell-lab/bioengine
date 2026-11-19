@@ -309,6 +309,31 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
+# Grace and backoff for the FIRST resolution of the artifact manager, in
+# ``initialize()``. Every later call is covered by _ReconnectingArtifactManager,
+# which re-resolves on demand; that first one had nothing, so a worker starting
+# while Hypha was not serving ``public:artifact-manager`` raised out of
+# initialize() and died, and the container then crash-looped. A worker already
+# running rode the same outage out untouched.
+#
+# Measured 2026-11-19 on a production Kubernetes deployment, both halves inside
+# one hour: the pod that was already up re-registered unaided once the service
+# returned, while
+# a pod started during the window reached CrashLoopBackOff with restartCount 5
+# on ``KeyError: 'Service not found: public/*:artifact-manager@*'``. So a routine
+# rollout landing in a platform blip was terminal while doing nothing survived it.
+#
+# The grace deliberately equals the worker's registration grace, so "how long a
+# Hypha gap may last before we stop waiting" is one number in this codebase
+# rather than two that can drift apart.
+#
+# This bounds the wait; it does not remove the failure. Past the grace the last
+# error is re-raised, because a worker that waits forever for a service that is
+# never coming back is a worse outcome than one that exits and says why.
+_ARTIFACT_MANAGER_RESOLVE_GRACE_S = 300.0
+_ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S = 2.0
+_ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S = 30.0
+
 # Consecutive monitor ticks an app may be missing from the Serve status report
 # before absence is acted on as a failure. Absence is not a verdict — the report
 # can be momentarily incomplete — but it must still converge: never redeploying
@@ -1751,6 +1776,52 @@ class AppsManager:
             return deployed_at
         return deployed_at if reported is None else reported
 
+    async def _resolve_artifact_manager_proxy(self) -> Any:
+        """Resolve ``public/artifact-manager``, tolerating a transient Hypha gap.
+
+        Every *later* use of this proxy is covered by
+        ``_ReconnectingArtifactManager``, which re-resolves on demand. This
+        first resolution had no such cover, and the asymmetry decided whether a
+        worker survived a Hypha outage: one already running rode it out, while
+        one that happened to start during the same window raised out of
+        ``complete_initialization`` and left the container crash-looping.
+
+        Retrying here rather than inside ``_re_resolve`` is deliberate. On the
+        running path a caller is already holding a request, and that path's rule
+        — one visible failure instead of an endless outage, with a write never
+        replayed — is load-bearing and tested. At boot there is no caller to
+        report to and nothing to replay: the only choices are to wait or to die.
+
+        The wait is bounded. Past ``_ARTIFACT_MANAGER_RESOLVE_GRACE_S`` the last
+        error is re-raised, so a worker whose platform is genuinely gone still
+        exits and says why instead of hanging forever looking healthy.
+        """
+        deadline = time.time() + _ARTIFACT_MANAGER_RESOLVE_GRACE_S
+        delay = _ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self.server.get_service("public/artifact-manager")
+            except Exception as error:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self.logger.error(
+                        f"Could not resolve 'public/artifact-manager' after "
+                        f"{attempt} attempt(s) over "
+                        f"{_ARTIFACT_MANAGER_RESOLVE_GRACE_S:.0f}s: {error}"
+                    )
+                    raise
+                self.logger.warning(
+                    f"Could not resolve 'public/artifact-manager' (attempt "
+                    f"{attempt}, {remaining:.0f}s of grace left): {error}. "
+                    f"Retrying in {min(delay, remaining):.0f}s."
+                )
+                # Never sleep past the deadline: the grace is the budget, and
+                # overshooting it would silently widen the window this bounds.
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(delay * 2, _ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S)
+
     async def complete_initialization(
         self, server: RemoteService, admin_users: List[str], worker_service_id: str
     ) -> None:
@@ -1792,10 +1863,12 @@ class AppsManager:
         try:
             # Get artifact manager service. Wrapped because the proxy is cached
             # for the process lifetime and the remote service can change client
-            # id without anything restarting.
+            # id without anything restarting. The first resolution is retried
+            # (see _resolve_artifact_manager_proxy) because the wrapper can only
+            # help once it exists.
             self.artifact_manager = _ReconnectingArtifactManager(
                 server=self.server,
-                proxy=await self.server.get_service("public/artifact-manager"),
+                proxy=await self._resolve_artifact_manager_proxy(),
                 logger=self.logger,
             )
             self.logger.info("Successfully connected to artifact manager.")

@@ -615,3 +615,195 @@ async def test_the_manager_wraps_the_proxy_it_caches(monkeypatch):
     assert isinstance(manager.artifact_manager, _ReconnectingArtifactManager)
     assert _Builder.received is manager.artifact_manager
     assert collection_received == [manager.artifact_manager]
+
+
+# ---------------------------------------------------------------------------
+# The FIRST resolution, in complete_initialization(), had no retry at all.
+#
+# The wrapper above can only help once it exists. Measured 2026-11-19 on a
+# production Kubernetes deployment, both halves within one hour: the worker pod
+# already running rode out a
+# `public:artifact-manager` outage and re-registered unaided, while a pod started
+# during the same window reached CrashLoopBackOff with restartCount 5 on
+# `KeyError: 'Service not found: public/*:artifact-manager@*'`. A routine rollout
+# landing in a platform blip was terminal; doing nothing survived it.
+# ---------------------------------------------------------------------------
+import ast
+import inspect
+import textwrap
+import time as _time
+
+from bioengine.apps import manager as _manager_module
+from bioengine.apps.manager import AppsManager
+
+
+class _FlakyServer:
+    """Fails the first ``fail_times`` resolutions, then hands over a proxy."""
+
+    def __init__(self, fail_times: int, error: BaseException | None = None):
+        self._remaining = fail_times
+        self._error = error or KeyError(
+            "Service not found: public/*:artifact-manager@*"
+        )
+        self.attempts = 0
+
+    async def get_service(self, service_id):
+        assert service_id == "public/artifact-manager"
+        await asyncio.sleep(0)
+        self.attempts += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise self._error
+        return _Proxy("after-retry")
+
+
+def _manager_with(server) -> AppsManager:
+    """An AppsManager with only the two attributes this method touches.
+
+    ``__init__`` builds a RayCluster and a workspace on disk, none of which this
+    resolution path reads, so constructing one would test the fixture instead of
+    the method.
+    """
+    manager = object.__new__(AppsManager)
+    manager.server = server
+    manager.logger = logger
+    return manager
+
+
+@pytest.fixture
+def fast_grace(monkeypatch):
+    """Shrink the real schedule so the test exercises it rather than mocking it."""
+    monkeypatch.setattr(_manager_module, "_ARTIFACT_MANAGER_RESOLVE_GRACE_S", 0.40)
+    monkeypatch.setattr(
+        _manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S", 0.02
+    )
+    monkeypatch.setattr(
+        _manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S", 0.05
+    )
+    return 0.40
+
+
+@pytest.mark.asyncio
+async def test_a_transient_resolution_failure_at_boot_is_survived(fast_grace):
+    """THE DEFECT: before the fix, one failure here killed the worker."""
+    server = _FlakyServer(fail_times=3)
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy()
+
+    assert proxy.name == "after-retry"
+    assert server.attempts == 4, "should have retried exactly until it succeeded"
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_boot_is_not_delayed(fast_grace, monkeypatch):
+    """The retry must cost nothing when the service is there.
+
+    A fix that sleeps before its first attempt would slow every normal start,
+    which is a regression nobody would attribute to this change.
+    """
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _recording_sleep(delay):
+        slept.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(_manager_module.asyncio, "sleep", _recording_sleep)
+
+    server = _FlakyServer(fail_times=0)
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy()
+
+    assert proxy.name == "after-retry"
+    assert server.attempts == 1
+    assert slept == [], f"a healthy boot must not sleep at all, slept {slept}"
+
+
+@pytest.mark.asyncio
+async def test_a_service_that_never_returns_still_RAISES_rather_than_hanging(
+    fast_grace,
+):
+    """CONTROL. The fix bounds the wait; it must not swallow the failure.
+
+    Without this, 'the worker no longer crash-loops' could be satisfied by a
+    worker that hangs forever looking healthy — a worse outcome than exiting,
+    and one the crash-loop at least made visible.
+    """
+    sentinel = KeyError("Service not found: public/*:artifact-manager@*")
+    server = _FlakyServer(fail_times=10**9, error=sentinel)
+
+    started = _time.monotonic()
+    with pytest.raises(KeyError) as raised:
+        await _manager_with(server)._resolve_artifact_manager_proxy()
+    elapsed = _time.monotonic() - started
+
+    assert raised.value is sentinel, "the operator must see the real error"
+    assert server.attempts > 1, "it should have retried before giving up"
+    assert elapsed < fast_grace * 3, (
+        f"gave up after {elapsed:.2f}s against a {fast_grace:.2f}s grace — "
+        "the wait is not bounded by the grace"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_wait_never_overshoots_the_grace(fast_grace, monkeypatch):
+    """The backoff must be clamped to the remaining budget, not just doubled.
+
+    `delay` grows independently of the deadline, so an unclamped sleep can park
+    past the grace and silently widen the window this is supposed to bound.
+    """
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _recording_sleep(delay):
+        slept.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(_manager_module.asyncio, "sleep", _recording_sleep)
+
+    server = _FlakyServer(fail_times=10**9)
+    with pytest.raises(KeyError):
+        await _manager_with(server)._resolve_artifact_manager_proxy()
+
+    assert slept, "expected at least one backoff sleep"
+    assert sum(slept) <= fast_grace + 1e-6, (
+        f"slept {sum(slept):.3f}s in total against a {fast_grace:.3f}s grace"
+    )
+    assert max(slept) <= fast_grace + 1e-6
+
+
+def test_the_boot_path_resolves_THROUGH_the_retry_and_not_around_it():
+    """TRIPWIRE: the call site, not the helper.
+
+    Every test above would still pass if `complete_initialization` went back to
+    calling `get_service("public/artifact-manager")` directly — the helper would
+    simply be dead code. This asserts the wiring, so a future refactor cannot
+    reintroduce the unprotected resolution while the suite stays green.
+    """
+    source = inspect.getsource(AppsManager.complete_initialization)
+    tree = ast.parse(textwrap.dedent(source))
+
+    bare_resolutions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and any(
+            isinstance(arg, ast.Constant) and arg.value == "public/artifact-manager"
+            for arg in node.args
+        )
+    ]
+    assert not bare_resolutions, (
+        "complete_initialization resolves 'public/artifact-manager' directly "
+        "again; it must go through _resolve_artifact_manager_proxy, which is the "
+        "only thing that survives a Hypha gap at boot"
+    )
+
+    retry_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_resolve_artifact_manager_proxy"
+    ]
+    assert len(retry_calls) == 1, (
+        f"expected exactly one call to _resolve_artifact_manager_proxy, "
+        f"found {len(retry_calls)}"
+    )
