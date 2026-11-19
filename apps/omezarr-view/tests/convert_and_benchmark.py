@@ -42,7 +42,7 @@ import numpy as np
 def provenance(extra: Dict[str, Any]) -> Dict[str, Any]:
     def _git(*a: str) -> str:
         try:
-            return subprocess.run(["git", "-C", "/data/nmechtel/bioengine", *a],
+            return subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[3]), *a],
                                   capture_output=True, text=True,
                                   timeout=10).stdout.strip()
         except Exception:
@@ -191,10 +191,10 @@ def main() -> int:
                                      "Vanderbilt-Spraggins-Kidney-MxIF.ome.tif")
     ap.add_argument("--dataset", default="spraggins-kidney")
     ap.add_argument("--base", required=True, help="served view base url (Tier B)")
-    ap.add_argument("--work", default="/data2/nmechtel/omezarr-bench")
+    ap.add_argument("--work", default=".omezarr-bench")
     ap.add_argument("--n", type=int, default=100)
     ap.add_argument("--seed", type=int, default=11)
-    ap.add_argument("--out", default="/data/nmechtel/bioengine-paper/analysis/"
+    ap.add_argument("--out", default="analysis/"
                                      "results/omezarr_view/figure_assets/"
                                      "converted_copy_benchmark.json")
     ap.add_argument("--skip-convert", action="store_true")
@@ -277,6 +277,7 @@ def main() -> int:
         "same cache and should not be pooled.",
         "Conversion wall-clock and on-disk size are measured here, not estimated.",
     ]
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(result, indent=1) + "\n")
     print("->", args.out)
     return 0

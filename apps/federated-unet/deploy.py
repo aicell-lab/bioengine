@@ -12,6 +12,7 @@ sites in any physical sense.
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -24,20 +25,26 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVER_URL = "https://hypha.aicell.io"
 ARTIFACT = "bioimage-io/federated-unet"
 
-EUROPA = "ws-user-github|49943582/bioengine-worker-europa"
+#: The single-machine site ("site A"). Its worker service id is deployment-specific:
+#: set FEDUNET_SITE_A_WORKER to "<workspace>/<service>". The default is a placeholder,
+#: not a real service id, so an unset variable cannot point at somebody's worker.
+SITE_A = os.environ.get("FEDUNET_SITE_A_WORKER", "<workspace>/bioengine-worker")
+#: Label appended to each instance's site_name on site A. Set it to keep a previous
+#: run's naming when rebuilding that run.
+SITE_A_LABEL = os.environ.get("FEDUNET_SITE_A_LABEL", "site-a")
 DENBI = "bioimage-io/bioengine-worker-denbi"
 
 WORKERS = {
-    EUROPA: {"token_key": "HYPHA_TOKEN", "description": "Europa single-machine worker, Stockholm"},
+    SITE_A: {"token_key": "HYPHA_TOKEN", "description": "single-machine worker (site A)"},
     DENBI: {"token_key": "BIOIMAGE_IO_TOKEN", "description": "de.NBI cloud worker, Germany"},
 }
 
 #: How many replicas of this app each worker admits **with the cluster to
 #: itself**, measured rather than assumed. This is not the placement ceiling on
-#: a shared cluster: co-tenants take Ray memory first, so europa can admit zero
+#: a shared cluster: co-tenants take Ray memory first, so site A can admit zero
 #: of these while its VRAM_MB is nearly untouched (2026-09-10: 1536 MiB of 30720
 #: free, 21316 of 24576 VRAM_MB free). Check the worker before deploying.
-#: Europa's worker sees one 24576 MB RTX 3090 and advertises it as
+#: Site A's worker sees one 24576 MB RTX 3090 and advertises it as
 #: VRAM_MB, so at gpu_memory_mb 5120 the GPU allows floor(24576 / 5120) = 4; its
 #: Ray cluster has 30 GiB of memory shared with other apps, so memory_mb 6144
 #: allows floor(30 / 6) = 5 and the GPU is the binding resource again. (At the
@@ -46,7 +53,7 @@ WORKERS = {
 #: 5120 / 15360 = 0.33 per replica and one T4 takes 3 x 0.33 = 0.99. Both
 #: ceilings are set by the declarations, not by the app — a replica measures
 #: 0.65 GiB of RAM and ~2.5 GB of VRAM, so both still carry about 2x headroom.
-PLACEMENT = {EUROPA: 4, DENBI: 3}
+PLACEMENT = {SITE_A: 4, DENBI: 3}
 
 LAYOUTS = {
     # The consortium: one client per public dataset, so a client boundary is an
@@ -66,9 +73,9 @@ LAYOUTS = {
         # val blocks, which is what puts a 16x span on the size axis.
         "n_train": None,
         "clients": {
-            "bbbc038-fluo": (EUROPA, ["bbbc038-fluo"]),
-            "bbbc039": (EUROPA, ["bbbc039"]),
-            "nuinsseg": (EUROPA, ["nuinsseg"]),
+            "bbbc038-fluo": (SITE_A, ["bbbc038-fluo"]),
+            "bbbc039": (SITE_A, ["bbbc039"]),
+            "nuinsseg": (SITE_A, ["nuinsseg"]),
             "bbbc038-histo": (DENBI, ["bbbc038-histo"]),
             "cellbindb": (DENBI, ["cellbindb"]),
             "kromp": (DENBI, ["kromp"]),
@@ -76,7 +83,7 @@ LAYOUTS = {
         # The oracle holds every client's data, which includes the 1.6 GB
         # NuInsSeg archive, so it goes on the worker with the larger disk.
         "pooled": (
-            EUROPA,
+            SITE_A,
             ["bbbc038-fluo", "bbbc038-histo", "bbbc039", "cellbindb", "nuinsseg", "kromp"],
         ),
     },
@@ -94,12 +101,12 @@ LAYOUTS = {
         ),
         "n_train": 55,
         "clients": {
-            "fluo-0": (EUROPA, ["bbbc038-fluo@0/3"]),
-            "fluo-1": (EUROPA, ["bbbc038-fluo@1/3"]),
+            "fluo-0": (SITE_A, ["bbbc038-fluo@0/3"]),
+            "fluo-1": (SITE_A, ["bbbc038-fluo@1/3"]),
             "fluo-2": (DENBI, ["bbbc038-fluo@2/3"]),
             "histo": (DENBI, ["bbbc038-histo"]),
         },
-        "pooled": (EUROPA, ["bbbc038-fluo@*/3", "bbbc038-histo"]),
+        "pooled": (SITE_A, ["bbbc038-fluo@*/3", "bbbc038-histo"]),
     },
     # The original two-site pairings, kept so either earlier run can be rebuilt.
     "caricature": {
@@ -110,10 +117,10 @@ LAYOUTS = {
         ),
         "n_train": 55,
         "clients": {
-            "site-a": (EUROPA, ["dsb2018-fluo"]),
+            "site-a": (SITE_A, ["dsb2018-fluo"]),
             "site-b": (DENBI, ["bbbc010-worms"]),
         },
-        "pooled": (EUROPA, ["dsb2018-fluo", "bbbc010-worms"]),
+        "pooled": (SITE_A, ["dsb2018-fluo", "bbbc010-worms"]),
     },
     "acquisition": {
         "caveat": (
@@ -122,10 +129,10 @@ LAYOUTS = {
         ),
         "n_train": 55,
         "clients": {
-            "site-a": (EUROPA, ["bbbc038-fluo"]),
+            "site-a": (SITE_A, ["bbbc038-fluo"]),
             "site-b": (DENBI, ["bbbc038-histo"]),
         },
-        "pooled": (EUROPA, ["bbbc038-fluo", "bbbc038-histo"]),
+        "pooled": (SITE_A, ["bbbc038-fluo", "bbbc038-histo"]),
     },
 }
 
@@ -173,7 +180,7 @@ async def main() -> None:
             application_id=f"fedunet-{name}",
             application_kwargs={
                 "FederatedUNetSite": {
-                    "site_name": f"{name}-{'europa' if worker_prefix == EUROPA else 'denbi'}",
+                    "site_name": f"{name}-{SITE_A_LABEL if worker_prefix == SITE_A else 'denbi'}",
                     "role": role,
                     "datasets": datasets,
                 }

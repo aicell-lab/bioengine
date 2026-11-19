@@ -18,11 +18,11 @@ the default is `acquisition-4site`:
 
 | Instance | Where | Data | Role |
 |---|---|---|---|
-| `fedunet-fluo-0` | Europa worker | `bbbc038-fluo@0/3` | participant |
-| `fedunet-fluo-1` | Europa worker | `bbbc038-fluo@1/3` | participant |
+| `fedunet-fluo-0` | single-machine worker (site A) | `bbbc038-fluo@0/3` | participant |
+| `fedunet-fluo-1` | single-machine worker (site A) | `bbbc038-fluo@1/3` | participant |
 | `fedunet-fluo-2` | de.NBI worker, GPU node | `bbbc038-fluo@2/3` | participant |
 | `fedunet-histo` | de.NBI worker, GPU node | `bbbc038-histo` | participant |
-| `fedunet-pooled` | Europa worker | `bbbc038-fluo@*/3` + `bbbc038-histo` | pooled-oracle control |
+| `fedunet-pooled` | single-machine worker (site A) | `bbbc038-fluo@*/3` + `bbbc038-histo` | pooled-oracle control |
 
 The two earlier two-site pairings are kept as the `caricature` and `acquisition`
 layouts so either previous run can be rebuilt unchanged.
@@ -72,10 +72,10 @@ than assumed (`PLACEMENT` in `deploy.py`):
 
 | Worker | Admission mechanism | Binding resource | Replicas of this app |
 |---|---|---|---|
-| Europa | `VRAM_MB` packing (single-machine head) | host RAM, 30 GiB | ⌊30 / 8⌋ = 3 |
+| Single-machine site (A) | `VRAM_MB` packing (single-machine head) | host RAM, 30 GiB | ⌊30 / 8⌋ = 3 |
 | de.NBI | GPU **fraction** (Kubernetes, no `VRAM_MB`) | GPU fraction, 0.40 each | ⌊1 / 0.40⌋ = 2 |
 
-On Europa the GPU is *not* what runs out: `VRAM_MB` packing would allow
+On the single-machine site the GPU is *not* what runs out: `VRAM_MB` packing would allow
 ⌊24576 / 6144⌋ = 4, but the Ray cluster's 30 GiB of memory is shared with other
 apps and `memory_mb` is what caps it. Only one of de.NBI's three T4 nodes has
 free GPU fraction; the other two are fully booked by whole-GPU apps.
