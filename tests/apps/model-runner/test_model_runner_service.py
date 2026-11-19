@@ -219,7 +219,7 @@ async def test_model_test_cache_skip(model_runner):
     )
     assert result.get("status") == "passed"
 
-    # A verdict must name the hardware and the worker that produced it (#0042).
+    # A verdict must name the hardware and the worker that produced it.
     env = {str(r[0]): str(r[1]) for r in result.get("env") or [] if len(r) >= 2}
     assert env.get("replica_accelerator") not in (None, "", "unknown")
     # Must be the worker service id, not a per-connection client id: the latter
@@ -231,7 +231,7 @@ async def test_model_test_cache_skip(model_runner):
 @pytest.mark.requires_gpu
 async def test_custom_env_model_skips_the_default_env_inference_check(model_runner):
     """A custom-environment model must not be recorded as FAILING a check that
-    runs in an environment it never claimed to work in (#0079).
+    runs in an environment it never claimed to work in.
 
     Uses CUSTOM_ENV_MODEL_ID, not TEST_MODEL_ID: ``custom_environment=True`` is a
     request, not a guarantee — a model that declares no environment is silently
