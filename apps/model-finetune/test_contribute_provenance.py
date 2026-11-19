@@ -7,10 +7,10 @@ apart from one written before versions were stamped at all (``pool.py``,
 0.27.6 moved every ``l2_from_base`` value without changing the record's shape, so
 two responses of the same shape can hold values computed by different releases.
 
-The stored ``metadata.json`` carried ``app_version`` from 0.27.14 (#0116). The dict
+The stored ``metadata.json`` carried ``app_version`` from 0.27.14. The dict
 returned to the caller did not — and that dict, not the stored file, is what a
 depositing site keeps. A campaign auditing 92 saved responses found five shapes it
-could not date and had to reconstruct provenance by joining across arms (#0140).
+could not date and had to reconstruct provenance by joining across arms.
 
 Asserted on the real ``contribute`` coroutine with its collaborators stubbed, and by
 comparing the returned value against the metadata bytes actually PUT — not against a
@@ -63,7 +63,7 @@ def fake_training(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _Runtime:
-    # model_type is accepted because the entry passes it (#0070): the base commitment is
+    # model_type is accepted because the entry passes it: the base commitment is
     # built on the runtime, so the entry has to say which stock base to fall back to.
     async def prepare_contribution(self, session_id: str, weights_put_url: str,
                                    model_type: str = "cpsam") -> Dict[str, Any]:

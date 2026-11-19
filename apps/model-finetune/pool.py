@@ -1835,7 +1835,7 @@ def append_contribution(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[st
     with no basis keeps having none and resolves by date, which is the one direction
     that is a proof rather than a guess.
 
-    REFUSES a second member for a digest the index already holds (#0376). A client
+    REFUSES a second member for a digest the index already holds. A client
     that retries a deposit after a gateway 504 ate the response — the correct thing
     for it to do, and 4 of 92 deposits on the r2 corpus needed it — otherwise
     becomes two members and that site is silently weighted 2:1 in the uniform mean.
@@ -2218,9 +2218,9 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
 
     baseline = index.get("baseline") or {}
     # Two independent corrections land on this one projection and both have to survive:
-    # _corrected_community (#0418) rewrites the pointer's own selection_metric and
+    # _corrected_community rewrites the pointer's own selection_metric and
     # witness_metric, which are NOT the merge records corrected alongside the soups,
-    # while sha256_provenance (#0417) says which of the two digests the pointer's sha256
+    # while sha256_provenance says which of the two digests the pointer's sha256
     # is. They are orthogonal, and the order between them is interchangeable — measured,
     # not assumed: reversing these two statements leaves the app suite identical at 229
     # passed, 2 skipped, because _corrected_community copies with dict(community) and so

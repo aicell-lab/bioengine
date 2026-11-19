@@ -40,7 +40,7 @@ logger = bioengine.logger
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
 # runtime_env install did not take fails instead of being advertised as ready
-# (#0371). Keep this list equal to what the bodies actually import: it is a
+#. Keep this list equal to what the bodies actually import: it is a
 # readiness gate, not a restatement of requirements-runtime-cellpose.txt, and a
 # module nothing imports would fail a replica that can serve every call.
 # ``numpy`` is absent on purpose — it is imported at module scope above, so a
@@ -94,7 +94,7 @@ def _read_pip(name: str) -> List[str]:
     # One replica, not autoscaled. Serve chooses which replica to stop from node
     # occupancy and replica age only, never from work in progress, so a second replica
     # makes the one holding a live merge removable — and min_replicas bounds the count,
-    # not the identity (#0088). A burst is absorbed by one replica regardless, since
+    # not the identity. A burst is absorbed by one replica regardless, since
     # max_ongoing_requests admits ten of them before an upscale can take any.
     autoscaling_config={
         "min_replicas": 1,
@@ -139,7 +139,7 @@ class CellposeRuntime:
     @bioengine.smoke_test
     async def _import_runtime_stack(self) -> None:
         """Import this backend's ML stack once, at startup, and fail the replica if
-        it is not there (#0371).
+        it is not there.
 
         A replica whose ``runtime_env`` install did not take answered the health
         probe correctly and was advertised as ready while **every** call raised
@@ -597,7 +597,7 @@ class CellposeRuntime:
 
         Learned tensors are averaged; non-learned ones (``diam_labels``) are carried
         from the base unchanged, and a key the base does not declare fails the merge
-        (#0070).
+       .
         """
         import pool
 
@@ -745,7 +745,7 @@ class CellposeRuntime:
         The checkpoint is torch + a runtime-local file, neither of
         which the torch-free CPU entry can touch, so all of it happens here.
 
-        ``base_commitment`` is produced HERE for exactly that reason (#0070). The entry
+        ``base_commitment`` is produced HERE for exactly that reason. The entry
         writes it into ``pool_index.json`` at pool creation but cannot build it: a
         commitment needs the base's own state_dict, and a constant or manifest-derived
         value would reinstate the key-set assumption the ruling's amendment removed.

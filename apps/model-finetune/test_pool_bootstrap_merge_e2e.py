@@ -203,7 +203,7 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
 
     assert index.get("base_commitment") is not None, (
         "contribute bootstrapped a pool with base_commitment: None — the record it wrote "
-        "can never merge (#0070). The runtime supplied one; the entry dropped it."
+        "can never merge. The runtime supplied one; the entry dropped it."
     )
     # Complete, not merely present: a partial record raises later and further away.
     written = pool.assert_base_commitment(index["base_commitment"])

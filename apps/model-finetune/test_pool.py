@@ -352,7 +352,7 @@ class TestDirectionalGuard:
         "from PAGE_RUNGS rather than assuming the branch tip still sits on "
         "it. The rung itself is checked "
         "unconditionally by test_schema_version_is_the_rung_this_backend_"
-        "targets, so this skip no longer hides a wrong SCHEMA_VERSION (#0419)"
+        "targets, so this skip no longer hides a wrong SCHEMA_VERSION"
     ),
 )
 def test_matches_fixture_corpus():
@@ -462,7 +462,7 @@ def test_cap_is_actually_enforced_not_just_approached(tmp_path):
     assert remaining == ["member-8.pt", "member-9.pt"]
 
 
-# ── a deposit record must always name the app version that wrote it (#0116) ──
+# ── a deposit record must always name the app version that wrote it ──
 #
 # 0.27.6 moved every ``l2_from_base`` value without touching ``schema_version``,
 # so the record's shape cannot date its own contents. These pin the field that
@@ -511,7 +511,7 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
     # this line the assertion above is satisfied by both sides being wrong
     # together, which is the whole of #0419. This line carries no weight of its
     # own unless BACKEND_TARGETS_RUNG is independent of pool.SCHEMA_VERSION —
-    # see test_the_targeted_rung_is_written_down_and_not_derived (#0442), which
+    # see test_the_targeted_rung_is_written_down_and_not_derived, which
     # is what keeps it so. It is the quieter of the two sites a derivation
     # silences, and the one nobody had reported.
     assert _major_minor(m["schema_version"]) == BACKEND_TARGETS_RUNG
@@ -715,7 +715,7 @@ def test_the_check_is_not_self_referential(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# ...and the target must be WRITTEN DOWN, not computed (#0442)
+# ...and the target must be WRITTEN DOWN, not computed
 # ---------------------------------------------------------------------------
 #
 # The test above monkeypatches pool.SCHEMA_VERSION AFTER import, so it can only

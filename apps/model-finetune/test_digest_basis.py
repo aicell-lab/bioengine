@@ -977,7 +977,7 @@ class _Runtime:
     async def score_soup(self, specs, imgs, gts, diam_mean,
                          base_commitment=None) -> Dict[str, Any]:
         # One per-image score per image of the split, as the real runtime returns
-        # (#0121). Uniform, so the mean is exactly the ``f1`` the caller chose —
+        #. Uniform, so the mean is exactly the ``f1`` the caller chose —
         # aggregate() refuses a record whose aggregate is not the mean of the
         # vector beside it, so a stub returning an arbitrary vector would make
         # every branch below fail for a reason that is not under test here.

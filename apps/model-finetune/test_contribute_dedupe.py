@@ -1,7 +1,7 @@
 """Re-depositing a checkpoint the pool already holds must not append a second
 member — and must not wedge the pool artifact on the way out.
 
-The defect (#0376): ``contribute`` appended unconditionally. A client whose
+The defect: ``contribute`` appended unconditionally. A client whose
 response was eaten by a gateway timeout retries, which is the correct thing for
 it to do — 4 of 92 deposits on the r2 corpus needed it, with the 504 threshold
 bracketed at 94.4–100.8 s — and the pool then held the same bytes twice. The

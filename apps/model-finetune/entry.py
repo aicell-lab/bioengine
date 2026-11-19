@@ -88,7 +88,7 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     """Whether this cluster can place the GPU runtimes the enabled backends need.
 
     Exists because getting this wrong is otherwise INVISIBLE from the running
-    system (#0370). Two enabled backends book two whole GPUs even to serve one
+    system. Two enabled backends book two whole GPUs even to serve one
     request; on a cluster whose second GPU is never free the second replica simply
     never schedules. Measured 2026-11-13 on a one-GPU ``external-cluster`` worker: the
     unplaceable runtime stays ``UPDATING`` with its replica ``STARTING``, the
@@ -403,7 +403,7 @@ class _RecognisedRedeposit(Exception):
     # replica-local; the records a caller polls are on disk, so a teardown
     # between calls is invisible to the frontend.
     #
-    # initial_replicas is 1, not 0, so the entry can SPEAK at deploy time (#0370).
+    # initial_replicas is 1, not 0, so the entry can SPEAK at deploy time.
     # Measured 2026-11-13 on a one-GPU external cluster with both backends on: a
     # GPU runtime that cannot be placed leaves the app in DEPLOYING forever, the
     # proxy registers its Hypha service only once every sibling is serviceable, so
@@ -507,7 +507,7 @@ class EntryApp:
         self._log_gpu_placement()
 
     def _log_gpu_placement(self) -> None:
-        """Say in the entry's own log whether the GPU runtimes can be placed (#0370).
+        """Say in the entry's own log whether the GPU runtimes can be placed.
 
         This is the signal that was missing. The entry replica reaches HEALTHY on
         any node, so these lines are in ``deployments.<entry>.logs`` — which
@@ -1126,8 +1126,8 @@ class EntryApp:
             })
             # Long-running: this await holds one GPU runtime replica for the whole
             # training run, and a concurrent infer queues behind it on that same
-            # replica — at the effective target of 2 (#0091) two calls in flight
-            # ask for one replica, not two (#0097).
+            # replica — at the effective target of 2 two calls in flight
+            # ask for one replica, not two.
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
             # so a session waiting here is not false-flagged STOPPED.
@@ -1177,7 +1177,7 @@ class EntryApp:
         ``placement.sufficient`` is False and ``placement.advice`` names
         ``MODEL_FINETUNE_BACKENDS``; without it the only symptom is a backend
         reading ``unavailable`` forever while the deployment reports
-        ``UPSCALING``, which never times out (#0370)."""
+        ``UPSCALING``, which never times out."""
         import training
 
         microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
@@ -1213,7 +1213,7 @@ class EntryApp:
             "models": models,
             "parameters": self._training_parameter_schema(),
             # Why a backend reads 'runtime unavailable' when nothing is broken
-            # (#0370): on a cluster with fewer GPUs than enabled backends the
+            #: on a cluster with fewer GPUs than enabled backends the
             # runtime never schedules, and the only other symptom is a permanent
             # UPSCALING that never times out. Answered CPU-side; never wakes a GPU.
             "placement": _gpu_placement_report(self._enabled_backends),
@@ -2540,7 +2540,7 @@ class EntryApp:
             if refusal:
                 raise ValueError(f"aggregate() refused this merge: {refusal}")
 
-            # ---- Provenance, before a single byte is souped (#0139) ----------
+            # ---- Provenance, before a single byte is souped ----------
             #
             # Until now nothing checked that a member's bytes were the bytes its
             # contribution attested to. The digest was written at upload and then

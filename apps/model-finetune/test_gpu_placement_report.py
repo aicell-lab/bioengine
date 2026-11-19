@@ -42,7 +42,7 @@ def _with_cluster_gpus(monkeypatch, total, free=_SAME):
     total and ``available_resources()`` is what is free, and the report keys its
     verdict to the first while reporting the second. A harness that set only a total
     could not express the shape the row was filed about — deNBI, 4 GPUs, 0 free —
-    which is the gap the re-review found (#0370). ``free`` defaults to ``total``,
+    which is the gap the re-review found. ``free`` defaults to ``total``,
     i.e. an idle cluster, so a case that is not about the distinction stays short.
 
     ``entry`` does not import ray at module scope — the report imports it lazily so a

@@ -5,7 +5,7 @@ contributor's training data. App 0.27.15 (commit ``e762a17b5af5``) retracted bot
 because split A and split B arrive as caller-supplied arrays and this app cannot
 check either claim — the most it can say is that the coordinator declared it. The
 retraction changed the constants. It did not change the records already written, and
-those records are still read back and shown to contributors (#0418).
+those records are still read back and shown to contributors.
 
 The fix here is a READ-PATH correction plus a WRITE-SIDE refusal, and the two halves
 are tested apart because they fail apart: a reader that stopped matching serves the

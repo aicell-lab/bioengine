@@ -288,7 +288,7 @@ stays `UPDATING` with its replica `STARTING`, the application stays `DEPLOYING`,
 none of it is a failure state and none of it times out — so `deploy_app` returns
 successfully and `get_app_status` reads like a slow first start forever. The
 CPU-only entry deployment schedules on any node, so it is alive to say what the
-GPU deployments cannot (#0370):
+GPU deployments cannot:
 
 - a `⚠ GPU placement: …` **warning in the entry's log**, which
   `get_app_status(application_ids=[...])` already returns under
@@ -397,7 +397,7 @@ Two things worth knowing when you see it:
   - *Per deployment, indefinitely.* Serve then **replaces** the condemned replica
     and the cycle repeats, because its circuit breaker never trips for a version
     whose replicas start successfully and fail only afterwards. Measured end to end
-    on a real `serve.run` (backlog `#0387`) over 100 health-check periods — that
+    on a real `serve.run` over 100 health-check periods — that
     probe ran at `health_check_period_s=1.0`, so ≈100 s in all, **not** 100 × the
     30 s above: **105 calls, 0 failed, 84 of them answered by a replica that
     already knew its own smoke test had failed, across 22 distinct replica pids.**

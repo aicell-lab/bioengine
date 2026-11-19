@@ -185,7 +185,7 @@ async def test_the_inspection_cannot_start_while_the_merge_holds_the_semaphore(r
     fired = await loop.run_in_executor(None, _INSPECTION_RAN.wait, 3.0)
     assert not fired, (
         "the inspection ran while _soup_sem was held — the deposit's state dicts can still "
-        "sum with a concurrent merge's (#0087)"
+        "sum with a concurrent merge's"
     )
     assert runtime._started == []
     assert not task.done()
