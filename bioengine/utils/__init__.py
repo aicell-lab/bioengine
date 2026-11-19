@@ -29,6 +29,12 @@ from .network import (
     get_internal_ip,
     is_transient_connect_error,
 )
+from .redaction import (
+    SECRET_ENV_VAR_PREFIX,
+    SECRET_MASK,
+    is_secret_env_var,
+    looks_like_secret,
+)
 from .permissions import check_permissions, create_context
 from .requirements import get_pip_requirements, update_requirements
 from .stale_service import (

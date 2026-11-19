@@ -31,7 +31,10 @@ from bioengine.utils import (
     create_logger,
     ensure_applications_collection,
     get_static_site_url,
+    is_secret_env_var,
     latest_committed_version,
+    looks_like_secret,
+    SECRET_MASK,
     stale_service_kind,
 )
 
@@ -1413,7 +1416,13 @@ class AppsManager:
                 if key.startswith("_"):
                     # Remove the underscore prefix and mask the value
                     new_key = key[1:]  # Remove first character (_)
-                    processed_vars[new_key] = "*****"
+                    processed_vars[new_key] = SECRET_MASK
+                elif looks_like_secret(value):
+                    # Credential-shaped value under an ordinary name. Mask it,
+                    # but do NOT touch the key: there is no prefix to strip, and
+                    # renaming it would make the status report disagree with
+                    # what the caller actually passed.
+                    processed_vars[key] = SECRET_MASK
                 else:
                     processed_vars[key] = value
 
@@ -3574,7 +3583,10 @@ class AppsManager:
                         f"Value for '{key}' in application_env_vars must be a dictionary."
                     )
 
-            # Construct the environment variables string, hide secret env vars starting with underscore as *****
+            # Construct the environment variables string. A value is hidden if its
+            # key opts in with an underscore OR the value itself is credential-
+            # shaped: keying only on the name failed open for every spelling
+            # nobody anticipated, and this log outlives the pod that wrote it.
             env_vars_str = (
                 ", ".join(
                     f"{deployment_class}: "
@@ -3582,14 +3594,14 @@ class AppsManager:
                         [
                             f"{key}={value!r}"
                             for key, value in env_vars.items()
-                            if not key.startswith("_")
+                            if not is_secret_env_var(key, value)
                         ]
                     )
                     + " ".join(
                         [
-                            f'{key}="*****"'
-                            for key in env_vars.keys()
-                            if key.startswith("_")
+                            f'{key}="{SECRET_MASK}"'
+                            for key, value in env_vars.items()
+                            if is_secret_env_var(key, value)
                         ]
                     )
                     for deployment_class, env_vars in application_env_vars.items()
