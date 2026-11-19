@@ -27,13 +27,24 @@ setup() {
         cp "$(dirname "$HOOK")/match-pr-only.sh" "$ROOT/hooks/"
         cp "$(dirname "$HOOK")/pr-only-paths.txt" "$ROOT/hooks/"
         chmod +x "$ROOT/hooks/pre-push" "$ROOT/hooks/match-pr-only.sh"
+        # The hook's version gate runs ../scripts relative to itself and refuses
+        # when it is missing, so a sandbox without it refuses every push.
+        rm -rf "$ROOT/scripts"
+        cp -R "$(dirname "$HOOK")/../scripts" "$ROOT/scripts"
     else
         rm -f "$ROOT/hooks/pre-push"
     fi
     # seed main so later pushes are incremental rather than initial
-    mkdir -p docs && echo seed > docs/seed.md
+    # The hook's worker version gate reads both version files on every push to
+    # main, so main has to carry a matching pair or every arm is refused by the
+    # version gate instead of being judged by the path policy. The seed touches
+    # a PR-only path, so it is pushed past the hook: it is setup, not an arm.
+    mkdir -p docs bioengine && echo seed > docs/seed.md
+    printf '[project]\nname = "seed"\nversion = "1.0.0"\n' > pyproject.toml
+    printf '__version__ = "1.0.0"\n' > bioengine/_version.py
     git add -A && git commit -q -m seed
-    git push -q origin HEAD:refs/heads/main 2>/dev/null
+    git push -q --no-verify origin HEAD:refs/heads/main 2>/dev/null \
+        || { echo "setup: could not seed main" >&2; exit 2; }
 }
 
 # arm: <name> <file> <target-ref> <expect: REFUSE|ALLOW> [with-hook|no-hook]
