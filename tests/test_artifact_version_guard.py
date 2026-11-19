@@ -94,7 +94,7 @@ def _collision_message(new_version, existing_versions):
         _enforce_version_increases(
             new_version=new_version,
             existing_versions=existing_versions,
-            artifact_id="ws-user-github|49943582/nucleus-profiler",
+            artifact_id="ws-user-test|1/nucleus-profiler",
         )
     return str(exc.value)
 

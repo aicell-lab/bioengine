@@ -761,7 +761,7 @@ def test_every_detected_runtime_is_also_an_accepted_choice():
     assert {"auto", "native"} <= accepted
 
 
-# ── Host resource census (svamp #0066) ───────────────────────────────────────
+# ── Host resource census ───────────────────────────────────────
 #
 # The census only works if every worker on the host mounts the SAME directory,
 # which is why the launcher owns it rather than each site's deployment template.
@@ -785,9 +785,9 @@ def test_the_worker_advertises_under_its_container_name():
     container id — unique, but unrecognisable in "co-tenant 8da84e16af4c".
     """
     env = _subprocess_env(
-        "docker", None, None, "bioengine-worker-europa", census=True
+        "docker", None, None, "bioengine-worker-dev", census=True
     )
-    assert env["BIOENGINE_WORKER_ID"] == "bioengine-worker-europa"
+    assert env["BIOENGINE_WORKER_ID"] == "bioengine-worker-dev"
     assert env["BIOENGINE_HOST_CENSUS_DIR"] == CONTAINER_CENSUS_DIR
 
 
@@ -835,7 +835,7 @@ def test_native_mode_has_no_census_mount():
     result = _run(["start", "--dry-run", "--runtime", "native", "--", "--mode", "single-machine"])
     assert result.exit_code == 0
     assert CONTAINER_CENSUS_DIR not in result.output
-# ── Container memory limit (svamp #0125) ─────────────────────────────────────
+# ── Container memory limit ─────────────────────────────────────
 #
 # Ray sizes its memory monitor from `min(cgroup limit, host total)`. With no
 # cgroup limit it reads the host's total, so an unlimited worker only starts

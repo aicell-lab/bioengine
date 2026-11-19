@@ -9,7 +9,7 @@ global delete of a record only a restart of a different process could restore,
 and every other worker on the directory lost a data server that was still
 answering.
 
-Measured on europa 2026-11-13 against a six-worker fleet, bioengine 0.16.1: the
+Measured 2026-11-13 against a six-worker fleet, bioengine 0.16.1: the
 data server ``Up 43 minutes (healthy)`` and answering ``/ping`` with HTTP 200
 from inside a worker container, the discovery directory empty, and
 ``get_worker_info().datasets == {}`` for the worker on the shared directory

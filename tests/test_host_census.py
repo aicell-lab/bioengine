@@ -184,9 +184,9 @@ def test_no_co_tenants_never_warns() -> None:
 
 
 def test_same_device_warns() -> None:
-    """Measured live on europa: two workers both handed DeviceIDs ["1"]."""
+    """Measured live on a development host: two workers both handed DeviceIDs ["1"]."""
     warning = host_census.gpu_co_tenancy_warning(
-        _advert("worker-europa", gpu_device_ids=["1"]),
+        _advert("worker-b", gpu_device_ids=["1"]),
         [_advert("worker-tabula", gpu_device_ids=["1"])],
     )
     assert warning is not None
@@ -245,7 +245,7 @@ def test_cpu_only_workers_never_collide() -> None:
 def test_cpu_oversubscription_is_not_a_warning() -> None:
     """CPU is time-shared: oversubscribing it costs throughput and kills nothing.
 
-    europa runs 16 CPUs with per-worker defaults of 8 and has never died of it,
+    a development host runs 16 CPUs with per-worker defaults of 8 and has never died of it,
     so a warning here would fire on a correct configuration — which is what
     teaches people to ignore the memory and GPU warnings that do matter.
     """
@@ -283,8 +283,8 @@ def test_census_is_inert_without_the_env_var(monkeypatch) -> None:
 
 
 def test_worker_id_prefers_the_container_name(monkeypatch) -> None:
-    monkeypatch.setenv(host_census.WORKER_ID_ENV, "bioengine-worker-europa")
-    assert host_census.worker_id() == "bioengine-worker-europa"
+    monkeypatch.setenv(host_census.WORKER_ID_ENV, "bioengine-worker-dev")
+    assert host_census.worker_id() == "bioengine-worker-dev"
     monkeypatch.delenv(host_census.WORKER_ID_ENV)
     assert host_census.worker_id()  # hostname fallback, whatever it is
 

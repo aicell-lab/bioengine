@@ -12,7 +12,7 @@ from bioengine.cluster.proxy_actor import BioEngineProxyActor
 
 _PLAIN_CLASS = BioEngineProxyActor.__ray_metadata__.modified_class
 
-#: One Europa-shaped head node: an RTX 3090 advertising its VRAM, with four
+#: One development-host-shaped head node: an RTX 3090 advertising its VRAM, with four
 #: federated-unet replicas holding 5120 MB and a 0.01 GPU handle each.
 _HEAD = {
     "node:172.17.0.3": 1.0,
