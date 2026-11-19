@@ -1,11 +1,11 @@
-"""#0523 — every ``weights_sha256`` the wire publishes carries a basis beside it, and
+"""every ``weights_sha256`` the wire publishes carries a basis beside it, and
 the basis it carries is the one the CONTRIBUTION resolver gives.
 
-`#0509` stamped ``weights_sha256_basis`` on every new stored contribution. But a
+the stored-basis stamp stamped ``weights_sha256_basis`` on every new stored contribution. But a
 bioimage.io client does not read the stored record; it reads what ``pool_wire_state``
 publishes, and that carried the number with no basis next to it — so from outside the
 pool, two digests computed under different bases stayed indistinguishable. That is the
-harm `#0509`'s own lede described, surviving `#0509`'s fix because one row is about
+harm the stored-basis stamp's own lede described, surviving the stored-basis stamp's fix because one row is about
 what is STORED and this one is about what is PUBLISHED.
 
 Read the payload BACK from the call rather than inspecting the writer: a test that
@@ -321,7 +321,7 @@ def test_an_unstamped_contribution_is_the_file_basis_not_undetermined() -> None:
     """Named separately from the arm above because it is the specific regression, and a
     reader who sees only this name should know what went wrong.
 
-    An unstamped contribution is every deposit made before `#0509`'s stamping landed —
+    An unstamped contribution is every deposit made before the stored-basis stamp's stamping landed —
     the real backlog this attribution exists for. ``prepare_contribution`` has computed
     ``weights_sha256`` with ``sha256_file`` on every build that ever wrote one, so an
     absent stamp proves the file basis rather than leaving it open. Publishing
@@ -358,7 +358,7 @@ def test_the_deposit_date_does_not_change_the_answer() -> None:
 def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
     """Clause 2. 'no digest stored' and 'a digest whose basis is known' must not read
     the same, and the absent answer must be DIGEST_BASIS_ABSENT rather than a guess at
-    the file basis — a silent default is the defect #0509 was filed for.
+    the file basis — a silent default is the defect the stored-basis stamp was filed for.
 
     Note the two absences this separates: no DIGEST at all (this record, and it is not
     attributable) versus no STAMP on a digest that exists (``c-unstamped``, and it is
@@ -463,7 +463,7 @@ def test_the_pinned_contribution_field_set_is_not_widened() -> None:
 
 
 def test_the_sibling_maps_still_stand() -> None:
-    """The new key is added alongside, not in place of, what #0417 and #0509 put here."""
+    """The new key is added alongside, not in place of, what the digest-basis rule and the stored-basis stamp put here."""
     dp = _wire()["digest_provenance"]
     assert set(dp) == {"soups", "contributions", "current_community"}, (
         f"digest_provenance should carry exactly three joins, found {sorted(dp)}"

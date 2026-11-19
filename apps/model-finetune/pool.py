@@ -124,7 +124,7 @@ _RETRACTED_BASIS = {
 # Appended to a corrected record so the substitution is visible rather than seamless.
 # A contributor comparing what the page shows against a stored record they fetched
 # themselves would otherwise find a difference with no explanation, which is the same
-# "is this corrupt?" dead end #0417 describes for global_sha256.
+# "is this corrupt?" dead end described for global_sha256.
 BASIS_CORRECTION_NOTE = (
     "[corrected on read: the record as stored asserts this split's disjointness as "
     "fact; that claim was withdrawn in app 0.27.15 because the splits arrive as "
@@ -282,7 +282,7 @@ def state_dict_digest(state_dict: Dict[str, Any]) -> str:
 
 
 # ── what a stored ``l2_from_base`` was measured AGAINST ──────────────────────
-# #0122. ``l2_from_base`` is a distance, and a distance is meaningless without
+# ``l2_from_base`` is a distance, and a distance is meaningless without
 # naming the point it is measured from. Two different bases are in use:
 #
 #   * a session that carries ``init_checkpoint.pt`` is measured against THAT file
@@ -290,7 +290,7 @@ def state_dict_digest(state_dict: Dict[str, Any]) -> str:
 #   * a stock-initialised session keeps no such file, so it is measured against
 #     the stock cellpose base the session was constructed with.
 #
-# Before #0122 the second case stored NULL rather than a number, so "this
+# Earlier versions stored NULL in the second case rather than a number, so "this
 # contributor did not move" and "nobody measured" were the same reading. Filling
 # it in without naming the base would replace one ambiguity with a worse one: two
 # contributions with the same number, measured from different points, would look
@@ -330,7 +330,7 @@ def l2_basis(
     5. a distance with NO basis field        -> ``L2_BASIS_UNDETERMINED``
 
     Step 5 is the one that matters and the one a shortcut would get wrong. Every
-    record written before #0122 carries a distance and no label, and the tempting
+    record written before the label existed carries a distance and no label, and the tempting
     default — "unlabelled means the session-init base, because that was the only
     one that produced a number" — is exactly the inference 0.27.6 makes unsafe. An
     unlabelled value reads as undetermined, never as a base and never as zero.
@@ -589,7 +589,7 @@ def contribution_digest_basis(record: Optional[Dict[str, Any]]) -> str:
 # produces a contribution digest at all; the absent note says "this merge admitted
 # nothing", said of a record that is not a merge; and the undetermined note blames the
 # timestamp, which this surface never consults. A wrong explanation travelling with
-# the number is worse than the bare number #0523 set out to fix, so the contribution
+# the number is worse than the bare number this basis field set out to fix, so the contribution
 # surface carries its own notes rather than borrowing the head's.
 #
 # Every note here says what the value is a digest OF, and the file note names the one
@@ -633,7 +633,7 @@ def contribution_digest_provenance(record: Optional[Dict[str, Any]]) -> Dict[str
     through it requires remembering BOTH ``digest_key="weights_sha256"`` and
     ``absent_basis=CONTRIBUTION_DIGEST_BASIS`` at every call site; forgetting the
     second answers "undetermined" for a record whose code path proves the file
-    meaning, which reads exactly like this module's honest refusal. #0523 shipped that
+    meaning, which reads exactly like this module's honest refusal. The wire projection shipped that
     exact call to the wire and a reviewer caught it. Call this instead.
 
     ``reproducible_by_re_merge`` is ``None`` for every basis here, and that is not the
@@ -670,7 +670,7 @@ def colliding_contribution_provenance() -> Dict[str, Any]:
     renders last silently overwrites the others — measured on this surface before the
     guard existed: a pool holding a correctly stamped contribution and a second record
     under the same id published the stamped one as ``undetermined``, which is exactly the
-    wrong attribution #0509 exists to prevent, arrived at by accident of ordering.
+    wrong attribution the stored basis field exists to prevent, arrived at by accident of ordering.
 
     Published only when the colliding records actually DISAGREE. Two records under one id
     that resolve to the same basis are attributed with that basis, because the answer the
@@ -693,7 +693,7 @@ def colliding_contribution_provenance() -> Dict[str, Any]:
 # writers).
 #
 # ⚠ THIS IS THE SINGLE DECLARATION AND cellpose_model.py REGISTERS BY ITERATING IT
-# (#0070 requirement 1: classify from the model definition, not from a second
+# (Requirement 1 of the base-commitment rules: classify from the model definition, not from a second
 # hardcoded list of names). It lives here, in the torch-free module, because
 # pool.py's import must stay stdlib-only — test_pool.py's contract — so the
 # dependency runs model -> pool and never the other way. Adding a non-learned
@@ -703,7 +703,7 @@ def colliding_contribution_provenance() -> Dict[str, Any]:
 NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
 
 
-# #0070 requirement 3+4: the basis strings a community manifest uses to say WHERE its
+# Base-commitment requirements 3 and 4: the basis strings a community manifest uses to say WHERE its
 # non-learned values came from. The ruling is explicit that reporting the float alone is
 # not enough — "the manifest must record that the soup's diam_labels was INHERITED and
 # name its source, or the original defect reappears in the manifest instead of the state
@@ -732,7 +732,7 @@ def inherited_non_learned(
     if not source:
         raise ValueError(
             "inherited_non_learned requires a named source: an 'inherited' label with "
-            "no source is not traceable, which is the defect #0070 was filed about"
+            "no source is not traceable, which is the defect this check exists for"
         )
     return {
         "basis": NON_LEARNED_INHERITED,
@@ -745,7 +745,7 @@ def inherited_non_learned(
 def key_set_digest(keys: Iterable[str]) -> str:
     """sha256 over a state_dict's sorted key list — the architecture's INVENTORY.
 
-    #0070 option (b), as amended by the ruling: two floats in ``pool_index.json`` record
+    The chosen design, as amended: two floats in ``pool_index.json`` record
     the base's non-learned VALUES but carry no inventory, and without one the only
     classification left is member-vs-member agreement, which cannot detect a
     newly-added non-learned Parameter because every member has it — the exact
@@ -807,13 +807,13 @@ def assert_base_commitment(commitment: Optional[Dict[str, Any]]) -> Dict[str, An
 
     A pool that records no base cannot merge: falling back to loading a stock base would
     make the field permanently optional, and a backfilled-on-the-fly base is a
-    provenance claim about a checkpoint nobody can re-derive. The census on #0533 counts
+    provenance claim about a checkpoint nobody can re-derive. A separate census counts
     how many existing pools this blocks (measured 2026-11-14: all of them).
     """
     if not commitment:
         raise ValueError(
             "this pool records no base commitment, so the merge cannot classify its "
-            "keys or carry a non-learned value through — see #0533. There is no "
+            "keys or carry a non-learned value through. There is no "
             "fallback to a stock base load, deliberately: that would make the field "
             "permanently optional"
         )
@@ -837,7 +837,7 @@ def unreported_non_learned(*, reason: str) -> Dict[str, Any]:
     """Provenance block for a merge whose runtime did not report its non-learned values.
 
     ``entry`` and the Cellpose runtime are separate Ray deployments and can sit at
-    different app versions during a rolling update, so a runtime that predates #0070
+    different app versions during a rolling update, so a runtime that predates the base commitment
     returns a ``materialize_soup`` payload without them. That case gets a block SAYING
     SO rather than a bare null, because a reader must be able to tell "this runtime did
     not supply them" from "this soup had no contributor diameters" — collapsing the two
@@ -1144,13 +1144,13 @@ def uniform_soup(
     against the runtime's 12 GiB reservation and the replica was OOM-killed.
 
     ``base`` is a loader for the checkpoint the pool started from, and it is
-    REQUIRED rather than defaulted, which is the whole point of #0070 requirement 2:
+    REQUIRED rather than defaulted, which is the whole point of requirement 2:
     a caller that cannot say what the base is must fail, not silently average. It is
     read once, reduced to its key set plus its non-learned values, and released
     before the accumulation loop allocates, so it costs one transient member and
     does not raise the steady-state peak.
 
-    #0070 requirement 3, RULED 2026-11-14: a non-learned key (``NON_WEIGHT_PARAMS``,
+    Requirement 3, ruled 2026-11-14: a non-learned key (``NON_WEIGHT_PARAMS``,
     e.g. ``diam_labels``) is carried through from ``base`` UNCHANGED and is never
     averaged. Averaging them produced 57.7405 for a four-member pool whose real
     per-site diameters were 29.711 / 54.986 / 28.912 / 117.353 — a field asserting a
@@ -1164,11 +1164,11 @@ def uniform_soup(
     LOADER ORDER — the caller zips it against the member specs it supplied, because
     this function is given loaders and never learns a contribution id. That ordering is
     the whole contract: an unordered map would lose which diameter belonged to whom,
-    which is the half of #0070 requirement 4 that makes the numbers worth keeping.
+    which is the half of requirement 4 that makes the numbers worth keeping.
     Collected as plain floats off the tensor while the member is already resident, so
     it adds no second pass and retains nothing after ``del sd``.
 
-    #0070 requirement 2: classification is TOTAL and fail-closed. Every member key
+    Requirement 2: classification is TOTAL and fail-closed. Every member key
     must appear in ``base``, whose key set IS the architecture's own inventory, and a
     key in neither the base nor the declared non-learned set raises rather than being
     averaged. That is the property that stops this recurring: a future non-learned
@@ -1265,7 +1265,7 @@ def uniform_soup(
                       if key not in carried}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
                    for key, value in sd.items() if key not in carried}
-        # #0070 requirement 4: the contributors' OWN diameters are not discarded, they
+        # Requirement 4: the contributors' OWN diameters are not discarded, they
         # are recorded in the community manifest. Collected here, in loader order, so
         # the caller gets them without a second pass over every member's weights — the
         # merge already holds this state dict and will not hold it again. Scalars only,
@@ -1483,7 +1483,7 @@ def build_contribution_metadata(
         "learning_rate": training_params.get("learning_rate"),
         "diam_mean": training_params.get("diam_mean"),
         "l2_from_base": l2_from_base,
-        # #0122. Written UNCONDITIONALLY, null included, for the same reason
+        # Written UNCONDITIONALLY, null included, for the same reason
         # ``app_version`` is: a label that is absent when unknown cannot be told
         # apart from one written before labels existed at all. A reader resolves it
         # with ``l2_basis``, which maps a null label beside a real distance to
@@ -1509,11 +1509,11 @@ def empty_index(model_type: str, architecture_signature: str,
         "schema_version": SCHEMA_VERSION,
         "model_type": model_type,
         "architecture_signature": architecture_signature,
-        # #0070 option (b): the base this pool is anchored to, recorded ONCE here. The
+        # The base this pool is anchored to, recorded ONCE here. The
         # merge reads its two floats and its key-set commitment and never loads a model.
         # Optional at CREATION and fatal at MERGE, by ruling: a pool that records none
         # cannot merge, and there is deliberately no fallback to loading a stock base,
-        # which would make the field permanently optional. #0533 carries the census of
+        # which would make the field permanently optional. A separate census covers
         # how many existing pools this blocks.
         "base_commitment": base_commitment,
         "current_community": None,
@@ -1549,7 +1549,7 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# #0139: a member whose provenance cannot be established is QUARANTINED, not
+# A member whose provenance cannot be established is QUARANTINED, not
 # souped and not fatal.
 #
 # The two findings below are deliberately SEPARATE reason codes and must stay
@@ -1924,7 +1924,7 @@ def build_community_manifest(
         # materialize_soup just computed, and a caller-supplied basis could disagree
         # with the bytes. See CURRENT_DIGEST_BASIS for the lock-step rule.
         "weights_sha256_basis": CURRENT_DIGEST_BASIS,
-        # #0070 requirements 3 and 4. ``non_learned`` says what the published checkpoint's
+        # Requirements 3 and 4. ``non_learned`` says what the published checkpoint's
         # diameter IS and that it was inherited rather than learned (build it with
         # ``inherited_non_learned`` so the basis label travels with the float).
         # ``member_non_learned`` is where the contributors' OWN measured diameters live —
@@ -2165,10 +2165,10 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
     # that quietly widens it is the mismatch SCHEMA_VERSION exists to make visible.
     # Joined on contribution_id.
     #
-    # #0523: without this, the wire published the number with no basis beside it, so
+    # Without this, the wire published the number with no basis beside it, so
     # from outside the pool two digests computed under different bases were
-    # indistinguishable — the harm #0509's lede described, surviving #0509's fix
-    # because #0509 stamped what is STORED and this is what is PUBLISHED.
+    # indistinguishable — the harm the stored-basis change described, surviving that fix
+    # because it stamped what is STORED and this is what is PUBLISHED.
     #
     # Resolved by ``contribution_digest_provenance`` and NOT by the community-head
     # resolver, which is the one thing this loop can get wrong invisibly. The first
@@ -2178,8 +2178,8 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
     # surface the digest function never changed, so an absent stamp is the file basis
     # as a PROOF (the history is quoted at CONTRIBUTION_DIGEST_BASIS), and refusing to
     # attribute it tells a contributor their value cannot be explained when the code
-    # path explains it with certainty — #0509's harm in mirror image, and the option
-    # #0509 explicitly rejected. Passing ``uploaded_at`` made it worse: it split one
+    # path explains it with certainty — that harm in mirror image, and the option
+    # explicitly rejected there. Passing ``uploaded_at`` made it worse: it split one
     # unchanged code path into two answers on nothing but a deposit date.
     #
     # The absent case is still DECIDED rather than defaulted — a record with no digest

@@ -164,7 +164,7 @@ class CellposeRuntime:
         **replaces** the condemned replica and the cycle repeats indefinitely,
         because its circuit breaker ``_terminally_failed()`` is gated on ``not
         _replica_has_started``, which any successful start clears. Measured on
-        ``#0387`` over 100 health-check periods — that probe ran at
+        a probe deployment over 100 health-check periods — that probe ran at
         ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the 30 s
         above: 105 calls, **0 failed**, 84 answered by a replica that already
         knew its own smoke test had failed, across 22 distinct replica pids.
@@ -674,7 +674,7 @@ class CellposeRuntime:
         and return its sha256 + byte size — so the head weights never traverse the
         CPU entry. ``members`` must be non-empty (a published head always has one).
 
-        Also returns what the community manifest needs for #0070 requirement 4, because
+        Also returns what the community manifest needs for requirement 4, because
         this is the only place the members' weights are resident and reading them again
         would mean re-downloading every one:
 
@@ -717,7 +717,7 @@ class CellposeRuntime:
             ]
             # Digest the tensors, not the saved file: the random stem below lands in
             # every torch zip record name, so a file digest would differ on every
-            # merge of the same members. The stem stays random for #0083.
+            # merge of the same members. The stem stays random.
             sha = await asyncio.to_thread(pool.state_dict_digest, soup)
             path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
             await asyncio.to_thread(lambda: torch.save(soup, str(path)))
@@ -774,7 +774,7 @@ class CellposeRuntime:
             out: Dict[str, Any] = {
                 "architecture_signature": pool.architecture_signature(sd),
                 "l2_from_base": None,
-                # #0122. Set in BOTH branches below, so a null here reaching the
+                # Set in BOTH branches below, so a null here reaching the
                 # record means neither ran — not that this writer does not label.
                 "l2_from_base_basis": None,
                 "base_checkpoint_sha256": None,
@@ -794,20 +794,20 @@ class CellposeRuntime:
                 del base_sd
             else:
                 # A stock-initialised session keeps no init_checkpoint.pt (the same root
-                # cause as #0122), so the base it started from is stock cellpose. Loading
+                # cause), so the base it started from is stock cellpose. Loading
                 # it here is the REAL base, not an assumed one -- which is the whole point
                 # of the amendment.
                 #
-                # CORRECTION (#0087, ruled 2026-11-15). This comment used to read "Peak
+                # CORRECTION (ruled 2026-11-15). This comment used to read "Peak
                 # memory is unchanged either way ... two state dicts in both cases and
-                # #0087's bound is not made worse". That was FALSE and it is worth saying
+                # this bound is not made worse". That was FALSE and it is worth saying
                 # why, because the mistake is easy to repeat: it compared this `else`
                 # branch to the sibling `if` branch, when the right comparator is what
-                # THIS path did before. Before #0070 there was no `else` at all, so a
+                # THIS path did before. Before the base commitment there was no `else` at all, so a
                 # stock-initialised deposit held exactly ONE state dict. It now holds two.
                 # Reusing this row's own FU1 figures (one cpsam dict 1.1348 GiB, two
                 # 2.3060 GiB -- a REUSE, not a fresh measurement), this path went from
-                # ~1.13 GiB to ~2.31 GiB. #0087's bound was made worse, by this branch.
+                # ~1.13 GiB to ~2.31 GiB. The memory bound was made worse, by this branch.
                 # That is why the whole computation now runs under `_soup_sem` below.
                 #
                 # WHY A CONSTRUCTED NET IS CORRECT HERE AND NOT ABOVE. base_commitment
@@ -823,12 +823,12 @@ class CellposeRuntime:
                 # The branch ABOVE must stay on torch.load: a fine-tuned base DOES carry a
                 # learned diam_labels, where the widening would be lossy.
                 stock = self._base_state_dict(model_type)
-                # #0122 half 1: measure against the stock base that was actually
+                # Half 1: measure against the stock base that was actually
                 # used, so the field stops being null for exactly these deposits.
                 # The stock dict is already loaded here for base_commitment, so THIS
                 # line adds no load and no second resident copy. That much is true and
                 # stays; what was struck from the correction above is the further claim
-                # that the branch as a whole left #0087's bound untouched. Loading the
+                # that the branch as a whole left the memory bound untouched. Loading the
                 # stock base at all is what moved it; reusing it here does not move it
                 # again.
                 out["l2_from_base"] = pool.state_dict_l2_from_base(sd, stock)
@@ -840,7 +840,7 @@ class CellposeRuntime:
                 del stock
             return out
 
-        # #0087, Option A (ruled 2026-11-15): the inspection holds up to TWO full cpsam
+        # Option A (ruled 2026-11-15): the inspection holds up to TWO full cpsam
         # state dicts, and until now it ran outside every lock and past every admission
         # gate -- so a deposit's peak could sum with a concurrent merge's, and the replica
         # could breach `memory_mb` with no merge of its own running at all.

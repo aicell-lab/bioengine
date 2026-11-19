@@ -402,7 +402,7 @@ Two things worth knowing when you see it:
     30 s above: **105 calls, 0 failed, 84 of them answered by a replica that
     already knew its own smoke test had failed, across 22 distinct replica pids.**
     Read that as a measurement of *routing*, not of what your callers will see:
-    `#0387`'s handler imported nothing, so its calls succeeded. In this app they do
+    a probe deployment's handler imported nothing, so its calls succeeded. In this app they do
     not — the micro-sam and Cellpose call paths import their own ML stack, so a
     replica in this state raises `ModuleNotFoundError`, which is the very symptom
     this section describes. What carries over is that calls keep arriving at a
@@ -412,7 +412,7 @@ Two things worth knowing when you see it:
     `HEALTHY` in silence. Debugging a fresh deploy, expect a replica that looks
     healthy for the first minute and a half and a deployment that keeps looking
     `RUNNING` — check the logs, not the status. Changing the behaviour is a
-    framework question and is tracked on `#0387`, not here.
+    framework question and is tracked on a probe deployment, not here.
 
 `ping()` stays shallow on purpose: the entry calls it with a 2 s timeout before every
 GPU call, which an import of torch does not fit, and importing a heavy stack on every

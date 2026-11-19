@@ -1,4 +1,4 @@
-"""Tests for aggregate()'s resume journal — the clause-2 half of #0068.
+"""Tests for aggregate()'s resume journal — the clause-2 half of the resume-journal work.
 
 A merge is ``2 * len(batch) + 3`` scoring passes and each pass is minutes of
 exclusive GPU. The run that prompted this was killed at pass 11 of 35 and returned

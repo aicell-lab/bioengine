@@ -141,7 +141,7 @@ class TestCorrectedMetric:
     def test_the_correction_is_visible_rather_than_seamless(self):
         """A silent substitution leaves a contributor who fetched the stored record
         themselves with an unexplained difference — the same "is this corrupt?" dead
-        end #0417 describes. The note says the stored record is unchanged and why."""
+        end the digest-basis rule describes. The note says the stored record is unchanged and why."""
         out = pool.corrected_metric(_metric(STORED_SELECTION))
         assert pool.BASIS_CORRECTION_NOTE in out["aggregate_basis"]
         assert "0.27.15" in out["aggregate_basis"]

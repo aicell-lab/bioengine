@@ -122,7 +122,7 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     So a cluster that owns enough but has none free right now reads
     ``sufficient: True`` with a ``detail`` that says the runtimes pend until a
     device is released — which is the whole of the answer an operator needs, with
-    no alarm attached (#0370, re-review).
+    no alarm attached.
 
     Never raises and never blocks the deploy. ``sufficient`` is deliberately
     three-valued, because "not enough" and "cannot tell" are different answers:
@@ -382,7 +382,7 @@ class _RecognisedRedeposit(Exception):
     retries for ~62 s before re-raising. One retried deposit would then take
     the whole pool down rather than just its own merge — strictly worse than
     the double-weighting this is fixing. Never crosses the RPC boundary: the
-    caller sees a normal return with ``deduplicated: true``. #0376.
+    caller sees a normal return with ``deduplicated: true``.
     """
 
     def __init__(self, existing: Dict[str, Any]) -> None:
@@ -410,7 +410,7 @@ class _RecognisedRedeposit(Exception):
     # nothing can call the app — and with initial_replicas 0 nothing wakes the entry
     # either, so the placement warning below is never written. One CPU-only replica
     # at deploy time puts it in deployments.<entry>.logs, which get_app_status
-    # returns while the app is still DEPLOYING. min_replicas stays 0, so #0045's
+    # returns while the app is still DEPLOYING. min_replicas stays 0, so the scale-to-zero
     # requirement ("should also scale down if not used") is untouched: this replica
     # goes away after downscale_delay_s like any other.
     autoscaling_config={
@@ -1905,9 +1905,9 @@ class EntryApp:
             # the pool index gets have to be repeated at this chokepoint or they are
             # absent from every named community version. Both callers come through here.
             #
-            # #0417: the manifest carries this digest too, so say which of the two it is.
+            # The manifest carries this digest too, so say which of the two it is.
             # It has its own created_at, so no join is needed.
-            # #0418: the manifest also carries the basis wording 0.27.15 retracted, so
+            # The manifest also carries the basis wording 0.27.15 retracted, so
             # correcting only the pool index would still leave a contributor reading the
             # withdrawn claim off a named version.
             "sha256_provenance": pool.digest_provenance(
@@ -2086,7 +2086,7 @@ class EntryApp:
                     # (equals stock cpsam). The pool artifact itself must already
                     # exist (created out-of-band with the pool_token's scope).
                     #
-                    # #0070: the base commitment is written HERE, once, at pool
+                    # The base commitment is written HERE, once, at pool
                     # creation. It is built on the runtime because a commitment needs
                     # the base's state_dict and this entry is torch-free; passing it
                     # through is what makes the pool mergeable at all, since
@@ -2103,7 +2103,7 @@ class EntryApp:
                 # them. Identity is the digest alone — see
                 # pool.find_contribution_by_digest for why metadata is not part of
                 # it, and why decided_contribution_ids is not consulted. Leaving by
-                # raise, never by return: see _RecognisedRedeposit. #0376.
+                # raise, never by return: see _RecognisedRedeposit.
                 existing = pool.find_contribution_by_digest(index, info["weights_sha256"])
                 if existing is not None:
                     raise _RecognisedRedeposit(existing)
@@ -2119,7 +2119,7 @@ class EntryApp:
                     samples_seen=samples_seen,
                     training_params=params,
                     l2_from_base=info["l2_from_base"],
-                    # #0122. .get, not ["…"]: an older runtime replica that predates
+                    # .get, not ["…"]: an older runtime replica that predates
                     # the label still answers this call, and it should write a null
                     # label — which reads as undetermined — rather than raise.
                     l2_from_base_basis=info.get("l2_from_base_basis"),
@@ -2184,7 +2184,7 @@ class EntryApp:
                 "weights_sha256": info["weights_sha256"],
                 "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
                 "l2_from_base": info["l2_from_base"],
-                # #0122. The caller keeps THIS record, so it carries the label for
+                # The caller keeps THIS record, so it carries the label for
                 # the same reason the stored one does: a distance whose origin is
                 # not named is not comparable with anyone else's.
                 "l2_from_base_basis": info.get("l2_from_base_basis"),
@@ -2209,7 +2209,7 @@ class EntryApp:
             # False, not absent, on the fresh path. A key present only when true
             # cannot be dated: a client holding a response without it cannot tell
             # "fresh deposit" from "a release that predates de-duplication" —
-            # the defect app_version exists to avoid (#0116, #0140). #0376.
+            # the defect app_version exists to avoid.
             "deduplicated": False,
         }
 
@@ -2704,14 +2704,14 @@ class EntryApp:
                         base_commitment=index.get("base_commitment")))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
-                    # #0070 requirement 4: the contributors' own measured diameters go in
+                    # Requirement 4: the contributors' own measured diameters go in
                     # the manifest. The runtime is given weights PATHS and never learns a
                     # contribution id, so the mapping is made here, where s_paths and
                     # s_ids are the parallel lists the gate built. An unmapped key RAISES
                     # rather than recording a null id: a diameter attributed to the wrong
                     # contributor, or to nobody, is worse than one not recorded, and this
                     # is the only place the correspondence is checkable.
-                    # A runtime that predates #0070 returns no such keys. entry and the
+                    # A runtime that predates the base commitment returns no such keys. entry and the
                     # Cellpose runtime are SEPARATE Ray deployments and can sit at
                     # different app versions during a rolling update, so this must not
                     # KeyError — and must not quietly write null either, because a reader
@@ -2738,7 +2738,7 @@ class EntryApp:
                         member_nl = None
                         non_learned_block = pool.unreported_non_learned(
                             reason="the Cellpose runtime serving this merge returned no "
-                                   "non_learned_inherited field, so it predates #0070")
+                                   "non_learned_inherited field, so it predates the base commitment")
                     manifest = pool.build_community_manifest(
                         community_version=new_version, combine="uniform",
                         selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
@@ -2842,7 +2842,7 @@ class EntryApp:
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
             # The digest of the head this call just published, and which of the two
-            # things it digests. This is the moment the #0417 false alarm happens —
+            # things it digests. This is the moment the false alarm happens —
             # someone re-merges an identical member set, gets a number, compares it
             # against a stored one and concludes corruption — so the attribution is
             # returned here, where both numbers are in the caller's hands, and not

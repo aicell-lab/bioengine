@@ -1,4 +1,4 @@
-"""#0139 end to end — what a merge DOES when a member cannot be vouched for.
+"""what a merge DOES when a member cannot be vouched for.
 
 ``test_pool_quarantine.py`` pins the pure split. This file drives the real
 ``aggregate()`` coroutine against a stub artifact manager and a stub GPU runtime
@@ -93,12 +93,12 @@ class _Runtime:
                          base_commitment=None) -> Dict[str, Any]:
         """``{"f1": scalar, "per_image": vector}``, matching the real runtime.
 
-        ``base_commitment`` is accepted and ignored. #0070 made it part of the
+        ``base_commitment`` is accepted and ignored. The base-commitment rules made it part of the
         call, and this file merged cleanly past that change — which is exactly
         why it broke: a stub whose signature is never in conflict is never
         reviewed against the contract it is standing in for.
 
-        ``per_image`` became part of this contract in #0121: ``aggregate()`` now
+        ``per_image`` became part of this contract in the per-image breakdown: ``aggregate()`` now
         reads ``scored["per_image"]`` on every pass and banks it beside the
         scalar, so a stub returning the scalar alone raises ``KeyError`` before
         any quarantine assertion is reached. Two entries rather than one, each
@@ -114,11 +114,11 @@ class _Runtime:
         """``base_commitment`` accepted and ignored, as in ``score_soup`` above.
 
         The real method also returns ``non_learned_inherited``,
-        ``non_learned_source`` and ``member_non_learned`` for #0070's
+        ``non_learned_source`` and ``member_non_learned`` for the base-commitment rules's
         requirement 4. They are deliberately NOT invented here: ``aggregate()``
         reads them with ``.get()``, so omitting them is tolerated, and a stub
         that made them up would let a requirement-4 assertion pass against
-        values no runtime produced. Requirement 4 is driven in the #0070 suite,
+        values no runtime produced. Requirement 4 is driven in the the base-commitment rules suite,
         against the real builder.
         """
         return {"sha256": HEAD_SHA, "n_bytes": 2048,

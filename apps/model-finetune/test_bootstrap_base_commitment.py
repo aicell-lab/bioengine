@@ -1,4 +1,4 @@
-"""#0070: a bootstrapped pool must record a base commitment, or it can never merge.
+"""a bootstrapped pool must record a base commitment, or it can never merge.
 
 `d0679f8f` added `pool.base_commitment()` / `assert_base_commitment()` and wired the READ
 path, but no production code ever CALLED the builder: the only pool-bootstrap site,

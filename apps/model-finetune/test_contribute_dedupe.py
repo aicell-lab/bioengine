@@ -217,7 +217,7 @@ class _Runtime:
             "l2_from_base": 0.5,
             "weights_sha256": self._digest,
             "n_bytes": 1218617275,
-            # #0070: the bootstrap writes this into a fresh pool_index.json. Present here
+            # The base-commitment rules: the bootstrap writes this into a fresh pool_index.json. Present here
             # so the dedupe fixtures exercise the same shape production now takes.
             "base_commitment": {
                 "non_learned": {"diam_labels": 30.0, "diam_mean": 30.0},
@@ -430,8 +430,8 @@ async def test_a_fresh_deposit_says_deduplicated_false_rather_than_omitting_it(
 ) -> None:
     """A key present only when true cannot be dated: a client holding a response
     without it cannot tell 'fresh deposit' from 'a release that predates
-    de-duplication'. That is the defect ``app_version`` exists to avoid (#0116,
-    #0140 — five of 92 saved responses were undatable)."""
+    de-duplication'. That is the defect ``app_version`` exists to avoid (the undatable-response defect,
+    the undatable-response report — five of 92 saved responses were undatable)."""
     returned = await _deposit(_Stub(_index(_member(_FIRST_ID, _OTHER_DIGEST)), _DIGEST))
     assert "deduplicated" in returned, (
         "contribute's return value is the only record the depositing site keeps"

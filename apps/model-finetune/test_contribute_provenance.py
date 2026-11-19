@@ -135,7 +135,7 @@ class _Stub:
     def _staged(self, am: Any, artifact_id: str):
         """The REAL staging context manager, bound here rather than faked.
 
-        #0134 moved ``contribute``'s staging into ``_staged``; a hand-rolled double
+        the staging change moved ``contribute``'s staging into ``_staged``; a hand-rolled double
         would keep passing if it stopped discarding on failure, which is the whole
         point of that change.
         """
@@ -212,7 +212,7 @@ async def test_empty_env_var_is_unset_in_both_records(
 async def test_the_digest_the_campaign_found_null_is_still_recorded_in_both(
     monkeypatch: pytest.MonkeyPatch, fake_training: None
 ) -> None:
-    """#0140's report claimed the digest could be written null. It cannot on this path:
+    """the undatable-response report's report claimed the digest could be written null. It cannot on this path:
     it comes from ``sha256_file``, which returns a hexdigest or raises. Pinned here so a
     future refactor cannot quietly make null reachable."""
     returned, stored = await _deposit(monkeypatch, "0.27.16")
