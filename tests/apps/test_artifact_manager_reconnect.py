@@ -694,27 +694,34 @@ async def test_a_transient_resolution_failure_at_boot_is_survived(fast_grace):
 
 
 @pytest.mark.asyncio
-async def test_a_healthy_boot_is_not_delayed(fast_grace, monkeypatch):
+async def test_a_healthy_boot_is_not_delayed(monkeypatch):
     """The retry must cost nothing when the service is there.
 
     A fix that sleeps before its first attempt would slow every normal start,
     which is a regression nobody would attribute to this change.
+
+    The backoff is set far LARGER than the assertion window, so a single
+    pre-attempt sleep would blow it. Real time is used rather than a patched
+    ``asyncio.sleep``: patching it reaches the whole event loop, including this
+    file's own fakes and pytest-asyncio, which is what made an earlier version
+    of this test fail against a correct fix.
     """
-    slept: list[float] = []
-    real_sleep = asyncio.sleep
-
-    async def _recording_sleep(delay):
-        slept.append(delay)
-        await real_sleep(0)
-
-    monkeypatch.setattr(_manager_module.asyncio, "sleep", _recording_sleep)
+    monkeypatch.setattr(_manager_module, "_ARTIFACT_MANAGER_RESOLVE_GRACE_S", 30.0)
+    monkeypatch.setattr(
+        _manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S", 5.0
+    )
 
     server = _FlakyServer(fail_times=0)
+    started = _time.monotonic()
     proxy = await _manager_with(server)._resolve_artifact_manager_proxy()
+    elapsed = _time.monotonic() - started
 
     assert proxy.name == "after-retry"
     assert server.attempts == 1
-    assert slept == [], f"a healthy boot must not sleep at all, slept {slept}"
+    assert elapsed < 1.0, (
+        f"a healthy boot took {elapsed:.2f}s against a 5s initial backoff — "
+        "the first attempt is being delayed"
+    )
 
 
 @pytest.mark.asyncio
@@ -744,30 +751,37 @@ async def test_a_service_that_never_returns_still_RAISES_rather_than_hanging(
 
 
 @pytest.mark.asyncio
-async def test_the_wait_never_overshoots_the_grace(fast_grace, monkeypatch):
+async def test_the_wait_never_overshoots_the_grace(monkeypatch):
     """The backoff must be clamped to the remaining budget, not just doubled.
 
-    `delay` grows independently of the deadline, so an unclamped sleep can park
-    past the grace and silently widen the window this is supposed to bound.
+    ``delay`` grows independently of the deadline, so an unclamped sleep parks
+    past the grace and silently widens the window this is meant to bound.
+
+    The clamp is isolated by making the backoff LARGER than the whole grace:
+    unclamped, the very first sleep would be 5 s against a 0.2 s budget, so the
+    call could not return anywhere near the deadline. Clamped, it sleeps only
+    the remaining budget and gives up on time. Real time again — see the note
+    in the healthy-boot test about why patching ``asyncio.sleep`` is wrong here.
     """
-    slept: list[float] = []
-    real_sleep = asyncio.sleep
-
-    async def _recording_sleep(delay):
-        slept.append(delay)
-        await real_sleep(0)
-
-    monkeypatch.setattr(_manager_module.asyncio, "sleep", _recording_sleep)
+    monkeypatch.setattr(_manager_module, "_ARTIFACT_MANAGER_RESOLVE_GRACE_S", 0.20)
+    monkeypatch.setattr(
+        _manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S", 5.0
+    )
+    monkeypatch.setattr(
+        _manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S", 5.0
+    )
 
     server = _FlakyServer(fail_times=10**9)
+    started = _time.monotonic()
     with pytest.raises(KeyError):
         await _manager_with(server)._resolve_artifact_manager_proxy()
+    elapsed = _time.monotonic() - started
 
-    assert slept, "expected at least one backoff sleep"
-    assert sum(slept) <= fast_grace + 1e-6, (
-        f"slept {sum(slept):.3f}s in total against a {fast_grace:.3f}s grace"
+    assert server.attempts >= 1
+    assert elapsed < 1.0, (
+        f"took {elapsed:.2f}s to give up on a 0.20s grace with a 5s backoff — "
+        "the sleep is not clamped to the remaining budget"
     )
-    assert max(slept) <= fast_grace + 1e-6
 
 
 def test_the_boot_path_resolves_THROUGH_the_retry_and_not_around_it():
