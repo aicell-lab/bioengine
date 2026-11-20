@@ -30,7 +30,7 @@ TIMEOUT = 900
 def provenance(base: str) -> Dict[str, Any]:
     def _git(*args: str) -> str:
         try:
-            return subprocess.run(["git", "-C", "/data/nmechtel/bioengine", *args],
+            return subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[3]), *args],
                                   capture_output=True, text=True,
                                   timeout=10).stdout.strip()
         except Exception:
@@ -316,7 +316,7 @@ def latency_tables(out: Path, sources: Dict[str, Path]) -> Path:
         "Tier A (client reads the original directly) and Tier B (served, "
         "transcoded) are reported separately and only Tier A is zero-copy.",
         "Derived views are computed products and are never zero-copy.",
-        "Latencies are site-specific: europa to Google Cloud Storage.",
+        "Latencies are site-specific: measured from one host to Google Cloud Storage.",
     ]
     path = out / "latency_tables.json"
     path.write_text(json.dumps(tables, indent=1) + "\n")
@@ -326,9 +326,9 @@ def latency_tables(out: Path, sources: Dict[str, Path]) -> Path:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
-    ap.add_argument("--out", default="/data/nmechtel/bioengine-paper/analysis/"
+    ap.add_argument("--out", default="analysis/"
                                      "results/omezarr_view/figure_assets")
-    ap.add_argument("--raw", default="/data/nmechtel/bioengine-paper/analysis/"
+    ap.add_argument("--raw", default="analysis/"
                                      "results/omezarr_view/raw")
     ap.add_argument("--token-file", default=".demo-token")
     ap.add_argument("--protected", default="protected-mousebrain")

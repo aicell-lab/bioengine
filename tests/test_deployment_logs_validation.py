@@ -1,4 +1,4 @@
-"""Unit tests for ``get_app_status``'s ``deployment_logs`` map validation (#0406).
+"""Unit tests for ``get_app_status``'s ``deployment_logs`` map validation.
 
 These exercise the pure helpers directly, so they need no Ray and no cluster —
 the same shape as ``tests/test_scaling_validation.py``.
@@ -191,7 +191,7 @@ def test_an_unknown_deployment_name_is_accepted():
 
 @pytest.mark.parametrize("bad, type_name", [(True, "bool"), (1, "int"), ("x", "str")])
 def test_a_non_dict_scaling_map_is_rejected(bad, type_name):
-    """``_validate_scaling_map`` — the precedent #0406 cites as the shape to
+    """``_validate_scaling_map`` — the precedent cited as the shape to
     copy — had the identical defect in its own first line,
     ``(scaling or {}).items()``. MEASURED before the fix:
     ``scaling=True`` -> ``AttributeError: 'bool' object has no attribute 'items'``,

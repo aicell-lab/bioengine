@@ -1,4 +1,4 @@
-"""A computed shortfall must reach the caller: compute → store → publish (#0384).
+"""A computed shortfall must reach the caller: compute → store → publish.
 
 ``tests/test_external_cluster_shortfall.py`` pins what ``_check_resources``
 *returns*, and that ``"resource_shortfall"`` is in ``PUBLIC_APP_STATUS_FIELDS``.

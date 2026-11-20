@@ -2,7 +2,7 @@
 
 Every exception below is the *verbatim* message a real failure produced against
 ``https://hypha.aicell.io`` with ``hypha_rpc 0.21.40``, only the client ids kept
-(#0407). That matters because the shape was not what the module was built for: a
+That matters because the shape was not what the module was built for: a
 handle resolved by name whose target client has gone does not fail send-side and
 does not time out — the server answers with an error envelope, which hypha_rpc
 decodes into a ``RemoteException``. ``origin/main`` short-circuited on that type

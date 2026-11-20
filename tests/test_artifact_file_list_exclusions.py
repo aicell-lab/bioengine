@@ -3,7 +3,7 @@
 A committed artifact version is immutable and is exactly what a deploy runs, so a
 git-ignored local leftover swept into the file list is permanent and does not
 appear in git. ``bioimage-io/model-finetune`` 0.27.3 shipped four
-``.pytest_cache/`` files that way while 0.27.1 was clean, which is #0085.
+``.pytest_cache/`` files that way while 0.27.1 was clean.
 
 Most of these exercise the pure helper against real temporary directories, so
 they need no Hypha server. The last one is live-gated and goes the whole way to

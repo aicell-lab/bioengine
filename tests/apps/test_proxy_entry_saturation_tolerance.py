@@ -173,12 +173,12 @@ async def test_initial_gate_waits_for_all_siblings() -> None:
     assert registered.called is True
 
 
-# ===== svamp #0059: min_replicas 0 must not be mistaken for an outage =====
+# ===== min_replicas 0 must not be mistaken for an outage =====
 
 
 @pytest.mark.asyncio
 async def test_scaled_to_zero_does_not_deregister() -> None:
-    """The #0059 regression: idling at ``min_replicas: 0`` is not an outage.
+    """The regression: idling at ``min_replicas: 0`` is not an outage.
 
     Deregistering here was unrecoverable by construction — waking the
     deployment needs a request, and a request needs the registration that the
@@ -352,7 +352,7 @@ async def test_sibling_states_unknown_app_is_none(monkeypatch) -> None:
     assert await _bare_proxy()._sibling_states() is None
 
 
-# ===== svamp #0037: the controller read is bounded, and bounded two ways =====
+# ===== the controller read is bounded, and bounded two ways =====
 #
 # ``serve.status()`` is sync, so it runs in the user-code executor — 5 threads,
 # because the proxy declares ``num_cpus: 0``. Ray re-arms an abandoned health

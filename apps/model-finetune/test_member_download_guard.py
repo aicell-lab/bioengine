@@ -1,4 +1,4 @@
-"""#0139 — a member re-downloaded mid-merge is checked where it lands.
+"""a member re-downloaded mid-merge is checked where it lands.
 
 ``aggregate()`` hashes every member once per merge before any soup is built. That
 alone is not enough, and the gap is easy to miss: the member cache is evicted under

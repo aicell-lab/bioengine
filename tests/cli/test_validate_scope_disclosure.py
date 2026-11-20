@@ -1,4 +1,4 @@
-"""A green ``bioengine apps validate`` has to say which half it checked (#0447).
+"""A green ``bioengine apps validate`` has to say which half it checked.
 
 Two app authors independently read ``OK: …/manifest.yaml is a valid v0.6.0
 BioEngine app manifest.`` as clearance to upload, and the upload was then

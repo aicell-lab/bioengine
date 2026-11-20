@@ -20,7 +20,7 @@ it green while the constant silently becomes false - which is this row's own def
 reintroduced from the other side.
 
 Authored by the sibling instance of this lane (cwd ``.../quiet-mountain``) as the missing
-assertion in its refutation on #0509, measured there at 3 failed / 2 passed against the
+assertion in its refutation on the stored-basis stamp, measured there at 3 failed / 2 passed against the
 wrong constant. Adopted into the branch rather than rewritten, because a test whose point
 is to be independent of its author's reasoning should not be re-derived by that author.
 """
@@ -180,7 +180,7 @@ def test_a_contribution_is_not_published_as_reproducible_by_re_merge() -> None:
     False, and ``digest_provenance`` publishes it next to the number. A contribution
     digest is sha256 over the .pt file, so re-merging cannot reproduce it. Claiming
     otherwise tells a contributor a mismatch is evidence about the weights, which is
-    the exact conclusion #0104 and #0417 exist to prevent.
+    the exact conclusion the digest-stability rule and the digest-basis rule exist to prevent.
     """
     stored = _append_one("c" * 64, pool.TENSOR_DIGEST_SINCE + 86_400.0)
     prov = pool.digest_provenance(
@@ -217,15 +217,15 @@ def test_the_forged_basis_is_not_a_real_one() -> None:
 
 
 def test_a_caller_supplied_basis_is_overridden_not_preserved() -> None:
-    """#0524. ``append_contribution``'s docstring says the basis is "Stamped here
+    """``append_contribution``'s docstring says the basis is "Stamped here
     rather than accepted as a field on ``entry``", and gives the reason: the writer is
     the only thing that knows which digest it just computed, so a caller-supplied
     basis could disagree with the number beside it.
 
     That claim was NOT enforced. Replacing the stamping assignment with a
     ``setdefault`` — leaving a caller's value in place — was measured GREEN on the
-    ``apps/model-finetune`` suite, the ``tests/`` suite and #0370's own gate during the
-    #0509 review ("Arm E"). A control arm that stamps the WRONG constant at the same
+    ``apps/model-finetune`` suite, the ``tests/`` suite and the GPU shortfall report's own gate during
+    the stored-basis stamp review ("Arm E"). A control arm that stamps the WRONG constant at the same
     site is caught by 10 tests, so the suite discriminated the VALUE and not its
     PROVENANCE. This test pins the provenance.
 

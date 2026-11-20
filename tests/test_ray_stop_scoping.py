@@ -171,7 +171,7 @@ def test_claims_nothing_when_no_ray_process_is_running(process_table):
 
 
 def test_does_not_claim_a_client_server_whose_port_merely_starts_with_ours(process_table):
-    """THE PREFIX CASE, and the one that pins ``gcs_argument in argv`` (#0212, site 5).
+    """THE PREFIX CASE, and the one that pins ``gcs_argument in argv`` (site 5).
 
     The address is compared against ``argv`` — a list, so an exact element match — and
     not against ``cmdline``, which is a string where it would be a substring test. The

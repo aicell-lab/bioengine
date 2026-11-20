@@ -1,4 +1,4 @@
-"""A directory option that cannot be created must name the option (#0583).
+"""A directory option that cannot be created must name the option.
 
 The option list is DERIVED FROM THE PARSER rather than typed here, per the row's clause 1: a
 hand-written list silently stops covering an option the moment somebody adds one, and the test

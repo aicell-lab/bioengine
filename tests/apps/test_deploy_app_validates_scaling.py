@@ -1,4 +1,4 @@
-"""``deploy_app`` must actually CALL the scaling validator (#0212).
+"""``deploy_app`` must actually CALL the scaling validator.
 
 ``_validate_scaling_map`` is thoroughly unit-tested — ``tests/test_scaling_validation.py``
 names it eleven times — but those cases import the helper directly, and none of them drives

@@ -341,7 +341,7 @@ OTHER_DEPLOYMENT = "RuntimeApp"
 
 
 def test_a_per_deployment_override_reaches_the_proxy_and_a_missing_one_falls_back():
-    """Site 4 of #0212: the per-deployment override has to arrive at the proxy call.
+    """Site 4: the per-deployment override has to arrive at the proxy call.
 
     ``this_prev``/``this_tail`` are computed and then forwarded, and nothing in the
     suite had ever looked at what the proxy was actually asked for — no test names

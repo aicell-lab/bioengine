@@ -6,5 +6,5 @@ export PYTHONPATH=.
 if [ -f .demo-token ]; then
   export OMEZARR_VIEW_DEMO_TOKEN="$(cat .demo-token)"
 fi
-exec "${OMEZARR_VIEW_PYTHON:-/data/nmechtel/bioengine/.dev/omezarr-probe/.venv/bin/python}" \
+exec "${OMEZARR_VIEW_PYTHON:-python3}" \
   -m omezarr_view.server

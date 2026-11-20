@@ -1,4 +1,4 @@
-"""``error_exit`` must not bury the cause under a remote traceback (myco #0446)."""
+"""``error_exit`` must not bury the cause under a remote traceback."""
 import traceback
 
 import pytest

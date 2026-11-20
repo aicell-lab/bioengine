@@ -1,7 +1,7 @@
 name: Test Suite
 
 # No workflow ran a test before this one, so the only gate on a merge was a
-# version comparison and a PR that broke the suite merged green (backlog #0223).
+# version comparison and a PR that broke the suite merged green.
 # The breakage that prompted it existed only in the COMBINATION of two
 # individually sound PRs, which is what a suite run on the merge result catches
 # and what a version check cannot see.
@@ -42,7 +42,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install test dependencies
         # requirements-test.txt brings pytest, pytest-asyncio and pytest-xdist,
@@ -123,7 +123,7 @@ jobs:
         # which this runner does not have. It is declared in
         # .github/app-bundle-suites.json and checked against the tree here, so a
         # NEW app shipping in-bundle tests fails this job instead of having them
-        # collected by nobody while every step reports success (backlog #0423).
+        # collected by nobody while every step reports success.
         run: python3 .github/scripts/app_bundle_suites.py reconcile
 
       - name: Run the app bundle suites

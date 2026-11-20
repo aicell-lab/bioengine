@@ -1,4 +1,4 @@
-"""#0139 — a pool member whose bytes cannot be vouched for is quarantined.
+"""a pool member whose bytes cannot be vouched for is quarantined.
 
 Plain pytest, no torch, no numpy, no live Hypha: ``pool``'s heavy imports are all
 function-local, so this surface imports on stdlib alone.

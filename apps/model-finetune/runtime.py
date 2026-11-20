@@ -11,10 +11,10 @@ subprocess gets the whole GPU.
 
 Autoscaling declares ``max_replicas=3``. The per-replica target it also declared
 was spelled with a field name Ray Serve removed, so the effective target has
-always been Serve's default of 2 (#0091) — at which a long training plus one
+always been Serve's default of 2 — at which a long training plus one
 concurrent inference asks for one replica, not two. This runtime has therefore
 never run training and inference on separate GPU replicas; whether to pin it to
-one replica or restore the eager target is open as #0097.
+one replica or restore the eager target is a separate open question.
 
 Import rule: heavy deps (``torch``, ``micro_sam``, ``segment_anything``) are
 imported inside method bodies so the ``@bioengine.app`` decorator module stays
@@ -53,8 +53,8 @@ _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
-# runtime_env install did not take fails instead of being advertised as ready
-# (#0371). Keep this list equal to what the bodies actually import: it is a
+# runtime_env install did not take fails instead of being advertised as ready.
+# Keep this list equal to what the bodies actually import: it is a
 # readiness gate, not a restatement of requirements-runtime.txt, and a module
 # nothing imports would fail a replica that can serve every call. ``numpy`` is
 # absent on purpose — it is imported at module scope above, so a replica missing
@@ -84,8 +84,8 @@ def _read_pip(name: str) -> List[str]:
         "initial_replicas": 1,
         "max_replicas": 3,
         # No target declared on purpose: the name this dict used is one Serve
-        # removed, so the effective target is Serve's default of 2 either way
-        # (#0091), and declaring 1.0 now is a behaviour change, not a fix (#0097).
+        # removed, so the effective target is Serve's default of 2 either way,
+        # and declaring 1.0 now is a behaviour change, not a fix.
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
         "downscale_delay_s": 600,
@@ -105,7 +105,7 @@ class RuntimeApp:
         self.start_time = time.time()
         # Serialises ALL GPU work (serving + training) within a replica. The queue
         # it creates is what the autoscaler measures, but at the effective target
-        # of 2 (#0091) a single concurrent call waits here rather than adding a
+        # of 2 a single concurrent call waits here rather than adding a
         # replica; it takes three in flight to ask for a second one.
         self._gpu_lock = asyncio.Lock()
         self._predictor = None
@@ -128,7 +128,7 @@ class RuntimeApp:
     @bioengine.smoke_test
     async def _import_runtime_stack(self) -> None:
         """Import this backend's ML stack once, at startup, and fail the replica if
-        it is not there (#0371).
+        it is not there.
 
         A replica whose ``runtime_env`` install did not take answered the health
         probe correctly and was advertised as ready while **every** call raised
@@ -153,7 +153,7 @@ class RuntimeApp:
         **replaces** the condemned replica and the cycle repeats indefinitely,
         because its circuit breaker ``_terminally_failed()`` is gated on ``not
         _replica_has_started``, which any successful start clears. Measured on
-        ``#0387`` over 100 health-check periods — that probe ran at
+        a probe deployment over 100 health-check periods — that probe ran at
         ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the 30 s
         above: 105 calls, **0 failed**, 84 answered by a replica that already
         knew its own smoke test had failed, across 22 distinct replica pids.
@@ -559,8 +559,8 @@ class RuntimeApp:
         Evicts the resident inference model first so the subprocess owns the GPU;
         the subprocess (``train_worker.py``) writes COMPLETED/FAILED to the
         session status. Held for the run's duration, so concurrent inference
-        queues behind it on this replica — at the effective target of 2 (#0091) a
-        training plus one inference asks for one replica, not two (#0097).
+        queues behind it on this replica — at the effective target of 2 a
+        training plus one inference asks for one replica, not two.
         """
         import training
 

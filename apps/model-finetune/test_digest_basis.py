@@ -1,4 +1,4 @@
-"""#0417 — a stored head digest must say WHICH digest it is, or say it cannot.
+"""a stored head digest must say WHICH digest it is, or say it cannot.
 
 ``global_sha256`` (and its ``current_community.sha256`` and manifest
 ``weights_sha256`` copies — one value, three places) digested the file
@@ -280,7 +280,7 @@ class TestProvenance:
 # CURRENT_DIGEST_BASIS names what state_dict_digest computes. Nothing in the
 # language ties them together, so a change to the function that forgets the
 # constant would start stamping new records with a basis that is no longer true —
-# the same defect as #0417, with a stamp on it. The golden vector below is the tie.
+# the same defect as the digest-basis rule, with a stamp on it. The golden vector below is the tie.
 
 
 class _StubTensor:
@@ -402,7 +402,7 @@ class TestWritersStampTheBasis:
         assert pool.digest_basis(cur, digest_key="sha256") == pool.DIGEST_BASIS_TENSORS
 
 
-# ── #0509: the contribution surface ──────────────────────────────────────────
+# ── the stored-basis stamp: the contribution surface ──────────────────────────────────────────
 #
 # The third writer. ``append_contribution`` stamped nothing, so a contribution's
 # ``weights_sha256`` was the one published digest with no attribution at all — a
@@ -437,7 +437,7 @@ UPLOADED_NEW = AFTER_CUTOFF
 
 def _contribution(cid: str, digest: str, uploaded_at: Any, basis: Any = "<omit>") -> Dict[str, Any]:
     """A contribution stub in the stored shape. ``basis='<omit>'`` writes no basis
-    key at all — what every record written before #0509 looks like, and distinct
+    key at all — what every record written before the stored-basis stamp looks like, and distinct
     from a key present and null."""
     rec: Dict[str, Any] = {
         "contribution_id": cid,
@@ -706,7 +706,7 @@ class TestContributionsStampTheBasis:
         assert index["contributions"][1]["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
 
     def test_the_refused_duplicate_append_stamps_nothing(self):
-        """The #0376 dedupe backstop still fires, and the stamp does not reach the
+        """The dedupe backstop still fires, and the stamp does not reach the
         index on the path that raises."""
         index: Dict[str, Any] = {
             "contributions": [_contribution("c-first", CONTRIB_SHA, UPLOADED_OLD)]
@@ -976,12 +976,12 @@ class _Runtime:
 
     async def score_soup(self, specs, imgs, gts, diam_mean,
                          base_commitment=None) -> Dict[str, Any]:
-        # One per-image score per image of the split, as the real runtime returns
-        # (#0121). Uniform, so the mean is exactly the ``f1`` the caller chose —
+        # One per-image score per image of the split, as the real runtime returns.
+        # Uniform, so the mean is exactly the ``f1`` the caller chose —
         # aggregate() refuses a record whose aggregate is not the mean of the
         # vector beside it, so a stub returning an arbitrary vector would make
         # every branch below fail for a reason that is not under test here.
-        # ``base_commitment`` is accepted and ignored: #0070 made it part of the
+        # ``base_commitment`` is accepted and ignored: the base-commitment rules made it part of the
         # call, and a stub that rejected it would fail on the signature rather
         # than on anything this file is about.
         return {"f1": self._f1, "per_image": [self._f1] * max(len(gts), 1),
@@ -1138,7 +1138,7 @@ async def test_a_merge_that_admitted_nothing_stamps_a_null_basis_not_an_absent_o
 
 @pytest.mark.asyncio
 async def test_aggregate_returns_the_attribution_of_the_digest_it_just_published():
-    """The moment the #0417 false alarm actually happens: a caller re-merges an
+    """The moment the false alarm the digest-basis rule removes actually happens: a caller re-merges an
     identical member set, gets a number, and compares it against a stored one. Both
     numbers are in their hands HERE, so the attribution has to travel with the
     return value and not only on a page they would have to go and read."""

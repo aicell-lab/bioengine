@@ -27,7 +27,7 @@ sources:
   - type: files
     files:
       - id: czi-tczyx
-        path: /data/nmechtel/omezarr-skilltest/T=3_Z=5_CH=2.czi
+        path: /path/to/your/T=3_Z=5_CH=2.czi
         title: CZI TCZYX (skill-test file, t axis with a declared increment)
         licence: CC-BY-4.0
         source_page: https://zenodo.org/records/7015307

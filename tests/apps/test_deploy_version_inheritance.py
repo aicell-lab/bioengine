@@ -5,7 +5,7 @@ version already running (``manager.py``, the ``is_update`` branch). That rule is
 deliberate and documented, but nothing ever flagged it as a *mistake*: a caller
 who had just uploaded newer code got a deploy that reported success while
 redeploying the code it had replaced, and every status field agreed. Reported
-twice independently — over the API (svamp #0023) and from the CLI
+twice independently — over the API and from the CLI
 (aicell-lab/bioengine#157).
 
 Two pins here:

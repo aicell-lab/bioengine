@@ -1,4 +1,4 @@
-"""A ``None`` proxy actor handle routes to the same recovery as a stale one (#0372).
+"""A ``None`` proxy actor handle routes to the same recovery as a stale one.
 
 ``reconnect()`` and the external-cluster branch of ``check_connection()`` both
 drop ``proxy_actor_handle`` immediately before re-acquiring it, so the ``None``
@@ -14,7 +14,7 @@ Measured on a live external-cluster worker (``bioengine-worker-local:0.16.89``,
 the next pass logged the ``AttributeError`` in the same second, then once per
 tick for 515 consecutive ticks.
 
-WHICH FIX, AND WHY (#0372 clause 1): the call site refuses to dereference a
+WHICH FIX, AND WHY: the call site refuses to dereference a
 ``None`` handle and raises ``ProxyHandleAbsentError``, which the recovery
 predicate accepts by TYPE. The alternative — teaching
 ``_is_stale_handle_error`` to recognise the ``AttributeError`` — was rejected:
