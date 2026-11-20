@@ -65,7 +65,7 @@ worker = [
     # Ray Serve touches FieldDescriptor.label, which protobuf 7 removed —
     # measured: present on the class in 6.33.1, absent in 7.36.2. Kept here as
     # well as in requirements-worker.txt because pip only sees this one, and
-    # without it `pip install -e ".[worker]"` resolved protobuf 7.36.2 (#0231).
+    # without it `pip install -e ".[worker]"` resolved protobuf 7.36.2.
     "protobuf>=4,<7",
     "pydantic~=2.12.0",
     "ray[client,serve]>=2.53.0,<3.0.0",
