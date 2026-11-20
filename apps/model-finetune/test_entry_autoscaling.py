@@ -84,7 +84,7 @@ def test_entryapp_scales_to_zero_which_is_why_the_cadence_matters():
 
 
 def test_entryapp_declares_a_metrics_interval_below_the_serve_default():
-    """THE arm this row exists for. Serve's default is 10.0; that is the slow mode."""
+    """THE arm this file exists for. Serve's default is 10.0; that is the slow mode."""
     cfg = _entryapp_autoscaling_config()
     assert "metrics_interval_s" in cfg, (
         "EntryApp declares no metrics_interval_s, so it inherits Serve's 10.0 s default — "
@@ -95,7 +95,7 @@ def test_entryapp_declares_a_metrics_interval_below_the_serve_default():
     assert isinstance(val, (int, float)), f"metrics_interval_s is {val!r}, not a number"
     assert 0 < val <= MAX_METRICS_INTERVAL_S, (
         f"metrics_interval_s is {val}, above the {MAX_METRICS_INTERVAL_S} s ceiling this "
-        f"row's measurement supports"
+        f"measurement here supports"
     )
 
 
@@ -113,7 +113,7 @@ def test_both_keys_are_real_autoscaling_config_fields():
     """AutoscalingConfig DROPS unknown keys instead of raising.
 
     So a renamed or misspelled field reaches Serve and is lost with no warning, and the
-    deployment would quietly run on the defaults this row is about.
+    deployment would quietly run on the defaults this file is about.
 
     This asserts a fact about **Ray**, not about this deployment, so it passes on both
     trees by design — it is the thing that would catch the key being *renamed upstream*,

@@ -63,7 +63,7 @@ def test_no_distance_is_its_own_answer_not_undetermined() -> None:
 
 
 def test_a_pre_change_record_is_UNDETERMINED_not_a_base_and_not_zero() -> None:
-    """THE case this row exists for. A distance with no label must not be
+    """THE case this file exists for. A distance with no label must not be
     attributed to either base, and must not read as zero movement."""
     pre = {"l2_from_base": 2.75}          # written before the basis label: value, no label
     got = pool.l2_basis(pre)

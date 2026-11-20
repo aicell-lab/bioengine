@@ -242,7 +242,7 @@ def test_the_averaged_diameter_is_not_published_and_the_two_differ() -> None:
     published = float(out["diam_labels"][0])
 
     assert published != pytest.approx(AVERAGED_DIAM, rel=1e-3)
-    assert AVERAGED_DIAM / BASE_DIAM > 1.9  # the factor-of-two the row reported
+    assert AVERAGED_DIAM / BASE_DIAM > 1.9  # the factor-of-two reported
     # And the weights really were averaged, so this is not passing because the
     # merge did nothing at all.
     assert torch.allclose(out["a.weight"], torch.full((4,), 1.0))

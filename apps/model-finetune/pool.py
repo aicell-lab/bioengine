@@ -725,7 +725,7 @@ def inherited_non_learned(
 
     ``source`` names the base the values came from (e.g. the cellpose base model
     identifier), because "inherited" without a named source is the same unfalsifiable
-    claim the row was filed about — a reader could not tell an inherited 30.0 from a
+    claim this guard is about — a reader could not tell an inherited 30.0 from a
     coincidental one. Built here rather than inline at the call site so the wording and
     the basis constant cannot drift apart across writers.
     """
@@ -841,7 +841,7 @@ def unreported_non_learned(*, reason: str) -> Dict[str, Any]:
     returns a ``materialize_soup`` payload without them. That case gets a block SAYING
     SO rather than a bare null, because a reader must be able to tell "this runtime did
     not supply them" from "this soup had no contributor diameters" — collapsing the two
-    is the same false silence the row was filed about. The published checkpoint is still
+    is the same false silence this guard is about. The published checkpoint is still
     correct: the carry-through happens inside ``uniform_soup``, so the tensor holds the
     base's value whether or not the runtime reported it; only the RECORD is poorer.
     """
@@ -1560,7 +1560,7 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
 # bytes that were deposited. One is expected and boring; the other is a possible
 # integrity incident that a human has to look at. A single code for both would
 # bury the second inside the first, which is exactly the "no digest" versus
-# "digest not checked" confusion this row was filed about.
+# "digest not checked" confusion this guard removes.
 # ---------------------------------------------------------------------------
 QUARANTINE_NO_DIGEST = "no_digest"
 QUARANTINE_DIGEST_MISMATCH = "digest_mismatch"
@@ -1648,7 +1648,7 @@ def digest_quarantine(
     be in it.
 
     RAISES rather than admitting a member whose bytes it was not shown. That is the
-    load-bearing line in this function: the failure this row exists to prevent is
+    load-bearing line in this function: the failure this function exists to prevent is
     souping bytes nothing checked, and a version of this that treated an unhashed
     member as "nothing to compare, carry on" would restore that failure exactly
     while every test below still passed. A missing entry is a caller bug, not a
@@ -1932,7 +1932,7 @@ def build_community_manifest(
         # record". Both default to None rather than to {} or [], because an empty map and
         # an absent one must stay distinguishable: a merge written before this field
         # existed carries null, and reading that as "this soup had no contributor
-        # diameters" would be the same false-silence the row was filed about.
+        # diameters" would be the same false silence this guard is about.
         "non_learned": non_learned,
         "member_non_learned": member_non_learned,
         "created_at": created_at,

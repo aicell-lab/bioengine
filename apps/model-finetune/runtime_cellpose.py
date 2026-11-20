@@ -804,7 +804,7 @@ class CellposeRuntime:
                 # branch to the sibling `if` branch, when the right comparator is what
                 # THIS path did before. Before the base commitment there was no `else` at all, so a
                 # stock-initialised deposit held exactly ONE state dict. It now holds two.
-                # Reusing this row's own FU1 figures (one cpsam dict 1.1348 GiB, two
+                # Reusing the measured figures (one cpsam dict 1.1348 GiB, two
                 # 2.3060 GiB -- a REUSE, not a fresh measurement), this path went from
                 # ~1.13 GiB to ~2.31 GiB. The memory bound was made worse, by this branch.
                 # That is why the whole computation now runs under `_soup_sem` below.
@@ -849,7 +849,7 @@ class CellposeRuntime:
         # replica's peak becomes max(merge, contribute) rather than their sum.
         #
         # What this does NOT do, stated because the close has to record the bound rather
-        # than an improvement: it does not reduce the single-path peak. Reusing this row's
+        # than an improvement: it does not reduce the single-path peak. Reusing the measured
         # FU1 figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
         # measurement), contribute alone still peaks at ~2.31 GiB. If max(merge,
         # contribute) is still above what the admission gate assumes, that is a separate
@@ -858,7 +858,7 @@ class CellposeRuntime:
         # The cost is latency: the deposit RPC now waits for any in-flight merge before it
         # starts its own torch load. That is the trade the ruling accepted -- a measured
         # memory bound over an unmeasured latency improvement -- and the measurement of
-        # what it adds is on the row.
+        # what it adds is recorded with those figures.
         async with self._soup_sem:
             info = await asyncio.to_thread(_inspect)
         weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)

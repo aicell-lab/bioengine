@@ -443,7 +443,7 @@ class _RecognisedRedeposit(Exception):
     # handle->controller push rate, max_replicas being 1, which is why this is the
     # per-deployment field and not the worker-wide
     # RAY_SERVE_HANDLE_AUTOSCALING_METRIC_PUSH_INTERVAL_S env var -- that one would
-    # change every deployment the worker hosts and is another lane's to set.
+    # change every deployment the worker hosts and is set elsewhere.
     #
     # Both keys are real AutoscalingConfig fields in Ray 2.55.1, asserted rather than
     # assumed: AutoscalingConfig drops unknown keys instead of raising, so a

@@ -132,7 +132,7 @@ class TestCorrectedMetric:
         assert out["aggregate_basis"].startswith(pool.SELECTION_BASIS)
 
     def test_the_retracted_witness_wording_is_restated(self):
-        """The half this row did not name, and the worse half of the two: it is
+        """The half the requirement did not name, and the worse half of the two: it is
         attached to the only number the improvement curve plots."""
         out = pool.corrected_metric(_metric(STORED_WITNESS, role="witness"))
         assert STORED_WITNESS not in out["aggregate_basis"]

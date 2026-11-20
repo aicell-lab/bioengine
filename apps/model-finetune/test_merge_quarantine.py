@@ -232,7 +232,7 @@ async def _merge(stub, **kw):
 
 @pytest.mark.asyncio
 async def test_a_digestless_candidate_is_excluded_and_the_merge_still_publishes():
-    """The whole decision, in one assertion pair. The earlier attempt at this row
+    """The whole decision, in one assertion pair. The earlier attempt at this check
     aborted the merge on a digest-less member, which on a pool carrying one legacy
     record means the campaign never merges again."""
     stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
@@ -248,7 +248,7 @@ async def test_a_digestless_candidate_is_excluded_and_the_merge_still_publishes(
 
 @pytest.mark.asyncio
 async def test_the_excluded_member_is_not_in_the_published_head():
-    """The failure mode this row is about: a member whose bytes nothing checked
+    """The failure mode this file is about: a member whose bytes nothing checked
     ending up inside the published checkpoint. ``selected_contribution_ids`` is the
     permanent record of what was souped, in an immutable artifact."""
     stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
@@ -420,9 +420,9 @@ async def test_the_same_merge_publishes_at_the_floor_it_can_meet():
 
 @pytest.mark.asyncio
 async def test_a_clean_merge_states_the_zero_rather_than_omitting_it():
-    """Every live pool measured for this row is clean, so this is the shape almost
+    """Every live pool measured here is clean, so this is the shape almost
     every real merge produces. An absent field would read identically to a merge
-    written by a build that predates the check — the exact ambiguity the row is
+    written by a build that predates the check — the exact ambiguity this check is
     about — so the counts are present and zero."""
     stub = _Merging(_index([_contrib("c-good", SHA_GOOD)]), _Runtime(0.90))
     result = await _merge(stub)

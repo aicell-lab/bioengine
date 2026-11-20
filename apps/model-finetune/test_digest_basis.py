@@ -136,7 +136,7 @@ class TestResolver:
             assert pool.digest_basis(_merge(created_at=ts)) == pool.DIGEST_BASIS_FILE
 
     def test_a_post_cutoff_record_without_a_stamp_is_undetermined(self):
-        """The row's fourth clause. A worker can still be running the old build a
+        """The requirement's fourth clause. A worker can still be running the old build a
         week after the commit, so the late side is evidence of nothing."""
         out = pool.digest_basis(_merge(created_at=AFTER_CUTOFF))
         assert out == pool.DIGEST_BASIS_UNDETERMINED
@@ -207,7 +207,7 @@ class TestResolver:
         assert pool.digest_basis(pointer, digest_key="sha256") == pool.DIGEST_BASIS_TENSORS
 
 
-# Measured 2026-11-13 from the six live bioimage-io pools (the snapshot the row's
+# Measured 2026-11-13 from the six live bioimage-io pools (the snapshot this file's
 # figures were re-checked against). Eight merges carry a digest; these are their
 # created_at values. Written out rather than derived so this file does not need the
 # snapshot to run, and so a change to the snapshot cannot quietly change the test.
@@ -224,7 +224,7 @@ REAL_MERGE_TIMES: List[float] = [
 
 
 def test_the_measured_live_timestamps_are_all_before_the_cutoff():
-    """The row's claim, as a fixture-level assertion: if a pool is later written by
+    """The claim, as a fixture-level assertion: if a pool is later written by
     a newer app and this list is refreshed, a value on the other side of the cutoff
     fails HERE, naming the reason, instead of silently changing what the suite above
     is testing."""
@@ -421,7 +421,7 @@ class TestWritersStampTheBasis:
 # wrong one is not used.
 #
 # Deliberately NOT asserted through the writer's own return value or its argument
-# dict: the row asks for the STORED entry read back out of the index, because a
+# dict: the requirement is the STORED entry read back out of the index, because a
 # stamp applied to the caller's dict and then dropped on the way in would satisfy
 # any assertion made on the dict.
 
@@ -503,7 +503,7 @@ class TestContributionsStampTheBasis:
         assert pool.contribution_digest_basis(stored) == pool.DIGEST_BASIS_FILE
 
     def test_two_contributions_under_different_bases_are_distinguishable(self):
-        """THE discrimination this row is for, and the test with teeth.
+        """THE discrimination this file is for, and the test with teeth.
 
         One record explicitly stamped with the TENSOR meaning — what a future build
         whose ``prepare_contribution`` switched digest functions would write — and
@@ -608,7 +608,7 @@ class TestContributionsStampTheBasis:
     def test_the_metadata_record_carries_the_same_basis_as_the_index_entry(self):
         """Both stored records hold the same digest, so both say what it is of. If
         only one did, the absence on the other would newly mean "written by a build
-        that does not stamp" — the ambiguity this row exists to remove, moved one
+        that does not stamp" — the ambiguity this check exists to remove, moved one
         file sideways."""
         meta = pool.build_contribution_metadata(
             contribution_id="c-new",

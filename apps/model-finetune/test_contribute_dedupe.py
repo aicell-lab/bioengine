@@ -14,7 +14,7 @@ checkpoint into two deposits; it can only hide the double weight. Comparing a
 caller-supplied field as well (``dataset_fingerprint``) would let a retry defeat
 de-duplication by accident.
 
-Two things are asserted that the row's own clause does not ask for, because
+Two things are asserted that the requirement does not ask for, because
 "one member remains" is satisfied by a run that left the artifact unusable:
 
 * the stage was DISCARDED, and
@@ -320,7 +320,7 @@ def _index_puts(stub: _Stub) -> List[bytes]:
 
 @pytest.mark.asyncio
 async def test_a_redeposit_leaves_exactly_one_member(fake_training: None) -> None:
-    """The row's clause 2, first half."""
+    """The requirement's clause 2, first half."""
     idx = _index(_member(_FIRST_ID, _DIGEST))
     stub = _Stub(idx, _DIGEST)
     await _deposit(stub)
@@ -450,7 +450,7 @@ async def test_both_return_paths_have_the_same_shape(fake_training: None) -> Non
 
 @pytest.mark.asyncio
 async def test_a_redeposit_discards_the_stage_and_writes_nothing(fake_training: None) -> None:
-    """The failure mode the row does not name, and the one that would be worse than
+    """The failure mode the requirement does not name, and the one that would be worse than
     the bug: ``put_file`` minted the duplicate's weights row inside the stage
     before the digest could be known, so leaving the block without discarding
     makes every later commit on this pool fail for ~62 s and then raise."""

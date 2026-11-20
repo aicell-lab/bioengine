@@ -133,7 +133,7 @@ def runtime(tmp_path, monkeypatch):
 
     The session is STOCK-INITIALISED on purpose — no `init_checkpoint.pt` — because that is the
     `else` branch the base-commitment rules added, the one that loads a second state dict and so the one whose
-    peak this row regressed on.
+    peak the regression was in.
     """
     sdir = tmp_path / "sess"
     (sdir / "models").mkdir(parents=True)
@@ -166,7 +166,7 @@ def runtime(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_inspection_cannot_start_while_the_merge_holds_the_semaphore(runtime):
-    """THE arm this row exists for. Hold ``_soup_sem``; the deposit must wait.
+    """THE arm this file exists for. Hold ``_soup_sem``; the deposit must wait.
 
     A mutant that drops the ``async with`` fails HERE and by name.
     """
@@ -215,7 +215,7 @@ async def test_the_semaphore_is_released_even_when_the_inspection_raises(runtime
 
     `async with` gives this for free, so the test is cheap; it is here because the failure it
     rules out — a replica that stops merging entirely after one bad checkpoint — is worse than
-    the breach this row is about.
+    the breach this file is about.
     """
     def _boom(model_type="cpsam"):
         runtime._started.append(model_type)

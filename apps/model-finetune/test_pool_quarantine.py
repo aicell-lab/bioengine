@@ -144,7 +144,7 @@ class TestDigestQuarantine:
         assert quarantined == []
 
     def test_a_member_nobody_hashed_raises_rather_than_being_admitted(self):
-        """The load-bearing line. The failure this row exists to prevent is souping
+        """The load-bearing line. The failure this check exists to prevent is souping
         bytes that nothing checked; a version of ``digest_quarantine`` that treated
         an unhashed member as "nothing to compare against, carry on" would restore
         that failure exactly, and every other test in this file would still pass."""
@@ -302,7 +302,7 @@ class TestManifestCarriesTheQuarantine:
     def test_a_clean_merge_still_states_that_it_was_clean(self):
         """The field is present and empty rather than absent. Absence would be
         indistinguishable from a writer that predates this change, which is the
-        exact ambiguity the row was filed about."""
+        exact ambiguity this check is about."""
         man = self._manifest([])
         assert man["quarantined"] == []
         assert man["quarantine_counts"][pool.QUARANTINE_DIGEST_MISMATCH] == 0
