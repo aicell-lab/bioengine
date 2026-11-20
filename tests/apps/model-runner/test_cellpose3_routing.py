@@ -62,12 +62,51 @@ def test_every_listed_cellpose3_model_routes(entry_ns):
         assert entry_ns["_python_env_for"](f"bioimage-io/{alias}") == "cellpose3"
 
 
-def test_infer_passes_the_env_to_the_runtime():
-    """``infer`` must hand the chosen venv to ``predict_from_disk``."""
+def _predict_call():
+    """The ``python_env=`` argument of the real ``predict_from_disk`` CALL.
+
+    Anchored on ``await self.runtime.predict_from_disk(`` rather than on the
+    bare name. The bare name also occurs in prose: a docstring that explains
+    what the argument is for mentions it, and a plain ``.index()`` then reads
+    the explanation instead of the call and fails with a diff full of comment
+    text. Which is exactly what happened when the custom-environment route
+    was added.
+    """
     src = ENTRY.read_text()
-    call = src[src.index("predict_from_disk(") :]
-    call = call[: call.index(")\n")]
-    assert "python_env=_python_env_for(model_id)" in call, call
+    call = src[src.index("await self.runtime.predict_from_disk(") :]
+    return call[: call.index("\n                )")]
+
+
+def test_infer_passes_the_env_to_the_runtime():
+    """``infer`` must hand the chosen interpreter to ``predict_from_disk``."""
+    call = _predict_call()
+    assert "python_env=" in call, call
+    assert "_python_env_for(model_id)" in call, call
+
+
+def test_a_declared_environment_outranks_the_cellpose3_mapping():
+    """``custom_environment=True`` wins over the id-based venv mapping.
+
+    Both can apply to one request. The model's own declared environment is the
+    more specific statement — the caller asked for it by name — so it has to be
+    the one that reaches the runtime, and a Cellpose-3 model tested in its
+    declared env must not be silently rerouted to the alt venv instead.
+    """
+    call = _predict_call()
+    assert "interpreter or _python_env_for(model_id)" in call, call
+
+
+def test_the_predict_call_anchor_can_actually_fail():
+    """Control for ``_predict_call``: the anchor must be able to miss.
+
+    Without this, a helper that silently returned the whole file would satisfy
+    both assertions above by accident.
+    """
+    assert "python_env=" in _predict_call()
+    # The slice really is a slice: the module docstring is outside it.
+    assert "Cellpose 3 and 4 are one distribution name" not in _predict_call()
+    with pytest.raises(ValueError):
+        "no such anchor here".index("await self.runtime.predict_from_disk(")
 
 
 def test_infer_no_longer_refuses_cellpose3():
