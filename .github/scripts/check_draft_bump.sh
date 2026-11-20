@@ -24,18 +24,25 @@
 #     API calls. Rebase and amend reset it, so a draft that is kept current by
 #     rebasing reads as freshly bumped however long it has really held the rung. A
 #     bump committed locally hours before being pushed reads as stale for the same
-#     reason. Merging main in resets it too, but only when main itself touched a
-#     non-version line of pyproject.toml: the merge commit then becomes the newest
-#     commit in range that touched the file. When main changed only the version line
-#     the original bump is still found. The approximation is deliberate; none of
-#     these history-rewriting or merge cases is covered.
+#     reason. The approximation is deliberate; the history-rewriting cases are NOT
+#     covered. Edits to pyproject.toml that leave the version alone do NOT reset it:
+#     the commit is selected by a change to a version LINE, not by the file, and
+#     merge commits are included (a version settled by resolving a merge is a claim
+#     made at that merge). The walk follows first-parent only, so a bump that arrived
+#     from the base branch is not attributed to this draft.
 #   * It can only judge when an event fires (opened, synchronize, reopened,
 #     ready_for_review, converted_to_draft). A draft that bumps and then sits with no
 #     further push is judged once, at age ~0, and never again -- which is exactly the
 #     pure reservation case. It is caught only if the author pushes again after the
 #     grace period.
 #
-# Usage:  check_draft_bump.sh <base_sha> <head_sha>
+# Usage:  check_draft_bump.sh <base_sha> <head_sha> [is_draft]
+#
+# is_draft defaults to true. When it is false the check says so and exits 0: the job
+# runs on every pull_request event ON PURPOSE, including ready_for_review and a
+# synchronize while not a draft, so the head that actually merges carries a REAL
+# conclusion. A job skipped by an `if:` reports completed/skipped, which looks green
+# and ran nothing -- the failure mode this is here to avoid.
 # Env:    DRAFT_BUMP_GRACE_S  how long a rung may be held before it is flagged (default 4h)
 #         NOW_S               override "now", for the test harness only
 #
@@ -46,12 +53,19 @@ set -uo pipefail
 
 BASE_SHA="${1:-}"
 HEAD_SHA="${2:-}"
+IS_DRAFT="${3:-true}"
 GRACE_S="${DRAFT_BUMP_GRACE_S:-14400}"
 NOW_S="${NOW_S:-$(date -u +%s)}"
 
 if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
   echo "::error::usage: check_draft_bump.sh <base_sha> <head_sha>"
   exit 1
+fi
+
+if [ "$IS_DRAFT" != "true" ]; then
+  echo "This pull request is not a draft, so no rung is being reserved: the bump it"
+  echo "carries is the one it is about to merge with. Checked and clear."
+  exit 0
 fi
 
 read_version() {
@@ -90,9 +104,17 @@ if [ "$HIGHER" != "$HEAD_V" ]; then
   exit 0
 fi
 
-# The newest commit in the pull request's own range that touched pyproject.toml. Its
-# committer time is when this rung was claimed, with the caveat in the header.
-BUMP_SHA=$(git log --format=%H -1 "$BASE_SHA..$HEAD_SHA" -- pyproject.toml 2>/dev/null)
+# The newest commit in the pull request's own range that touched a VERSION line, not
+# merely the file. Selecting by file lets any later edit to pyproject.toml -- a
+# dependency, a tool setting -- reset the clock while the rung goes on being held.
+# -m is required or merge commits are not diffed at all, and a version set by
+# resolving a merge becomes invisible: measured on git 2.25.1, plain -G returned
+# nothing for a rung claimed in a merge commit, which failed closed on a fresh rung.
+# --first-parent keeps the walk on this draft's own line, so a bump that arrived FROM
+# main is not misread as this draft claiming it. -m prints one line per parent, so
+# take the first.
+BUMP_SHA=$(git log --format=%H -1 -G'^version' -m --first-parent \
+             "$BASE_SHA..$HEAD_SHA" -- pyproject.toml 2>/dev/null | head -1)
 BUMP_AT=""
 [ -n "$BUMP_SHA" ] && BUMP_AT=$(git show -s --format=%ct "$BUMP_SHA" 2>/dev/null)
 

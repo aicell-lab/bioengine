@@ -210,7 +210,11 @@ jobs:
   # and test_check_draft_bump.sh.
   # ---------------------------------------------------------------------------
   draft-bump-check:
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+    # No draft filter here ON PURPOSE. An `if:` that skips reports completed/skipped
+    # on the head that merges -- green-looking, ran nothing -- and that head is
+    # exactly where ready_for_review and a synchronize-while-not-draft land. The
+    # draft/non-draft decision is made by the script, which says which branch it took.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -218,7 +222,26 @@ jobs:
         fetch-depth: 0
 
     - name: Flag a version rung that has SAT on this draft
+      # Through env rather than interpolated into the script: a branch name is
+      # attacker-shaped input even when only writers can trigger the dispatch.
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BRANCH: ${{ github.event.inputs.pr_branch }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_IS_DRAFT: ${{ github.event.pull_request.draft }}
       run: |
-        .github/scripts/check_draft_bump.sh \
-          "${{ github.event.pull_request.base.sha }}" \
-          "${{ github.event.pull_request.head.sha }}"
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # Demonstration path: grade an arbitrary branch against main as if it were a
+          # draft, so the check can be SEEN to go red without waiting for a real one.
+          git fetch --quiet origin "$PR_BRANCH" main
+          .github/scripts/check_draft_bump.sh \
+            "$(git rev-parse origin/main)" \
+            "$(git rev-parse FETCH_HEAD)" \
+            true
+        else
+          .github/scripts/check_draft_bump.sh \
+            "$PR_BASE_SHA" \
+            "$PR_HEAD_SHA" \
+            "$PR_IS_DRAFT"
+        fi

@@ -58,7 +58,36 @@ GIT_COMMITTER_DATE="2026-01-01T02:00:00Z" git commit -qm "dependency edit" --dat
 DEPEDIT=$(git rev-parse HEAD)
 git checkout -q "$BUMP"
 
-run() { NOW_S="$1" DRAFT_BUMP_GRACE_S="$2" bash "$SUT" "$3" "$4" >"$T/out.txt" 2>&1; echo $?; }
+# A later edit to pyproject.toml that leaves the version alone. Selecting the bump
+# commit by FILE would make this the clock, hiding a rung that is still held.
+git checkout -q -B depslater "$BUMP"
+printf 'version = "0.1.1"\ndeps = ["x"]\n' > pyproject.toml
+git add pyproject.toml
+GIT_COMMITTER_DATE="2026-01-09T00:00:00Z" git commit -qm "deps, not the version" --date="2026-01-09T00:00:00Z"
+DEPSLATER=$(git rev-parse HEAD)
+git checkout -q "$BUMP"
+
+# A rung claimed by RESOLVING A MERGE, which is the shape `git log -G` cannot see
+# without -m: the draft carries no bump commit of its own, and the version is settled
+# in the merge itself.
+git checkout -q -B mainline "$BASE"
+printf 'version = "0.1.1"\n' > pyproject.toml
+git add pyproject.toml
+GIT_COMMITTER_DATE="2026-01-05T00:00:00Z" git commit -qm "base branch moves to 0.1.1" --date="2026-01-05T00:00:00Z"
+MAINLINE=$(git rev-parse HEAD)
+git checkout -q -B mergepr "$BASE"
+printf 'y\n' > work.txt
+git add work.txt
+GIT_COMMITTER_DATE="2026-01-02T00:00:00Z" git commit -qm "work, no version change" --date="2026-01-02T00:00:00Z"
+GIT_COMMITTER_DATE="2026-01-09T00:00:00Z" git merge -q --no-edit "$MAINLINE" >/dev/null 2>&1 || true
+printf 'version = "0.1.2"\n' > pyproject.toml
+git add pyproject.toml
+GIT_COMMITTER_DATE="2026-01-09T00:00:00Z" git commit -q --amend --no-edit --date="2026-01-09T00:00:00Z"
+MERGEHEAD=$(git rev-parse HEAD)
+MERGE_EPOCH=$(git show -s --format=%ct "$MERGEHEAD")
+git checkout -q "$BUMP"
+
+run() { NOW_S="$1" DRAFT_BUMP_GRACE_S="$2" bash "$SUT" "$3" "$4" "${5:-true}" >"$T/out.txt" 2>&1; echo $?; }
 
 say "=== a draft BEHIND main reserves nothing (the false-RED class this replaced) ==="
 rc=$(run "$((BUMP_EPOCH + 86400))" 14400 "$BUMP" "$NOBUMP")
@@ -67,6 +96,17 @@ rc=$(run "$((BUMP_EPOCH + 86400))" 14400 "$BUMP" "$DEPEDIT")
 check "behind main, edited pyproject but not the version -> silent"               0 "$rc"
 grep -q "BEHIND main" "$T/out.txt"
 check "and it says so, rather than being silent for an unstated reason"           0 "$?"
+
+say
+say "=== a non-draft RUNS and reports clear, rather than being skipped ==="
+say "    The job has no draft filter: a skipped job reports completed/skipped on the"
+say "    head that merges, which looks green and ran nothing."
+rc=$(run "$((BUMP_EPOCH + 86400))" 14400 "$BASE" "$BUMP" false)
+check "an aged bump on a NON-draft is clear (it is the bump it will merge with)"   0 "$rc"
+grep -q "not a draft" "$T/out.txt"
+check "and it SAYS it ran, rather than being silently skipped"                     0 "$?"
+rc=$(run "$((BUMP_EPOCH + 86400))" 14400 "$BASE" "$BUMP" true)
+check "CONTROL: the SAME bump, same age, IS flagged when it is a draft"            1 "$rc"
 
 say
 say "=== the distinction: the same bump, fresh vs sat ==="
@@ -81,6 +121,27 @@ rc=$(run "$((BUMP_EPOCH + 86400))" 999999 "$BASE" "$BUMP")
 check "CONTROL: the 24 h-old bump passes when the grace is raised above its age"   0 "$rc"
 rc=$(run "$((BUMP_EPOCH + 600))" 60 "$BASE" "$BUMP")
 check "CONTROL: the 10 min bump fails when the grace is lowered below its age"     1 "$rc"
+
+say
+say "=== a later non-version edit must NOT reset the clock ==="
+say "    The rung is selected by a change to a version LINE, not by the file."
+rc=$(run "$((BUMP_EPOCH + 605400))" 14400 "$BASE" "$DEPSLATER")
+check "rung held 7 days, with a later deps-only commit on top -> still flagged"    1 "$rc"
+rc=$(run "$((BUMP_EPOCH + 600))" 14400 "$BASE" "$DEPSLATER")
+check "CONTROL: the same history 10 min after the BUMP -> clear"                   0 "$rc"
+grep -q "claimed by" "$T/out.txt"
+check "and the line names the commit it timed from"                                0 "$?"
+
+say
+say "=== a rung claimed by resolving a MERGE is seen, and timed from the merge ==="
+say "    git log -G does not diff merge commits without -m: without it this rung is"
+say "    invisible, which fails closed on a rung claimed moments ago."
+rc=$(run "$((MERGE_EPOCH + 600))" 14400 "$MAINLINE" "$MERGEHEAD")
+check "a fresh rung set in the merge commit is clear, not a fail-closed error"     0 "$rc"
+grep -q "claimed by $MERGEHEAD" "$T/out.txt"
+check "and it is timed from the MERGE, not from an older commit"                   0 "$?"
+rc=$(run "$((MERGE_EPOCH + 605400))" 14400 "$MAINLINE" "$MERGEHEAD")
+check "CONTROL: the same merge-claimed rung, 7 days on, IS flagged"                1 "$rc"
 
 say
 say "=== no bump at all ==="
