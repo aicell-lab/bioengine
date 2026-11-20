@@ -1,10 +1,21 @@
 aiofiles>=23.0.0
 bioimageio.core==0.11.0
-# Pinned EXPLICITLY, not left transitive (myco #0550). This deployment and the
-# RuntimeApp both feed their installed core/spec into pin_bioimageio_conda_env
-# and both hash the result, so a divergence silently stops the pre-built custom
-# env from ever being reused. It must equal what bioimageio.core pins, so a
-# core bump that changes the pairing fails loudly at install instead.
+# Pinned EXPLICITLY, not left transitive. This deployment and the RuntimeApp
+# both feed their installed core/spec into pin_bioimageio_conda_env and both
+# hash the result, so a divergence silently stops the pre-built custom env from
+# ever being reused. It must equal what bioimageio.core pins, so a core bump
+# that changes the pairing fails loudly at install instead.
+#
+# The suite's core guard asserts both deployments pin the same core and INFERS
+# equal spec from it, because core pins spec with ==. That inference is not
+# checked anywhere in the suite and cannot be: measuring it needs
+# importlib.metadata.requires("bioimageio.core"), and CI installs only the test
+# and datasets requirements into the worker image, so bioimageio.core is not
+# importable there and such an assertion would SKIP rather than check. If a
+# future core pinned spec as a range - including a wildcard like ==0.5.2.*,
+# which real core releases have used - two deployments could pin the same core
+# and still resolve different specs, and every test would keep passing. A
+# scheduled check outside this repository covers it.
 bioimageio.spec==0.5.12.0
 imageio>=2.37.0
 numpy==1.26.4
