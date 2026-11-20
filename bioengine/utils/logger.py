@@ -51,31 +51,47 @@ def create_logger(
     logger.setLevel(level)
     logger.propagate = False
 
-    # Snapshot ours BEFORE attaching the replacements, then drop them AFTER. Removing first left
-    # a window with zero handlers, and a log call from another thread inside it was lost: INFO
-    # dropped, WARNING+ emitted unformatted by logging.lastResort. Snapshotting is what makes the
-    # order safe -- the new handlers carry the same ownership mark, so a removal loop computed
-    # after attaching them would remove the replacements too.
     previously_ours = [
         h for h in logger.handlers if getattr(h, _OWNED_BY_CREATE_LOGGER, False)
     ]
 
-    # Create console handler with a custom format
+    # BUILD the replacements without touching the logger, then swap. Three orderings were tried
+    # and only this one has no bad state:
+    #
+    #   remove-then-add   leaves a window with ZERO handlers, and a concurrent log call inside it
+    #                     is lost -- INFO dropped, WARNING+ emitted unformatted by lastResort.
+    #   add-then-remove   leaves BOTH sets if anything in between raises. Measured: a repeat call
+    #                     whose log_file is a directory raises IsADirectoryError after the console
+    #                     handler is attached but before the removal loop, so the logger keeps 2
+    #                     handlers and every line prints twice from then on -- reinstating the
+    #                     exact defect this function exists to fix, on an error path.
+    #   build-then-swap   everything that can raise (mkdir, FileHandler) happens before the logger
+    #                     is mutated at all, so a failure leaves it EXACTLY as it was.
+    #
+    # The swap itself cannot raise: addHandler and removeHandler are list operations under a lock.
+    # close() is last, after the handler is already detached, so even a failure there cannot leave
+    # a removed handler attached.
+    new_handlers = []
+
     console_handler = logging.StreamHandler()
-    formatter = logging.Formatter(fmt=stream_logging_format, datefmt=date_format)
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(
+        logging.Formatter(fmt=stream_logging_format, datefmt=date_format)
+    )
     setattr(console_handler, _OWNED_BY_CREATE_LOGGER, True)
-    logger.addHandler(console_handler)
+    new_handlers.append(console_handler)
 
     if log_file:
         log_dir = Path(log_file).resolve().parent
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file)
-        formatter = logging.Formatter(fmt=file_logging_format, datefmt=date_format)
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(
+            logging.Formatter(fmt=file_logging_format, datefmt=date_format)
+        )
         setattr(file_handler, _OWNED_BY_CREATE_LOGGER, True)
-        logger.addHandler(file_handler)
+        new_handlers.append(file_handler)
 
+    for handler in new_handlers:
+        logger.addHandler(handler)
     for handler in previously_ours:
         logger.removeHandler(handler)
         handler.close()

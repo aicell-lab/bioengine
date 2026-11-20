@@ -26,6 +26,10 @@ reader who assumed they did would look for the wrong guarantee:
   F  a later level still applies                      -- an early-return implementation passes
                                                          A-E and silently ignores this; worker.py
                                                          passes DEBUG or INFO from --debug
+  G  a call that RAISES changes nothing               -- attaching before removing left BOTH sets
+                                                         attached when FileHandler raised, so the
+                                                         double-emit defect came back on an error
+                                                         path
 """
 import logging
 import os
@@ -124,6 +128,39 @@ def test_a_repeat_call_without_log_file_replaces_the_file_destination(tmp_path):
     assert target.read_text() == before, (
         "file logging continued after a repeat call without log_file, so the destination was "
         "carried forward and the result now depends on call history"
+    )
+
+
+def test_a_failing_repeat_call_leaves_the_logger_untouched(tmp_path):
+    """Arm G. A repeat call that RAISES must not change the handler set.
+
+    This exists because of a defect introduced while closing the zero-handler window: attaching
+    the new handlers before removing the old ones meant an exception in between left BOTH sets
+    attached, so every line printed twice from then on -- the exact defect this module exists to
+    fix, reinstated on an error path. Measured at the time: handler count 1 before the reorder,
+    2 after.
+
+    `log_file` pointing at a DIRECTORY is the cheapest real raiser: the parent mkdir succeeds and
+    FileHandler then fails with IsADirectoryError. A bad permission or a path component that is a
+    file would do the same.
+    """
+    _fresh("ExcProbe")
+    create_logger("ExcProbe")
+    before = list(logging.getLogger("ExcProbe").handlers)
+    assert len(before) == 1, "setup should leave exactly the console handler"
+
+    a_directory = tmp_path / "not_a_file"
+    a_directory.mkdir()
+    with pytest.raises(OSError):
+        create_logger("ExcProbe", log_file=str(a_directory))
+
+    after = logging.getLogger("ExcProbe").handlers
+    assert len(after) == 1, (
+        "a failed call left %d handlers, so a later line is emitted once per handler" % len(after)
+    )
+    assert after[0] is before[0], (
+        "the original handler was swapped out by a call that raised, so the logger was mutated "
+        "despite the failure"
     )
 
 
