@@ -87,6 +87,21 @@ MERGEHEAD=$(git rev-parse HEAD)
 MERGE_EPOCH=$(git show -s --format=%ct "$MERGEHEAD")
 git checkout -q "$BUMP"
 
+# A base branch that does NOT touch pyproject.toml, so a draft can merge it cleanly
+# and keep a rung that is still above it. This is the shape that pins --first-parent:
+# without it, -m diffs the merge against the base side too, where the version line
+# differs, and the merge is then mistaken for the moment the rung was claimed.
+git checkout -q -B cleanbase "$BASE"
+printf 'unrelated\n' > notes.txt
+git add notes.txt
+GIT_COMMITTER_DATE="2026-01-05T00:00:00Z" git commit -qm "base branch moves, no version change" --date="2026-01-05T00:00:00Z"
+CLEANBASE=$(git rev-parse HEAD)
+git checkout -q -B cleanmerge "$BUMP"
+GIT_COMMITTER_DATE="2026-01-09T00:00:00Z" git merge -q --no-edit "$CLEANBASE" >/dev/null 2>&1
+CLEANMERGE=$(git rev-parse HEAD)
+CLEANMERGE_EPOCH=$(git show -s --format=%ct "$CLEANMERGE")
+git checkout -q "$BUMP"
+
 run() { NOW_S="$1" DRAFT_BUMP_GRACE_S="$2" bash "$SUT" "$3" "$4" "${5:-true}" >"$T/out.txt" 2>&1; echo $?; }
 
 say "=== a draft BEHIND main reserves nothing (the false-RED class this replaced) ==="
@@ -142,6 +157,19 @@ grep -q "claimed by $MERGEHEAD" "$T/out.txt"
 check "and it is timed from the MERGE, not from an older commit"                   0 "$?"
 rc=$(run "$((MERGE_EPOCH + 605400))" 14400 "$MAINLINE" "$MERGEHEAD")
 check "CONTROL: the same merge-claimed rung, 7 days on, IS flagged"                1 "$rc"
+
+say
+say "=== merging the base branch in must NOT reset the draft's own clock ==="
+say "    Pins --first-parent. Without it the merge is diffed against the base side,"
+say "    where the version line differs, and an old rung reads as claimed just now."
+say "    MEASURED: this pair discriminates on git >= 2.31 only. git 2.31 changed how"
+say "    -m combines with --first-parent; on 2.25.1 the mutant passes because the"
+say "    defect does not arise there. Mutate on a modern git or this proves nothing."
+say "    git here: $(git --version)"
+rc=$(run "$((CLEANMERGE_EPOCH + 600))" 14400 "$CLEANBASE" "$CLEANMERGE")
+check "a 7-day-old rung survives a later CLEAN merge of the base -> still flagged"  1 "$rc"
+grep -q "claimed by $BUMP" "$T/out.txt"
+check "and it is still timed from the original bump, not from the merge"            0 "$?"
 
 say
 say "=== no bump at all ==="
