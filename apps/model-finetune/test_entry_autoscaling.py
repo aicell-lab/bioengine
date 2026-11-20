@@ -1,11 +1,11 @@
-"""#0463: the EntryApp deployment must declare its autoscaler sampling cadence.
+"""The EntryApp deployment must declare its autoscaler sampling cadence.
 
 `EntryApp` scales to **zero**. With Serve's defaults (`metrics_interval_s=10.0`,
 `look_back_period_s=30.0`) a request arriving at an idle app waits for the next
-handle->controller metrics push before the controller can see anything is queued. `#0513`
-measured that on this app's own cold-start path, varying only that field: phase A median
-**14.698 s at 10** against **2.142 s at 1**, a 6.9x collapse. `#0463` records the production
-consequence -- the deNBI watcher series shows ~190-490 ms when a replica is up and
+handle->controller metrics push before the controller can see anything is queued. That was
+measured on this app's own cold-start path, varying only that field: phase A median
+**14.698 s at 10** against **2.142 s at 1**, a 6.9x collapse. In production the
+consequence is visible: the deNBI watcher series shows ~190-490 ms when a replica is up and
 9.7-12.6 s when it is not, with nothing in between.
 
 So the cadence is load-bearing, and a later refactor dropping it would silently restore a
@@ -16,7 +16,7 @@ and the whole entry module for a question that is answered by the decorator's ow
 and an import-time failure would read as this check failing rather than as the module being
 unloadable. There is deliberately **no `pytest.importorskip`** anywhere here: CI runs
 `pytest apps/model-finetune` inside `bioengine-worker`, and a skip would turn this guard into
-nothing exactly when it matters (the shape `#0087` spent a refusal on).
+nothing exactly when it matters -- the shape a previous review spent a refusal on.
 """
 import ast
 import pathlib
@@ -27,7 +27,7 @@ from ray.serve.config import AutoscalingConfig
 
 HERE = pathlib.Path(__file__).parent
 
-# The ceiling, not the exact value. 1.0 is what #0513 measured; the sibling deployment in
+# The ceiling, not the exact value. 1.0 is the measured value; the sibling deployment in
 # this same app uses 2.0. Anything at or below 2.0 keeps the cold-start wait off the
 # ten-second default, and pinning the exact number would turn a tuning change into a test
 # failure.
@@ -64,7 +64,7 @@ def test_the_finder_actually_reads_the_decorator():
     """CONTROL. Without this, every assertion below could pass on an empty dict.
 
     Checks the finder returns the keys that have been on this deployment since long before
-    #0463, so a finder that silently matched nothing would fail HERE rather than make the
+    this change, so a finder that silently matched nothing would fail HERE rather than make
     real assertions vacuous.
     """
     cfg = _entryapp_autoscaling_config()
@@ -79,7 +79,7 @@ def test_entryapp_scales_to_zero_which_is_why_the_cadence_matters():
     cfg = _entryapp_autoscaling_config()
     assert cfg.get("min_replicas") == 0, (
         "EntryApp no longer scales to zero; re-derive whether metrics_interval_s is still "
-        "load-bearing before relaxing the next assertion (#0463)"
+        "load-bearing before relaxing the next assertion"
     )
 
 
@@ -88,8 +88,8 @@ def test_entryapp_declares_a_metrics_interval_below_the_serve_default():
     cfg = _entryapp_autoscaling_config()
     assert "metrics_interval_s" in cfg, (
         "EntryApp declares no metrics_interval_s, so it inherits Serve's 10.0 s default — "
-        "which #0513 measured as phase A median 14.698 s against 2.142 s at 1.0, and #0463 "
-        "records as a 9.7-12.6 s cold call in production"
+        "which was measured as phase A median 14.698 s against 2.142 s at 1.0, and appears "
+        "as a 9.7-12.6 s cold call in production"
     )
     val = cfg["metrics_interval_s"]
     assert isinstance(val, (int, float)), f"metrics_interval_s is {val!r}, not a number"
@@ -104,13 +104,13 @@ def test_the_look_back_window_is_not_left_at_the_serve_default():
     cfg = _entryapp_autoscaling_config()
     assert "look_back_period_s" in cfg, (
         "look_back_period_s is unset, so Serve averages the queue signal over its 30 s "
-        "default and a 1 s metrics interval buys less than it appears to (#0463)"
+        "default and a 1 s metrics interval buys less than it appears to"
     )
     assert cfg["look_back_period_s"] <= 10.0
 
 
 def test_both_keys_are_real_autoscaling_config_fields():
-    """#0091: AutoscalingConfig DROPS unknown keys instead of raising.
+    """AutoscalingConfig DROPS unknown keys instead of raising.
 
     So a renamed or misspelled field reaches Serve and is lost with no warning, and the
     deployment would quietly run on the defaults this row is about.

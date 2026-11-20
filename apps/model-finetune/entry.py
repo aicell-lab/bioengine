@@ -416,24 +416,24 @@ class _RecognisedRedeposit(Exception):
     #
     # metrics_interval_s and look_back_period_s are declared because this deployment
     # scales to ZERO, which makes the autoscaler's own sampling cadence the dominant
-    # term in what a caller waits for (#0463, #0513).
+    # term in what a caller waits for.
     #
     # Serve's defaults are metrics_interval_s=10.0 and look_back_period_s=30.0. With
     # min_replicas 0 that means a request arriving at an idle app waits for the next
     # handle->controller metrics push before the controller can even see that anything
-    # is queued, and then for a 30 s window to carry enough signal to decide. #0513
-    # measured the cost on this app's own cold-start path, varying ONLY this field:
+    # is queued, and then for a 30 s window to carry enough signal to decide. The cost
+    # was measured on this app's own cold-start path, varying ONLY this field:
     #
     #     metrics_interval_s = 10 (default)   phase A median 14.698 s
     #     metrics_interval_s = 1              phase A median  2.142 s     6.9x
     #
     # where phase A is autoscale + placement + runtime_env, i.e. everything before the
-    # replica's actor exists. #0463 records what that costs in production: on the deNBI
+    # replica's actor exists. In production that cost is plain: on the deNBI
     # watcher's own series the app answers in ~190-490 ms when a replica is already up
     # and 9.7-12.6 s when it is not, with nothing in between -- a bimodal distribution
     # whose slow mode IS this wait.
     #
-    # 1.0 is used rather than the sibling's 2.0 because 1.0 is the value #0513 actually
+    # 1.0 is used rather than the sibling's 2.0 because 1.0 is the value actually
     # measured; 2.0 would be an interpolation. The cost is this ONE deployment's
     # handle->controller push rate, max_replicas being 1, which is why this is the
     # per-deployment field and not the worker-wide
@@ -441,7 +441,7 @@ class _RecognisedRedeposit(Exception):
     # change every deployment the worker hosts and is another lane's to set.
     #
     # Both keys are real AutoscalingConfig fields in Ray 2.55.1, asserted rather than
-    # assumed: AutoscalingConfig drops unknown keys instead of raising (#0091), so a
+    # assumed: AutoscalingConfig drops unknown keys instead of raising, so a
     # renamed field would reach Serve and be lost with no warning. Verified in the
     # worker image with a control -- `zzz_not_a_field` is absent from model_fields
     # while these two are present, and both round-trip.
