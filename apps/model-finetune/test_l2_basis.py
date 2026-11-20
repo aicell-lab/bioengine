@@ -7,8 +7,8 @@ Two halves of one rule:
 2. every ``l2_from_base`` carries an explicit basis label, and a record written
    BEFORE this change reads as ambiguous rather than as zero.
 
-The third sentence is the one a shortcut gets wrong. Every pre-the basis label record holds
-a distance and no label, and the tempting default — "unlabelled means the
+The second half is the one a shortcut gets wrong. Every record written before the
+basis label existed holds a distance and no label, and the tempting default — "unlabelled means the
 session-init base, because that was the only one that produced a number" — is the
 inference 0.27.6 makes unsafe. ``l2_basis`` must refuse it.
 """
