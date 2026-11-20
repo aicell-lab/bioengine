@@ -201,9 +201,9 @@ def test_the_decision_not_to_wrap_the_connection_is_recorded_at_the_site() -> No
     assert len(src) > 10_000, f"entry.py read back implausibly short ({len(src)} chars)"
     assert "ZZZ_PHRASE_THAT_IS_NOT_IN_ENTRY_PY" not in src
 
-    assert "deliberately NOT wrapped" in src, (
-        "the decision not to wrap `self._hypha` is not stated where `self._s3` is wrapped"
-    )
+    assert (
+        "deliberately NOT wrapped" in src
+    ), "the decision not to wrap `self._hypha` is not stated where `self._s3` is wrapped"
     assert "different object from the connection" in src, (
         "the REASON is not stated: that reconnecting_service re-resolves a service "
         "proxy, which is not the connection it was resolved through"
