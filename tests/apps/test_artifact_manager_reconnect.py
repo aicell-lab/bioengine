@@ -687,7 +687,7 @@ def fast_grace(monkeypatch):
 async def test_a_transient_resolution_failure_at_boot_is_survived(fast_grace):
     """THE DEFECT: before the fix, one failure here killed the worker."""
     server = _FlakyServer(fail_times=3)
-    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
 
     assert proxy.name == "after-retry"
     assert server.attempts == 4, "should have retried exactly until it succeeded"
@@ -713,7 +713,7 @@ async def test_a_healthy_boot_is_not_delayed(monkeypatch):
 
     server = _FlakyServer(fail_times=0)
     started = _time.monotonic()
-    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
     elapsed = _time.monotonic() - started
 
     assert proxy.name == "after-retry"
@@ -739,7 +739,7 @@ async def test_a_service_that_never_returns_still_RAISES_rather_than_hanging(
 
     started = _time.monotonic()
     with pytest.raises(KeyError) as raised:
-        await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+        await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
     elapsed = _time.monotonic() - started
 
     assert raised.value is sentinel, "the operator must see the real error"
@@ -774,7 +774,7 @@ async def test_the_wait_never_overshoots_the_grace(monkeypatch):
     server = _FlakyServer(fail_times=10**9)
     started = _time.monotonic()
     with pytest.raises(KeyError):
-        await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+        await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
     elapsed = _time.monotonic() - started
 
     assert server.attempts >= 1
@@ -867,7 +867,7 @@ async def test_the_boot_path_still_retries_when_it_opts_in(fast_grace):
     """
     server = _FlakyServer(fail_times=3)
     proxy = await _manager_with(server)._resolve_artifact_manager_proxy(
-        _manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S
+        grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S
     )
     assert proxy.name == "after-retry"
     assert server.attempts == 4, server.attempts

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from bioengine.apps import manager as manager_module
-from bioengine.apps.manager import AppsManager
+from bioengine.apps.manager import _ARTIFACT_MANAGER_RESOLVE_GRACE_S, AppsManager
 from bioengine.cluster import ray_cluster as ray_cluster_module
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.heartbeat import heartbeat_stale_after_seconds
@@ -344,11 +344,23 @@ class _Reached(Exception):
     """Ends a start() once the value under test has been recorded."""
 
 
-def _budget_recorder(budgets):
-    """Stands in for a connect method, defaulting exactly as the real one does."""
+def _budget_recorder(budgets, graces=None):
+    """Stands in for a connect method, defaulting exactly as the real one does.
 
-    async def _connect(retry_budget_seconds: float = RECONNECT_BUDGET_S):
+    Records the artifact-manager grace too, so this test also pins that BOOT
+    opts into it. A fake that only accepted the budget turned a real call-site
+    change into a TypeError here rather than a finding, which is a worse failure
+    than the one it was guarding.
+    """
+
+    async def _connect(
+        retry_budget_seconds: float = RECONNECT_BUDGET_S,
+        *,
+        artifact_manager_grace_s: float = 0.0,
+    ):
         budgets.append(retry_budget_seconds)
+        if graces is not None:
+            graces.append(artifact_manager_grace_s)
         raise _Reached
 
     return _connect
@@ -362,6 +374,7 @@ async def test_worker_startup_connects_on_the_startup_budget(tmp_path):
     puts the worker back inside the hypha restart gap it exits on.
     """
     budgets = []
+    graces = []
 
     async def _noop(*_args, **_kwargs):
         return None
@@ -372,13 +385,18 @@ async def test_worker_startup_connects_on_the_startup_budget(tmp_path):
     worker.heartbeat_file = tmp_path / "worker_heartbeat.json"
     worker._shutdown_event = asyncio.Event()
     worker.ray_cluster = SimpleNamespace(start=_noop)
-    worker._connect_to_server = _budget_recorder(budgets)
+    worker._connect_to_server = _budget_recorder(budgets, graces)
     worker._stop = _noop
 
     with pytest.raises(_Reached):
         await worker.start(blocking=False)
 
     assert budgets == [STARTUP_CONNECT_BUDGET_S]
+    # Boot is the ONLY caller that may wait out an artifact-manager gap; see the
+    # comment on _ARTIFACT_MANAGER_RESOLVE_GRACE_S. Pinned here because this is
+    # the call site, and the repair path's counterpart is pinned in
+    # test_worker_registration_probe.py.
+    assert graces == [_ARTIFACT_MANAGER_RESOLVE_GRACE_S]
 
 
 async def test_ray_startup_connects_on_the_startup_budget(monkeypatch):

@@ -1787,7 +1787,7 @@ class AppsManager:
             return deployed_at
         return deployed_at if reported is None else reported
 
-    async def _resolve_artifact_manager_proxy(self, grace_s: float = 0.0) -> Any:
+    async def _resolve_artifact_manager_proxy(self, *, grace_s: float = 0.0) -> Any:
         """Resolve ``public/artifact-manager``, tolerating a transient Hypha gap.
 
         ``grace_s`` defaults to **0**, i.e. one attempt and fail. The grace is opt-in
@@ -1847,6 +1847,7 @@ class AppsManager:
         server: RemoteService,
         admin_users: List[str],
         worker_service_id: str,
+        *,
         artifact_manager_grace_s: float = 0.0,
     ) -> None:
         """
@@ -1902,7 +1903,9 @@ class AppsManager:
             # help once it exists.
             self.artifact_manager = _ReconnectingArtifactManager(
                 server=self.server,
-                proxy=await self._resolve_artifact_manager_proxy(artifact_manager_grace_s),
+                proxy=await self._resolve_artifact_manager_proxy(
+                    grace_s=artifact_manager_grace_s
+                ),
                 logger=self.logger,
             )
             self.logger.info("Successfully connected to artifact manager.")

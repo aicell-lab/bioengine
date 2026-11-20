@@ -910,6 +910,7 @@ class BioEngineWorker:
     async def _connect_to_server(
         self,
         retry_budget_seconds: float = RECONNECT_BUDGET_S,
+        *,
         artifact_manager_grace_s: float = 0.0,
     ) -> None:
         """
