@@ -314,6 +314,25 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
+# How many consecutive failed redeploys an app gets before the worker stops
+# trying. The backoff above caps the RATE; it never capped the COUNT, so an app
+# that can never come back — a deleted artifact, a GPU that is gone, a manifest
+# the current worker refuses — was redeployed at the 10-minute floor for as long
+# as the worker lived. Each attempt is a real ``serve.run``: it builds a
+# runtime_env, schedules replicas, and on a GPU app holds the reservation while
+# it fails, so "bounded rate, unbounded count" still burns the cluster
+# indefinitely and buries every other line in the log an operator reads.
+#
+# 10 attempts with the schedule above is ~85 minutes of trying (10+20+40+80+160+
+# 320+600+600+600 s) before giving up, which comfortably outlasts a Hypha
+# restart, a node drain or an image pull, and is the point past which the
+# difference between "recovering" and "never coming back" has stopped being
+# interesting. Giving up is NOT silent: it logs once at error level and is
+# reported as ``auto_redeploy_exhausted_at`` on the app's status, because an app
+# that quietly stops being retried is the same invisible failure as an app that
+# was never retried at all.
+_REDEPLOY_MAX_ATTEMPTS = 10
+
 # Consecutive monitor ticks an app may be missing from the Serve status report
 # before absence is acted on as a failure. Absence is not a verdict — the report
 # can be momentarily incomplete — but it must still converge: never redeploying
@@ -1761,6 +1780,15 @@ class AppsManager:
             "last_updated_at": application_info["last_updated_at"],
             "last_updated_by": application_info["last_updated_by"],
             "auto_redeploy": application_info["auto_redeploy"],
+            # None while the app is healthy or still being retried; a timestamp
+            # once the worker has STOPPED retrying it after
+            # _REDEPLOY_MAX_ATTEMPTS consecutive failures. A caller cannot infer
+            # this from `status` alone: DEPLOY_FAILED reads the same whether a
+            # redeploy is due in nine minutes or will never come again, and that
+            # ambiguity is what let a dead app sit unnoticed for 19 hours.
+            "auto_redeploy_exhausted_at": application_info.get(
+                "auto_redeploy_exhausted_at"
+            ),
             "deployed_by_worker_client_id": application_info.get(
                 "deployed_by_worker_client_id"
             ),
@@ -2150,9 +2178,11 @@ class AppsManager:
         """
         pending = list(app_configs)
         delay = _REDEPLOY_BACKOFF_INITIAL_SECONDS
-        while pending:
+        attempts = 0
+        while pending and attempts < _REDEPLOY_MAX_ATTEMPTS:
             await asyncio.sleep(delay)
             delay = min(delay * 2, _REDEPLOY_BACKOFF_MAX_SECONDS)
+            attempts += 1
 
             still_pending = []
             for app_config in pending:
@@ -2168,6 +2198,17 @@ class AppsManager:
                     )
                     still_pending.append(app_config)
             pending = still_pending
+
+        if pending:
+            # Same rule as monitor_applications: bounded attempts, and the
+            # give-up is announced. Without this the loop retried a startup
+            # application that can never deploy for the worker's whole life.
+            self.logger.error(
+                f"Giving up on {len(pending)} startup application(s) after "
+                f"{_REDEPLOY_MAX_ATTEMPTS} failed attempts: "
+                f"{', '.join(c['artifact_id'] for c in pending)}. They will NOT be "
+                f"retried again; deploy them explicitly once the cause is fixed."
+            )
 
     def cancel_startup_retry(self) -> None:
         """Stop retrying startup applications that failed to deploy."""
@@ -2258,8 +2299,15 @@ class AppsManager:
           unless the current time has passed the per-app deadline; when it has,
           fire the redeploy and double the backoff (capped at
           ``_REDEPLOY_BACKOFF_MAX_SECONDS``).
+        - After ``_REDEPLOY_MAX_ATTEMPTS`` consecutive failures the app is given
+          up on: no further redeploy is fired, one error-level line says so, and
+          ``auto_redeploy_exhausted_at`` appears on its status. The backoff caps
+          how OFTEN a redeploy fires and never capped HOW MANY, so without this
+          an app that can never come back was redeployed for the worker's whole
+          life.
         - The moment the app is observed healthy again, the per-app backoff
-          state is dropped — the next failure restarts from the initial delay.
+          state is dropped — the next failure restarts from the initial delay,
+          and a given-up app is eligible again if something else revives it.
 
         A worker with no opted-in app does not take that path, but still probes
         for a lost Serve controller and reports one; detection is what every
@@ -2392,6 +2440,11 @@ class AppsManager:
                         f"Application '{application_id}' recovered; "
                         f"auto-redeploy backoff cleared."
                     )
+                # Clear the give-up too. Without this an app that was abandoned
+                # and later revived by any other route keeps reporting
+                # auto_redeploy_exhausted_at forever, i.e. a healthy app reads
+                # as permanently dead.
+                application_info.pop("auto_redeploy_exhausted_at", None)
                 # RUNNING is not proof the new code is live: Ray Serve can reuse
                 # a replica of ANY deployment (not just the entry) after a
                 # version bump, serving stale in-memory code. If any live replica
@@ -2503,6 +2556,28 @@ class AppsManager:
                     "consecutive_failures": 1,
                     "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
                 }
+                continue
+
+            # Give up after a bounded number of attempts. The deadline check
+            # below would otherwise let this app be redeployed forever: the
+            # backoff caps how OFTEN, never HOW MANY TIMES.
+            if backoff_state["consecutive_failures"] >= _REDEPLOY_MAX_ATTEMPTS:
+                if application_info.get("auto_redeploy_exhausted_at") is None:
+                    # Recorded on the app's own state, not on the backoff dict,
+                    # so _get_app_status reads only what it already reads. The
+                    # first version of this put it on _redeploy_backoff and the
+                    # status builder reached across for it, which broke 49 tests
+                    # that build an AppsManager with just the attributes the code
+                    # under test needs — a status surface should not depend on
+                    # the monitor's private bookkeeping existing.
+                    application_info["auto_redeploy_exhausted_at"] = now
+                    self.logger.error(
+                        f"Giving up on application '{application_id}': "
+                        f"{_REDEPLOY_MAX_ATTEMPTS} consecutive auto-redeploys all "
+                        f"failed ({reason}). It will NOT be retried again and is "
+                        f"left in its failed state; redeploy it explicitly once "
+                        f"the cause is fixed."
+                    )
                 continue
 
             # Subsequent failure — honour the per-app deadline.
