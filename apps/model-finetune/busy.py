@@ -4,7 +4,7 @@ A caller starved behind a long call cannot see why, and neither can an
 operator: ``get_app_status`` reports Ray Serve's view — application
 ``RUNNING``, every deployment ``HEALTHY`` at its replica target, every
 ``message`` empty — and Serve gives an app no field to write to, so "busy with
-a 62-minute merge" and "healthy and idle" are the same response (#0072).
+a 62-minute merge" and "healthy and idle" are the same response.
 
 The replica *logs* are in that same response and are the one part a deployment
 can write. They are also the right channel rather than merely the available
@@ -12,7 +12,7 @@ one: logs are read from the replica's log files, not through the replica's
 request queue, and a probe that travels that queue cannot report that the queue
 is blocked.
 
-Two things this must not rely on, both measured on the europa worker
+Two things this must not rely on, both measured on a live worker
 (bioengine 0.16.1, 2026-10-26):
 
 * **Not the health check.** Ray Serve called ``check_health`` exactly once per

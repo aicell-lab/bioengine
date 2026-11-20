@@ -5,7 +5,7 @@ contributor's training data. App 0.27.15 (commit ``e762a17b5af5``) retracted bot
 because split A and split B arrive as caller-supplied arrays and this app cannot
 check either claim — the most it can say is that the coordinator declared it. The
 retraction changed the constants. It did not change the records already written, and
-those records are still read back and shown to contributors (#0418).
+those records are still read back and shown to contributors.
 
 The fix here is a READ-PATH correction plus a WRITE-SIDE refusal, and the two halves
 are tested apart because they fail apart: a reader that stopped matching serves the
@@ -141,7 +141,7 @@ class TestCorrectedMetric:
     def test_the_correction_is_visible_rather_than_seamless(self):
         """A silent substitution leaves a contributor who fetched the stored record
         themselves with an unexplained difference — the same "is this corrupt?" dead
-        end #0417 describes. The note says the stored record is unchanged and why."""
+        end the digest-basis rule describes. The note says the stored record is unchanged and why."""
         out = pool.corrected_metric(_metric(STORED_SELECTION))
         assert pool.BASIS_CORRECTION_NOTE in out["aggregate_basis"]
         assert "0.27.15" in out["aggregate_basis"]

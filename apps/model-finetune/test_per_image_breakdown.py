@@ -1,4 +1,4 @@
-"""The per-image breakdown behind the gate's scalar — #0121.
+"""The per-image breakdown behind the gate's scalar — the per-image breakdown.
 
 The greedy gate admits a contribution when the soup's mean instance F1 on split A
 does not drop. That decision is recorded as one number, and one number cannot be

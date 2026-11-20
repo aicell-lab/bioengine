@@ -1,4 +1,4 @@
-"""#0122 — every ``l2_from_base`` says what it was measured AGAINST.
+"""every ``l2_from_base`` says what it was measured AGAINST.
 
 Two halves, both from the 2026-11-14 ruling:
 
@@ -7,7 +7,7 @@ Two halves, both from the 2026-11-14 ruling:
 2. every ``l2_from_base`` carries an explicit basis label, and a record written
    BEFORE this change reads as ambiguous rather than as zero.
 
-The third sentence is the one a shortcut gets wrong. Every pre-#0122 record holds
+The third sentence is the one a shortcut gets wrong. Every pre-the basis label record holds
 a distance and no label, and the tempting default — "unlabelled means the
 session-init base, because that was the only one that produced a number" — is the
 inference 0.27.6 makes unsafe. ``l2_basis`` must refuse it.
@@ -56,7 +56,7 @@ def test_a_labelled_stock_record_resolves_to_that_base() -> None:
 def test_no_distance_is_its_own_answer_not_undetermined() -> None:
     """"the pool holds no distance" and "the pool holds a distance whose origin is
     unknown" are different facts, and folding them together would lose the one
-    #0122 was filed about."""
+    the basis label exists to record."""
     assert pool.l2_basis({"l2_from_base": None}) == pool.L2_BASIS_ABSENT
     assert pool.l2_basis({}) == pool.L2_BASIS_ABSENT
     assert pool.L2_BASIS_ABSENT != pool.L2_BASIS_UNDETERMINED
@@ -65,7 +65,7 @@ def test_no_distance_is_its_own_answer_not_undetermined() -> None:
 def test_a_pre_change_record_is_UNDETERMINED_not_a_base_and_not_zero() -> None:
     """THE case this row exists for. A distance with no label must not be
     attributed to either base, and must not read as zero movement."""
-    pre = {"l2_from_base": 2.75}          # written before #0122: value, no label
+    pre = {"l2_from_base": 2.75}          # written before the basis label: value, no label
     got = pool.l2_basis(pre)
     assert got == pool.L2_BASIS_UNDETERMINED
     assert got != pool.L2_BASIS_SESSION_INIT, (
@@ -135,7 +135,7 @@ def test_the_metadata_writer_carries_a_supplied_label_through() -> None:
 
 
 def test_the_stamp_does_not_disturb_the_digest_basis() -> None:
-    """Paired assertion: #0509's label must still be stamped beside #0122's, or
+    """Paired assertion: the stored-basis stamp's label must still be stamped beside the basis label's, or
     this change traded one attributable field for another."""
     meta = _meta(l2_from_base_basis=pool.L2_BASIS_STOCK)
     assert meta["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
@@ -146,7 +146,7 @@ def test_the_stamp_does_not_disturb_the_digest_basis() -> None:
 def test_both_runtime_branches_label_the_distance_they_measured() -> None:
     """Read off the source, because exercising it needs torch and a real
     checkpoint. The claim is structural: the stock branch must compute a distance
-    AND name its base, or #0122's null simply moves to the label.
+    AND name its base, or the basis label's null simply moves to the label.
 
     Controls: a constant that appears in neither branch must be absent, and the
     file must actually have been read.

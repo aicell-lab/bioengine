@@ -352,7 +352,7 @@ class TestDirectionalGuard:
         "from PAGE_RUNGS rather than assuming the branch tip still sits on "
         "it. The rung itself is checked "
         "unconditionally by test_schema_version_is_the_rung_this_backend_"
-        "targets, so this skip no longer hides a wrong SCHEMA_VERSION (#0419)"
+        "targets, so this skip no longer hides a wrong SCHEMA_VERSION"
     ),
 )
 def test_matches_fixture_corpus():
@@ -462,7 +462,7 @@ def test_cap_is_actually_enforced_not_just_approached(tmp_path):
     assert remaining == ["member-8.pt", "member-9.pt"]
 
 
-# ── a deposit record must always name the app version that wrote it (#0116) ──
+# ── a deposit record must always name the app version that wrote it ──
 #
 # 0.27.6 moved every ``l2_from_base`` value without touching ``schema_version``,
 # so the record's shape cannot date its own contents. These pin the field that
@@ -509,9 +509,9 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
     assert m["schema_version"] == pool.SCHEMA_VERSION
     # ...and that the constant is itself the rung this backend targets. Without
     # this line the assertion above is satisfied by both sides being wrong
-    # together, which is the whole of #0419. This line carries no weight of its
+    # together, which is the whole of the schema-version guard. This line carries no weight of its
     # own unless BACKEND_TARGETS_RUNG is independent of pool.SCHEMA_VERSION —
-    # see test_the_targeted_rung_is_written_down_and_not_derived (#0442), which
+    # see test_the_targeted_rung_is_written_down_and_not_derived, which
     # is what keeps it so. It is the quieter of the two sites a derivation
     # silences, and the one nobody had reported.
     assert _major_minor(m["schema_version"]) == BACKEND_TARGETS_RUNG
@@ -583,7 +583,7 @@ PAGE_RUNGS = {
 
 # The rung whose SHAPE this backend implements. This is NOT derived from
 # pool.SCHEMA_VERSION — that is the point. Deriving it would recreate the
-# self-referential assertion #0419 is about, where the fixture agrees with
+# self-referential assertion the schema-version guard is about, where the fixture agrees with
 # whatever the constant happens to hold.
 #
 # Bumping the wire contract is therefore a TWO-SIDED edit, deliberately: move
@@ -630,7 +630,7 @@ def _rung_violation(schema_version: str) -> str | None:
 
 
 def test_schema_version_is_the_rung_this_backend_targets():
-    """The assertion #0419 found missing. Compares the constant against an
+    """The assertion the schema-version guard found missing. Compares the constant against an
     independently-recorded rung, not against itself."""
     assert _rung_violation(pool.SCHEMA_VERSION) is None, _rung_violation(
         pool.SCHEMA_VERSION
@@ -661,13 +661,13 @@ def _a_rung_the_page_has_never_defined() -> str:
 
 
 def test_the_check_rejects_a_superseded_page_rung():
-    """#0114's actual defect, pinned so it cannot recur silently. 0.14.0-draft
+    """the schema-version defect's actual defect, pinned so it cannot recur silently. 0.14.0-draft
     is a real rung the page committed for the dropped-synchronous-arm shape."""
     # The pin's premise, stated so a future bump to 0.14 fails with a reason
     # rather than cryptically. A rung already committed stays committed, so
     # this is the only way the historical fact below can stop applying.
     assert BACKEND_TARGETS_RUNG != "0.14", (
-        "this test pins #0114's defect, whose premise is that the backend does "
+        "this test pins the schema-version defect's defect, whose premise is that the backend does "
         "NOT target 0.14; if it now deliberately does, rewrite the pin against "
         "whichever rung was superseded — do not delete it"
     )
@@ -704,7 +704,7 @@ def test_the_check_ignores_the_patch_and_the_draft_suffix():
 
 
 def test_the_check_is_not_self_referential(monkeypatch):
-    """The regression guard for #0419 itself. If someone later rewrites the
+    """The regression guard for the schema-version guard itself. If someone later rewrites the
     rung check to read pool.SCHEMA_VERSION on both sides, every test above
     still passes and this one fails."""
     monkeypatch.setattr(pool, "SCHEMA_VERSION", "0.14.0-draft")
@@ -715,7 +715,7 @@ def test_the_check_is_not_self_referential(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# ...and the target must be WRITTEN DOWN, not computed (#0442)
+# ...and the target must be WRITTEN DOWN, not computed
 # ---------------------------------------------------------------------------
 #
 # The test above monkeypatches pool.SCHEMA_VERSION AFTER import, so it can only
@@ -723,7 +723,7 @@ def test_the_check_is_not_self_referential(monkeypatch):
 # from pool.SCHEMA_VERSION at module level instead — a one-line change that
 # reads like a tidy-up — and the derived value FREEZES at import, before any
 # monkeypatch runs. The comparison is the constant against itself again, one
-# level up from where #0419 removed it, and the test above can only redden when
+# level up from where the schema-version guard removed it, and the test above can only redden when
 # the frozen value already IS the rung it patches to.
 #
 # Measured 2026-11-13, sweeping the derivation over all thirteen rungs PAGE_RUNGS
@@ -817,7 +817,7 @@ def _not_written_down(name: str, live_value: object) -> str | None:
 
 
 def test_the_targeted_rung_is_written_down_and_not_derived():
-    """#0442. The new check is "the target is not derived from the constant it
+    """The new check is "the target is not derived from the constant it
     guards" — NOT "the target equals this specific table". Only the first
     survives a legitimate rung bump; the second is the shape that just failed."""
     why = _not_written_down("BACKEND_TARGETS_RUNG", BACKEND_TARGETS_RUNG)
@@ -838,14 +838,14 @@ def test_this_guard_can_actually_refuse_a_derivation():
 
     They assert an absence, so on their own they are equally consistent with
     "nothing is derived" and "the instrument cannot see a derivation". This runs
-    the same predicate over the exact one-line derivation #0442 is about and
+    the same predicate over the exact one-line derivation the rung-target rule is about and
     requires it to come back refused, naming the expression it refused.
     """
     derivation = 'BACKEND_TARGETS_RUNG = ".".join(pool.SCHEMA_VERSION.split(".")[:2])'
     is_literal, _ = _written_down(ast.parse(derivation).body[0].value)
     assert not is_literal, (
         f"the predicate accepted {derivation!r} as written down, so it cannot "
-        f"refuse the derivation #0442 is about and the two tests above are green "
+        f"refuse the derivation the rung-target rule is about and the two tests above are green "
         f"for no reason"
     )
     # ...and it must still ACCEPT a plain literal, or it refuses everything and
@@ -861,7 +861,7 @@ def test_this_guard_can_actually_refuse_a_derivation():
 
 
 # ---------------------------------------------------------------------------
-# #0141: the wire view must publish the digest the index already holds.
+# The wire-digest change: the wire view must publish the digest the index already holds.
 # ---------------------------------------------------------------------------
 
 def test_every_contribution_publishes_its_stored_weights_digest(wire):

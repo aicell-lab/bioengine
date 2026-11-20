@@ -1,4 +1,4 @@
-"""Regression tests for #0370 — a GPU shortfall must be visible from the running app.
+"""Regression tests for the GPU shortfall report — a GPU shortfall must be visible from the running app.
 
 Both GPU runtimes declare ``gpu_memory_mb=-1`` (``runtime.py:65``,
 ``runtime_cellpose.py:79``), which ``bioengine/apps/builder.py:514-516`` resolves to
@@ -42,7 +42,7 @@ def _with_cluster_gpus(monkeypatch, total, free=_SAME):
     total and ``available_resources()`` is what is free, and the report keys its
     verdict to the first while reporting the second. A harness that set only a total
     could not express the shape the row was filed about — deNBI, 4 GPUs, 0 free —
-    which is the gap the re-review found (#0370). ``free`` defaults to ``total``,
+    which is the gap the re-review found. ``free`` defaults to ``total``,
     i.e. an idle cluster, so a case that is not about the distinction stays short.
 
     ``entry`` does not import ray at module scope — the report imports it lazily so a
@@ -205,7 +205,7 @@ def test_a_cluster_that_owns_enough_but_has_none_free_names_the_free_count(monke
     assert "pend" in report["detail"]
 
     # DELIBERATELY unchanged, and this is the half that is easy to get wrong in the
-    # other direction (#0370 re-review): a free shortfall is NOT a shortfall. The
+    # other direction: a free shortfall is NOT a shortfall. The
     # cluster owns enough, this app's own replicas are part of what books the
     # devices, and an elastic cluster is momentarily 0-free between jobs. Escalating
     # it would make the diagnostic fire at itself.
@@ -302,7 +302,7 @@ def _async_init_source() -> str:
 
 
 def test_the_placement_log_is_actually_called_at_startup() -> None:
-    """The warning is worth writing only if something writes it (#0370, re-review).
+    """The warning is worth writing only if something writes it.
 
     Replacing ``self._log_gpu_placement()`` in ``_connect`` with ``pass`` left the
     whole suite green at 139 passed, while a comment-only control arm was also green
@@ -424,19 +424,41 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     it into ``deployments.<entry>.logs``, which ``get_app_status`` returns throughout
     ``DEPLOYING``.
 
-    ``min_replicas`` must stay 0: #0045's brief is that an idle entry holds nothing on
+    ``min_replicas`` must stay 0: the scale-to-zero requirement's brief is that an idle entry holds nothing on
     an HPC login node. Both halves are asserted, because satisfying one by breaking the
     other is the easy mistake.
     """
     cfg = entry.EntryApp._deployment_config.autoscaling_config
-    assert cfg.min_replicas == 0, "#0045: an idle entry must still scale to zero"
+    assert cfg.min_replicas == 0, "an idle entry must still scale to zero"
     assert cfg.initial_replicas == 1, (
-        "#0370: with 0 the placement warning is never written on the cluster it is for"
+        "with 0 the placement warning is never written on the cluster it is for"
     )
-    # CONTROL: this is the live resolved config, not a default-shaped object — these
-    # two values are set in the decorator and are not Ray Serve defaults.
-    assert cfg.max_replicas == 1
-    assert cfg.downscale_delay_s == 600.0
+    # CONTROL that the two contracts above are read off the LIVE resolved config rather
+    # than a default-shaped object. For that to mean anything it has to assert a field
+    # whose decorator value DIFFERS from Ray Serve's own default — otherwise it passes
+    # against exactly the object it claims to exclude.
+    #
+    # ⚠ The previous control asserted `max_replicas == 1` and `downscale_delay_s == 600.0`
+    # under a comment stating that neither is a Ray Serve default. BOTH WERE. Measured in
+    # the CI image on ray 2.55.1, AutoscalingConfig() defaults are:
+    #
+    #   min_replicas=1  initial_replicas=None  max_replicas=1
+    #   downscale_delay_s=600.0  upscale_delay_s=30.0
+    #   metrics_interval_s=10.0  look_back_period_s=30.0
+    #
+    # So the old control would have gone on passing if the decorator had stopped setting
+    # either field, which is the one thing it existed to catch. `upscale_delay_s` is 0.0
+    # here against a default of 30.0, so this assertion can actually fail. The two
+    # contracts above are self-witnessing for the same reason — `min_replicas` is 0
+    # against a default of 1, and `initial_replicas` is 1 against a default of None.
+    #
+    # `downscale_delay_s` is deliberately NOT asserted here any more. Its value is the
+    # subject of a separate, held product decision, and pinning it in this file would
+    # make an unrelated test the thing that fails when that decision lands.
+    assert cfg.upscale_delay_s == 0.0, (
+        "control: 0.0 differs from Ray's 30.0 default, so reaching this line proves the "
+        "decorator's config was resolved rather than a default object read"
+    )
 
 
 def test_the_declaration_this_row_is_about_is_unchanged() -> None:
