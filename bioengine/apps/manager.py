@@ -29,6 +29,7 @@ from bioengine.utils import (
     create_application_from_files,
     create_context,
     create_logger,
+    describe_deploy_arguments,
     ensure_applications_collection,
     get_static_site_url,
     is_secret_env_var,
@@ -3559,19 +3560,6 @@ class AppsManager:
                         f"Value for '{key}' in application_kwargs must be a dictionary."
                     )
 
-            kwargs_str = (
-                ", ".join(
-                    f"{deployment_class}("
-                    + ", ".join(
-                        [f"{key}={value!r}" for key, value in deployment_kwargs.items()]
-                    )
-                    + ")"
-                    for deployment_class, deployment_kwargs in application_kwargs.items()
-                )
-                if application_kwargs
-                else "None"
-            )
-
             # Validate application_env_vars
             if not isinstance(application_env_vars, dict):
                 raise ValueError(
@@ -3583,31 +3571,17 @@ class AppsManager:
                         f"Value for '{key}' in application_env_vars must be a dictionary."
                     )
 
-            # Construct the environment variables string. A value is hidden if its
-            # key opts in with an underscore OR the value itself is credential-
-            # shaped: keying only on the name failed open for every spelling
-            # nobody anticipated, and this log outlives the pod that wrote it.
-            env_vars_str = (
-                ", ".join(
-                    f"{deployment_class}: "
-                    + " ".join(
-                        [
-                            f"{key}={value!r}"
-                            for key, value in env_vars.items()
-                            if not is_secret_env_var(key, value)
-                        ]
-                    )
-                    + " ".join(
-                        [
-                            f'{key}="{SECRET_MASK}"'
-                            for key, value in env_vars.items()
-                            if is_secret_env_var(key, value)
-                        ]
-                    )
-                    for deployment_class, env_vars in application_env_vars.items()
-                )
-                if application_env_vars
-                else "None"
+            # Both strings are built by `describe_deploy_arguments`, which masks a value
+            # whose key opts in with an underscore OR whose value is itself credential-
+            # shaped. Keying only on the name failed open for every spelling nobody
+            # anticipated, and this log outlives the pod that wrote it.
+            #
+            # It lives in utils.redaction rather than inline here so a test can render its
+            # OUTPUT and assert the secret literal is absent. Inline, the only testable
+            # property was "deploy_app mentions the matcher somewhere", which stayed true
+            # with the guard deleted from the cleartext half.
+            kwargs_str, env_vars_str = describe_deploy_arguments(
+                application_kwargs, application_env_vars
             )
 
             if is_update:

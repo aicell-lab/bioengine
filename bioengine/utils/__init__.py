@@ -32,6 +32,7 @@ from .network import (
 from .redaction import (
     SECRET_ENV_VAR_PREFIX,
     SECRET_MASK,
+    describe_deploy_arguments,
     is_secret_env_var,
     looks_like_secret,
 )
