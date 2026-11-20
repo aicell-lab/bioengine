@@ -19,7 +19,7 @@ apart, not four copies of one case:
   first two: it is a possible integrity incident and a human has to see it, and a
   single code for both would bury it inside the boring case forever.
 
-The last case is the one the whole row turns on. Before this change the merge
+The last case is the one this file turns on. Before this change the merge
 hashed nothing on load, so ``c-mismatch`` and ``c-good`` produced byte-identical
 behaviour and an identical published checkpoint.
 """

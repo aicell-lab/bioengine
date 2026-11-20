@@ -97,7 +97,7 @@ def _ray_unimportable(monkeypatch):
 
 
 def test_each_enabled_gpu_backend_costs_one_whole_gpu(monkeypatch) -> None:
-    """The arithmetic the whole row is about: N backends on → N whole GPUs needed."""
+    """The arithmetic this file is about: N backends on → N whole GPUs needed."""
     _with_cluster_gpus(monkeypatch, 8.0)
     assert entry._gpu_placement_report({"microsam", "cellpose"})["gpus_required"] == 2
     assert entry._gpu_placement_report({"cellpose"})["gpus_required"] == 1
@@ -424,7 +424,7 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     it into ``deployments.<entry>.logs``, which ``get_app_status`` returns throughout
     ``DEPLOYING``.
 
-    ``min_replicas`` must stay 0: the scale-to-zero requirement's brief is that an idle entry holds nothing on
+    ``min_replicas`` must stay 0: the scale-to-zero requirement is that an idle entry holds nothing on
     an HPC login node. Both halves are asserted, because satisfying one by breaking the
     other is the easy mistake.
     """

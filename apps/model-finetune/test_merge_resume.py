@@ -207,7 +207,7 @@ def test_no_scoring_call_bypasses_the_journal():
     assert "_write_merge_journal(" in inside_score
 
 
-# ── up-front admission (clause 1's second disjunct) ──────────────────────────
+# ── up-front admission (the second disjunct) ──────────────────────────
 
 GIB = 1024 ** 3
 

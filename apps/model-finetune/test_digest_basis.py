@@ -136,7 +136,7 @@ class TestResolver:
             assert pool.digest_basis(_merge(created_at=ts)) == pool.DIGEST_BASIS_FILE
 
     def test_a_post_cutoff_record_without_a_stamp_is_undetermined(self):
-        """The requirement's fourth clause. A worker can still be running the old build a
+        """A worker can still be running the old build a
         week after the commit, so the late side is evidence of nothing."""
         out = pool.digest_basis(_merge(created_at=AFTER_CUTOFF))
         assert out == pool.DIGEST_BASIS_UNDETERMINED
@@ -457,7 +457,7 @@ def _contribution(cid: str, digest: str, uploaded_at: Any, basis: Any = "<omit>"
 
 class TestContributionsStampTheBasis:
     def test_a_new_contribution_carries_the_basis_on_the_stored_entry(self):
-        """Clause 1, read back out of the index rather than off the writer."""
+        """Read back out of the index rather than off the writer."""
         index: Dict[str, Any] = {}
         pool.append_contribution(
             index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
@@ -542,7 +542,7 @@ class TestContributionsStampTheBasis:
         assert pool.contribution_digest_basis(tensors) != pool.contribution_digest_basis(new)
 
     def test_an_unstamped_contribution_is_the_file_basis_on_BOTH_sides_of_the_cutoff(self):
-        """Clause 2's decision, as behaviour rather than prose: an absent basis
+        """The decision, as behaviour rather than prose: an absent basis
         means the FILE basis here, and it means it as a PROOF rather than as a
         dated inference — ``prepare_contribution`` has never computed this value
         any other way.
@@ -686,7 +686,7 @@ class TestContributionsStampTheBasis:
         assert pool.contribution_digest_basis(legacy) == pool.DIGEST_BASIS_FILE
 
     def test_appending_back_fills_nothing_and_does_not_mutate_the_caller(self):
-        """Clause 5. Existing stored records keep having no basis — they resolve to
+        """Existing stored records keep having no basis — they resolve to
         the file meaning from the code path on every read, where the inference stays
         visible as one — and the dict the caller passed in is left alone, so nothing
         it might also be holding is rewritten."""

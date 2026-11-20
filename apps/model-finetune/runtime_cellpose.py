@@ -848,7 +848,7 @@ class CellposeRuntime:
         # build. Taking it HERE makes the deposit and the merge mutually exclusive, so the
         # replica's peak becomes max(merge, contribute) rather than their sum.
         #
-        # What this does NOT do, stated because the close has to record the bound rather
+        # What this does NOT do, stated because what matters is the bound rather
         # than an improvement: it does not reduce the single-path peak. Reusing the measured
         # FU1 figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
         # measurement), contribute alone still peaks at ~2.31 GiB. If max(merge,
