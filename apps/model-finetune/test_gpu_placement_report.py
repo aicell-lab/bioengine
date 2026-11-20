@@ -433,10 +433,32 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     assert cfg.initial_replicas == 1, (
         "#0370: with 0 the placement warning is never written on the cluster it is for"
     )
-    # CONTROL: this is the live resolved config, not a default-shaped object — these
-    # two values are set in the decorator and are not Ray Serve defaults.
-    assert cfg.max_replicas == 1
-    assert cfg.downscale_delay_s == 600.0
+    # CONTROL that the two contracts above are read off the LIVE resolved config rather
+    # than a default-shaped object. For that to mean anything it has to assert a field
+    # whose decorator value DIFFERS from Ray Serve's own default — otherwise it passes
+    # against exactly the object it claims to exclude.
+    #
+    # ⚠ The previous control asserted `max_replicas == 1` and `downscale_delay_s == 600.0`
+    # under a comment stating that neither is a Ray Serve default. BOTH WERE. Measured in
+    # the CI image on ray 2.55.1, AutoscalingConfig() defaults are:
+    #
+    #   min_replicas=1  initial_replicas=None  max_replicas=1
+    #   downscale_delay_s=600.0  upscale_delay_s=30.0
+    #   metrics_interval_s=10.0  look_back_period_s=30.0
+    #
+    # So the old control would have gone on passing if the decorator had stopped setting
+    # either field, which is the one thing it existed to catch. `upscale_delay_s` is 0.0
+    # here against a default of 30.0, so this assertion can actually fail. The two
+    # contracts above are self-witnessing for the same reason — `min_replicas` is 0
+    # against a default of 1, and `initial_replicas` is 1 against a default of None.
+    #
+    # `downscale_delay_s` is deliberately NOT asserted here any more. Its value is the
+    # subject of a separate, held product decision, and pinning it in this file would
+    # make an unrelated test the thing that fails when that decision lands.
+    assert cfg.upscale_delay_s == 0.0, (
+        "control: 0.0 differs from Ray's 30.0 default, so reaching this line proves the "
+        "decorator's config was resolved rather than a default object read"
+    )
 
 
 def test_the_declaration_this_row_is_about_is_unchanged() -> None:
