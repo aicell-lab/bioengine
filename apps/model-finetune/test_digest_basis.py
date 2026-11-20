@@ -421,7 +421,7 @@ class TestWritersStampTheBasis:
 # wrong one is not used.
 #
 # Deliberately NOT asserted through the writer's own return value or its argument
-# dict: the requirement is the STORED entry read back out of the index, because a
+# dict: what must be stamped is the STORED entry read back out of the index, because a
 # stamp applied to the caller's dict and then dropped on the way in would satisfy
 # any assertion made on the dict.
 

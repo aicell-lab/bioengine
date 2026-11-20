@@ -408,7 +408,7 @@ def test_a_member_missing_a_base_key_fails_the_merge() -> None:
 
 
 def test_a_pool_with_no_base_record_cannot_merge() -> None:
-    """Option (b), ruled: a pool that records no base FAILS the merge, and there is
+    """A pool that records no base FAILS the merge, and there is
     deliberately no fallback to loading a stock base — a fallback would make the field
     permanently optional. A separate census counts how many existing pools this blocks."""
     with pytest.raises(ValueError, match="records no base commitment"):
@@ -522,7 +522,7 @@ def test_a_refusal_still_names_the_key_without_a_recorded_key_list() -> None:
 
 
 def test_the_recorded_key_list_costs_what_the_record_says() -> None:
-    """The ruling priced option (b) at "a few hundred bytes", which is true of the
+    """The design was priced at "a few hundred bytes", which is true of the
     digest and the count and NOT of the key list added beside them. Measured here so
     the trade is a number on the record rather than an estimate: a cpsam-sized layout
     is several hundred tensors with long dotted names.

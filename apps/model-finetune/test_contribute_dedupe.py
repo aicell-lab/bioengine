@@ -450,7 +450,7 @@ async def test_both_return_paths_have_the_same_shape(fake_training: None) -> Non
 
 @pytest.mark.asyncio
 async def test_a_redeposit_discards_the_stage_and_writes_nothing(fake_training: None) -> None:
-    """The failure mode the requirement does not name, and the one that would be worse than
+    """The failure mode nothing above asks for, and the one that would be worse than
     the bug: ``put_file`` minted the duplicate's weights row inside the stage
     before the digest could be known, so leaving the block without discarding
     makes every later commit on this pool fail for ~62 s and then raise."""

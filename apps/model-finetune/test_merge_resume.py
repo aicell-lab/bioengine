@@ -100,7 +100,7 @@ def test_record_score_evicts_oldest_first_at_the_cap():
     assert list(journal["scores"]) == ["k6", "k7", "k8", "k9"]
 
 
-# ── the behaviour the clause is about ────────────────────────────────────────
+# ── the behaviour under test ────────────────────────────────────────
 
 def _merge(members, journal, killed_at=None):
     """Replay aggregate()'s scoring sequence against a journal.
@@ -255,7 +255,7 @@ def test_a_known_size_is_used_even_when_others_are_missing():
 
 
 def test_the_refusal_happens_before_any_scoring_pass():
-    """"Rejected up front" is the clause. A check that ran after the baseline passes
+    """Rejection happens up front. A check that ran after the baseline passes
     would already have spent GPU time, so the ORDER is the property — pinned at
     source because no unit test of pool can see it."""
     source = (pathlib.Path(__file__).parent / "entry.py").read_text()

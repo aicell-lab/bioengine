@@ -8,7 +8,7 @@ disagreement has to be injected at the one boundary where the bytes are hashed.
 
 What is actually asserted here, rather than in the unit file:
 
-- the merge proceeds and publishes — the ruled behaviour is quarantine, not refusal;
+- the merge proceeds and publishes — the chosen behaviour is quarantine, not refusal;
 - a quarantined candidate reaches neither the soup nor the ``members`` record, and
   the published ``selected_contribution_ids`` does not contain it;
 - it IS marked decided, so the next merge does not re-weigh it forever;
@@ -228,7 +228,7 @@ async def _merge(stub, **kw):
         gate_split=dict(GATE_SPLIT), witness_split=dict(WITNESS_SPLIT), **kw)
 
 
-# ── the ruled behaviour: exclude the member, publish the rest ────────────────
+# ── the chosen behaviour: exclude the member, publish the rest ────────────────
 
 @pytest.mark.asyncio
 async def test_a_digestless_candidate_is_excluded_and_the_merge_still_publishes():
