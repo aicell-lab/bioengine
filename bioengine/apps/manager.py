@@ -23,6 +23,7 @@ from ray.serve.config import AutoscalingConfig
 
 from bioengine import __version__
 from bioengine.apps.builder import AppBuilder
+from bioengine.apps.placement import describe_placement
 from bioengine.cluster.ray_cluster import RayCluster
 from bioengine.utils import (
     check_permissions,
@@ -1301,9 +1302,15 @@ class AppsManager:
                 if state:
                     replica_states[state] = replica_states.get(state, 0) + 1
 
+            message = deployment_info.get("message", "")
             deployments_info[deployment_name] = {
                 "status": deployment_info.get("status"),
-                "message": deployment_info.get("message", ""),
+                "message": message,
+                # A deployment stuck on a placement and one mid-wake-up are both
+                # UPSCALING at zero RUNNING replicas, and the only thing that tells
+                # them apart is the resource pair Serve buries in the message.
+                # Reading it here means a caller does not have to.
+                **describe_placement(message),
                 "replica_states": replica_states,
                 "replicas": replicas,
                 "max_ongoing_requests": self._per_replica_ongoing_limit(
