@@ -530,11 +530,20 @@ class EntryApp:
         )
         # Resolved once per replica and cached for its whole life, so a plain
         # proxy pinned to a client id the server later forgets would hang every
-        # call to the full method timeout. `_health` below no longer relies on an
-        # `is None` test, which a dead handle passes — it makes a bounded round
-        # trip on `self._hypha`, so a replica in that state is reported unhealthy
-        # and replaced. `put_file`/`get_file` only mint a presigned URL, so both
-        # are safe to re-send after a call that may already have landed.
+        # call to the full method timeout. `put_file`/`get_file` only mint a
+        # presigned URL, so both are safe to re-send after a call that may
+        # already have landed.
+        #
+        # `self._s3` IS wrapped and `self._hypha` above is deliberately NOT wrapped.
+        # That asymmetry is a decision, not an oversight, and this is where a reader
+        # meets it. `reconnecting_service` is a drop-in for `get_service(id)`: it
+        # re-resolves a service proxy, which is a different object from the connection
+        # it was resolved through, so it cannot be applied to `self._hypha` at all —
+        # and re-resolving anything through a dead connection fails the same way.
+        # What covers the connection instead is the bounded round trip in `_health`:
+        # it fails, Serve replaces the replica, and `_connect` runs again on a fresh
+        # connection. Replacing the connection is the only repair that works when the
+        # connection itself is what died.
         self._s3 = await bioengine.reconnecting_service(
             self._hypha,
             "public/s3-storage",
@@ -569,16 +578,12 @@ class EntryApp:
         # CPU-only methods stay served when the runtime is down/scaling.
         if self._s3 is None:
             raise RuntimeError("S3 storage service not connected")
-        # The `is None` test above cannot fail on a DEAD handle, and this file said so
-        # for a long time before anything acted on it: the comment in `_connect`
-        # explaining why `_s3` is wrapped used to note that `_health` tested `is None`,
-        # "which a dead handle passes". That is the hazard this probe closes, so that
-        # sentence has been updated rather than left reading as a live defect.
-        # hypha_rpc pins a proxy to one client instance of the server; when that
-        # instance is gone every call fails at send time forever while the websocket
-        # underneath happily reconnects. A replica in that state keeps passing this
-        # check, stays in the Serve routing table, and turns every call into a
-        # full-method-timeout hang instead of a fast failure.
+        # The `is None` test above cannot fail on a DEAD handle. hypha_rpc pins a proxy
+        # to one client instance of the server; when that instance is gone every call
+        # fails at send time forever while the websocket underneath happily reconnects.
+        # A replica in that state keeps passing this check, stays in the Serve routing
+        # table, and turns every call into a full-method-timeout hang instead of a fast
+        # failure.
         #
         # So exercise the connection for real. `echo` is the cheapest call that proves
         # it — it reaches the Hypha server and nothing else, touching neither S3 nor a
@@ -588,24 +593,12 @@ class EntryApp:
         # after the 2026-08-24 outage (`broker.py` `_health`), and it is cheap for this
         # app for the reason the autoscaling block above already relies on: the records
         # a caller polls are on disk, so a teardown between calls is invisible to the
-        # frontend.
+        # frontend. Why the connection is covered this way rather than by wrapping it
+        # is recorded in `_connect`, at the call that wraps `self._s3`.
         #
         # Bounded well under `health_check_timeout_s=30.0` so a hung connection is
         # reported as unhealthy rather than timing the check itself out, which Serve
         # would otherwise surface as a less specific failure.
-        #
-        # WHY `self._hypha` IS deliberately NOT wrapped the way `self._s3` is — a
-        # decision, not an oversight, recorded here because the asymmetry otherwise
-        # reads as one and invites a "fix". `bioengine.reconnecting_service` is
-        # documented as a drop-in for `await server.get_service(id)` and takes the
-        # server as its first argument: it re-resolves a *service proxy*, which is a
-        # different object from the connection it was resolved through. So it cannot
-        # be applied to `self._hypha` at all — and re-resolving anything through a
-        # dead connection would fail the same way regardless. What covers
-        # `self._hypha` instead is this probe: it fails, Serve replaces the replica,
-        # and `_connect` runs again on a fresh connection. That is strictly stronger
-        # than re-resolution, because replacing the connection is the only repair
-        # that works when the connection itself is what died.
         try:
             await asyncio.wait_for(
                 self._hypha.echo("ping"), timeout=_HEALTH_CALL_TIMEOUT_S
