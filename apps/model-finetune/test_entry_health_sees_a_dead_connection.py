@@ -8,7 +8,7 @@ method timeout, and that ``_health`` tested ``is None``, *"which a dead handle p
 So the hazard was written down at the site that avoided it while the health check that
 would surface it could not. (That sentence in ``_connect`` has since been updated to
 describe the probe, so it no longer reads as a live defect; it is quoted here as the
-record of why this row existed.)
+record of why this check exists.)
 
 Why it matters: a replica in that state passes its health check, stays in the Serve
 routing table, and converts every call into a full-method-timeout hang instead of a fast
@@ -29,6 +29,7 @@ one arm asserts the call was really made.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 
 import pytest
@@ -83,7 +84,7 @@ async def test_a_live_connection_is_healthy() -> None:
 
 
 async def test_a_dead_handle_is_UNHEALTHY() -> None:
-    """THE arm this row exists for.
+    """THE arm this regression test exists for.
 
     ``_s3`` is non-None, so the old ``is None`` check passed here and the replica stayed
     in the routing table. The send failure is what every real call would have hit.
@@ -94,7 +95,7 @@ async def test_a_dead_handle_is_UNHEALTHY() -> None:
 
 
 async def test_a_HUNG_connection_is_unhealthy_within_the_bound(monkeypatch) -> None:
-    """A hang is the failure mode the row names, and it must not hang the CHECK.
+    """A hang is the failure mode at issue, and it must not hang the CHECK.
 
     The bound has to be well under the deployment's ``health_check_timeout_s=30.0`` so
     Serve is told UNHEALTHY by this check rather than timing the check itself out, which
@@ -149,7 +150,7 @@ async def test_the_OLD_check_passed_this_exact_handle() -> None:
 
     ``test_a_live_connection_is_healthy`` shows the new check does not reject
     everything. This shows the complementary half: that the OLD body *accepted* the very
-    handle the new one rejects. Without it, the row's premise — that a dead connection
+    handle the new one rejects. Without it, the premise — that a dead connection
     used to pass — is taken on trust, and a reader cannot tell a real regression test
     from one written against a bug that never existed.
 
@@ -185,26 +186,55 @@ async def test_the_cheap_precondition_is_reached_BEFORE_the_wire() -> None:
     )
 
 
-def test_the_decision_not_to_wrap_the_connection_is_recorded_at_the_site() -> None:
+def test_the_decision_not_to_wrap_the_connection_is_recorded_AT_THE_WRAPPING_CALL() -> (
+    None
+):
     """``self._s3`` is wrapped in ``reconnecting_service`` and ``self._hypha`` is not.
 
-    That asymmetry reads as an oversight unless the reasoning is written where the
-    wrapping happens, and an "oversight" invites a fix that cannot work: the wrapper
-    re-resolves a service proxy THROUGH a connection, so it has nothing to offer the
-    connection itself. Asserted off the source because the claim is about what a
-    maintainer sees, not about behaviour.
+    That asymmetry reads as an oversight unless the reasoning is written where a reader
+    MEETS it, and an "oversight" invites a fix that cannot work: the wrapper re-resolves
+    a service proxy THROUGH a connection, so it has nothing to offer the connection
+    itself. Asserted off the source because the claim is about what a maintainer sees,
+    not about behaviour.
+
+    SCOPED TO ``_connect`` ON PURPOSE. An earlier version searched the whole of
+    ``entry.py``, which pins nothing about location: deleting the paragraph from the
+    source and putting the same two phrases on an unrelated line elsewhere in the file
+    left all nine arms green. A whole-file substring search cannot tell "recorded where
+    the asymmetry is visible" from "these words appear somewhere", which is the only
+    claim worth making here.
     """
-    src = (Path(__file__).with_name("entry.py")).read_text(encoding="utf-8")
+    connect_src = inspect.getsource(entry.EntryApp.func_or_class._connect)
+    whole_file = (Path(__file__).with_name("entry.py")).read_text(encoding="utf-8")
 
-    # CONTROLS first: the file must have been read, and a phrase that is not in it must
-    # be absent — otherwise a mis-resolved path or an empty read passes every assertion.
-    assert len(src) > 10_000, f"entry.py read back implausibly short ({len(src)} chars)"
-    assert "ZZZ_PHRASE_THAT_IS_NOT_IN_ENTRY_PY" not in src
-
+    # CONTROLS. The scoped read must be non-empty, must be a genuine SUBSET of the file
+    # (or scoping is a no-op and this test is the whole-file search again), and must not
+    # match a phrase that is nowhere.
     assert (
-        "deliberately NOT wrapped" in src
-    ), "the decision not to wrap `self._hypha` is not stated where `self._s3` is wrapped"
-    assert "different object from the connection" in src, (
+        len(whole_file) > 10_000
+    ), f"entry.py read implausibly short ({len(whole_file)})"
+    assert "reconnecting_service" in connect_src, "scoped to the wrong function"
+    assert 0 < len(connect_src) < len(whole_file) / 4, (
+        f"the scoped read is {len(connect_src)} of {len(whole_file)} chars, which is not "
+        f"a narrow region — scoping has stopped discriminating"
+    )
+    assert "ZZZ_PHRASE_THAT_IS_NOT_IN_ENTRY_PY" not in connect_src
+
+    assert "deliberately NOT wrapped" in connect_src, (
+        "the decision not to wrap `self._hypha` is not stated at the call that wraps "
+        "`self._s3`, which is where the asymmetry is visible"
+    )
+    assert "different object from the connection" in connect_src, (
         "the REASON is not stated: that reconnecting_service re-resolves a service "
         "proxy, which is not the connection it was resolved through"
+    )
+
+    # The discriminating control, and the one that kills the mutant above: a phrase that
+    # belongs to the PROBE must not be what satisfied the assertions. If the decision
+    # text drifts back into `_health`, the two asserts above go red rather than passing
+    # on words found in the wrong place.
+    health_src = inspect.getsource(entry.EntryApp.func_or_class._health)
+    assert "deliberately NOT wrapped" not in health_src, (
+        "the decision is recorded in `_health`, not at the wrapping call; a reader "
+        "looking at the asymmetry in `_connect` still cannot see it"
     )
