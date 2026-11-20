@@ -66,6 +66,11 @@ if "cellpose" in _ENABLED_BACKENDS:
 logger = bioengine.logger
 
 SERVER_URL = "https://hypha.aicell.io"
+# Ceiling on the liveness call in `_health` (#0755). Must stay well under the
+# deployment's `health_check_timeout_s=30.0`, so a hung Hypha connection is reported
+# as UNHEALTHY by this check rather than timing the check itself out. Matches
+# annotation-broker's `_HEALTH_CALL_TIMEOUT_S`, which guards the same shape.
+_HEALTH_CALL_TIMEOUT_S = 15.0
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal[
@@ -554,6 +559,34 @@ class EntryApp:
         # CPU-only methods stay served when the runtime is down/scaling.
         if self._s3 is None:
             raise RuntimeError("S3 storage service not connected")
+        # #0755: the `is None` test above cannot fail on a DEAD handle, and this file
+        # already said so — the comment in `_connect` explaining why `_s3` is wrapped
+        # notes that "`_health` below tests `is None`, which a dead handle passes".
+        # hypha_rpc pins a proxy to one client instance of the server; when that
+        # instance is gone every call fails at send time forever while the websocket
+        # underneath happily reconnects. A replica in that state keeps passing this
+        # check, stays in the Serve routing table, and turns every call into a
+        # full-method-timeout hang instead of a fast failure.
+        #
+        # So exercise the connection for real. `echo` is the cheapest call that proves
+        # it — it reaches the Hypha server and nothing else, touching neither S3 nor a
+        # GPU runtime — and it is the same probe `apps/model-runner/entry.py` uses in
+        # its own health path. Raising here makes Serve replace the replica, which
+        # rebuilds the connection; that is the remedy annotation-broker settled on
+        # after the 2026-08-24 outage (`broker.py` `_health`), and it is cheap for this
+        # app for the reason the autoscaling block above already relies on: the records
+        # a caller polls are on disk, so a teardown between calls is invisible to the
+        # frontend.
+        #
+        # Bounded well under `health_check_timeout_s=30.0` so a hung connection is
+        # reported as unhealthy rather than timing the check itself out, which Serve
+        # would otherwise surface as a less specific failure.
+        try:
+            await asyncio.wait_for(
+                self._hypha.echo("ping"), timeout=_HEALTH_CALL_TIMEOUT_S
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Hypha server connection unusable: {exc}") from exc
 
     def _runtime_for(self, model_type: Optional[str]):
         """Route to the backend that owns ``model_type`` (cpsam → CellposeRuntime,
