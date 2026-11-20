@@ -1,6 +1,6 @@
-"""Resident-window gate for ``score_soup`` — re-runnable evidence for #0084.
+"""Resident-window gate for ``score_soup`` — re-runnable evidence for the resident-window gate.
 
-#0083 made the *merge* single-flight, but ``_build_soup`` has two callers and
+the single-flight change made the *merge* single-flight, but ``_build_soup`` has two callers and
 ``score_soup`` was the other one: it built a soup BEFORE taking ``_gpu_lock`` and
 kept the local alive through the whole segmentation loop, with no bound on how
 many did so at once. ``max_ongoing_requests=10`` admits ten, ``_gpu_lock``

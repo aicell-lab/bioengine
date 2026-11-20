@@ -1,7 +1,7 @@
-"""#0087: the contribute path's state-dict inspection must run under ``_soup_sem``.
+"""the contribute path's state-dict inspection must run under ``_soup_sem``.
 
 `prepare_contribution` holds up to TWO full cpsam state dicts while it inspects a finished
-session's checkpoint. Until Option A (ruled 2026-11-15) that work ran outside every lock and
+session's checkpoint. Until this change that work ran outside every lock and
 past every admission gate, so a deposit's peak could sum with a concurrent merge's and the
 replica could breach ``memory_mb`` with no merge of its own running. Option A takes the
 runtime's existing single-permit ``_soup_sem`` around the inspection, so the replica's peak
@@ -16,7 +16,7 @@ lose three cases and stay far above it. The invariant would have landed with not
 it, and a later refactor dropping the ``async with`` would have gone unnoticed.
 
 So the heavy dependencies are stubbed the way `bench_soup_concurrency.py` stubs them — the
-evidence for `#0083`, the row that put `_soup_sem` around the merge in the first place. What is
+evidence for the single-flight change that first put `_soup_sem` around the merge.
 under test is the **semaphore around the allocating region**, not torch: the state dicts here
 are three-key dicts, because ordering is what is being asserted, not bytes.
 
@@ -71,7 +71,7 @@ def _tiny_sd():
 def _install_stubs(monkeypatch, ckpt: Path, sdir: Path):
     """Stub every heavy dependency, for the duration of ONE test.
 
-    Mirrors `bench_soup_concurrency.py:_load_runtime`, which is `#0083`'s own harness, rather
+    Mirrors `bench_soup_concurrency.py:_load_runtime`, which is the single-flight change's own harness, rather
     than inventing a second way to do the same thing.
     """
     fake_be = types.ModuleType("bioengine")
@@ -132,8 +132,8 @@ def runtime(tmp_path, monkeypatch):
     """A no-``__init__`` runtime with only what `prepare_contribution` touches.
 
     The session is STOCK-INITIALISED on purpose — no `init_checkpoint.pt` — because that is the
-    `else` branch `#0070` added, the one that loads a second state dict and so the one whose
-    peak this row regressed on.
+    `else` branch the base-commitment rules added, the one that loads a second state dict and so the one whose
+    peak the regression was in.
     """
     sdir = tmp_path / "sess"
     (sdir / "models").mkdir(parents=True)
@@ -166,7 +166,7 @@ def runtime(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_inspection_cannot_start_while_the_merge_holds_the_semaphore(runtime):
-    """THE arm this row exists for. Hold ``_soup_sem``; the deposit must wait.
+    """THE arm this file exists for. Hold ``_soup_sem``; the deposit must wait.
 
     A mutant that drops the ``async with`` fails HERE and by name.
     """
@@ -185,7 +185,7 @@ async def test_the_inspection_cannot_start_while_the_merge_holds_the_semaphore(r
     fired = await loop.run_in_executor(None, _INSPECTION_RAN.wait, 3.0)
     assert not fired, (
         "the inspection ran while _soup_sem was held — the deposit's state dicts can still "
-        "sum with a concurrent merge's (#0087)"
+        "sum with a concurrent merge's"
     )
     assert runtime._started == []
     assert not task.done()
@@ -215,7 +215,7 @@ async def test_the_semaphore_is_released_even_when_the_inspection_raises(runtime
 
     `async with` gives this for free, so the test is cheap; it is here because the failure it
     rules out — a replica that stops merging entirely after one bad checkpoint — is worse than
-    the breach this row is about.
+    the breach this file is about.
     """
     def _boom(model_type="cpsam"):
         runtime._started.append(model_type)
@@ -252,7 +252,7 @@ def test_these_tests_do_not_need_real_torch():
              and getattr(n.func, "attr", getattr(n.func, "id", None)) == "importorskip"]
     assert not skips, (
         "this file must run where torch is absent; CI's bioengine-worker image has no torch "
-        "and an importorskip turns all of #0087's evidence back into skips"
+        "and an importorskip turns all of the memory-bound change's evidence back into skips"
     )
 
     # A module-level `import torch` would fail collection outright in that image, taking the
