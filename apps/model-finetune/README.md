@@ -412,7 +412,7 @@ Two things worth knowing when you see it:
     `HEALTHY` in silence. Debugging a fresh deploy, expect a replica that looks
     healthy for the first minute and a half and a deployment that keeps looking
     `RUNNING` — check the logs, not the status. Changing the behaviour is a
-    framework question and is tracked on a probe deployment, not here.
+    framework question and is tracked separately, not here.
 
 `ping()` stays shallow on purpose: the entry calls it with a 2 s timeout before every
 GPU call, which an import of torch does not fit, and importing a heavy stack on every
