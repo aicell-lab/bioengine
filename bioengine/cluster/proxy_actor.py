@@ -1376,6 +1376,7 @@ class BioEngineProxyActor:
         n_previous_replica: int = 0,
         tail: int = 30,
         death_causes: Optional[Dict[str, Optional[Dict[str, str]]]] = None,
+        death_cause_query_failed: bool = False,
     ) -> Dict[str, Dict[str, List[str]]]:
         """
         Get logs for all replicas of a Ray Serve deployment.
@@ -1407,6 +1408,10 @@ class BioEngineProxyActor:
                   query also yields None from ``_get_actor_death_causes`` and makes
                   this method report no deaths at all rather than invent unexplained
                   ones.
+            death_cause_query_failed: set by the caller when the HOISTED query failed.
+                  ``death_causes=None`` cannot express that on its own -- it already means
+                  "no map supplied" -- and treating the two alike made a failed hoist
+                  re-query once per deployment.
 
         Returns:
             Dictionary mapping replica IDs to their log dictionaries:
@@ -1517,6 +1522,13 @@ class BioEngineProxyActor:
                     replica_id: registered_replicas[replica_id][0]
                     for replica_id in dead_replica_ids
                 }
+                if death_cause_query_failed:
+                    # The HOISTED query already failed. `death_causes=None` cannot carry that:
+                    # it is overloaded with "no map was supplied", so falling through here
+                    # re-ran the cluster-wide query ONCE PER DEPLOYMENT -- five lookups for one
+                    # get_app_status, each able to block for the full RPC timeout, in exactly
+                    # the case where the query is slow. A separate flag is the whole fix.
+                    return logs
                 causes = (
                     death_causes
                     if death_causes is not None

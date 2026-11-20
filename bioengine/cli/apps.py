@@ -631,6 +631,11 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
         return
 
     printed = False
+    if dep_info.get("death_causes_unavailable"):
+        # Otherwise a failed GCS query is indistinguishable from a healthy deployment: both
+        # print no death lines. An empty answer and an unanswered question are different.
+        click.echo(f"{indent}[deaths unavailable: the death-cause query failed]")
+        printed = True
     stopped = dep_info.get("deliberately_stopped_replicas")
     if stopped:
         click.echo(

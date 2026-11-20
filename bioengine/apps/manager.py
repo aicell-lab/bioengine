@@ -1289,6 +1289,7 @@ class AppsManager:
         logs_tail: int,
         deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
         death_causes: Optional[Dict[str, Any]] = None,
+        death_cause_query_failed: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         overrides = deployment_logs_overrides or {}
         deployments_info = {}
@@ -1323,6 +1324,7 @@ class AppsManager:
                     n_previous_replica=this_prev,
                     tail=this_tail,
                     death_causes=death_causes,
+                    death_cause_query_failed=death_cause_query_failed,
                 )
                 # The proxy returns the deliberate-stop COUNT alongside the replica entries.
                 # Lift it OUT of that map before any consumer sees it: `logs` is contracted as
@@ -1347,6 +1349,10 @@ class AppsManager:
                         for k, v in deployment_logs.items()
                         if k != "_deliberately_stopped_replicas"
                     }
+                if death_cause_query_failed:
+                    # So "no deaths shown" cannot be read as "nothing died". The reader has
+                    # to be able to tell an empty answer from an unanswered question.
+                    deployments_info[deployment_name]["death_causes_unavailable"] = True
                 deployments_info[deployment_name]["logs"] = deployment_logs
             except Exception as e:
                 self.logger.error(
@@ -1593,6 +1599,7 @@ class AppsManager:
         logs_tail: int,
         deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
         death_causes: Optional[Dict[str, Any]] = None,
+        death_cause_query_failed: bool = False,
     ) -> Dict[str, Any]:
         """
         Application States: [NOT_STARTED, DEPLOYING, DEPLOY_FAILED, RUNNING, UNHEALTHY, DELETING]
@@ -1626,6 +1633,7 @@ class AppsManager:
                 logs_tail=logs_tail,
                 deployment_logs_overrides=deployment_logs_overrides,
                 death_causes=death_causes,
+                death_cause_query_failed=death_cause_query_failed,
             )
         else:
             if application_info["is_deployed"].is_set():
@@ -4090,9 +4098,21 @@ class AppsManager:
         # None means the query FAILED, and that is passed down as None rather than as
         # an empty map: the difference decides whether a deployment reports "nothing
         # died" or declines to guess.
-        death_causes = (
-            await self.ray_cluster.proxy_actor_handle.get_all_death_causes.remote()
-        )
+        # Guarded: unguarded, a proxy RPC failure here would fail the WHOLE get_app_status,
+        # where a per-deployment failure used to degrade to a logged error. The flag is what
+        # the deployments are told, because `None` alone cannot say "the query failed" --
+        # it already means "no map supplied", and conflating them made a failed hoist re-query
+        # once per deployment.
+        death_causes = None
+        death_cause_query_failed = False
+        try:
+            death_causes = (
+                await self.ray_cluster.proxy_actor_handle.get_all_death_causes.remote()
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to fetch actor death causes: {e}")
+        if death_causes is None:
+            death_cause_query_failed = True
 
         # Iterate over applications to check
         status_tasks = [
@@ -4103,6 +4123,7 @@ class AppsManager:
                 logs_tail=logs_tail,
                 deployment_logs_overrides=deployment_logs,
                 death_causes=death_causes,
+                death_cause_query_failed=death_cause_query_failed,
             )
             for application_id in apps_to_check
         ]

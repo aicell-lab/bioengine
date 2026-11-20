@@ -491,3 +491,68 @@ def test_clause_2_the_exception_is_carried_by_the_LOGS_not_by_the_cause():
     )
     assert at_default["crashed"]["logs_omitted"] is True
     assert at_default["crashed"]["stderr"] == []
+
+
+# ── A FAILED hoisted query must not be re-run once per deployment ─────────────
+
+
+def _raising_deployment_actor(registered, alive):
+    """Real proxy class whose GCS list() always raises, counting every attempt."""
+    actor = object.__new__(_PLAIN_CLASS)
+    actor._last_called_at = 0.0
+    actor.gcs_calls = 0
+
+    def _raise(resource, options, raise_on_missing_output):
+        actor.gcs_calls += 1
+        raise RuntimeError("GCS unreachable")
+
+    actor.state_api_client = SimpleNamespace(list=_raise)
+    actor.application_replicas = {"app": {"D": registered}}
+    actor.get_deployment_replicas = lambda application_id, deployment_name: alive
+    actor.get_actor_logs = lambda actor_id, tail, timezone, creation_timestamp: {
+        "stdout": [], "stderr": []
+    }
+    return actor
+
+
+def test_a_failed_hoisted_query_is_not_re_run_per_deployment():
+    """The cost ruling on the FAILURE path, which the mocked call-count test cannot see.
+
+    `death_causes=None` is overloaded: it means both "no map supplied" and "the hoisted query
+    failed". Treating them alike made a failed hoist fall through and re-run the CLUSTER-WIDE
+    query once per deployment -- five lookups for one get_app_status, each able to block for
+    the full RPC timeout, in precisely the case where the query is slow or the GCS unreachable.
+
+    `death_cause_query_failed` is the separate signal. With it set, a deployment must return
+    without asking again, so N deployments cost ZERO further queries.
+    """
+    registered = {"dead1": ("actor-1", 0.0), "dead2": ("actor-2", 0.0)}
+    total = 0
+    for _ in range(4):                       # four deployments, as one application has
+        actor = _raising_deployment_actor(registered, alive={})
+        logs = actor.get_deployment_logs(
+            application_id="app", deployment_name="D",
+            n_previous_replica=0, tail=30,
+            death_causes=None, death_cause_query_failed=True,
+        )
+        total += actor.gcs_calls
+        assert logs == {}, logs      # and it invents no unexplained deaths
+
+    assert total == 0, (
+        "a failed hoisted query was re-run %d time(s) across 4 deployments; the hoist is "
+        "defeated on exactly the path where the query is expensive" % total
+    )
+
+
+def test_without_the_flag_a_deployment_still_fetches_for_itself():
+    """The control: the flag must be what suppresses it, not the code having stopped asking.
+
+    A direct caller that supplies no map still gets its own lookup -- otherwise the test above
+    would pass against a version that never queries at all.
+    """
+    actor = _raising_deployment_actor({"dead1": ("actor-1", 0.0)}, alive={})
+    actor.get_deployment_logs(
+        application_id="app", deployment_name="D",
+        n_previous_replica=0, tail=30,
+    )
+    assert actor.gcs_calls == 1, actor.gcs_calls
