@@ -231,6 +231,53 @@ The per-app `ProxyDeployment` replica calls
 here, all client RPCs to `workspace/<application_id>` route through
 this proxy. Per-replica WebSocket service IDs are derived under it.
 
+## A successful return is not a routable service
+
+`deploy_app` returns once the replicas are up. **Step 14 — the proxy registering the Hypha
+service — can still be in progress at that moment**, and until it completes a caller that resolves
+the application id gets a service it cannot usefully call.
+
+Measured on a restarted application: a call placed at 22:33:00 was not served until 22:34:38 — a
+**95-second window** in which the call was accepted and then lost, after the restart had already
+reported success.
+
+This is deliberately **not** a guarantee BioEngine makes. The return value says the deployment was
+accepted and the replicas started; it does not say the end-to-end path is live. Making the return
+wait on a demonstrated round trip would change what every caller of this API observes, and would
+make a slow-but-healthy startup indistinguishable from a failure.
+
+**So the caller owns this.** Do not treat a successful return as readiness. Hold until a method
+demonstrably returns a value:
+
+```python
+deployed = await worker.deploy_app(
+    artifact_id="bioimage-io/my-app", application_id="my-app", version="1.2.3",
+)
+
+svc = None
+for _ in range(60):                      # ~2 min at 2 s, comfortably past the window seen above
+    try:
+        svc = await client.get_service(f"{workspace}/{deployed['application_id']}")
+        await svc.get_status()           # any cheap method that must return a value
+        break
+    except Exception:
+        svc = None
+        await asyncio.sleep(2)
+if svc is None:
+    raise RuntimeError("app did not become routable")
+```
+
+Two things that do **not** substitute for that round trip:
+
+- `get_app_status`'s top-level `RUNNING`. The same file already warns that `RUNNING` is not proof
+  the new code is live, because Serve can reuse a replica of any deployment after a version bump
+  and serve stale in-memory code.
+- a resolvable service id. Resolution and routability are separate: the id can resolve while the
+  proxy is still wiring up behind it.
+
+Anything that polls a *state* rather than calling a *method* is reading a signal the platform does
+not promise is sufficient.
+
 ## What lives where
 
 | Concern | Code |
