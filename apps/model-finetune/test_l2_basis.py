@@ -85,7 +85,7 @@ def test_a_pre_change_record_is_UNDETERMINED_not_a_base_and_not_zero() -> None:
 def test_an_unrecognised_label_is_undetermined_not_passed_through() -> None:
     """A label written by a newer app must not be echoed back as if this build
     understood it."""
-    rec = {"l2_from_base": 1.0, "l2_from_base_basis": "some_future_base_0122"}
+    rec = {"l2_from_base": 1.0, "l2_from_base_basis": "some_future_base"}
     assert pool.l2_basis(rec) == pool.L2_BASIS_UNDETERMINED
 
 
@@ -99,7 +99,7 @@ def test_a_non_record_is_undetermined(record: Any) -> None:
 
 def _meta(**over: Any) -> Dict[str, Any]:
     kw: Dict[str, Any] = dict(
-        contribution_id="c-0122",
+        contribution_id="c-stamped",
         model_type="cpsam",
         app_version="0.30.21",
         cellpose_version="4.0.0",
@@ -170,4 +170,4 @@ def test_both_runtime_branches_label_the_distance_they_measured() -> None:
         "a runtime branch stamped UNDETERMINED as if it were a base; undetermined "
         "is a READER's answer to a missing label, never something a writer stamps"
     )
-    assert "ZZZNOSUCH_L2_BASIS_0122" not in src
+    assert "ZZZNOSUCH_L2_BASIS_SENTINEL" not in src
