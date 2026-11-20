@@ -205,3 +205,83 @@ def test_a_fenced_key_that_is_absent_anyway_does_not_raise():
     remove and the instruction is harmless."""
     out = _hydrate({FENCE_KEY: "HYPHA_TOKEN"})
     assert "HYPHA_TOKEN" not in out
+
+
+# --------------------------------------------------------------------------
+# the documented CLI combination, and the one edge case worth disclosing
+# --------------------------------------------------------------------------
+
+
+def _via_application_env_vars(application_env_vars, hypha_token):
+    """Run the builder's own flattening, then `_build_env_vars`.
+
+    `--env K=V` arrives as ``application_env_vars`` keyed by deployment class
+    and is flattened ACROSS deployments before the secret/non-secret split.
+    These four lines are copied from that site rather than imported, because
+    the flattening is inline in a long async method; the tripwire below asserts
+    the real one still looks like this.
+    """
+    flat = {}
+    for env_dict in application_env_vars.values():
+        for key, value in env_dict.items():
+            flat[key] = value
+    secret = {k[1:]: v for k, v in flat.items() if k.startswith("_")}
+    non_secret = {k: v for k, v in flat.items() if not k.startswith("_")}
+    return _builder()._build_env_vars(
+        application_id="app1",
+        artifact_id="ws-test/my-app",
+        version="1.0.0",
+        non_secret_env_vars=non_secret,
+        secret_env_vars=secret,
+        hypha_token=hypha_token,
+        download_token=None,
+    )
+
+
+def test_an_empty_token_WITH_an_env_supplied_one_still_delivers_it():
+    """The combination the published skill documents, so it must not change.
+
+    `--hypha-token '' --env HYPHA_TOKEN=x` is the one invocation where an
+    env-supplied token reaches the replica rather than being overwritten. The
+    fence must not take it: the caller passed it explicitly, and a reader
+    following the skill would be standing a deployment up on this.
+    """
+    env = _via_application_env_vars({"Entry": {"HYPHA_TOKEN": "x"}}, "")
+    assert env["HYPHA_TOKEN"] == "x"
+    assert FENCE_KEY not in env
+
+
+def test_the_fence_is_decided_ACROSS_deployments_not_per_deployment():
+    """DISCLOSED LIMITATION, pinned so it is a known shape and not a surprise.
+
+    The flattening merges every deployment's env before the fence is decided,
+    so `--env HYPHA_TOKEN=x` on ONE deployment class suppresses the fence for
+    ALL of them — and the value reaches all of them too, which it already did
+    before this change.
+
+    Per-deployment fencing would need the decision moved inside the
+    per-deployment loop, which is a wider change than this fix. Asserting it
+    here means the next person reads it off a test rather than discovering it
+    on a worker.
+    """
+    env = _via_application_env_vars(
+        {"Entry": {"HYPHA_TOKEN": "x"}, "Runtime": {}}, ""
+    )
+    assert env["HYPHA_TOKEN"] == "x"
+    assert FENCE_KEY not in env, (
+        "the fence is global; if this starts passing, fencing became "
+        "per-deployment and the skill's account of it needs rewriting"
+    )
+
+
+def test_the_builders_flattening_still_matches_what_the_helper_copies():
+    """TRIPWIRE. The two tests above copy the builder's flattening; if the real
+    one changes shape they would keep passing against a stale copy."""
+    import inspect
+
+    source = inspect.getsource(AppBuilder)
+    assert "for env_dict in application_env_vars.values():" in source, (
+        "the builder no longer flattens application_env_vars this way, so the "
+        "helper in this file is testing a path that no longer exists"
+    )
+    assert 'k[1:]: v for k, v in flat_env_vars.items() if k.startswith("_")' in source
