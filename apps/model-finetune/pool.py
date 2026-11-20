@@ -227,7 +227,7 @@ def round_metric(
 def merge_trigger() -> Dict[str, Any]:
     """The campaign's merge-cadence policy record (5 fields). All null: no
     merge-cadence policy is declared here and the merge provenance is unpopulated,
-    pending the campaign's trigger ruling. A merge-on-N-contributions policy would
+    pending a decision on the campaign's trigger. A merge-on-N-contributions policy would
     set ``kind`` and ``contributions_per_merge``; a named decider would set
     ``decided_by``/``agent``."""
     return {
@@ -704,7 +704,7 @@ NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
 
 
 # The basis strings a community manifest uses to say WHERE its
-# non-learned values came from. The ruling is explicit that reporting the float alone is
+# non-learned values came from. Reporting the float alone is explicitly
 # not enough — "the manifest must record that the soup's diam_labels was INHERITED and
 # name its source, or the original defect reappears in the manifest instead of the state
 # dict". So the value never travels without this label beside it.
@@ -790,7 +790,7 @@ def base_commitment(
         },
         "key_set_sha256": key_set_digest(state_dict.keys()),
         "key_count": len(state_dict),
-        # The gate is the digest and the count, per the ruling. This list is carried so a
+        # The gate is the digest and the count, by design. This list is carried so a
         # REFUSAL can name the offending key: a digest proves inequality and says nothing
         # about which key caused it, and the first version of this change regressed the
         # old message from "carries key ['net.some_future_statistic']" to "has 5 keys,
@@ -803,7 +803,7 @@ def base_commitment(
 
 
 def assert_base_commitment(commitment: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Validate a pool's base record, or RAISE. There is no fallback, by ruling.
+    """Validate a pool's base record, or RAISE. There is deliberately no fallback.
 
     A pool that records no base cannot merge: falling back to loading a stock base would
     make the field permanently optional, and a backfilled-on-the-fly base is a
@@ -1193,7 +1193,7 @@ def uniform_soup(
 
     # The pool's RECORDED base, not a loaded checkpoint:
     # the merge reads two floats and a key-set commitment out of pool_index.json and
-    # never builds a model. Raises when absent — there is no fallback, by ruling.
+    # never builds a model. Raises when absent — there is deliberately no fallback.
     commitment = assert_base_commitment(base)
     base_non_learned = commitment["non_learned"]
     expected_keys_sha = commitment["key_set_sha256"]
@@ -1511,7 +1511,7 @@ def empty_index(model_type: str, architecture_signature: str,
         "architecture_signature": architecture_signature,
         # The base this pool is anchored to, recorded ONCE here. The
         # merge reads its two floats and its key-set commitment and never loads a model.
-        # Optional at CREATION and fatal at MERGE, by ruling: a pool that records none
+        # Optional at CREATION and fatal at MERGE, by design: a pool that records none
         # cannot merge, and there is deliberately no fallback to loading a stock base,
         # which would make the field permanently optional. A separate census covers
         # how many existing pools this blocks.
@@ -1928,7 +1928,7 @@ def build_community_manifest(
         # diameter IS and that it was inherited rather than learned (build it with
         # ``inherited_non_learned`` so the basis label travels with the float).
         # ``member_non_learned`` is where the contributors' OWN measured diameters live —
-        # the ruling's "one operative value in the tensor, four honest values in the
+        # the rule's "one operative value in the tensor, four honest values in the
         # record". Both default to None rather than to {} or [], because an empty map and
         # an absent one must stay distinguishable: a merge written before this field
         # existed carries null, and reading that as "this soup had no contributor

@@ -747,7 +747,7 @@ class CellposeRuntime:
         ``base_commitment`` is produced HERE for exactly that reason. The entry
         writes it into ``pool_index.json`` at pool creation but cannot build it: a
         commitment needs the base's own state_dict, and a constant or manifest-derived
-        value would reinstate the key-set assumption the ruling's amendment removed.
+        value would reinstate the key-set assumption the design dropped.
         It rides on the existing return rather than a second call, because the base is
         already resident here.
 
@@ -856,7 +856,7 @@ class CellposeRuntime:
         # concern, not a reason to widen this one.
         #
         # The cost is latency: the deposit RPC now waits for any in-flight merge before it
-        # starts its own torch load. That is the trade the ruling accepted -- a measured
+        # starts its own torch load. That is the trade accepted here -- a measured
         # memory bound over an unmeasured latency improvement -- and the measurement of
         # what it adds is recorded with those figures.
         async with self._soup_sem:

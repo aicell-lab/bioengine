@@ -2167,7 +2167,7 @@ class EntryApp:
                     # the base's state_dict and this entry is torch-free; passing it
                     # through is what makes the pool mergeable at all, since
                     # assert_base_commitment refuses a pool that records none and has
-                    # no fallback by ruling. A bootstrap that omitted it produced a
+                    # deliberately no fallback. A bootstrap that omitted it produced a
                     # pool that could never merge.
                     index = pool.empty_index(
                         model_type, signature, info.get("base_commitment"))

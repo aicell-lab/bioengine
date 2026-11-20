@@ -46,7 +46,7 @@ def _base(dtype=torch.float32):
     inventory every member key is classified against, and its non-learned values
     are what the soup carries through. Passing it
     explicitly in every test is the point: a default would be the "neither
-    classifiable nor classified, so average it" hole the ruling closes.
+    classifiable nor classified, so average it" hole the rule closes.
     """
     return _sd(0.0, dtype=dtype)
 

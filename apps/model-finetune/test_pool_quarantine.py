@@ -106,7 +106,7 @@ class TestDigestQuarantine:
         assert len(quarantined) == 3
 
     def test_absent_and_null_share_one_reason_and_the_mismatch_does_not(self):
-        """The ruling's first implementability condition, as an assertion. If this
+        """The first implementability condition, as an assertion. If this
         ever goes green with all three reasons equal, a reader filtering the
         community manifest for integrity incidents finds every legacy record and
         gives up on the filter."""

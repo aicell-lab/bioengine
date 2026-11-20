@@ -1,6 +1,6 @@
 """every ``l2_from_base`` says what it was measured AGAINST.
 
-Two halves, both from the 2026-11-14 ruling:
+Two halves of one rule:
 
 1. a stock-initialised deposit carries a NON-NULL ``l2_from_base``, measured
    against the stock base it actually started from;

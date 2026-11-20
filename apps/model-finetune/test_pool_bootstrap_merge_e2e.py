@@ -232,7 +232,7 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
 def test_a_pool_bootstrapped_the_old_way_cannot_merge() -> None:
     """`empty_index(model_type, signature)` — the two-argument call `entry.py` used to make.
 
-    No fallback to loading a stock base: the ruling is explicit that a fallback would make
+    No fallback to loading a stock base: a fallback would make
     the commitment permanently optional.
     """
     index = pool.empty_index(MODEL_TYPE, _SIG)
