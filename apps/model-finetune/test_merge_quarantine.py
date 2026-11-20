@@ -119,7 +119,7 @@ class _Runtime:
         ``aggregate()`` reads them with ``.get()``, so omitting them is tolerated,
         and a stub that made them up would let such an assertion pass against
         values no runtime produced. That property is driven in the base-commitment
-        against the real builder.
+        tests, against the real builder.
         """
         return {"sha256": HEAD_SHA, "n_bytes": 2048,
                 "replica": "r0", "soup_dl_bytes": 0}

@@ -1138,7 +1138,7 @@ async def test_a_merge_that_admitted_nothing_stamps_a_null_basis_not_an_absent_o
 
 @pytest.mark.asyncio
 async def test_aggregate_returns_the_attribution_of_the_digest_it_just_published():
-    """The moment the digest-basis rule's false alarm actually happens: a caller re-merges an
+    """The moment the false alarm the digest-basis rule removes actually happens: a caller re-merges an
     identical member set, gets a number, and compares it against a stored one. Both
     numbers are in their hands HERE, so the attribution has to travel with the
     return value and not only on a page they would have to go and read."""

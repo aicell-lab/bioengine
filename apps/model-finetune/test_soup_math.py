@@ -32,7 +32,7 @@ def _commit(state_dict, source="test:stock-cpsam"):
     """A pool's recorded base commitment, built from a real state dict.
 
     uniform_soup now reads the pool's RECORD rather than loading a checkpoint,
-   so every test states the base it is classifying against as
+    so every test states the base it is classifying against as
     data. Built through pool.base_commitment so the digest and the count in the test
     cannot disagree with the ones the merge computes.
     """

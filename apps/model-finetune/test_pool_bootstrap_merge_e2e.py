@@ -14,7 +14,7 @@ the `pool_index.json` bytes it PUT, and merges against that. Against the pre-fix
 written record carries `base_commitment: None` and the merge raises.
 
 The remaining arms pin the merge contract itself — the base's diameter is carried rather than
-averaged (the original defect in the base-commitment rules), the inventory is fail-closed, and a merge of zero members
+averaged (the defect the base-commitment rules fix), the inventory is fail-closed, and a merge of zero members
 raises rather than returning an empty checkpoint.
 
 Synthetic tensors only: torch, no cellpose, no GPU, no pool artifact.
@@ -219,7 +219,7 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
 
     assert float(soup["encoder.weight"][0]) == pytest.approx(4.0)   # (3+5)/2
     assert float(soup["decoder.bias"][0]) == pytest.approx(7.0)     # (5+9)/2
-    # The original defect in the base-commitment rules: the base's diameter is carried, NOT averaged. 30.0 vs 47.0.
+    # The defect the base-commitment rules fix: the base's diameter is carried, NOT averaged. 30.0 vs 47.0.
     assert float(soup["diam_labels"][0]) == pytest.approx(BASE_DIAM)
     assert float(soup["diam_labels"][0]) != pytest.approx((M1_DIAM + M2_DIAM) / 2)
     # Requirement 4: the contributors' own diameters survive, in loader order.
