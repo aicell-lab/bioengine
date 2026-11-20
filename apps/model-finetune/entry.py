@@ -413,11 +413,36 @@ class _RecognisedRedeposit(Exception):
     # returns while the app is still DEPLOYING. min_replicas stays 0, so #0045's
     # requirement ("should also scale down if not used") is untouched: this replica
     # goes away after downscale_delay_s like any other.
+    # downscale_delay_s must NOT equal the interval of whatever polls this app, or
+    # every tick lands on the teardown boundary and half of them pay a cold start
+    # (#0463). It was 600.0 while the de.NBI watcher probed `get_upload_url` every
+    # 600 s, and on 2026-11-20 that produced, over 72 consecutive readings:
+    #
+    #   over 5000 ms   32 of 72 (44.4%)    fast median 195 ms   slow 6089-12581 ms
+    #   slow -> slow    0  of 71 transitions      slow -> fast  31/31 (100%)
+    #
+    # Zero back-to-back stalls is the mechanism's fingerprint, not a quiet window:
+    # chance at 44.4% predicts ~14. A tick resets the idle clock on completion, so
+    # with the delay equal to the interval each tick is a coin flip; a tick that
+    # LOSES pays ~10 s, which moves the new replica's birth ~10 s later, so the next
+    # tick arrives inside the window and is certain to be fast. Caught in the act:
+    # replica `qjhhtcsw` was born 2026-11-20T10:56:14Z, 7 s inside the 11:56:07
+    # local stall that ran 9709 ms.
+    #
+    # 1800 is three times the current probe interval, so polling keeps the entry warm
+    # instead of straddling the boundary. ⚠ CONSEQUENCE, stated rather than buried:
+    # on a cluster that IS polled more often than every 1800 s, the poll is traffic
+    # and this app effectively stops scaling to zero there. #0045's requirement
+    # ("should also scale down if not used") still holds where nothing calls it --
+    # an idle, unpolled deployment releases its CPU and 4 GB after 30 min instead of
+    # 10. Lowering this below a poller's interval is strictly worse than either
+    # extreme: the replica is then torn down between EVERY pair of ticks, so every
+    # call pays the cold start.
     autoscaling_config={
         "min_replicas": 0,
         "initial_replicas": 1,
         "max_replicas": 1,
-        "downscale_delay_s": 600.0,
+        "downscale_delay_s": 1800.0,
         "upscale_delay_s": 0.0,
     },
     health_check_period_s=30.0,

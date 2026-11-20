@@ -433,10 +433,34 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     assert cfg.initial_replicas == 1, (
         "#0370: with 0 the placement warning is never written on the cluster it is for"
     )
-    # CONTROL: this is the live resolved config, not a default-shaped object — these
-    # two values are set in the decorator and are not Ray Serve defaults.
-    assert cfg.max_replicas == 1
-    assert cfg.downscale_delay_s == 600.0
+    # #0463: 1800, not 600. The de.NBI watcher polls `get_upload_url` every 600 s, so a
+    # 600 s downscale delay put every tick on the teardown boundary: 32 of 72 readings
+    # over 5 s on 2026-11-20, and 0 of 71 transitions slow->slow because a cold start
+    # moves the next tick inside the window. Asserted as a VALUE rather than a bound,
+    # because the defect was the coincidence with a poller's interval, and the next
+    # person to retune this needs to be told that rather than handed a `> 600` that
+    # permits the collision back.
+    assert cfg.downscale_delay_s == 1800.0, (
+        "#0463: a delay equal to a poller's interval makes every tick a coin flip "
+        "between a warm replica and a ~10 s cold start"
+    )
+    # CONTROL that the two contracts above are read off the LIVE resolved config and
+    # not a default-shaped object. It has to be a field whose decorator value DIFFERS
+    # from Ray Serve's default, or it cannot fail.
+    #
+    # ⚠ The previous control was `max_replicas == 1` and `downscale_delay_s == 600.0`,
+    # under a comment asserting neither is a Ray Serve default. BOTH WERE. Measured in
+    # the CI image: Ray's AutoscalingConfig defaults are min_replicas=1,
+    # initial_replicas=None, max_replicas=1, downscale_delay_s=600.0,
+    # upscale_delay_s=30.0. So the old control passed against exactly the object it
+    # claimed to exclude, and would have gone on passing if the decorator had stopped
+    # setting either field. `upscale_delay_s` is 0.0 here against a default of 30.0,
+    # so this one discriminates; `min_replicas` (0 vs 1) and `initial_replicas`
+    # (1 vs None) also differ, which is why the contracts above are self-witnessing.
+    assert cfg.upscale_delay_s == 0.0, (
+        "control: 0.0 differs from Ray's 30.0 default, so reaching this line proves "
+        "the decorator's config was resolved rather than a default object read"
+    )
 
 
 def test_the_declaration_this_row_is_about_is_unchanged() -> None:
