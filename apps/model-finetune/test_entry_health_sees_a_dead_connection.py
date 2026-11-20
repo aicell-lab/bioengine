@@ -2,11 +2,13 @@
 
 The check used to be ``if self._s3 is None: raise``. That is an identity test against
 ``None``, and this file's subject already knew it was insufficient: the comment in
-``_connect`` explaining why ``_s3`` is wrapped in ``reconnecting_service`` says a proxy
-pinned to a client id the server later forgets *"would hang every call to the full method
-timeout — and ``_health`` below tests ``is None``, which a dead handle passes."* So the
-hazard was written down at the site that avoided it while the health check that would
-surface it could not.
+``_connect`` explaining why ``_s3`` is wrapped in ``reconnecting_service`` observed that a
+proxy pinned to a client id the server later forgets would hang every call to the full
+method timeout, and that ``_health`` tested ``is None``, *"which a dead handle passes"*.
+So the hazard was written down at the site that avoided it while the health check that
+would surface it could not. (That sentence in ``_connect`` has since been updated to
+describe the probe, so it no longer reads as a live defect; it is quoted here as the
+record of why this row existed.)
 
 Why it matters: a replica in that state passes its health check, stays in the Serve
 routing table, and converts every call into a full-method-timeout hang instead of a fast
@@ -27,6 +29,7 @@ one arm asserts the call was really made.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -137,4 +140,71 @@ async def test_the_bound_is_read_from_the_module_constant() -> None:
     assert entry._HEALTH_CALL_TIMEOUT_S < cfg.health_check_timeout_s, (
         "the liveness call must be bounded BELOW the deployment's health-check timeout, "
         "or Serve times out the check instead of being told the connection is dead"
+    )
+
+
+async def test_the_OLD_check_passed_this_exact_handle() -> None:
+    """DISCRIMINATION CONTROL, and what makes ``test_a_dead_handle_is_UNHEALTHY``
+    evidence rather than an assertion.
+
+    ``test_a_live_connection_is_healthy`` shows the new check does not reject
+    everything. This shows the complementary half: that the OLD body *accepted* the very
+    handle the new one rejects. Without it, the row's premise — that a dead connection
+    used to pass — is taken on trust, and a reader cannot tell a real regression test
+    from one written against a bug that never existed.
+
+    The body is reconstructed rather than imported because the point is what the previous
+    revision DID; pulling it from git history would make this test depend on the SHA.
+    """
+    hypha = _Hypha("send-failure")
+    inst = _entry(hypha)
+
+    async def _old_health(self) -> None:
+        if self._s3 is None:
+            raise RuntimeError("S3 storage service not connected")
+
+    assert await _old_health(inst) is None, "the old body did not accept a dead handle"
+    assert hypha.echo_calls == 0, "the reconstructed old body is not the old body"
+
+
+async def test_the_cheap_precondition_is_reached_BEFORE_the_wire() -> None:
+    """Order matters, and ``test_a_missing_s3_handle_is_still_unhealthy`` does not pin it.
+
+    That arm asserts the right exception; it would also pass if the probe ran first and
+    happened to succeed. With no ``_s3`` there is nothing to serve and nothing to probe,
+    so probing anyway would spend the bound on every check of a replica whose
+    ``_connect`` never finished, and would report a CONNECTION fault for what is a
+    missing dependency — the wrong remedy, since replacing that replica does not help.
+    """
+    hypha = _Hypha("ok")
+    with pytest.raises(RuntimeError, match="S3 storage service not connected"):
+        await _health_of(_entry(hypha, s3=None))()
+    assert hypha.echo_calls == 0, (
+        "the liveness probe ran before the `_s3 is None` precondition, so a replica "
+        "that never connected is reported as a dead connection"
+    )
+
+
+def test_the_decision_not_to_wrap_the_connection_is_recorded_at_the_site() -> None:
+    """``self._s3`` is wrapped in ``reconnecting_service`` and ``self._hypha`` is not.
+
+    That asymmetry reads as an oversight unless the reasoning is written where the
+    wrapping happens, and an "oversight" invites a fix that cannot work: the wrapper
+    re-resolves a service proxy THROUGH a connection, so it has nothing to offer the
+    connection itself. Asserted off the source because the claim is about what a
+    maintainer sees, not about behaviour.
+    """
+    src = (Path(__file__).with_name("entry.py")).read_text(encoding="utf-8")
+
+    # CONTROLS first: the file must have been read, and a phrase that is not in it must
+    # be absent — otherwise a mis-resolved path or an empty read passes every assertion.
+    assert len(src) > 10_000, f"entry.py read back implausibly short ({len(src)} chars)"
+    assert "ZZZ_PHRASE_THAT_IS_NOT_IN_ENTRY_PY" not in src
+
+    assert "deliberately NOT wrapped" in src, (
+        "the decision not to wrap `self._hypha` is not stated where `self._s3` is wrapped"
+    )
+    assert "different object from the connection" in src, (
+        "the REASON is not stated: that reconnecting_service re-resolves a service "
+        "proxy, which is not the connection it was resolved through"
     )
