@@ -132,7 +132,7 @@ class TestCorrectedMetric:
         assert out["aggregate_basis"].startswith(pool.SELECTION_BASIS)
 
     def test_the_retracted_witness_wording_is_restated(self):
-        """The half this row did not name, and the worse half of the two: it is
+        """The half not named above, and the worse half of the two: it is
         attached to the only number the improvement curve plots."""
         out = pool.corrected_metric(_metric(STORED_WITNESS, role="witness"))
         assert STORED_WITNESS not in out["aggregate_basis"]
@@ -279,7 +279,7 @@ def _legacy_index() -> Dict[str, Any]:
 def _all_strings(node: Any) -> str:
     """Every string anywhere in the projected structure, concatenated.
 
-    A whole-tree search rather than a field-by-field one: the clause is that NO
+    A whole-tree search rather than a field-by-field one: what must hold is that NO
     surface presents the wording, and a field-by-field check can only ever cover the
     fields someone remembered.
     """

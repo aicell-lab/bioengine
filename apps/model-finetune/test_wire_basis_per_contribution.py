@@ -149,7 +149,7 @@ def test_the_unrecognised_fixture_basis_really_is_unrecognised() -> None:
 
 
 def test_every_published_digest_has_a_basis_beside_it() -> None:
-    """Clause 1. Read back from the call: one entry per published contribution.
+    """Read back from the call: one entry per published contribution.
 
     The length assertion is not redundant with the set comparison: sets collapse
     duplicate ids, so a map that dropped one of two entries sharing an id would still
@@ -272,7 +272,7 @@ def test_colliding_ids_that_agree_are_not_downgraded() -> None:
 
 
 def test_each_record_gets_its_own_basis_not_a_constant() -> None:
-    """Clause 3. Four records, three different bases, matched per id."""
+    """Four records, three different bases, matched per id."""
     prov = _by_contribution()
     assert prov["c-file"]["basis"] == pool.DIGEST_BASIS_FILE
     assert prov["c-unstamped"]["basis"] == pool.DIGEST_BASIS_FILE
@@ -356,7 +356,7 @@ def test_the_deposit_date_does_not_change_the_answer() -> None:
 
 
 def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
-    """Clause 2. 'no digest stored' and 'a digest whose basis is known' must not read
+    """'no digest stored' and 'a digest whose basis is known' must not read
     the same, and the absent answer must be DIGEST_BASIS_ABSENT rather than a guess at
     the file basis — a silent default is the very defect that stamp prevents.
 
@@ -370,7 +370,7 @@ def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
     assert absent == pool.DIGEST_BASIS_ABSENT
     assert absent != pool.CONTRIBUTION_DIGEST_BASIS, (
         "a record with no digest was published as if it carried the file basis; that "
-        "is the silent default this row exists to prevent"
+        "is the silent default this file exists to prevent"
     )
     # And the undetermined case is its own third answer, not folded into either.
     assert prov["c-badstamp"]["basis"] == pool.DIGEST_BASIS_UNDETERMINED
@@ -379,7 +379,7 @@ def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
 
 def test_the_note_is_written_about_a_contribution_not_the_community_head() -> None:
     """The explanation travels with the number, so a wrong explanation is worse than
-    the bare number this row set out to fix. ``DIGEST_BASIS_NOTES`` is written about
+    the bare number this file is about. ``DIGEST_BASIS_NOTES`` is written about
     the community head and three of its sentences are false of a contribution: the app
     did not name the contributor's checkpoint, "re-merge and compare" is not an
     operation that produces a contribution digest, and a contribution is not a merge

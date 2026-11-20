@@ -1,14 +1,14 @@
 """every ``l2_from_base`` says what it was measured AGAINST.
 
-Two halves, both from the 2026-11-14 ruling:
+Two halves of one rule:
 
 1. a stock-initialised deposit carries a NON-NULL ``l2_from_base``, measured
    against the stock base it actually started from;
 2. every ``l2_from_base`` carries an explicit basis label, and a record written
    BEFORE this change reads as ambiguous rather than as zero.
 
-The third sentence is the one a shortcut gets wrong. Every pre-the basis label record holds
-a distance and no label, and the tempting default — "unlabelled means the
+The second half is the one a shortcut gets wrong. Every record written before the
+basis label existed holds a distance and no label, and the tempting default — "unlabelled means the
 session-init base, because that was the only one that produced a number" — is the
 inference 0.27.6 makes unsafe. ``l2_basis`` must refuse it.
 """
@@ -63,7 +63,7 @@ def test_no_distance_is_its_own_answer_not_undetermined() -> None:
 
 
 def test_a_pre_change_record_is_UNDETERMINED_not_a_base_and_not_zero() -> None:
-    """THE case this row exists for. A distance with no label must not be
+    """THE case this file exists for. A distance with no label must not be
     attributed to either base, and must not read as zero movement."""
     pre = {"l2_from_base": 2.75}          # written before the basis label: value, no label
     got = pool.l2_basis(pre)

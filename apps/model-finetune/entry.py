@@ -443,7 +443,7 @@ class _RecognisedRedeposit(Exception):
     # handle->controller push rate, max_replicas being 1, which is why this is the
     # per-deployment field and not the worker-wide
     # RAY_SERVE_HANDLE_AUTOSCALING_METRIC_PUSH_INTERVAL_S env var -- that one would
-    # change every deployment the worker hosts and is another lane's to set.
+    # change every deployment the worker hosts and is set elsewhere.
     #
     # Both keys are real AutoscalingConfig fields in Ray 2.55.1, asserted rather than
     # assumed: AutoscalingConfig drops unknown keys instead of raising, so a
@@ -2167,7 +2167,7 @@ class EntryApp:
                     # the base's state_dict and this entry is torch-free; passing it
                     # through is what makes the pool mergeable at all, since
                     # assert_base_commitment refuses a pool that records none and has
-                    # no fallback by ruling. A bootstrap that omitted it produced a
+                    # deliberately no fallback. A bootstrap that omitted it produced a
                     # pool that could never merge.
                     index = pool.empty_index(
                         model_type, signature, info.get("base_commitment"))
@@ -2780,7 +2780,7 @@ class EntryApp:
                         base_commitment=index.get("base_commitment")))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
-                    # Base-commitment requirement 4: the contributors' own measured diameters go in
+                    # The contributors' own measured diameters go in
                     # the manifest. The runtime is given weights PATHS and never learns a
                     # contribution id, so the mapping is made here, where s_paths and
                     # s_ids are the parallel lists the gate built. An unmapped key RAISES

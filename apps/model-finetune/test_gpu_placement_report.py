@@ -41,7 +41,7 @@ def _with_cluster_gpus(monkeypatch, total, free=_SAME):
     The two views are SEPARATE arguments on purpose: ``cluster_resources()`` is the
     total and ``available_resources()`` is what is free, and the report keys its
     verdict to the first while reporting the second. A harness that set only a total
-    could not express the shape the row was filed about — deNBI, 4 GPUs, 0 free —
+    could not express the shape this check is about — deNBI, 4 GPUs, 0 free —
     which is the gap the re-review found. ``free`` defaults to ``total``,
     i.e. an idle cluster, so a case that is not about the distinction stays short.
 
@@ -97,7 +97,7 @@ def _ray_unimportable(monkeypatch):
 
 
 def test_each_enabled_gpu_backend_costs_one_whole_gpu(monkeypatch) -> None:
-    """The arithmetic the whole row is about: N backends on → N whole GPUs needed."""
+    """The arithmetic this file is about: N backends on → N whole GPUs needed."""
     _with_cluster_gpus(monkeypatch, 8.0)
     assert entry._gpu_placement_report({"microsam", "cellpose"})["gpus_required"] == 2
     assert entry._gpu_placement_report({"cellpose"})["gpus_required"] == 1
@@ -312,7 +312,7 @@ def test_the_placement_log_is_actually_called_at_startup() -> None:
     the method with ``__get__(inst)`` and so exercises the helper, never the wiring.
     A grep for the call site existed, but outside the repo, where CI never runs it — and
     a report nothing calls is indistinguishable from no report at all, which is this
-    row's whole subject.
+    the whole subject here.
 
     Asserted against the startup coroutine specifically, not the file: the call
     surviving somewhere else in ``entry.py`` is not the thing that makes it run.
@@ -424,7 +424,7 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     it into ``deployments.<entry>.logs``, which ``get_app_status`` returns throughout
     ``DEPLOYING``.
 
-    ``min_replicas`` must stay 0: the scale-to-zero requirement's brief is that an idle entry holds nothing on
+    ``min_replicas`` must stay 0: the scale-to-zero requirement is that an idle entry holds nothing on
     an HPC login node. Both halves are asserted, because satisfying one by breaking the
     other is the easy mistake.
     """
@@ -465,7 +465,7 @@ def test_the_declaration_this_row_is_about_is_unchanged() -> None:
     """The recorded decision, pinned. Changing either runtime to a positive
     ``gpu_memory_mb`` opts it into VRAM packing (builder.py:518-536) with a figure
     fixed at author time while the real need is per-model and per-caller — so it
-    must be re-argued on the row, not slipped in.
+    must be re-argued explicitly, not slipped in.
 
     Read off disk rather than by importing, so this holds in an environment where
     neither ML stack is installed (which is every environment this suite runs in).

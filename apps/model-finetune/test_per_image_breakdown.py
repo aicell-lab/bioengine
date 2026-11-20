@@ -75,7 +75,7 @@ def test_the_scalar_is_exactly_the_mean_of_the_published_vector():
 
 
 def test_the_vector_discriminates_splits_the_scalar_cannot():
-    """Why the row exists, as a measurement rather than an argument: two splits with
+    """Why this check exists, as a measurement rather than an argument: two splits with
     the SAME mean, one uniform and one carrying a collapse. Without this the whole
     change could be satisfied by publishing a constant vector of the right length."""
     uniform = pool.per_image_instance_f1([SWAPPED3, SWAPPED3], [GT3, GT3])
