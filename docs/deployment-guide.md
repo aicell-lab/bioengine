@@ -67,8 +67,15 @@ The worker image sets no `USER`, so a plain `docker run` is root and `0400` work
 > than falling back, and **no new `runtime_env` venv can be built at all**:
 > `RuntimeError: could not determine the home directory for '~/.config'`. Already-cached
 > venvs keep working, so this surfaces only on a first-time deploy of an app with a new
-> `pip` spec. `requirements-worker.txt` pins `platformdirs<4.12` to keep the fallback;
-> if you lift that pin, either give the uid a passwd entry or set an absolute `HOME`.
+> `pip` spec. `requirements-worker.txt` pins `platformdirs<4.12` to keep the fallback.
+>
+> **Setting `HOME` does NOT help**, and neither does an absolute `XDG_*`. Ray hands
+> `virtualenv` an *empty* environment, so whatever you export is discarded before
+> `platformdirs` ever looks — measured on an unpinned image with
+> `docker run -e HOME=/tmp --user 61234:61234`, which fails with the identical
+> `RuntimeError`. The error message suggests setting `HOME` too, and it is wrong for the
+> same reason. If you lift the pin, the workaround that does work is to give the uid a
+> **passwd entry**, for example by bind-mounting an `/etc/passwd` that contains it.
 
 Substitute your own secret name and key. `items` maps a key in the Secret to a filename in the mount, so a Secret holding the token under `HYPHA_TOKEN` needs `- key: HYPHA_TOKEN`. Get it wrong and kubelet refuses to set the volume up at all (`FailedMount`, `references non-existent secret key`) and the container never starts; mark the volume `optional: true` and the file is simply absent, at which point the worker exits at startup with `Could not read --token-file`.
 
