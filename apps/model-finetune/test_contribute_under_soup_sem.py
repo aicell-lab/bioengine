@@ -79,7 +79,7 @@ def _install_stubs(monkeypatch, ckpt: Path, sdir: Path):
     fake_be.async_init = lambda f: f
     fake_be.smoke_test = lambda f: f
     fake_be.health_check = lambda f: f
-    fake_be.logger = logging.getLogger("test-0087")
+    fake_be.logger = logging.getLogger("model-finetune-test")
     monkeypatch.setitem(sys.modules, "bioengine", fake_be)
 
     fake_np = types.ModuleType("numpy")
@@ -120,9 +120,9 @@ def _load_runtime_module():
     `sys.modules` for every other test file in this pytest process.
     """
     path = Path(__file__).with_name("runtime_cellpose.py")
-    spec = importlib.util.spec_from_file_location("_rtc_0087", path)
+    spec = importlib.util.spec_from_file_location("_rtc_isolated", path)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["_rtc_0087"] = mod
+    sys.modules["_rtc_isolated"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -143,7 +143,7 @@ def runtime(tmp_path, monkeypatch):
 
     _install_stubs(monkeypatch, ckpt, sdir)
     mod = _load_runtime_module()
-    monkeypatch.delitem(sys.modules, "_rtc_0087", raising=False)
+    monkeypatch.delitem(sys.modules, "_rtc_isolated", raising=False)
 
     cls = getattr(mod.CellposeRuntime, "func_or_class", mod.CellposeRuntime)
     rt = object.__new__(cls)

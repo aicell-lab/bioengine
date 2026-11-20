@@ -196,7 +196,7 @@ def test_a_contribution_is_not_published_as_reproducible_by_re_merge() -> None:
 # A value no code path in this repo produces. Not a basis constant, not a digest, and
 # not a timestamp — so an assertion that the stored record does NOT carry it cannot be
 # satisfied by some other mechanism happening to write the right answer.
-_FORGED_BASIS = "caller_supplied_basis_0524_no_code_path_produces_this"
+_FORGED_BASIS = "caller_supplied_basis_no_code_path_produces_this"
 
 
 def test_the_forged_basis_is_not_a_real_one() -> None:
