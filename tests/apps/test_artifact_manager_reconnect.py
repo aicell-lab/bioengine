@@ -171,7 +171,7 @@ def test_a_remote_failure_is_never_treated_as_unsent():
 
 
 def test_the_servers_own_routing_refusal_is_classified():
-    """Measured against a live server (#0407): the shape this module exists for.
+    """Measured against a live server: the shape this module exists for.
 
     A handle resolved by name whose target client has gone fails neither
     send-side nor by timeout — the server answers with an error envelope, so it
@@ -256,7 +256,7 @@ async def test_a_send_side_failure_re_resolves_and_retries():
 async def test_the_servers_routing_refusal_re_resolves_and_retries():
     """On ``origin/main`` this raised instead, and nothing was re-resolved.
 
-    The live counterpart was run against ``https://hypha.aicell.io`` for #0407:
+    The live counterpart was run against ``https://hypha.aicell.io``:
     the same refusal, the real ``public/artifact-manager`` re-resolved, and the
     retry returned the artifact. This pins it without a server.
     """
@@ -282,7 +282,7 @@ async def test_a_routing_refusal_on_a_write_is_retried_because_nothing_ran():
     """The counterpart to the timed-out-write guard below.
 
     A refusal is ``never_sent``, so unlike a timeout it carries no risk of
-    double-execution — measured for #0407 from an invocation log that did not
+    double-execution — measured from an invocation log that did not
     move. Refusing to retry here would leave a write failing for a handle the
     wrapper had already replaced.
     """

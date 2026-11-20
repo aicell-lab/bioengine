@@ -1,4 +1,4 @@
-"""Single-flight gate for the soup merge — re-runnable evidence for #0083.
+"""Single-flight gate for the soup merge — re-runnable evidence for the single-flight change.
 
 ``aggregate()``'s admission check models ONE resident merge (``soup_admission``
 predicts ``base + 3x`` the largest member), but ``CellposeRuntime`` sets

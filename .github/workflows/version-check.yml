@@ -9,7 +9,10 @@ on:
   pull_request:
     branches:
       - main
-    types: [opened, synchronize, reopened, ready_for_review]
+    # converted_to_draft is here for the draft-bump job below: a PR taken BACK
+    # to draft while carrying a bump is the rung-hoarding case this row is about,
+    # and without this event nothing re-evaluates it.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 jobs:
   check-version:
@@ -19,13 +22,13 @@ jobs:
     steps:
     - name: Checkout code (pull_request)
       if: github.event_name == 'pull_request'
-      uses: actions/checkout@v3
+      uses: actions/checkout@v5
       with:
         fetch-depth: 0  # Fetch full history for accurate origin/main reference
 
     - name: Checkout code (workflow_dispatch)
       if: github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v3
+      uses: actions/checkout@v5
       with:
         ref: ${{ inputs.pr_branch }}
         fetch-depth: 0  # Fetch full history for accurate origin/main reference
@@ -179,4 +182,71 @@ jobs:
       if: env.RELEVANT_CHANGE == 'false'
       run: echo "✅ No relevant files changed. Skipping version check."
 
+  # ---------------------------------------------------------------------------
+  # ADVISORY, and deliberately NOT a required check.
+  #
+  # The rule is bump LAST: a draft that already carries a version bump has
+  # reserved a rung nobody else can use, so every other open PR conflicts the
+  # moment one of them merges. check-version above cannot see this at all --
+  # it skips drafts by design, which is why the reservation was invisible.
+  #
+  # Why advisory rather than required, which is a real trade-off and not
+  # timidity: bump-last means the bump commit IS the commit that gets readied
+  # and merged. A required job failing on that commit while it was still a
+  # draft would leave a red run on the merge head and block the very sequence
+  # the rule prescribes. Making this required would need a settings change as
+  # well, which the decision on this row explicitly excludes.
+  #
+  # So this exists to make a reserved rung LOUD while the PR is still a draft,
+  # at the one moment when moving it is free.
+  # ---------------------------------------------------------------------------
+  draft-bump-check:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
 
+    - name: Refuse a version bump on a draft
+      run: |
+        set -uo pipefail
+        BASE_SHA="${{ github.event.pull_request.base.sha }}"
+        HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+        read_version() {
+          # $1 = a git ref. Prints nothing and returns 1 if it cannot be read,
+          # so an unreadable side is never mistaken for "no bump".
+          git show "$1:pyproject.toml" 2>/dev/null \
+            | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/'
+        }
+
+        BASE_V=$(read_version "$BASE_SHA")
+        HEAD_V=$(read_version "$HEAD_SHA")
+
+        if [ -z "$BASE_V" ] || [ -z "$HEAD_V" ]; then
+          echo "::error::Could not read pyproject.toml version on one side"
+          echo "  base $BASE_SHA -> '${BASE_V:-<unreadable>}'"
+          echo "  head $HEAD_SHA -> '${HEAD_V:-<unreadable>}'"
+          echo "This check FAILS CLOSED: an unreadable version is not evidence of no bump."
+          exit 1
+        fi
+
+        echo "base version: $BASE_V"
+        echo "head version: $HEAD_V"
+
+        if [ "$BASE_V" = "$HEAD_V" ]; then
+          echo "No bump on this draft. A draft that merged main in will match the"
+          echo "base version, which is correct and is not a reservation."
+          exit 0
+        fi
+
+        echo "::error::This draft already bumps the worker version ($BASE_V -> $HEAD_V)."
+        echo ""
+        echo "The rule is bump LAST. While this draft holds $HEAD_V, no other PR can"
+        echo "use that rung, so each of them has to re-bump the moment one merges."
+        echo "Drop the bump, keep iterating, and add it back in the same sitting as"
+        echo "'gh pr ready'."
+        echo ""
+        echo "This job is advisory and does not block a merge."
+        exit 1

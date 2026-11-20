@@ -5,7 +5,16 @@ on:
     branches:
       - main
     paths:
-      - 'bioengine/datasets/**'
+      # datasets.Dockerfile COPYs all of bioengine/ plus pyproject.toml, so the
+      # published image embeds the whole core and not just bioengine/datasets/.
+      # Triggering only on bioengine/datasets/** froze that embedded core at
+      # whatever it was when this subtree last changed: the newest datasets tag
+      # was 0.16.48 while the worker had reached 0.16.116. docker-compose pins
+      # bioengine-datasets:${BIOENGINE_VERSION:-latest}, so anyone setting
+      # BIOENGINE_VERSION to their worker's version asked for a tag that did
+      # not exist.
+      - 'bioengine/**'
+      - 'pyproject.toml'
       - 'requirements-datasets.txt'
       - 'docker/datasets.Dockerfile'
       - '.dockerignore'
@@ -21,7 +30,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         fetch-depth: 2
 
@@ -36,7 +45,7 @@ jobs:
         echo "VERSION=$VERSION" >> $GITHUB_ENV
 
     - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v2
+      uses: docker/login-action@v4
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -87,10 +96,10 @@ jobs:
         echo "✅ Version updated correctly."
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     - name: Build and push datasets image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v7
       with:
         context: .
         file: docker/datasets.Dockerfile

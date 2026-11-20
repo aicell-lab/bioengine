@@ -1,4 +1,4 @@
-"""The destructor must not print a second traceback after a failed startup (#0584).
+"""The destructor must not print a second traceback after a failed startup.
 
 The defect: __init__ raises before `self.start_time` is assigned, CPython still calls __del__ on
 the half-constructed object, and the bare `self.start_time` raises AttributeError. Python prints

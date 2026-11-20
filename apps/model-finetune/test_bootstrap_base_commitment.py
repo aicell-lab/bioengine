@@ -1,4 +1,4 @@
-"""#0070: a bootstrapped pool must record a base commitment, or it can never merge.
+"""a bootstrapped pool must record a base commitment, or it can never merge.
 
 `d0679f8f` added `pool.base_commitment()` / `assert_base_commitment()` and wired the READ
 path, but no production code ever CALLED the builder: the only pool-bootstrap site,
@@ -105,7 +105,7 @@ def test_every_production_empty_index_call_passes_a_base_commitment():
         n = len(call.args) + len(call.keywords)
         assert n >= 3, (
             "entry.py line %d calls empty_index with %d argument(s): a pool bootstrapped "
-            "without a base commitment can never merge (#0070)" % (call.lineno, n)
+            "without a base commitment can never merge" % (call.lineno, n)
         )
 
 
@@ -119,7 +119,7 @@ def test_the_runtime_builds_a_base_commitment():
     calls = _calls_to(tree, "base_commitment")
     assert calls, (
         "runtime_cellpose.py never calls pool.base_commitment, so nothing in production "
-        "produces a commitment for the entry to write (#0070)"
+        "produces a commitment for the entry to write"
     )
     # CONTROL: the same finder must report nothing for a name that cannot be there, so a
     # bug that made it match everything would be visible.
@@ -169,7 +169,7 @@ def test_prepare_contribution_advertises_the_commitment_and_the_model_type():
     arg_names = [a.arg for a in fn.args.args]
     assert "model_type" in arg_names, (
         "prepare_contribution takes no model_type, so the entry cannot say which stock "
-        "base to commit to for a stock-initialised session (#0070)"
+        "base to commit to for a stock-initialised session"
     )
     # The returned dict must mention the key the entry reads. A string search over the
     # function's own source only, so an unrelated mention elsewhere in the file cannot
@@ -177,5 +177,5 @@ def test_prepare_contribution_advertises_the_commitment_and_the_model_type():
     src = ast.get_source_segment((HERE / "runtime_cellpose.py").read_text(), fn) or ""
     assert "base_commitment" in src, (
         "prepare_contribution does not mention base_commitment, so the entry's "
-        "info.get('base_commitment') would always be None (#0070)"
+        "info.get('base_commitment') would always be None"
     )

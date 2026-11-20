@@ -1,4 +1,4 @@
-"""#0534: the one line that keeps secrets out of the per-replica runtime_env is guarded here.
+"""The one line that keeps secrets out of the per-replica runtime_env is guarded here.
 
 Reverting `builder.py`'s ``split_secret_env_vars`` call left the whole suite green, so the invariant
 this PR exists for was protected by nothing. The existing tests
@@ -11,20 +11,20 @@ WHAT THIS GUARDS, and it is the bind-time surface specifically: ``build()`` must
 ``replica_env_vars`` from ``split_secret_env_vars(env_vars)`` and hand *that* to ``BuiltApp``.
 ``BuiltApp.replica_env_vars`` is what bootstrap merges into every deployment's ``runtime_env`` at
 bind time, so if it is the unsplit ``env_vars`` then every ``_BIOENGINE_SECRET_*`` value is written
-into Ray's ``runtime_env_agent.log`` on every node — which is #0517.
+into Ray's ``runtime_env_agent.log`` on every node.
 
 WHY THIS IS STRUCTURAL AND NOT BEHAVIOURAL, stated so nobody mistakes its reach: ``build()`` is a
 291-line async method taking 12 arguments, and **no test in this suite drives it** — doing so needs
 the introspect Ray task, Hypha artifact access and a Serve binding stubbed. A harness that large is
 itself a place for a vacuous pass to hide. These assertions read the wiring out of the AST instead,
-which is enough to fail on the revert that prompted the row and is the same approach #0321's stored
+which is enough to fail on the revert that prompted the row and is the same approach the stored
 verify takes.
 
 WHAT IT DOES NOT CATCH, and this is the honest boundary:
   * ``split_secret_env_vars`` being changed to split nothing. That function has its own direct tests
     and they would go red.
   * a secret arriving under a name the prefix does not match. ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN``
-    is exactly that case and is tracked on #0522, not here.
+    is exactly that case and is tracked separately, not here.
   * anything about the proxy-actor delivery path, which has its own tests.
 """
 
@@ -85,7 +85,7 @@ def test_build_derives_replica_env_vars_from_the_split() -> None:
     """The bind-time env_vars must come OUT of split_secret_env_vars, not straight from env_vars."""
     fn = _build_fn()
     assert _assigns_from_split(fn), (
-        f"`{TARGET}` in builder.build() is not assigned from `{SPLIT}(...)`. That is #0517: "
+        f"`{TARGET}` in builder.build() is not assigned from `{SPLIT}(...)`. That is the defect this file guards: "
         f"BuiltApp.{TARGET} is merged into every replica's runtime_env at bind time, so unsplit "
         "env_vars put every _BIOENGINE_SECRET_* value into Ray's runtime_env_agent.log on every node."
     )
@@ -104,7 +104,7 @@ def test_builtapp_receives_the_split_result_and_not_raw_env_vars() -> None:
         f"`{TARGET}`; anything else risks handing the unsplit env_vars to the replica runtime_env."
     )
     assert passed != "env_vars", (
-        "BuiltApp receives the raw `env_vars` as the bind-time replica env — this is #0517 exactly."
+        "BuiltApp receives the raw `env_vars` as the bind-time replica env — this is that defect exactly."
     )
 
 

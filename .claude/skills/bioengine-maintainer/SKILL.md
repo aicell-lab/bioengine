@@ -210,7 +210,7 @@ assert status["test_reports_writable"], (
 
 Beyond the production external-cluster deployments, the other two supported modes each have their own workflow. Concrete targets vary per maintainer — the examples below happen to be the current maintainer's setup.
 
-- **`single-machine` mode** — local Ray cluster on a workstation. Used for dev validation of the `ray.init(...)` path (different code path from KubeRay-mode; regressions in one won't necessarily show in the other). Launch with `python -m bioengine.worker --mode single-machine` or via docker-compose. Example: the current maintainer runs this on a machine called Europa; other maintainers will have their own dev box.
+- **`single-machine` mode** — local Ray cluster on a workstation. Used for dev validation of the `ray.init(...)` path (different code path from KubeRay-mode; regressions in one won't necessarily show in the other). Launch with `python -m bioengine.worker --mode single-machine` or via docker-compose. Typically this is a maintainer's own workstation.
 - **`slurm` mode** — on-demand worker per SLURM job on an HPC cluster, launched via apptainer. The bioengine version is picked up from `bioengine[worker]==<version>` in the job's env at submission time — no persistent helm, no active push required for framework bumps. Watch out for cluster-specific apptainer gotchas: e.g. `apptainer build sif` may fail on newer apptainer versions with `yama.ptrace_scope=2` — `apptainer build --sandbox` is the workaround (and the `start_hpc_worker.sh` script accepts sandbox dirs from 0.9.8+). Example: the current maintainer runs this on NSC's Berzelius (A100-SXM4-80GB); other maintainers will have their own HPC.
 
 ## No framework GPU model cache (removed in 0.11.24)
@@ -254,7 +254,7 @@ For deployment-side PRs (changes under `bioengine/**`, `bioengine/cluster/**`, `
 **Never validate on the production worker.** Both modes run against the dedicated `bioengine-devtest` Hypha workspace, never `bioimage-io`. Changing a production worker — `bioengine-worker-kth` in namespace `hypha`, or the deNBI equivalent — needs explicit permission from the maintainer each time, even when this workflow would otherwise call for it. A dev image on the production worker exposes every real consumer to unmerged code, and it stays exposed until someone remembers to roll it back.
 
 1. Pick the next bioengine version (one above current `pyproject.toml` on `main` AND the latest published GHCR tag — bump from the higher) and append `-devN`. Example: next release `0.11.5` → `ghcr.io/aicell-lab/bioengine-worker:0.11.5-dev1`. Bump the suffix (`-dev2`, …) for each follow-up fix in the PR cycle.
-2. Build + push directly with `docker buildx build --builder multiarch-builder --platform linux/amd64 -f docker/worker.Dockerfile -t ghcr.io/aicell-lab/bioengine-worker:<version>-devN --push .` using `GITHUB_PAT`. Bypasses `docker-publish-worker.yml` (which enforces strictly-increasing canonical tags). **Build single-arch only** (`--platform linux/amd64`) — both KTH and the single-machine test on europa are amd64. Multi-arch (`linux/amd64,linux/arm64`) adds ~25 min of QEMU cross-compile to the dev cycle for zero validation value; the canonical CI build covers arm64 once the PR is merged.
+2. Build + push directly with `docker buildx build --builder multiarch-builder --platform linux/amd64 -f docker/worker.Dockerfile -t ghcr.io/aicell-lab/bioengine-worker:<version>-devN --push .` using `GITHUB_PAT`. Bypasses `docker-publish-worker.yml` (which enforces strictly-increasing canonical tags). **Build single-arch only** (`--platform linux/amd64`) — both KTH and the single-machine test host are amd64. Multi-arch (`linux/amd64,linux/arm64`) adds ~25 min of QEMU cross-compile to the dev cycle for zero validation value; the canonical CI build covers arm64 once the PR is merged.
 3. **External-cluster validation** (KTH): deploy a *second* worker side-by-side with production — a separate helm release (`bioengine-worker-devtest`) in namespace `hypha` running the dev tag, with `--workspace=bioengine-devtest`, that workspace's admin token, its own `--client-id`, and its own `--workspace-dir`. Point it at the **same** Ray head (`ray://raycluster-kuberay-head-svc.ray-cluster.svc.cluster.local:10001`) so it exercises the real cluster topology. Leave the production release alone. The dev tag lives **only** in the devtest release's values — never in the production `values.yaml` on `kth-k8s` main.
 
    Two constraints the shared Ray cluster imposes:
@@ -294,12 +294,12 @@ For app-side changes (anything under `apps/<name>/**` that changes the deploymen
 ### Running `scripts/upload_app.py` — the two things that are not in `--help`
 
 ```sh
-set -a; . /data/nmechtel/bioengine/.env; set +a
+set -a; . ./.env; set +a    # from the repo root
 python3 scripts/upload_app.py \
   -d apps/<name> --workspace bioimage-io --token "$BIOIMAGE_IO_TOKEN"
 ```
 
-**`PYTHONPATH` is no longer needed since PR #341** (myco `#0559`) — the script appends the repo root to `sys.path` itself, and runs from any cwd. Before that it died with `ModuleNotFoundError: No module named 'bioengine'` even in a good checkout, because running a script puts the *script's* directory on `sys.path` and not the cwd. If you meet that error, you are on an older checkout; the workaround was `PYTHONPATH="$(pwd -P)"`.
+**`PYTHONPATH` is no longer needed since PR #341** — the script appends the repo root to `sys.path` itself, and runs from any cwd. Before that it died with `ModuleNotFoundError: No module named 'bioengine'` even in a good checkout, because running a script puts the *script's* directory on `sys.path` and not the cwd. If you meet that error, you are on an older checkout; the workaround was `PYTHONPATH="$(pwd -P)"`.
 
 1. **`--workspace bioimage-io` is required.** The flag is passed to `connect_to_server`, and the script then rebinds `workspace = server.config.workspace` from the live connection and publishes *there*. The workspace is **encoded in the token**, so the flag does not select a destination — it **asserts** one, and a mismatch is refused before anything is written: `Current workspace encoded in the token (ws-user-…) does not match the specified workspace (bioimage-io)`. Omit it and you silently publish into whatever workspace the token carries, **while reporting success**. With `$BIOIMAGE_IO_TOKEN` that happens to be `bioimage-io` and no harm is done; with `$HYPHA_TOKEN` it is your personal workspace. An artifact version is immutable, so a rung burned that way is unrecoverable — which is why you pass the flag every time rather than reasoning about which token you have.
 2. **Use `--token "$BIOIMAGE_IO_TOKEN"`,** not `HYPHA_TOKEN`. The script falls back to `os.environ["HYPHA_TOKEN"]` and then to an interactive `login()`, neither of which is what you want in a worktree. Together with (1) this is belt and braces: the wrong token alone fails loudly, and the missing flag alone is harmless with the right token — it takes *both* mistakes to publish to the wrong place quietly.
@@ -312,7 +312,7 @@ python3 scripts/upload_app.py \
 curl -sL "https://hypha.aicell.io/bioimage-io/artifacts/<name>/files/<file>?version=<v>"
 ```
 
-`upload_app.py` has **no `--version` flag** — the version comes from the manifest, so edit `apps/<name>/manifest.yaml` FIRST and upload second. (myco #0557)
+`upload_app.py` has **no `--version` flag** — the version comes from the manifest, so edit `apps/<name>/manifest.yaml` FIRST and upload second.
 
 **Always build the `files` list by directory glob, never by hand.** The canonical `scripts/upload_app.py` calls `create_file_list_from_directory(apps/<name>)` (then strips `__pycache__`), so it picks up every file — including nested subpackages like `model_cache/`. A hand-curated `files=[...]` list passed straight to `worker.upload_app` silently omits whatever you forget, and this bites hard because **`upload_app` commits the version without importing it** — the import/introspection check only runs later at `deploy_app`. So a partial upload lands as a real, permanent artifact version and the failure surfaces one step too late (this is how a broken `model-runner` 1.15.6 missing `model_cache/` got committed, forcing a skip to 1.15.7). Use `scripts/upload_app.py`, or replicate its `create_file_list_from_directory` glob in an ad-hoc script — don't enumerate files manually.
 
@@ -412,23 +412,6 @@ Everything after the lede is for the reader who has already decided to act. Dens
 
 After the lede: how it was observed or reproduced, the evidence that localises it, and any candidate fix with its caveats. Attributing a finding to whoever made it is useful here.
 
-### In a backlog row, never write "blocked by #NNNN" — or quote the annotation — about a row that isn't this one
-
-`myco issue list` and `issue pending` derive a row's `BLOCKED on #NNNN — not startable, NOT counted` annotation by scanning the row's own text and attributing any match to the row **containing** the sentence rather than to the row it names. There is no stored edge to correct afterwards: the issue schema has no `blockedBy` key, and `blocked` is a free-text string.
-
-**Two spellings are confirmed to trigger it, and removing only the first does not clear the annotation:**
-
-- `blocked by #NNNN`
-- `BLOCKED on #NNNN` — the annotation's own text, which means **quoting the rendered output while reporting this defect creates another instance of it**
-
-Measured 2026-11-13 on two rows that were being excluded from the startable count, each carrying both spellings. Single-variable edits with the other row held as a negative control: neutralising only `BLOCKED on #NNNN` cleared one row; restoring `blocked by #NNNN` alone brought both back; removing both cleared both. An arm/disarm pass on one row confirmed the instrument still fires, which the final all-clear snapshot cannot show on its own. The spelling set is a **floor, not a complete grammar** — case variants and other wordings were not tested.
-
-Only the description and comments are scanned; frontmatter is not, so the `original:` archive of a reworded body is harmless.
-
-A parenthetical in a related-rows list is the usual way in — "`#0322` (blocked by #0298)" — and the failure is silent: the row leaves the startable set with nothing recording that it was excluded. Write **"is held behind #NNNN"**, **"#NNNN is its blocker"**, or **"waits on #NNNN"** instead, and when quoting the renderer's output replace the id with "that row"; all of these read the same to a human and none is parsed. The genuine blocker of the row you are writing goes in its `blocked` field via `myco issue pause`, never in prose.
-
-**Get it right the first time**: the offending text is usually in a *comment*, and no `myco issue` verb can edit or delete a comment — `comment` only appends, `edit --body-file` replaces the description only. The sole remedy is a direct write to `.mycolab/issues/<id>.md`, which is an untracked store with no version-control safety net. Back the file up first.
-
 ### PR descriptions
 
 **Include, after the lede:**
@@ -449,9 +432,9 @@ A parenthetical in a related-rows list is the usual way in — "`#0322` (blocked
 
 ### Every identifier must resolve for the reader
 
-`#N` means a GitHub issue or PR **in this repo** and nothing else. Never write a svamp backlog id into a body — not bare, not zero-padded as `#0026`, not annotated "(internal issue tracker)". The annotation is the tell: if you have to explain that the reader can't follow a reference, the reference doesn't belong there. The same goes for any link only you can open.
+`#N` means a GitHub issue or PR **in this repo** and nothing else. Never write an identifier from a private tracker into a body — not bare, not zero-padded as `#026`, not annotated "(internal issue tracker)". The annotation is the tell: if you have to explain that the reader can't follow a reference, the reference doesn't belong there. The same goes for any link only you can open.
 
-`Closes` / `Fixes` / `Resolves` is reserved for a GitHub issue in this repo that this PR really closes, written unpadded. Zero-padding silently disarms it, so it is not a safe way to write a reference you don't mean: `Closes #0026` arms nothing, `Closes #26` closes whatever #26 turns out to be.
+`Closes` / `Fixes` / `Resolves` is reserved for a GitHub issue in this repo that this PR really closes, written unpadded. Zero-padding silently disarms it, so it is not a safe way to write a reference you don't mean: `Closes #026` arms nothing, `Closes #26` closes whatever #26 turns out to be.
 
 ### Don't quote or attribute people
 
@@ -468,7 +451,7 @@ An evidence item is re-run by whoever audits the close later, so it has to still
 | a line being present — `export FOO` is in the script | absence-or-replacement — `export FOO` is gone **or** the replacement is wired |
 | a branch ref — `git show origin/fix/my-branch:file` | the landed state — `origin/main` contains the merge commit, and the twins agree on `main` |
 
-**The branch-ref row is the one that catches people, because the repo deletes the branch for you.** `delete_branch_on_merge: true` means every item naming a ref other than `origin/main` expires within hours of the merge — and a re-run then exits 128, which reads as a close that was false rather than as a ref that is gone. PR-readiness rows are where this bites hardest: the deliverable only ever lived on a branch, so naming the branch is the natural thing to write. So an item naming any ref other than `origin/main` must either be restated against `origin/main` once the merge lands, or carry a decay note saying the ref will be deleted. Measured 2026-11-05 across the 36 issues closed since this convention landed: 33 clean, two (#0216, #0217) naming a deleted branch and exiting 128 on all six items between them — and the convention's text above had not mentioned refs at all, so the gap was in what it said rather than in anyone's discipline.
+**The branch-ref row is the one that catches people, because the repo deletes the branch for you.** `delete_branch_on_merge: true` means every item naming a ref other than `origin/main` expires within hours of the merge — and a re-run then exits 128, which reads as a close that was false rather than as a ref that is gone. PR-readiness rows are where this bites hardest: the deliverable only ever lived on a branch, so naming the branch is the natural thing to write. So an item naming any ref other than `origin/main` must either be restated against `origin/main` once the merge lands, or carry a decay note saying the ref will be deleted. Measured 2026-11-05 across the 36 issues closed since this convention landed: 33 clean, two naming a deleted branch and exiting 128 on all six items between them — and the convention's text above had not mentioned refs at all, so the gap was in what it said rather than in anyone's discipline.
 
 A snapshot assertion fails the moment later legitimate work moves past it, and a reviewer re-running it reads that failure as a close that was false. Four such items were measured on 2026-11-02: a version bumped ten times since, a config pin a later fix deliberately removed, a flag that got renamed, and a discrimination control that stopped discriminating because the cluster changed. None of the four closes was wrong; all four now exit non-zero.
 
@@ -486,7 +469,7 @@ A test that re-implements a production predicate inside its own assertion is tru
 
 **What does find it: a comprehension carrying an `if` filter inside an `assert`** — that is where a re-implemented predicate hides. On the pre-fix file that arm flags **1 of 11**, the right one.
 
-**It is a candidate generator, not a verdict, and the false-positive rate is real.** The same arm flags the *fixed* version of that same test, which is legitimate because the thing it filters is what `get_export_status` returned. Across the #0233 sweep it produced **46 flags over 407 test functions**, every one of which had to be read. Budget the reading; do not expect an automated answer.
+**It is a candidate generator, not a verdict, and the false-positive rate is real.** The same arm flags the *fixed* version of that same test, which is legitimate because the thing it filters is what `get_export_status` returned. Across one full sweep it produced **46 flags over 407 test functions**, every one of which had to be read. Budget the reading; do not expect an automated answer.
 
 **The decisive check is a mutation, not a static rule.** Delete or weaken the production guard and see whether any test reddens — a surviving mutant with an apparently-covering test is the signal, and the static arms only narrow where to look. See *Close evidence must assert an invariant* above for the same principle applied to evidence: name the mutation that must redden a test.
 

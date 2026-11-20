@@ -59,7 +59,7 @@ def test_fixed_count_clears_the_decorators_autoscaling_config() -> None:
 
 def test_autoscaling_config_entry_is_passed_through_alone() -> None:
     """The sibling branch must not grow a ``num_replicas`` kwarg: Ray rejects
-    the two together, and this branch is how #0088 expresses a pin today."""
+    the two together, and this branch is how a pin is expressed today."""
     cls = _FakeDeployment()
     config = {"min_replicas": 1, "max_replicas": 1}
     _apply_scaling(cls, {"autoscaling_config": config})

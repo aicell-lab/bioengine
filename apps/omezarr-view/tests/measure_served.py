@@ -8,6 +8,7 @@ rather than assumed from ordering.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import json
 import platform
 import statistics
@@ -36,7 +37,7 @@ def _stats(values: List[float]) -> Dict[str, Any]:
 def _provenance(base: str) -> Dict[str, Any]:
     try:
         commit = subprocess.run(
-            ["git", "-C", "/data/nmechtel/bioengine", "rev-parse", "--short", "HEAD"],
+            ["git", "-C", str(Path(__file__).resolve().parents[3]), "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception:
         commit = "unknown"
@@ -45,7 +46,7 @@ def _provenance(base: str) -> Dict[str, Any]:
         "client_host": platform.node(),
         "bioengine_commit": commit,
         "measured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "note": "client and server are the same host (europa); the endpoint is "
+        "note": "client and server are the same host; the endpoint is "
                 "reached through its public tunnel, so each request pays a "
                 "tunnel round trip that a co-located client would not.",
     }

@@ -37,7 +37,7 @@ import numpy as np
 def provenance(base: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     def _git(*a: str) -> str:
         try:
-            return subprocess.run(["git", "-C", "/data/nmechtel/bioengine", *a],
+            return subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[3]), *a],
                                   capture_output=True, text=True,
                                   timeout=10).stdout.strip()
         except Exception:
@@ -257,7 +257,7 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--seed", type=int, default=17)
     ap.add_argument("--scratch", default=".training_demo")
-    ap.add_argument("--out", default="/data/nmechtel/bioengine-paper/analysis/"
+    ap.add_argument("--out", default="analysis/"
                                      "results/omezarr_view/figure_assets/"
                                      "training_demo.json")
     args = ap.parse_args()
@@ -356,9 +356,10 @@ def main() -> int:
             "are reported beside it and must be quoted with it.",
             "CPU only. No GPU was used.",
             "No training-quality claim follows from this run.",
-            "Throughput is site-specific: europa to Google Cloud Storage.",
+            "Throughput is site-specific: measured from one host to Google Cloud Storage.",
         ],
     }
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(payload, indent=1) + "\n")
     print(json.dumps({k: v for k, v in results.items() if k != "training"}, indent=1))
     print("training:", {k: v for k, v in results["training"].items()
