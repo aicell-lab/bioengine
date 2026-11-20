@@ -560,10 +560,11 @@ def logs(app_id, tail, as_json, worker_service_id, token, server_url):
             result = await worker.get_app_status(
                 application_ids=[app_id],
                 logs_tail=tail,
-                # Defaults to 0, which returns live replicas only — and a dead
-                # replica's logs and its death_cause are both attached past
-                # that early return. Without this the crashed replica is
-                # invisible to the one command run after a crash.
+                # Defaults to 0, which omits replica LOGS but still reports
+                # every abnormal death_cause. Asking for 1 is what adds the
+                # dead replica's stdout/stderr, which is where a Python
+                # traceback lives — the cause alone names Ray's exit reason
+                # (SYSTEM_ERROR), not the exception the replica raised.
                 n_previous_replica=1,
             )
         except Exception as exc:
@@ -603,10 +604,16 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
     already tailed to the requested number by the worker — so everything fetched
     is printed, and the caller's line count means what it says. Iterating it
     rather than the deployment's ``replicas`` is deliberate: the map keys
-    recently dead replicas too, which the live replica list does not contain —
-    but only for a caller that passed ``n_previous_replica > 0``. ``apps logs``
-    does; ``apps status`` does not, because it fetches logs on every invocation
-    and each dead replica adds a GCS lookup to every poll.
+    recently dead replicas too, which the live replica list does not contain.
+    ``apps logs`` passes ``n_previous_replica > 0`` and so gets their LOGS;
+    ``apps status`` does not, because it fetches on every invocation and the logs
+    are the expensive half. The death CAUSE is not: every dead actor is fetched
+    in one state-API query regardless of how many there are, so ``apps status``
+    reports an abnormal death — for every such replica — without its logs.
+
+    Replicas stopped deliberately are not listed here at all. They arrive as a
+    count in the deployment's ``deliberately_stopped_replicas`` field, printed
+    above the per-replica lines.
 
     The field is *absent* rather than empty when the caller may not read it, so
     the withheld case must not print the same thing as "nothing logged yet".
@@ -624,7 +631,34 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
         return
 
     printed = False
+    if dep_info.get("death_causes_unavailable"):
+        # Otherwise a failed GCS query is indistinguishable from a healthy deployment: both
+        # print no death lines. An empty answer and an unanswered question are different.
+        click.echo(f"{indent}[deaths unavailable: the death-cause query failed]")
+        printed = True
+    stopped = dep_info.get("deliberately_stopped_replicas")
+    if stopped:
+        click.echo(
+            f"{indent}{stopped} replica(s) stopped deliberately (scale-down or redeploy); "
+            "not shown."
+        )
+        printed = True
     for replica_id, streams in logs.items():
+        # Defensive, and the reason is worth stating: the count above used to be delivered
+        # INSIDE this map as a bare int, and `streams.get(...)` on it raised AttributeError and
+        # took the whole command down. It is lifted to a sibling field now, but a worker on an
+        # older build still returns the old shape, and a status command must not crash on it.
+        if not isinstance(streams, dict):
+            continue
+        if "death_cause" in streams and not streams["death_cause"]:
+            # A dead replica whose cause Ray no longer holds. `if cause:` alone skipped
+            # it entirely, so the replica that died left NO trace in the output at all —
+            # indistinguishable from a deployment where nothing had died. The presence of
+            # the key is what marks a dead replica; its value is what Ray could still tell
+            # us, and "we know it died, we no longer know why" is a different statement
+            # from silence.
+            click.echo(f"{indent}[{replica_id}] died: cause unknown (no longer held by Ray)")
+            printed = True
         cause = streams.get("death_cause")
         if cause:
             # A replica killed mid-request writes no traceback, so its streams

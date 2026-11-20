@@ -71,12 +71,25 @@ def _actor(death_causes):
     actor._last_called_at = 0.0
 
     def _list(resource, options, raise_on_missing_output):
-        (_, _, actor_id), = options.filters
-        cause = death_causes.get(actor_id, _MISSING)
+        actor.gcs_calls += 1
+        (field, _, value), = options.filters
+        if field == "state":
+            # The BULK query: every dead actor, which the caller intersects with
+            # its own replicas. Modelled rather than special-cased, because the
+            # cost claim ("one query however many replicas") is only true if the
+            # code really asks this way.
+            assert value == "DEAD", f"unexpected state filter {value!r}"
+            return [
+                SimpleNamespace(actor_id=aid, death_cause=cause)
+                for aid, cause in death_causes.items()
+                if cause is not _MISSING
+            ]
+        cause = death_causes.get(value, _MISSING)
         if cause is _MISSING:
             return []
-        return [SimpleNamespace(actor_id=actor_id, death_cause=cause)]
+        return [SimpleNamespace(actor_id=value, death_cause=cause)]
 
+    actor.gcs_calls = 0
     actor.state_api_client = SimpleNamespace(list=_list)
     return actor
 
@@ -171,13 +184,17 @@ def test_cause_survives_a_replica_whose_logs_cannot_be_read():
     assert logs["dd12spcw"]["death_cause"]["reason"] == "WORKER_DIED"
 
 
-def test_the_default_n_previous_replica_hides_the_cause_entirely():
-    """Why the CLI has to override it: at the default the dead replica is gone.
+def test_the_default_now_REPORTS_the_cause_without_the_logs():
+    """REPLACES a test that pinned the opposite, and the swap is deliberate.
 
-    ``get_deployment_logs`` returns early when ``n_previous_replica == 0``, and
-    both the dead replica's logs and its ``death_cause`` are attached after
-    that return. Every other test here passes ``-1``, so this is the one that
-    pins the behaviour a caller gets by default.
+    The previous version of this test asserted that at the default the dead
+    replica is absent and no ``death_cause`` appears anywhere — it pinned the
+    blind spot as intended behaviour, and explained that this is why the CLI
+    overrides the default. That blind spot was then decided to be a defect: a
+    caller using defaults saw no dead replica and concluded nothing had died,
+    which is this module's own failure mode one level up.
+
+    So the default now reports THAT a replica died and why, with no log lines.
     """
     actor = _deployment_actor(
         death_causes={"a_dead": _WORKER_DIED},
@@ -191,8 +208,96 @@ def test_the_default_n_previous_replica_hides_the_cause_entirely():
         application_id="soup",
         deployment_name="CellposeRuntime",
     )
+
+    assert set(logs) == {"live1", "dd12spcw"}
+    assert logs["dd12spcw"]["death_cause"]["reason"] == "WORKER_DIED"
+    # the cheap half only: no log lines are fetched at the default
+    assert logs["dd12spcw"]["stdout"] == []
+    assert logs["dd12spcw"]["stderr"] == []
+    assert logs["dd12spcw"]["logs_omitted"] is True
+    # and the live replica is untouched by any of this
+    assert "death_cause" not in logs["live1"]
+
+
+def test_a_deployment_with_NO_dead_replica_gains_nothing_and_asks_the_gcs_nothing():
+    """CONTROL. The default path must stay free when nothing has died."""
+    actor = _deployment_actor(
+        death_causes={},
+        alive={"live1": "a_live"},
+        registered={"live1": ("a_live", 1.0, "UTC")},
+    )
+    calls = []
+    inner = actor._get_actor_death_cause
+    actor._get_actor_death_cause = lambda actor_id: (calls.append(actor_id), inner(actor_id))[1]
+
+    logs = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
     assert set(logs) == {"live1"}
-    assert not any("death_cause" in streams for streams in logs.values())
+    assert calls == [], f"asked the GCS {len(calls)} time(s) with nothing dead"
+
+
+def test_the_default_costs_exactly_ONE_gcs_QUERY_however_many_have_died():
+    """CONTROL on the cost, which is what made the original defect tempting.
+
+    The first implementation held the cost down by describing a single dead
+    replica — one GCS lookup instead of one per replica, with 94 dead replicas
+    measured on a live worker. Review showed what that bought: the chosen one
+    was the last REGISTERED, so a deliberate stop could hide an earlier crash.
+
+    The cost argument is answered a different way now. Every dead actor is
+    fetched in ONE query and intersected locally, so the lookup count does not
+    grow with the number of dead replicas AND no death has to be dropped.
+    Without this assertion the obvious rewrite — a lookup per replica — passes
+    every other test here.
+    """
+    registered = {"live1": ("a_live", 1.0, "UTC")}
+    for i in range(40):
+        registered[f"dead{i:02d}"] = (f"a_dead{i:02d}", 2.0 + i, "UTC")
+
+    actor = _deployment_actor(
+        death_causes={f"a_dead{i:02d}": _WORKER_DIED for i in range(40)},
+        alive={"live1": "a_live"},
+        registered=registered,
+    )
+    logs = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
+    assert actor.gcs_calls == 1, (
+        f"{actor.gcs_calls} GCS queries at the default with 40 dead replicas"
+    )
+
+    # ...and all 40 are reported, because every one of them died abnormally.
+    described = set(logs) - {"live1", "_deliberately_stopped_replicas"}
+    assert described == {f"dead{i:02d}" for i in range(40)}, (
+        f"described {len(described)} of 40 abnormal deaths"
+    )
+
+
+def test_many_deliberate_stops_are_summarised_not_listed():
+    """The payload bound. A long-lived deployment's dead replicas are mostly
+    routine scale-downs; listing all of them would make the default status
+    grow without telling an operator anything. They are counted instead, and
+    the one crash among them is still described in full."""
+    registered = {"live1": ("a_live", 1.0, "UTC")}
+    causes = {}
+    for i in range(30):
+        registered[f"stop{i:02d}"] = (f"a_stop{i:02d}", 2.0 + i, "UTC")
+        causes[f"a_stop{i:02d}"] = _RAY_KILL
+    registered["crashed"] = ("a_oom", 99.0, "UTC")
+    causes["a_oom"] = _OOM
+
+    logs = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
+    assert logs["_deliberately_stopped_replicas"] == 30
+    assert set(logs) - {"live1", "_deliberately_stopped_replicas"} == {"crashed"}
+    assert logs["crashed"]["death_cause"]["reason"] == "OOM"
 
 
 def test_apps_logs_asks_for_the_dead_replica():
@@ -298,3 +403,156 @@ def test_a_live_replica_renders_exactly_as_before():
     out = _render({"live1": {"stdout": ["hello"], "stderr": []}})
     assert "died:" not in out
     assert out.splitlines() == ["[live1] stdout", "  hello"]
+
+
+def test_a_routine_scale_down_cannot_hide_a_crash_at_the_default():
+    """THE REGRESSION THIS ISSUE IS ABOUT, one level up.
+
+    Reported by review of this change. Timeline, in REGISTRATION order:
+
+      A registers, serves, and later dies of OOM
+      B is added by autoscaling, then deliberately scaled down (RAY_KILL)
+
+    Picking the last-REGISTERED dead replica reports B's RAY_KILL and drops
+    A's OOM, so the operator reads "something was deliberately stopped" and
+    concludes nothing crashed — the exact wrong-layer diagnosis the
+    ``death_cause`` field exists to prevent.
+
+    Ray's ``ActorState`` carries NO death timestamp (measured against ray
+    2.55: the dataclass has no end-time field at all), so "the most recently
+    dead replica" is not derivable here and ordering cannot be repaired.
+    Choosing ONE dead replica is therefore the defect. An abnormal death is
+    never dropped.
+    """
+    actor = _deployment_actor(
+        death_causes={"a_oom": _OOM, "b_kill": _RAY_KILL},
+        alive={"c_live": "a_c"},
+        registered={
+            "a_crashed": ("a_oom", 1.0, "UTC"),   # registered FIRST, died of OOM
+            "b_stopped": ("b_kill", 2.0, "UTC"),  # registered LAST, deliberate stop
+            "c_live": ("a_c", 3.0, "UTC"),
+        },
+    )
+    logs = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
+    assert "a_crashed" in logs, (
+        "the OOM crash is absent at the default: a deliberate stop registered "
+        f"later hid it. got {sorted(logs)}"
+    )
+    assert logs["a_crashed"]["death_cause"]["reason"] == "OOM"
+
+
+def test_clause_2_the_exception_is_carried_by_the_LOGS_not_by_the_cause():
+    """CLAUSE 2, and an honest statement of which path meets it.
+
+    The clause asks that the surfaced cause name the server-side exception.
+    Ray's GCS does NOT carry it: for a replica that raised and exited, the
+    death cause reads ``WORKER_DIED`` with Ray's own wording about
+    ``SYSTEM_ERROR``, and the exception's name appears nowhere in it. The
+    filed incident's ``IncompleteRead`` is in the replica's STDERR.
+
+    So the exception is reachable at ``n_previous_replica >= 1``, where the
+    logs are fetched, and NOT at the default, which omits them by design.
+    This test pins both halves so the limit is a measured property rather
+    than something a reader discovers against a live worker.
+    """
+    actor = _deployment_actor(
+        death_causes={"a_dead": _WORKER_DIED},
+        alive={},
+        registered={"crashed": ("a_dead", 2.0, "UTC")},
+    )
+    actor.get_actor_logs = lambda actor_id, tail, timezone, creation_timestamp: {
+        "stdout": [],
+        "stderr": [
+            "Traceback (most recent call last):",
+            "  File 'entry.py', line 1, in _score",
+            "http.client.IncompleteRead: IncompleteRead(0 bytes read)",
+        ],
+    }
+
+    with_logs = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+        n_previous_replica=1,
+    )
+    assert any("IncompleteRead" in line for line in with_logs["crashed"]["stderr"]), (
+        "the exception is not reachable even with logs requested"
+    )
+    assert with_logs["crashed"]["death_cause"]["reason"] == "WORKER_DIED"
+    # ...and the cause ALONE does not name it — which is why the clause needs
+    # the logs path, not the default.
+    assert "IncompleteRead" not in with_logs["crashed"]["death_cause"]["message"]
+
+    at_default = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
+    assert at_default["crashed"]["logs_omitted"] is True
+    assert at_default["crashed"]["stderr"] == []
+
+
+# ── A FAILED hoisted query must not be re-run once per deployment ─────────────
+
+
+def _raising_deployment_actor(registered, alive):
+    """Real proxy class whose GCS list() always raises, counting every attempt."""
+    actor = object.__new__(_PLAIN_CLASS)
+    actor._last_called_at = 0.0
+    actor.gcs_calls = 0
+
+    def _raise(resource, options, raise_on_missing_output):
+        actor.gcs_calls += 1
+        raise RuntimeError("GCS unreachable")
+
+    actor.state_api_client = SimpleNamespace(list=_raise)
+    actor.application_replicas = {"app": {"D": registered}}
+    actor.get_deployment_replicas = lambda application_id, deployment_name: alive
+    actor.get_actor_logs = lambda actor_id, tail, timezone, creation_timestamp: {
+        "stdout": [], "stderr": []
+    }
+    return actor
+
+
+def test_a_failed_hoisted_query_is_not_re_run_per_deployment():
+    """The cost ruling on the FAILURE path, which the mocked call-count test cannot see.
+
+    `death_causes=None` is overloaded: it means both "no map supplied" and "the hoisted query
+    failed". Treating them alike made a failed hoist fall through and re-run the CLUSTER-WIDE
+    query once per deployment -- five lookups for one get_app_status, each able to block for
+    the full RPC timeout, in precisely the case where the query is slow or the GCS unreachable.
+
+    `death_cause_query_failed` is the separate signal. With it set, a deployment must return
+    without asking again, so N deployments cost ZERO further queries.
+    """
+    registered = {"dead1": ("actor-1", 0.0), "dead2": ("actor-2", 0.0)}
+    total = 0
+    for _ in range(4):                       # four deployments, as one application has
+        actor = _raising_deployment_actor(registered, alive={})
+        logs = actor.get_deployment_logs(
+            application_id="app", deployment_name="D",
+            n_previous_replica=0, tail=30,
+            death_causes=None, death_cause_query_failed=True,
+        )
+        total += actor.gcs_calls
+        assert logs == {}, logs      # and it invents no unexplained deaths
+
+    assert total == 0, (
+        "a failed hoisted query was re-run %d time(s) across 4 deployments; the hoist is "
+        "defeated on exactly the path where the query is expensive" % total
+    )
+
+
+def test_without_the_flag_a_deployment_still_fetches_for_itself():
+    """The control: the flag must be what suppresses it, not the code having stopped asking.
+
+    A direct caller that supplies no map still gets its own lookup -- otherwise the test above
+    would pass against a version that never queries at all.
+    """
+    actor = _raising_deployment_actor({"dead1": ("actor-1", 0.0)}, alive={})
+    actor.get_deployment_logs(
+        application_id="app", deployment_name="D",
+        n_previous_replica=0, tail=30,
+    )
+    assert actor.gcs_calls == 1, actor.gcs_calls
