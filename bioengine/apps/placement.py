@@ -119,13 +119,20 @@ def parse_resource_pair(
 # Without the mapping that case reports nothing at all, since every GPU requirement
 # here arrives under this name.
 #
-# A node that advertises no ``VRAM_MB`` reports ``total_vram_mb: 0``, and that cannot
-# produce a false shortfall: ``proxy_actor`` derives the field from Ray's own
-# ``VRAM_MB`` resource, and ``builder.py`` drops the requirement for exactly the
-# clusters that do not advertise it -- so a VRAM requirement and a zero capacity
-# cannot co-occur. Measured on a single-machine worker with one GPU: Ray advertised
-# ``accelerator_type:P400`` and no ``VRAM_MB``, the node reported ``total_vram_mb: 0``,
-# and the requirement came through as a GPU fraction instead.
+# A node that advertises no ``VRAM_MB`` reports ``total_vram_mb: 0`` -- the key is
+# always written, never absent, so there is no "unknown VRAM" shape to fall through.
+# On the ordinary path that zero cannot meet a VRAM requirement, because
+# ``builder.py`` only requests ``VRAM_MB`` for clusters that advertise it: measured on
+# a single-machine worker with one GPU, Ray advertised ``accelerator_type:P400`` and no
+# ``VRAM_MB``, the node reported ``total_vram_mb: 0``, and the requirement arrived as a
+# GPU fraction.
+#
+# **They CAN co-occur, and then ``True`` is the right answer.** Elastic SLURM requests
+# ``VRAM_MB`` before any GPU node exists, so a worker that joins without advertising it
+# -- ``num_gpus != 1``, or nvidia-smi detection failed -- leaves a VRAM requirement
+# against zero capacity. That replica genuinely cannot be placed, which is exactly what
+# this reports. An earlier version of this comment claimed the two could never co-occur;
+# that was checked on the single-machine path only and is false.
 _CAPACITY_KEY_BY_RESOURCE = {
     "CPU": "total_cpu",
     "GPU": "total_gpu",

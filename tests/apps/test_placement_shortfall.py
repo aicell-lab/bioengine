@@ -161,12 +161,39 @@ class TestVramIsTheGpuRequirementOnThisPlatform:
             "VRAM_MB": {"required": 40000.0, "largest_node": 24000.0}
         }
 
-    def test_a_cluster_advertising_no_vram_reports_nothing(self):
-        # builder.py falls back to a GPU fraction when the cluster advertises no
-        # VRAM_MB, and a node status without the key must not read as zero capacity.
+    def test_zero_vram_capacity_against_a_vram_requirement_IS_a_shortfall(self):
+        """The shape `proxy_actor` actually produces, which is not the obvious one.
+
+        It always writes `total_vram_mb`, as 0 when the node advertises no VRAM -- the
+        key is never absent. On the ordinary path a VRAM requirement cannot arrive on
+        such a cluster, because `builder.py` only requests `VRAM_MB` where it is
+        advertised. But elastic SLURM requests it before any GPU node exists, so a
+        worker that joins without advertising it leaves exactly this pair -- and then
+        the replica really cannot be placed, so True is correct.
+
+        An earlier version of this arm used a node with NO `total_vram_mb` key and
+        asserted no shortfall. `proxy_actor` never produces that shape, so it pinned a
+        branch real data cannot reach.
+        """
+        nodes = {
+            "n1": {
+                "total_cpu": 4.0,
+                "total_gpu": 1.0,
+                "total_memory": GIB,
+                "total_vram_mb": 0,
+            }
+        }
+        message = _slow_allocation({"CPU": 1, "GPU": 0.01, "VRAM_MB": 8000}, {})
+        assert placement_shortfall(message, nodes) == {
+            "VRAM_MB": {"required": 8000.0, "largest_node": 0.0}
+        }
+
+    def test_a_node_status_missing_the_key_entirely_still_reports_nothing(self):
+        # Not a shape proxy_actor produces, but the fail-safe that keeps an
+        # unreadable status from becoming a verdict. Kept as the defensive case it
+        # is, and labelled so nobody mistakes it for the real-data path above.
         nodes = {"n1": {"total_cpu": 4.0, "total_gpu": 1.0, "total_memory": GIB}}
-        message = _slow_allocation({"VRAM_MB": 80000}, {})
-        assert placement_shortfall(message, nodes) == {}
+        assert placement_shortfall(_slow_allocation({"VRAM_MB": 80000}, {}), nodes) == {}
 
 
 class TestCapacity:
