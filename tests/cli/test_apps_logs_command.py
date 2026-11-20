@@ -397,3 +397,63 @@ def test_a_per_deployment_override_reaches_the_proxy_and_a_missing_one_falls_bac
     # and the one with no override, which must still get the top-level defaults
     assert by_dep[OTHER_DEPLOYMENT]["n_previous_replica"] == 2
     assert by_dep[OTHER_DEPLOYMENT]["tail"] == 100
+
+
+# ── The deliberate-stop COUNT, which is not a replica ─────────────────────────
+
+# What `get_deployment_logs` really returns at the DEFAULT n_previous_replica=0 for a
+# deployment that has a crashed replica and has also been scaled down at some point. The
+# count is the one entry in this map whose value is not a replica dict, and that is the
+# whole hazard: every consumer walks this map as replica-id -> stream-dict.
+PROXY_LOGS_WITH_STOPPED_COUNT = {
+    **PROXY_LOGS,
+    "CellposeApp#deadOOM": {
+        "stdout": [],
+        "stderr": [],
+        "death_cause": {"reason": "OOM", "message": "Task was killed due to the node running low on memory."},
+        "logs_omitted": True,
+    },
+    "_deliberately_stopped_replicas": 3,
+}
+
+
+def test_apps_status_does_not_crash_on_the_deliberate_stop_count(invoke):
+    """The RED-maker for the shipped crash.
+
+    The count used to be delivered INSIDE the replica map as a bare int, so
+    ``streams.get("death_cause")`` raised ``AttributeError: 'int' object has no attribute
+    'get'`` and ``bioengine apps status`` died for ANY deployment that had ever been
+    scaled down -- which is most long-lived ones. The existing CLI tests stayed green
+    because their maps are hand-built and contain only replica dicts; this one renders
+    what the worker actually produces, through the real ``_get_deployment_status``.
+    """
+    output = invoke(["status", APP_ID], _status(PROXY_LOGS_WITH_STOPPED_COUNT))
+    assert "object has no attribute" not in output, output
+    assert "Traceback" not in output, output
+    # and the crashed replica is still reported, so "did not crash" is not the whole claim
+    assert "OOM" in output, output
+
+
+def test_the_deliberate_stop_count_is_reported_not_silently_dropped(invoke):
+    """Lifting it out of the map must not throw the information away.
+
+    Skipping non-dict entries alone would stop the crash and lose the count, which reads
+    to an operator exactly like a deployment that was never scaled down.
+    """
+    output = invoke(["status", APP_ID], _status(PROXY_LOGS_WITH_STOPPED_COUNT))
+    assert "3 replica(s) stopped deliberately" in output, output
+
+
+def test_the_count_is_lifted_out_of_the_replica_map_by_the_worker():
+    """The map the worker hands on must contain replica entries and nothing else.
+
+    Asserted on the producer rather than the printer: a consumer-side guard protects the
+    one consumer that has it, while this keeps the contract true for every other reader,
+    including the dashboard.
+    """
+    deployments = _deployments(PROXY_LOGS_WITH_STOPPED_COUNT, [LIVE_REPLICA])
+    logs = deployments[DEPLOYMENT]["logs"]
+    assert "_deliberately_stopped_replicas" not in logs, logs
+    for replica_id, streams in logs.items():
+        assert isinstance(streams, dict), (replica_id, streams)
+    assert deployments[DEPLOYMENT]["deliberately_stopped_replicas"] == 3

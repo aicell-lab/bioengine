@@ -1385,10 +1385,19 @@ class BioEngineProxyActor:
             Error messages are included in stderr if log retrieval fails.
             Dead replicas additionally carry ``death_cause``
             (``{"reason", "message"}``, or None if Ray no longer holds one).
-            At the default ``n_previous_replica=0`` the most recent dead replica
-            is still reported, with empty log lists and ``logs_omitted: True``,
-            so a caller using defaults learns that something died and why
-            without paying for its logs.
+            At the default ``n_previous_replica=0`` EVERY abnormally-dead replica is
+            reported -- not one chosen replica -- each with empty log lists and
+            ``logs_omitted: True``, so a caller using defaults learns that something
+            died and why without paying for its logs. Replicas that were stopped
+            DELIBERATELY (scale-down, redeploy) are not listed individually; they are
+            returned as a count under ``_deliberately_stopped_replicas``.
+
+            That count is the one key in this mapping whose value is NOT a replica
+            dict. ``AppsManager`` pops it into a sibling ``deliberately_stopped_replicas``
+            field on the deployment before any consumer sees it, because every consumer
+            iterates this mapping as replica-id -> stream-dict and an int in it raises
+            ``AttributeError``. A caller invoking this method DIRECTLY gets the raw
+            shape and must skip the key itself.
         """
         logs = {}
 

@@ -604,12 +604,16 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
     already tailed to the requested number by the worker — so everything fetched
     is printed, and the caller's line count means what it says. Iterating it
     rather than the deployment's ``replicas`` is deliberate: the map keys
-    recently dead replicas too, which the live replica list does not contain —
-    but only for a caller that passed ``n_previous_replica > 0``. ``apps logs``
-    does; ``apps status`` does not, because it fetches logs on every invocation
-    and the LOGS are the expensive half. The death cause is not: every dead
-    actor is fetched in one state-API query regardless of how many there are,
-    so ``apps status`` does report an abnormal death without its logs.
+    recently dead replicas too, which the live replica list does not contain.
+    ``apps logs`` passes ``n_previous_replica > 0`` and so gets their LOGS;
+    ``apps status`` does not, because it fetches on every invocation and the logs
+    are the expensive half. The death CAUSE is not: every dead actor is fetched
+    in one state-API query regardless of how many there are, so ``apps status``
+    reports an abnormal death — for every such replica — without its logs.
+
+    Replicas stopped deliberately are not listed here at all. They arrive as a
+    count in the deployment's ``deliberately_stopped_replicas`` field, printed
+    above the per-replica lines.
 
     The field is *absent* rather than empty when the caller may not read it, so
     the withheld case must not print the same thing as "nothing logged yet".
@@ -627,7 +631,20 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
         return
 
     printed = False
+    stopped = dep_info.get("deliberately_stopped_replicas")
+    if stopped:
+        click.echo(
+            f"{indent}{stopped} replica(s) stopped deliberately (scale-down or redeploy); "
+            "not shown."
+        )
+        printed = True
     for replica_id, streams in logs.items():
+        # Defensive, and the reason is worth stating: the count above used to be delivered
+        # INSIDE this map as a bare int, and `streams.get(...)` on it raised AttributeError and
+        # took the whole command down. It is lifted to a sibling field now, but a worker on an
+        # older build still returns the old shape, and a status command must not crash on it.
+        if not isinstance(streams, dict):
+            continue
         cause = streams.get("death_cause")
         if cause:
             # A replica killed mid-request writes no traceback, so its streams
