@@ -101,6 +101,13 @@ _DOWNLOAD_TOKEN_TTL_SECONDS = 3600 * 24 * 30
 #: raw source and must not import this module to learn one string.
 _SECRET_ENV_VAR_PREFIX = "_BIOENGINE_SECRET_"
 
+#: Names the env vars a replica must DELETE from its own environment before the
+#: user's ``__init__`` runs. Needed because a single-machine replica inherits
+#: the worker's environment, so "do not inject" leaves an inherited credential
+#: in place — see ``_build_env_vars``. Read by
+#: ``bioengine._app.mixin._install_secret_env_vars``.
+_FENCED_ENV_KEYS_VAR = "BIOENGINE_FENCED_ENV_KEYS"
+
 
 def split_secret_env_vars(
     env_vars: Dict[str, str],
@@ -269,6 +276,36 @@ class AppBuilder:
         # must leave HYPHA_TOKEN genuinely absent, not present and empty.
         if hypha_token:
             env_vars[f"{_SECRET_ENV_VAR_PREFIX}HYPHA_TOKEN"] = hypha_token
+        elif hypha_token == "":
+            # Declining to INJECT is not the same as the replica not HAVING one.
+            # On ``--mode single-machine`` Ray runs inside the worker's own
+            # container, so the replica process inherits the worker's
+            # environment — and the worker's own HYPHA_TOKEN with it. Measured
+            # on europa (#0526): deployed with ``hypha_token=''`` into a
+            # container started with ``-e HYPHA_TOKEN``, all four replica
+            # processes carried the variable and the app reported
+            # ``test_reports_writable: true``; an unreviewed app version then
+            # overwrote a published report on a shared public artifact. On
+            # ``--mode external-cluster`` the replica is a pod in another
+            # namespace which inherits nothing, which is why the same empty
+            # token already fenced correctly there.
+            #
+            # So the fence has to be an instruction to REMOVE, not an omission.
+            # ``None`` (the argument omitted) deliberately does NOT get this:
+            # omitting means "preserve whatever this instance had", and only an
+            # explicit empty string means "deploy with no credential".
+            #
+            # A HYPHA_TOKEN the caller passed themselves is theirs to keep: when
+            # ``hypha_token`` carries no token, a plain ``application_env_vars``
+            # value legitimately reaches the replica, so fencing it here would
+            # silently discard something explicitly asked for. Only the
+            # inherited case is scrubbed.
+            caller_supplied = (
+                "HYPHA_TOKEN" in non_secret_env_vars
+                or "HYPHA_TOKEN" in secret_env_vars
+            )
+            if not caller_supplied:
+                env_vars[_FENCED_ENV_KEYS_VAR] = "HYPHA_TOKEN"
 
         worker_workspace = (
             self.server.config.workspace if self.server is not None else "local"
