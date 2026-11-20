@@ -102,15 +102,35 @@ def parse_resource_pair(
 
 
 # Serve states a requirement in Ray's own resource names; the cluster status reports
-# per-node capacity under its own. Only these three can be compared. A requirement in
-# any other name -- a custom resource, an accelerator label, VRAM_MB -- has no
-# capacity to compare against here and is reported as no shortfall rather than
-# guessed at, which is why `unschedulable: false` is never a guarantee of
-# placeability.
+# per-node capacity under its own. Only these four can be compared. A requirement in
+# any other name -- another custom resource, an accelerator label -- has no capacity
+# to compare against here and is reported as no shortfall rather than guessed at,
+# which is why `unschedulable: false` is never a guarantee of placeability.
+#
+# VRAM_MB is here because on this platform it is how a GPU app states its
+# requirement: ``@bioengine.app`` rejects ``num_gpus`` outright and sizes GPUs by
+# ``gpu_memory_mb``, which ``builder.py`` turns into a ``VRAM_MB`` custom resource.
+#
+# It is NOT here to catch an over-large request at deploy time -- measured on a live
+# worker, ``deploy_app`` already refuses that up front: *"gpu_memory_mb=N does not fit
+# the smallest GPU on the cluster (M MB)"*. What this catches is the case that gate
+# cannot see, which is the one this whole module is about: a deployment that WAS
+# placeable and stops being so, because the cluster lost the node that could hold it.
+# Without the mapping that case reports nothing at all, since every GPU requirement
+# here arrives under this name.
+#
+# A node that advertises no ``VRAM_MB`` reports ``total_vram_mb: 0``, and that cannot
+# produce a false shortfall: ``proxy_actor`` derives the field from Ray's own
+# ``VRAM_MB`` resource, and ``builder.py`` drops the requirement for exactly the
+# clusters that do not advertise it -- so a VRAM requirement and a zero capacity
+# cannot co-occur. Measured on a single-machine worker with one GPU: Ray advertised
+# ``accelerator_type:P400`` and no ``VRAM_MB``, the node reported ``total_vram_mb: 0``,
+# and the requirement came through as a GPU fraction instead.
 _CAPACITY_KEY_BY_RESOURCE = {
     "CPU": "total_cpu",
     "GPU": "total_gpu",
     "memory": "total_memory",
+    "VRAM_MB": "total_vram_mb",
 }
 
 

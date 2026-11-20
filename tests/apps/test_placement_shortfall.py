@@ -66,12 +66,20 @@ SLOW_INITIALIZATION = (
 )
 
 
-def _node(cpu=4.0, gpu=0.0, memory=16 * GIB):
-    return {"total_cpu": cpu, "total_gpu": gpu, "total_memory": memory}
+def _node(cpu=4.0, gpu=0.0, memory=16 * GIB, vram=0.0):
+    return {
+        "total_cpu": cpu,
+        "total_gpu": gpu,
+        "total_memory": memory,
+        "total_vram_mb": vram,
+    }
 
 
-ONE_SMALL_NODE = {"n1": _node(cpu=4.0, gpu=1.0)}
-TWO_SMALL_NODES = {"n1": _node(cpu=4.0, gpu=1.0), "n2": _node(cpu=4.0, gpu=1.0)}
+ONE_SMALL_NODE = {"n1": _node(cpu=4.0, gpu=1.0, vram=24000.0)}
+TWO_SMALL_NODES = {
+    "n1": _node(cpu=4.0, gpu=1.0, vram=24000.0),
+    "n2": _node(cpu=4.0, gpu=1.0, vram=24000.0),
+}
 
 # The live repro, and the reason this file exists in its current shape: a 3-CPU
 # replica waking on an idle 4-CPU node. Serve has already granted its lease, so the
@@ -123,6 +131,42 @@ class TestTheDistinction:
         assert placement_shortfall(message, TWO_SMALL_NODES) == {
             "GPU": {"required": 2.0, "largest_node": 1.0}
         }
+
+
+class TestVramIsTheGpuRequirementOnThisPlatform:
+    """``@bioengine.app`` rejects ``num_gpus``; GPUs are sized by ``gpu_memory_mb``.
+
+    Measured on a live worker 2026-11-20: deploying an app with ``num_gpus`` raises
+    *"@bioengine.app no longer accepts 'num_gpus' -- GPUs are now sized by VRAM"*, and
+    ``builder.py`` turns ``gpu_memory_mb`` into a ``VRAM_MB`` custom resource. So a
+    VRAM requirement is not an exotic case here -- it is how every GPU app asks, and
+    asking for more than any device has is the one failure that queues forever
+    instead of failing.
+    """
+
+    def test_more_vram_than_any_device_has_is_reported(self):
+        message = _slow_allocation({"CPU": 1, "VRAM_MB": 80000}, {"CPU": 3})
+        assert placement_shortfall(message, ONE_SMALL_NODE) == {
+            "VRAM_MB": {"required": 80000.0, "largest_node": 24000.0}
+        }
+
+    def test_vram_that_fits_a_device_is_not(self):
+        message = _slow_allocation({"CPU": 1, "VRAM_MB": 8000}, {"CPU": 3})
+        assert placement_shortfall(message, ONE_SMALL_NODE) == {}
+
+    def test_vram_capacity_is_per_node_too(self):
+        # Two 24 GB cards on two nodes do not serve one 40 GB replica.
+        message = _slow_allocation({"VRAM_MB": 40000}, {})
+        assert placement_shortfall(message, TWO_SMALL_NODES) == {
+            "VRAM_MB": {"required": 40000.0, "largest_node": 24000.0}
+        }
+
+    def test_a_cluster_advertising_no_vram_reports_nothing(self):
+        # builder.py falls back to a GPU fraction when the cluster advertises no
+        # VRAM_MB, and a node status without the key must not read as zero capacity.
+        nodes = {"n1": {"total_cpu": 4.0, "total_gpu": 1.0, "total_memory": GIB}}
+        message = _slow_allocation({"VRAM_MB": 80000}, {})
+        assert placement_shortfall(message, nodes) == {}
 
 
 class TestCapacity:
@@ -201,10 +245,10 @@ class TestNoVerdictWithoutEvidence:
         assert placement_shortfall(TOO_BIG_FOR_ANY_NODE, nodes) == {}
 
     def test_a_resource_with_no_comparable_capacity_reports_nothing(self):
-        # VRAM_MB and accelerator labels are real requirements with no counterpart in
-        # the node status, so `unschedulable: false` is never a guarantee of
-        # placeability. Asserting the gap means closing it turns this arm red.
-        message = _slow_allocation({"VRAM_MB": 80000, "CPU": 1}, {})
+        # An accelerator label is a real requirement with no counterpart in the node
+        # status, so `unschedulable: false` is never a guarantee of placeability.
+        # Asserting the gap means closing it turns this arm red.
+        message = _slow_allocation({"accelerator_type:A100": 1, "CPU": 1}, {})
         assert placement_shortfall(message, ONE_SMALL_NODE) == {}
 
     def test_a_bundle_list_would_otherwise_have_looked_short(self):
