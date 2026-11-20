@@ -46,7 +46,7 @@ def _base(dtype=torch.float32):
     inventory every member key is classified against, and its non-learned values
     are what the soup carries through. Passing it
     explicitly in every test is the point: a default would be the "neither
-    classifiable nor classified, so average it" hole the ruling closes.
+    classifiable nor classified, so average it" hole the rule closes.
     """
     return _sd(0.0, dtype=dtype)
 
@@ -201,7 +201,7 @@ def test_a_nonweight_name_does_not_swallow_a_real_weight() -> None:
 
 
 # ── the merge carries the BASE diameter, never an average ────────────────
-# RULED 2026-11-14: the operative value in the tensor is the base checkpoint's,
+# The operative value in the tensor is the base checkpoint's,
 # unchanged; the contributors' own diameters are recorded in the community
 # manifest instead of being averaged into a number nobody measured.
 #
@@ -218,7 +218,7 @@ def _pool_loaders():
 
 
 def test_the_merge_carries_the_base_diameter_unchanged() -> None:
-    """Requirement 3: one operative value in the tensor, and it is traceable.
+    """One operative value in the tensor, and it is traceable.
 
     The base model's diameter is the prior the soup inherited, and the soup did
     not learn a diameter, so it is the only number here that describes something
@@ -242,7 +242,7 @@ def test_the_averaged_diameter_is_not_published_and_the_two_differ() -> None:
     published = float(out["diam_labels"][0])
 
     assert published != pytest.approx(AVERAGED_DIAM, rel=1e-3)
-    assert AVERAGED_DIAM / BASE_DIAM > 1.9  # the factor-of-two the row reported
+    assert AVERAGED_DIAM / BASE_DIAM > 1.9  # the factor-of-two reported
     # And the weights really were averaged, so this is not passing because the
     # merge did nothing at all.
     assert torch.allclose(out["a.weight"], torch.full((4,), 1.0))
@@ -284,11 +284,11 @@ def test_the_soup_does_not_alias_the_base_tensors() -> None:
     assert float(base_sd["diam_labels"][0]) == pytest.approx(BASE_DIAM, rel=1e-9)
 
 
-# ── requirement 4: the contributors' own diameters are RECORDED, not discarded ──
+# ── the contributors' own diameters are RECORDED, not discarded ──
 
 
 def test_member_diameters_are_collected_in_loader_order() -> None:
-    """Requirement 4. Order is the contract: the caller zips this against the member
+    """Order is the contract: the caller zips this against the member
     specs it supplied, because uniform_soup is given loaders and never learns a
     contribution id. An unordered map would lose which diameter belonged to whom.
     """
@@ -360,11 +360,11 @@ def test_an_unreported_block_is_distinguishable_from_an_inherited_one() -> None:
     assert "weights are unaffected" in unr["note"]
 
 
-# ── requirement 2: unclassifiable keys FAIL the merge, never get averaged ────
+# ── unclassifiable keys FAIL the merge, never get averaged ────
 
 
 def test_a_key_absent_from_the_base_fails_the_merge() -> None:
-    """Requirement 2, and the property that stops this recurring.
+    """The total-classification rule, and the property that stops this recurring.
 
     A future non-learned nn.Parameter added to the architecture is a key an
     existing pool's base does not have. It must break the merge rather than being
@@ -408,7 +408,7 @@ def test_a_member_missing_a_base_key_fails_the_merge() -> None:
 
 
 def test_a_pool_with_no_base_record_cannot_merge() -> None:
-    """Option (b), ruled: a pool that records no base FAILS the merge, and there is
+    """A pool that records no base FAILS the merge, and there is
     deliberately no fallback to loading a stock base — a fallback would make the field
     permanently optional. A separate census counts how many existing pools this blocks."""
     with pytest.raises(ValueError, match="records no base commitment"):
@@ -423,7 +423,7 @@ def test_a_pool_with_no_base_record_cannot_merge() -> None:
 
 
 def test_base_is_required_so_a_caller_cannot_default_into_averaging() -> None:
-    """Requirement 2 at the API boundary: there is no base-less call. A default
+    """The same rule at the API boundary: there is no base-less call. A default
     would be the "neither classifiable nor classified, so average it" hole."""
     with pytest.raises(TypeError):
         pool.uniform_soup([lambda: _sd(1.0)])  # type: ignore[call-arg]
@@ -522,7 +522,7 @@ def test_a_refusal_still_names_the_key_without_a_recorded_key_list() -> None:
 
 
 def test_the_recorded_key_list_costs_what_the_record_says() -> None:
-    """The ruling priced option (b) at "a few hundred bytes", which is true of the
+    """The design was priced at "a few hundred bytes", which is true of the
     digest and the count and NOT of the key list added beside them. Measured here so
     the trade is a number on the record rather than an estimate: a cpsam-sized layout
     is several hundred tensors with long dotted names.

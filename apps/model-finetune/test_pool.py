@@ -727,7 +727,7 @@ def test_the_check_is_not_self_referential(monkeypatch):
 # the frozen value already IS the rung it patches to.
 #
 # Measured 2026-11-13, sweeping the derivation over all thirteen rungs PAGE_RUNGS
-# records (harness .dev/verify/0442/sweep-rung-derivation.sh): exactly ONE goes
+# records: exactly ONE goes
 # red (0.14, and only because test_the_check_rejects_a_superseded_page_rung
 # hardcodes that rung as its premise). Twelve stay fully GREEN, of which eleven
 # are wrong values a revert could land on. That 1-of-13 is an artefact of one

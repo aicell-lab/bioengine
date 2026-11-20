@@ -227,7 +227,7 @@ def round_metric(
 def merge_trigger() -> Dict[str, Any]:
     """The campaign's merge-cadence policy record (5 fields). All null: no
     merge-cadence policy is declared here and the merge provenance is unpopulated,
-    pending the campaign's trigger ruling. A merge-on-N-contributions policy would
+    pending a decision on the campaign's trigger. A merge-on-N-contributions policy would
     set ``kind`` and ``contributions_per_merge``; a named decider would set
     ``decided_by``/``agent``."""
     return {
@@ -693,7 +693,7 @@ def colliding_contribution_provenance() -> Dict[str, Any]:
 # writers).
 #
 # ⚠ THIS IS THE SINGLE DECLARATION AND cellpose_model.py REGISTERS BY ITERATING IT
-# (Requirement 1 of the base-commitment rules: classify from the model definition, not from a second
+# (The rule: classify from the model definition, not from a second
 # hardcoded list of names). It lives here, in the torch-free module, because
 # pool.py's import must stay stdlib-only — test_pool.py's contract — so the
 # dependency runs model -> pool and never the other way. Adding a non-learned
@@ -703,11 +703,11 @@ def colliding_contribution_provenance() -> Dict[str, Any]:
 NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
 
 
-# Base-commitment requirements 3 and 4: the basis strings a community manifest uses to say WHERE its
-# non-learned values came from. The ruling is explicit that reporting the float alone is
-# not enough — "the manifest must record that the soup's diam_labels was INHERITED and
-# name its source, or the original defect reappears in the manifest instead of the state
-# dict". So the value never travels without this label beside it.
+# The basis strings a community manifest uses to say WHERE its
+# non-learned values came from. Reporting the float alone is not enough: the manifest
+# must record that the soup's diam_labels was INHERITED and name its source, or the
+# original defect reappears in the manifest instead of the state dict. So the value
+# never travels without this label beside it.
 NON_LEARNED_INHERITED = "inherited_from_base_checkpoint"
 NON_LEARNED_NOTE = (
     "A federated checkpoint has no single learned object diameter. These values are the "
@@ -725,7 +725,7 @@ def inherited_non_learned(
 
     ``source`` names the base the values came from (e.g. the cellpose base model
     identifier), because "inherited" without a named source is the same unfalsifiable
-    claim the row was filed about — a reader could not tell an inherited 30.0 from a
+    claim this guard is about — a reader could not tell an inherited 30.0 from a
     coincidental one. Built here rather than inline at the call site so the wording and
     the basis constant cannot drift apart across writers.
     """
@@ -749,7 +749,7 @@ def key_set_digest(keys: Iterable[str]) -> str:
     the base's non-learned VALUES but carry no inventory, and without one the only
     classification left is member-vs-member agreement, which cannot detect a
     newly-added non-learned Parameter because every member has it — the exact
-    recurrence requirement 2 exists to catch. So the pool commits to the base's key set
+    recurrence the total-classification rule exists to catch. So the pool commits to the base's key set
     as a digest, and the merge digests the sorted member keys and requires equality.
 
     Keys only, deliberately: no shapes and no dtypes, because
@@ -769,8 +769,8 @@ def base_commitment(
 ) -> Dict[str, Any]:
     """The pool's record of the base it is anchored to — written ONCE, at pool creation.
 
-    Holds the base's non-learned values (requirement 3's operative value) and a
-    commitment to its key set (requirement 2's inventory), so the merge needs neither a
+    Holds the base's non-learned values (the operative value) and a
+    commitment to its key set (the committed inventory), so the merge needs neither a
     model load nor a base checkpoint download. ``source`` names the base, because an
     inherited value with no named origin is not traceable.
 
@@ -790,7 +790,7 @@ def base_commitment(
         },
         "key_set_sha256": key_set_digest(state_dict.keys()),
         "key_count": len(state_dict),
-        # The gate is the digest and the count, per the ruling. This list is carried so a
+        # The gate is the digest and the count, by design. This list is carried so a
         # REFUSAL can name the offending key: a digest proves inequality and says nothing
         # about which key caused it, and the first version of this change regressed the
         # old message from "carries key ['net.some_future_statistic']" to "has 5 keys,
@@ -803,7 +803,7 @@ def base_commitment(
 
 
 def assert_base_commitment(commitment: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Validate a pool's base record, or RAISE. There is no fallback, by ruling.
+    """Validate a pool's base record, or RAISE. There is deliberately no fallback.
 
     A pool that records no base cannot merge: falling back to loading a stock base would
     make the field permanently optional, and a backfilled-on-the-fly base is a
@@ -841,7 +841,7 @@ def unreported_non_learned(*, reason: str) -> Dict[str, Any]:
     returns a ``materialize_soup`` payload without them. That case gets a block SAYING
     SO rather than a bare null, because a reader must be able to tell "this runtime did
     not supply them" from "this soup had no contributor diameters" — collapsing the two
-    is the same false silence the row was filed about. The published checkpoint is still
+    is the same false silence this guard is about. The published checkpoint is still
     correct: the carry-through happens inside ``uniform_soup``, so the tensor holds the
     base's value whether or not the runtime reported it; only the RECORD is poorer.
     """
@@ -1150,7 +1150,7 @@ def uniform_soup(
     before the accumulation loop allocates, so it costs one transient member and
     does not raise the steady-state peak.
 
-    Base-commitment requirement 3, ruled 2026-11-14: a non-learned key (``NON_WEIGHT_PARAMS``,
+    A non-learned key (``NON_WEIGHT_PARAMS``,
     e.g. ``diam_labels``) is carried through from ``base`` UNCHANGED and is never
     averaged. Averaging them produced 57.7405 for a four-member pool whose real
     per-site diameters were 29.711 / 54.986 / 28.912 / 117.353 — a field asserting a
@@ -1168,7 +1168,7 @@ def uniform_soup(
     Collected as plain floats off the tensor while the member is already resident, so
     it adds no second pass and retains nothing after ``del sd``.
 
-    Base-commitment requirement 2: classification is TOTAL and fail-closed. Every member key
+    Classification is TOTAL and fail-closed. Every member key
     must appear in ``base``, whose key set IS the architecture's own inventory, and a
     key in neither the base nor the declared non-learned set raises rather than being
     averaged. That is the property that stops this recurring: a future non-learned
@@ -1191,9 +1191,9 @@ def uniform_soup(
     if not n:
         raise ValueError("uniform_soup requires at least one state_dict")
 
-    # The pool's RECORDED base (option (b), ruled 2026-11-14), not a loaded checkpoint:
+    # The pool's RECORDED base, not a loaded checkpoint:
     # the merge reads two floats and a key-set commitment out of pool_index.json and
-    # never builds a model. Raises when absent — there is no fallback, by ruling.
+    # never builds a model. Raises when absent — there is deliberately no fallback.
     commitment = assert_base_commitment(base)
     base_non_learned = commitment["non_learned"]
     expected_keys_sha = commitment["key_set_sha256"]
@@ -1208,7 +1208,7 @@ def uniform_soup(
             raise ValueError(
                 f"uniform_soup member {index} loaded an empty state_dict"
             )
-        # Requirement 2, fail-closed, against the pool's committed inventory. Both the
+        # Fail-closed, against the pool's committed inventory. Both the
         # digest AND the count are checked: the digest alone would be enough
         # cryptographically, but the count makes the failure message actionable, and a
         # count that disagreed with its own digest would mean the commitment itself was
@@ -1265,7 +1265,7 @@ def uniform_soup(
                       if key not in carried}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
                    for key, value in sd.items() if key not in carried}
-        # Base-commitment requirement 4: the contributors' OWN diameters are not discarded, they
+        # The contributors' OWN diameters are not discarded, they
         # are recorded in the community manifest. Collected here, in loader order, so
         # the caller gets them without a second pass over every member's weights — the
         # merge already holds this state dict and will not hold it again. Scalars only,
@@ -1511,7 +1511,7 @@ def empty_index(model_type: str, architecture_signature: str,
         "architecture_signature": architecture_signature,
         # The base this pool is anchored to, recorded ONCE here. The
         # merge reads its two floats and its key-set commitment and never loads a model.
-        # Optional at CREATION and fatal at MERGE, by ruling: a pool that records none
+        # Optional at CREATION and fatal at MERGE, by design: a pool that records none
         # cannot merge, and there is deliberately no fallback to loading a stock base,
         # which would make the field permanently optional. A separate census covers
         # how many existing pools this blocks.
@@ -1560,7 +1560,7 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
 # bytes that were deposited. One is expected and boring; the other is a possible
 # integrity incident that a human has to look at. A single code for both would
 # bury the second inside the first, which is exactly the "no digest" versus
-# "digest not checked" confusion this row was filed about.
+# "digest not checked" confusion this guard removes.
 # ---------------------------------------------------------------------------
 QUARANTINE_NO_DIGEST = "no_digest"
 QUARANTINE_DIGEST_MISMATCH = "digest_mismatch"
@@ -1648,7 +1648,7 @@ def digest_quarantine(
     be in it.
 
     RAISES rather than admitting a member whose bytes it was not shown. That is the
-    load-bearing line in this function: the failure this row exists to prevent is
+    load-bearing line in this function: the failure this function exists to prevent is
     souping bytes nothing checked, and a version of this that treated an unhashed
     member as "nothing to compare, carry on" would restore that failure exactly
     while every test below still passed. A missing entry is a caller bug, not a
@@ -1924,15 +1924,15 @@ def build_community_manifest(
         # materialize_soup just computed, and a caller-supplied basis could disagree
         # with the bytes. See CURRENT_DIGEST_BASIS for the lock-step rule.
         "weights_sha256_basis": CURRENT_DIGEST_BASIS,
-        # Base-commitment requirements 3 and 4. ``non_learned`` says what the published checkpoint's
+        # ``non_learned`` says what the published checkpoint's
         # diameter IS and that it was inherited rather than learned (build it with
         # ``inherited_non_learned`` so the basis label travels with the float).
         # ``member_non_learned`` is where the contributors' OWN measured diameters live —
-        # the ruling's "one operative value in the tensor, four honest values in the
+        # the rule's "one operative value in the tensor, four honest values in the
         # record". Both default to None rather than to {} or [], because an empty map and
         # an absent one must stay distinguishable: a merge written before this field
         # existed carries null, and reading that as "this soup had no contributor
-        # diameters" would be the same false-silence the row was filed about.
+        # diameters" would be the same false silence this guard is about.
         "non_learned": non_learned,
         "member_non_learned": member_non_learned,
         "created_at": created_at,

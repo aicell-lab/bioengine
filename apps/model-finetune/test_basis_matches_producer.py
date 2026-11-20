@@ -16,13 +16,13 @@ assertion is about which function is NAMED, not about running it, and importing
 This is the only check in the suite that pins ``CONTRIBUTION_DIGEST_BASIS`` to the code
 it describes. ``test_digest_basis.py`` compares the stamp against that constant, so the
 two agree by construction and a change to the runtime's digest call leaves the whole of
-it green while the constant silently becomes false - which is this row's own defect,
+it green while the constant silently becomes false - which is this check's own subject,
 reintroduced from the other side.
 
-Authored by the sibling instance of this lane (cwd ``.../quiet-mountain``) as the missing
-assertion in its refutation on the stored-basis stamp, measured there at 3 failed / 2 passed against the
-wrong constant. Adopted into the branch rather than rewritten, because a test whose point
-is to be independent of its author's reasoning should not be re-derived by that author.
+Written as the missing assertion in a refutation of the stored-basis stamp, measured there at
+3 failed / 2 passed against the wrong constant, and adopted as written rather than re-derived:
+a test whose point is to be independent of an author's reasoning should not be rewritten by
+that author.
 """
 
 from __future__ import annotations

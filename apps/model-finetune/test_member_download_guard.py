@@ -157,7 +157,7 @@ def _seed_cache(rt, key: str, payload: bytes) -> Path:
 
 @pytest.mark.asyncio
 async def test_a_cached_member_is_hashed_from_its_BYTES_not_its_recorded_digest(tmp_path):
-    """The clause this row exists for: ``verify_members`` must hash what is on
+    """What this file exists to check: ``verify_members`` must hash what is on
     disk, every merge, cache hit included.
 
     The failure it guards is one line and ships green: returning ``m["sha256"]``

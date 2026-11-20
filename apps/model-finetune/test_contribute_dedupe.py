@@ -14,7 +14,7 @@ checkpoint into two deposits; it can only hide the double weight. Comparing a
 caller-supplied field as well (``dataset_fingerprint``) would let a retry defeat
 de-duplication by accident.
 
-Two things are asserted that the row's own clause does not ask for, because
+Two things are asserted beyond what is strictly required, because
 "one member remains" is satisfied by a run that left the artifact unusable:
 
 * the stage was DISCARDED, and
@@ -320,7 +320,7 @@ def _index_puts(stub: _Stub) -> List[bytes]:
 
 @pytest.mark.asyncio
 async def test_a_redeposit_leaves_exactly_one_member(fake_training: None) -> None:
-    """The row's clause 2, first half."""
+    """Exactly one member for a repeated digest: first half."""
     idx = _index(_member(_FIRST_ID, _DIGEST))
     stub = _Stub(idx, _DIGEST)
     await _deposit(stub)
@@ -332,7 +332,7 @@ async def test_a_redeposit_leaves_exactly_one_member(fake_training: None) -> Non
 
 @pytest.mark.asyncio
 async def test_a_redeposit_leaves_the_first_member_intact(fake_training: None) -> None:
-    """Clause 2's other half, paired with the count: a dedup that DELETED the
+    """The other half, paired with the count: a dedup that DELETED the
     member would also leave 'exactly one' false-green on an empty pool, and would
     satisfy the count assertion above on a pool of two."""
     first = _member(_FIRST_ID, _DIGEST)
@@ -450,10 +450,10 @@ async def test_both_return_paths_have_the_same_shape(fake_training: None) -> Non
 
 @pytest.mark.asyncio
 async def test_a_redeposit_discards_the_stage_and_writes_nothing(fake_training: None) -> None:
-    """The failure mode the row does not name, and the one that would be worse than
-    the bug: ``put_file`` minted the duplicate's weights row inside the stage
-    before the digest could be known, so leaving the block without discarding
-    makes every later commit on this pool fail for ~62 s and then raise."""
+    """Not the bug itself, and worse than it: ``put_file`` minted the duplicate's
+    weights row inside the stage before the digest could be known, so leaving the
+    block without discarding makes every later commit on this pool fail for ~62 s
+    and then raise."""
     stub = _Stub(_index(_member(_FIRST_ID, _DIGEST)), _DIGEST)
     await _deposit(stub)
     assert stub.discards == ["bioimage-io/cpsam-community-pool"], (
@@ -467,7 +467,7 @@ async def test_a_redeposit_discards_the_stage_and_writes_nothing(fake_training: 
 
 @pytest.mark.asyncio
 async def test_a_different_checkpoint_still_appends_and_commits(fake_training: None) -> None:
-    """Clause 3's pair for the whole path: the dedup cannot pass by refusing every
+    """The pair for the whole path: the dedup cannot pass by refusing every
     deposit. Read off the index bytes actually PUT, not off the in-memory dict."""
     idx = _index(_member(_FIRST_ID, _OTHER_DIGEST))
     stub = _Stub(idx, _DIGEST)
@@ -522,7 +522,7 @@ async def test_a_fresh_deposit_counts_a_contribution(fake_training: None) -> Non
 async def test_an_already_merged_checkpoint_is_recognised_on_the_whole_path(
     fake_training: None,
 ) -> None:
-    """Clause 3 end to end: a re-deposit of a checkpoint already inside a published
+    """The dedup end to end: a re-deposit of a checkpoint already inside a published
     community soup is returned, never appended."""
     idx = _index(_member(_FIRST_ID, _DIGEST))
     idx["decided_contribution_ids"] = [_FIRST_ID]

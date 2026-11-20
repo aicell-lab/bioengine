@@ -23,7 +23,7 @@ that probe ran at ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100
 30 s named above: 105 calls, 0 failed, 84 answered by a replica that already knew its
 smoke test had failed, across 22 distinct pids. What this fix buys is the missing modules being **named in the
 replica log on every cycle** rather than nothing being said at all; a probe deployment owns
-the behaviour question and is a ``bioengine/**`` change in another lane.
+the behaviour question and is a ``bioengine/**`` change, tracked separately.
 ``_settle_check_health`` below models one replica's two polls, which is the most a
 plain-pytest test can reach. ``ping()`` stays shallow on purpose and that is pinned
 here too — importing torch cannot fit a 2 s pre-call gate, and a per-poll import of a
