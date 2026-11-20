@@ -106,10 +106,38 @@ class _PermanentRegistrationError(RuntimeError):
 # there would remove the service during the very wake-up it is meant to allow.
 _SERVICEABLE_AT_ZERO_REPLICAS = ("HEALTHY", "UPSCALING", "DOWNSCALING")
 
+# Serve writes this into a deployment's status message when replicas have been
+# PENDING_ALLOCATION past its slow-start threshold — it cannot place them, and the
+# message carries the required-vs-available pair that says why. Its sibling case,
+# PENDING_INITIALIZATION, gets a different message ("...to initialize") and is a
+# replica that WILL arrive: a scale-from-zero wake-up building a runtime_env venv
+# looks exactly like that. Matching this phrase is therefore the line between
+# "cannot ever be placed" and "slow to place", which elapsed time cannot draw.
+#
+# Keyed on the message because nothing else carries it: ``update_message`` leaves
+# ``status_trigger`` untouched, so the trigger is identical in both cases. The phrase
+# occurs in exactly one Serve source file, which is as stable as this gets.
+_UNPLACEABLE_MARKER = "Resources required for each replica"
 
-def _is_serviceable(running: int, status: str) -> bool:
-    """Whether a sibling deployment can serve a request, now or after an upscale."""
-    return running > 0 or status in _SERVICEABLE_AT_ZERO_REPLICAS
+
+def _is_unplaceable(message: str) -> bool:
+    """Whether Serve is reporting that this deployment's replicas cannot be placed."""
+    return bool(message) and _UNPLACEABLE_MARKER in message
+
+
+def _is_serviceable(running: int, status: str, message: str = "") -> bool:
+    """Whether a sibling deployment can serve a request, now or after an upscale.
+
+    A running replica settles it. At zero replicas the status alone used to decide,
+    which made a deployment whose replicas can never be placed indistinguishable
+    from one mid-wake-up — so an app that could never come back kept its Hypha
+    service registered and accepted requests it could not serve.
+    """
+    if running > 0:
+        return True
+    if status not in _SERVICEABLE_AT_ZERO_REPLICAS:
+        return False
+    return not _is_unplaceable(message)
 
 
 # ``ray_actor_options`` is intentionally minimal here. The proxy needs a
@@ -1663,8 +1691,8 @@ class ProxyDeployment:
         # Deregister so the service disappears from Hypha, and re-gate. The
         # outage stays visible in the app status via the down deployment
         # itself, so the proxy need not fail its own health.
-        for dep, (running, status) in states.items():
-            if _is_serviceable(running, status):
+        for dep, (running, status, message) in states.items():
+            if _is_serviceable(running, status, message):
                 self._dep_seen_ready[dep] = True
             elif self._dep_seen_ready.get(dep):
                 logger.error(
@@ -1822,7 +1850,7 @@ class ProxyDeployment:
     # ===== Ray Serve Health Check =====
     # Implements periodic health checks for Ray Serve.
 
-    async def _sibling_states(self) -> Optional[Dict[str, Tuple[int, str]]]:
+    async def _sibling_states(self) -> Optional[Dict[str, Tuple[int, str, str]]]:
         """``(RUNNING replica count, deployment status)`` for every sibling
         deployment (all deployments in this app but the proxy itself), read
         out-of-band from the Serve controller.
@@ -1878,11 +1906,11 @@ class ProxyDeployment:
             except Exception:
                 self._own_deployment_name = None
 
-        def _query() -> Optional[Dict[str, Tuple[int, str]]]:
+        def _query() -> Optional[Dict[str, Tuple[int, str, str]]]:
             app = _serve.status().applications.get(self.application_id)
             if app is None:
                 return None
-            states: Dict[str, Tuple[int, str]] = {}
+            states: Dict[str, Tuple[int, str, str]] = {}
             for name, deployment in app.deployments.items():
                 if name == self._own_deployment_name:
                     continue
@@ -1892,10 +1920,12 @@ class ProxyDeployment:
                     if str(getattr(state, "value", state)) == "RUNNING"
                 )
                 status = str(getattr(deployment.status, "value", deployment.status))
-                states[name] = (running, status)
+                # Serve puts the unplaceable-replica report here and nowhere else.
+                message = str(getattr(deployment, "message", "") or "")
+                states[name] = (running, status, message)
             return states
 
-        def _read() -> Optional[Dict[str, Tuple[int, str]]]:
+        def _read() -> Optional[Dict[str, Tuple[int, str, str]]]:
             try:
                 try:
                     return _query()

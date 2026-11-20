@@ -112,7 +112,7 @@ async def test_saturation_does_not_deregister() -> None:
         server=_Server(),
         websocket_service_id="ws",
     )
-    inst._sibling_states = _stub_states({"EntryDeployment": (1, "HEALTHY")})
+    inst._sibling_states = _stub_states({"EntryDeployment": (1, "HEALTHY", "")})
     await _run(inst)
     assert inst._deregister_services.called is False
 
@@ -140,7 +140,7 @@ async def test_sibling_crash_deregisters() -> None:
         server=_Server(),
         websocket_service_id="ws",
     )
-    inst._sibling_states = _stub_states({"RuntimeDeployment": (0, "UNHEALTHY")})
+    inst._sibling_states = _stub_states({"RuntimeDeployment": (0, "UNHEALTHY", "")})
     await _run(inst)
     assert inst._deregister_services.called is True
 
@@ -157,7 +157,7 @@ async def test_initial_gate_waits_for_all_siblings() -> None:
     inst._register_services = registered
 
     inst._sibling_states = _stub_states(
-        {"EntryDeployment": (1, "HEALTHY"), "RuntimeDeployment": (0, "UPDATING")}
+        {"EntryDeployment": (1, "HEALTHY", ""), "RuntimeDeployment": (0, "UPDATING", "")}
     )
     await _run(inst)
     assert inst.entry_deployment_ready is False
@@ -165,7 +165,7 @@ async def test_initial_gate_waits_for_all_siblings() -> None:
     assert registered.called is False
 
     inst._sibling_states = _stub_states(
-        {"EntryDeployment": (1, "HEALTHY"), "RuntimeDeployment": (1, "HEALTHY")}
+        {"EntryDeployment": (1, "HEALTHY", ""), "RuntimeDeployment": (1, "HEALTHY", "")}
     )
     await _run(inst)
     assert inst.entry_deployment_ready is True
@@ -190,7 +190,7 @@ async def test_scaled_to_zero_does_not_deregister() -> None:
         server=_Server(),
         websocket_service_id="ws",
     )
-    inst._sibling_states = _stub_states({"EntryDeployment": (0, "HEALTHY")})
+    inst._sibling_states = _stub_states({"EntryDeployment": (0, "HEALTHY", "")})
     await _run(inst)
     assert inst._deregister_services.called is False
 
@@ -208,7 +208,7 @@ async def test_wake_up_window_does_not_deregister() -> None:
         server=_Server(),
         websocket_service_id="ws",
     )
-    inst._sibling_states = _stub_states({"EntryDeployment": (0, "UPSCALING")})
+    inst._sibling_states = _stub_states({"EntryDeployment": (0, "UPSCALING", "")})
     await _run(inst)
     assert inst._deregister_services.called is False
 
@@ -222,7 +222,7 @@ async def test_downscaling_to_zero_does_not_deregister() -> None:
         server=_Server(),
         websocket_service_id="ws",
     )
-    inst._sibling_states = _stub_states({"EntryDeployment": (0, "DOWNSCALING")})
+    inst._sibling_states = _stub_states({"EntryDeployment": (0, "DOWNSCALING", "")})
     await _run(inst)
     assert inst._deregister_services.called is False
 
@@ -242,14 +242,14 @@ async def test_cold_start_at_min_replicas_zero_registers() -> None:
     inst._register_services = registered
 
     # Still coming up: not serviceable, gate stays shut.
-    inst._sibling_states = _stub_states({"EntryDeployment": (0, "UPDATING")})
+    inst._sibling_states = _stub_states({"EntryDeployment": (0, "UPDATING", "")})
     await _run(inst)
     assert inst.entry_deployment_ready is False
     await inst._maintenance_tick()
     assert registered.called is False
 
     # Settled at zero replicas because that is what was asked for.
-    inst._sibling_states = _stub_states({"EntryDeployment": (0, "HEALTHY")})
+    inst._sibling_states = _stub_states({"EntryDeployment": (0, "HEALTHY", "")})
     await _run(inst)
     assert inst.entry_deployment_ready is True
     await inst._maintenance_tick()
@@ -274,7 +274,7 @@ def test_serviceability_separates_idle_from_crashed() -> None:
         "_SERVICEABLE_AT_ZERO_REPLICAS before this test can pass."
     )
 
-    assert pd_module._is_serviceable(1, "UNHEALTHY") is True, (
+    assert pd_module._is_serviceable(1, "UNHEALTHY", "") is True, (
         "a deployment with a RUNNING replica can serve regardless of what Serve "
         "thinks of it overall"
     )
@@ -304,13 +304,24 @@ async def test_sibling_states_reads_real_serve_schema(monkeypatch) -> None:
     )
     from ray.serve._private.common import DeploymentStatusTrigger
 
-    def _deployment(status, replica_states):
+    def _deployment(status, replica_states, message=""):
         return DeploymentStatusOverview(
             status=status,
             status_trigger=DeploymentStatusTrigger.CONFIG_UPDATE_COMPLETED,
             replica_states=replica_states,
-            message="",
+            message=message,
         )
+
+    # Serve's own wording for replicas it cannot place, kept verbatim: the predicate
+    # keys on this phrase, so a Serve rewording must fail here rather than silently
+    # turn every unplaceable deployment back into a serviceable one.
+    unplaceable = (
+        "Deployment 'StuckDeployment' in application 'app' has 1 replicas that "
+        "have taken more than 30s to be scheduled. This may be due to waiting for "
+        "the cluster to auto-scale or for a runtime environment to be installed. "
+        "Resources required for each replica: {'CPU': 1.0, 'GPU': 1.0}, total "
+        "resources available: {'CPU': 8.0}. Use `ray status` for more details."
+    )
 
     overview = ServeStatus(
         applications={
@@ -328,6 +339,9 @@ async def test_sibling_states_reads_real_serve_schema(monkeypatch) -> None:
                     ),
                     "IdleDeployment": _deployment(DeploymentStatus.HEALTHY, {}),
                     "BrokenDeployment": _deployment(DeploymentStatus.UNHEALTHY, {}),
+                    "StuckDeployment": _deployment(
+                        DeploymentStatus.UPSCALING, {}, unplaceable
+                    ),
                 },
             )
         }
@@ -336,10 +350,19 @@ async def test_sibling_states_reads_real_serve_schema(monkeypatch) -> None:
 
     inst = _bare_proxy()
     assert await inst._sibling_states() == {
-        "EntryDeployment": (2, "HEALTHY"),
-        "IdleDeployment": (0, "HEALTHY"),
-        "BrokenDeployment": (0, "UNHEALTHY"),
+        "EntryDeployment": (2, "HEALTHY", ""),
+        "IdleDeployment": (0, "HEALTHY", ""),
+        "BrokenDeployment": (0, "UNHEALTHY", ""),
+        "StuckDeployment": (0, "UPSCALING", unplaceable),
     }
+
+    # And the message is not merely carried: it decides. UPSCALING at zero replicas
+    # is serviceable while a wake-up is plausible and not when Serve says the
+    # replicas cannot be placed.
+    import bioengine.apps.proxy_deployment as pd_module
+
+    assert pd_module._is_serviceable(0, "UPSCALING", "") is True
+    assert pd_module._is_serviceable(0, "UPSCALING", unplaceable) is False
 
 
 @pytest.mark.asyncio
