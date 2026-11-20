@@ -1250,12 +1250,11 @@ class BioEngineWorker:
     async def _check_token_expiry(self) -> None:
         if self._token_expires_at - time.time() < 3600:
             # ATTEMPT the mint and fall back on failure, rather than trying to PREDICT whether
-            # the connection is alive. Predicting does not work and the first version of this
-            # fix got it wrong: measured 2026-11-18, `self.server.generate_token` is still a
-            # live callable after the connection dies -- `callable(getattr(...))` returns True
-            # in exactly the broken case -- and the None is deeper inside hypha_rpc, surfacing
-            # only when the call is made. A liveness guard is a presence check that survives
-            # the meaning inversion; only the call itself can tell you.
+            # the connection is alive. Predicting does not work: `self.server.generate_token`
+            # is still a live callable after the connection dies -- `callable(getattr(...))`
+            # returns True in exactly the broken case -- and the None is deeper inside
+            # hypha_rpc, surfacing only when the call is made. A liveness guard is a presence
+            # check that survives the meaning inversion; only the call itself can tell you.
             try:
                 self.logger.info(
                     "Generating a new Hypha token with expiration time set to 3 hours."

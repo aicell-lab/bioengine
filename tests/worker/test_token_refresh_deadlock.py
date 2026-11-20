@@ -1,7 +1,7 @@
 """A worker must not deadlock when its minted token expires while disconnected.
 
-MEASURED FAILURE THIS PINS, deNBI 2026-11-18. A 6.5-hour network outage outlasted the 3-hour
-token the worker mints for itself. When the path returned the reconnect failed on
+THE FAILURE THIS PINS. A network outage lasting longer than the 3-hour token the worker mints
+for itself leaves it holding an expired credential. When the path returns the reconnect fails on
 "Authentication error: The token has expired", and the refresh step then CRASHED:
 
     Monitoring step 'token_expiry' failed: 'NoneType' object is not callable
@@ -35,11 +35,11 @@ from bioengine.worker.worker import BioEngineWorker
 class _DeadServer:
     """Post-auth-failure shape, MEASURED rather than assumed.
 
-    The first version of this fake set `generate_token = None`, which is NOT what happens:
-    measured 2026-11-18 against a real disconnected Hypha client, `generate_token` is still a
-    live `function` and `callable()` returns True -- the None is deeper inside hypha_rpc and
-    surfaces only when the call is MADE. That fake let a liveness-guard fix pass the unit arms
-    and then fail the live reproduction, so it is written here the way the system really behaves.
+    Setting `generate_token = None` is NOT what happens: against a real disconnected Hypha
+    client `generate_token` is still a live `function` and `callable()` returns True -- the None
+    is deeper inside hypha_rpc and surfaces only when the call is MADE. A fake using None lets a
+    liveness-guard fix pass the unit arms and then fail the live reproduction, so this one is
+    written the way the system really behaves.
     """
 
     async def generate_token(self, _config=None):
@@ -72,7 +72,7 @@ def _worker(server, token, bootstrap, expires_at):
     w.workspace = "ws"
     w.client_id = "cid"
     import logging
-    w.logger = logging.getLogger("test_0632")
+    w.logger = logging.getLogger("test_token_refresh")
     return w
 
 
