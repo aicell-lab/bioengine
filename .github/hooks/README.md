@@ -25,8 +25,8 @@ git config core.hooksPath .github/hooks
 
 **Read this before running that command on a shared clone.** `core.hooksPath` is
 stored in `.git/config`, which every worktree of a clone shares, so installing the
-hook arms it for every checkout and every agent session using that clone at once. A
-hook that refuses a push is, from inside another session's turn, hard to tell apart
+hook arms it for every checkout of that clone, and everyone using it, at once. A
+hook that refuses a push is, to someone who did not install it, hard to tell apart
 from a credential or network failure. Install it in your own clone; do not arm it in
 a clone other people are working in without telling them.
 

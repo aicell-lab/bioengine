@@ -43,11 +43,11 @@ def _read_pip(name: str) -> List[str]:
 @bioengine.app(
     num_cpus=2,
     # Sized so the consortium's seven instances fit on two GPUs: 24576 / 5120
-    # admits 4 on Europa's RTX 3090, and on de.NBI (no VRAM_MB, so the worker
+    # admits 4 on the single-machine site's RTX 3090, and on de.NBI (no VRAM_MB, so the worker
     # falls back to a fraction) 5120 / 15360 = 0.33 admits 3 on one T4.
     gpu_memory_mb=5120,
     # Host RAM, not VRAM, is what bounds how many replicas a single-machine
-    # worker admits: Europa has 30 GiB of Ray memory shared across every app, so
+    # worker admits: the single-machine site has 30 GiB of Ray memory shared across every app, so
     # 8 GiB per replica capped it at three. A replica's real footprint is 0.65 GiB
     # idle and about 1 GiB more with a whole dataset resident — every image is
     # float32 at native resolution and the largest pool is ~650 of them.

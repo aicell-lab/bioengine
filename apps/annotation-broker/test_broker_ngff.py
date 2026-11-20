@@ -82,7 +82,7 @@ def _make_hypha_rpc_stub():
 def _install_runtime_stubs() -> dict:
     """Install the stubs UNCONDITIONALLY, remembering what each name held before.
 
-    #0598: the previous version installed a stub only when the name was ABSENT, which
+    An earlier version installed a stub only when the name was ABSENT, which
     made this file's result depend on what ran before it in the same pytest process.
     If another app's suite had already imported the REAL ``bioengine``, this file
     inserted nothing and then imported ``broker`` against the real package, which does
@@ -90,7 +90,7 @@ def _install_runtime_stubs() -> dict:
     and 34 collection errors, against 0 when this suite ran first.
 
     Installing unconditionally makes the import deterministic. Returning the PREVIOUS
-    value per name -- including ``_ABSENT`` -- is what keeps #0147's guarantee intact:
+    value per name -- including ``_ABSENT`` -- is what keeps the restore guarantee intact:
     the restore below puts back exactly what was there, so this file still cannot leave
     a fake ``bioengine`` behind for any other suite.
     """
@@ -111,9 +111,9 @@ import broker as bk  # noqa: E402  (must follow the stubs)
 
 # ``broker`` holds its own references now, so put ``sys.modules`` back exactly as it
 # was. Leaving a fake ``bioengine`` here breaks every other app suite collected into
-# the same pytest process -- it imports the stub instead of the real package (#0147).
+# the same pytest process -- it imports the stub instead of the real package.
 # RESTORE, not delete: a plain ``del`` would evict a real module another suite had
-# already imported, which is the same harm in the other direction (#0598).
+# already imported, which is the same harm in the other direction.
 for _name, _prev in _stubbed.items():
     if _prev is _ABSENT:
         del sys.modules[_name]

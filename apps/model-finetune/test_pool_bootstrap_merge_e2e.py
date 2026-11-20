@@ -1,4 +1,4 @@
-"""#0070 end-to-end: bootstrap a pool through the REAL `contribute`, then MERGE it.
+"""bootstrap a pool through the REAL `contribute`, then MERGE it.
 
 This is the test whose absence let `d0679f8f` reach a `done` label with a dead production
 path. Every pre-existing test built the base commitment itself, via the helper at
@@ -14,7 +14,7 @@ the `pool_index.json` bytes it PUT, and merges against that. Against the pre-fix
 written record carries `base_commitment: None` and the merge raises.
 
 The remaining arms pin the merge contract itself — the base's diameter is carried rather than
-averaged (#0070's original defect), the inventory is fail-closed, and a merge of zero members
+averaged (the defect the base-commitment rules fix), the inventory is fail-closed, and a merge of zero members
 raises rather than returning an empty checkpoint.
 
 Synthetic tensors only: torch, no cellpose, no GPU, no pool artifact.
@@ -203,7 +203,7 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
 
     assert index.get("base_commitment") is not None, (
         "contribute bootstrapped a pool with base_commitment: None — the record it wrote "
-        "can never merge (#0070). The runtime supplied one; the entry dropped it."
+        "can never merge. The runtime supplied one; the entry dropped it."
     )
     # Complete, not merely present: a partial record raises later and further away.
     written = pool.assert_base_commitment(index["base_commitment"])
@@ -219,10 +219,10 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
 
     assert float(soup["encoder.weight"][0]) == pytest.approx(4.0)   # (3+5)/2
     assert float(soup["decoder.bias"][0]) == pytest.approx(7.0)     # (5+9)/2
-    # #0070's original defect: the base's diameter is carried, NOT averaged. 30.0 vs 47.0.
+    # The defect the base-commitment rules fix: the base's diameter is carried, NOT averaged. 30.0 vs 47.0.
     assert float(soup["diam_labels"][0]) == pytest.approx(BASE_DIAM)
     assert float(soup["diam_labels"][0]) != pytest.approx((M1_DIAM + M2_DIAM) / 2)
-    # Requirement 4: the contributors' own diameters survive, in loader order.
+    # The contributors' own diameters survive, in loader order.
     assert [c["diam_labels"] for c in collected] == [M1_DIAM, M2_DIAM]
     assert set(soup) == set(_BASE_SD)
 
@@ -232,7 +232,7 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
 def test_a_pool_bootstrapped_the_old_way_cannot_merge() -> None:
     """`empty_index(model_type, signature)` — the two-argument call `entry.py` used to make.
 
-    No fallback to loading a stock base: the ruling is explicit that a fallback would make
+    No fallback to loading a stock base: a fallback would make
     the commitment permanently optional.
     """
     index = pool.empty_index(MODEL_TYPE, _SIG)
