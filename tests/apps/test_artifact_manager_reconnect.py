@@ -687,7 +687,7 @@ def fast_grace(monkeypatch):
 async def test_a_transient_resolution_failure_at_boot_is_survived(fast_grace):
     """THE DEFECT: before the fix, one failure here killed the worker."""
     server = _FlakyServer(fail_times=3)
-    proxy = await _manager_with(server)._resolve_artifact_manager_proxy()
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
 
     assert proxy.name == "after-retry"
     assert server.attempts == 4, "should have retried exactly until it succeeded"
@@ -713,7 +713,7 @@ async def test_a_healthy_boot_is_not_delayed(monkeypatch):
 
     server = _FlakyServer(fail_times=0)
     started = _time.monotonic()
-    proxy = await _manager_with(server)._resolve_artifact_manager_proxy()
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
     elapsed = _time.monotonic() - started
 
     assert proxy.name == "after-retry"
@@ -739,7 +739,7 @@ async def test_a_service_that_never_returns_still_RAISES_rather_than_hanging(
 
     started = _time.monotonic()
     with pytest.raises(KeyError) as raised:
-        await _manager_with(server)._resolve_artifact_manager_proxy()
+        await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
     elapsed = _time.monotonic() - started
 
     assert raised.value is sentinel, "the operator must see the real error"
@@ -774,7 +774,7 @@ async def test_the_wait_never_overshoots_the_grace(monkeypatch):
     server = _FlakyServer(fail_times=10**9)
     started = _time.monotonic()
     with pytest.raises(KeyError):
-        await _manager_with(server)._resolve_artifact_manager_proxy()
+        await _manager_with(server)._resolve_artifact_manager_proxy(_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
     elapsed = _time.monotonic() - started
 
     assert server.attempts >= 1
@@ -820,4 +820,131 @@ def test_the_boot_path_resolves_THROUGH_the_retry_and_not_around_it():
     assert len(retry_calls) == 1, (
         f"expected exactly one call to _resolve_artifact_manager_proxy, "
         f"found {len(retry_calls)}"
+    )
+
+
+# ── The grace must NOT reach the running worker's repair path ────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_repair_path_fails_fast_instead_of_waiting_the_boot_grace():
+    """The regression this guards against.
+
+    `complete_initialization` is NOT boot-only: a running worker repairs an evicted
+    registration through `_connect_to_server`, whose entire budget is RECONNECT_BUDGET_S
+    (15 s) so the repair "fits inside one pass". With the grace applied unconditionally
+    that repair blocked for up to 300 s, which stalled every later step in the tick,
+    staled the 120 s heartbeat so the host census aged the worker out, and pushed
+    `unreachable_for` past the condemn threshold on the FIRST attempt -- making the
+    absorb-silently branch unreachable.
+
+    The assertion is on ELAPSED TIME against the caller's own budget, not on a flag,
+    because the flag is only interesting insofar as it bounds the wait.
+    """
+    from bioengine.utils.network import RECONNECT_BUDGET_S
+
+    server = _FlakyServer(fail_times=10_000)   # never succeeds
+    started = asyncio.get_event_loop().time()
+    with pytest.raises(Exception):
+        await _manager_with(server)._resolve_artifact_manager_proxy()   # default grace = 0
+    elapsed = asyncio.get_event_loop().time() - started
+
+    assert elapsed < RECONNECT_BUDGET_S, (
+        "the repair path took %.2fs, which does not fit inside its own %.0fs budget"
+        % (elapsed, RECONNECT_BUDGET_S)
+    )
+    assert server.attempts == 1, (
+        "expected ONE attempt on the fail-fast path, got %d" % server.attempts
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_boot_path_still_retries_when_it_opts_in(fast_grace):
+    """The control: the fix must not have simply deleted the retry.
+
+    Without this, the test above would pass against a version that never waits at all --
+    i.e. the original defect, reintroduced.
+    """
+    server = _FlakyServer(fail_times=3)
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(
+        _manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S
+    )
+    assert proxy.name == "after-retry"
+    assert server.attempts == 4, server.attempts
+
+
+# ── The two call sites, pinned separately — not just the default ───────────────
+
+
+def _enclosing_source(method):
+    """The source of ONE method, so a match proves location and not mere presence.
+
+    A test that greps the whole module passes against a mutant that deletes the
+    opt-in from the boot path and adds it anywhere else in the file. Scoping each
+    assertion to `inspect.getsource(<the method>)` is what makes it a statement
+    about *where* the argument is passed.
+    """
+    import inspect
+
+    return inspect.getsource(method)
+
+
+def test_the_default_grace_is_FAIL_FAST_at_both_layers():
+    """A caller that has not thought about the grace must get one attempt.
+
+    Both the repair path (`_check_service_registration` -> `_connect_to_server()`
+    with no arguments) and any future caller inherit these defaults, so the
+    defaults are the actual safety property -- not the boot path's explicit value.
+    """
+    import inspect
+
+    from bioengine.apps.manager import AppsManager
+    from bioengine.worker.worker import BioEngineWorker
+
+    checked = {}
+    for label, fn in (
+        ("AppsManager._resolve_artifact_manager_proxy", AppsManager._resolve_artifact_manager_proxy),
+        ("AppsManager.complete_initialization", AppsManager.complete_initialization),
+        ("BioEngineWorker._connect_to_server", BioEngineWorker._connect_to_server),
+    ):
+        params = inspect.signature(fn).parameters
+        name = "grace_s" if "grace_s" in params else "artifact_manager_grace_s"
+        assert name in params, f"{label} has no grace parameter at all"
+        checked[label] = params[name].default
+
+    assert checked, "nothing was checked"
+    for label, default in checked.items():
+        assert default == 0, (
+            f"{label} defaults its grace to {default!r}; the repair path calls it "
+            f"with no arguments, so a non-zero default puts the 300 s wait back on "
+            f"the monitoring tick"
+        )
+
+
+def test_the_BOOT_call_site_opts_IN_and_the_REPAIR_call_site_does_NOT():
+    """Where the opt-in lives, asserted per-method rather than per-file.
+
+    The grace itself is not wrong -- it is right at boot. The problem is that
+    `complete_initialization` is reached from TWO places and only one of them can
+    afford to wait. So the fix is a property of the two call sites, and this is the
+    arm that fails if someone later "simplifies" it back to one path.
+    """
+    from bioengine.worker.worker import BioEngineWorker
+
+    boot = _enclosing_source(BioEngineWorker.start)
+    repair = _enclosing_source(BioEngineWorker._check_service_registration)
+
+    # CONTROL: both methods must actually call _connect_to_server, or the two
+    # assertions below are vacuous -- an empty haystack satisfies "not in".
+    assert "_connect_to_server" in boot, "boot path no longer calls _connect_to_server"
+    assert "_connect_to_server" in repair, "repair path no longer calls _connect_to_server"
+
+    assert "artifact_manager_grace_s" in boot, (
+        "the boot path no longer opts into the grace, so a Hypha gap at boot "
+        "crash-loops the worker again, which is the defect this module exists for"
+    )
+    assert "artifact_manager_grace_s" not in repair, (
+        "the repair path now passes a grace; one monitoring tick can again block "
+        "for the full grace, stale the heartbeat and condemn the registration on "
+        "its first attempt"
     )

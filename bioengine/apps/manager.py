@@ -309,12 +309,23 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
-# Grace and backoff for the FIRST resolution of the artifact manager, in
-# ``initialize()``. Every later call is covered by _ReconnectingArtifactManager,
-# which re-resolves on demand; that first one had nothing, so a worker starting
-# while Hypha was not serving ``public:artifact-manager`` raised out of
-# initialize() and died, and the container then crash-looped. A worker already
-# running rode the same outage out untouched.
+# Grace and backoff for the artifact-manager resolution done at BOOT, which is
+# the only caller that opts into this wait. Every *later* call on a resolved
+# proxy is covered by _ReconnectingArtifactManager, which re-resolves on demand;
+# the boot one had nothing, so a worker starting while Hypha was not serving
+# ``public:artifact-manager`` raised out of startup and died, and the container
+# then crash-looped. A worker already running rode the same outage out untouched.
+#
+# ⚠ This is NOT a property of ``complete_initialization``, which resolves the
+# proxy: that method runs on EVERY reconnect, including the running worker's
+# registration repair in ``_check_service_registration``, whose whole monitoring
+# pass is budgeted at RECONNECT_BUDGET_S. Waiting this long there stalls every
+# later step of the tick, lets the heartbeat go stale so the host census ages the
+# worker out, and pushes ``unreachable_for`` past the condemn threshold on the
+# first repair attempt — making the absorb-silently branch unreachable. Hence the
+# grace is a per-call argument defaulting to 0, and only the boot call site
+# passes it. Measured before that split: a repair whose resolution never
+# succeeded took 304 s inside a 15 s budget.
 #
 # Measured 2026-11-19 on a production Kubernetes deployment, both halves inside
 # one hour: the pod that was already up re-registered unaided once the service
@@ -1776,8 +1787,17 @@ class AppsManager:
             return deployed_at
         return deployed_at if reported is None else reported
 
-    async def _resolve_artifact_manager_proxy(self) -> Any:
+    async def _resolve_artifact_manager_proxy(self, grace_s: float = 0.0) -> Any:
         """Resolve ``public/artifact-manager``, tolerating a transient Hypha gap.
+
+        ``grace_s`` defaults to **0**, i.e. one attempt and fail. The grace is opt-in
+        per call because this method is NOT boot-only: ``complete_initialization`` runs
+        on every reconnect, including the running worker's registration repair, and that
+        caller has a 15 s budget for a whole monitoring pass. Waiting 300 s there stalled
+        every later step in the tick, staled the 120 s heartbeat so the host census aged
+        the worker out, and pushed the repair past the condemn threshold on its FIRST
+        attempt. Defaulting to 0 means a caller that has not thought about it gets the
+        fail-fast behaviour rather than the 300 s one.
 
         Every *later* use of this proxy is covered by
         ``_ReconnectingArtifactManager``, which re-resolves on demand. This
@@ -1796,7 +1816,7 @@ class AppsManager:
         error is re-raised, so a worker whose platform is genuinely gone still
         exits and says why instead of hanging forever looking healthy.
         """
-        deadline = time.time() + _ARTIFACT_MANAGER_RESOLVE_GRACE_S
+        deadline = time.time() + grace_s
         delay = _ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S
         attempt = 0
         while True:
@@ -1823,7 +1843,11 @@ class AppsManager:
                 delay = min(delay * 2, _ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S)
 
     async def complete_initialization(
-        self, server: RemoteService, admin_users: List[str], worker_service_id: str
+        self,
+        server: RemoteService,
+        admin_users: List[str],
+        worker_service_id: str,
+        artifact_manager_grace_s: float = 0.0,
     ) -> None:
         """
         Initialize the deployment manager with Hypha server connections and admin permissions.
@@ -1844,10 +1868,20 @@ class AppsManager:
             admin_users: List of user IDs or email addresses with administrative permissions
                         for managing applications and deployments
             worker_service_id: BioEngine worker service ID
+            artifact_manager_grace_s: how long to keep retrying the artifact-manager
+                        resolution before giving up, in seconds. **Defaults to 0 —
+                        one attempt and raise.** Only the worker's boot path opts
+                        into a non-zero grace, because this method also runs on
+                        every reconnect, including the running worker's
+                        registration repair, and that caller's whole monitoring
+                        pass is budgeted at RECONNECT_BUDGET_S. See the comment on
+                        _ARTIFACT_MANAGER_RESOLVE_GRACE_S.
 
         Raises:
-            Exception: If server connection fails, artifact manager is unavailable,
-                      or startup application deployment fails
+            Exception: If server connection fails, the artifact manager is still
+                      unavailable after ``artifact_manager_grace_s``, or startup
+                      application deployment fails. With the default grace of 0
+                      this is immediate; with a grace it can take that long.
         """
         if not server or not isinstance(server, RemoteService):
             raise ValueError("Invalid server connection provided.")
@@ -1868,7 +1902,7 @@ class AppsManager:
             # help once it exists.
             self.artifact_manager = _ReconnectingArtifactManager(
                 server=self.server,
-                proxy=await self._resolve_artifact_manager_proxy(),
+                proxy=await self._resolve_artifact_manager_proxy(artifact_manager_grace_s),
                 logger=self.logger,
             )
             self.logger.info("Successfully connected to artifact manager.")
