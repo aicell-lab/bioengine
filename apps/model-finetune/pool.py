@@ -704,10 +704,10 @@ NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
 
 
 # The basis strings a community manifest uses to say WHERE its
-# non-learned values came from. Reporting the float alone is explicitly
-# not enough — "the manifest must record that the soup's diam_labels was INHERITED and
-# name its source, or the original defect reappears in the manifest instead of the state
-# dict". So the value never travels without this label beside it.
+# non-learned values came from. Reporting the float alone is not enough: the manifest
+# must record that the soup's diam_labels was INHERITED and name its source, or the
+# original defect reappears in the manifest instead of the state dict. So the value
+# never travels without this label beside it.
 NON_LEARNED_INHERITED = "inherited_from_base_checkpoint"
 NON_LEARNED_NOTE = (
     "A federated checkpoint has no single learned object diameter. These values are the "
