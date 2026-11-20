@@ -433,10 +433,23 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     assert cfg.initial_replicas == 1, (
         "#0370: with 0 the placement warning is never written on the cluster it is for"
     )
-    # CONTROL: this is the live resolved config, not a default-shaped object — these
-    # two values are set in the decorator and are not Ray Serve defaults.
-    assert cfg.max_replicas == 1
-    assert cfg.downscale_delay_s == 600.0
+    # CONTROL that the contracts above are read off the LIVE resolved config and not a
+    # default-shaped object. It has to be a field whose decorator value DIFFERS from
+    # Ray Serve's default, or it cannot fail.
+    #
+    # ⚠ The previous control was `max_replicas == 1` and `downscale_delay_s == 600.0`,
+    # under a comment asserting neither is a Ray Serve default. BOTH WERE. Measured in
+    # the CI image: Ray's AutoscalingConfig defaults are min_replicas=1,
+    # initial_replicas=None, max_replicas=1, downscale_delay_s=600.0,
+    # upscale_delay_s=30.0. So the old control passed against exactly the object it
+    # claimed to exclude, and would have gone on passing if the decorator had stopped
+    # setting either field. `upscale_delay_s` is 0.0 here against a default of 30.0,
+    # so this one discriminates; `min_replicas` (0 vs 1) and `initial_replicas`
+    # (1 vs None) also differ, which is why the contracts above are self-witnessing.
+    assert cfg.upscale_delay_s == 0.0, (
+        "control: 0.0 differs from Ray's 30.0 default, so reaching this line proves "
+        "the decorator's config was resolved rather than a default object read"
+    )
 
 
 def test_the_declaration_this_row_is_about_is_unchanged() -> None:
