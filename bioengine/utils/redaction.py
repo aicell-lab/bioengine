@@ -66,12 +66,25 @@ def looks_like_secret(value: Any) -> bool:
     embedded in something larger — a URL with a token in it, a JSON blob, a
     connection string — and a full-match rule would print all of those.
 
-    Non-strings are never secret-shaped: an int, a bool or ``None`` carries no
-    credential, and coercing them to text to scan would only invent matches.
+    **Containers are scanned through their ``repr``**, because a credential
+    nested inside one is still a credential that gets printed. ``kwargs`` is
+    exactly where a config dict goes, and
+    ``{"config": {"token": "hf_…"}}`` rendered in cleartext while the identical
+    token one level up was masked. The whole container is then masked: masking
+    the leaf alone would mean rebuilding it, and a partially-rendered dict is
+    harder to read than a single ``*****``.
+
+    SCALAR non-strings are still never secret-shaped. An int, a float, a bool or
+    ``None`` carries no credential, and coercing those to text to scan would only
+    invent matches — ``repr(True)`` can match nothing here, but the rule is
+    stated rather than relied on.
     """
-    if not isinstance(value, str):
-        return False
-    return any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS)
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS)
+    if isinstance(value, (dict, list, tuple, set, frozenset)):
+        rendered = repr(value)
+        return any(pattern.search(rendered) for pattern in _SECRET_VALUE_PATTERNS)
+    return False
 
 
 def is_secret_env_var(key: str, value: Any) -> bool:

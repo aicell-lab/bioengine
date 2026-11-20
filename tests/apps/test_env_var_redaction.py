@@ -254,3 +254,49 @@ def test_a_fine_grained_github_pat_is_recognised():
 def test_empty_arguments_render_as_None_not_as_an_empty_string():
     """Unchanged behaviour, pinned so the extraction cannot quietly alter the line."""
     assert describe_deploy_arguments({}, {}) == ("None", "None")
+
+
+# ── Nested secrets: kwargs is where config dicts live ─────────────────────────
+
+
+def test_a_secret_NESTED_in_a_kwarg_dict_is_masked():
+    """The same leak one level down.
+
+    `looks_like_secret` returned False for anything that was not a string, so a
+    credential inside a dict-valued kwarg rendered in cleartext while the identical token
+    passed directly beside it was masked. kwargs is exactly where a config dict goes.
+    """
+    kwargs_str, _ = describe_deploy_arguments(
+        {"M": {"config": {"token": HF_SECRET}, "batch_size": 8}}, {}
+    )
+    assert HF_SECRET not in kwargs_str, kwargs_str
+    assert SECRET_MASK in kwargs_str, kwargs_str
+    assert "batch_size=8" in kwargs_str, kwargs_str
+
+
+def test_a_secret_NESTED_in_a_kwarg_list_is_masked():
+    kwargs_str, _ = describe_deploy_arguments({"M": {"tokens": [HF_SECRET, "public"]}}, {})
+    assert HF_SECRET not in kwargs_str, kwargs_str
+    assert SECRET_MASK in kwargs_str, kwargs_str
+
+
+def test_a_secret_nested_in_an_ENV_VAR_container_is_masked_too():
+    """env_vars takes the same path, so it must not be fixed on one side only."""
+    _, env_vars_str = describe_deploy_arguments({}, {"App": {"CFG": {"inner": JWT_SECRET}}})
+    assert JWT_SECRET not in env_vars_str, env_vars_str
+    assert SECRET_MASK in env_vars_str, env_vars_str
+
+
+def test_scalar_non_strings_are_still_never_masked():
+    """The narrow-by-design scope, pinned.
+
+    Masking an int or a bool would make ordinary config unreadable, and an operator who
+    cannot read their own logs routes around the redaction. A deep container of harmless
+    values must stay readable too.
+    """
+    kwargs_str, _ = describe_deploy_arguments(
+        {"M": {"n": 4, "flag": True, "nothing": None, "shape": {"w": 256, "h": 256}}}, {}
+    )
+    assert SECRET_MASK not in kwargs_str, kwargs_str
+    assert "n=4" in kwargs_str and "flag=True" in kwargs_str, kwargs_str
+    assert "'w': 256" in kwargs_str, kwargs_str
