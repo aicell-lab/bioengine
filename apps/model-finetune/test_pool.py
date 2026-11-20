@@ -466,9 +466,10 @@ def test_cap_is_actually_enforced_not_just_approached(tmp_path):
 #
 # 0.27.6 moved every ``l2_from_base`` value without touching ``schema_version``,
 # so the record's shape cannot date its own contents. These pin the field that
-# can. The null case is the load-bearing one: an ABSENT key is what a writer from before the stamp
-# writer produces, so writing the key with None is the only thing that tells
-# "this writer did not know its version" apart from "this writer did not stamp".
+# can. The null case is the load-bearing one: an ABSENT key is what a
+# writer older than the version stamp produces, so writing the key with None is
+# the only thing that tells "this writer did not know its version" apart from
+# "this writer did not stamp".
 
 def _metadata(app_version):
     return pool.build_contribution_metadata(
