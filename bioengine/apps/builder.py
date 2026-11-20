@@ -137,6 +137,7 @@ def split_secret_env_vars(
         replica_env_vars["BIOENGINE_SECRET_KEYS"] = ",".join(sorted(secret_env_vars))
     return replica_env_vars, secret_env_vars
 
+
 #: Tiny GPU reservation used only to bind a physical device (and populate
 #: ``CUDA_VISIBLE_DEVICES``) when packing is driven by the ``VRAM_MB`` custom
 #: resource. The ``VRAM_MB`` reservation — not this fraction — bounds how many
@@ -488,10 +489,7 @@ class AppBuilder:
         totals["memory"] += int(proxy_memory_in_gb * (1024**3))
         # num_gpus stays a float: fractional and epsilon reservations round to
         # zero as ints, which would understate the app's GPU demand.
-        return {
-            k: (float(v) if k == "num_gpus" else int(v))
-            for k, v in totals.items()
-        }
+        return {k: (float(v) if k == "num_gpus" else int(v)) for k, v in totals.items()}
 
     async def _get_cluster_gpu_sizing(self) -> Dict[str, Any]:
         """Ask the proxy actor how to size GPU reservations on this cluster.
@@ -663,7 +661,7 @@ class AppBuilder:
 
     @staticmethod
     def _sanitize_recovery_env_vars(
-        application_env_vars: Dict[str, Dict[str, str]]
+        application_env_vars: Dict[str, Dict[str, str]],
     ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, List[str]]]:
         """Strip secret-like keys from proxy app_data, and name what was stripped.
 
@@ -703,9 +701,7 @@ class AppBuilder:
         last_updated_by: Optional[str] = None,
         auto_redeploy: bool = False,
         ice_servers: Optional[List[Dict[str, Any]]] = None,
-        authorized_users: Optional[
-            Union[Dict[str, List[str]], List[str]]
-        ] = None,
+        authorized_users: Optional[Union[Dict[str, List[str]], List[str]]] = None,
         deploying_user: Optional[tuple] = None,
         admin_users: Optional[List[str]] = None,
         scaling: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -776,8 +772,13 @@ class AppBuilder:
             k: v for k, v in flat_env_vars.items() if not k.startswith("_")
         }
         env_vars = self._build_env_vars(
-            application_id, artifact_id, version,
-            non_secret_env_vars, secret_env_vars, hypha_token, download_token,
+            application_id,
+            artifact_id,
+            version,
+            non_secret_env_vars,
+            secret_env_vars,
+            hypha_token,
+            download_token,
         )
         runtime_env = self._build_submit_runtime_env(env_vars)
 
@@ -920,8 +921,7 @@ class AppBuilder:
             "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
         }
         self.logger.info(
-            f"Introspected '{application_id}' "
-            f"(methods: {available_methods})"
+            f"Introspected '{application_id}' " f"(methods: {available_methods})"
         )
         # Compute the proxy + user-replica pip lists here on the worker.
         # ``get_pip_requirements`` uses ``importlib.metadata`` which only

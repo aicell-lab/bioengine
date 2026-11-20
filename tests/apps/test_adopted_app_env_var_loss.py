@@ -335,9 +335,9 @@ def test_the_recovery_blob_strips_every_secret_and_names_what_it_stripped() -> N
         "Every key the sanitiser removes must be named, for every class it "
         "removed one from — and classes that lost nothing must not appear."
     )
-    assert SECRET_VALUE not in str(redacted), (
-        "The names are what travel in the blob; the values must not follow them."
-    )
+    assert SECRET_VALUE not in str(
+        redacted
+    ), "The names are what travel in the blob; the values must not follow them."
 
 
 def test_the_builder_writes_the_redacted_key_names_into_the_recovery_blob() -> None:

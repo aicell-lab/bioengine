@@ -63,11 +63,26 @@ CELLPOSE_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
 # omitted argument arrives as a ``FieldInfo`` object rather than its default value --
 # which fails in a way that looks like a bug in the code under test.
 BASE_KWARGS = dict(
-    train_images=["i"], train_labels=["l"], val_images=None, val_labels=None,
-    model_type="cpsam", n_epochs=1, n_objects_per_batch=8, patch_size=512,
-    diam_mean=30.0, train_tile_size=None, batch_size=1, learning_rate=1e-5,
-    val_fraction=0.2, n_samples=None, resume_session_id=None, init_checkpoint=None,
-    init_from_pool=None, init_from_pool_version=None, pool_token=None, metrics=None,
+    train_images=["i"],
+    train_labels=["l"],
+    val_images=None,
+    val_labels=None,
+    model_type="cpsam",
+    n_epochs=1,
+    n_objects_per_batch=8,
+    patch_size=512,
+    diam_mean=30.0,
+    train_tile_size=None,
+    batch_size=1,
+    learning_rate=1e-5,
+    val_fraction=0.2,
+    n_samples=None,
+    resume_session_id=None,
+    init_checkpoint=None,
+    init_from_pool=None,
+    init_from_pool_version=None,
+    pool_token=None,
+    metrics=None,
     label="",
 )
 
@@ -132,7 +147,9 @@ async def test_the_refusal_happens_before_the_runtime_is_touched() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_type", CELLPOSE_TYPES)
-async def test_omitting_the_tile_is_accepted_for_every_cellpose_model(model_type) -> None:
+async def test_omitting_the_tile_is_accepted_for_every_cellpose_model(
+    model_type,
+) -> None:
     """``None`` keeps cellpose's own per-backbone default and must never be refused."""
     with pytest.raises(_PastTheGuard):
         await _call(model_type=model_type, train_tile_size=None)
@@ -219,7 +236,8 @@ def test_the_worker_passes_it_to_train_seg_as_bsize() -> None:
     tree = ast.parse(source)
 
     calls = [
-        node for node in ast.walk(tree)
+        node
+        for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and getattr(node.func, "attr", getattr(node.func, "id", None)) == "train_seg"
     ]

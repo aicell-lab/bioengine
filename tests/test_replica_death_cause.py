@@ -71,7 +71,7 @@ def _actor(death_causes):
     actor._last_called_at = 0.0
 
     def _list(resource, options, raise_on_missing_output):
-        (_, _, actor_id), = options.filters
+        ((_, _, actor_id),) = options.filters
         cause = death_causes.get(actor_id, _MISSING)
         if cause is _MISSING:
             return []
@@ -232,9 +232,14 @@ def test_apps_logs_asks_for_the_dead_replica():
     async def _connect(*args, **kwargs):
         return SimpleNamespace(get_app_status=_get_app_status)
 
-    with patch.object(
-        apps_cli, "require_worker", lambda w, t, s: ("http://srv", "ws/worker", "tok")
-    ), patch.object(apps_cli, "connect_worker", _connect):
+    with (
+        patch.object(
+            apps_cli,
+            "require_worker",
+            lambda w, t, s: ("http://srv", "ws/worker", "tok"),
+        ),
+        patch.object(apps_cli, "connect_worker", _connect),
+    ):
         result = CliRunner().invoke(apps_cli.logs, ["soup"])
 
     assert result.exit_code == 0, result.output

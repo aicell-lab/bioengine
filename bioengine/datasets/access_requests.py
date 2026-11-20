@@ -28,7 +28,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # parse_token maps an absent token onto these placeholders, and Hypha reports no
 # email at all for an anonymous websocket. Either way there is no account a
 # grant could name.
-UNAUTHENTICATED_EMAILS = frozenset({"anonymous@example.com", "no-email", "anonymous-user"})
+UNAUTHENTICATED_EMAILS = frozenset(
+    {"anonymous@example.com", "no-email", "anonymous-user"}
+)
 
 DECISIONS = ("grant", "deny", "clear")
 

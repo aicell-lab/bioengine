@@ -11,6 +11,7 @@ build the service URL by mirroring this formula in
 ``bioengine.apps.manager.AppsManager._get_application_service_ids``, so
 the two implementations must agree.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -20,18 +21,16 @@ def _expected_suffix(application_id: str) -> str:
     return hashlib.sha1(application_id.encode("utf-8")).hexdigest()[:8]
 
 
-def _proxy_client_id_from_code(
-    worker_client_id: str, application_id: str
-) -> str:
+def _proxy_client_id_from_code(worker_client_id: str, application_id: str) -> str:
     """Replicate the exact expression used in ProxyDeployment.__init__."""
     app_hash = hashlib.sha1(application_id.encode("utf-8")).hexdigest()[:8]
     return f"{worker_client_id}-{app_hash}"
 
 
 def test_client_id_is_deterministic_for_same_app_id() -> None:
-    assert _proxy_client_id_from_code("worker-abc", "demo-app") == _proxy_client_id_from_code(
+    assert _proxy_client_id_from_code(
         "worker-abc", "demo-app"
-    )
+    ) == _proxy_client_id_from_code("worker-abc", "demo-app")
 
 
 def test_client_id_uses_worker_client_id_as_prefix() -> None:

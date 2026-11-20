@@ -46,12 +46,12 @@ def test_roundtrip_excludes_self(tmp_path) -> None:
     _published(tmp_path, "worker-a", head_memory_in_gb=30)
     _published(tmp_path, "worker-b", head_memory_in_gb=30)
 
-    assert [e["worker_id"] for e in host_census.read_co_tenants(tmp_path, "worker-a")] == [
-        "worker-b"
-    ]
-    assert [e["worker_id"] for e in host_census.read_co_tenants(tmp_path, "worker-b")] == [
-        "worker-a"
-    ]
+    assert [
+        e["worker_id"] for e in host_census.read_co_tenants(tmp_path, "worker-a")
+    ] == ["worker-b"]
+    assert [
+        e["worker_id"] for e in host_census.read_co_tenants(tmp_path, "worker-b")
+    ] == ["worker-a"]
 
 
 def test_withdrawn_claim_stops_counting(tmp_path) -> None:
@@ -298,7 +298,10 @@ def test_gpu_env_parsing(monkeypatch) -> None:
         ("none", []),
         ("void", []),
         ("", []),
-        ("GPU-f3f75397-e6e1-a0da-cea9-5e200a6bcb9a", ["GPU-f3f75397-e6e1-a0da-cea9-5e200a6bcb9a"]),
+        (
+            "GPU-f3f75397-e6e1-a0da-cea9-5e200a6bcb9a",
+            ["GPU-f3f75397-e6e1-a0da-cea9-5e200a6bcb9a"],
+        ),
     ]:
         monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", value)
         assert host_census.visible_gpu_device_ids() == expected, value

@@ -283,9 +283,7 @@ def _install_secret_env_vars(instance: Any, logger: logging.Logger) -> None:
     )
 
 
-def _wrap_runtime_handles(
-    user_cls: type, kwargs: Dict[str, Any]
-) -> Dict[str, Any]:
+def _wrap_runtime_handles(user_cls: type, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """Replace incoming ``DeploymentHandle`` kwargs with ``BioEngineRuntimeHandle``.
 
     The decorator scans ``user_cls.__init__``'s type hints once at decoration
@@ -313,9 +311,7 @@ def _wrap_runtime_handles(
     return wrapped
 
 
-def _make_check_health(
-    user_cls: type, lifecycle: Dict[str, Any]
-) -> Callable[..., Any]:
+def _make_check_health(user_cls: type, lifecycle: Dict[str, Any]) -> Callable[..., Any]:
     """Build the orchestrating ``check_health`` method installed on the class.
 
     Ray Serve calls ``check_health`` repeatedly; on the first call we run
@@ -360,7 +356,10 @@ def _make_check_health(
                     _invoke_lifecycle(self, smoke_test_name, "smoke_test", logger)
                 )
 
-            if self._bioengine_test_task is not None and self._bioengine_test_task.done():
+            if (
+                self._bioengine_test_task is not None
+                and self._bioengine_test_task.done()
+            ):
                 exc = self._bioengine_test_task.exception()
                 if exc is not None:
                     self._bioengine_replica_test_failed = True
@@ -431,9 +430,7 @@ async def _invoke_lifecycle(
     logger.info(f"✅ @bioengine.{label} done in {elapsed:.2f}s")
 
 
-def wrap_init(
-    user_cls: type, orig_init: Callable[..., None]
-) -> Callable[..., None]:
+def wrap_init(user_cls: type, orig_init: Callable[..., None]) -> Callable[..., None]:
     """Wrap the user class's ``__init__`` so framework setup runs first."""
 
     @wraps(orig_init)

@@ -103,8 +103,9 @@ def test_no_recorded_digest_means_no_check_rather_than_a_crash(tmp_path):
 
 def test_case_difference_alone_does_not_reject_a_download(tmp_path):
     rt = _runtime(tmp_path, GOOD)
-    path = rt._ensure_member("contrib/c/w.pt", "https://example.invalid/w",
-                             GOOD_SHA.upper())
+    path = rt._ensure_member(
+        "contrib/c/w.pt", "https://example.invalid/w", GOOD_SHA.upper()
+    )
     assert path.read_bytes() == GOOD
 
 
@@ -156,7 +157,9 @@ def _seed_cache(rt, key: str, payload: bytes) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_a_cached_member_is_hashed_from_its_BYTES_not_its_recorded_digest(tmp_path):
+async def test_a_cached_member_is_hashed_from_its_BYTES_not_its_recorded_digest(
+    tmp_path,
+):
     """The clause this row exists for: ``verify_members`` must hash what is on
     disk, every merge, cache hit included.
 
@@ -173,19 +176,22 @@ async def test_a_cached_member_is_hashed_from_its_BYTES_not_its_recorded_digest(
     """
     rt = _preflight_runtime(tmp_path)
     key = "contrib/c-substituted/w.pt"
-    _seed_cache(rt, key, OTHER)          # on disk: OTHER
-    recorded = GOOD_SHA                  # what the pool recorded: sha of GOOD
+    _seed_cache(rt, key, OTHER)  # on disk: OTHER
+    recorded = GOOD_SHA  # what the pool recorded: sha of GOOD
 
     out = await rt.verify_members(
-        [{"key": key, "url": "https://example.invalid/w", "sha256": recorded}])
+        [{"key": key, "url": "https://example.invalid/w", "sha256": recorded}]
+    )
 
     got = out["digests"][key]
     assert got == hashlib.sha256(OTHER).hexdigest(), (
         "verify_members returned a digest that is not the sha256 of the bytes "
-        "on disk — the cached file was never hashed")
+        "on disk — the cached file was never hashed"
+    )
     assert got != recorded, (
         "verify_members echoed the pool's recorded digest back, so the caller's "
-        "actual-vs-recorded comparison compares a value with itself")
+        "actual-vs-recorded comparison compares a value with itself"
+    )
     assert out["soup_dl_bytes"] == 0, "a cache hit must not be counted as transport"
 
 
@@ -202,7 +208,8 @@ async def test_a_cached_member_whose_bytes_agree_reports_that_same_digest(tmp_pa
     _seed_cache(rt, key, GOOD)
 
     out = await rt.verify_members(
-        [{"key": key, "url": "https://example.invalid/w", "sha256": GOOD_SHA}])
+        [{"key": key, "url": "https://example.invalid/w", "sha256": GOOD_SHA}]
+    )
 
     assert out["digests"][key] == GOOD_SHA
 
@@ -217,10 +224,12 @@ async def test_every_member_is_hashed_not_only_the_first(tmp_path):
     _seed_cache(rt, honest, GOOD)
     _seed_cache(rt, bad, OTHER)
 
-    out = await rt.verify_members([
-        {"key": honest, "url": "https://example.invalid/a", "sha256": GOOD_SHA},
-        {"key": bad, "url": "https://example.invalid/b", "sha256": GOOD_SHA},
-    ])
+    out = await rt.verify_members(
+        [
+            {"key": honest, "url": "https://example.invalid/a", "sha256": GOOD_SHA},
+            {"key": bad, "url": "https://example.invalid/b", "sha256": GOOD_SHA},
+        ]
+    )
 
     assert out["digests"][honest] == GOOD_SHA
     assert out["digests"][bad] == hashlib.sha256(OTHER).hexdigest()

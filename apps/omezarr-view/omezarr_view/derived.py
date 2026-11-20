@@ -11,6 +11,7 @@ the source's pixels.** Every derived view says so in its own report and caption,
 names its transform chain, and reports its cache statistics as measured facts.
 Nothing here may be described as zero-copy.
 """
+
 from __future__ import annotations
 
 import json
@@ -163,7 +164,9 @@ class DerivedView(BaseView):
         )
         if channels is not None:
             if "c" not in self.axes:
-                raise ViewError("channel selection requested but the source has no channel axis")
+                raise ViewError(
+                    "channel selection requested but the source has no channel axis"
+                )
             picked = []
             for want in channels:
                 if isinstance(want, int):
@@ -171,7 +174,8 @@ class DerivedView(BaseView):
                 else:
                     if want not in base_names:
                         raise ViewError(
-                            f"no channel named {want!r}; source has {base_names}")
+                            f"no channel named {want!r}; source has {base_names}"
+                        )
                     picked.append(base_names.index(want))
             n_c = base_shape[self.axes.index("c")]
             bad = [i for i in picked if not 0 <= i < n_c]
@@ -186,7 +190,8 @@ class DerivedView(BaseView):
             if len(self.source_spacing) < 2:
                 raise ViewError(
                     "target_spacing_um needs the source's physical pixel size, which "
-                    "this file does not declare; use target_scale instead")
+                    "this file does not declare; use target_scale instead"
+                )
             fy = target_spacing_um / self.source_spacing["y"]
             fx = target_spacing_um / self.source_spacing["x"]
         elif target_scale is not None:
@@ -198,7 +203,8 @@ class DerivedView(BaseView):
         if fy < 1 or fx < 1:
             raise ViewError(
                 "this view only downsamples; the requested target is finer than the "
-                "source, which would invent detail")
+                "source, which would invent detail"
+            )
         self._factor = (fy, fx)
         self.target_spacing_um = target_spacing_um
 
@@ -216,8 +222,10 @@ class DerivedView(BaseView):
         # exactly the requested target; the extra levels are only for
         # navigation.
         self.level_shapes = [list(out_shape)]
-        while (max(self.level_shapes[-1][self._yi], self.level_shapes[-1][self._xi])
-               > 1024 and len(self.level_shapes) < 6):
+        while (
+            max(self.level_shapes[-1][self._yi], self.level_shapes[-1][self._xi]) > 1024
+            and len(self.level_shapes) < 6
+        ):
             prev = self.level_shapes[-1]
             nxt = list(prev)
             nxt[self._yi] = max(1, prev[self._yi] // 2)
@@ -225,7 +233,9 @@ class DerivedView(BaseView):
             self.level_shapes.append(nxt)
 
         self.chunks = [1] * (len(out_shape) - 2) + [
-            min(TILE, out_shape[self._yi]), min(TILE, out_shape[self._xi])]
+            min(TILE, out_shape[self._yi]),
+            min(TILE, out_shape[self._xi]),
+        ]
 
         # Per output level, read from the coarsest source level that still
         # holds the detail it needs; resizing from level 0 every time would
@@ -234,7 +244,10 @@ class DerivedView(BaseView):
         for shape in self.level_shapes:
             chosen = 0
             for i, src in enumerate(base.level_shapes):
-                if src[self._yi] >= shape[self._yi] and src[self._xi] >= shape[self._xi]:
+                if (
+                    src[self._yi] >= shape[self._yi]
+                    and src[self._xi] >= shape[self._xi]
+                ):
                     chosen = i
             self._source_level.append(chosen)
         self._level = self._source_level[0]
@@ -246,8 +259,11 @@ class DerivedView(BaseView):
         # declared them.
         self._bounds: List[Tuple[float, float]] = []
         base_channels = (base.attrs.get("omero") or {}).get("channels") or []
-        selected = self._channel_index if self._channel_index is not None \
+        selected = (
+            self._channel_index
+            if self._channel_index is not None
             else list(range(max(1, len(base_channels))))
+        )
         for ci in selected:
             if normalise == "percentile" and ci < len(base_channels):
                 w = base_channels[ci]["window"]
@@ -263,32 +279,38 @@ class DerivedView(BaseView):
             ".zattrs": json.dumps(self.attrs).encode(),
         }
         for lvl, shape in enumerate(self.level_shapes):
-            self._meta[f"{lvl}/.zarray"] = json.dumps({
-                "zarr_format": 2,
-                "shape": shape,
-                "chunks": self.chunks,
-                "dtype": self.dtype.str,
-                "compressor": OUT_COMPRESSOR.get_config(),
-                "dimension_separator": "/",
-                "fill_value": 0,
-                "filters": None,
-                "order": "C",
-            }).encode()
+            self._meta[f"{lvl}/.zarray"] = json.dumps(
+                {
+                    "zarr_format": 2,
+                    "shape": shape,
+                    "chunks": self.chunks,
+                    "dtype": self.dtype.str,
+                    "compressor": OUT_COMPRESSOR.get_config(),
+                    "dimension_separator": "/",
+                    "fill_value": 0,
+                    "filters": None,
+                    "order": "C",
+                }
+            ).encode()
             self._meta[f"{lvl}/.zattrs"] = json.dumps(
-                {"_ARRAY_DIMENSIONS": list(self.axes.upper())}).encode()
+                {"_ARRAY_DIMENSIONS": list(self.axes.upper())}
+            ).encode()
 
     # ------------------------------------------------------------------
 
-    def _build_attrs(self, base_names: List[Optional[str]],
-                     selected: List[int]) -> Tuple[Dict[str, Any], MetadataMapping]:
+    def _build_attrs(
+        self, base_names: List[Optional[str]], selected: List[int]
+    ) -> Tuple[Dict[str, Any], MetadataMapping]:
         mapping = MetadataMapping()
         sizes = self.base.mapping.mapped.get("physical_pixel_sizes") or {}
         fy, fx = self._factor
         out_sizes = {}
         for axis, factor in (("y", fy), ("x", fx)):
             if axis in sizes:
-                out_sizes[axis] = {"size": sizes[axis]["size"] * factor,
-                                   "unit": sizes[axis]["unit"]}
+                out_sizes[axis] = {
+                    "size": sizes[axis]["size"] * factor,
+                    "unit": sizes[axis]["unit"],
+                }
         if "z" in sizes:
             # z is not resampled by this view; the source spacing carries over.
             out_sizes["z"] = dict(sizes["z"])
@@ -297,7 +319,8 @@ class DerivedView(BaseView):
         for a in self.axes:
             entry: Dict[str, Any] = {
                 "name": a,
-                "type": {"t": "time", "c": "channel"}.get(a, "space")}
+                "type": {"t": "time", "c": "channel"}.get(a, "space"),
+            }
             if entry["type"] == "space" and a in out_sizes and out_sizes[a]["unit"]:
                 entry["unit"] = out_sizes[a]["unit"]
             ngff_axes.append(entry)
@@ -309,34 +332,44 @@ class DerivedView(BaseView):
             scale = list(base_scale)
             scale[self._yi] *= ratio_y
             scale[self._xi] *= ratio_x
-            datasets.append({"path": str(lvl), "coordinateTransformations": [
-                {"type": "scale", "scale": scale}]})
+            datasets.append(
+                {
+                    "path": str(lvl),
+                    "coordinateTransformations": [{"type": "scale", "scale": scale}],
+                }
+            )
 
         names = [base_names[i] if i < len(base_names) else None for i in selected]
         attrs: Dict[str, Any] = {
-            "multiscales": [{
-                "version": "0.4",
-                "name": self.title,
-                "axes": ngff_axes,
-                "datasets": datasets,
-            }]
+            "multiscales": [
+                {
+                    "version": "0.4",
+                    "name": self.title,
+                    "axes": ngff_axes,
+                    "datasets": datasets,
+                }
+            ]
         }
         if "c" in self.axes:
             hi = 1.0 if self.dtype == np.float32 else float(np.iinfo(self.dtype).max)
             attrs["omero"] = {
                 "version": "0.4",
                 "name": self.title,
-                "channels": [{
-                    "label": names[i] or f"Channel {i}",
-                    "color": ["00FF00", "FF0000", "0000FF", "FFFF00"][i % 4],
-                    "window": {"start": 0, "end": hi, "min": 0, "max": hi},
-                    "active": i < 3,
-                } for i in range(len(selected))],
+                "channels": [
+                    {
+                        "label": names[i] or f"Channel {i}",
+                        "color": ["00FF00", "FF0000", "0000FF", "FFFF00"][i % 4],
+                        "window": {"start": 0, "end": hi, "min": 0, "max": hi},
+                        "active": i < 3,
+                    }
+                    for i in range(len(selected))
+                ],
                 "rdefs": {"model": "color"},
             }
             if "z" in self.axes:
-                attrs["omero"]["rdefs"]["defaultZ"] = \
+                attrs["omero"]["rdefs"]["defaultZ"] = (
                     self.shape[self.axes.index("z")] // 2
+                )
 
         mapping.add("derived_from", self.base.id)
         mapping.add("transform_chain", self.transform_chain())
@@ -347,18 +380,28 @@ class DerivedView(BaseView):
         mapping.add("dtype", self.dtype.str)
         mapping.add("output_levels", len(self.level_shapes))
         mapping.add("source_level_read", self._source_level)
-        mapping.miss("pixel values",
-                     "COMPUTED, not the source's own pixels — resampled and "
-                     "rescaled per request; the original file is untouched")
+        mapping.miss(
+            "pixel values",
+            "COMPUTED, not the source's own pixels — resampled and "
+            "rescaled per request; the original file is untouched",
+        )
         if self.normalise == "percentile":
-            mapping.miss("intensity calibration",
-                         "normalisation bounds are 1-99.8 percentiles measured "
-                         "from a coarse level of the source, not declared by it; "
-                         "absolute intensities are not preserved")
-        mapping.miss("z spacing", "not resampled by this view; source z spacing carried over")
-        for absent in ("channel colours", "objective / instrument metadata",
-                       "stage position", "plate / well context",
-                       "ROIs and annotations"):
+            mapping.miss(
+                "intensity calibration",
+                "normalisation bounds are 1-99.8 percentiles measured "
+                "from a coarse level of the source, not declared by it; "
+                "absolute intensities are not preserved",
+            )
+        mapping.miss(
+            "z spacing", "not resampled by this view; source z spacing carried over"
+        )
+        for absent in (
+            "channel colours",
+            "objective / instrument metadata",
+            "stage position",
+            "plate / well context",
+            "ROIs and annotations",
+        ):
             mapping.miss(absent, "not mapped by this recipe")
         return attrs, mapping
 
@@ -371,7 +414,8 @@ class DerivedView(BaseView):
             if self.target_spacing_um:
                 chain.append(
                     f"resample to {self.target_spacing_um:g} µm/px "
-                    f"(x{1/fx:.3g} in x, x{1/fy:.3g} in y, bilinear)")
+                    f"(x{1/fx:.3g} in x, x{1/fy:.3g} in y, bilinear)"
+                )
             else:
                 chain.append(f"rescale x{1/fx:.3g} (bilinear)")
         if self.normalise == "percentile":
@@ -413,12 +457,17 @@ class DerivedView(BaseView):
                 # The output channel index is the request's own index whether
                 # or not a selection is in play; only the SOURCE index differs.
                 out_c = index[i]
-                sel.append(self._channel_index[index[i]]
-                           if self._channel_index is not None else index[i])
+                sel.append(
+                    self._channel_index[index[i]]
+                    if self._channel_index is not None
+                    else index[i]
+                )
             else:
                 sel.append(index[i])
         region = self._reader.region(src_level, tuple(sel))
-        resized = _resize_plane(np.asarray(region, dtype=np.float32), (y1 - y0, x1 - x0))
+        resized = _resize_plane(
+            np.asarray(region, dtype=np.float32), (y1 - y0, x1 - x0)
+        )
 
         if self.normalise == "percentile" and out_c < len(self._bounds):
             lo, hi = self._bounds[out_c]
@@ -442,9 +491,9 @@ class DerivedView(BaseView):
         if not 0 <= level < len(self.level_shapes):
             return False
         shape = self.level_shapes[level]
-        return (len(index) == len(shape)
-                and not any(i < 0 or i * c >= s
-                            for i, c, s in zip(index, self.chunks, shape)))
+        return len(index) == len(shape) and not any(
+            i < 0 or i * c >= s for i, c, s in zip(index, self.chunks, shape)
+        )
 
     def zarr_key(self, key: str) -> Optional[bytes]:
         if key in self._meta:
@@ -464,7 +513,8 @@ class DerivedView(BaseView):
         if any(i < 0 or i * c >= s for i, c, s in zip(index, self.chunks, shape)):
             return None
         return OUT_COMPRESSOR.encode(
-            np.ascontiguousarray(self._compute_tile(level, index)))
+            np.ascontiguousarray(self._compute_tile(level, index))
+        )
 
     def thumbnail_array(self) -> np.ndarray:
         sample = self.base.thumbnail_array()
@@ -494,7 +544,8 @@ class DerivedView(BaseView):
             "served_compression": "zlib",
             "build_reads": (
                 "no file headers of its own — configured from the raw view; each "
-                "chunk is computed on request from source pixels"),
+                "chunk is computed on request from source pixels"
+            ),
             "index_copies_pixel_data": False,
             "direct_client_access": False,
             "computed_product": True,
@@ -507,7 +558,8 @@ class DerivedView(BaseView):
                     "pixels are COMPUTED per request rather than re-addressed. "
                     f"Transform chain: {'; '.join(self.transform_chain())}. The "
                     "original file is neither migrated nor rewritten; this "
-                    "output is a computed product and is not zero-copy."),
+                    "output is a computed product and is not zero-copy."
+                ),
                 **self.mapping.as_sentences(),
             },
         }

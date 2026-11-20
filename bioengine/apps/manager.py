@@ -906,12 +906,8 @@ class AppsManager:
             # hangs with no failure state. The other modes gain nothing from it
             # — one node on single-machine, and no gating on external-cluster.
             # For updates, add back the resources that will be freed
-            used_cpu = max(
-                0, node_resource["used_cpu"] - current_resources["num_cpus"]
-            )
-            used_gpu = max(
-                0, node_resource["used_gpu"] - current_resources["num_gpus"]
-            )
+            used_cpu = max(0, node_resource["used_cpu"] - current_resources["num_cpus"])
+            used_gpu = max(0, node_resource["used_gpu"] - current_resources["num_gpus"])
             used_memory = max(
                 0, node_resource["used_memory"] - current_resources["memory"]
             )
@@ -1229,9 +1225,7 @@ class AppsManager:
         self._deleted_pending_redeploy.discard(application_id)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
-    def _project_replicas(
-        self, replicas: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+    def _project_replicas(self, replicas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Pick the fields the dashboard needs from each ReplicaDetails entry.
 
         Keeps the payload small — `actor_id`, `worker_id`, `log_file_path`
@@ -1454,10 +1448,8 @@ class AppsManager:
         # id in between hands out an address that does not resolve yet.
         registered = None
         try:
-            registered = (
-                await self.ray_cluster.proxy_actor_handle.get_service_registration.remote(
-                    application_id
-                )
+            registered = await self.ray_cluster.proxy_actor_handle.get_service_registration.remote(
+                application_id
             )
         except Exception as exc:
             self.logger.debug(
@@ -1474,8 +1466,7 @@ class AppsManager:
         # surfaced separately via deployed_by_worker_client_id.
         info = self._deployed_applications.get(application_id, {})
         base_worker_client_id = (
-            info.get("deployed_by_worker_client_id")
-            or self.server.config.client_id
+            info.get("deployed_by_worker_client_id") or self.server.config.client_id
         )
         app_hash = hashlib.sha1(application_id.encode("utf-8")).hexdigest()[:8]
         proxy_client_id = f"{base_worker_client_id}-{app_hash}"
@@ -1738,10 +1729,8 @@ class AppsManager:
         under-states the remaining life, which errs toward alerting.
         """
         try:
-            reported = (
-                await self.ray_cluster.proxy_actor_handle.get_reported_token_issued_at.remote(
-                    application_id
-                )
+            reported = await self.ray_cluster.proxy_actor_handle.get_reported_token_issued_at.remote(
+                application_id
             )
         except Exception as exc:
             self.logger.debug(
@@ -1891,8 +1880,7 @@ class AppsManager:
                 missing_keys = sorted(required_keys - set(app_data.keys()))
                 if missing_keys:
                     raise ValueError(
-                        "Missing required app_data keys: "
-                        f"{missing_keys}"
+                        "Missing required app_data keys: " f"{missing_keys}"
                     )
 
                 is_deployed = asyncio.Event()
@@ -1953,9 +1941,7 @@ class AppsManager:
                     "proxy_service_token_ttl_seconds": app_data.get(
                         "proxy_service_token_ttl_seconds"
                     ),
-                    "entry_deployment_name": _entry_deployment_name(
-                        app_data["entry"]
-                    ),
+                    "entry_deployment_name": _entry_deployment_name(app_data["entry"]),
                     # Stays None: an adopted app cannot be rebuilt from here,
                     # which is what _fire_redeploy and
                     # _recover_from_controller_loss both gate on.
@@ -2051,9 +2037,7 @@ class AppsManager:
                 )
 
                 deploy_app_kwargs = {
-                    key: value
-                    for key, value in app_config.items()
-                    if key in valid_keys
+                    key: value for key, value in app_config.items() if key in valid_keys
                 }
                 deploy_app_kwargs["context"] = admin_context
 
@@ -2458,9 +2442,7 @@ class AppsManager:
             backoff_state["consecutive_failures"] = attempt
             backoff_state["next_attempt_at"] = now + delay
 
-    async def _recover_from_controller_loss(
-        self, application_ids: List[str]
-    ) -> bool:
+    async def _recover_from_controller_loss(self, application_ids: List[str]) -> bool:
         """Re-establish Ray Serve in-place after the controller was lost.
 
         A Ray head restart destroys the Serve controller; ``reconnect`` has
@@ -2619,7 +2601,9 @@ class AppsManager:
             remote_server = await connect_to_server(
                 {"server_url": server_url, "token": hypha_token, "workspace": workspace}
             )
-            artifact_manager = await remote_server.get_service("public/artifact-manager")
+            artifact_manager = await remote_server.get_service(
+                "public/artifact-manager"
+            )
             target_workspace = workspace
 
         try:
@@ -2677,9 +2661,7 @@ class AppsManager:
 
             if len(alive_node_ids) <= 1:
                 self._fs_topology_mode = "shared"
-                self.logger.info(
-                    f"FS topology: single Ray node ⇒ shared (trivially)."
-                )
+                self.logger.info(f"FS topology: single Ray node ⇒ shared (trivially).")
                 return self._fs_topology_mode
 
             marker_name = f".bioengine_fs_probe_{uuid.uuid4().hex}.txt"
@@ -2689,10 +2671,10 @@ class AppsManager:
                 return NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
 
             try:
-                write_ref = ray.remote(num_cpus=0)(
-                    _fs_probe_write
-                ).options(scheduling_strategy=_affinity(alive_node_ids[0])).remote(
-                    apps_workdir, marker_name, marker_content
+                write_ref = (
+                    ray.remote(num_cpus=0)(_fs_probe_write)
+                    .options(scheduling_strategy=_affinity(alive_node_ids[0]))
+                    .remote(apps_workdir, marker_name, marker_content)
                 )
                 await asyncio.to_thread(ray.get, write_ref)
 
@@ -3302,12 +3284,16 @@ class AppsManager:
         ),
         ice_servers: Optional[List[Dict[str, Any]]] = Field(
             None,
-            description="Custom ICE server configurations for WebRTC connections. If provided, these are used instead of fetching from the default Hypha TURN server endpoint. Each entry should have a 'urls' key and optionally 'username' and 'credential' for TURN servers. Example: [{\"urls\": \"stun:stun.example.com:19302\"}, {\"urls\": \"turn:turn.example.com:3478\", \"username\": \"user\", \"credential\": \"pass\"}]. If not specified, ICE servers are fetched automatically.",
+            description='Custom ICE server configurations for WebRTC connections. If provided, these are used instead of fetching from the default Hypha TURN server endpoint. Each entry should have a \'urls\' key and optionally \'username\' and \'credential\' for TURN servers. Example: [{"urls": "stun:stun.example.com:19302"}, {"urls": "turn:turn.example.com:3478", "username": "user", "credential": "pass"}]. If not specified, ICE servers are fetched automatically.',
             examples=[
                 [{"urls": "stun:stun.example.com:19302"}],
                 [
                     {"urls": "stun:stun.example.com:19302"},
-                    {"urls": "turn:turn.example.com:3478", "username": "user", "credential": "pass"},
+                    {
+                        "urls": "turn:turn.example.com:3478",
+                        "username": "user",
+                        "credential": "pass",
+                    },
                 ],
             ],
         ),
@@ -3325,7 +3311,16 @@ class AppsManager:
             description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. A class absent from the map gets no override at all: it keeps whatever num_replicas or autoscaling_config its own @bioengine.app decorator declared, and runs at one fixed replica only if the decorator declares neither — so omitting an entry does NOT pin a class that autoscales itself. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
             examples=[
                 {"DemoApp": {"num_replicas": 3}},
-                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_ongoing_requests": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
+                {
+                    "EntryDeployment": {
+                        "autoscaling_config": {
+                            "min_replicas": 1,
+                            "max_replicas": 8,
+                            "target_ongoing_requests": 4,
+                        }
+                    },
+                    "RuntimeDeployment": {"num_replicas": 1},
+                },
             ],
         ),
         context: Dict[str, Any] = Field(
@@ -3639,8 +3634,7 @@ class AppsManager:
             # introspect task discovered. The ProxyDeployment is intentionally
             # not in the spec — it always runs as a single replica.
             user_deployment_names = sorted(
-                meta["qualname"].split(".")[-1]
-                for meta in app.spec["classes"].values()
+                meta["qualname"].split(".")[-1] for meta in app.spec["classes"].values()
             )
             _validate_scaling_map(scaling, user_deployment_names, application_id)
 
@@ -3929,7 +3923,8 @@ class AppsManager:
 
         # Wait for all undeployment tasks to complete
         undeployment_tasks = [
-            undeploy_and_track(application_id) for application_id in deployed_application_ids
+            undeploy_and_track(application_id)
+            for application_id in deployed_application_ids
         ]
         results = await asyncio.gather(*undeployment_tasks)
 

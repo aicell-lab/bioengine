@@ -166,7 +166,9 @@ class TestLabelName:
     def test_valid_names(self, name):
         assert bc.is_valid_label_name(name)
 
-    @pytest.mark.parametrize("name", ["Cells", "cells!", "cell nuclei", "", None, "label:cells"])
+    @pytest.mark.parametrize(
+        "name", ["Cells", "cells!", "cell nuclei", "", None, "label:cells"]
+    )
     def test_invalid_names(self, name):
         assert not bc.is_valid_label_name(name)
 
@@ -190,7 +192,9 @@ class TestMiscPaths:
         assert bc.image_path("img001", ext=".tif") == "images/img001.tif"
 
     def test_embedding_path(self):
-        assert bc.embedding_path("img001", "vit_l_lm") == "embeddings/img001_vit_l_lm.npz"
+        assert (
+            bc.embedding_path("img001", "vit_l_lm") == "embeddings/img001_vit_l_lm.npz"
+        )
 
     def test_annotation_save_paths(self):
         paths = bc.annotation_save_paths("cells", "alice", "img001", "20260814-120000")
@@ -200,7 +204,9 @@ class TestMiscPaths:
         }
 
     def test_annotation_save_paths_sanitizes_user(self):
-        paths = bc.annotation_save_paths("cells", "github|123", "img001", "20260814-120000")
+        paths = bc.annotation_save_paths(
+            "cells", "github|123", "img001", "20260814-120000"
+        )
         assert paths["png"].startswith("label_cells/user-github-123/")
 
 
@@ -235,8 +241,12 @@ class TestTimestamps:
     def test_lexicographic_sort_equals_chronological(self):
         import datetime as dt
 
-        earlier = bc.format_timestamp(dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=dt.timezone.utc))
-        later = bc.format_timestamp(dt.datetime(2026, 12, 31, 23, 59, 59, tzinfo=dt.timezone.utc))
+        earlier = bc.format_timestamp(
+            dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=dt.timezone.utc)
+        )
+        later = bc.format_timestamp(
+            dt.datetime(2026, 12, 31, 23, 59, 59, tzinfo=dt.timezone.utc)
+        )
         assert sorted([later, earlier]) == [earlier, later]
 
 
@@ -254,7 +264,9 @@ class TestParseAnnotationFilename:
         }
 
     def test_stem_with_hyphens(self):
-        parsed = bc.parse_annotation_filename("my-cool-image-01-20260814-120000.geojson")
+        parsed = bc.parse_annotation_filename(
+            "my-cool-image-01-20260814-120000.geojson"
+        )
         assert parsed == {
             "stem": "my-cool-image-01",
             "timestamp": "20260814-120000",
@@ -308,7 +320,12 @@ class TestLatestPairsByStem:
         assert set(result.keys()) == {"img001", "img002"}
 
     def test_ignores_non_annotation_files(self):
-        files = ["users.json", ".keep", "img001-20260814-090000.png", "img001-20260814-090000.geojson"]
+        files = [
+            "users.json",
+            ".keep",
+            "img001-20260814-090000.png",
+            "img001-20260814-090000.geojson",
+        ]
         result = bc.latest_pairs_by_stem(files)
         assert list(result.keys()) == ["img001"]
 
@@ -396,9 +413,7 @@ class TestCollectEmbeddings:
         }
 
     def test_preferred_falls_back_to_first_sorted(self):
-        out = bc.collect_embeddings(
-            ["img_vit_t_lm.npz", "img_vit_b_em_organelles.npz"]
-        )
+        out = bc.collect_embeddings(["img_vit_t_lm.npz", "img_vit_b_em_organelles.npz"])
         assert out["img"]["model_type"] == "vit_b_em_organelles"
         assert out["img"]["model_types"] == ["vit_b_em_organelles", "vit_t_lm"]
 
@@ -449,7 +464,9 @@ class TestMetadataReadWrite:
         meta = bc.new_metadata("bioimage-io/annotation-xyz", owner={"id": "u1"})
         bc.write_metadata(meta, root=tmp_path)
         d = tmp_path / "datasets"
-        assert sorted(p.name for p in d.iterdir()) == ["bioimage-io__annotation-xyz.json"]
+        assert sorted(p.name for p in d.iterdir()) == [
+            "bioimage-io__annotation-xyz.json"
+        ]
 
     def test_write_updates_updated_at(self, tmp_path):
         meta = bc.new_metadata("bioimage-io/annotation-xyz", owner={"id": "u1"})
@@ -473,7 +490,9 @@ class TestMetadataReadWrite:
 
     def test_list_dataset_ids(self, tmp_path):
         for suffix in ("a", "b", "c"):
-            meta = bc.new_metadata(f"bioimage-io/annotation-{suffix}", owner={"id": "u1"})
+            meta = bc.new_metadata(
+                f"bioimage-io/annotation-{suffix}", owner={"id": "u1"}
+            )
             bc.write_metadata(meta, root=tmp_path)
         assert bc.list_dataset_ids(root=tmp_path) == [
             "bioimage-io/annotation-a",
@@ -526,7 +545,9 @@ class TestUpsertLabelUser:
 
     def test_preserves_other_entries(self):
         existing = {"user-bob": {"id": "bob", "email": None}}
-        users = bc.upsert_label_user(existing, "user-alice", "alice", "alice@example.com")
+        users = bc.upsert_label_user(
+            existing, "user-alice", "alice", "alice@example.com"
+        )
         assert users["user-bob"] == {"id": "bob", "email": None}
         assert users["user-alice"] == {"id": "alice", "email": "alice@example.com"}
 
@@ -574,7 +595,9 @@ class TestBuildAclPermissions:
         assert perms["dup"] == "*"
 
     def test_prefers_id_over_email_as_key(self):
-        meta = _meta(managers=[{"id": "mgr-1", "email": "mgr@example.com"}], annotators=[])
+        meta = _meta(
+            managers=[{"id": "mgr-1", "email": "mgr@example.com"}], annotators=[]
+        )
         perms = bc.build_acl_permissions(meta)
         assert "mgr-1" in perms
         assert "mgr@example.com" not in perms
@@ -650,7 +673,9 @@ class TestEnsureStaged:
         assert calls == ["call", "restage", "call"]
 
     def test_is_stage_mode_error_accepts_both_wordings(self):
-        assert bc.is_stage_mode_error(AssertionError("Artifact must be in staging mode."))
+        assert bc.is_stage_mode_error(
+            AssertionError("Artifact must be in staging mode.")
+        )
         assert bc.is_stage_mode_error(RuntimeError("Artifact is not in stage mode"))
         assert not bc.is_stage_mode_error(ValueError("something else entirely"))
 
@@ -735,7 +760,9 @@ class TestCallerMatchesArtifactOwner:
 
     def test_no_match(self):
         manifest = {"owner": {"id": "u1"}}
-        assert not bc.caller_matches_artifact_owner(manifest, "u1", "someone-else", None)
+        assert not bc.caller_matches_artifact_owner(
+            manifest, "u1", "someone-else", None
+        )
 
     def test_empty_manifest_and_no_created_by(self):
         assert not bc.caller_matches_artifact_owner({}, None, "u1", None)
@@ -743,6 +770,7 @@ class TestCallerMatchesArtifactOwner:
 
 def test_resolve_role_http_anonymous_is_public_on_public_dataset():
     import broker_core as core
+
     meta = core.new_metadata("bioimage-io/x", owner={"id": "u1"})
     meta["public"] = True
     assert core.resolve_role(meta, "http-anonymous", None) == "public"
@@ -754,10 +782,12 @@ def test_resolve_role_http_anonymous_is_public_on_public_dataset():
 class TestAccessRequests:
     def _meta(self):
         import broker_core as core
+
         return core.new_metadata("bioimage-io/x", owner={"id": "owner1"})
 
     def test_add_and_remove_request(self):
         import broker_core as core
+
         m = self._meta()
         core.add_access_request(m, {"id": "u2", "email": "u2@x.org"}, "annotator", "t1")
         assert len(m["access_requests"]) == 1
@@ -767,6 +797,7 @@ class TestAccessRequests:
 
     def test_repeat_request_updates_role(self):
         import broker_core as core
+
         m = self._meta()
         core.add_access_request(m, {"id": "u2"}, "annotator", "t1")
         core.add_access_request(m, {"id": "u2"}, "manager", "t2")
@@ -776,13 +807,16 @@ class TestAccessRequests:
 
     def test_invalid_role_rejected(self):
         import broker_core as core, pytest
+
         m = self._meta()
         with pytest.raises(ValueError):
             core.add_access_request(m, {"id": "u2"}, "owner", "t1")
 
     def test_legacy_metadata_without_key(self):
         import broker_core as core
-        m = self._meta(); m.pop("access_requests")
+
+        m = self._meta()
+        m.pop("access_requests")
         core.add_access_request(m, {"email": "a@b.c"}, "annotator", "t1")
         assert len(m["access_requests"]) == 1
         core.remove_access_request(m, {"email": "A@B.C"})
@@ -796,8 +830,10 @@ class TestAccessRequests:
 
 def test_count_pairs_counts_complete_saves_only():
     files = [
-        "a-20260101-000001.png", "a-20260101-000001.geojson",
-        "a-20260102-000002.png", "a-20260102-000002.geojson",
+        "a-20260101-000001.png",
+        "a-20260101-000001.geojson",
+        "a-20260102-000002.png",
+        "a-20260102-000002.geojson",
         "a-20260103-000003.png",  # incomplete save
         "b-20260101-000001.geojson",  # incomplete
         "junk.txt",
@@ -945,7 +981,13 @@ def test_parse_png_dims_rejects_non_png_and_short_input():
 
 
 def test_parse_png_dims_rejects_zero_dims():
-    header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0d" + b"IHDR" + (0).to_bytes(4, "big") + (150).to_bytes(4, "big")
+    header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\x0d"
+        + b"IHDR"
+        + (0).to_bytes(4, "big")
+        + (150).to_bytes(4, "big")
+    )
     assert bc.parse_png_dims(header) is None
 
 
@@ -976,10 +1018,9 @@ class TestEmbeddingRemovalPaths:
 
 def _listing(*names, dirs=()):
     """A list_files("images") result: files plus optional directory entries."""
-    return (
-        [{"name": n, "type": "file"} for n in names]
-        + [{"name": d, "type": "directory"} for d in dirs]
-    )
+    return [{"name": n, "type": "file"} for n in names] + [
+        {"name": d, "type": "directory"} for d in dirs
+    ]
 
 
 class TestImageNamesFromListing:
@@ -1067,7 +1108,10 @@ class TestMergeImageManifest:
         assert changed is False
 
     def test_prune_drops_a_deleted_local_file(self):
-        stored = {"a": bc.local_image_entry("a.png"), "b": bc.local_image_entry("b.png")}
+        stored = {
+            "a": bc.local_image_entry("a.png"),
+            "b": bc.local_image_entry("b.png"),
+        }
         entries, changed = bc.merge_image_manifest(stored, ["a.png"], prune=True)
         assert set(entries) == {"a"}
         assert changed is True
@@ -1081,13 +1125,17 @@ class TestMergeImageManifest:
 
     def test_dims_backfilled_into_an_existing_entry(self):
         stored = {"a": bc.local_image_entry("a.png")}
-        entries, changed = bc.merge_image_manifest(stored, ["a.png"], dims={"a": [8, 9]})
+        entries, changed = bc.merge_image_manifest(
+            stored, ["a.png"], dims={"a": [8, 9]}
+        )
         assert changed is True
         assert (entries["a"]["width"], entries["a"]["height"]) == (8, 9)
 
     def test_existing_dims_are_not_overwritten(self):
         stored = {"a": bc.local_image_entry("a.png", [1, 2])}
-        entries, changed = bc.merge_image_manifest(stored, ["a.png"], dims={"a": [8, 9]})
+        entries, changed = bc.merge_image_manifest(
+            stored, ["a.png"], dims={"a": [8, 9]}
+        )
         assert changed is False
         assert (entries["a"]["width"], entries["a"]["height"]) == (1, 2)
 
@@ -1260,13 +1308,15 @@ class TestNgffAxisRoles:
 
 class TestParseZarrArrayMeta:
     def test_v2_blosc(self):
-        meta = bc.parse_zarr_array_meta({
-            "shape": [3, 600, 800],
-            "chunks": [1, 256, 256],
-            "dtype": "<u2",
-            "compressor": {"id": "blosc", "cname": "zstd"},
-            "zarr_format": 2,
-        })
+        meta = bc.parse_zarr_array_meta(
+            {
+                "shape": [3, 600, 800],
+                "chunks": [1, 256, 256],
+                "dtype": "<u2",
+                "compressor": {"id": "blosc", "cname": "zstd"},
+                "zarr_format": 2,
+            }
+        )
         assert meta["shape"] == [3, 600, 800]
         assert meta["chunks"] == [1, 256, 256]
         assert meta["dtype"] == "<u2"
@@ -1274,47 +1324,69 @@ class TestParseZarrArrayMeta:
         assert meta["separator"] == "."
 
     def test_v2_filters_come_before_the_compressor(self):
-        meta = bc.parse_zarr_array_meta({
-            "shape": [4, 4], "chunks": [2, 2], "dtype": "|u1",
-            "filters": [{"id": "delta", "dtype": "|u1"}],
-            "compressor": {"id": "zstd"},
-        })
+        meta = bc.parse_zarr_array_meta(
+            {
+                "shape": [4, 4],
+                "chunks": [2, 2],
+                "dtype": "|u1",
+                "filters": [{"id": "delta", "dtype": "|u1"}],
+                "compressor": {"id": "zstd"},
+            }
+        )
         assert meta["codecs"] == ["delta", "zstd"]
 
     def test_v2_uncompressed(self):
-        meta = bc.parse_zarr_array_meta({
-            "shape": [4, 4], "chunks": [2, 2], "dtype": "|u1", "compressor": None,
-        })
+        meta = bc.parse_zarr_array_meta(
+            {
+                "shape": [4, 4],
+                "chunks": [2, 2],
+                "dtype": "|u1",
+                "compressor": None,
+            }
+        )
         assert meta["codecs"] == []
 
     def test_v2_honours_dimension_separator(self):
-        meta = bc.parse_zarr_array_meta({
-            "shape": [4, 4], "chunks": [2, 2], "dtype": "|u1",
-            "dimension_separator": "/",
-        })
+        meta = bc.parse_zarr_array_meta(
+            {
+                "shape": [4, 4],
+                "chunks": [2, 2],
+                "dtype": "|u1",
+                "dimension_separator": "/",
+            }
+        )
         assert meta["separator"] == "/"
 
     def test_v3(self):
-        meta = bc.parse_zarr_array_meta({
-            "zarr_format": 3,
-            "node_type": "array",
-            "shape": [600, 800],
-            "data_type": "uint16",
-            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [256, 256]}},
-            "chunk_key_encoding": {"name": "default"},
-            "codecs": [{"name": "bytes"}, {"name": "blosc"}],
-        })
+        meta = bc.parse_zarr_array_meta(
+            {
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [600, 800],
+                "data_type": "uint16",
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [256, 256]},
+                },
+                "chunk_key_encoding": {"name": "default"},
+                "codecs": [{"name": "bytes"}, {"name": "blosc"}],
+            }
+        )
         assert meta["dtype"] == "uint16"
         assert meta["codecs"] == ["bytes", "blosc"]
         assert meta["separator"] == "/"
 
     def test_v3_with_v2_key_encoding_defaults_to_a_dot(self):
-        meta = bc.parse_zarr_array_meta({
-            "zarr_format": 3, "shape": [4, 4], "data_type": "uint8",
-            "chunk_grid": {"configuration": {"chunk_shape": [2, 2]}},
-            "chunk_key_encoding": {"name": "v2"},
-            "codecs": [],
-        })
+        meta = bc.parse_zarr_array_meta(
+            {
+                "zarr_format": 3,
+                "shape": [4, 4],
+                "data_type": "uint8",
+                "chunk_grid": {"configuration": {"chunk_shape": [2, 2]}},
+                "chunk_key_encoding": {"name": "v2"},
+                "codecs": [],
+            }
+        )
         assert meta["separator"] == "."
 
     def test_rejects_junk(self):
@@ -1326,7 +1398,16 @@ class TestParseZarrArrayMeta:
 
 class TestNgffCodecAndDtypeGates:
     def test_accepts_what_zarrita_ships(self):
-        for codec in ("blosc", "lz4", "zstd", "gzip", "zlib", "transpose", "bytes", "crc32c"):
+        for codec in (
+            "blosc",
+            "lz4",
+            "zstd",
+            "gzip",
+            "zlib",
+            "transpose",
+            "bytes",
+            "crc32c",
+        ):
             assert bc.undecodable_ngff_codecs({"codecs": [codec]}) == []
 
     def test_names_only_the_offenders(self):
@@ -1349,24 +1430,56 @@ class TestNgffCodecAndDtypeGates:
 
 class TestFirstChunkKey:
     def test_v2_dot_separated(self):
-        assert bc.first_chunk_key(
-            {"zarr_format": 2, "chunks": [1, 256, 256], "separator": ".", "key_encoding": "v2"}
-        ) == "0.0.0"
+        assert (
+            bc.first_chunk_key(
+                {
+                    "zarr_format": 2,
+                    "chunks": [1, 256, 256],
+                    "separator": ".",
+                    "key_encoding": "v2",
+                }
+            )
+            == "0.0.0"
+        )
 
     def test_v2_slash_separated(self):
-        assert bc.first_chunk_key(
-            {"zarr_format": 2, "chunks": [256, 256], "separator": "/", "key_encoding": "v2"}
-        ) == "0/0"
+        assert (
+            bc.first_chunk_key(
+                {
+                    "zarr_format": 2,
+                    "chunks": [256, 256],
+                    "separator": "/",
+                    "key_encoding": "v2",
+                }
+            )
+            == "0/0"
+        )
 
     def test_v3_default_encoding(self):
-        assert bc.first_chunk_key(
-            {"zarr_format": 3, "chunks": [1, 256, 256], "separator": "/", "key_encoding": "default"}
-        ) == "c/0/0/0"
+        assert (
+            bc.first_chunk_key(
+                {
+                    "zarr_format": 3,
+                    "chunks": [1, 256, 256],
+                    "separator": "/",
+                    "key_encoding": "default",
+                }
+            )
+            == "c/0/0/0"
+        )
 
     def test_v3_with_v2_keys(self):
-        assert bc.first_chunk_key(
-            {"zarr_format": 3, "chunks": [4, 4], "separator": ".", "key_encoding": "v2"}
-        ) == "0.0"
+        assert (
+            bc.first_chunk_key(
+                {
+                    "zarr_format": 3,
+                    "chunks": [4, 4],
+                    "separator": ".",
+                    "key_encoding": "v2",
+                }
+            )
+            == "0.0"
+        )
 
 
 class TestNgffChannelNames:
@@ -1377,7 +1490,9 @@ class TestNgffChannelNames:
         assert names == ["DAPI", "GFP"]
 
     def test_falls_back_to_name(self):
-        assert bc.ngff_channel_names({"omero": {"channels": [{"name": "Cy5"}]}}) == ["Cy5"]
+        assert bc.ngff_channel_names({"omero": {"channels": [{"name": "Cy5"}]}}) == [
+            "Cy5"
+        ]
 
     def test_absent_omero_is_none_not_an_error(self):
         for doc in ({}, None, {"omero": {}}, {"omero": {"channels": []}}, {"omero": 3}):
@@ -1392,8 +1507,14 @@ class TestNgffChannelNames:
 class TestRemoteImageEntry:
     def test_shape(self):
         entry = bc.remote_image_entry(
-            "https://x/zarr/ds1/", "0", 800, 600,
-            dtype="uint16", channels=["DAPI"], levels=3, content_hint="etag-1",
+            "https://x/zarr/ds1/",
+            "0",
+            800,
+            600,
+            dtype="uint16",
+            channels=["DAPI"],
+            levels=3,
+            content_hint="etag-1",
             fetched_at="2026-09-10T00:00:00Z",
         )
         assert entry["state"] == "remote"
@@ -1416,7 +1537,9 @@ class TestRemoteImageEntry:
 
     def test_optional_fields_are_omitted_rather_than_null(self):
         entry = bc.remote_image_entry("https://x/", None, 4, 4)
-        assert "dtype" not in entry and "channels" not in entry and "levels" not in entry
+        assert (
+            "dtype" not in entry and "channels" not in entry and "levels" not in entry
+        )
 
     def test_survives_a_manifest_round_trip(self):
         entry = bc.remote_image_entry("https://x/", "0", 4, 4)
@@ -1441,9 +1564,12 @@ class TestNormaliseRegion:
     def test_a_whole_store_region_collapses_to_none(self):
         # Identical to a whole-store import, so it must produce an identical
         # entry rather than a second spelling of the same thing.
-        assert bc.normalise_region(
-            {"x": 0, "y": 0, "width": 1000, "height": 800}, 1000, 800
-        ) is None
+        assert (
+            bc.normalise_region(
+                {"x": 0, "y": 0, "width": 1000, "height": 800}, 1000, 800
+            )
+            is None
+        )
 
     def test_far_edge_is_clamped_not_refused(self):
         assert bc.normalise_region(
@@ -1466,15 +1592,22 @@ class TestNormaliseRegion:
         with pytest.raises(ValueError):
             bc.normalise_region([0, 0, 8, 8], 1000, 800)
         with pytest.raises(ValueError):
-            bc.normalise_region({"x": 0, "y": 0, "width": "wide", "height": 8}, 1000, 800)
+            bc.normalise_region(
+                {"x": 0, "y": 0, "width": "wide", "height": 8}, 1000, 800
+            )
 
     def test_entry_dimensions_are_the_patchs(self):
         region = bc.normalise_region(
             {"x": 10, "y": 20, "width": 512, "height": 384}, 100000, 80000
         )
         entry = bc.remote_image_entry(
-            "https://x/slide.zarr/", None, region["width"], region["height"],
-            dtype="uint8", channels=["r", "g", "b"], region=region,
+            "https://x/slide.zarr/",
+            None,
+            region["width"],
+            region["height"],
+            dtype="uint8",
+            channels=["r", "g", "b"],
+            region=region,
         )
         assert (entry["width"], entry["height"]) == (512, 384)
         assert entry["source"]["region"] == region
@@ -1484,8 +1617,12 @@ class TestNormaliseRegion:
         assert bc.materialisation_bytes(entry) == 512 * 384 * 3
         bc.check_materialisable("slide", entry)
         whole = bc.remote_image_entry(
-            "https://x/slide.zarr/", None, 100000, 80000,
-            dtype="uint8", channels=["r", "g", "b"],
+            "https://x/slide.zarr/",
+            None,
+            100000,
+            80000,
+            dtype="uint8",
+            channels=["r", "g", "b"],
         )
         with pytest.raises(ValueError):
             bc.check_materialisable("slide", whole)
@@ -1496,7 +1633,10 @@ class TestImageEntryIsLocal:
         assert bc.image_entry_is_local(bc.local_image_entry("a.png")) is True
 
     def test_remote_is_not_local(self):
-        assert bc.image_entry_is_local(bc.remote_image_entry("https://x/", None, 4, 4)) is False
+        assert (
+            bc.image_entry_is_local(bc.remote_image_entry("https://x/", None, 4, 4))
+            is False
+        )
 
     def test_local_without_a_path_is_not_local(self):
         # A bug if it happens; treating it as local would push the failure
@@ -1525,8 +1665,14 @@ class TestDtypeItemsize:
     @pytest.mark.parametrize(
         "dtype,size",
         [
-            ("<u2", 2), ("uint16", 2), ("|u1", 1), ("uint8", 1),
-            (">f4", 4), ("float32", 4), ("float64", 8), ("b1", 1),
+            ("<u2", 2),
+            ("uint16", 2),
+            ("|u1", 1),
+            ("uint8", 1),
+            (">f4", 4),
+            ("float32", 4),
+            ("float64", 8),
+            ("b1", 1),
         ],
     )
     def test_both_spellings(self, dtype, size):
@@ -1555,7 +1701,7 @@ class TestMaterialisationBytes:
         [
             None,
             {},
-            {"state": "remote", "width": 10, "height": 10},          # no dtype
+            {"state": "remote", "width": 10, "height": 10},  # no dtype
             {"state": "remote", "width": 0, "height": 10, "dtype": "uint8"},
             {"state": "remote", "width": 10, "height": 10, "dtype": "str"},
         ],
@@ -1580,9 +1726,7 @@ class TestCheckMaterialisable:
             bc.check_materialisable("a", bc.local_image_entry("a.tif"))
 
     def test_refuses_a_slide_sized_source(self):
-        huge = bc.remote_image_entry(
-            "https://x/", "0", 100_000, 80_000, dtype="uint16"
-        )
+        huge = bc.remote_image_entry("https://x/", "0", 100_000, 80_000, dtype="uint16")
         with pytest.raises(ValueError, match="over the 64 MB"):
             bc.check_materialisable("wsi", huge)
 
@@ -1595,8 +1739,14 @@ class TestCheckMaterialisable:
 class TestMaterialiseImageEntry:
     def _remote(self):
         return bc.remote_image_entry(
-            "https://x/zarr/ds1/", "0", 800, 600,
-            dtype="uint16", channels=["DAPI"], levels=3, content_hint="etag-1",
+            "https://x/zarr/ds1/",
+            "0",
+            800,
+            600,
+            dtype="uint16",
+            channels=["DAPI"],
+            levels=3,
+            content_hint="etag-1",
         )
 
     def test_flips_state_and_sets_the_path(self):
@@ -1645,15 +1795,18 @@ class TestMergeImageManifestPromotesRemote:
 
     def _remote(self):
         return bc.remote_image_entry(
-            "https://x/zarr/ds1/", "0", 800, 600,
-            dtype="uint16", channels=["DAPI", "GFP"], levels=3,
+            "https://x/zarr/ds1/",
+            "0",
+            800,
+            600,
+            dtype="uint16",
+            channels=["DAPI", "GFP"],
+            levels=3,
             content_hint="etag-1",
         )
 
     def test_promotes_instead_of_replacing(self):
-        entries, changed = bc.merge_image_manifest(
-            {"r": self._remote()}, ["r.tif"]
-        )
+        entries, changed = bc.merge_image_manifest({"r": self._remote()}, ["r.tif"])
         assert changed is True
         assert entries["r"]["state"] == "local"
         assert entries["r"]["path"] == "images/r.tif"
@@ -1696,10 +1849,10 @@ class TestLooksLikeTiff:
     @pytest.mark.parametrize(
         "head",
         [
-            b"II*\x00\x08\x00\x00\x00",   # classic, little endian
-            b"MM\x00*\x00\x00\x00\x08",   # classic, big endian
-            b"II+\x00\x08\x00",           # BigTIFF, little endian
-            b"MM\x00+\x00\x08",           # BigTIFF, big endian
+            b"II*\x00\x08\x00\x00\x00",  # classic, little endian
+            b"MM\x00*\x00\x00\x00\x08",  # classic, big endian
+            b"II+\x00\x08\x00",  # BigTIFF, little endian
+            b"MM\x00+\x00\x08",  # BigTIFF, big endian
         ],
     )
     def test_accepts_every_tiff_flavour(self, head):
@@ -1709,12 +1862,12 @@ class TestLooksLikeTiff:
         "head",
         [
             b"",
-            b"II",                        # truncated signature
-            b"\x89PNG\r\n\x1a\n",         # a PNG
-            b"<?xml version",             # an S3 error document
-            b"II*\x01",                   # wrong magic
+            b"II",  # truncated signature
+            b"\x89PNG\r\n\x1a\n",  # a PNG
+            b"<?xml version",  # an S3 error document
+            b"II*\x01",  # wrong magic
             None,
-            "II*\x00",                    # str, not bytes
+            "II*\x00",  # str, not bytes
         ],
     )
     def test_rejects_everything_else(self, head):
@@ -1727,8 +1880,13 @@ class TestLooksLikeTiff:
 class TestCheckMaterialisableChannels:
     def _remote(self, channels):
         return bc.remote_image_entry(
-            "https://x/zarr/ds1/", "0", 64, 64,
-            dtype="uint16", channels=channels, levels=1,
+            "https://x/zarr/ds1/",
+            "0",
+            64,
+            64,
+            dtype="uint16",
+            channels=channels,
+            levels=1,
         )
 
     @pytest.mark.parametrize("n", [0, 1, 2, 3, 4])
@@ -1751,8 +1909,13 @@ class TestCheckMaterialisableChannels:
         # Both would fire here. The channel message is the actionable one:
         # a smaller region (design §13 step 6) fixes size, never width.
         wide = bc.remote_image_entry(
-            "https://x/zarr/ds1/", "0", 100000, 80000,
-            dtype="uint16", channels=[f"c{i}" for i in range(9)], levels=1,
+            "https://x/zarr/ds1/",
+            "0",
+            100000,
+            80000,
+            dtype="uint16",
+            channels=[f"c{i}" for i in range(9)],
+            levels=1,
         )
         with pytest.raises(ValueError, match="9 channels"):
             bc.check_materialisable("r", wide)

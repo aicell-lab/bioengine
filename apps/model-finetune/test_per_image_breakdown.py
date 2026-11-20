@@ -46,18 +46,19 @@ def _map(*instances) -> "np.ndarray":
 
 
 PERFECT = _map((1, 4), (2, 4))
-HALF = _map((1, 4), (0, 4))      # finds one of the two instances
-MISS = _map((0, 8))              # finds nothing
+HALF = _map((1, 4), (0, 4))  # finds one of the two instances
+MISS = _map((0, 8))  # finds nothing
 
 # A second geometry with room for a false positive, so an image can score exactly
 # 0.5: one instance matched, one predicted onto background, one ground truth missed.
 GT3 = _map((1, 4), (2, 4), (0, 4))
 PERFECT3 = GT3
-SWAPPED3 = _map((1, 4), (0, 4), (2, 4))   # 1 tp, 1 fp, 1 fn -> f1 0.5
+SWAPPED3 = _map((1, 4), (0, 4), (2, 4))  # 1 tp, 1 fp, 1 fn -> f1 0.5
 MISS3 = _map((0, 12))
 
 
 # ── the vector exists, and the scalar is its mean ────────────────────────────
+
 
 def test_the_vector_has_one_score_per_image():
     v = pool.per_image_instance_f1([PERFECT, HALF, MISS], [PERFECT, PERFECT, PERFECT])
@@ -109,15 +110,30 @@ def test_the_truncation_this_guards_was_really_reachable():
 # ── the record: the pairing, and the aggregate it must be the mean of ────────
 
 EXPECTED_KEYS = {
-    "role", "name", "aggregate", "aggregate_basis", "aggregate_scope",
-    "higher_is_better", "n_sites_scored", "n_datasets_scored", "per_site",
-    "per_site_basis", "aggregate_withheld", "per_image", "per_image_basis",
+    "role",
+    "name",
+    "aggregate",
+    "aggregate_basis",
+    "aggregate_scope",
+    "higher_is_better",
+    "n_sites_scored",
+    "n_datasets_scored",
+    "per_site",
+    "per_site_basis",
+    "aggregate_withheld",
+    "per_image",
+    "per_image_basis",
 }
 
 
 def test_the_record_carries_the_two_new_fields_and_nothing_else_moved():
-    m = pool.round_metric(role="witness", aggregate=0.5, aggregate_basis="x",
-                          per_image=[0.4, 0.6], per_image_basis=pool.PER_IMAGE_BASIS)
+    m = pool.round_metric(
+        role="witness",
+        aggregate=0.5,
+        aggregate_basis="x",
+        per_image=[0.4, 0.6],
+        per_image_basis=pool.PER_IMAGE_BASIS,
+    )
     assert set(m) == EXPECTED_KEYS
     assert m["per_image"] == [0.4, 0.6]
     assert m["per_image_basis"] == pool.PER_IMAGE_BASIS
@@ -132,10 +148,13 @@ def test_a_record_without_a_breakdown_still_carries_the_fields_as_null():
     assert m["per_image"] is None and m["per_image_basis"] is None
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"per_image": [0.5]},
-    {"per_image_basis": pool.PER_IMAGE_BASIS},
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"per_image": [0.5]},
+        {"per_image_basis": pool.PER_IMAGE_BASIS},
+    ],
+)
 def test_half_a_pair_is_refused(kwargs):
     """A vector with no basis does not say what its numbers are or how they are
     ordered; a basis with no vector describes nothing."""
@@ -148,8 +167,13 @@ def test_a_breakdown_from_a_different_pass_is_refused():
     belongs to another scoring pass would read as an audit trail while auditing
     nothing — worse than publishing no vector at all."""
     with pytest.raises(ValueError, match="different scoring pass"):
-        pool.round_metric(role="selection", aggregate=0.90, aggregate_basis="x",
-                          per_image=[0.1, 0.2], per_image_basis=pool.PER_IMAGE_BASIS)
+        pool.round_metric(
+            role="selection",
+            aggregate=0.90,
+            aggregate_basis="x",
+            per_image=[0.1, 0.2],
+            per_image_basis=pool.PER_IMAGE_BASIS,
+        )
 
 
 def test_the_rounding_the_call_sites_do_is_inside_the_tolerance():
@@ -159,35 +183,55 @@ def test_the_rounding_the_call_sites_do_is_inside_the_tolerance():
     and rounds the hard way."""
     vector = [1 / 3, 1 / 3, 1 / 3]
     exact = pool.mean_of_per_image(vector)
-    m = pool.round_metric(role="selection", aggregate=round(exact, 4),
-                          aggregate_basis="x", per_image=vector,
-                          per_image_basis=pool.PER_IMAGE_BASIS)
+    m = pool.round_metric(
+        role="selection",
+        aggregate=round(exact, 4),
+        aggregate_basis="x",
+        per_image=vector,
+        per_image_basis=pool.PER_IMAGE_BASIS,
+    )
     assert m["aggregate"] != exact, "the fixture must actually exercise the slack"
-    assert abs(m["aggregate"] - pool.mean_of_per_image(m["per_image"])) \
+    assert (
+        abs(m["aggregate"] - pool.mean_of_per_image(m["per_image"]))
         <= pool.PER_IMAGE_AGGREGATE_TOLERANCE
+    )
 
 
 def test_a_disagreement_just_outside_the_tolerance_is_refused():
     """Discrimination control for the tolerance: it must be a bound, not a licence.
     A record off by 10x the slack is a different pass and must still be refused."""
     with pytest.raises(ValueError, match="different scoring pass"):
-        pool.round_metric(role="selection", aggregate=0.5 + 10 * pool.PER_IMAGE_AGGREGATE_TOLERANCE,
-                          aggregate_basis="x", per_image=[0.5, 0.5],
-                          per_image_basis=pool.PER_IMAGE_BASIS)
+        pool.round_metric(
+            role="selection",
+            aggregate=0.5 + 10 * pool.PER_IMAGE_AGGREGATE_TOLERANCE,
+            aggregate_basis="x",
+            per_image=[0.5, 0.5],
+            per_image_basis=pool.PER_IMAGE_BASIS,
+        )
 
 
 @pytest.mark.parametrize("vector", [[], [float("nan")], [float("inf")]])
 def test_an_unusable_vector_is_refused(vector):
     with pytest.raises(ValueError):
-        pool.round_metric(role="witness", aggregate=0.5, aggregate_basis="x",
-                          per_image=vector, per_image_basis=pool.PER_IMAGE_BASIS)
+        pool.round_metric(
+            role="witness",
+            aggregate=0.5,
+            aggregate_basis="x",
+            per_image=vector,
+            per_image_basis=pool.PER_IMAGE_BASIS,
+        )
 
 
 def test_a_vector_with_no_aggregate_is_refused():
     """Nothing to check the vector against, so the guard above would be unreachable."""
     with pytest.raises(ValueError, match="mean of"):
-        pool.round_metric(role="witness", aggregate=None, aggregate_basis="x",
-                          per_image=[0.5], per_image_basis=pool.PER_IMAGE_BASIS)
+        pool.round_metric(
+            role="witness",
+            aggregate=None,
+            aggregate_basis="x",
+            per_image=[0.5],
+            per_image_basis=pool.PER_IMAGE_BASIS,
+        )
 
 
 def test_per_image_is_allowed_where_per_site_is_refused():
@@ -197,10 +241,16 @@ def test_per_image_is_allowed_where_per_site_is_refused():
     campaign-owned holdout and then breaks it down by participant. A per-IMAGE vector
     makes no claim about participants, so the same scope admits it."""
     with pytest.raises(ValueError, match="per_site"):
-        pool.round_metric(role="witness", aggregate=0.5, aggregate_basis="x",
-                          per_site={"site-1": 0.5})
-    ok = pool.round_metric(role="witness", aggregate=0.5, aggregate_basis="x",
-                           per_image=[0.4, 0.6], per_image_basis=pool.PER_IMAGE_BASIS)
+        pool.round_metric(
+            role="witness", aggregate=0.5, aggregate_basis="x", per_site={"site-1": 0.5}
+        )
+    ok = pool.round_metric(
+        role="witness",
+        aggregate=0.5,
+        aggregate_basis="x",
+        per_image=[0.4, 0.6],
+        per_image_basis=pool.PER_IMAGE_BASIS,
+    )
     assert ok["aggregate_scope"] == "campaign_holdout"
     assert ok["per_site"] is None and ok["per_image"] == [0.4, 0.6]
 
@@ -212,6 +262,7 @@ def test_the_basis_says_the_aggregate_is_the_mean_of_these_numbers():
 
 
 # ── the cache half: the journal banks both, or serves neither ────────────────
+
 
 def test_the_journal_banks_the_vector_beside_the_scalar():
     j = pool.new_merge_journal(GATE, WITNESS, DIAM)
@@ -268,14 +319,18 @@ def test_the_stamps_really_do_let_that_journal_through():
     wholesale by the stamp check, the pruning would be pinning an unreachable case —
     and the test would pass for a function that returned an empty journal always."""
     j = _scalar_only_journal()
-    assert all(j[f] == pool.new_merge_journal(GATE, WITNESS, DIAM)[f]
-               for f in ("schema_version", "gate_split", "witness_split", "diam_mean"))
+    assert all(
+        j[f] == pool.new_merge_journal(GATE, WITNESS, DIAM)[f]
+        for f in ("schema_version", "gate_split", "witness_split", "diam_mean")
+    )
     assert "orphan" in j["scores"], "the fixture must present the half-entry at all"
     assert len(pool.usable_merge_journal(j, GATE, WITNESS, DIAM)["scores"]) == 1
 
 
 @pytest.mark.parametrize("vectors", [None, "not-a-dict", {}])
-def test_a_journal_with_no_vectors_at_all_degrades_to_empty_not_to_bare_scalars(vectors):
+def test_a_journal_with_no_vectors_at_all_degrades_to_empty_not_to_bare_scalars(
+    vectors,
+):
     j = pool.new_merge_journal(GATE, WITNESS, DIAM)
     pool.record_score(j, "k", 0.5, per_image=[0.5])
     if vectors is None:
@@ -287,6 +342,7 @@ def test_a_journal_with_no_vectors_at_all_degrades_to_empty_not_to_bare_scalars(
 
 # ── the two halves together: a resumed merge still publishes a breakdown ─────
 
+
 def _replay(members, journal, killed_at=None):
     """aggregate()'s scoring sequence against a journal, carrying both halves —
     the same replay ``test_merge_resume`` uses, extended to the vector. Returns
@@ -297,8 +353,10 @@ def _replay(members, journal, killed_at=None):
     def score(paths, split):
         key = pool.score_key(split, paths)
         if key in journal["scores"]:
-            return {"f1": journal["scores"][key],
-                    "per_image": list(journal["per_image_scores"][key])}
+            return {
+                "f1": journal["scores"][key],
+                "per_image": list(journal["per_image_scores"][key]),
+            }
         if killed_at is not None and len(paid) == killed_at:
             raise RuntimeError("replica killed")
         vector = [round(0.4 + len(paths) / 100, 6), round(0.6 + len(paths) / 100, 6)]
@@ -333,12 +391,17 @@ def test_a_resumed_merge_publishes_the_same_breakdown_a_cold_one_does():
 
     paid_cold, head_cold = _replay(members, pool.new_merge_journal(GATE, WITNESS, DIAM))
 
-    assert len(paid_on_resume) == len(paid_cold) - 5, "it must still resume where it died"
+    assert (
+        len(paid_on_resume) == len(paid_cold) - 5
+    ), "it must still resume where it died"
     assert head["per_image"] == head_cold["per_image"] != []
-    record = pool.round_metric(role="witness", aggregate=round(head["f1"], 4),
-                               aggregate_basis=pool.WITNESS_BASIS,
-                               per_image=head["per_image"],
-                               per_image_basis=pool.PER_IMAGE_BASIS)
+    record = pool.round_metric(
+        role="witness",
+        aggregate=round(head["f1"], 4),
+        aggregate_basis=pool.WITNESS_BASIS,
+        per_image=head["per_image"],
+        per_image_basis=pool.PER_IMAGE_BASIS,
+    )
     assert record["per_image"] == head_cold["per_image"]
 
 
@@ -356,37 +419,54 @@ def test_a_scalar_only_journal_would_have_published_no_breakdown():
 
     def score_without_vectors(paths, split):
         key = pool.score_key(split, paths)
-        return {"f1": stripped["scores"][key], "per_image": stripped["per_image_scores"][key]}
+        return {
+            "f1": stripped["scores"][key],
+            "per_image": stripped["per_image_scores"][key],
+        }
 
     hit = score_without_vectors([], pool.split_identity(GATE))
     assert hit["per_image"] == []
     with pytest.raises(ValueError):
-        pool.round_metric(role="selection", aggregate=round(hit["f1"], 4),
-                          aggregate_basis=pool.SELECTION_BASIS,
-                          per_image=hit["per_image"],
-                          per_image_basis=pool.PER_IMAGE_BASIS)
+        pool.round_metric(
+            role="selection",
+            aggregate=round(hit["f1"], 4),
+            aggregate_basis=pool.SELECTION_BASIS,
+            per_image=hit["per_image"],
+            per_image_basis=pool.PER_IMAGE_BASIS,
+        )
 
 
 # ── it reaches the page: the wire projects the record whole ──────────────────
+
 
 def test_the_breakdown_survives_the_wire_projection():
     """``pool_wire_state`` passes metric records through without a key whitelist, so
     an added field really does reach the page rather than being projected away. If
     that ever changes, the field is dead weight and this says so."""
     vector = [0.4, 0.6]
-    metric = pool.round_metric(role="witness", aggregate=0.5,
-                               aggregate_basis=pool.WITNESS_BASIS,
-                               per_image=vector, per_image_basis=pool.PER_IMAGE_BASIS)
+    metric = pool.round_metric(
+        role="witness",
+        aggregate=0.5,
+        aggregate_basis=pool.WITNESS_BASIS,
+        per_image=vector,
+        per_image_basis=pool.PER_IMAGE_BASIS,
+    )
     index = {
         "model_type": "cpsam",
         "architecture_signature": "sig",
         "contributions": [],
         "decided_contribution_ids": [],
         "merges": [],
-        "baseline": {"model": "stock-cpsam", "witness_metric": metric,
-                     "selection_metric": metric, "created_at": 1.0},
+        "baseline": {
+            "model": "stock-cpsam",
+            "witness_metric": metric,
+            "selection_metric": metric,
+            "created_at": 1.0,
+        },
     }
-    wire = pool.pool_wire_state(index, pool_artifact_id="bioimage-io/cellpose-finetuning-pool")
+    wire = pool.pool_wire_state(
+        index, pool_artifact_id="bioimage-io/cellpose-finetuning-pool"
+    )
     assert wire["baseline_metric"]["per_image"] == vector
     assert wire["baseline_metric"]["per_image_basis"] == pool.PER_IMAGE_BASIS
 
@@ -395,9 +475,15 @@ def test_the_basis_correction_path_keeps_the_breakdown():
     """A record carrying retracted basis wording is rewritten on read. That path
     copies the dict, so it must carry the vector across — a correction that dropped
     it would delete breakdowns from exactly the oldest records."""
-    metric = dict(pool.round_metric(role="selection", aggregate=0.5,
-                                    aggregate_basis="x", per_image=[0.4, 0.6],
-                                    per_image_basis=pool.PER_IMAGE_BASIS))
+    metric = dict(
+        pool.round_metric(
+            role="selection",
+            aggregate=0.5,
+            aggregate_basis="x",
+            per_image=[0.4, 0.6],
+            per_image_basis=pool.PER_IMAGE_BASIS,
+        )
+    )
     metric["aggregate_basis"] = pool.RETRACTED_SELECTION_BASIS
     out = pool.corrected_metric(metric)
     assert out is not metric, "the fixture must actually reach the correcting branch"
@@ -420,10 +506,12 @@ def test_the_runtime_returns_the_vector_it_reduced():
     body = RUNTIME.split("    async def score_soup(")[1].split("\n    async def ")[0]
     assert "pool.per_image_instance_f1(" in body, "the runtime must produce the vector"
     assert '"per_image": per_image' in body, "and return it"
-    assert "pool.mean_of_per_image(per_image)" in body, (
-        "the scalar must be the reduction of that vector, not a separate measurement")
-    assert "pool.mean_instance_f1(" not in body, (
-        "a second scoring pass would make the two halves independent again")
+    assert (
+        "pool.mean_of_per_image(per_image)" in body
+    ), "the scalar must be the reduction of that vector, not a separate measurement"
+    assert (
+        "pool.mean_instance_f1(" not in body
+    ), "a second scoring pass would make the two halves independent again"
 
 
 def test_every_published_metric_goes_through_one_builder():
@@ -433,7 +521,8 @@ def test_every_published_metric_goes_through_one_builder():
     calls = re.findall(r"pool\.round_metric\(", ENTRY)
     assert len(calls) == 1, (
         f"expected exactly one pool.round_metric call (inside _metric, which attaches "
-        f"the breakdown); found {len(calls)}")
+        f"the breakdown); found {len(calls)}"
+    )
     builder = ENTRY.split("def _metric(")[1].split("\n            cc = ")[0]
     assert "pool.PER_IMAGE_BASIS" in builder
     assert "per_image=" in builder
@@ -444,4 +533,6 @@ def test_the_scoring_pass_carries_both_halves_to_the_journal():
     vector must be banked there or not at all."""
     inside = ENTRY.split("async def _score(")[1].split("\n            def _as_pass(")[0]
     assert "per_image=per_image" in inside, "the vector must reach record_score"
-    assert "journal[\"per_image_scores\"][key]" in inside, "a journal hit must serve it too"
+    assert (
+        'journal["per_image_scores"][key]' in inside
+    ), "a journal hit must serve it too"

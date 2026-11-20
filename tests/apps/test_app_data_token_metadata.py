@@ -5,6 +5,7 @@ to (a) surface token expiry in ``get_app_status`` so operators can act
 before it lapses and (b) detect apps deployed by a previous worker
 whose client_id no longer matches (URLs may go stale).
 """
+
 from __future__ import annotations
 
 import inspect
@@ -37,6 +38,6 @@ def test_metadata_mirrors_app_data_keys() -> None:
         '"proxy_service_token_issued_at"',
         '"proxy_service_token_ttl_seconds"',
     ):
-        assert src.count(key) >= 2, (
-            f"expected {key} to appear in both app_data and metadata dicts"
-        )
+        assert (
+            src.count(key) >= 2
+        ), f"expected {key} to appear in both app_data and metadata dicts"

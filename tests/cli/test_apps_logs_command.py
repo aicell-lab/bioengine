@@ -155,9 +155,7 @@ def invoke(monkeypatch):
     def _invoke(command: list, status: dict):
         worker = MagicMock()
         worker.get_app_status = AsyncMock(return_value={APP_ID: status})
-        monkeypatch.setattr(
-            apps_cli, "connect_worker", AsyncMock(return_value=worker)
-        )
+        monkeypatch.setattr(apps_cli, "connect_worker", AsyncMock(return_value=worker))
         result = CliRunner().invoke(
             apps_cli.apps_group,
             [*command, "--worker", WORKER, "--token", TOKEN],

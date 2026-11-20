@@ -45,7 +45,10 @@ MANIFEST_CACHE_TTL_S = 60.0
 # the service and retrying is safe even for writes.
 _HEALTH_CALL_TIMEOUT_S = 15.0
 
-_SEND_FAILURE_MARKERS = ("Failed to send the request", "WebSocket reconnection timed out")
+_SEND_FAILURE_MARKERS = (
+    "Failed to send the request",
+    "WebSocket reconnection timed out",
+)
 
 
 def _is_send_failure(exc: Exception) -> bool:
@@ -190,7 +193,9 @@ class AnnotationBroker:
     def _metadata_or_raise(self, artifact_id: str) -> Dict[str, Any]:
         meta = core.read_metadata(artifact_id, root=STATE_ROOT)
         if meta is None:
-            raise ValueError(f"Dataset '{artifact_id}' is not registered with the broker.")
+            raise ValueError(
+                f"Dataset '{artifact_id}' is not registered with the broker."
+            )
         return meta
 
     def _require_role(
@@ -212,7 +217,9 @@ class AnnotationBroker:
             )
         return meta, caller, role
 
-    def _require_logged_in(self, context: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    def _require_logged_in(
+        self, context: Optional[Dict[str, Any]]
+    ) -> Dict[str, Optional[str]]:
         """Caller identity for an RPC that hangs off no dataset.
 
         ``_require_role`` cannot be used for those: it starts by loading a
@@ -241,9 +248,13 @@ class AnnotationBroker:
 
         return await core.ensure_staged(call, restage)
 
-    async def _list_files_safe(self, artifact_id: str, dir_path: str) -> List[Dict[str, Any]]:
+    async def _list_files_safe(
+        self, artifact_id: str, dir_path: str
+    ) -> List[Dict[str, Any]]:
         try:
-            files = await self._am.list_files(artifact_id, dir_path=dir_path, stage=True)
+            files = await self._am.list_files(
+                artifact_id, dir_path=dir_path, stage=True
+            )
             return files or []
         except Exception as exc:
             # [] means "no such directory yet". Reporting a transport failure as
@@ -262,9 +273,13 @@ class AnnotationBroker:
             (e.get("name") if isinstance(e, dict) else str(e)) == name for e in entries
         )
 
-    async def _read_json_file(self, artifact_id: str, file_path: str, default: Any) -> Any:
+    async def _read_json_file(
+        self, artifact_id: str, file_path: str, default: Any
+    ) -> Any:
         try:
-            url = await self._am.get_file(artifact_id=artifact_id, file_path=file_path, stage=True)
+            url = await self._am.get_file(
+                artifact_id=artifact_id, file_path=file_path, stage=True
+            )
         except Exception as exc:
             if _is_send_failure(exc):
                 raise
@@ -275,12 +290,16 @@ class AnnotationBroker:
         resp.raise_for_status()
         return resp.json()
 
-    async def _write_json_file(self, artifact_id: str, file_path: str, data: Any) -> None:
+    async def _write_json_file(
+        self, artifact_id: str, file_path: str, data: Any
+    ) -> None:
         url = await self._am.put_file(artifact_id, file_path=file_path)
         resp = await self._http.put(url, content=json.dumps(data).encode("utf-8"))
         resp.raise_for_status()
 
-    async def _put_bytes(self, artifact_id: str, file_path: str, content: bytes) -> None:
+    async def _put_bytes(
+        self, artifact_id: str, file_path: str, content: bytes
+    ) -> None:
         url = await self._am.put_file(artifact_id, file_path=file_path)
         resp = await self._http.put(url, content=content)
         resp.raise_for_status()
@@ -367,7 +386,9 @@ class AnnotationBroker:
     async def _cached_manifest_info(self, artifact_id: str) -> Dict[str, str]:
         cached = self._manifest_name_cache.get(artifact_id)
         now = time.time()
-        if cached is not None and core.is_cache_fresh(cached[0], ttl_s=MANIFEST_CACHE_TTL_S, now=now):
+        if cached is not None and core.is_cache_fresh(
+            cached[0], ttl_s=MANIFEST_CACHE_TTL_S, now=now
+        ):
             return cached[1]
         try:
             manifest = await self._read_artifact_manifest(artifact_id)
@@ -376,7 +397,9 @@ class AnnotationBroker:
                 "description": str(manifest.get("description") or ""),
             }
         except Exception as exc:
-            logger.warning(f"annotation-broker: failed to read manifest for '{artifact_id}': {exc}")
+            logger.warning(
+                f"annotation-broker: failed to read manifest for '{artifact_id}': {exc}"
+            )
             info = {"name": artifact_id, "description": ""}
         self._manifest_name_cache[artifact_id] = (now, info)
         return info
@@ -438,7 +461,9 @@ class AnnotationBroker:
                 else dict(getattr(current, "config", {}) or {})
             )
             current_config["permissions"] = perms
-            await self._am.edit(artifact_id=artifact_id, config=current_config, stage=True)
+            await self._am.edit(
+                artifact_id=artifact_id, config=current_config, stage=True
+            )
             await self._commit_tolerating_pending_uploads(artifact_id)
             await self._am.edit(artifact_id=artifact_id, stage=True)
 
@@ -449,7 +474,9 @@ class AnnotationBroker:
     @bioengine.method(context=True)
     async def register_dataset(
         self,
-        artifact_id: str = Field(..., description="Full artifact id, e.g. 'bioimage-io/annotation-abc123'."),
+        artifact_id: str = Field(
+            ..., description="Full artifact id, e.g. 'bioimage-io/annotation-abc123'."
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Register a freshly-created dataset artifact with the broker.
@@ -475,18 +502,20 @@ class AnnotationBroker:
         # not the artifact top level.
         created_by = created_by or manifest.get("created_by")
 
-        if not core.caller_matches_artifact_owner(manifest, created_by, caller["id"], caller["email"]):
+        if not core.caller_matches_artifact_owner(
+            manifest, created_by, caller["id"], caller["email"]
+        ):
             who = caller["id"] or caller["email"] or "anonymous"
-            raise PermissionError(f"User '{who}' does not own artifact '{artifact_id}'; cannot register it.")
+            raise PermissionError(
+                f"User '{who}' does not own artifact '{artifact_id}'; cannot register it."
+            )
 
         owner = manifest.get("owner") or {"id": caller["id"], "email": caller["email"]}
         meta = core.new_metadata(artifact_id, owner=owner)
         return core.write_metadata(meta, root=STATE_ROOT)
 
     @bioengine.method(context=True)
-    async def list_my_datasets(
-        self, context=None
-    ) -> Dict[str, Any]:
+    async def list_my_datasets(self, context=None) -> Dict[str, Any]:
         """Datasets where the caller is a manager or annotator (NOT owner —
         the frontend gets the caller's own datasets from the collection)."""
         caller = self._ctx_user(context)
@@ -543,7 +572,8 @@ class AnnotationBroker:
         label_dir = core.label_folder(label)
         entries = await self._list_files_safe(artifact_id, label_dir)
         user_dirs = [
-            e.get("name") for e in entries
+            e.get("name")
+            for e in entries
             if isinstance(e, dict)
             and (e.get("type") == "directory" or e.get("is_dir"))
             and str(e.get("name", "")).startswith("user-")
@@ -551,7 +581,9 @@ class AnnotationBroker:
         totals: Dict[str, int] = {}
         for user_dir in user_dirs:
             files = await self._list_files_safe(artifact_id, f"{label_dir}/{user_dir}")
-            filenames = [f.get("name", "") if isinstance(f, dict) else str(f) for f in files]
+            filenames = [
+                f.get("name", "") if isinstance(f, dict) else str(f) for f in files
+            ]
             for stem, n in core.count_pairs_by_stem(filenames).items():
                 totals[stem] = totals.get(stem, 0) + n
         return totals
@@ -602,8 +634,12 @@ class AnnotationBroker:
         artifact_id: str = Field(..., description="Dataset artifact id."),
         label: str = Field(..., description="Label the split belongs to."),
         name: str = Field(..., description="Split name (^[a-z0-9._-]+$)."),
-        train: List[str] = Field(..., description="Annotated image stems for training."),
-        test: Optional[List[str]] = Field(None, description="Annotated image stems for testing."),
+        train: List[str] = Field(
+            ..., description="Annotated image stems for training."
+        ),
+        test: Optional[List[str]] = Field(
+            None, description="Annotated image stems for testing."
+        ),
         ratio: Optional[float] = Field(
             None,
             description="Target train fraction (0..1] used for later auto-distribution; defaults to the actual fraction at creation.",
@@ -633,8 +669,13 @@ class AnnotationBroker:
         await self._validate_split_stems_are_images(artifact_id, stems)
         counts = await self._annotation_counts(artifact_id, label)
         doc = core.new_split(
-            label, name, train, test, counts,
-            caller.get("id") or caller.get("email"), ratio,
+            label,
+            name,
+            train,
+            test,
+            counts,
+            caller.get("id") or caller.get("email"),
+            ratio,
         )
 
         async def _write():
@@ -649,8 +690,12 @@ class AnnotationBroker:
         artifact_id: str = Field(..., description="Dataset artifact id."),
         label: str = Field(..., description="Label the split belongs to."),
         name: str = Field(..., description="Split name."),
-        add_train: Optional[List[str]] = Field(None, description="Annotated stems to add to train."),
-        add_test: Optional[List[str]] = Field(None, description="Annotated stems to add to test."),
+        add_train: Optional[List[str]] = Field(
+            None, description="Annotated stems to add to train."
+        ),
+        add_test: Optional[List[str]] = Field(
+            None, description="Annotated stems to add to test."
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Add-only extension of an existing split. Added stems must be
@@ -667,7 +712,10 @@ class AnnotationBroker:
         await self._validate_split_stems_are_images(artifact_id, added)
         counts = await self._annotation_counts(artifact_id, label)
         doc = core.extend_split(
-            doc, add_train, add_test, counts,
+            doc,
+            add_train,
+            add_test,
+            counts,
             caller.get("id") or caller.get("email"),
         )
 
@@ -745,7 +793,9 @@ class AnnotationBroker:
         )
         summaries: List[Dict[str, Any]] = []
         for lbl in labels:
-            entries = await self._list_files_safe(artifact_id, core.splits_dir_path(lbl))
+            entries = await self._list_files_safe(
+                artifact_id, core.splits_dir_path(lbl)
+            )
             for e in entries:
                 fname = e.get("name", "") if isinstance(e, dict) else str(e)
                 if not fname.endswith(".json"):
@@ -790,8 +840,12 @@ class AnnotationBroker:
     async def get_training_urls(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
-        label: str = Field(..., description="Label whose annotations feed the training."),
-        split_name: str = Field(..., description="Split that defines the train/test membership."),
+        label: str = Field(
+            ..., description="Label whose annotations feed the training."
+        ),
+        split_name: str = Field(
+            ..., description="Split that defines the train/test membership."
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Training inputs for micro-sam fine-tuning: for the LATEST pair per
@@ -807,7 +861,8 @@ class AnnotationBroker:
         label_dir = core.label_folder(label)
         entries = await self._list_files_safe(artifact_id, label_dir)
         user_dirs = [
-            e.get("name") for e in entries
+            e.get("name")
+            for e in entries
             if isinstance(e, dict)
             and (e.get("type") == "directory" or e.get("is_dir"))
             and str(e.get("name", "")).startswith("user-")
@@ -817,15 +872,19 @@ class AnnotationBroker:
         for user_dir in user_dirs:
             dir_path = f"{label_dir}/{user_dir}"
             files = await self._list_files_safe(artifact_id, dir_path)
-            filenames = [f.get("name", "") if isinstance(f, dict) else str(f) for f in files]
+            filenames = [
+                f.get("name", "") if isinstance(f, dict) else str(f) for f in files
+            ]
             for stem, pair in core.latest_pairs_by_stem(filenames).items():
                 if stem not in train_stems and stem not in test_stems:
                     continue
-                pairs.append({
-                    "stem": stem,
-                    "user": user_dir,
-                    "geojson_path": f"{dir_path}/{pair['geojson']}",
-                })
+                pairs.append(
+                    {
+                        "stem": stem,
+                        "user": user_dir,
+                        "geojson_path": f"{dir_path}/{pair['geojson']}",
+                    }
+                )
 
         # model-finetune fetches each image URL whole and hands the buffer to
         # imageio.imread, so a not-yet-materialised image has nothing that can
@@ -869,16 +928,24 @@ class AnnotationBroker:
                 "geojson_url": geo_url,
             }
             (test_out if p["stem"] in test_stems else train_out).append(row)
-        return {"train": train_out, "test": test_out, "split": core.split_summary(split)}
+        return {
+            "train": train_out,
+            "test": test_out,
+            "split": core.split_summary(split),
+        }
 
     @bioengine.method(context=True)
     async def delete_annotation(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
         label: str = Field(..., description="Label the annotation belongs to."),
-        user_folder: str = Field(..., description="Sanitized annotator folder, e.g. 'user-github-12345'."),
+        user_folder: str = Field(
+            ..., description="Sanitized annotator folder, e.g. 'user-github-12345'."
+        ),
         stem: str = Field(..., description="Image stem the annotation belongs to."),
-        timestamp: str = Field(..., description="Timestamp of the save pair (YYYYMMDD-HHMMSS)."),
+        timestamp: str = Field(
+            ..., description="Timestamp of the save pair (YYYYMMDD-HHMMSS)."
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Delete one annotation save (its png + geojson pair). Allowed for
@@ -888,7 +955,9 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, caller, role = self._require_role(context, artifact_id, "annotator")
         if not core.is_valid_timestamp(timestamp):
-            raise ValueError(f"Invalid timestamp {timestamp!r}; expected YYYYMMDD-HHMMSS.")
+            raise ValueError(
+                f"Invalid timestamp {timestamp!r}; expected YYYYMMDD-HHMMSS."
+            )
         is_own = core.sanitize_user_id(caller.get("id")) == user_folder
         if not core.role_at_least(role, "manager") and not is_own:
             raise PermissionError(
@@ -946,7 +1015,9 @@ class AnnotationBroker:
                     await _rm_dir(path)
                 else:
                     try:
-                        await self._am.remove_file(artifact_id=artifact_id, file_path=path)
+                        await self._am.remove_file(
+                            artifact_id=artifact_id, file_path=path
+                        )
                     except Exception as exc:
                         failed.append(path)
                         logger.warning(
@@ -958,7 +1029,9 @@ class AnnotationBroker:
             await _rm_dir(folder)
 
         await self._ensure_staged(artifact_id, _do)
-        meta["labels"] = [l for l in meta.get("labels", []) or [] if l.get("name") != name]
+        meta["labels"] = [
+            l for l in meta.get("labels", []) or [] if l.get("name") != name
+        ]
         meta = core.write_metadata(meta, root=STATE_ROOT)
         # Persist the deletion into the committed version as well: staged
         # removals alone leave the last committed snapshot holding the label
@@ -1004,12 +1077,18 @@ class AnnotationBroker:
             role = entry.get("role")
             user = entry.get("user") or {}
             if role not in core.ROLE_LIST_KEYS:
-                raise ValueError(f"Invalid role '{role}'; expected 'manager' or 'annotator'.")
+                raise ValueError(
+                    f"Invalid role '{role}'; expected 'manager' or 'annotator'."
+                )
             if not user.get("id") and not user.get("email"):
                 raise ValueError("Each add entry needs a user with an id or email.")
             target_role = core.resolve_role(meta, user.get("id"), user.get("email"))
-            if caller_role != "owner" and (role == "manager" or target_role == "manager"):
-                raise PermissionError("Only the dataset owner may add or remove managers.")
+            if caller_role != "owner" and (
+                role == "manager" or target_role == "manager"
+            ):
+                raise PermissionError(
+                    "Only the dataset owner may add or remove managers."
+                )
         for user in remove:
             target_role = core.resolve_role(meta, user.get("id"), user.get("email"))
             if caller_role != "owner" and target_role == "manager":
@@ -1036,7 +1115,9 @@ class AnnotationBroker:
     async def request_access(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
-        role: str = Field("annotator", description="Requested role: 'annotator' or 'manager'."),
+        role: str = Field(
+            "annotator", description="Requested role: 'annotator' or 'manager'."
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Register an access request from a logged-in user without a role
@@ -1084,7 +1165,9 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, caller_role = self._require_role(context, artifact_id, "manager")
         if role not in core.ROLE_LIST_KEYS:
-            raise ValueError(f"Invalid role '{role}'; expected 'manager' or 'annotator'.")
+            raise ValueError(
+                f"Invalid role '{role}'; expected 'manager' or 'annotator'."
+            )
 
         target_role = core.resolve_role(meta, user.get("id"), user.get("email"))
         if caller_role != "owner" and (role == "manager" or target_role == "manager"):
@@ -1120,7 +1203,10 @@ class AnnotationBroker:
     async def set_public(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
-        is_public: bool = Field(..., description="Whether anyone can read (and, if logged in, annotate) this dataset."),
+        is_public: bool = Field(
+            ...,
+            description="Whether anyone can read (and, if logged in, annotate) this dataset.",
+        ),
         context=None,
     ) -> Dict[str, Any]:
         artifact_id = self._canonical_id(artifact_id)
@@ -1151,7 +1237,9 @@ class AnnotationBroker:
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
 
         async with self._image_manifest_lock(artifact_id):
-            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            doc = await self._read_json_file(
+                artifact_id, core.IMAGE_MANIFEST_PATH, None
+            )
             listing = await self._list_files_safe(artifact_id, "images")
             entries, changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
@@ -1160,9 +1248,12 @@ class AnnotationBroker:
                 prune=True,
             )
             if changed:
+
                 async def _write():
                     await self._write_json_file(
-                        artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                        artifact_id,
+                        core.IMAGE_MANIFEST_PATH,
+                        core.build_image_manifest(entries),
                     )
 
                 await self._ensure_staged(artifact_id, _write)
@@ -1174,7 +1265,9 @@ class AnnotationBroker:
         return {
             "changed": changed,
             "images": len(entries),
-            "remote": sum(1 for e in entries.values() if e.get("state") == core.IMAGE_STATE_REMOTE),
+            "remote": sum(
+                1 for e in entries.values() if e.get("state") == core.IMAGE_STATE_REMOTE
+            ),
         }
 
     # --- Remote NGFF import (0.10.0) --------------------------------------
@@ -1188,9 +1281,7 @@ class AnnotationBroker:
         try:
             resp = await self._http.get(root + key)
         except Exception as exc:
-            raise core.NgffSourceError(
-                f"Could not reach {root + key}: {exc}"
-            ) from exc
+            raise core.NgffSourceError(f"Could not reach {root + key}: {exc}") from exc
         if resp.status_code == 404:
             return None
         if resp.status_code >= 400:
@@ -1276,7 +1367,8 @@ class AnnotationBroker:
         coarsest_index = min(
             range(len(metas)),
             key=lambda i: core.ngff_level_dims(
-                metas[i]["shape"], core.ngff_axis_roles(parsed["axes"], len(metas[i]["shape"]))
+                metas[i]["shape"],
+                core.ngff_axis_roles(parsed["axes"], len(metas[i]["shape"])),
             )["width"],
         )
         chunk_url = (
@@ -1327,7 +1419,8 @@ class AnnotationBroker:
             ),
         ),
         multiscale_path: Optional[str] = Field(
-            None, description="Name of the multiscale to use when the group holds several."
+            None,
+            description="Name of the multiscale to use when the group holds several.",
         ),
         origin: str = Field(
             "https://bioimage.io",
@@ -1382,7 +1475,8 @@ class AnnotationBroker:
             description="Name for the image; derived from the store root when omitted.",
         ),
         multiscale_path: Optional[str] = Field(
-            None, description="Name of the multiscale to use when the group holds several."
+            None,
+            description="Name of the multiscale to use when the group holds several.",
         ),
         region: Optional[Dict[str, int]] = Field(
             None,
@@ -1453,7 +1547,9 @@ class AnnotationBroker:
         )
 
         async with self._image_manifest_lock(artifact_id):
-            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            doc = await self._read_json_file(
+                artifact_id, core.IMAGE_MANIFEST_PATH, None
+            )
             listing = await self._list_files_safe(artifact_id, "images")
             entries, _ = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
@@ -1469,7 +1565,9 @@ class AnnotationBroker:
 
             async def _write():
                 await self._write_json_file(
-                    artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                    artifact_id,
+                    core.IMAGE_MANIFEST_PATH,
+                    core.build_image_manifest(entries),
                 )
 
             await self._ensure_staged(artifact_id, _write)
@@ -1508,7 +1606,9 @@ class AnnotationBroker:
         _meta, _caller, _role = self._require_role(context, artifact_id, "manager")
 
         async with self._image_manifest_lock(artifact_id):
-            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            doc = await self._read_json_file(
+                artifact_id, core.IMAGE_MANIFEST_PATH, None
+            )
             entries = core.parse_image_manifest(doc)
             entry = entries.get(stem)
             if entry is None:
@@ -1522,7 +1622,9 @@ class AnnotationBroker:
 
             async def _write():
                 await self._write_json_file(
-                    artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                    artifact_id,
+                    core.IMAGE_MANIFEST_PATH,
+                    core.build_image_manifest(entries),
                 )
 
             await self._ensure_staged(artifact_id, _write)
@@ -1533,7 +1635,9 @@ class AnnotationBroker:
 
     # --- Materialisation (0.11.0) -----------------------------------------
 
-    async def _object_head(self, artifact_id: str, file_path: str, nbytes: int) -> bytes:
+    async def _object_head(
+        self, artifact_id: str, file_path: str, nbytes: int
+    ) -> bytes:
         """First *nbytes* of an artifact file, or ``b""`` if it cannot be read.
 
         A presigned GET is minted per call rather than cached: the URL is
@@ -1562,7 +1666,8 @@ class AnnotationBroker:
             ),
         ),
         levels: Optional[int] = Field(
-            None, description="Pyramid levels the encoder wrote. Only read when done=true."
+            None,
+            description="Pyramid levels the encoder wrote. Only read when done=true.",
         ),
         context=None,
     ) -> Dict[str, Any]:
@@ -1638,7 +1743,9 @@ class AnnotationBroker:
             )
 
         async with self._image_manifest_lock(artifact_id):
-            doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            doc = await self._read_json_file(
+                artifact_id, core.IMAGE_MANIFEST_PATH, None
+            )
             entries = core.parse_image_manifest(doc)
             entry = entries.get(stem)
             if entry is None:
@@ -1650,7 +1757,9 @@ class AnnotationBroker:
 
             async def _write():
                 await self._write_json_file(
-                    artifact_id, core.IMAGE_MANIFEST_PATH, core.build_image_manifest(entries)
+                    artifact_id,
+                    core.IMAGE_MANIFEST_PATH,
+                    core.build_image_manifest(entries),
                 )
 
             await self._ensure_staged(artifact_id, _write)
@@ -1682,7 +1791,11 @@ class AnnotationBroker:
             await self._write_json_file(
                 artifact_id,
                 core.label_metadata_path(name),
-                {"name": name, "description": description, "created_at": core.now_iso()},
+                {
+                    "name": name,
+                    "description": description,
+                    "created_at": core.now_iso(),
+                },
             )
 
         await self._ensure_staged(artifact_id, _put_label_metadata)
@@ -1727,7 +1840,8 @@ class AnnotationBroker:
         # stem, is cached in the dataset's broker metadata, and failed reads
         # stay uncached so a later index call retries them.
         missing_dims = [
-            stem for stem, entry in manifest.items()
+            stem
+            for stem, entry in manifest.items()
             if "width" not in entry and stem not in dims_cache and entry.get("path")
         ]
         if missing_dims:
@@ -1741,7 +1855,9 @@ class AnnotationBroker:
                             file_path=manifest[stem]["path"],
                             stage=True,
                         )
-                        resp = await self._http.get(url, headers={"Range": "bytes=0-23"})
+                        resp = await self._http.get(
+                            url, headers={"Range": "bytes=0-23"}
+                        )
                         resp.raise_for_status()
                         return stem, core.parse_png_dims(resp.content[:24])
                     except Exception:
@@ -1758,7 +1874,11 @@ class AnnotationBroker:
                 core.write_metadata(meta, root=STATE_ROOT)
         for img in images:
             entry = manifest[img["stem"]]
-            dims = [entry["width"], entry["height"]] if "width" in entry else dims_cache.get(img["stem"])
+            dims = (
+                [entry["width"], entry["height"]]
+                if "width" in entry
+                else dims_cache.get(img["stem"])
+            )
             if dims:
                 img["width"], img["height"] = int(dims[0]), int(dims[1])
 
@@ -1780,7 +1900,10 @@ class AnnotationBroker:
                     continue
                 dir_path = core.user_label_dir(label_name, caller["id"])
                 entries = await self._list_files_safe(artifact_id, dir_path)
-                filenames = [e.get("name", "") if isinstance(e, dict) else str(e) for e in entries]
+                filenames = [
+                    e.get("name", "") if isinstance(e, dict) else str(e)
+                    for e in entries
+                ]
                 pairs = core.latest_pairs_by_stem(filenames)
                 if pairs:
                     my_annotations[label_name] = {
@@ -1809,13 +1932,17 @@ class AnnotationBroker:
         _meta, caller, _role = self._require_role(context, artifact_id, "annotator")
         dir_path = core.user_label_dir(label, caller["id"])
         entries = await self._list_files_safe(artifact_id, dir_path)
-        filenames = [e.get("name", "") if isinstance(e, dict) else str(e) for e in entries]
+        filenames = [
+            e.get("name", "") if isinstance(e, dict) else str(e) for e in entries
+        ]
         pairs = core.latest_pairs_by_stem(filenames)
         pair = pairs.get(image_stem)
         if not pair:
             return {"exists": False}
         url = await self._am.get_file(
-            artifact_id=artifact_id, file_path=f"{dir_path}/{pair['geojson']}", stage=True
+            artifact_id=artifact_id,
+            file_path=f"{dir_path}/{pair['geojson']}",
+            stage=True,
         )
         return {"exists": True, "latest_ts": pair["timestamp"], "geojson_read_url": url}
 
@@ -1823,7 +1950,9 @@ class AnnotationBroker:
     async def get_image_url(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
-        image_stem: str = Field(..., description="Image stem (filename without extension)."),
+        image_stem: str = Field(
+            ..., description="Image stem (filename without extension)."
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Where to read one image from. Featherweight first call for the
@@ -1874,7 +2003,9 @@ class AnnotationBroker:
     async def get_embedding_urls(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
-        image_stem: str = Field(..., description="Image stem (filename without extension)."),
+        image_stem: str = Field(
+            ..., description="Image stem (filename without extension)."
+        ),
         model_type: str = Field(..., description="μSAM model type, e.g. 'vit_l_lm'."),
         context=None,
     ) -> Dict[str, Any]:
@@ -1884,7 +2015,9 @@ class AnnotationBroker:
         self._require_role(context, artifact_id, "annotator")
         emb_path = core.embedding_path(image_stem, model_type)
         if await self._file_exists(artifact_id, emb_path):
-            read_url = await self._am.get_file(artifact_id=artifact_id, file_path=emb_path, stage=True)
+            read_url = await self._am.get_file(
+                artifact_id=artifact_id, file_path=emb_path, stage=True
+            )
             return {"exists": True, "read_url": read_url}
 
         image_file_path = await self._image_file_path(artifact_id, image_stem)
@@ -1902,7 +2035,9 @@ class AnnotationBroker:
     async def remove_embedding(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
-        image_stem: str = Field(..., description="Image stem (filename without extension)."),
+        image_stem: str = Field(
+            ..., description="Image stem (filename without extension)."
+        ),
         model_type: Optional[str] = Field(
             None,
             description="μSAM model type to clear, e.g. 'vit_l_lm'. Omit to clear "
@@ -1943,7 +2078,9 @@ class AnnotationBroker:
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
         label: str = Field(..., description="Label name."),
-        image_stem: str = Field(..., description="Image stem (filename without extension)."),
+        image_stem: str = Field(
+            ..., description="Image stem (filename without extension)."
+        ),
         context=None,
     ) -> Dict[str, Any]:
         artifact_id = self._canonical_id(artifact_id)
@@ -1957,14 +2094,18 @@ class AnnotationBroker:
         timestamp = core.new_timestamp()
         paths = core.annotation_save_paths(label, caller["id"], image_stem, timestamp)
         png_put_url = await self._am.put_file(artifact_id, file_path=paths["png"])
-        geojson_put_url = await self._am.put_file(artifact_id, file_path=paths["geojson"])
+        geojson_put_url = await self._am.put_file(
+            artifact_id, file_path=paths["geojson"]
+        )
 
         safe_user = core.sanitize_user_id(caller["id"])
         users_path = core.label_users_path(label)
 
         async def _upsert_users():
             current = await self._read_json_file(artifact_id, users_path, default={})
-            updated = core.upsert_label_user(current, safe_user, caller["id"], caller["email"])
+            updated = core.upsert_label_user(
+                current, safe_user, caller["id"], caller["email"]
+            )
             await self._write_json_file(artifact_id, users_path, updated)
 
         await self._ensure_staged(artifact_id, _upsert_users)

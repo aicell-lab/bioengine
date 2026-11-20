@@ -71,8 +71,13 @@ class _Stub:
         # ever SUCCEEDS the run proceeds instead of dying on a missing key. Without
         # that, a defect arm fails with KeyError and looks like a discriminating
         # result while saying nothing about the destination (caught 2026-11-06).
-        return {"patch_shape": (512, 512), "train_images": [], "train_labels": [],
-                "val_images": None, "val_labels": None}
+        return {
+            "patch_shape": (512, 512),
+            "train_images": [],
+            "train_labels": [],
+            "val_images": None,
+            "val_labels": None,
+        }
 
     async def _http_retry(self, *a, **k):
         return _Resp()
@@ -126,7 +131,9 @@ def _fail_half_way_through_writing(monkeypatch, target_name: str):
 
 
 @pytest.mark.asyncio
-async def test_a_torn_init_checkpoint_write_does_not_damage_the_destination(monkeypatch) -> None:
+async def test_a_torn_init_checkpoint_write_does_not_damage_the_destination(
+    monkeypatch,
+) -> None:
     dest = training.session_dir(SESSION) / "init_checkpoint.pt"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(OLD)
@@ -137,7 +144,12 @@ async def test_a_torn_init_checkpoint_write_does_not_damage_the_destination(monk
     _fail_half_way_through_writing(monkeypatch, "init_checkpoint.pt")
 
     await _method_of("_run_training", _Stub())(
-        SESSION, "vit_b_lm", [], [], None, None,
+        SESSION,
+        "vit_b_lm",
+        [],
+        [],
+        None,
+        None,
         {"init_checkpoint": "https://example.invalid/init_checkpoint.pt"},
     )
 
@@ -160,7 +172,9 @@ async def test_a_torn_init_checkpoint_write_does_not_damage_the_destination(monk
 
 
 @pytest.mark.asyncio
-async def test_the_destination_is_never_left_as_a_prefix_when_absent_beforehand(monkeypatch) -> None:
+async def test_the_destination_is_never_left_as_a_prefix_when_absent_beforehand(
+    monkeypatch,
+) -> None:
     """Same fault with no pre-existing file: the name must not appear at all.
 
     Separate from the arm above because "the old bytes survived" and "the name was
@@ -174,7 +188,12 @@ async def test_the_destination_is_never_left_as_a_prefix_when_absent_beforehand(
     _fail_half_way_through_writing(monkeypatch, "init_checkpoint.pt")
 
     await _method_of("_run_training", _Stub())(
-        SESSION + "-fresh", "vit_b_lm", [], [], None, None,
+        SESSION + "-fresh",
+        "vit_b_lm",
+        [],
+        [],
+        None,
+        None,
         {"init_checkpoint": "https://example.invalid/init_checkpoint.pt"},
     )
 

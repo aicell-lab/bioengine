@@ -5,6 +5,7 @@ Examples:
   bioengine cluster status
   bioengine cluster status --json
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,7 +36,9 @@ _WORKER_OPTIONS = [
         metavar="TOKEN",
         help="Hypha auth token (or HYPHA_TOKEN env var).",
     ),
-    click.option("--server-url", envvar="BIOENGINE_SERVER_URL", default=None, hidden=True),
+    click.option(
+        "--server-url", envvar="BIOENGINE_SERVER_URL", default=None, hidden=True
+    ),
 ]
 
 
@@ -113,13 +116,15 @@ def cluster_status(as_json, worker_service_id, token, server_url):
         nodes = ray.get("nodes", {})
 
         if as_json:
-            print_json({
-                "cluster": cluster,
-                "nodes": {
-                    nid: {k: v for k, v in info.items()}
-                    for nid, info in nodes.items()
-                },
-            })
+            print_json(
+                {
+                    "cluster": cluster,
+                    "nodes": {
+                        nid: {k: v for k, v in info.items()}
+                        for nid, info in nodes.items()
+                    },
+                }
+            )
             return
 
         # Human-readable summary
@@ -129,8 +134,12 @@ def cluster_status(as_json, worker_service_id, token, server_url):
         )
         click.echo("")
 
-        gpu_nodes = [(nid, info) for nid, info in nodes.items() if info.get("total_gpu", 0) > 0]
-        cpu_only = [(nid, info) for nid, info in nodes.items() if info.get("total_gpu", 0) == 0]
+        gpu_nodes = [
+            (nid, info) for nid, info in nodes.items() if info.get("total_gpu", 0) > 0
+        ]
+        cpu_only = [
+            (nid, info) for nid, info in nodes.items() if info.get("total_gpu", 0) == 0
+        ]
 
         if gpu_nodes:
             click.echo("GPU nodes:")

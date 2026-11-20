@@ -2228,8 +2228,7 @@ class BioEngineWorker:
             "geo_location": self.geo_location,
             "is_ready": (
                 self.is_ready.is_set()
-                and self._monitor_consecutive_errors
-                < self._monitor_degraded_threshold
+                and self._monitor_consecutive_errors < self._monitor_degraded_threshold
                 # .get, not a subscript: this is the unauthenticated health
                 # surface, so raising here would fail the probe that reads it.
                 # The key's presence is pinned by tests instead.
@@ -2244,9 +2243,9 @@ class BioEngineWorker:
         # die quickly otherwise fall entirely between two ticks).
         if self.ray_cluster.slurm_workers is not None:
             try:
-                status["ray_cluster"]["slurm_jobs"] = (
-                    await self.ray_cluster.slurm_workers.get_job_status()
-                )
+                status["ray_cluster"][
+                    "slurm_jobs"
+                ] = await self.ray_cluster.slurm_workers.get_job_status()
             except Exception as e:
                 self.logger.warning(f"Failed to refresh slurm_jobs for get_status: {e}")
 

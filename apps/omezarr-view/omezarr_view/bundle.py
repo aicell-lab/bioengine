@@ -12,6 +12,7 @@ two is detectable rather than silent.
     python -m omezarr_view.bundle          # regenerate after editing the HTML
     python -m omezarr_view.bundle --check  # non-zero exit if out of date
 """
+
 from __future__ import annotations
 
 import argparse
@@ -59,8 +60,11 @@ def main() -> int:
         except ImportError:
             print("_pages.py missing; run python -m omezarr_view.bundle")
             return 1
-        stale = [n for n in PAGES
-                 if _pages.SOURCE_HASHES.get(n) != digest((FRONTEND / n).read_text())]
+        stale = [
+            n
+            for n in PAGES
+            if _pages.SOURCE_HASHES.get(n) != digest((FRONTEND / n).read_text())
+        ]
         if stale:
             print("stale bundled pages:", ", ".join(stale))
             return 1

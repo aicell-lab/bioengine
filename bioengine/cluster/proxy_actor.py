@@ -90,10 +90,12 @@ def _touch_on_call(method: Callable) -> Callable:
     wrapped — they are reached only via calls that already touched the
     timer at the public-method boundary.
     """
+
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         self._last_called_at = time.time()
         return method(self, *args, **kwargs)
+
     return wrapper
 
 
@@ -231,7 +233,9 @@ class BioEngineProxyActor:
         # Structure: {app_id: {"HYPHA_TOKEN": str, ...}}
         self._app_secret_env_vars: Dict[str, Dict[str, str]] = {}
 
-        self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
+        self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = (
+            None
+        )
 
         # Last successful per-node GPU read (memory and device names) from the
         # Ray dashboard. The dashboard sits behind a KubeRay auth proxy where a
@@ -831,18 +835,14 @@ class BioEngineProxyActor:
             from ray import serve
 
             client = serve.context._get_global_client()
-            details = ray.get(
-                client._controller.get_serve_instance_details.remote()
-            )
+            details = ray.get(client._controller.get_serve_instance_details.remote())
             if hasattr(details, "model_dump"):
                 return details.model_dump()
             if isinstance(details, dict):
                 return details
             return {}
         except Exception as e:
-            logger.error(
-                f"Failed to fetch Serve instance details: {e}", exc_info=True
-            )
+            logger.error(f"Failed to fetch Serve instance details: {e}", exc_info=True)
             return {}
 
     @_touch_on_call

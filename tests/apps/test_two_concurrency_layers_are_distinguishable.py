@@ -58,51 +58,49 @@ def manager_with_both_layers(
     """A manager whose two layers hold deliberately different numbers."""
     manager = make_manager(authorized_users={"*": [ADMIN]})
     manager._deployed_applications[APP_ID]["max_ongoing_requests"] = proxy_cap
-    manager.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote = (
-        AsyncMock(
-            return_value={
-                "applications": {
-                    APP_ID: {
-                        "status": "RUNNING",
-                        "message": "",
-                        "deployments": {
-                            ENTRY_DEPLOYMENT: {
-                                "status": "HEALTHY",
-                                "message": "",
-                                "deployment_config": {
-                                    "max_ongoing_requests": decorator_cap,
-                                    # Planted beside it: whatever is copied out
-                                    # of deployment_config must be that one
-                                    # integer and not its neighbours.
-                                    "runtime_env": {
-                                        "env_vars": {
-                                            "_BIOENGINE_SECRET_HYPHA_TOKEN": (
-                                                SECRET_IN_DEPLOYMENT_CONFIG
-                                            )
-                                        }
-                                    },
+    manager.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote = AsyncMock(
+        return_value={
+            "applications": {
+                APP_ID: {
+                    "status": "RUNNING",
+                    "message": "",
+                    "deployments": {
+                        ENTRY_DEPLOYMENT: {
+                            "status": "HEALTHY",
+                            "message": "",
+                            "deployment_config": {
+                                "max_ongoing_requests": decorator_cap,
+                                # Planted beside it: whatever is copied out
+                                # of deployment_config must be that one
+                                # integer and not its neighbours.
+                                "runtime_env": {
+                                    "env_vars": {
+                                        "_BIOENGINE_SECRET_HYPHA_TOKEN": (
+                                            SECRET_IN_DEPLOYMENT_CONFIG
+                                        )
+                                    }
                                 },
-                                "replicas": [],
                             },
-                            RUNTIME_DEPLOYMENT: {
-                                "status": "HEALTHY",
-                                "message": "",
-                                "deployment_config": {"max_ongoing_requests": 5},
-                                "replicas": [],
-                            },
-                            "ProxyDeployment": {
-                                "status": "HEALTHY",
-                                "message": "",
-                                "deployment_config": {
-                                    "max_ongoing_requests": PROXY_SERVE_CAP
-                                },
-                                "replicas": [],
-                            },
+                            "replicas": [],
                         },
-                    }
+                        RUNTIME_DEPLOYMENT: {
+                            "status": "HEALTHY",
+                            "message": "",
+                            "deployment_config": {"max_ongoing_requests": 5},
+                            "replicas": [],
+                        },
+                        "ProxyDeployment": {
+                            "status": "HEALTHY",
+                            "message": "",
+                            "deployment_config": {
+                                "max_ongoing_requests": PROXY_SERVE_CAP
+                            },
+                            "replicas": [],
+                        },
+                    },
                 }
             }
-        )
+        }
     )
     return manager
 
@@ -232,9 +230,9 @@ def test_independence_is_not_stated_as_a_claim_about_the_other_layers_value() ->
     # Positive control, first: an emptied or renamed description satisfies every
     # absence assertion below while saying nothing at all.
     assert "independent" in text, f"the independence claim itself is gone: {text!r}"
-    assert "preserves the previous value if updating" in text, (
-        f"the update behaviour is no longer stated: {text!r}"
-    )
+    assert (
+        "preserves the previous value if updating" in text
+    ), f"the update behaviour is no longer stated: {text!r}"
 
     assert "at its default" not in text, (
         "the description again promises a value for the other layer rather than "

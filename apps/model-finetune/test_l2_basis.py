@@ -43,6 +43,7 @@ def test_the_four_bases_are_distinct() -> None:
 
 # ── the resolution table ─────────────────────────────────────────────────────
 
+
 def test_a_labelled_session_init_record_resolves_to_that_base() -> None:
     rec = {"l2_from_base": 1.5, "l2_from_base_basis": pool.L2_BASIS_SESSION_INIT}
     assert pool.l2_basis(rec) == pool.L2_BASIS_SESSION_INIT
@@ -54,7 +55,7 @@ def test_a_labelled_stock_record_resolves_to_that_base() -> None:
 
 
 def test_no_distance_is_its_own_answer_not_undetermined() -> None:
-    """"the pool holds no distance" and "the pool holds a distance whose origin is
+    """ "the pool holds no distance" and "the pool holds a distance whose origin is
     unknown" are different facts, and folding them together would lose the one
     #0122 was filed about."""
     assert pool.l2_basis({"l2_from_base": None}) == pool.L2_BASIS_ABSENT
@@ -65,7 +66,7 @@ def test_no_distance_is_its_own_answer_not_undetermined() -> None:
 def test_a_pre_change_record_is_UNDETERMINED_not_a_base_and_not_zero() -> None:
     """THE case this row exists for. A distance with no label must not be
     attributed to either base, and must not read as zero movement."""
-    pre = {"l2_from_base": 2.75}          # written before #0122: value, no label
+    pre = {"l2_from_base": 2.75}  # written before #0122: value, no label
     got = pool.l2_basis(pre)
     assert got == pool.L2_BASIS_UNDETERMINED
     assert got != pool.L2_BASIS_SESSION_INIT, (
@@ -95,6 +96,7 @@ def test_a_non_record_is_undetermined(record: Any) -> None:
 
 # ── the writer stamps it unconditionally ─────────────────────────────────────
 
+
 def _meta(**over: Any) -> Dict[str, Any]:
     kw: Dict[str, Any] = dict(
         contribution_id="c-0122",
@@ -119,7 +121,7 @@ def _meta(**over: Any) -> Dict[str, Any]:
 def test_the_metadata_writer_stamps_the_label_even_when_null() -> None:
     """Null included, for the reason app_version is: a label absent when unknown
     cannot be told apart from one written before labels existed."""
-    meta = _meta()                      # caller passes no basis
+    meta = _meta()  # caller passes no basis
     assert "l2_from_base_basis" in meta, (
         "the key is missing entirely, so a reader cannot tell this writer from one "
         "that predates the label"
@@ -143,6 +145,7 @@ def test_the_stamp_does_not_disturb_the_digest_basis() -> None:
 
 # ── half 1: both runtime branches set the label ──────────────────────────────
 
+
 def test_both_runtime_branches_label_the_distance_they_measured() -> None:
     """Read off the source, because exercising it needs torch and a real
     checkpoint. The claim is structural: the stock branch must compute a distance
@@ -154,7 +157,9 @@ def test_both_runtime_branches_label_the_distance_they_measured() -> None:
     src = (HERE / "runtime_cellpose.py").read_text(encoding="utf-8")
     assert len(src) > 1000, "runtime_cellpose.py read back implausibly short"
 
-    assert "pool.L2_BASIS_SESSION_INIT" in src, "the init-checkpoint branch names no base"
+    assert (
+        "pool.L2_BASIS_SESSION_INIT" in src
+    ), "the init-checkpoint branch names no base"
     assert "pool.L2_BASIS_STOCK" in src, "the stock branch names no base"
     # The stock branch must MEASURE, not just label.
     assert re.search(

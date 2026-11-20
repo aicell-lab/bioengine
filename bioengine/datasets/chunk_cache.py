@@ -34,8 +34,8 @@ class ChunkCache:
     ):
         self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
         self.logger = logger
-        self._cache: dict = {}           # {key: (buffer, size)}
-        self._order: list = []           # LRU order, oldest first
+        self._cache: dict = {}  # {key: (buffer, size)}
+        self._order: list = []  # LRU order, oldest first
         self._total_size: int = 0
         self._lock = asyncio.Lock()
 
@@ -86,7 +86,9 @@ class ChunkCache:
                 if oldest in self._cache:
                     _, evicted_size = self._cache.pop(oldest)
                     self._total_size -= evicted_size
-                    self.logger.debug(f"Evicted on resize: {oldest} ({evicted_size} bytes)")
+                    self.logger.debug(
+                        f"Evicted on resize: {oldest} ({evicted_size} bytes)"
+                    )
         self.logger.info(
             f"Cache resized to {max_size_gb} GB "
             f"({self._total_size / max(new_max, 1) * 100:.1f}% full)"

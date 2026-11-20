@@ -117,7 +117,9 @@ def test_the_destination_is_never_opened_for_writing(tmp_path: Path) -> None:
     assert "dest_at_rename" in saw, "the write never renamed; it wrote in place"
     assert saw["dest_at_rename"] == OLD, "dest was modified before the rename"
     assert saw["src_at_rename"] == NEW
-    assert str(dest) != saw["src_name"], "the temp name must differ from the destination"
+    assert (
+        str(dest) != saw["src_name"]
+    ), "the temp name must differ from the destination"
     assert dest.read_bytes() == NEW
     assert list(tmp_path.iterdir()) == [dest], "a temp file was left behind"
 
@@ -183,7 +185,11 @@ def test_two_writers_do_not_share_a_temp_name(tmp_path: Path) -> None:
     real_replace = os.replace
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(os, "replace", lambda src, dst: (names.append(str(src)), real_replace(src, dst))[1])
+        mp.setattr(
+            os,
+            "replace",
+            lambda src, dst: (names.append(str(src)), real_replace(src, dst))[1],
+        )
         _atomic_write()(dest, NEW)
         _atomic_write()(dest, NEW)
 
@@ -206,9 +212,16 @@ def test_a_short_download_never_reaches_the_cache() -> None:
     get_verified = _entry_class()._get_verified
 
     with pytest.raises(IncompleteRead):
-        asyncio.run(get_verified(_Caller(NEW[:17], len(NEW)), "https://example.invalid/w.pt"))
+        asyncio.run(
+            get_verified(_Caller(NEW[:17], len(NEW)), "https://example.invalid/w.pt")
+        )
 
-    assert asyncio.run(get_verified(_Caller(NEW, len(NEW)), "https://example.invalid/w.pt")) == NEW
+    assert (
+        asyncio.run(
+            get_verified(_Caller(NEW, len(NEW)), "https://example.invalid/w.pt")
+        )
+        == NEW
+    )
 
 
 def test_an_error_response_never_reaches_the_cache() -> None:
@@ -234,7 +247,11 @@ def test_an_error_response_never_reaches_the_cache() -> None:
     xml = b"<?xml version='1.0'?><Error><Code>AccessDenied</Code></Error>"
 
     with pytest.raises(httpx.HTTPStatusError):
-        asyncio.run(get_verified(_Caller(xml, len(xml), status=403), "https://example.invalid/w.pt"))
+        asyncio.run(
+            get_verified(
+                _Caller(xml, len(xml), status=403), "https://example.invalid/w.pt"
+            )
+        )
 
 
 def test_a_concurrent_reader_never_observes_a_partial_file(tmp_path: Path) -> None:

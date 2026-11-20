@@ -45,7 +45,7 @@ T0 = 1_700_000_000.0
 
 # Large enough that pool.soup_admission never refuses: a memory refusal would exit
 # before the quarantine this file is about.
-_BUDGET = {"declared_bytes": 64 * 1024 ** 3, "rss_bytes": 1024 ** 3}
+_BUDGET = {"declared_bytes": 64 * 1024**3, "rss_bytes": 1024**3}
 
 
 class _Resp:
@@ -84,13 +84,16 @@ class _Runtime:
     async def verify_members(self, specs) -> Dict[str, Any]:
         self.verified.extend(s["key"] for s in specs)
         return {
-            "digests": {s["key"]: self._actual.get(s["key"], s["sha256"])
-                        for s in specs},
-            "replica": "r0", "soup_dl_bytes": 0,
+            "digests": {
+                s["key"]: self._actual.get(s["key"], s["sha256"]) for s in specs
+            },
+            "replica": "r0",
+            "soup_dl_bytes": 0,
         }
 
-    async def score_soup(self, specs, imgs, gts, diam_mean,
-                         base_commitment=None) -> Dict[str, Any]:
+    async def score_soup(
+        self, specs, imgs, gts, diam_mean, base_commitment=None
+    ) -> Dict[str, Any]:
         """``{"f1": scalar, "per_image": vector}``, matching the real runtime.
 
         ``base_commitment`` is accepted and ignored. #0070 made it part of the
@@ -106,11 +109,16 @@ class _Runtime:
         drift, and a length of two means a vector truncated to a single element
         would still be visible to anything that looks.
         """
-        return {"f1": self._f1, "per_image": [self._f1, self._f1],
-                "replica": "r0", "soup_dl_bytes": 0}
+        return {
+            "f1": self._f1,
+            "per_image": [self._f1, self._f1],
+            "replica": "r0",
+            "soup_dl_bytes": 0,
+        }
 
-    async def materialize_soup(self, specs, url,
-                               base_commitment=None) -> Dict[str, Any]:
+    async def materialize_soup(
+        self, specs, url, base_commitment=None
+    ) -> Dict[str, Any]:
         """``base_commitment`` accepted and ignored, as in ``score_soup`` above.
 
         The real method also returns ``non_learned_inherited``,
@@ -121,8 +129,12 @@ class _Runtime:
         values no runtime produced. Requirement 4 is driven in the #0070 suite,
         against the real builder.
         """
-        return {"sha256": HEAD_SHA, "n_bytes": 2048,
-                "replica": "r0", "soup_dl_bytes": 0}
+        return {
+            "sha256": HEAD_SHA,
+            "n_bytes": 2048,
+            "replica": "r0",
+            "soup_dl_bytes": 0,
+        }
 
 
 class _Merging:
@@ -132,8 +144,12 @@ class _Merging:
     bytes that were actually sent rather than as the dict that was built.
     """
 
-    def __init__(self, index: Dict[str, Any], runtime: _Runtime,
-                 manifests: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        index: Dict[str, Any],
+        runtime: _Runtime,
+        manifests: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._pool_locks: Dict[str, Any] = {}
         self._merges_in_flight = 0
         self.index = index
@@ -162,7 +178,9 @@ class _Merging:
         return self.index
 
     async def _http_retry(self, method: str, url: str, **kw: Any):
-        path = url.split("/put/", 1)[-1] if "/put/" in url else url.split("/get/", 1)[-1]
+        path = (
+            url.split("/put/", 1)[-1] if "/put/" in url else url.split("/get/", 1)[-1]
+        )
         if method == "PUT":
             self.put[path] = json.loads(kw["content"].decode())
             return _Resp({})
@@ -195,8 +213,12 @@ def _aggregate_of(instance):
 
 
 def _contrib(cid: str, sha: Any, *, with_key: bool = True) -> Dict[str, Any]:
-    rec = {"contribution_id": cid, "weights_path": f"contributions/{cid}/weights.pt",
-           "n_bytes": 4096, "uploaded_at": T0}
+    rec = {
+        "contribution_id": cid,
+        "weights_path": f"contributions/{cid}/weights.pt",
+        "n_bytes": 4096,
+        "uploaded_at": T0,
+    }
     if with_key:
         rec["weights_sha256"] = sha
     return rec
@@ -222,22 +244,32 @@ def _index(contributions: List[Dict[str, Any]], **extra) -> Dict[str, Any]:
 
 async def _merge(stub, **kw):
     return await _aggregate_of(stub)(
-        pool_artifact_id=POOL_ID, pool_token="t",
-        gate_val_images=[], gate_val_labels=[],
-        witness_val_images=[], witness_val_labels=[],
-        gate_split=dict(GATE_SPLIT), witness_split=dict(WITNESS_SPLIT), **kw)
+        pool_artifact_id=POOL_ID,
+        pool_token="t",
+        gate_val_images=[],
+        gate_val_labels=[],
+        witness_val_images=[],
+        witness_val_labels=[],
+        gate_split=dict(GATE_SPLIT),
+        witness_split=dict(WITNESS_SPLIT),
+        **kw,
+    )
 
 
 # ── the ruled behaviour: exclude the member, publish the rest ────────────────
+
 
 @pytest.mark.asyncio
 async def test_a_digestless_candidate_is_excluded_and_the_merge_still_publishes():
     """The whole decision, in one assertion pair. The earlier attempt at this row
     aborted the merge on a digest-less member, which on a pool carrying one legacy
     record means the campaign never merges again."""
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-legacy", None, with_key=False)]),
-                    _Runtime(0.90))
+    stub = _Merging(
+        _index(
+            [_contrib("c-good", SHA_GOOD), _contrib("c-legacy", None, with_key=False)]
+        ),
+        _Runtime(0.90),
+    )
     result = await _merge(stub)
 
     assert result["published_version"] == "v2"
@@ -251,9 +283,10 @@ async def test_the_excluded_member_is_not_in_the_published_head():
     """The failure mode this row is about: a member whose bytes nothing checked
     ending up inside the published checkpoint. ``selected_contribution_ids`` is the
     permanent record of what was souped, in an immutable artifact."""
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-legacy", None)]),
-                    _Runtime(0.90))
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-legacy", None)]),
+        _Runtime(0.90),
+    )
     await _merge(stub)
     manifest = stub.put["community/v2/manifest.json"]
     assert manifest["selected_contribution_ids"] == ["c-good"]
@@ -262,16 +295,18 @@ async def test_the_excluded_member_is_not_in_the_published_head():
 
 @pytest.mark.asyncio
 async def test_the_excluded_member_is_not_reported_as_an_ordinary_rejection():
-    """"Evaluated, not included" is a statement about a candidate that was scored.
+    """ "Evaluated, not included" is a statement about a candidate that was scored.
     A quarantined member was never scored, so reporting it under ``rejected`` would
     tell a contributor their weights lost on merit."""
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-legacy", None)]),
-                    _Runtime(0.90))
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-legacy", None)]),
+        _Runtime(0.90),
+    )
     result = await _merge(stub)
     assert "c-legacy" not in result["rejected"]
-    assert "c-legacy" not in [m["contribution_id"]
-                              for m in stub.put["community/v2/manifest.json"]["members"]]
+    assert "c-legacy" not in [
+        m["contribution_id"] for m in stub.put["community/v2/manifest.json"]["members"]
+    ]
 
 
 @pytest.mark.asyncio
@@ -281,9 +316,10 @@ async def test_a_quarantined_candidate_is_marked_decided():
     head of permanently-quarantined rows starves real candidates out of every batch.
     The trade is deliberate: "kept in the pool" means the record and the weights
     stay in the artifact, not that the merge keeps re-weighing it."""
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-legacy", None)]),
-                    _Runtime(0.90))
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-legacy", None)]),
+        _Runtime(0.90),
+    )
     await _merge(stub)
     assert set(stub.index["decided_contribution_ids"]) == {"c-good", "c-legacy"}
 
@@ -293,13 +329,15 @@ async def test_a_digestless_member_is_never_downloaded_to_be_rejected():
     """It is quarantined from the index alone. Hashing it would move a gigabyte
     across the network to produce a number with nothing to compare against."""
     rt = _Runtime(0.90)
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-legacy", None)]), rt)
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-legacy", None)]), rt
+    )
     await _merge(stub)
     assert rt.verified == ["contributions/c-good/weights.pt"]
 
 
 # ── the mismatch is a different finding ──────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_bytes_that_do_not_hash_to_the_recorded_digest_are_an_incident():
@@ -307,8 +345,9 @@ async def test_bytes_that_do_not_hash_to_the_recorded_digest_are_an_incident():
     digest is recorded, the bytes disagree with it, and the old merge souped them
     anyway because nothing ever read the digest back."""
     rt = _Runtime(0.90, actual={"contributions/c-bad/weights.pt": WRONG})
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-bad", SHA_OTHER)]), rt)
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-bad", SHA_OTHER)]), rt
+    )
     result = await _merge(stub)
 
     bad = next(q for q in result["quarantined"] if q["contribution_id"] == "c-bad")
@@ -324,25 +363,38 @@ async def test_a_mismatch_does_not_report_as_a_missing_digest():
     what a reader filtering an immutable manifest for integrity incidents has to
     filter on. One shared code would bury every incident among the legacy records."""
     rt = _Runtime(0.90, actual={"contributions/c-bad/weights.pt": WRONG})
-    stub = _Merging(_index([_contrib("c-bad", SHA_OTHER),
-                            _contrib("c-legacy", None)]), rt)
+    stub = _Merging(
+        _index([_contrib("c-bad", SHA_OTHER), _contrib("c-legacy", None)]), rt
+    )
     result = await _merge(stub)
     by_id = {q["contribution_id"]: q["reason"] for q in result["quarantined"]}
-    assert by_id == {"c-bad": pool.QUARANTINE_DIGEST_MISMATCH,
-                     "c-legacy": pool.QUARANTINE_NO_DIGEST}
-    assert result["quarantine_counts"] == {pool.QUARANTINE_NO_DIGEST: 1,
-                                           pool.QUARANTINE_DIGEST_MISMATCH: 1}
+    assert by_id == {
+        "c-bad": pool.QUARANTINE_DIGEST_MISMATCH,
+        "c-legacy": pool.QUARANTINE_NO_DIGEST,
+    }
+    assert result["quarantine_counts"] == {
+        pool.QUARANTINE_NO_DIGEST: 1,
+        pool.QUARANTINE_DIGEST_MISMATCH: 1,
+    }
 
 
 # ── the head is checked too, and losing it is fatal ──────────────────────────
 
+
 def _with_head(members: List[str], contributions: List[Dict[str, Any]]):
-    idx = _index(contributions, current_community={
-        "version": "v1", "path": "community/v1/weights.pt", "sha256": HEAD_SHA,
-        "witness_metric": {"role": "witness", "aggregate": 0.60},
-    }, decided_contribution_ids=list(members))
-    manifests = {"community/v1/manifest.json": {
-        "selected_contribution_ids": list(members)}}
+    idx = _index(
+        contributions,
+        current_community={
+            "version": "v1",
+            "path": "community/v1/weights.pt",
+            "sha256": HEAD_SHA,
+            "witness_metric": {"role": "witness", "aggregate": 0.60},
+        },
+        decided_contribution_ids=list(members),
+    )
+    manifests = {
+        "community/v1/manifest.json": {"selected_contribution_ids": list(members)}
+    }
     return idx, manifests
 
 
@@ -352,10 +404,14 @@ async def test_a_head_member_that_fails_verification_stops_the_merge():
     report about "the current head" (its gate score, the bar a candidate must
     clear, the witness point carried forward) would describe a soup that is not the
     published checkpoint, and there is no honest way to continue."""
-    idx, man = _with_head(["h-1", "h-2"],
-                          [_contrib("h-1", SHA_HEAD_MEMBER),
-                           _contrib("h-2", SHA_HEAD_MEMBER),
-                           _contrib("c-good", SHA_GOOD)])
+    idx, man = _with_head(
+        ["h-1", "h-2"],
+        [
+            _contrib("h-1", SHA_HEAD_MEMBER),
+            _contrib("h-2", SHA_HEAD_MEMBER),
+            _contrib("c-good", SHA_GOOD),
+        ],
+    )
     rt = _Runtime(0.90, actual={"contributions/h-2/weights.pt": WRONG})
     stub = _Merging(idx, rt, man)
     with pytest.raises(ValueError, match="refused this merge"):
@@ -366,9 +422,12 @@ async def test_a_head_member_that_fails_verification_stops_the_merge():
 async def test_that_refusal_publishes_nothing_and_commits_nothing():
     """A refusal that had already written half a merge would be worse than the bug.
     Checked by counting commits, not by reading the code path."""
-    idx, man = _with_head(["h-1"], [_contrib("h-1", SHA_HEAD_MEMBER),
-                                    _contrib("c-good", SHA_GOOD)])
-    stub = _Merging(idx, _Runtime(0.90, actual={"contributions/h-1/weights.pt": WRONG}), man)
+    idx, man = _with_head(
+        ["h-1"], [_contrib("h-1", SHA_HEAD_MEMBER), _contrib("c-good", SHA_GOOD)]
+    )
+    stub = _Merging(
+        idx, _Runtime(0.90, actual={"contributions/h-1/weights.pt": WRONG}), man
+    )
     with pytest.raises(ValueError):
         await _merge(stub)
     assert stub.commits == 0
@@ -383,8 +442,9 @@ async def test_that_refusal_publishes_nothing_and_commits_nothing():
 async def test_an_intact_head_merges_normally():
     """The control for the three tests above. Without it they are all satisfiable
     by a change that refuses every merge against any head at all."""
-    idx, man = _with_head(["h-1"], [_contrib("h-1", SHA_HEAD_MEMBER),
-                                    _contrib("c-good", SHA_GOOD)])
+    idx, man = _with_head(
+        ["h-1"], [_contrib("h-1", SHA_HEAD_MEMBER), _contrib("c-good", SHA_GOOD)]
+    )
     stub = _Merging(idx, _Runtime(0.90), man)
     result = await _merge(stub)
     assert result["published_version"] == "v2"
@@ -394,13 +454,15 @@ async def test_an_intact_head_merges_normally():
 
 # ── the floor ────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_an_explicit_floor_refuses_rather_than_publishing_a_thin_soup():
     """The caller states how many members the published head must have; a merge
     that cannot reach it fails instead of publishing a smaller one quietly."""
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-legacy", None)]),
-                    _Runtime(0.90))
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-legacy", None)]),
+        _Runtime(0.90),
+    )
     with pytest.raises(ValueError, match="floor of 2"):
         await _merge(stub, min_members=2)
 
@@ -409,14 +471,16 @@ async def test_an_explicit_floor_refuses_rather_than_publishing_a_thin_soup():
 async def test_the_same_merge_publishes_at_the_floor_it_can_meet():
     """The discrimination control for the test above: the refusal has to be about
     the NUMBER, not about ``min_members`` having been passed at all."""
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-legacy", None)]),
-                    _Runtime(0.90))
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-legacy", None)]),
+        _Runtime(0.90),
+    )
     result = await _merge(stub, min_members=1)
     assert result["published_version"] == "v2"
 
 
 # ── a clean merge still says so ──────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_a_clean_merge_states_the_zero_rather_than_omitting_it():
@@ -428,8 +492,10 @@ async def test_a_clean_merge_states_the_zero_rather_than_omitting_it():
     result = await _merge(stub)
     assert result["quarantined"] == []
     assert result["n_quarantined"] == 0
-    assert result["quarantine_counts"] == {pool.QUARANTINE_NO_DIGEST: 0,
-                                           pool.QUARANTINE_DIGEST_MISMATCH: 0}
+    assert result["quarantine_counts"] == {
+        pool.QUARANTINE_NO_DIGEST: 0,
+        pool.QUARANTINE_DIGEST_MISMATCH: 0,
+    }
     manifest = stub.put["community/v2/manifest.json"]
     assert manifest["quarantined"] == []
     assert manifest["quarantine_counts"][pool.QUARANTINE_DIGEST_MISMATCH] == 0
@@ -442,8 +508,9 @@ async def test_the_merge_record_carries_the_quarantine_too():
     nothing. A quarantine recorded in only one of the two is invisible in whichever
     the reader happens to open."""
     rt = _Runtime(0.90, actual={"contributions/c-bad/weights.pt": WRONG})
-    stub = _Merging(_index([_contrib("c-good", SHA_GOOD),
-                            _contrib("c-bad", SHA_OTHER)]), rt)
+    stub = _Merging(
+        _index([_contrib("c-good", SHA_GOOD), _contrib("c-bad", SHA_OTHER)]), rt
+    )
     await _merge(stub)
     merge = stub.index["merges"][-1]
     assert [q["contribution_id"] for q in merge["quarantined"]] == ["c-bad"]
@@ -461,5 +528,7 @@ async def test_a_merge_that_admits_nothing_still_records_the_quarantine():
     result = await _merge(stub)
     assert result["published_version"] is None
     assert [q["contribution_id"] for q in result["quarantined"]] == ["c-bad"]
-    assert stub.index["merges"][-1]["quarantine_counts"][
-        pool.QUARANTINE_DIGEST_MISMATCH] == 1
+    assert (
+        stub.index["merges"][-1]["quarantine_counts"][pool.QUARANTINE_DIGEST_MISMATCH]
+        == 1
+    )

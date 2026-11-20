@@ -26,6 +26,7 @@ These tests pin the parser, the margin constant, the mutation semantics
 (in place — replacing the dict would break the closure), and the
 integration between ``check_health`` and ``_refresh_ice_if_expiring``.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -92,9 +93,9 @@ def test_register_services_stores_rtc_config_and_expiry() -> None:
         "expected _register_services to hold a reference to rtc_config so "
         "_refresh_ice_if_expiring can mutate it in place."
     )
-    assert "self._ice_expires_at" in src, (
-        "expected _register_services to capture the parsed expiry timestamp."
-    )
+    assert (
+        "self._ice_expires_at" in src
+    ), "expected _register_services to capture the parsed expiry timestamp."
 
 
 def test_maintenance_loop_calls_refresh() -> None:

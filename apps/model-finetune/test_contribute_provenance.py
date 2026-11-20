@@ -54,19 +54,25 @@ def fake_training(monkeypatch: pytest.MonkeyPatch) -> None:
     about what the two records agree on, not about reading a real session."""
     mod = types.ModuleType("training")
     mod.get_status = lambda sid: {
-        "status": "COMPLETED", "model_type": "cpsam",
-        "n_epochs_completed": 2, "n_train_inputs": 5,
+        "status": "COMPLETED",
+        "model_type": "cpsam",
+        "n_epochs_completed": 2,
+        "n_train_inputs": 5,
     }
     mod.session_backend = lambda sid: "cellpose"
-    mod.read_training_params = lambda sid: {"model_type": "cpsam", "init_checkpoint": "stock"}
+    mod.read_training_params = lambda sid: {
+        "model_type": "cpsam",
+        "init_checkpoint": "stock",
+    }
     monkeypatch.setitem(sys.modules, "training", mod)
 
 
 class _Runtime:
     # model_type is accepted because the entry passes it (#0070): the base commitment is
     # built on the runtime, so the entry has to say which stock base to fall back to.
-    async def prepare_contribution(self, session_id: str, weights_put_url: str,
-                                   model_type: str = "cpsam") -> Dict[str, Any]:
+    async def prepare_contribution(
+        self, session_id: str, weights_put_url: str, model_type: str = "cpsam"
+    ) -> Dict[str, Any]:
         return {
             "architecture_signature": "sig-1",
             "base_checkpoint_sha256": "b" * 64,
@@ -166,7 +172,9 @@ async def _deposit(monkeypatch: pytest.MonkeyPatch, app_version: Optional[str]):
 
 
 @pytest.mark.asyncio
-async def test_returned_record_carries_app_version(monkeypatch: pytest.MonkeyPatch, fake_training: None) -> None:
+async def test_returned_record_carries_app_version(
+    monkeypatch: pytest.MonkeyPatch, fake_training: None
+) -> None:
     """The defect: the caller's copy could not be dated at all."""
     returned, _ = await _deposit(monkeypatch, "0.27.16")
     assert "app_version" in returned, (

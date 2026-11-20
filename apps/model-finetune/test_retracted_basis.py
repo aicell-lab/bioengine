@@ -103,6 +103,7 @@ def test_no_retracted_string_maps_onto_another_retracted_string():
 
 # ── corrected_metric: the unit ───────────────────────────────────────────────
 
+
 def _metric(basis: str, role: str = "selection") -> Dict[str, Any]:
     """A stored metric record, hand-built.
 
@@ -168,8 +169,13 @@ class TestCorrectedMetric:
         """Identity, not equality, so "was this corrected?" is answerable without
         re-comparing strings — and so a correction that rebuilt every record
         unconditionally would be caught here rather than passing as a no-op."""
-        for basis in (pool.SELECTION_BASIS, pool.WITNESS_BASIS,
-                      pool.BASELINE_BASIS, pool.EMPTY_SELECTION_BASIS, NEVER_WRITTEN):
+        for basis in (
+            pool.SELECTION_BASIS,
+            pool.WITNESS_BASIS,
+            pool.BASELINE_BASIS,
+            pool.EMPTY_SELECTION_BASIS,
+            NEVER_WRITTEN,
+        ):
             m = _metric(basis)
             assert pool.corrected_metric(m) is m
 
@@ -185,11 +191,15 @@ class TestCorrectedMetric:
 
 # ── round_metric: a record written AFTER the fix cannot reintroduce it ───────
 
+
 class TestWriterRefusesRetractedWording:
-    @pytest.mark.parametrize("basis,role", [
-        (STORED_SELECTION, "selection"),
-        (STORED_WITNESS, "witness"),
-    ])
+    @pytest.mark.parametrize(
+        "basis,role",
+        [
+            (STORED_SELECTION, "selection"),
+            (STORED_WITNESS, "witness"),
+        ],
+    )
     def test_a_new_record_cannot_carry_retracted_wording(self, basis, role):
         """The read-path correction fixes the records that exist. This stops a new
         one being written with the withdrawn claim — which is not hypothetical: the
@@ -201,25 +211,32 @@ class TestWriterRefusesRetractedWording:
     def test_the_refusal_names_the_constant_to_use_instead(self):
         """An error that only says no sends the caller back to guess."""
         with pytest.raises(ValueError) as exc:
-            pool.round_metric(role="selection", aggregate=0.5,
-                              aggregate_basis=STORED_SELECTION)
+            pool.round_metric(
+                role="selection", aggregate=0.5, aggregate_basis=STORED_SELECTION
+            )
         assert "SELECTION_BASIS" in str(exc.value)
         with pytest.raises(ValueError) as exc:
-            pool.round_metric(role="witness", aggregate=0.5,
-                              aggregate_basis=STORED_WITNESS)
+            pool.round_metric(
+                role="witness", aggregate=0.5, aggregate_basis=STORED_WITNESS
+            )
         assert "WITNESS_BASIS" in str(exc.value)
 
     def test_every_basis_the_app_actually_writes_is_still_accepted(self):
         """The control that keeps the guard from being a blanket refusal. These four
         are every ``aggregate_basis`` value ``entry.py`` passes; a guard that
         rejected one of them would stop the merge path dead."""
-        for basis in (pool.SELECTION_BASIS, pool.WITNESS_BASIS,
-                      pool.BASELINE_BASIS, pool.EMPTY_SELECTION_BASIS):
+        for basis in (
+            pool.SELECTION_BASIS,
+            pool.WITNESS_BASIS,
+            pool.BASELINE_BASIS,
+            pool.EMPTY_SELECTION_BASIS,
+        ):
             m = pool.round_metric(role="witness", aggregate=0.5, aggregate_basis=basis)
             assert m["aggregate_basis"] == basis
 
 
 # ── the projection: every surface a contributor reads ────────────────────────
+
 
 def _legacy_index() -> Dict[str, Any]:
     """A stored ``pool_index.json`` as a pre-0.27.15 release wrote it.
@@ -255,8 +272,14 @@ def _legacy_index() -> Dict[str, Any]:
         "merges": [
             {
                 "created_at": 1_750_100_000.0,
-                "members": [{"contribution_id": "alpha-0", "marginal_score": 0.1,
-                             "gate_score": 0.1, "included": True}],
+                "members": [
+                    {
+                        "contribution_id": "alpha-0",
+                        "marginal_score": 0.1,
+                        "gate_score": 0.1,
+                        "included": True,
+                    }
+                ],
                 "selection_metric": _metric(STORED_SELECTION),
                 "witness_metric": _metric(STORED_WITNESS, role="witness"),
                 "global_sha256": "d" * 64,
@@ -265,8 +288,14 @@ def _legacy_index() -> Dict[str, Any]:
             },
             {
                 "created_at": 1_750_200_000.0,
-                "members": [{"contribution_id": "beta-0", "marginal_score": 0.0,
-                             "gate_score": 0.0, "included": False}],
+                "members": [
+                    {
+                        "contribution_id": "beta-0",
+                        "marginal_score": 0.0,
+                        "gate_score": 0.0,
+                        "included": False,
+                    }
+                ],
                 # Unaffected: an empty merge's bar is EMPTY_SELECTION_BASIS.
                 "selection_metric": _metric(pool.EMPTY_SELECTION_BASIS),
             },
@@ -302,8 +331,8 @@ class TestWireProjection:
         reports clean for the real strings AND for this one. The real search is only
         evidence while this one can still tell the difference."""
         blob = _all_strings(wire)
-        assert NEVER_WRITTEN not in blob            # never written: must be absent
-        assert pool.SELECTION_BASIS in blob         # ...and the haystack is not empty
+        assert NEVER_WRITTEN not in blob  # never written: must be absent
+        assert pool.SELECTION_BASIS in blob  # ...and the haystack is not empty
         assert pool.WITNESS_BASIS in blob
 
     def test_unaffected_wording_survives_byte_for_byte(self, wire):
@@ -315,15 +344,20 @@ class TestWireProjection:
         assert pool.BASELINE_BASIS in blob
         assert pool.EMPTY_SELECTION_BASIS in blob
         assert wire["baseline_metric"]["aggregate_basis"] == pool.BASELINE_BASIS
-        assert wire["empty_merges"][0]["selection_metric"]["aggregate_basis"] == \
-            pool.EMPTY_SELECTION_BASIS
+        assert (
+            wire["empty_merges"][0]["selection_metric"]["aggregate_basis"]
+            == pool.EMPTY_SELECTION_BASIS
+        )
 
-    @pytest.mark.parametrize("path", [
-        ("soups", 0, "selection_metric"),
-        ("soups", 0, "witness_metric"),
-        ("current_community", "selection_metric"),
-        ("current_community", "witness_metric"),
-    ])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            ("soups", 0, "selection_metric"),
+            ("soups", 0, "witness_metric"),
+            ("current_community", "selection_metric"),
+            ("current_community", "witness_metric"),
+        ],
+    )
     def test_each_corrected_site_carries_the_note(self, wire, path):
         """Named site by site as well as by whole-tree search, so a failure says
         WHICH surface regressed instead of only that one did."""
@@ -366,9 +400,11 @@ class TestWireProjection:
         this ever fails, a current constant has been added to the retracted map."""
         index = _legacy_index()
         index["current_community"]["selection_metric"] = pool.round_metric(
-            role="selection", aggregate=0.8, aggregate_basis=pool.SELECTION_BASIS)
+            role="selection", aggregate=0.8, aggregate_basis=pool.SELECTION_BASIS
+        )
         index["current_community"]["witness_metric"] = pool.round_metric(
-            role="witness", aggregate=0.8, aggregate_basis=pool.WITNESS_BASIS)
+            role="witness", aggregate=0.8, aggregate_basis=pool.WITNESS_BASIS
+        )
         wire = pool.pool_wire_state(index, pool_artifact_id=POOL_ID)
         cc = wire["current_community"]
         assert cc["selection_metric"]["aggregate_basis"] == pool.SELECTION_BASIS
@@ -381,6 +417,7 @@ class TestWireProjection:
 # A manifest at community/<version>/manifest.json is a SEPARATE stored file that does
 # NOT pass through pool_wire_state. Correcting only the index would leave a
 # contributor who asks for a named community version reading the withdrawn claim.
+
 
 class _Resp:
     status_code = 200
@@ -426,19 +463,21 @@ def _read_manifest_of(instance):
 
 @pytest.mark.asyncio
 async def test_a_published_manifest_is_corrected_on_read_back():
-    stub = _Entry({
-        "community_version": "v2",
-        "weights_sha256": "e" * 64,
-        "selection_metric": _metric(STORED_SELECTION),
-        "witness_metric": _metric(STORED_WITNESS, role="witness"),
-    })
+    stub = _Entry(
+        {
+            "community_version": "v2",
+            "weights_sha256": "e" * 64,
+            "selection_metric": _metric(STORED_SELECTION),
+            "witness_metric": _metric(STORED_WITNESS, role="witness"),
+        }
+    )
     out = await _read_manifest_of(stub)(_AM(), POOL_ID, "v2")
 
     blob = _all_strings(out)
     assert STORED_SELECTION not in blob
     assert STORED_WITNESS not in blob
-    assert NEVER_WRITTEN not in blob                      # negative control, same pass
-    assert pool.SELECTION_BASIS in blob                   # and the haystack is real
+    assert NEVER_WRITTEN not in blob  # negative control, same pass
+    assert pool.SELECTION_BASIS in blob  # and the haystack is real
     assert pool.WITNESS_BASIS in blob
     assert out["version"] == "v2"
     assert out["sha256"] == "e" * 64
@@ -450,12 +489,14 @@ async def test_a_manifest_with_current_wording_is_passed_through_unchanged():
     manifest unconditionally, the test above would pass on a function that corrupts
     current records too."""
     current = _metric(pool.SELECTION_BASIS)
-    stub = _Entry({
-        "community_version": "v3",
-        "weights_sha256": "f" * 64,
-        "selection_metric": current,
-        "witness_metric": None,
-    })
+    stub = _Entry(
+        {
+            "community_version": "v3",
+            "weights_sha256": "f" * 64,
+            "selection_metric": current,
+            "witness_metric": None,
+        }
+    )
     out = await _read_manifest_of(stub)(_AM(), POOL_ID, "v3")
 
     assert out["selection_metric"] is current

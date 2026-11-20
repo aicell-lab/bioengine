@@ -24,6 +24,7 @@ The retry rule is the delicate part, and it is not "retry transport errors":
   would risk double-running a ``create`` or ``commit``. Those re-raise, and only
   the handle is refreshed — one visible failure instead of an endless outage.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -513,7 +514,9 @@ async def test_a_call_issued_during_a_re_resolve_waits_for_the_new_handle():
 
     commit = asyncio.create_task(am.commit("ws/my-app"))
     await asyncio.sleep(0)
-    assert dead.calls == [("read", "ws/my-app")], "the commit must not reach the dead proxy"
+    assert dead.calls == [
+        ("read", "ws/my-app")
+    ], "the commit must not reach the dead proxy"
 
     release.set()
     assert (await read)["served_by"] == "fresh"
@@ -539,9 +542,9 @@ async def test_a_failed_re_resolve_surfaces_rather_than_being_swallowed():
 
     fresh = _Proxy("fresh")
     am._server = _Server(fresh)
-    assert (await am.read("ws/my-app"))["served_by"] == "fresh", (
-        "a failed re-resolve must not leave callers blocked forever"
-    )
+    assert (await am.read("ws/my-app"))[
+        "served_by"
+    ] == "fresh", "a failed re-resolve must not leave callers blocked forever"
 
 
 # ===== attribute delegation =====

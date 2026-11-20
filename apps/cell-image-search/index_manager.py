@@ -14,6 +14,7 @@ Storage layout at workspace_dir/cell_search/:
   umap_cache.npz          — pre-computed UMAP coords for a sample
   index_info.json         — build stats (n_cells, dim, index_type, build_time, ...)
 """
+
 from __future__ import annotations
 
 import json
@@ -72,12 +73,12 @@ def build_index(
         quantizer = faiss.IndexFlatIP(d)
         index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
         logger.info("Training IVFFlat nlist=%d on %d vectors...", nlist, n)
-        index.train(embeddings[:min(n, 256 * nlist)])
+        index.train(embeddings[: min(n, 256 * nlist)])
         index_type = f"IVFFlat(nlist={nlist})"
     else:
         # IVFPQ: 96 subquantizers × 8 bits → 96 bytes per vector
         nlist = min(65536, max(4096, int(np.sqrt(n_target))))
-        m = 96              # must divide d=768; 768/96=8 ✓
+        m = 96  # must divide d=768; 768/96=8 ✓
         nbits = 8
         quantizer = faiss.IndexFlatIP(d)
         index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)
@@ -140,7 +141,9 @@ def load_index(workspace_dir: str) -> tuple["faiss.Index", "pd.DataFrame", dict]
     metadata_df = pd.read_parquet(meta_path) if meta_path.exists() else None
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
 
-    logger.info("Loaded index: %d vectors, type=%s", index.ntotal, info.get("index_type"))
+    logger.info(
+        "Loaded index: %d vectors, type=%s", index.ntotal, info.get("index_type")
+    )
     return index, metadata_df, info
 
 
@@ -173,12 +176,14 @@ def search_index(
         meta = {}
         if metadata_df is not None and idx < len(metadata_df):
             meta = metadata_df.iloc[idx].to_dict()
-        results.append({
-            "rank": rank + 1,
-            "score": float(score),
-            "faiss_idx": int(idx),
-            **meta,
-        })
+        results.append(
+            {
+                "rank": rank + 1,
+                "score": float(score),
+                "faiss_idx": int(idx),
+                **meta,
+            }
+        )
     return results
 
 
@@ -233,14 +238,18 @@ def compute_umap(
     # UMAP
     try:
         from umap import UMAP
+
         logger.info("Computing UMAP on %d vectors...", n_samples)
         t0 = time.time()
-        reducer = UMAP(n_neighbors=15, min_dist=0.1, metric="cosine", random_state=random_state)
+        reducer = UMAP(
+            n_neighbors=15, min_dist=0.1, metric="cosine", random_state=random_state
+        )
         coords = reducer.fit_transform(vecs)
         logger.info("UMAP done in %.1fs", time.time() - t0)
     except ImportError:
         logger.warning("umap-learn not installed; returning PCA instead")
         from sklearn.decomposition import PCA
+
         coords = PCA(n_components=2).fit_transform(vecs)
 
     # Labels from metadata
@@ -248,11 +257,17 @@ def compute_umap(
     colors = ["#888888"] * n_samples
     if meta_path.exists():
         df = pd.read_parquet(meta_path)
-        moa_col = "moa_class" if "moa_class" in df.columns else ("compound" if "compound" in df.columns else None)
+        moa_col = (
+            "moa_class"
+            if "moa_class" in df.columns
+            else ("compound" if "compound" in df.columns else None)
+        )
         if moa_col:
             unique_labels = df[moa_col].unique().tolist()
             palette = _generate_palette(len(unique_labels))
-            color_map = {lbl: palette[i % len(palette)] for i, lbl in enumerate(unique_labels)}
+            color_map = {
+                lbl: palette[i % len(palette)] for i, lbl in enumerate(unique_labels)
+            }
             for i, idx in enumerate(sample_idx):
                 if idx < len(df):
                     lbl = str(df.iloc[idx].get(moa_col, "unknown"))
@@ -266,25 +281,48 @@ def compute_umap(
         "colors": colors,
         "n_total": n_total,
     }
-    np.savez(cache_path, x=coords[:, 0], y=coords[:, 1],
-             labels=np.array(labels), colors=np.array(colors), n_total=np.array(n_total))
+    np.savez(
+        cache_path,
+        x=coords[:, 0],
+        y=coords[:, 1],
+        labels=np.array(labels),
+        colors=np.array(colors),
+        n_total=np.array(n_total),
+    )
     return result
 
 
 def _generate_palette(n: int) -> list[str]:
     """Generate n visually distinct hex colors."""
     colors = [
-        "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
-        "#a65628", "#f781bf", "#999999", "#66c2a5", "#fc8d62",
-        "#8da0cb", "#e78ac3", "#a6d854", "#ffd92f", "#e5c494",
-        "#b3b3b3", "#1b9e77", "#d95f02", "#7570b3", "#e7298a",
+        "#e41a1c",
+        "#377eb8",
+        "#4daf4a",
+        "#984ea3",
+        "#ff7f00",
+        "#a65628",
+        "#f781bf",
+        "#999999",
+        "#66c2a5",
+        "#fc8d62",
+        "#8da0cb",
+        "#e78ac3",
+        "#a6d854",
+        "#ffd92f",
+        "#e5c494",
+        "#b3b3b3",
+        "#1b9e77",
+        "#d95f02",
+        "#7570b3",
+        "#e7298a",
     ]
     if n <= len(colors):
         return colors[:n]
     import colorsys
+
     extended = list(colors)
     for i in range(n - len(colors)):
-        h = (i / (n - len(colors)))
+        h = i / (n - len(colors))
         r, g, b = colorsys.hsv_to_rgb(h, 0.7, 0.85)
         extended.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
     return extended

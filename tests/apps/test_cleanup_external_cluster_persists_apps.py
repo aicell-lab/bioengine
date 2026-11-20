@@ -18,6 +18,7 @@ _cleanup composes Ray + Hypha + AppsManager in a way that's not
 practical to reconstruct in a unit test. The contract we're pinning is
 that the guard exists.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -28,9 +29,9 @@ from bioengine.worker import worker as worker_module
 def test_cleanup_skips_stop_all_apps_in_external_cluster_mode() -> None:
     src = inspect.getsource(worker_module.BioEngineWorker._cleanup)
     # The guard must check for external-cluster before calling stop_all_apps.
-    assert "external-cluster" in src, (
-        "expected _cleanup to branch on ray_cluster.mode == 'external-cluster'"
-    )
+    assert (
+        "external-cluster" in src
+    ), "expected _cleanup to branch on ray_cluster.mode == 'external-cluster'"
     # stop_all_apps must be under the non-external-cluster branch, not
     # unconditional as before.
     external_guard = src.find("external-cluster")

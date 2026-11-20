@@ -68,9 +68,9 @@ async def test_deleting_a_version_with_a_release_after_it_is_refused() -> None:
 
     message = str(excinfo.value)
     assert "2.11.1" in message, "The versions at risk have to be named."
-    assert "newest-first" in message, (
-        "The error has to name the way out, or it just restates the symptom."
-    )
+    assert (
+        "newest-first" in message
+    ), "The error has to name the way out, or it just restates the symptom."
     manager.artifact_manager.delete.assert_not_awaited()
 
 

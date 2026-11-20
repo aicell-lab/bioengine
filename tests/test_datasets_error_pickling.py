@@ -129,10 +129,13 @@ def test_no_httpx_type_crosses_the_boundary():
             id="get_dataset_access_request",
         ),
         pytest.param(
-            lambda c: c.list_dataset_access_requests(), id="list_dataset_access_requests"
+            lambda c: c.list_dataset_access_requests(),
+            id="list_dataset_access_requests",
         ),
         pytest.param(
-            lambda c: c.resolve_dataset_access_request("blood-atlas", "a@b.invalid", "grant"),
+            lambda c: c.resolve_dataset_access_request(
+                "blood-atlas", "a@b.invalid", "grant"
+            ),
             id="resolve_dataset_access_request",
         ),
     ],

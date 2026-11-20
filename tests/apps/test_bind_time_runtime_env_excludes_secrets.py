@@ -43,7 +43,9 @@ def _build_fn() -> ast.AsyncFunctionDef:
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "build":
             return node
-    raise AssertionError("builder.py has no `async def build` -- the anchor moved, not the fix")
+    raise AssertionError(
+        "builder.py has no `async def build` -- the anchor moved, not the fix"
+    )
 
 
 def _assigns_from_split(fn: ast.AST) -> bool:
@@ -52,16 +54,15 @@ def _assigns_from_split(fn: ast.AST) -> bool:
         if not isinstance(node, ast.Assign):
             continue
         names = {
-            n.id
-            for t in node.targets
-            for n in ast.walk(t)
-            if isinstance(n, ast.Name)
+            n.id for t in node.targets for n in ast.walk(t) if isinstance(n, ast.Name)
         }
         if TARGET not in names:
             continue
         for call in ast.walk(node.value):
             if isinstance(call, ast.Call):
-                fname = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+                fname = getattr(call.func, "id", None) or getattr(
+                    call.func, "attr", None
+                )
                 if fname == SPLIT:
                     return True
     return False
@@ -103,9 +104,9 @@ def test_builtapp_receives_the_split_result_and_not_raw_env_vars() -> None:
         f"BuiltApp received `{TARGET}={passed}`. It must receive the split result bound to "
         f"`{TARGET}`; anything else risks handing the unsplit env_vars to the replica runtime_env."
     )
-    assert passed != "env_vars", (
-        "BuiltApp receives the raw `env_vars` as the bind-time replica env — this is that defect exactly."
-    )
+    assert (
+        passed != "env_vars"
+    ), "BuiltApp receives the raw `env_vars` as the bind-time replica env — this is that defect exactly."
 
 
 def test_the_prefix_the_split_keys_on_is_still_the_one_the_fix_documents() -> None:

@@ -274,7 +274,9 @@ async def test_execute_test_refuses_custom_env_when_no_conda_is_installed(
 ):
     monkeypatch.setattr(entry, "resolve_conda_binary", lambda: None)
     harness = _Harness(_write_rdf(tmp_path, declares_env=True))
-    job, coro = _run(harness, custom_environment=True, model_id="bioimage-io/affable-shark")
+    job, coro = _run(
+        harness, custom_environment=True, model_id="bioimage-io/affable-shark"
+    )
 
     with pytest.raises(RuntimeError) as exc:
         await coro

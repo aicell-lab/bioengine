@@ -19,6 +19,7 @@ raises rather than returning an empty checkpoint.
 
 Synthetic tensors only: torch, no cellpose, no GPU, no pool artifact.
 """
+
 import json
 import sys
 import types
@@ -40,7 +41,7 @@ _DIGEST = "a" * 64
 # The base's diameter is NOT the mean of the members' below, so "carried the base's value"
 # and "averaged the members" give different numbers and the assertions can tell them apart.
 BASE_DIAM = 30.0
-M1_DIAM, M2_DIAM = 41.0, 53.0          # mean 47.0, nowhere near 30.0
+M1_DIAM, M2_DIAM = 41.0, 53.0  # mean 47.0, nowhere near 30.0
 
 
 def _base_state_dict() -> Dict[str, Any]:
@@ -70,17 +71,22 @@ _COMMITMENT = pool.base_commitment(_BASE_SD, source="test:e2e-init-checkpoint")
 
 # ── the real contribute path, with its collaborators stubbed ────────────────────────
 
+
 @pytest.fixture
 def fake_training(monkeypatch: pytest.MonkeyPatch) -> None:
     """A COMPLETED cpsam session, stubbed rather than created on disk."""
     mod = types.ModuleType("training")
     mod.get_status = lambda sid: {
-        "status": "COMPLETED", "model_type": MODEL_TYPE,
-        "n_epochs_completed": 2, "n_train_inputs": 5,
+        "status": "COMPLETED",
+        "model_type": MODEL_TYPE,
+        "n_epochs_completed": 2,
+        "n_train_inputs": 5,
     }
     mod.session_backend = lambda sid: "cellpose"
-    mod.read_training_params = lambda sid: {"model_type": MODEL_TYPE,
-                                            "init_checkpoint": "stock"}
+    mod.read_training_params = lambda sid: {
+        "model_type": MODEL_TYPE,
+        "init_checkpoint": "stock",
+    }
     monkeypatch.setitem(sys.modules, "training", mod)
 
 
@@ -91,8 +97,9 @@ class _Runtime:
     hand-written, so this stub cannot drift from the contract `uniform_soup` enforces.
     """
 
-    async def prepare_contribution(self, session_id: str, weights_put_url: str,
-                                   model_type: str = MODEL_TYPE) -> Dict[str, Any]:
+    async def prepare_contribution(
+        self, session_id: str, weights_put_url: str, model_type: str = MODEL_TYPE
+    ) -> Dict[str, Any]:
         return {
             "architecture_signature": _SIG,
             "base_checkpoint_sha256": "b" * 64,
@@ -175,9 +182,11 @@ async def _deposit(stub: _Stub) -> Dict[str, Any]:
     import entry
 
     contribute = entry.EntryApp.func_or_class.contribute.__get__(stub)
-    return await contribute(session_id=_SESSION,
-                            pool_artifact_id="bioimage-io/cpsam-e2e-pool",
-                            pool_token="t")
+    return await contribute(
+        session_id=_SESSION,
+        pool_artifact_id="bioimage-io/cpsam-e2e-pool",
+        pool_token="t",
+    )
 
 
 def _written_index(stub: _Stub) -> Dict[str, Any]:
@@ -188,6 +197,7 @@ def _written_index(stub: _Stub) -> Dict[str, Any]:
 
 
 # === THE load-bearing arm: production bootstrap, then a real merge ===================
+
 
 @pytest.mark.asyncio
 async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) -> None:
@@ -213,12 +223,14 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
     # ...and now MERGE against the record that contribute wrote.
     members = [_member(3.0, 5.0, M1_DIAM), _member(5.0, 9.0, M2_DIAM)]
     collected: List[Dict[str, float]] = []
-    soup = pool.uniform_soup([lambda m=m: m for m in members],
-                             base=index["base_commitment"],
-                             member_non_learned=collected)
+    soup = pool.uniform_soup(
+        [lambda m=m: m for m in members],
+        base=index["base_commitment"],
+        member_non_learned=collected,
+    )
 
-    assert float(soup["encoder.weight"][0]) == pytest.approx(4.0)   # (3+5)/2
-    assert float(soup["decoder.bias"][0]) == pytest.approx(7.0)     # (5+9)/2
+    assert float(soup["encoder.weight"][0]) == pytest.approx(4.0)  # (3+5)/2
+    assert float(soup["decoder.bias"][0]) == pytest.approx(7.0)  # (5+9)/2
     # #0070's original defect: the base's diameter is carried, NOT averaged. 30.0 vs 47.0.
     assert float(soup["diam_labels"][0]) == pytest.approx(BASE_DIAM)
     assert float(soup["diam_labels"][0]) != pytest.approx((M1_DIAM + M2_DIAM) / 2)
@@ -229,6 +241,7 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
 
 # === the merge contract itself ======================================================
 
+
 def test_a_pool_bootstrapped_the_old_way_cannot_merge() -> None:
     """`empty_index(model_type, signature)` — the two-argument call `entry.py` used to make.
 
@@ -238,8 +251,9 @@ def test_a_pool_bootstrapped_the_old_way_cannot_merge() -> None:
     index = pool.empty_index(MODEL_TYPE, _SIG)
     assert index["base_commitment"] is None
     with pytest.raises(ValueError, match="records no base commitment"):
-        pool.uniform_soup([lambda: _member(3.0, 5.0, M1_DIAM)],
-                          base=index["base_commitment"])
+        pool.uniform_soup(
+            [lambda: _member(3.0, 5.0, M1_DIAM)], base=index["base_commitment"]
+        )
 
 
 def test_a_member_with_an_extra_key_fails_the_merge_naming_the_key() -> None:

@@ -5,6 +5,7 @@ versus a local copy of the very same file. That pairing is what separates
 storage locality from route, which a view-vs-converted-copy comparison would
 otherwise confound.
 """
+
 from __future__ import annotations
 
 import io
@@ -20,8 +21,9 @@ def _index_for(source: str) -> Dict[str, Any]:
     import tifffile
 
     if "://" in source:
-        handle = fsspec.filesystem(source.split("://")[0],
-                                   block_size=2 << 20).open(source, "rb")
+        handle = fsspec.filesystem(source.split("://")[0], block_size=2 << 20).open(
+            source, "rb"
+        )
     else:
         handle = source
     tf = tifffile.TiffFile(handle)
@@ -54,16 +56,22 @@ def _reader(refs: Dict[str, Any], local_path: str | None):
                 fh.seek(offset)
                 raw = fh.read(length)
         else:
-            r = client.get(url, headers={
-                "Range": f"bytes={offset}-{offset + length - 1}"})
+            r = client.get(
+                url, headers={"Range": f"bytes={offset}-{offset + length - 1}"}
+            )
             raw = r.content
         return codec.decode(raw) if codec else raw
 
     return read
 
 
-def tier_a_arms(remote_url: str, local_tif, indices: List[Tuple[int, ...]],
-                stats: Callable, time_reads: Callable) -> Dict[str, Any]:
+def tier_a_arms(
+    remote_url: str,
+    local_tif,
+    indices: List[Tuple[int, ...]],
+    stats: Callable,
+    time_reads: Callable,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
 
     refs_remote = _index_for(remote_url)
@@ -71,16 +79,22 @@ def tier_a_arms(remote_url: str, local_tif, indices: List[Tuple[int, ...]],
     cold, warm = time_reads(read_remote, indices, True)
     out["B_view_tierA_remote"] = {
         "description": "client holds the byte-offset index and range-reads the "
-                       "original in the bucket; the platform is not in the data path",
-        "storage": "remote (GCS)", "route": "view Tier A (zero-copy)",
-        "cold": stats(cold), "warm_client_side": stats(warm)}
+        "original in the bucket; the platform is not in the data path",
+        "storage": "remote (GCS)",
+        "route": "view Tier A (zero-copy)",
+        "cold": stats(cold),
+        "warm_client_side": stats(warm),
+    }
 
     refs_local = _index_for(str(local_tif))
     read_local = _reader(refs_local, local_path=str(local_tif))
     cold, warm = time_reads(read_local, indices, True)
     out["C_view_tierA_local"] = {
         "description": "same index and same route, but against a local copy of "
-                       "the UNCONVERTED original",
-        "storage": "local disk", "route": "view Tier A (zero-copy)",
-        "cold": stats(cold), "warm_os_page_cache": stats(warm)}
+        "the UNCONVERTED original",
+        "storage": "local disk",
+        "route": "view Tier A (zero-copy)",
+        "cold": stats(cold),
+        "warm_os_page_cache": stats(warm),
+    }
     return out

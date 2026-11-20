@@ -11,6 +11,7 @@ API signatures verified against:
   bioengine-worker/bioengine/apps/manager.py
   bioengine-worker/scripts/upload_app.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +35,7 @@ from bioengine.cli.utils import (
 def _get_worker_service_id(ctx_param: Optional[str]) -> Optional[str]:
     """Resolve worker service ID from CLI flag → env var."""
     import os
+
     return ctx_param or os.environ.get("BIOENGINE_WORKER_SERVICE_ID")
 
 
@@ -59,7 +61,9 @@ _WORKER_OPTIONS = [
         metavar="TOKEN",
         help="Hypha authentication token. Can also be set via HYPHA_TOKEN env var.",
     ),
-    click.option("--server-url", envvar="BIOENGINE_SERVER_URL", default=None, hidden=True),
+    click.option(
+        "--server-url", envvar="BIOENGINE_SERVER_URL", default=None, hidden=True
+    ),
 ]
 
 
@@ -112,6 +116,7 @@ def _validate_manifest_or_exit(manifest_path: Path) -> dict:
 
 
 # ── Group ─────────────────────────────────────────────────────────────────────
+
 
 @click.group("apps")
 def apps_group():
@@ -182,6 +187,7 @@ def validate(app_dir):
 
 # ── upload ─────────────────────────────────────────────────────────────────────
 
+
 @apps_group.command("upload")
 @click.argument("app_dir", metavar="APP_DIR")
 @click.option(
@@ -214,7 +220,9 @@ def upload(app_dir, public, worker_service_id, token, server_url):
       bioengine apps upload ./my-app/
       bioengine apps upload ./my-pipeline/ --public
     """
-    server_url, worker_service_id, token = require_worker(worker_service_id, token, server_url)
+    server_url, worker_service_id, token = require_worker(
+        worker_service_id, token, server_url
+    )
     app_path = Path(app_dir).resolve()
 
     if not app_path.is_dir():
@@ -244,6 +252,7 @@ def upload(app_dir, public, worker_service_id, token, server_url):
                 files.append({"name": rel_name, "content": content, "type": "text"})
             except UnicodeDecodeError:
                 import base64
+
                 content = base64.b64encode(file_path.read_bytes()).decode("ascii")
                 files.append({"name": rel_name, "content": content, "type": "base64"})
 
@@ -262,6 +271,7 @@ def upload(app_dir, public, worker_service_id, token, server_url):
 
 
 # ── run ───────────────────────────────────────────────────────────────────────
+
 
 @apps_group.command("run")
 @click.argument("artifact_id")
@@ -318,7 +328,17 @@ def upload(app_dir, public, worker_service_id, token, server_url):
     ),
 )
 @add_worker_options
-def run_app(artifact_id, application_id, version, disable_gpu, env_vars, hypha_token, worker_service_id, token, server_url):
+def run_app(
+    artifact_id,
+    application_id,
+    version,
+    disable_gpu,
+    env_vars,
+    hypha_token,
+    worker_service_id,
+    token,
+    server_url,
+):
     """
     Deploy a BioEngine application from artifact storage.
 
@@ -338,7 +358,9 @@ def run_app(artifact_id, application_id, version, disable_gpu, env_vars, hypha_t
       bioengine apps run my-workspace/my-app --no-gpu --env DEBUG=true
       bioengine apps run my-workspace/my-app --hypha-token $HYPHA_TOKEN
     """
-    server_url, worker_service_id, token = require_worker(worker_service_id, token, server_url)
+    server_url, worker_service_id, token = require_worker(
+        worker_service_id, token, server_url
+    )
 
     # Default hypha_token to the auth token unless explicitly set to empty string
     if hypha_token is None:
@@ -391,6 +413,7 @@ def run_app(artifact_id, application_id, version, disable_gpu, env_vars, hypha_t
 
 # ── list ──────────────────────────────────────────────────────────────────────
 
+
 @apps_group.command("list")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
 @add_worker_options
@@ -406,7 +429,9 @@ def list_apps(as_json, worker_service_id, token, server_url):
       bioengine apps list
       bioengine apps list --json
     """
-    server_url, worker_service_id, token = require_worker(worker_service_id, token, server_url)
+    server_url, worker_service_id, token = require_worker(
+        worker_service_id, token, server_url
+    )
 
     async def _run():
         try:
@@ -442,10 +467,12 @@ def list_apps(as_json, worker_service_id, token, server_url):
 
 # ── status ────────────────────────────────────────────────────────────────────
 
+
 @apps_group.command("status")
 @click.argument("app_ids", nargs=-1, metavar="APP_ID...")
 @click.option(
-    "--logs", "logs_tail",
+    "--logs",
+    "logs_tail",
     default=10,
     show_default=True,
     metavar="N",
@@ -466,7 +493,9 @@ def status(app_ids, logs_tail, as_json, worker_service_id, token, server_url):
       bioengine apps status my-app-id-123
       bioengine apps status app-a app-b --json
     """
-    server_url, worker_service_id, token = require_worker(worker_service_id, token, server_url)
+    server_url, worker_service_id, token = require_worker(
+        worker_service_id, token, server_url
+    )
 
     async def _run():
         try:
@@ -518,7 +547,9 @@ def _print_single_status(app_id: str, info: dict) -> None:
     if deployments:
         click.echo(f"  Deployments:")
         for dep_name, dep_info in deployments.items():
-            dep_status = dep_info.get("status", "?") if isinstance(dep_info, dict) else dep_info
+            dep_status = (
+                dep_info.get("status", "?") if isinstance(dep_info, dict) else dep_info
+            )
             click.echo(f"    [{dep_name}]  {dep_status}")
 
     if deployments:
@@ -530,10 +561,12 @@ def _print_single_status(app_id: str, info: dict) -> None:
 
 # ── logs ──────────────────────────────────────────────────────────────────────
 
+
 @apps_group.command("logs")
 @click.argument("app_id")
 @click.option(
-    "--tail", "-n",
+    "--tail",
+    "-n",
     default=100,
     show_default=True,
     metavar="N",
@@ -552,7 +585,9 @@ def logs(app_id, tail, as_json, worker_service_id, token, server_url):
       bioengine apps logs my-app-id-123
       bioengine apps logs my-app-id-123 --tail 200
     """
-    server_url, worker_service_id, token = require_worker(worker_service_id, token, server_url)
+    server_url, worker_service_id, token = require_worker(
+        worker_service_id, token, server_url
+    )
 
     async def _run():
         try:
@@ -653,10 +688,12 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
 
 # ── stop ──────────────────────────────────────────────────────────────────────
 
+
 @apps_group.command("stop")
 @click.argument("app_id")
 @click.option(
-    "--yes", "-y",
+    "--yes",
+    "-y",
     is_flag=True,
     default=False,
     help="Skip confirmation prompt.",
@@ -675,7 +712,9 @@ def stop(app_id, yes, worker_service_id, token, server_url):
       bioengine apps stop my-app-id-123
       bioengine apps stop my-app-id-123 --yes
     """
-    server_url, worker_service_id, token = require_worker(worker_service_id, token, server_url)
+    server_url, worker_service_id, token = require_worker(
+        worker_service_id, token, server_url
+    )
 
     if not yes:
         click.confirm(f"Stop application '{app_id}'?", abort=True)
@@ -693,6 +732,7 @@ def stop(app_id, yes, worker_service_id, token, server_url):
 
 
 # ── deploy (combined upload + run convenience command) ─────────────────────────
+
 
 @apps_group.command("deploy")
 @click.argument("app_dir", metavar="APP_DIR")
@@ -731,7 +771,16 @@ def stop(app_id, yes, worker_service_id, token, server_url):
     ),
 )
 @add_worker_options
-def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_service_id, token, server_url):
+def deploy(
+    app_dir,
+    application_id,
+    disable_gpu,
+    env_vars,
+    hypha_token,
+    worker_service_id,
+    token,
+    server_url,
+):
     """
     Upload and immediately deploy a local BioEngine app directory.
 
@@ -751,7 +800,9 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
       bioengine apps deploy ./my-pipeline/ --app-id pipeline-v1 --no-gpu
       bioengine apps deploy ./my-app/ --hypha-token $HYPHA_TOKEN
     """
-    server_url, worker_service_id, token = require_worker(worker_service_id, token, server_url)
+    server_url, worker_service_id, token = require_worker(
+        worker_service_id, token, server_url
+    )
     app_path = Path(app_dir).resolve()
 
     if not app_path.is_dir():
@@ -792,6 +843,7 @@ def deploy(app_dir, application_id, disable_gpu, env_vars, hypha_token, worker_s
                 files.append({"name": rel_name, "content": content, "type": "text"})
             except UnicodeDecodeError:
                 import base64
+
                 content = base64.b64encode(file_path.read_bytes()).decode("ascii")
                 files.append({"name": rel_name, "content": content, "type": "base64"})
 

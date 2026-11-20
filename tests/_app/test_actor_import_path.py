@@ -17,6 +17,7 @@ These tests use the same pattern as test_decorators_baseline_imports.py:
 intercept ``builtins.__import__`` to simulate a missing module, then drive
 the import chain the actor actually walks and assert it survives.
 """
+
 from __future__ import annotations
 
 import builtins

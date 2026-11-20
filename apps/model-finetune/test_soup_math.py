@@ -24,8 +24,10 @@ torch = pytest.importorskip("torch")
 
 
 def _sd(value, dtype=torch.float32):
-    return {"a.weight": torch.full((4,), value, dtype=dtype),
-            "b.bias": torch.full((2,), -value, dtype=dtype)}
+    return {
+        "a.weight": torch.full((4,), value, dtype=dtype),
+        "b.bias": torch.full((2,), -value, dtype=dtype),
+    }
 
 
 def _commit(state_dict, source="test:stock-cpsam"):
@@ -52,8 +54,9 @@ def _base(dtype=torch.float32):
 
 
 def test_mean_of_members():
-    out = pool.uniform_soup([lambda: _sd(1.0), lambda: _sd(3.0), lambda: _sd(5.0)],
-                            base=_commit(_base()))
+    out = pool.uniform_soup(
+        [lambda: _sd(1.0), lambda: _sd(3.0), lambda: _sd(5.0)], base=_commit(_base())
+    )
     assert torch.allclose(out["a.weight"], torch.full((4,), 3.0))
     assert torch.allclose(out["b.bias"], torch.full((2,), -3.0))
 
@@ -66,9 +69,10 @@ def test_single_member_round_trips_unchanged():
 def test_dtype_is_restored_after_float32_averaging():
     """Averaging happens in float32 for stability, but the community checkpoint
     must round-trip into cellpose with each key's original dtype."""
-    out = pool.uniform_soup([lambda: _sd(1.0, torch.float16),
-                             lambda: _sd(2.0, torch.float16)],
-                            base=_commit(_base()))
+    out = pool.uniform_soup(
+        [lambda: _sd(1.0, torch.float16), lambda: _sd(2.0, torch.float16)],
+        base=_commit(_base()),
+    )
     assert out["a.weight"].dtype is torch.float16
     assert torch.allclose(out["a.weight"], torch.full((4,), 1.5, dtype=torch.float16))
 
@@ -132,7 +136,9 @@ def test_an_empty_first_member_is_rejected_at_two_members_too():
 
 def test_an_empty_later_member_is_rejected_by_the_same_guard():
     with pytest.raises(ValueError, match="member 2 loaded an empty state_dict"):
-        pool.uniform_soup([lambda: _sd(10.0), lambda: _sd(10.0), dict], base=_commit(_base()))
+        pool.uniform_soup(
+            [lambda: _sd(10.0), lambda: _sd(10.0), dict], base=_commit(_base())
+        )
 
 
 # ── l2_from_base is weight-only (#0070 requirement 2) ────────────────────────
@@ -266,8 +272,10 @@ def test_a_module_prefixed_diameter_is_carried_through_too() -> None:
     how it was wrapped when saved, so the carry-through keys off the last
     component exactly as the l2 exclusion does."""
     out = pool.uniform_soup(
-        [lambda: _ckpt(1.0, 29.711, prefix="net."),
-         lambda: _ckpt(1.0, 117.353, prefix="net.")],
+        [
+            lambda: _ckpt(1.0, 29.711, prefix="net."),
+            lambda: _ckpt(1.0, 117.353, prefix="net."),
+        ],
         base=_commit(_ckpt(0.0, BASE_DIAM, prefix="net.")),
     )
 
@@ -293,8 +301,11 @@ def test_member_diameters_are_collected_in_loader_order() -> None:
     contribution id. An unordered map would lose which diameter belonged to whom.
     """
     collected: list = []
-    pool.uniform_soup(_pool_loaders(), base=_commit(_ckpt(0.0, BASE_DIAM)),
-                      member_non_learned=collected)
+    pool.uniform_soup(
+        _pool_loaders(),
+        base=_commit(_ckpt(0.0, BASE_DIAM)),
+        member_non_learned=collected,
+    )
 
     assert [c["diam_labels"] for c in collected] == pytest.approx(list(POOL_DIAMS))
     assert len(collected) == len(POOL_DIAMS)
@@ -305,8 +316,11 @@ def test_collected_diameters_are_the_members_own_not_the_base() -> None:
     value instead of each member's, every entry would equal BASE_DIAM and the test
     above would still have four entries in the right order."""
     collected: list = []
-    pool.uniform_soup(_pool_loaders(), base=_commit(_ckpt(0.0, BASE_DIAM)),
-                      member_non_learned=collected)
+    pool.uniform_soup(
+        _pool_loaders(),
+        base=_commit(_ckpt(0.0, BASE_DIAM)),
+        member_non_learned=collected,
+    )
 
     assert all(c["diam_labels"] != pytest.approx(BASE_DIAM) for c in collected)
     # And the published tensor is still the base's, so the two really are different
@@ -320,8 +334,9 @@ def test_collecting_is_opt_in_and_changes_nothing() -> None:
     same bytes as one that does."""
     a = pool.uniform_soup(_pool_loaders(), base=_commit(_ckpt(0.0, BASE_DIAM)))
     sink: list = []
-    b = pool.uniform_soup(_pool_loaders(), base=_commit(_ckpt(0.0, BASE_DIAM)),
-                          member_non_learned=sink)
+    b = pool.uniform_soup(
+        _pool_loaders(), base=_commit(_ckpt(0.0, BASE_DIAM)), member_non_learned=sink
+    )
 
     assert pool.state_dict_digest(a) == pool.state_dict_digest(b)
     assert sink, "the collector was passed but filled nothing"
@@ -336,7 +351,8 @@ def test_an_inherited_block_must_name_its_source() -> None:
 
 def test_the_inherited_block_carries_basis_source_and_values() -> None:
     block = pool.inherited_non_learned(
-        {"diam_labels": 30.0, "diam_mean": 30.0}, source="cellpose:cpsam_v2")
+        {"diam_labels": 30.0, "diam_mean": 30.0}, source="cellpose:cpsam_v2"
+    )
 
     assert block["basis"] == pool.NON_LEARNED_INHERITED
     assert block["source"] == "cellpose:cpsam_v2"
@@ -371,6 +387,7 @@ def test_a_key_absent_from_the_base_fails_the_merge() -> None:
     quietly souped into every community checkpoint — which is exactly how
     diam_labels survived review.
     """
+
     def member():
         sd = _ckpt(1.0, 29.711)
         sd["net.some_future_statistic"] = torch.tensor([7.0])
@@ -382,6 +399,7 @@ def test_a_key_absent_from_the_base_fails_the_merge() -> None:
 
 def test_the_failure_names_the_offending_key() -> None:
     """An operator has to be able to act on this without re-deriving it."""
+
     def member():
         sd = _ckpt(1.0, 29.711)
         sd["net.some_future_statistic"] = torch.tensor([7.0])
@@ -398,6 +416,7 @@ def test_a_member_missing_a_base_key_fails_the_merge() -> None:
     """The other direction: a member that does not carry everything the base
     declares is a layout mismatch, and averaging over the intersection would
     publish a checkpoint missing parameters."""
+
     def member():
         sd = _ckpt(1.0, 29.711)
         del sd["b.bias"]
@@ -466,13 +485,16 @@ def test_the_published_digest_is_the_same_for_two_merges_of_the_same_members() -
 def test_the_digest_still_moves_when_a_tensor_moves() -> None:
     """The discrimination control for the test above: a digest could be stable
     because it stopped reading the tensors at all."""
-    soup = pool.uniform_soup([lambda: _sd(1.0), lambda: _sd(3.0)], base=_commit(_base()))
+    soup = pool.uniform_soup(
+        [lambda: _sd(1.0), lambda: _sd(3.0)], base=_commit(_base())
+    )
     nudged = dict(soup)
     nudged["a.weight"] = soup["a.weight"] + 1e-6
 
     assert pool.state_dict_digest(nudged) != pool.state_dict_digest(soup)
-    assert pool.state_dict_digest({"renamed": soup["a.weight"],
-                                   "b.bias": soup["b.bias"]}) != pool.state_dict_digest(soup)
+    assert pool.state_dict_digest(
+        {"renamed": soup["a.weight"], "b.bias": soup["b.bias"]}
+    ) != pool.state_dict_digest(soup)
 
 
 def test_the_digest_does_not_follow_the_file_the_soup_is_saved_under(tmp_path) -> None:
@@ -485,7 +507,9 @@ def test_the_digest_does_not_follow_the_file_the_soup_is_saved_under(tmp_path) -
     control: they fail if torch ever stops doing that, which would mean this
     test has stopped testing anything.
     """
-    soup = pool.uniform_soup([lambda: _sd(1.0), lambda: _sd(3.0)], base=_commit(_base()))
+    soup = pool.uniform_soup(
+        [lambda: _sd(1.0), lambda: _sd(3.0)], base=_commit(_base())
+    )
     a, b = tmp_path / "head-aaaaaaaa.pt", tmp_path / "head-bbbbbbbb.pt"
     torch.save(soup, str(a))
     once = pool.sha256_file(str(a))
@@ -517,8 +541,8 @@ def test_a_refusal_still_names_the_key_without_a_recorded_key_list() -> None:
 
     msg = str(exc.value)
     assert "does not match this pool's base commitment" in msg
-    assert "base commitment declares" in msg          # the counts still land
-    assert "net.some_future_statistic" not in msg     # and it honestly cannot name it
+    assert "base commitment declares" in msg  # the counts still land
+    assert "net.some_future_statistic" not in msg  # and it honestly cannot name it
 
 
 def test_the_recorded_key_list_costs_what_the_record_says() -> None:
@@ -531,12 +555,14 @@ def test_the_recorded_key_list_costs_what_the_record_says() -> None:
 
     synthetic = {
         f"encoder.blocks.{i}.attn.qkv.{part}": torch.zeros(2)
-        for i in range(150) for part in ("weight", "bias")
+        for i in range(150)
+        for part in ("weight", "bias")
     }
     rec = pool.base_commitment(synthetic, source="test:sizing")
 
-    gate_only = json.dumps({k: rec[k] for k in
-                            ("non_learned", "key_set_sha256", "key_count", "source")})
+    gate_only = json.dumps(
+        {k: rec[k] for k in ("non_learned", "key_set_sha256", "key_count", "source")}
+    )
     with_list = json.dumps(rec)
 
     assert len(synthetic) == 300

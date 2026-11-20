@@ -10,6 +10,7 @@ https://arxiv.org/abs/2304.07193
 
 Throughput: ~500 images/sec on A100 GPU (batch_size=64, fp16)
 """
+
 from __future__ import annotations
 
 import logging
@@ -32,7 +33,7 @@ class DINOv2Embedder:
         # → np.ndarray shape (N, 768), dtype float32, L2-normalised
     """
 
-    MODEL_NAME = "dinov2_vitb14"   # 768-dim; vitl14 = 1024-dim (slower, better)
+    MODEL_NAME = "dinov2_vitb14"  # 768-dim; vitl14 = 1024-dim (slower, better)
     EMBED_DIM = 768
     INPUT_SIZE = 224
 
@@ -44,7 +45,10 @@ class DINOv2Embedder:
     def load(self) -> None:
         """Download (first time) and load the DINOv2 model."""
         import torch
-        logger.info("Loading DINOv2 %s on %s (fp16=%s)", self.MODEL_NAME, self.device, self.fp16)
+
+        logger.info(
+            "Loading DINOv2 %s on %s (fp16=%s)", self.MODEL_NAME, self.device, self.fp16
+        )
         self._model = torch.hub.load(
             "facebookresearch/dinov2",
             self.MODEL_NAME,
@@ -79,12 +83,14 @@ class DINOv2Embedder:
         all_embeddings = []
         for i in range(0, len(images_rgb), batch_size):
             batch_imgs = images_rgb[i : i + batch_size]
-            tensors = [to_dinov2_tensor(img, size=self.INPUT_SIZE) for img in batch_imgs]
+            tensors = [
+                to_dinov2_tensor(img, size=self.INPUT_SIZE) for img in batch_imgs
+            ]
             batch = torch.cat(tensors, dim=0).to(self.device)  # (B, 3, 224, 224)
             if self.fp16 and self.device != "cpu":
                 batch = batch.half()
             with torch.no_grad():
-                feats = self._model(batch)                      # (B, 768)
+                feats = self._model(batch)  # (B, 768)
             feats = feats.float().cpu().numpy()
             # L2-normalise for cosine similarity via inner product
             norms = np.linalg.norm(feats, axis=1, keepdims=True)
@@ -103,6 +109,7 @@ class DINOv2Embedder:
 # Ray actor wrapper — used by ingestion pipeline as a stateful worker
 # ---------------------------------------------------------------------------
 
+
 class EmbeddingActor:
     """Ray actor that holds the model in GPU memory and processes batches.
 
@@ -111,6 +118,7 @@ class EmbeddingActor:
 
     def __init__(self) -> None:
         import torch
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._embedder = DINOv2Embedder(device=device, fp16=(device == "cuda"))
         self._embedder.load()

@@ -76,9 +76,13 @@ async def test_get_export_status_answers_after_the_replica_is_gone() -> None:
     would be.
     """
     training.write_export(
-        "e-ready", status="READY", progress=1.0,
-        message="ready", download_url="https://example.invalid/pkg.zip",
-        size_bytes=123, error=None,
+        "e-ready",
+        status="READY",
+        progress=1.0,
+        message="ready",
+        download_url="https://example.invalid/pkg.zip",
+        size_bytes=123,
+        error=None,
     )
 
     class _FreshReplica:
@@ -97,6 +101,7 @@ async def test_an_unknown_export_id_still_raises_keyerror() -> None:
     If ``get_export_status`` returned something for every id, the previous test
     would pass against a store that was not storing anything.
     """
+
     class _FreshReplica:
         pass
 
@@ -112,8 +117,10 @@ async def test_push_export_recovers_the_package_dir_after_a_restart(tmp_path) ->
     pkg.mkdir()
     (pkg / "weights.pt").write_bytes(b"x" * 16)
     training.write_export(
-        "e-push", status="READY",
-        _package_dir=str(pkg), files=[{"name": "weights.pt", "size": 16}],
+        "e-push",
+        status="READY",
+        _package_dir=str(pkg),
+        files=[{"name": "weights.pt", "size": 16}],
     )
 
     pushed_to = []
@@ -148,7 +155,9 @@ async def test_the_private_package_dir_is_not_leaked_to_the_caller() -> None:
     ``get_export_status``, and so stayed green when the filter was deleted.
     """
     training.write_export(
-        "e-private", status="READY", _package_dir="/srv/secret",
+        "e-private",
+        status="READY",
+        _package_dir="/srv/secret",
         files=[{"name": "weights.pt", "size": 16}],
     )
 
@@ -198,7 +207,9 @@ async def test_the_export_heartbeat_keeps_a_live_build_alive() -> None:
     training.write_export("e-live", status="BUILDING")
     _backdate_export("e-live", training.STATUS_STALE_SECONDS + 60)
 
-    beat = asyncio.create_task(_method_of("_export_heartbeat", object())("e-live", interval=0.05))
+    beat = asyncio.create_task(
+        _method_of("_export_heartbeat", object())("e-live", interval=0.05)
+    )
     await asyncio.sleep(0.25)
     status_while_beating = training.get_export("e-live")["status"]
     beat.cancel()

@@ -10,6 +10,7 @@ Everything here is best-effort and reports what it INSPECTED separately from
 what it found, so an unrecognised layout produces "not read by this recipe"
 rather than a confident falsehood.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -76,8 +77,11 @@ def read_czi_extras(metadata: Any) -> Tuple[Dict[str, Any], List[str]]:
         # passband edges in NANOMETRES (412, 438, ...). A display Low/High is a
         # normalised fraction, so anything outside 0..1 is not one, whatever
         # element it was found in.
-        normalised = (high is not None and 0.0 <= high <= 1.0
-                      and (low is None or 0.0 <= low <= 1.0))
+        normalised = (
+            high is not None
+            and 0.0 <= high <= 1.0
+            and (low is None or 0.0 <= low <= 1.0)
+        )
         if normalised and "bit_depth" in fields:
             full = 2 ** fields["bit_depth"] - 1
             windows.append(((low or 0.0) * full, high * full))
@@ -90,8 +94,10 @@ def read_czi_extras(metadata: Any) -> Tuple[Dict[str, Any], List[str]]:
 
     # --- scenes -----------------------------------------------------------
     inspected.append("scenes")
-    scenes = [s.get("Name") or s.get("Id") or f"scene {i}"
-              for i, s in enumerate(root.findall(".//Dimensions/S/Scenes/Scene"))]
+    scenes = [
+        s.get("Name") or s.get("Id") or f"scene {i}"
+        for i, s in enumerate(root.findall(".//Dimensions/S/Scenes/Scene"))
+    ]
     if scenes:
         fields["scenes"] = scenes
 

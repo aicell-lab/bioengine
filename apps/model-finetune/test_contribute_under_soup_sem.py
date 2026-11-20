@@ -25,6 +25,7 @@ stubs have to be live when it is CALLED, not merely when this module was importe
 installed with `monkeypatch.setitem`, which restores them afterwards, so a sibling test file in
 the same pytest process still sees the real torch.
 """
+
 import asyncio
 import importlib.util
 import logging
@@ -41,6 +42,7 @@ _INSPECTION_RAN = threading.Event()
 
 def _fake_tensor(value=0.0):
     """Enough of a tensor for the code paths these tests reach."""
+
     class _T:
         def __init__(self, v):
             self._v = v
@@ -56,6 +58,7 @@ def _fake_tensor(value=0.0):
 
         def __getitem__(self, i):
             return self._v
+
     return _T(value)
 
 
@@ -97,13 +100,17 @@ def _install_stubs(monkeypatch, ckpt: Path, sdir: Path):
     fake_pool.state_dict_l2_from_base = lambda a, b: 0.5
     fake_pool.sha256_file = lambda p: "0" * 64
     fake_pool.base_commitment = lambda sd, source: {
-        "non_learned": {"diam_labels": 30.0}, "key_set_sha256": "c" * 64,
-        "key_count": len(sd), "source": source,
+        "non_learned": {"diam_labels": 30.0},
+        "key_set_sha256": "c" * 64,
+        "key_count": len(sd),
+        "source": source,
     }
     fake_pool.L2_BASIS_STOCK = "stock"
     fake_pool.L2_BASIS_SESSION_INIT = "session_init"
     fake_pool.is_non_weight_param = lambda k: k.rsplit(".", 1)[-1] in {
-        "diam_labels", "diam_mean"}
+        "diam_labels",
+        "diam_mean",
+    }
     monkeypatch.setitem(sys.modules, "pool", fake_pool)
 
     fake_training = types.ModuleType("training")
@@ -139,7 +146,9 @@ def runtime(tmp_path, monkeypatch):
     (sdir / "models").mkdir(parents=True)
     ckpt = sdir / "models" / "cp.pt"
     ckpt.write_bytes(b"not-really-a-checkpoint")
-    assert not (sdir / "init_checkpoint.pt").exists(), "fixture must be stock-initialised"
+    assert not (
+        sdir / "init_checkpoint.pt"
+    ).exists(), "fixture must be stock-initialised"
 
     _install_stubs(monkeypatch, ckpt, sdir)
     mod = _load_runtime_module()
@@ -170,9 +179,10 @@ async def test_the_inspection_cannot_start_while_the_merge_holds_the_semaphore(r
 
     A mutant that drops the ``async with`` fails HERE and by name.
     """
-    await runtime._soup_sem.acquire()                  # stand in for a merge in flight
+    await runtime._soup_sem.acquire()  # stand in for a merge in flight
     task = asyncio.create_task(
-        runtime.prepare_contribution("sess", "https://example.invalid/put"))
+        runtime.prepare_contribution("sess", "https://example.invalid/put")
+    )
 
     # Wait on an EVENT the inspection sets, not on event-loop yields.
     #
@@ -190,9 +200,11 @@ async def test_the_inspection_cannot_start_while_the_merge_holds_the_semaphore(r
     assert runtime._started == []
     assert not task.done()
 
-    runtime._soup_sem.release()                        # the merge finishes
+    runtime._soup_sem.release()  # the merge finishes
     info = await asyncio.wait_for(task, timeout=30)
-    assert runtime._started == ["cpsam"], "the inspection never ran even after the release"
+    assert runtime._started == [
+        "cpsam"
+    ], "the inspection never ran even after the release"
     assert info["architecture_signature"] == "sig-under-test"
 
 
@@ -204,8 +216,11 @@ async def test_the_same_call_completes_when_the_semaphore_is_free(runtime):
     inspection would satisfy `_started == []` and the first test would pass for the wrong reason.
     """
     info = await asyncio.wait_for(
-        runtime.prepare_contribution("sess", "https://example.invalid/put"), timeout=30)
-    assert runtime._started == ["cpsam"], "the inspection did not run even with the lock free"
+        runtime.prepare_contribution("sess", "https://example.invalid/put"), timeout=30
+    )
+    assert runtime._started == [
+        "cpsam"
+    ], "the inspection did not run even with the lock free"
     assert info["base_commitment"] is not None
 
 
@@ -217,6 +232,7 @@ async def test_the_semaphore_is_released_even_when_the_inspection_raises(runtime
     rules out — a replica that stops merging entirely after one bad checkpoint — is worse than
     the breach this row is about.
     """
+
     def _boom(model_type="cpsam"):
         runtime._started.append(model_type)
         _INSPECTION_RAN.set()
@@ -225,10 +241,14 @@ async def test_the_semaphore_is_released_even_when_the_inspection_raises(runtime
     runtime._base_state_dict = _boom
     with pytest.raises(RuntimeError, match="deliberate"):
         await asyncio.wait_for(
-            runtime.prepare_contribution("sess", "https://example.invalid/put"), timeout=30)
+            runtime.prepare_contribution("sess", "https://example.invalid/put"),
+            timeout=30,
+        )
 
     assert runtime._started == ["cpsam"]
-    await asyncio.wait_for(runtime._soup_sem.acquire(), timeout=5)   # merge path still usable
+    await asyncio.wait_for(
+        runtime._soup_sem.acquire(), timeout=5
+    )  # merge path still usable
     runtime._soup_sem.release()
 
 
@@ -247,9 +267,12 @@ def test_these_tests_do_not_need_real_torch():
     # Checked over the AST, not the raw text. A text grep for "importorskip" matches this
     # file's OWN docstring, which explains the mistake by naming it — the first version of
     # this guard failed on its own prose. Code is what matters, so code is what is parsed.
-    skips = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Call)
-             and getattr(n.func, "attr", getattr(n.func, "id", None)) == "importorskip"]
+    skips = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", getattr(n.func, "id", None)) == "importorskip"
+    ]
     assert not skips, (
         "this file must run where torch is absent; CI's bioengine-worker image has no torch "
         "and an importorskip turns all of #0087's evidence back into skips"
@@ -263,14 +286,19 @@ def test_these_tests_do_not_need_real_torch():
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in (node.names if isinstance(node, ast.Import) else [])
     ]
-    assert "torch" not in top_level_imports, (
-        "a module-level `import torch` makes this file uncollectable where torch is absent"
-    )
+    assert (
+        "torch" not in top_level_imports
+    ), "a module-level `import torch` makes this file uncollectable where torch is absent"
 
     # CONTROL: the finder must be able to see things that ARE there, or both assertions above
     # are vacuous — an AST walk that matched nothing would pass them for the wrong reason.
     assert "asyncio" in top_level_imports
-    calls = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Call)
-             and getattr(n.func, "attr", getattr(n.func, "id", None)) == "_install_stubs"]
-    assert calls, "the Call finder matched nothing at all, so the guards above prove nothing"
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", getattr(n.func, "id", None)) == "_install_stubs"
+    ]
+    assert (
+        calls
+    ), "the Call finder matched nothing at all, so the guards above prove nothing"

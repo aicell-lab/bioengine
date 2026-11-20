@@ -56,7 +56,9 @@ def _app(artifact_id: str, auto_redeploy: bool) -> dict:
         "version": "1.0.0",
         "auto_redeploy": auto_redeploy,
         "entry_deployment_name": "Entry",
-        "built_app": SimpleNamespace(spec={"entry_id": "deployment:Entry", "classes": {}}),
+        "built_app": SimpleNamespace(
+            spec={"entry_id": "deployment:Entry", "classes": {}}
+        ),
         "deployment_task": None,
     }
 
@@ -75,7 +77,9 @@ def _make_manager(apps: dict) -> AppsManager:
     # point is that the probe answers without a serve.status round trip.
     manager.ray_cluster = SimpleNamespace(
         check_connection=AsyncMock(side_effect=AssertionError("cluster touched")),
-        call_with_reconnect=AsyncMock(side_effect=AssertionError("serve.status called")),
+        call_with_reconnect=AsyncMock(
+            side_effect=AssertionError("serve.status called")
+        ),
     )
     return manager
 
@@ -192,6 +196,6 @@ async def test_one_opted_in_app_sends_the_episode_down_the_sweep_instead(
             await manager.monitor_applications()
 
     manager._recover_from_controller_loss.assert_awaited_once()
-    assert all(DETECTION_MARK not in m for m in _at(caplog, logging.ERROR)), (
-        "the opted-out detection line must not fire when the sweep handles it"
-    )
+    assert all(
+        DETECTION_MARK not in m for m in _at(caplog, logging.ERROR)
+    ), "the opted-out detection line must not fire when the sweep handles it"
