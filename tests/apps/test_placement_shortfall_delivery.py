@@ -33,15 +33,25 @@ def _slow_allocation(required, available):
     )
 
 
-# The live case the refuted attempt broke: trivially placeable, building a venv.
-PLACEABLE_WAKE_UP = _slow_allocation({"CPU": 0.1}, {"CPU": 3.9})
-UNPLACEABLE = _slow_allocation({"CPU": 1, "GPU": 1}, {"CPU": 8})
+GIB = 1024**3
+
+# One 4-CPU, 1-GPU node. Both fixtures below are read against it.
+NODES = {"n1": {"total_cpu": 4.0, "total_gpu": 1.0, "total_memory": 16 * GIB}}
+
+# A 3-CPU replica waking on that node. Serve has already granted its lease, so the
+# message reports only 1.0 free -- against the replica's own 3.0. It fits the node
+# and it serves; comparing against the message's own figure called it stuck.
+PLACEABLE_WAKE_UP = _slow_allocation({"CPU": 3.0}, {"CPU": 1.0})
+
+# A requirement no node in this cluster could ever hold.
+UNPLACEABLE = _slow_allocation({"CPU": 5.0}, {"CPU": 4.0})
 
 
 def _make_manager() -> AppsManager:
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test.placement_shortfall_delivery")
     manager.ray_cluster = MagicMock()
+    manager.ray_cluster.status = {"nodes": NODES}
     manager.ray_cluster.proxy_actor_handle.get_deployment_logs.remote = AsyncMock(
         return_value={}
     )
@@ -76,7 +86,7 @@ async def test_an_unplaceable_deployment_is_reported_through_get_app_status():
     dep = await _deployment(UNPLACEABLE)
 
     assert dep["unschedulable"] is True
-    assert dep["placement_shortfall"] == {"GPU": {"required": 1.0, "available": 0.0}}
+    assert dep["placement_shortfall"] == {"CPU": {"required": 5.0, "largest_node": 4.0}}
 
 
 @pytest.mark.asyncio

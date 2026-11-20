@@ -1291,6 +1291,15 @@ class AppsManager:
         deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         overrides = deployment_logs_overrides or {}
+        # Read once for the whole application. Never raises: a status this cannot
+        # read leaves the capacities empty, and an empty capacity map reports no
+        # shortfall rather than an invented one.
+        try:
+            node_capacities = self.ray_cluster.status["nodes"]
+        except Exception:
+            node_capacities = None
+        if not isinstance(node_capacities, dict):
+            node_capacities = None
         deployments_info = {}
         for deployment_name, deployment_info in (
             application_details.get("deployments") or {}
@@ -1307,10 +1316,11 @@ class AppsManager:
                 "status": deployment_info.get("status"),
                 "message": message,
                 # A deployment stuck on a placement and one mid-wake-up are both
-                # UPSCALING at zero RUNNING replicas, and the only thing that tells
-                # them apart is the resource pair Serve buries in the message.
-                # Reading it here means a caller does not have to.
-                **describe_placement(message),
+                # UPSCALING at zero RUNNING replicas, and nothing a caller can read
+                # tells them apart. Serve states the requirement in the message; the
+                # cluster status states what a node could ever hold. Comparing those
+                # two here means a caller does not have to.
+                **describe_placement(message, node_capacities),
                 "replica_states": replica_states,
                 "replicas": replicas,
                 "max_ongoing_requests": self._per_replica_ongoing_limit(

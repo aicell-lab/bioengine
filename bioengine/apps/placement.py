@@ -14,13 +14,28 @@ cluster to auto-scale or for a runtime environment to be installed"). Matching t
 sentence therefore flags every cold wake-up. What separates the two cases is the
 *pair*: a wake-up whose replicas fit reports a requirement the cluster can meet.
 
-**What ``available`` actually is, which the message gets wrong.** Serve labels it
-"total resources available" and fills it from ``ray.available_resources()``
-(``deployment_state.py``, ``DeploymentReplica.resource_requirements``), which is
-what is *free right now*. A shortfall reported here therefore means "does not fit at
-this moment", not "can never fit": a cluster still adding a node, or a sibling
-holding the GPUs for another minute, both produce one. Treat it as a reason to look,
-not as a verdict.
+**Only the requirement is read out of the message. Its "available" figure is
+unusable, and quietly so.** Serve labels it "total resources available" and fills it
+from ``ray.available_resources()`` (``deployment_state.py``,
+``DeploymentReplica.resource_requirements``) — what is *free right now*. By the time
+Serve writes this message the replica's own lease has already been granted, so its
+own requirement has already been subtracted from that figure. Comparing the two
+therefore compares a replica against a cluster that has already set its share aside,
+and **any replica needing more than half of what was free reports a shortfall
+against itself** for the whole of a healthy venv build. Measured: a 3-CPU deployment
+waking on an idle 4-CPU cluster reports ``required 3.0, available 1.0`` and then
+serves. A one-GPU deployment on a one-GPU node does it on every cold start.
+
+So the comparison here is against **node capacity**, which does not move: a replica
+has to fit on ONE node, so a requirement no single node could ever satisfy — however
+idle the cluster — is the thing that cannot be waited out. That is immune both to
+the self-reservation above and to a sibling transiently holding the resource.
+
+What it still cannot see is a cluster that could grow a bigger node than it
+currently has. On a KubeRay cluster with a larger instance type available, this
+reports a shortfall for a replica the autoscaler would eventually place. That false
+positive is left in, and said out loud, because the alternative is reporting nothing
+at all.
 
 The field is called ``placement_shortfall`` and not ``resource_shortfall`` because
 an application already carries a ``resource_shortfall`` — the deploy-time report
@@ -86,41 +101,96 @@ def parse_resource_pair(
     return required, available
 
 
-def placement_shortfall(message: Optional[str]) -> Dict[str, Dict[str, float]]:
-    """Which required resources the cluster could not supply, keyed by name.
+# Serve states a requirement in Ray's own resource names; the cluster status reports
+# per-node capacity under its own. Only these three can be compared. A requirement in
+# any other name -- a custom resource, an accelerator label, VRAM_MB -- has no
+# capacity to compare against here and is reported as no shortfall rather than
+# guessed at, which is why `unschedulable: false` is never a guarantee of
+# placeability.
+_CAPACITY_KEY_BY_RESOURCE = {
+    "CPU": "total_cpu",
+    "GPU": "total_gpu",
+    "memory": "total_memory",
+}
 
-    Empty when the deployment's requirement is met, and empty when no pair could be
-    read — absence of evidence is reported as no shortfall on purpose, because the
-    consumers are health checks and an unreadable message is not a fault.
 
-    Serve filters ``available`` down to the keys in ``required``, so a required name
-    missing from it has none free.
+def largest_node_capacity(
+    nodes: Optional[Dict[str, Dict[str, Any]]],
+) -> Dict[str, float]:
+    """The biggest single-node capacity per comparable resource.
+
+    Per node and not summed, because a replica is one actor and has to fit on one
+    node. Summing would call a 2-GPU requirement placeable on two one-GPU nodes,
+    which it is not.
+
+    Each resource is maximised independently. That is deliberately generous -- no
+    single node need hold all three maxima -- so this errs towards reporting nothing,
+    which is the right direction for a signal consumed by health checks.
+    """
+    capacity: Dict[str, float] = {}
+    for node in (nodes or {}).values():
+        if not isinstance(node, dict):
+            continue
+        for resource, key in _CAPACITY_KEY_BY_RESOURCE.items():
+            try:
+                total = float(node[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if total > capacity.get(resource, -1.0):
+                capacity[resource] = total
+    return capacity
+
+
+def placement_shortfall(
+    message: Optional[str],
+    nodes: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """Which required resources no single node in the cluster could ever supply.
+
+    Empty whenever the question cannot be answered: no pair in the message, no node
+    capacities, or a requirement named in units this cannot map. Absence of evidence
+    is reported as no shortfall on purpose -- the consumers are health checks, and an
+    unreadable message is not a fault.
+
+    The ``available`` half of Serve's message is deliberately ignored; see the module
+    docstring for why it reports a replica as short against itself.
     """
     pair = parse_resource_pair(message)
     if pair is None:
         return {}
 
-    required, available = pair
+    capacity = largest_node_capacity(nodes)
+    required, _available = pair
     shortfall: Dict[str, Dict[str, float]] = {}
     for name, needed in required.items():
+        if name not in capacity:
+            # No capacity figure for this resource, because the cluster status could
+            # not be read at all or because the name has no counterpart there. Either
+            # way there is nothing to compare, and "we do not know" is reported as no
+            # shortfall -- NOT as a capacity of zero, which would turn an unreadable
+            # cluster into an unschedulable verdict for every deployment at once.
+            continue
         try:
             needed_f = float(needed)
-            have_f = float(available.get(name, 0.0))
         except (TypeError, ValueError):
-            # A value this cannot compare is not a shortfall. One unreadable entry
-            # does not say anything about the others, so the rest are still checked.
+            # One unreadable entry says nothing about the others, so the rest are
+            # still checked.
             continue
-        if needed_f > have_f + _EPSILON:
-            shortfall[name] = {"required": needed_f, "available": have_f}
+        largest = capacity[name]
+        if needed_f > largest + _EPSILON:
+            shortfall[name] = {"required": needed_f, "largest_node": largest}
     return shortfall
 
 
-def describe_placement(message: Optional[str]) -> Dict[str, Any]:
+def describe_placement(
+    message: Optional[str],
+    nodes: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """The projection ``get_app_status`` adds per deployment.
 
-    ``unschedulable`` is true only when a pair was read AND it falls short, so a
-    caller never has to tell an absent key from a false one, and never has to parse
-    ``replica_states`` or the message itself.
+    ``unschedulable`` is true only when a requirement was read AND no single node
+    could ever hold it, so a caller never has to tell an absent key from a false one,
+    and never has to parse ``replica_states`` or the message itself.
     """
-    shortfall = placement_shortfall(message)
+    shortfall = placement_shortfall(message, nodes)
     return {"unschedulable": bool(shortfall), "placement_shortfall": shortfall}
