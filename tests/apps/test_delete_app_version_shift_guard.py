@@ -3,7 +3,7 @@
 Hypha maps an artifact version to its stored files by POSITION in the version
 list, so deleting version i re-points every later version's payload down one
 slot: version i+1 starts serving version i's bytes under its own label, with a
-200 and a version list that still reads correctly (myco #0019, re-measured on
+200 and a version list that still reads correctly (re-measured on
 live Hypha 2026-10-24).
 
 ``delete_app_version`` used to call ``artifact_manager.delete`` unconditionally

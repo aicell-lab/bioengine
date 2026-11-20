@@ -78,7 +78,8 @@ def _load_runtime():
 
     fake_pool = types.ModuleType("pool")
     fake_pool.sha256_file = lambda p: "0" * 64
-    fake_pool.mean_instance_f1 = lambda masks, labels: 0.0
+    fake_pool.per_image_instance_f1 = lambda masks, labels: [0.0] * max(len(labels), 1)
+    fake_pool.mean_of_per_image = lambda per_image: 0.0
     sys.modules["pool"] = fake_pool
 
     fake_torch = types.ModuleType("torch")
@@ -140,8 +141,10 @@ async def _old_score_soup(
         finally:
             if ckpt and ckpt.exists():
                 ckpt.unlink()
+    per_image = pool.per_image_instance_f1(masks, [np.asarray(lbl) for lbl in labels])
     return {
-        "f1": pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels]),
+        "f1": pool.mean_of_per_image(per_image),
+        "per_image": per_image,
         "replica": self._replica_id(),
         "soup_dl_bytes": self._soup_dl_bytes - dl_before,
     }

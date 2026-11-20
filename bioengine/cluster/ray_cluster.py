@@ -35,6 +35,17 @@ from bioengine.utils import (
 )
 
 
+class ProxyHandleAbsentError(RuntimeError):
+    """The cached ``proxy_actor_handle`` is ``None``, so there is nothing to call.
+
+    Raised instead of letting a bare dereference produce
+    ``AttributeError: 'NoneType' object has no attribute ...``. That shape is
+    unclassifiable by ``_is_stale_handle_error``, so the reconnect that would
+    re-acquire the handle was skipped and the real cause — an unreachable head
+    — was reported as a worker bug.
+    """
+
+
 def _is_stale_handle_error(exc: BaseException) -> bool:
     """Detect a Ray Client stale-handle error.
 
@@ -1357,25 +1368,50 @@ class RayCluster:
         error, so it propagates to the per-step error path and counts towards
         ``_monitor_consecutive_errors`` rather than triggering a reconnect.
         """
+        # Read the handle once: ``reconnect()`` nulls it without holding
+        # anything this helper waits on, so a check against the attribute
+        # could still be followed by a dereference of ``None``.
+        handle = self.proxy_actor_handle
+        if handle is None:
+            raise ProxyHandleAbsentError(
+                "No proxy actor handle — the Ray Client session is not connected"
+            )
         return await asyncio.wait_for(
-            self.proxy_actor_handle.get_cluster_state.remote(),
+            handle.get_cluster_state.remote(),
             timeout=CLUSTER_STATE_TIMEOUT_S,
         )
 
+    def _is_recoverable_handle_error(self, exc: BaseException) -> bool:
+        """Can a reconnect plausibly fix this, for this worker?
+
+        An absent handle and a stale one are both re-acquired by
+        ``_connect_to_cluster()``, so both route to ``reconnect()`` — but only
+        for a Ray Client. In single-machine / SLURM modes the handle is set
+        during startup and never dropped, so a ``None`` there means the
+        cluster was never connected, which a reconnect cannot fix and
+        ``reconnect()`` refuses to attempt.
+        """
+        if isinstance(exc, ProxyHandleAbsentError):
+            return self.mode == "external-cluster"
+        return _is_stale_handle_error(exc)
+
     async def _get_cluster_state_with_reconnect(self):
-        """Fetch cluster state, recovering once from a stale proxy handle.
+        """Fetch cluster state, recovering once from a stale or absent handle.
 
         The cached ``proxy_actor_handle`` is invalidated when the head node /
-        proxy actor is recycled; reconnect re-acquires it via
-        ``get_if_exists=True`` so the retry lands on a live actor.
+        proxy actor is recycled, and dropped outright while a reconnect is in
+        flight; reconnect re-acquires it via ``get_if_exists=True`` so the
+        retry lands on a live actor. Exactly one retry — a reconnect that
+        keeps failing propagates to the per-step error path and counts towards
+        ``_monitor_consecutive_errors``, same as a timeout.
         """
         try:
             return await self._get_cluster_state_bounded()
         except Exception as exc:
-            if not _is_stale_handle_error(exc):
+            if not self._is_recoverable_handle_error(exc):
                 raise
             self.logger.warning(
-                f"Stale proxy actor handle in monitor_cluster: {exc!s}. "
+                f"Unusable proxy actor handle in monitor_cluster: {exc!s}. "
                 f"Reconnecting and retrying once."
             )
             await self.reconnect()

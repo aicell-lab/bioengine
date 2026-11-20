@@ -20,13 +20,17 @@ unit-testable and free of transport concerns.
 
 import hashlib
 import json
+import math
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import (
+    Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional,
+    Sequence, Tuple,
+)
 
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
 # record and every read method so the page can flag a backend/page mismatch
 # instead of silently mis-rendering. Bump in lock-step with the page's fixtures.
-SCHEMA_VERSION = "0.13.0-draft"
+SCHEMA_VERSION = "0.15.0-draft"
 
 POOL_INDEX = "pool_index.json"
 # Resume journal for aggregate(): scores already paid for, so a killed merge
@@ -67,6 +71,66 @@ BASELINE_BASIS = (
     "0f1cc3f7ecdd8a037a57c6c48d9d8921391be4cbce3fa9f13c3e3a2e1253c667), "
     "scored on the witness split before the first merge"
 )
+# The per-IMAGE breakdown behind the aggregate. This is NOT per_site: per_site is a
+# participant map keyed by a declared KeySpace ('site' | 'dataset'), and a
+# campaign_holdout metric is refused for publishing one at all (round_metric below,
+# mirroring the page). A holdout split has no participants to key on — it has images,
+# in the order the caller supplied them — so this is an ordered vector under its own
+# field, additive to the record and ignored by a consumer that does not know it.
+#
+# The second sentence is the load-bearing one: it is enforced, not merely asserted.
+# round_metric refuses a record whose aggregate is not the mean of the vector beside
+# it, so "the gate decided on a scalar nobody can audit" cannot be answered with a
+# breakdown that was computed separately and happens to disagree.
+PER_IMAGE_BASIS = (
+    "one instance F1 at IoU 0.5 per image of the scored split, in the order the "
+    "split's arrays were supplied to this app; the aggregate on this record is the "
+    "arithmetic mean of exactly these numbers and is not measured independently of "
+    "them"
+)
+# Slack allowed between a record's aggregate and the mean of its per-image vector.
+# The call sites publish round(x, 4), which is 5e-5 of rounding on its own, and the
+# resume journal stores both halves at 6 decimal places, which adds ~1e-6. 1e-4 is
+# the smallest bound that admits every honest record and still refuses a vector that
+# belongs to a different scoring pass.
+PER_IMAGE_AGGREGATE_TOLERANCE = 1e-4
+
+# The two wordings 0.27.15 (commit e762a17b5af5) retracted, verbatim. Both asserted
+# disjointness as FACT — "a public benchmark disjoint from…", "the disjoint witness
+# split B, held back from…" — which this app cannot check, because split A and B
+# arrive as caller-supplied arrays. Records written before that release still carry
+# them and are still shown to contributors, so the read path below maps them onto the
+# current wording. They live here as constants, not as a substring search, because a
+# substring that drifts stops matching and a search that stops matching reports clean.
+#
+# Keep these byte-exact. They are historical record, not editable prose: changing one
+# character stops it matching the stored data it exists to recognise, and nothing
+# announces that — the projection just quietly resumes publishing the retracted claim.
+RETRACTED_SELECTION_BASIS = (
+    "the score the greedy gate admitted contributions against, on split A, a public "
+    "benchmark disjoint from every contributor's training data"
+)
+RETRACTED_WITNESS_BASIS = (
+    "scored on the disjoint witness split B, held back from the selection split and "
+    "from every contributor, the only number the improvement curve plots"
+)
+# Stored wording -> what it is corrected to on the way out. The value is the current
+# constant, so the two cannot drift apart: re-word SELECTION_BASIS and the correction
+# follows automatically rather than silently continuing to serve the older rewrite.
+_RETRACTED_BASIS = {
+    RETRACTED_SELECTION_BASIS: SELECTION_BASIS,
+    RETRACTED_WITNESS_BASIS: WITNESS_BASIS,
+}
+# Appended to a corrected record so the substitution is visible rather than seamless.
+# A contributor comparing what the page shows against a stored record they fetched
+# themselves would otherwise find a difference with no explanation, which is the same
+# "is this corrupt?" dead end #0417 describes for global_sha256.
+BASIS_CORRECTION_NOTE = (
+    "[corrected on read: the record as stored asserts this split's disjointness as "
+    "fact; that claim was withdrawn in app 0.27.15 because the splits arrive as "
+    "caller-supplied arrays and this app cannot verify them. The stored record is "
+    "unchanged — only this wording is restated as what the app can actually check.]"
+)
 
 
 def round_metric(
@@ -82,19 +146,67 @@ def round_metric(
     per_site: Optional[Any] = None,
     per_site_basis: Optional[str] = None,
     aggregate_withheld: Optional[Any] = None,
+    per_image: Optional[Sequence[float]] = None,
+    per_image_basis: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """One role-tagged metric record — the page's RoundMetric (11 fields).
+    """One role-tagged metric record — the page's CampaignMetric, plus the per-image
+    breakdown this backend adds (13 fields).
 
     ``role`` is the load-bearing tag: the page refuses to plot anything whose
     ``role != 'witness'`` on the improvement curve, EVEN if it arrived through the
     ``witness_metric`` field. The field NAME and this tag are two carriers that must
     agree; keeping both makes a selection/witness swap detectable rather than silent.
     A ``campaign_holdout`` scope must not carry a ``per_site`` map (the page refuses
-    that combination), so both stay null for our curated splits."""
+    that combination), so both stay null for our curated splits.
+
+    ``per_image``/``per_image_basis`` are the two fields this app adds beyond the
+    page's record. They are the breakdown behind ``aggregate``, and the pairing is
+    enforced three ways: both or neither, a non-empty vector of finite numbers, and
+    ``aggregate`` within ``PER_IMAGE_AGGREGATE_TOLERANCE`` of its mean. Without that
+    last check a record could publish a breakdown of a DIFFERENT scoring pass, which
+    is worse than publishing no breakdown at all — it would read as an audit trail
+    while auditing nothing.
+    """
     if role not in ("witness", "selection"):
         raise ValueError(f"role must be 'witness' or 'selection', not {role!r}")
     if aggregate_scope == _HOLDOUT and per_site is not None:
         raise ValueError("a campaign_holdout metric must not carry a per_site map")
+    if (per_image is None) != (per_image_basis is None):
+        raise ValueError(
+            "per_image and per_image_basis are published together or not at all: a "
+            "vector with no basis does not say what its numbers are or how they are "
+            "ordered, and a basis with no vector describes nothing"
+        )
+    if per_image is not None:
+        per_image = [float(v) for v in per_image]
+        if not per_image:
+            raise ValueError("per_image must not be empty; omit it instead of publishing []")
+        if not all(math.isfinite(v) for v in per_image):
+            raise ValueError(f"per_image carries a non-finite score: {per_image!r}")
+        if aggregate is None:
+            raise ValueError(
+                "a record publishing per_image must publish the aggregate it is the "
+                "mean of; otherwise the vector cannot be checked against anything"
+            )
+        mean = mean_of_per_image(per_image)
+        if abs(float(aggregate) - mean) > PER_IMAGE_AGGREGATE_TOLERANCE:
+            raise ValueError(
+                f"aggregate {float(aggregate)!r} is not the mean of the per_image "
+                f"vector beside it (mean {mean!r} over {len(per_image)} image(s), "
+                f"tolerance {PER_IMAGE_AGGREGATE_TOLERANCE}). The breakdown belongs "
+                f"to a different scoring pass than the aggregate."
+            )
+    # Refusing at the WRITE site, not just correcting at the read site. Correcting on
+    # read fixes the records that already exist; this stops a new one being written
+    # with wording the project has withdrawn — a caller passing a basis string copied
+    # from an old record, which is exactly how the retracted text would come back.
+    if aggregate_basis in _RETRACTED_BASIS:
+        raise ValueError(
+            "aggregate_basis is wording withdrawn in app 0.27.15 (commit e762a17b5af5): "
+            "it asserts the split's disjointness as fact, which this app cannot verify "
+            "because split A and B arrive as caller-supplied arrays. Use "
+            f"{'SELECTION_BASIS' if role == 'selection' else 'WITNESS_BASIS'} instead."
+        )
     return {
         "role": role,
         "name": name,
@@ -107,6 +219,8 @@ def round_metric(
         "per_site": per_site,
         "per_site_basis": per_site_basis,
         "aggregate_withheld": aggregate_withheld,
+        "per_image": per_image,
+        "per_image_basis": per_image_basis,
     }
 
 
@@ -167,14 +281,581 @@ def state_dict_digest(state_dict: Dict[str, Any]) -> str:
     return h.hexdigest()
 
 
+# ── what a stored ``l2_from_base`` was measured AGAINST ──────────────────────
+# #0122. ``l2_from_base`` is a distance, and a distance is meaningless without
+# naming the point it is measured from. Two different bases are in use:
+#
+#   * a session that carries ``init_checkpoint.pt`` is measured against THAT file
+#     — the checkpoint the contributor actually started from;
+#   * a stock-initialised session keeps no such file, so it is measured against
+#     the stock cellpose base the session was constructed with.
+#
+# Before #0122 the second case stored NULL rather than a number, so "this
+# contributor did not move" and "nobody measured" were the same reading. Filling
+# it in without naming the base would replace one ambiguity with a worse one: two
+# contributions with the same number, measured from different points, would look
+# comparable. These constants make the base nameable and ``l2_basis`` attributes a
+# stored value to one of them — or declines to, which is the point.
+L2_BASIS_SESSION_INIT = "session_init_checkpoint"
+L2_BASIS_STOCK = "stock_base"
+# No value stored at all. Its own answer, deliberately NOT folded into
+# "undetermined": "the pool holds no distance for this record" and "the pool holds
+# a distance whose origin is unknown" are different facts about the record.
+L2_BASIS_ABSENT = "no_l2"
+# A value with no label. Spelled the same as the digest vocabulary's undetermined
+# on purpose — one word for one concept, so a reader meeting it on either field
+# learns it once. 0.27.6 moved every ``l2_from_base`` without changing the record's
+# shape, so an unlabelled value could have been written under either meaning and
+# this build must refuse to guess between them.
+L2_BASIS_UNDETERMINED = "undetermined"
+
+_L2_BASES = (L2_BASIS_SESSION_INIT, L2_BASIS_STOCK, L2_BASIS_ABSENT)
+
+
+def l2_basis(
+    record: Optional[Dict[str, Any]],
+    *,
+    value_key: str = "l2_from_base",
+    basis_key: str = "l2_from_base_basis",
+) -> str:
+    """What ``record[value_key]`` was measured against, from the record alone.
+
+    Resolution order, each step refusing rather than guessing:
+
+    1. not a record                          -> ``L2_BASIS_UNDETERMINED``
+    2. no distance stored (absent or None)   -> ``L2_BASIS_ABSENT``
+    3. an explicit basis this build knows    -> that basis
+    4. an explicit basis it does NOT know
+       (written by a newer app)              -> ``L2_BASIS_UNDETERMINED``
+    5. a distance with NO basis field        -> ``L2_BASIS_UNDETERMINED``
+
+    Step 5 is the one that matters and the one a shortcut would get wrong. Every
+    record written before #0122 carries a distance and no label, and the tempting
+    default — "unlabelled means the session-init base, because that was the only
+    one that produced a number" — is exactly the inference 0.27.6 makes unsafe. An
+    unlabelled value reads as undetermined, never as a base and never as zero.
+    """
+    if not isinstance(record, dict):
+        return L2_BASIS_UNDETERMINED
+    if record.get(value_key) is None:
+        return L2_BASIS_ABSENT
+    stated = record.get(basis_key)
+    if stated is None:
+        return L2_BASIS_UNDETERMINED
+    return stated if stated in _L2_BASES else L2_BASIS_UNDETERMINED
+
+
+# ── which of the two digests a stored value is ───────────────────────────────
+# The published head digest (``merges[].global_sha256``, the
+# ``current_community.sha256`` copy of it and the ``weights_sha256`` copy in each
+# community manifest — one value written once, copied three ways) digested the FILE
+# ``torch.save`` wrote before commit d3040c4f8165 (app 0.27.12) and digests the
+# TENSORS after it. Same field name, same type, same 64-hex shape, so the value
+# alone does not say which. A contributor who re-merges an identical member set
+# gets a tensor digest, compares it against a stored file digest, and the only
+# conclusion available to them is that the community model is corrupt. It is not:
+# the two numbers were never answers to the same question. These constants make
+# both meanings nameable and ``digest_provenance`` attributes a stored value to one
+# of them — or declines to, which is the point.
+
+DIGEST_BASIS_TENSORS = "state_dict_tensors"
+DIGEST_BASIS_FILE = "torch_save_file"
+DIGEST_BASIS_UNDETERMINED = "undetermined"
+# A record with no digest at all (a merge that admitted nothing publishes no head).
+# Kept apart from "undetermined" on purpose: "there is no value to attribute" and
+# "the value cannot be attributed" are different answers and collapsing them would
+# hide the second behind the first.
+DIGEST_BASIS_ABSENT = "no_digest"
+
+# What ``state_dict_digest`` above computes TODAY, stamped onto every new record so
+# that a reader after the NEXT change to it never has to date-reason the way this
+# module has to for pre-0.27.12 records. Change this in the SAME commit that changes
+# ``state_dict_digest``: test_digest_basis.py pins that function's output against a
+# golden vector, so a change which forgets this constant fails there.
+CURRENT_DIGEST_BASIS = DIGEST_BASIS_TENSORS
+
+# What a CONTRIBUTION's ``weights_sha256`` is — and it is NOT CURRENT_DIGEST_BASIS.
+# The cut-over above moved the COMMUNITY head digest only. A contribution's digest is
+# computed by ``sha256_file`` over the checkpoint the client uploaded, and it always
+# has been. Measured 2026-11-14 over runtime_cellpose.py with `git log -G`:
+#
+#   :586  sha = await asyncio.to_thread(pool.state_dict_digest, soup)   <- the soup
+#   :634  weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)  <- this
+#
+#   the soup line:         changed by d3040c4f ("digest the soup tensors, not the
+#                          file torch wrote") — the cut-over itself
+#   the contribution line: 6eec9581 (app 0.20.0) only, i.e. the commit that
+#                          INTRODUCED it. d3040c4f did not touch it; it reads
+#                          sha256_file at 6eec9581 and at d3040c4f alike.
+#
+# So this surface has exactly one basis over its whole history and no cut-over
+# instant applies to it. Two consequences, both load-bearing:
+#   * stamping CURRENT_DIGEST_BASIS here would assert "sha256 over keys, shapes,
+#     dtypes and raw weight bytes" over a number produced by hashing a file. Worse
+#     than the absence it replaces: digest_basis honours an explicit basis above
+#     every other signal, so a wrong explicit value is BELIEVED, while an absent one
+#     at least resolves to a refusal.
+#   * an absent field on a contribution means the file basis as a PROOF, not as a
+#     dated inference — the code that could have written anything else never existed
+#     on this path. That is why contribution_digest_basis passes ``absent_basis``
+#     instead of date-reasoning: one unchanged code path must not answer two ways
+#     depending on when a deposit happened.
+# Lock-step rule, same as the constant above: change this in the SAME commit that
+# changes which digest function ``prepare_contribution`` calls. A grep for
+# ``sha256_file, ckpt`` in runtime_cellpose.py is the thing that must still match.
+CONTRIBUTION_DIGEST_BASIS = DIGEST_BASIS_FILE
+
+# 2026-10-26T08:43:26Z — commit d3040c4f8165, which introduced state_dict_digest.
+# Strictly BEFORE this instant the tensor-digest code did not exist anywhere, so a
+# record written then carries a file digest with certainty. At or after it nothing
+# follows: a pool can be served by a worker still running an older app build, so a
+# late timestamp is UNDETERMINED rather than evidence of the new meaning. The
+# asymmetry is deliberate — resolving the late side to the new meaning would be
+# exactly the silent default this exists to remove, one version later.
+# Read with `git show -s --format=%ct d3040c4f8165`, not by hand: a value derived by
+# re-parsing the date is a year out at a glance and still resolves every real stored
+# record to "undetermined", i.e. it looks like a working fix that attributes nothing.
+# test_digest_basis.py keeps an independent copy and pins the eight live records
+# against it, so a wrong constant here fails there rather than in production.
+TENSOR_DIGEST_SINCE = 1793004206.0
+TENSOR_DIGEST_SINCE_APP_VERSION = "0.27.12"
+
+# Published next to the digest. This is the text that stands between a contributor
+# and the conclusion that an intact community model is corrupt, so it says what the
+# number is, whether re-merging reproduces it, and what to do when it does not.
+DIGEST_BASIS_NOTES = {
+    DIGEST_BASIS_TENSORS: (
+        "sha256 over the checkpoint's keys, shapes, dtypes and raw weight bytes in "
+        "sorted key order. Reproducible by construction: re-merging the same members "
+        "in the same order yields this value again, so a mismatch is evidence about "
+        "the weights."
+    ),
+    DIGEST_BASIS_FILE: (
+        "sha256 over the .pt file torch.save wrote, which this app named "
+        "head-<random>.pt before version "
+        f"{TENSOR_DIGEST_SINCE_APP_VERSION}. torch's zip container embeds that random "
+        "stem in every record name, so the digest is a function of the filename: "
+        "re-merging the same members CANNOT reproduce it, and a mismatch against it "
+        "is not evidence about the weights. Compare the weights themselves, or "
+        "re-merge and compare against a digest recorded as "
+        f"'{DIGEST_BASIS_TENSORS}'."
+    ),
+    DIGEST_BASIS_UNDETERMINED: (
+        "this record does not say which digest the value is, and it was written late "
+        "enough that the timestamp cannot settle it either — the app may have been "
+        "running either build. Treat a mismatch against it as UNEXPLAINED, not as "
+        "evidence about the weights."
+    ),
+    DIGEST_BASIS_ABSENT: (
+        "no head digest on this record: this merge admitted nothing, so no community "
+        "checkpoint was published and there is no value to attribute."
+    ),
+}
+
+# Whether re-merging an identical member set reproduces the stored value. None is a
+# third state, not a false: "we do not know" must not render as "no".
+_DIGEST_REPRODUCIBLE = {
+    DIGEST_BASIS_TENSORS: True,
+    DIGEST_BASIS_FILE: False,
+    DIGEST_BASIS_UNDETERMINED: None,
+    DIGEST_BASIS_ABSENT: None,
+}
+
+
+def digest_basis(
+    record: Optional[Dict[str, Any]],
+    *,
+    digest_key: str = "global_sha256",
+    basis_key: Optional[str] = None,
+    created_at_key: str = "created_at",
+    absent_basis: Optional[str] = None,
+) -> str:
+    """Which of the two digests ``record[digest_key]`` is, from the record alone.
+
+    Resolution order, each step refusing rather than guessing:
+
+    1. no digest stored                       -> ``DIGEST_BASIS_ABSENT``
+    2. an explicit basis field this build
+       recognises                             -> that basis
+    3. an explicit basis field it does NOT
+       recognise (written by a newer app)     -> ``DIGEST_BASIS_UNDETERMINED``
+    4. no basis field and ``absent_basis``
+       given by the caller                    -> ``absent_basis``
+    5. no basis field, ``created_at`` finite
+       and strictly before TENSOR_DIGEST_SINCE-> ``DIGEST_BASIS_FILE``
+    6. anything else                          -> ``DIGEST_BASIS_UNDETERMINED``
+
+    Step 5 is one-directional by construction. A timestamp before the cutoff proves
+    the file meaning because the tensor-digest code did not yet exist; a timestamp
+    after it proves nothing, because deployment lags the commit. There is no input
+    for which this returns ``DIGEST_BASIS_TENSORS`` on timestamp evidence alone.
+
+    ``absent_basis`` is for a surface whose digest function NEVER changed, where the
+    date is not evidence of anything because there was never a second meaning to
+    choose between — see ``CONTRIBUTION_DIGEST_BASIS``. It is deliberately not the
+    default: passing it asserts that a code path's whole history was checked, which
+    is true of the contribution path and false of the community head. It cannot
+    override a basis the record states (steps 2 and 3 come first), so it adds no way
+    for a caller to contradict stored data; it only says what an absence means.
+    An unrecognised value raises rather than resolving to "undetermined" — that
+    would be a typo'd constant reading exactly like the honest refusal this module
+    exists to give.
+    """
+    if absent_basis is not None and absent_basis not in (
+        DIGEST_BASIS_TENSORS,
+        DIGEST_BASIS_FILE,
+    ):
+        raise ValueError(
+            f"absent_basis={absent_basis!r} is not one of {DIGEST_BASIS_TENSORS!r} "
+            f"or {DIGEST_BASIS_FILE!r}. It states what a MISSING field means, so an "
+            f"unrecognised value would silently become 'undetermined' and read as "
+            f"this function working."
+        )
+    if not isinstance(record, dict):
+        return DIGEST_BASIS_UNDETERMINED
+    if basis_key is None:
+        basis_key = f"{digest_key}_basis"
+    if not record.get(digest_key):
+        return DIGEST_BASIS_ABSENT
+    stated = record.get(basis_key)
+    if stated in (DIGEST_BASIS_TENSORS, DIGEST_BASIS_FILE):
+        return stated
+    if stated is not None:
+        return DIGEST_BASIS_UNDETERMINED
+    if absent_basis is not None:
+        return absent_basis
+    try:
+        written_at = float(record.get(created_at_key))
+    except (TypeError, ValueError):
+        return DIGEST_BASIS_UNDETERMINED
+    if not math.isfinite(written_at):
+        return DIGEST_BASIS_UNDETERMINED
+    if written_at < TENSOR_DIGEST_SINCE:
+        return DIGEST_BASIS_FILE
+    return DIGEST_BASIS_UNDETERMINED
+
+
+def digest_provenance(
+    record: Optional[Dict[str, Any]], **kwargs: Any
+) -> Dict[str, Any]:
+    """``digest_basis`` plus the two things a reader needs to act on it: whether a
+    re-merge reproduces the value, and the sentence that explains a mismatch.
+
+    Published alongside every digest the app hands out, so the explanation travels
+    with the number instead of living in a document the reader has to already know
+    about. Takes the same keyword arguments as ``digest_basis``.
+    """
+    basis = digest_basis(record, **kwargs)
+    return {
+        "basis": basis,
+        "reproducible_by_re_merge": _DIGEST_REPRODUCIBLE[basis],
+        "note": DIGEST_BASIS_NOTES[basis],
+    }
+
+
+def contribution_digest_basis(record: Optional[Dict[str, Any]]) -> str:
+    """Which of the two digests a CONTRIBUTION's ``weights_sha256`` is.
+
+    Always the FILE basis unless the record itself says otherwise, because
+    ``prepare_contribution`` has computed this value with ``sha256_file`` on every
+    build that ever wrote one — the history is quoted at
+    ``CONTRIBUTION_DIGEST_BASIS``. So an absent field is a proof here, and no
+    timestamp is consulted: ``uploaded_at`` is NOT passed, and that omission is the
+    point rather than an oversight. Dating a record whose code path never changed
+    would make one deposit resolve "file" and another "undetermined" on nothing but
+    when it arrived.
+
+    Named for this surface rather than spelled out at each call site because a
+    contribution is the one record shape whose digest key differs from the default,
+    so a plain ``digest_basis(record)`` is wrong in a way that does not raise: it
+    looks up ``global_sha256``, finds nothing, and answers "no_digest" — "this
+    record stores no digest", said of a record that stores one. The half-right call
+    (``digest_key`` corrected, ``absent_basis`` forgotten) answers "undetermined"
+    for a record whose code path PROVES the file meaning, and that one is the
+    dangerous one: it is indistinguishable from the honest refusal this module
+    exists to give, so it reads as the fix working. Both are pinned in
+    test_digest_basis.py, which is what keeps this function from being an alias.
+    """
+    return digest_basis(
+        record,
+        digest_key="weights_sha256",
+        absent_basis=CONTRIBUTION_DIGEST_BASIS,
+    )
+
+
+# ``DIGEST_BASIS_NOTES`` above is written about the COMMUNITY head, and three of its
+# sentences are false of a contribution: the file note says the app chose the filename
+# and offers "re-merge and compare" as the remedy, which is not an operation that
+# produces a contribution digest at all; the absent note says "this merge admitted
+# nothing", said of a record that is not a merge; and the undetermined note blames the
+# timestamp, which this surface never consults. A wrong explanation travelling with
+# the number is worse than the bare number #0523 set out to fix, so the contribution
+# surface carries its own notes rather than borrowing the head's.
+#
+# Every note here says what the value is a digest OF, and the file note names the one
+# operation a contributor can actually perform: re-hash the file you uploaded.
+CONTRIBUTION_DIGEST_BASIS_NOTES = {
+    DIGEST_BASIS_FILE: (
+        "sha256 over the checkpoint file you uploaded, exactly as it arrived — the "
+        "value sha256_file computed at deposit. Reproducible by re-hashing that same "
+        "file, so a mismatch is evidence that the bytes the pool holds are not the "
+        "bytes that were sent. It is not a digest of merged weights: re-merging is "
+        "not an operation that reproduces it, in either direction."
+    ),
+    DIGEST_BASIS_TENSORS: (
+        "this record states that its value is a digest over the checkpoint's keys, "
+        "shapes, dtypes and raw weight bytes rather than over the uploaded file. No "
+        "build of this app has ever computed a contribution digest that way, so "
+        "re-hashing the uploaded file will NOT reproduce it and whatever wrote the "
+        "stamp is the only thing that knows what it covers."
+    ),
+    DIGEST_BASIS_UNDETERMINED: (
+        "this record states a basis this build does not recognise, so what the value "
+        "covers is unknown — most likely a newer app wrote it. The deposit date is "
+        "not consulted here and could not settle it: the contribution digest function "
+        "never changed, so an ABSENT basis on this surface is the file basis with "
+        "certainty and only a stated-but-unrecognised one is undetermined. Treat a "
+        "mismatch against it as UNEXPLAINED, not as evidence about the weights."
+    ),
+    DIGEST_BASIS_ABSENT: (
+        "this contribution record carries no digest, so there is no value to "
+        "attribute and nothing to compare against. The pool holds the contribution; "
+        "it says nothing either way about the checkpoint's contents."
+    ),
+}
+
+
+def contribution_digest_provenance(record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``contribution_digest_basis`` plus the two things a reader needs to act on it.
+
+    Exists so the half-right call has no site left to recur at. ``digest_provenance``
+    forwards ``**kwargs`` to ``digest_basis``, so publishing contribution provenance
+    through it requires remembering BOTH ``digest_key="weights_sha256"`` and
+    ``absent_basis=CONTRIBUTION_DIGEST_BASIS`` at every call site; forgetting the
+    second answers "undetermined" for a record whose code path proves the file
+    meaning, which reads exactly like this module's honest refusal. #0523 shipped that
+    exact call to the wire and a reviewer caught it. Call this instead.
+
+    ``reproducible_by_re_merge`` is ``None`` for every basis here, and that is not the
+    "we do not know" of ``_DIGEST_REPRODUCIBLE``: a contribution digest covers one
+    uploaded file, so re-merging is not an operation that bears on it and the question
+    does not apply. ``False`` would answer it, and the field is a tri-state bool with
+    no fourth value to mean "not applicable" — so the note carries that sentence, and
+    says what a contributor CAN do instead. The key is kept rather than dropped so a
+    client can join this map and ``soups`` without branching on which it is reading.
+    """
+    basis = contribution_digest_basis(record)
+    return {
+        "basis": basis,
+        "reproducible_by_re_merge": None,
+        "note": CONTRIBUTION_DIGEST_BASIS_NOTES[basis],
+    }
+
+
+CONTRIBUTION_ID_COLLISION_NOTE = (
+    "the pool holds more than one contribution under this id and they do not agree on "
+    "what their digests cover, so nothing here can say which record the value beside it "
+    "belongs to. Contribution ids are unique by construction — prepare_contribution "
+    "requires one and append_contribution writes it — so reaching this is a caller bug "
+    "upstream of the wire rather than anything about the deposit. Re-hash the file you "
+    "uploaded and ask the pool which contribution_id it landed under."
+)
+
+
+def colliding_contribution_provenance() -> Dict[str, Any]:
+    """The entry published at a contribution_id that more than one record claims.
+
+    A map keyed by contribution_id has one slot per id, so when two records claim one id
+    the map cannot carry both answers. The alternative to this is that whichever record
+    renders last silently overwrites the others — measured on this surface before the
+    guard existed: a pool holding a correctly stamped contribution and a second record
+    under the same id published the stamped one as ``undetermined``, which is exactly the
+    wrong attribution #0509 exists to prevent, arrived at by accident of ordering.
+
+    Published only when the colliding records actually DISAGREE. Two records under one id
+    that resolve to the same basis are attributed with that basis, because the answer the
+    map gives is then right for both and downgrading it would lose a true statement.
+    """
+    return {
+        "basis": DIGEST_BASIS_UNDETERMINED,
+        "reproducible_by_re_merge": None,
+        "note": CONTRIBUTION_ID_COLLISION_NOTE,
+    }
+
+
 # Entries that live in a cpsam state_dict but are data statistics rather than
-# learned weights: cellpose_model.py:78-79 registers both as
-# nn.Parameter(requires_grad=False), so they are float32 scalars with matching
-# shapes and pass every dtype/shape filter. requires_grad is not serialised, so
-# a state_dict carries no way to tell them apart — the name is the only handle,
-# and it must come from the key (storage keys inside a .pt are bare positional
-# integers and position is not stable across writers).
+# learned weights. cellpose's own CPSAM/CPDINO do not declare these at all —
+# cellpose_model.py registers them, as nn.Parameter(requires_grad=False), so they
+# are float32 scalars with matching shapes and pass every dtype/shape filter.
+# requires_grad is not serialised, so a state_dict carries no way to tell them
+# apart — the name is the only handle, and it must come from the key (storage keys
+# inside a .pt are bare positional integers and position is not stable across
+# writers).
+#
+# ⚠ THIS IS THE SINGLE DECLARATION AND cellpose_model.py REGISTERS BY ITERATING IT
+# (#0070 requirement 1: classify from the model definition, not from a second
+# hardcoded list of names). It lives here, in the torch-free module, because
+# pool.py's import must stay stdlib-only — test_pool.py's contract — so the
+# dependency runs model -> pool and never the other way. Adding a non-learned
+# Parameter therefore means adding it HERE, which is what makes it excluded from
+# the soup in the same edit that registers it; test_soup_math.py asserts the two
+# agree, so the pair cannot drift.
 NON_WEIGHT_PARAMS = frozenset({"diam_labels", "diam_mean"})
+
+
+# #0070 requirement 3+4: the basis strings a community manifest uses to say WHERE its
+# non-learned values came from. The ruling is explicit that reporting the float alone is
+# not enough — "the manifest must record that the soup's diam_labels was INHERITED and
+# name its source, or the original defect reappears in the manifest instead of the state
+# dict". So the value never travels without this label beside it.
+NON_LEARNED_INHERITED = "inherited_from_base_checkpoint"
+NON_LEARNED_NOTE = (
+    "A federated checkpoint has no single learned object diameter. These values are the "
+    "base checkpoint's, carried through unchanged: the soup averaged its learned weights "
+    "and did not learn a diameter, so an average over the contributors' diameters would "
+    "describe no contributor. The contributors' own measured diameters are recorded "
+    "per member under 'member_non_learned'."
+)
+
+
+def inherited_non_learned(
+    values: Dict[str, float], *, source: str
+) -> Dict[str, Any]:
+    """The manifest's provenance block for the non-learned values the soup inherited.
+
+    ``source`` names the base the values came from (e.g. the cellpose base model
+    identifier), because "inherited" without a named source is the same unfalsifiable
+    claim the row was filed about — a reader could not tell an inherited 30.0 from a
+    coincidental one. Built here rather than inline at the call site so the wording and
+    the basis constant cannot drift apart across writers.
+    """
+    if not source:
+        raise ValueError(
+            "inherited_non_learned requires a named source: an 'inherited' label with "
+            "no source is not traceable, which is the defect #0070 was filed about"
+        )
+    return {
+        "basis": NON_LEARNED_INHERITED,
+        "source": source,
+        "values": {key: float(value) for key, value in sorted(values.items())},
+        "note": NON_LEARNED_NOTE,
+    }
+
+
+def key_set_digest(keys: Iterable[str]) -> str:
+    """sha256 over a state_dict's sorted key list — the architecture's INVENTORY.
+
+    #0070 option (b), as amended by the ruling: two floats in ``pool_index.json`` record
+    the base's non-learned VALUES but carry no inventory, and without one the only
+    classification left is member-vs-member agreement, which cannot detect a
+    newly-added non-learned Parameter because every member has it — the exact
+    recurrence requirement 2 exists to catch. So the pool commits to the base's key set
+    as a digest, and the merge digests the sorted member keys and requires equality.
+
+    Keys only, deliberately: no shapes and no dtypes, because
+    ``architecture_signature`` already covers those and ``assert_compatible`` enforces
+    it. This answers the narrower question "is any key present that the base did not
+    have, or missing one it did", which is the one the carry-through needs.
+    """
+    payload = json.dumps(sorted(keys), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+BASE_COMMITMENT_FIELDS = ("non_learned", "key_set_sha256", "key_count", "source")
+
+
+def base_commitment(
+    state_dict: Dict[str, Any], *, source: str
+) -> Dict[str, Any]:
+    """The pool's record of the base it is anchored to — written ONCE, at pool creation.
+
+    Holds the base's non-learned values (requirement 3's operative value) and a
+    commitment to its key set (requirement 2's inventory), so the merge needs neither a
+    model load nor a base checkpoint download. ``source`` names the base, because an
+    inherited value with no named origin is not traceable.
+
+    A single dict rather than three arguments so the three cannot be recorded
+    inconsistently: a key count that disagrees with the digest it was taken from would
+    make the merge's equality check unfalsifiable.
+    """
+    if not state_dict:
+        raise ValueError("base_commitment requires a non-empty state_dict")
+    if not source:
+        raise ValueError("base_commitment requires a named source")
+    return {
+        "non_learned": {
+            key: float(value.detach().reshape(-1)[0])
+            for key, value in sorted(state_dict.items())
+            if is_non_weight_param(key)
+        },
+        "key_set_sha256": key_set_digest(state_dict.keys()),
+        "key_count": len(state_dict),
+        # The gate is the digest and the count, per the ruling. This list is carried so a
+        # REFUSAL can name the offending key: a digest proves inequality and says nothing
+        # about which key caused it, and the first version of this change regressed the
+        # old message from "carries key ['net.some_future_statistic']" to "has 5 keys,
+        # expected 4", which an operator cannot act on. NOT part of
+        # assert_base_commitment's required set, so an older commitment without it still
+        # merges and only loses the key name.
+        "key_set": sorted(state_dict.keys()),
+        "source": source,
+    }
+
+
+def assert_base_commitment(commitment: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Validate a pool's base record, or RAISE. There is no fallback, by ruling.
+
+    A pool that records no base cannot merge: falling back to loading a stock base would
+    make the field permanently optional, and a backfilled-on-the-fly base is a
+    provenance claim about a checkpoint nobody can re-derive. The census on #0533 counts
+    how many existing pools this blocks (measured 2026-11-14: all of them).
+    """
+    if not commitment:
+        raise ValueError(
+            "this pool records no base commitment, so the merge cannot classify its "
+            "keys or carry a non-learned value through — see #0533. There is no "
+            "fallback to a stock base load, deliberately: that would make the field "
+            "permanently optional"
+        )
+    missing = [f for f in BASE_COMMITMENT_FIELDS if commitment.get(f) is None]
+    if missing:
+        raise ValueError(
+            "this pool's base commitment is incomplete, missing %s" % (missing,)
+        )
+    if not isinstance(commitment["key_count"], int) or commitment["key_count"] <= 0:
+        raise ValueError(
+            "base commitment key_count must be a positive int, not %r"
+            % (commitment["key_count"],)
+        )
+    return commitment
+
+
+NON_LEARNED_UNREPORTED = "unreported_by_runtime"
+
+
+def unreported_non_learned(*, reason: str) -> Dict[str, Any]:
+    """Provenance block for a merge whose runtime did not report its non-learned values.
+
+    ``entry`` and the Cellpose runtime are separate Ray deployments and can sit at
+    different app versions during a rolling update, so a runtime that predates #0070
+    returns a ``materialize_soup`` payload without them. That case gets a block SAYING
+    SO rather than a bare null, because a reader must be able to tell "this runtime did
+    not supply them" from "this soup had no contributor diameters" — collapsing the two
+    is the same false silence the row was filed about. The published checkpoint is still
+    correct: the carry-through happens inside ``uniform_soup``, so the tensor holds the
+    base's value whether or not the runtime reported it; only the RECORD is poorer.
+    """
+    return {
+        "basis": NON_LEARNED_UNREPORTED,
+        "source": None,
+        "values": None,
+        "note": (
+            "This merge's runtime did not report the checkpoint's non-learned values, so "
+            "the manifest cannot name them. Reason: " + reason + ". The published "
+            "weights are unaffected — uniform_soup carries the base's value through "
+            "regardless — but the diameter cannot be read from this record."
+        ),
+    }
 
 
 def is_non_weight_param(key: str) -> bool:
@@ -323,13 +1004,23 @@ def score_key(split_id: str, member_paths: Sequence[str]) -> str:
 
 
 def new_merge_journal(gate_split, witness_split, diam_mean: float) -> Dict[str, Any]:
-    """An empty resume journal stamped with everything a recorded score depends on."""
+    """An empty resume journal stamped with everything a recorded score depends on.
+
+    ``per_image_scores`` is keyed identically to ``scores`` and holds the breakdown
+    behind each scalar. It is not an optimisation: ``score_key`` hashes the split id
+    and the sorted member paths and nothing about what was ASKED for, so a journal
+    that banked only the scalar would serve a hit for a pass whose vector it does not
+    have — and the published record would then be missing its breakdown on exactly
+    the merges that were resumed, where the absence is indistinguishable from the
+    vector never having been measured.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "gate_split": split_identity(gate_split),
         "witness_split": split_identity(witness_split),
         "diam_mean": float(diam_mean),
         "scores": {},
+        "per_image_scores": {},
     }
 
 
@@ -353,19 +1044,56 @@ def usable_merge_journal(
     if any(journal.get(field) != fresh[field]
            for field in ("schema_version", "gate_split", "witness_split", "diam_mean")):
         return fresh
+    # Prune to the entries that carry BOTH halves. An entry can be half-present in
+    # two ways: a journal written before this app banked vectors at all (the stamp
+    # fields do not move, because the breakdown is additive and the recorded SCALAR
+    # is still true), or a journal a mixed-version replica pair wrote into. Either
+    # way a half-entry would be served as a hit and publish a scalar with no
+    # breakdown. Dropping those entries costs their scoring passes; discarding the
+    # whole journal would cost every pass, and keeping them would publish an
+    # uninterpretable record — so this prunes rather than doing either.
+    vectors = journal.get("per_image_scores")
+    if not isinstance(vectors, dict):
+        vectors = {}
+    paired = {k: v for k, v in journal["scores"].items() if isinstance(vectors.get(k), list)}
+    journal["scores"] = paired
+    journal["per_image_scores"] = {k: vectors[k] for k in paired}
     return journal
 
 
-def record_score(journal: Dict[str, Any], key: str, value: float, cap: int = 512) -> None:
-    """Add a score, evicting oldest-first so the journal cannot grow without bound.
+def record_score(
+    journal: Dict[str, Any], key: str, value: float, *,
+    per_image: Sequence[float], cap: int = 512,
+) -> None:
+    """Add a score and the per-image vector it is the mean of, evicting oldest-first
+    so the journal cannot grow without bound.
 
     One merge records at most ``2 * max_batch + 3`` scores (67 at the default
     max_batch of 32), so the cap holds several merges' worth — enough for deferred
     candidates, which aggregate() re-scores on the next merge, to come back free.
+
+    ``per_image`` is keyword-only and required rather than defaulted to ``None``: a
+    caller that forgets it would otherwise bank a scalar whose breakdown is gone for
+    good, and the journal is precisely the place where re-measuring is not an option.
+    The two maps are written and evicted in lock-step, which is what lets
+    ``usable_merge_journal`` treat a half-entry as evidence of a foreign writer.
     """
+    vector = [round(float(v), 6) for v in per_image]
+    if not vector:
+        raise ValueError("record_score requires the per-image vector behind the score")
+    mean = mean_of_per_image(vector)
+    if abs(float(value) - mean) > PER_IMAGE_AGGREGATE_TOLERANCE:
+        raise ValueError(
+            f"record_score was given {float(value)!r} and a vector whose mean is "
+            f"{mean!r} over {len(vector)} image(s) — they are not the same scoring "
+            f"pass, and banking them together would make the journal lie on resume"
+        )
     journal["scores"][key] = round(float(value), 6)
+    journal.setdefault("per_image_scores", {})[key] = vector
     while len(journal["scores"]) > cap:
-        del journal["scores"][next(iter(journal["scores"]))]
+        oldest = next(iter(journal["scores"]))
+        del journal["scores"][oldest]
+        journal["per_image_scores"].pop(oldest, None)
 
 
 def evict_lru_to_cap(
@@ -400,8 +1128,14 @@ def evict_lru_to_cap(
     return deleted
 
 
-def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, Any]:
-    """Key-wise uniform mean of full weight tensors — the AXIS-1 combine rule.
+def uniform_soup(
+    loaders: Sequence[Callable[[], Dict[str, Any]]],
+    *,
+    base: Optional[Dict[str, Any]],
+    member_non_learned: Optional[List[Dict[str, float]]] = None,
+) -> Dict[str, Any]:
+    """Key-wise uniform mean of LEARNED tensors, with non-learned values taken from
+    the base checkpoint — the AXIS-1 combine rule.
 
     Takes one zero-arg loader per member rather than materialised state dicts, and
     accumulates member-by-member, so peak memory is the running sum plus a single
@@ -409,11 +1143,41 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
     pins every member in RAM at once: at 16 cpsam members that measured ~27 GB
     against the runtime's 12 GiB reservation and the replica was OOM-killed.
 
-    Still averages ``NON_WEIGHT_PARAMS``, which is wrong and deliberately left:
-    what a community checkpoint should carry for an object diameter instead of a
-    mean is a product decision, and "stop averaging it" has no defined output
-    until that is answered (#0070 requirement 3). Only the contributor-facing
-    ``state_dict_l2_from_base`` is fixed so far.
+    ``base`` is a loader for the checkpoint the pool started from, and it is
+    REQUIRED rather than defaulted, which is the whole point of #0070 requirement 2:
+    a caller that cannot say what the base is must fail, not silently average. It is
+    read once, reduced to its key set plus its non-learned values, and released
+    before the accumulation loop allocates, so it costs one transient member and
+    does not raise the steady-state peak.
+
+    #0070 requirement 3, RULED 2026-11-14: a non-learned key (``NON_WEIGHT_PARAMS``,
+    e.g. ``diam_labels``) is carried through from ``base`` UNCHANGED and is never
+    averaged. Averaging them produced 57.7405 for a four-member pool whose real
+    per-site diameters were 29.711 / 54.986 / 28.912 / 117.353 — a field asserting a
+    measurement nobody made, wrong by about a factor of two for three of the four.
+    The base value is the only traceable answer: it is the prior the soup inherited,
+    and the soup did not learn a diameter. The four real per-site numbers are not
+    discarded; they belong in the community manifest, because they are statistics
+    about contributors' DATA rather than parameters of the model.
+
+    ``member_non_learned``, when a list is passed, collects one dict per member in
+    LOADER ORDER — the caller zips it against the member specs it supplied, because
+    this function is given loaders and never learns a contribution id. That ordering is
+    the whole contract: an unordered map would lose which diameter belonged to whom,
+    which is the half of #0070 requirement 4 that makes the numbers worth keeping.
+    Collected as plain floats off the tensor while the member is already resident, so
+    it adds no second pass and retains nothing after ``del sd``.
+
+    #0070 requirement 2: classification is TOTAL and fail-closed. Every member key
+    must appear in ``base``, whose key set IS the architecture's own inventory, and a
+    key in neither the base nor the declared non-learned set raises rather than being
+    averaged. That is the property that stops this recurring: a future non-learned
+    ``nn.Parameter`` added to the architecture is a key the base of an existing pool
+    does not have, so it breaks the merge loudly instead of being quietly souped into
+    every community checkpoint. A name blacklist could not do this — the reason the
+    original defect survived review is that the docstring asked "are there persistent
+    buffers to reset?", correctly got zero, and read clean, while the thing needing
+    exclusion was a non-learned *Parameter*.
 
     Every member must share one parameter layout (``assert_compatible`` guards this
     at contribute + aggregate time), so the mean is well-defined per key. cpsam is
@@ -426,6 +1190,16 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
     n = len(loaders)
     if not n:
         raise ValueError("uniform_soup requires at least one state_dict")
+
+    # The pool's RECORDED base (option (b), ruled 2026-11-14), not a loaded checkpoint:
+    # the merge reads two floats and a key-set commitment out of pool_index.json and
+    # never builds a model. Raises when absent — there is no fallback, by ruling.
+    commitment = assert_base_commitment(base)
+    base_non_learned = commitment["non_learned"]
+    expected_keys_sha = commitment["key_set_sha256"]
+    expected_key_count = int(commitment["key_count"])
+    carried: Dict[str, Any] = {}
+
     acc: Dict[str, Any] = {}
     dtypes: Dict[str, Any] = {}
     for index, load in enumerate(loaders):
@@ -434,15 +1208,79 @@ def uniform_soup(loaders: Sequence[Callable[[], Dict[str, Any]]]) -> Dict[str, A
             raise ValueError(
                 f"uniform_soup member {index} loaded an empty state_dict"
             )
+        # Requirement 2, fail-closed, against the pool's committed inventory. Both the
+        # digest AND the count are checked: the digest alone would be enough
+        # cryptographically, but the count makes the failure message actionable, and a
+        # count that disagreed with its own digest would mean the commitment itself was
+        # written inconsistently rather than the member being wrong.
+        got_sha = key_set_digest(sd.keys())
+        if got_sha != expected_keys_sha or len(sd) != expected_key_count:
+            # Name the keys when the commitment recorded its key list; fall back to the
+            # counts and digests when it did not.
+            detail = (
+                f"member has {len(sd)} keys, base commitment declares "
+                f"{expected_key_count} (member digest {got_sha[:12]}, base "
+                f"{expected_keys_sha[:12]})"
+            )
+            base_list = commitment.get("key_set")
+            if base_list:
+                base_keys = frozenset(base_list)
+                extra = sorted(frozenset(sd) - base_keys)
+                missing = sorted(base_keys - frozenset(sd))
+                if extra:
+                    detail = (
+                        f"member {index} carries {len(extra)} key(s) absent from the "
+                        f"base checkpoint, so they can be classified neither learned "
+                        f"nor non-learned and MUST NOT be averaged: {extra[:8]}"
+                    )
+                elif missing:
+                    detail = (
+                        f"member {index} is missing {len(missing)} key(s) the base "
+                        f"checkpoint declares: {missing[:8]}"
+                    )
+            raise ValueError(
+                f"uniform_soup member {index} key set does not match this pool's base "
+                f"commitment: {detail}"
+            )
         if not index:
-            dtypes = {key: value.dtype for key, value in sd.items()}
+            # Carry the RECORDED non-learned values through, built at each key's own
+            # dtype and shape taken from the member, so the published checkpoint
+            # round-trips into cellpose unchanged. A value the commitment does not
+            # carry for a key the members DO have is a refusal, not a default.
+            for key in sorted(sd):
+                if not is_non_weight_param(key):
+                    continue
+                if key not in base_non_learned:
+                    raise ValueError(
+                        f"this pool's base commitment carries no value for "
+                        f"non-learned key {key!r}, so the merge cannot say what the "
+                        f"published checkpoint should hold for it"
+                    )
+                carried[key] = torch.full_like(
+                    sd[key], float(base_non_learned[key]))
+            # Built after `carried` is filled: the accumulator must exclude exactly the
+            # keys that are carried, and `key not in carried` only means that once the
+            # loop above has run.
+            dtypes = {key: value.dtype for key, value in sd.items()
+                      if key not in carried}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
-                   for key, value in sd.items()}
+                   for key, value in sd.items() if key not in carried}
+        # #0070 requirement 4: the contributors' OWN diameters are not discarded, they
+        # are recorded in the community manifest. Collected here, in loader order, so
+        # the caller gets them without a second pass over every member's weights — the
+        # merge already holds this state dict and will not hold it again. Scalars only,
+        # converted off the tensor, so nothing is retained once `sd` is released.
+        if member_non_learned is not None:
+            member_non_learned.append(
+                {key: float(sd[key].detach().reshape(-1)[0])
+                 for key in sorted(sd) if is_non_weight_param(key)}
+            )
         for key in acc:
             acc[key] += sd[key].detach().float()
         del sd
     for key in acc:
         acc[key] = (acc[key] / n).to(dtypes[key])
+    acc.update(carried)
     return acc
 
 
@@ -537,13 +1375,53 @@ def instance_f1(pred_labels: "np.ndarray", gt_labels: "np.ndarray", iou_thresh: 
     }
 
 
+def per_image_instance_f1(
+    pred_maps: List["np.ndarray"], gt_maps: List["np.ndarray"], iou_thresh: float = 0.5,
+) -> List[float]:
+    """One instance F1 per image of a split, in the order supplied — the breakdown
+    the gate's scalar is the mean of.
+
+    This list already existed inside ``mean_instance_f1`` and was discarded there, so
+    nothing new is measured here; it is the same numbers, kept. The gate admits a
+    contribution on a single scalar, and a scalar with no breakdown cannot be audited
+    against any admission rule: a soup that gained 0.02 by improving every image and
+    one that gained 0.02 by trading a collapse on two images against the rest are
+    indistinguishable in the record.
+
+    The length check is not defensive tidying. ``zip`` stops at the shorter argument,
+    so a caller passing mismatched lists would previously get a mean over a silently
+    truncated prefix; now that the vector is PUBLISHED, its length is read as the
+    size of the split and the truncation would misstate what was scored.
+    """
+    if not gt_maps:
+        raise ValueError("per_image_instance_f1 requires at least one image")
+    if len(pred_maps) != len(gt_maps):
+        raise ValueError(
+            f"per_image_instance_f1 got {len(pred_maps)} prediction map(s) for "
+            f"{len(gt_maps)} ground-truth map(s); zip would score only the shorter "
+            f"prefix and report it as the whole split"
+        )
+    return [instance_f1(p, g, iou_thresh=iou_thresh)["f1"] for p, g in zip(pred_maps, gt_maps)]
+
+
+def mean_of_per_image(per_image: Sequence[float]) -> float:
+    """The split's scalar from its per-image vector. One definition, used by
+    ``mean_instance_f1`` and by anything that already holds the vector, so the
+    published aggregate and the published breakdown cannot drift apart by being
+    reduced two different ways."""
+    if not per_image:
+        raise ValueError("mean_of_per_image requires at least one score")
+    return float(sum(per_image) / len(per_image))
+
+
 def mean_instance_f1(pred_maps: List["np.ndarray"], gt_maps: List["np.ndarray"], iou_thresh: float = 0.5) -> float:
     """Mean of per-image instance F1 over a split — the scalar the gate compares and
-    the witness curve plots. Empty split is undefined, so raise rather than invent 0."""
-    if not gt_maps:
-        raise ValueError("mean_instance_f1 requires at least one image")
-    scores = [instance_f1(p, g, iou_thresh=iou_thresh)["f1"] for p, g in zip(pred_maps, gt_maps)]
-    return float(sum(scores) / len(scores))
+    the witness curve plots. Empty split is undefined, so raise rather than invent 0.
+
+    Defined as the mean of ``per_image_instance_f1``'s output rather than computing
+    its own sum, so a record publishing both is publishing one measurement reduced
+    once, not two measurements that agree today."""
+    return mean_of_per_image(per_image_instance_f1(pred_maps, gt_maps, iou_thresh=iou_thresh))
 
 
 def sha256_file(path: str, chunk: int = 1 << 20) -> str:
@@ -570,6 +1448,7 @@ def build_contribution_metadata(
     solo_val_metric: Optional[float],
     weights_sha256: str,
     uploaded_at: float,
+    l2_from_base_basis: Optional[str] = None,
 ) -> Dict[str, Any]:
     """A contribution's metadata.json. ``samples_seen`` and ``l2_from_base`` are
     recorded on every contribution but only become load-bearing under specific
@@ -580,7 +1459,15 @@ def build_contribution_metadata(
     absent when unknown cannot be told apart from one written before versions
     were stamped at all, which is the ambiguity it exists to remove.
     ``schema_version`` does not cover it — 0.27.6 moved every ``l2_from_base``
-    value without changing the record's shape."""
+    value without changing the record's shape.
+
+    ``weights_sha256_basis`` says what ``weights_sha256`` is a digest OF, from
+    ``CONTRIBUTION_DIGEST_BASIS``, so the number is reproducible by whoever reads
+    this file. Stamped here as well as on the index entry on purpose: both records
+    carry the same digest, and stamping only one would make the absence on the other
+    newly ambiguous — a reader would have to know which writer ran to know whether
+    "no field" means "old record" or "this writer does not stamp". Additive, so
+    ``SCHEMA_VERSION`` is unchanged: no existing field moves or changes meaning."""
     return {
         "schema_version": SCHEMA_VERSION,
         "contribution_id": contribution_id,
@@ -596,14 +1483,22 @@ def build_contribution_metadata(
         "learning_rate": training_params.get("learning_rate"),
         "diam_mean": training_params.get("diam_mean"),
         "l2_from_base": l2_from_base,
+        # #0122. Written UNCONDITIONALLY, null included, for the same reason
+        # ``app_version`` is: a label that is absent when unknown cannot be told
+        # apart from one written before labels existed at all. A reader resolves it
+        # with ``l2_basis``, which maps a null label beside a real distance to
+        # UNDETERMINED rather than guessing a base.
+        "l2_from_base_basis": l2_from_base_basis,
         "dataset_fingerprint": dataset_fingerprint,
         "solo_val_metric": solo_val_metric,
         "weights_sha256": weights_sha256,
+        "weights_sha256_basis": CONTRIBUTION_DIGEST_BASIS,
         "uploaded_at": uploaded_at,
     }
 
 
-def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
+def empty_index(model_type: str, architecture_signature: str,
+                base_commitment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """A fresh pool_index.json for a newly created pool artifact.
 
     ``baseline`` anchors the witness curve at stock cpsam (set on the first merge);
@@ -614,6 +1509,13 @@ def empty_index(model_type: str, architecture_signature: str) -> Dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "model_type": model_type,
         "architecture_signature": architecture_signature,
+        # #0070 option (b): the base this pool is anchored to, recorded ONCE here. The
+        # merge reads its two floats and its key-set commitment and never loads a model.
+        # Optional at CREATION and fatal at MERGE, by ruling: a pool that records none
+        # cannot merge, and there is deliberately no fallback to loading a stock base,
+        # which would make the field permanently optional. #0533 carries the census of
+        # how many existing pools this blocks.
+        "base_commitment": base_commitment,
         "current_community": None,
         "contributions": [],
         "decided_contribution_ids": [],
@@ -646,6 +1548,222 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sorted(pending, key=lambda c: c.get("uploaded_at", 0.0))
 
 
+# ---------------------------------------------------------------------------
+# #0139: a member whose provenance cannot be established is QUARANTINED, not
+# souped and not fatal.
+#
+# The two findings below are deliberately SEPARATE reason codes and must stay
+# separate. ``no_digest`` is a legacy-writer artifact: a record written before
+# ``weights_sha256`` was required carries none, and nothing can ever be done about
+# that record. ``digest_mismatch`` is the opposite — the digest IS recorded and the
+# bytes in the pool do not hash to it, which means the bytes on disk are not the
+# bytes that were deposited. One is expected and boring; the other is a possible
+# integrity incident that a human has to look at. A single code for both would
+# bury the second inside the first, which is exactly the "no digest" versus
+# "digest not checked" confusion this row was filed about.
+# ---------------------------------------------------------------------------
+QUARANTINE_NO_DIGEST = "no_digest"
+QUARANTINE_DIGEST_MISMATCH = "digest_mismatch"
+QUARANTINE_REASONS = (QUARANTINE_NO_DIGEST, QUARANTINE_DIGEST_MISMATCH)
+assert len(set(QUARANTINE_REASONS)) == len(QUARANTINE_REASONS), (
+    "the quarantine reasons must be distinct strings: a reader that cannot tell "
+    "a missing digest from a wrong one has lost the whole point of recording one."
+)
+
+
+def is_usable_digest(value: Any) -> bool:
+    """Whether ``value`` can be compared against a sha256 of some bytes at all.
+
+    A digest is usable iff it is 64 hex characters. Everything else — absent, None,
+    empty string, a truncated prefix, a non-string — is unusable and means the same
+    thing operationally: there is nothing here to check the bytes against.
+
+    Case-insensitive, because ``hexdigest()`` is lowercase but a digest that
+    travelled through a shell, a spreadsheet or another tool may not be, and
+    refusing an upper-case copy of the right digest would quarantine a member whose
+    provenance is in fact established.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdefABCDEF" for c in value)
+    )
+
+
+def quarantine_record(
+    *,
+    contribution_id: str,
+    weights_path: Optional[str],
+    reason: str,
+    expected_sha256: Any,
+    actual_sha256: Optional[str],
+) -> Dict[str, Any]:
+    """One quarantined member, as recorded in the community manifest and the merge.
+
+    ``reason`` is machine-readable and validated here rather than at the call site,
+    so a typo cannot reach a published manifest as a reason nothing can match on.
+    ``expected_sha256`` is stored verbatim — including ``None`` — because "what the
+    pool recorded" is the evidence, and normalising it to a string would erase the
+    difference between a record that carried nothing and one that carried junk.
+    """
+    if reason not in QUARANTINE_REASONS:
+        raise ValueError(
+            f"'{reason}' is not a quarantine reason; expected one of "
+            f"{list(QUARANTINE_REASONS)}. The reason is published in the community "
+            f"manifest and is what a reader filters on, so it cannot be free text."
+        )
+    return {
+        "contribution_id": contribution_id,
+        "weights_path": weights_path,
+        "reason": reason,
+        "expected_sha256": expected_sha256,
+        "actual_sha256": actual_sha256,
+    }
+
+
+def members_to_hash(records: Sequence[Dict[str, Any]]) -> List[str]:
+    """The ``weights_path``s whose bytes this merge must hash, de-duplicated.
+
+    A record with no usable digest is excluded: it is quarantined on the strength of
+    the index alone, and downloading a gigabyte to hash it would only produce a
+    number with nothing to compare against.
+    """
+    seen, out = set(), []
+    for r in records:
+        path = r.get("weights_path")
+        if not is_usable_digest(r.get("weights_sha256")) or path is None or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def digest_quarantine(
+    records: Sequence[Dict[str, Any]], actual_by_path: Mapping[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split contribution records into ``(admitted, quarantined)`` on provenance.
+
+    ``actual_by_path`` maps ``weights_path`` to the sha256 of the bytes that were
+    actually loaded for it on this merge — ``members_to_hash`` says which paths must
+    be in it.
+
+    RAISES rather than admitting a member whose bytes it was not shown. That is the
+    load-bearing line in this function: the failure this row exists to prevent is
+    souping bytes nothing checked, and a version of this that treated an unhashed
+    member as "nothing to compare, carry on" would restore that failure exactly
+    while every test below still passed. A missing entry is a caller bug, not a
+    property of the pool, so it is an exception and not a quarantine.
+    """
+    admitted: List[Dict[str, Any]] = []
+    quarantined: List[Dict[str, Any]] = []
+    for r in records:
+        cid = r.get("contribution_id")
+        path = r.get("weights_path")
+        recorded = r.get("weights_sha256")
+        if not is_usable_digest(recorded):
+            quarantined.append(quarantine_record(
+                contribution_id=cid, weights_path=path,
+                reason=QUARANTINE_NO_DIGEST, expected_sha256=recorded,
+                actual_sha256=actual_by_path.get(path) if path is not None else None,
+            ))
+            continue
+        if path not in actual_by_path:
+            raise ValueError(
+                f"contribution '{cid}' was about to be admitted without its bytes "
+                f"ever being hashed (weights_path '{path}' is absent from the "
+                f"verification map). Admitting it would be the unverified soup this "
+                f"check exists to prevent; hash it with members_to_hash() first."
+            )
+        actual = actual_by_path[path]
+        if not is_usable_digest(actual):
+            raise ValueError(
+                f"the verifier returned '{actual}' as the sha256 of contribution "
+                f"'{cid}' bytes, which is not a sha256. Refusing to decide anything "
+                f"about this member on it."
+            )
+        if actual.lower() != str(recorded).lower():
+            quarantined.append(quarantine_record(
+                contribution_id=cid, weights_path=path,
+                reason=QUARANTINE_DIGEST_MISMATCH, expected_sha256=recorded,
+                actual_sha256=actual,
+            ))
+            continue
+        admitted.append(r)
+    return admitted, quarantined
+
+
+def quarantine_counts(quarantined: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """``{reason: n}`` over every defined reason, zeros included.
+
+    Every reason is always present, so a reader testing ``counts["digest_mismatch"]``
+    gets 0 rather than a KeyError on the overwhelmingly common merge where nothing
+    was quarantined — and an absent key and a zero stop being the same read.
+    """
+    counts = {reason: 0 for reason in QUARANTINE_REASONS}
+    for q in quarantined:
+        counts[q["reason"]] = counts.get(q["reason"], 0) + 1
+    return counts
+
+
+def head_integrity_refusal(
+    *,
+    head_version: Optional[str],
+    head_member_ids: Sequence[str],
+    quarantined_ids: Collection[str],
+    floor: int,
+) -> Optional[str]:
+    """Reason to abandon the merge because the CURRENT head cannot be reconstituted.
+
+    A quarantined head member is not a thinner soup, it is a different one: every
+    number this merge would then report about "the current head" — its gate score,
+    the bar a candidate has to clear, the witness point carried forward — would
+    describe a soup that is not the checkpoint the pool is publishing. There is no
+    honest way to continue, so this fails the merge rather than quarantining its way
+    into a quieter wrong answer. Nothing is published and nothing is lost: the
+    members stay in the pool and the next merge sees the same state.
+
+    Returns None when there is no head at all — a first merge has no composition to
+    preserve.
+    """
+    if not head_member_ids:
+        return None
+    surviving = [cid for cid in head_member_ids if cid not in set(quarantined_ids)]
+    if len(surviving) >= floor:
+        return None
+    lost = [cid for cid in head_member_ids if cid in set(quarantined_ids)]
+    return (
+        f"the published head '{head_version}' has {len(head_member_ids)} member(s) "
+        f"and {len(lost)} of them cannot be verified ({', '.join(sorted(lost))}), "
+        f"leaving {len(surviving)} against a floor of {floor}. Refusing to merge: "
+        f"every score this merge would report for the head describes the soup of its "
+        f"members, and that soup can no longer be rebuilt. Nothing has been "
+        f"published and no contribution has been removed from the pool."
+    )
+
+
+def publish_floor_refusal(
+    *, member_ids: Sequence[str], floor: int, quarantined: Sequence[Dict[str, Any]],
+) -> Optional[str]:
+    """Reason not to publish a soup thinner than the caller's floor, or None.
+
+    Separate from ``head_integrity_refusal`` because it answers a different question:
+    that one asks whether the head survived, this one asks whether what is about to
+    be published is big enough to be worth publishing. With the default floor the two
+    coincide; with an explicit ``min_members`` they do not.
+    """
+    if len(member_ids) >= floor:
+        return None
+    counts = quarantine_counts(quarantined)
+    return (
+        f"this merge would publish a {len(member_ids)}-member community checkpoint "
+        f"against a floor of {floor}, after quarantining "
+        f"{sum(counts.values())} member(s) ({counts}). Refusing to publish: a "
+        f"checkpoint whose composition shrank because members were excluded is a "
+        f"different checkpoint, and nobody should meet that by seeing it happen. "
+        f"Pass min_members explicitly to publish it deliberately."
+    )
+
+
 def next_community_version(index: Dict[str, Any]) -> str:
     """Monotonic ``vN`` for the next community checkpoint, derived from the current
     pointer so no separate counter can drift out of sync with it."""
@@ -658,13 +1776,87 @@ def next_community_version(index: Dict[str, Any]) -> str:
         raise ValueError(f"cannot derive next version from '{cur.get('version')}'")
 
 
+def find_contribution_by_digest(
+    index: Dict[str, Any], weights_sha256: str
+) -> Optional[Dict[str, Any]]:
+    """The contribution already holding ``weights_sha256``, or None.
+
+    Identity is the digest ALONE — not the digest plus any metadata. What a soup
+    averages is the bytes, so two members carrying one digest weight that
+    checkpoint 2:1 in the uniform mean whatever metadata they carry; metadata can
+    only make the double-weighting harder to see. Comparing the digest against a
+    caller-supplied field as well would let a retry defeat de-duplication by
+    passing a different ``dataset_fingerprint``, which a retrying client can do by
+    accident.
+
+    Deliberately does NOT consult ``decided_contribution_ids``: a re-deposit of a
+    checkpoint that is already inside a published community soup is the case where
+    appending is *worst*, since the next merge would compound a weight that has
+    already shipped. The first member is returned there too.
+
+    Earliest match wins, so a pool that somehow already holds a duplicate (one
+    created before this check existed) resolves to the same member on every call
+    rather than drifting with list order.
+    """
+    if not weights_sha256:
+        return None
+    for entry in index.get("contributions", []) or []:
+        if entry.get("weights_sha256") == weights_sha256:
+            return entry
+    return None
+
+
 def append_contribution(index: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append a contribution stub to the index. ``entry`` carries the pointers +
     the audit fields a reader needs without opening each metadata.json:
     ``{contribution_id, weights_path, metadata_path, weights_sha256,
     architecture_signature, samples_seen, uploaded_at}``. Append-only: existing
-    entries are immutable."""
-    index.setdefault("contributions", []).append(entry)
+    entries are immutable.
+
+    Stamps ``weights_sha256_basis`` from ``CONTRIBUTION_DIGEST_BASIS`` — the FILE
+    basis, NOT ``CURRENT_DIGEST_BASIS``, which is the community head's and would
+    assert a tensor digest over a number this process produced by hashing a file.
+    That is what makes the stored record attributable from itself; read it back with
+    ``contribution_digest_basis``. Stamped here rather than accepted as a field on
+    ``entry`` for the reason ``build_community_manifest`` records at its own stamp:
+    the app that writes the record is the only thing that knows which digest it just
+    computed (``prepare_contribution`` computes ``weights_sha256`` in this process,
+    so the client never supplies it), and a caller-supplied basis could disagree
+    with the bytes — and would be believed, since an explicit field outranks every
+    other signal.
+
+    Stamped only when the entry carries a digest. A basis on a record with no digest
+    would be an assertion about a value that is not there, and ``digest_basis``
+    answers ``no_digest`` for it before ever reading the field, so writing one buys
+    nothing and claims something.
+
+    Written onto a COPY, so the caller's dict is not mutated: entries already in the
+    index are never touched and nothing stored is back-filled. A pre-existing record
+    with no basis keeps having none and resolves by date, which is the one direction
+    that is a proof rather than a guess.
+
+    REFUSES a second member for a digest the index already holds (#0376). A client
+    that retries a deposit after a gateway 504 ate the response — the correct thing
+    for it to do, and 4 of 92 deposits on the r2 corpus needed it — otherwise
+    becomes two members and that site is silently weighted 2:1 in the uniform mean.
+    The refusal is the invariant stated where the write happens, so a later caller
+    cannot re-create the defect by forgetting to look first; on the retry path
+    ``contribute`` recognises the duplicate and returns before reaching here, so
+    this raise is a backstop rather than the mechanism.
+    """
+    existing = find_contribution_by_digest(index, entry.get("weights_sha256", ""))
+    if existing is not None:
+        raise ValueError(
+            f"contribution '{entry.get('contribution_id')}' carries weights_sha256 "
+            f"{entry.get('weights_sha256')}, which this pool already holds as "
+            f"'{existing.get('contribution_id')}' — appending it would weight that "
+            f"checkpoint twice in the uniform soup. Recognise the re-deposit and "
+            f"return the existing member instead."
+        )
+    stored = dict(entry)
+    if stored.get("weights_sha256"):
+        stored["weights_sha256_basis"] = CONTRIBUTION_DIGEST_BASIS
+    index.setdefault("contributions", []).append(stored)
     return index
 
 
@@ -678,9 +1870,12 @@ def build_community_manifest(
     selection_metric: Dict[str, Any],
     witness_metric: Dict[str, Any],
     members: List[Dict[str, Any]],
+    quarantined: Sequence[Dict[str, Any]],
     architecture_signature: str,
     weights_sha256: str,
     created_at: float,
+    non_learned: Optional[Dict[str, Any]] = None,
+    member_non_learned: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """A community checkpoint's manifest.json (one per ``community/<version>/``).
 
@@ -699,7 +1894,17 @@ def build_community_manifest(
     stood); ``gate_score`` is the cumulative score of the soup including it, so the
     two are not interconvertible. Both are audit-only and stripped from the wire
     projection. ``combine`` is "uniform" unless sample-weighting was empirically
-    justified for this version."""
+    justified for this version.
+
+    ``quarantined`` records every member excluded because its provenance could not
+    be established (see ``digest_quarantine``), as ``quarantine_record`` rows. It is
+    a REQUIRED argument with no default, deliberately: an omitted list and an empty
+    one would publish the identical manifest, so a caller that forgot to thread the
+    quarantine through would attest "nothing was excluded" for a merge that excluded
+    members. Separate from ``members`` because the two say different things — a
+    ``members`` row reads "evaluated, not included" and carries the scores that
+    decision was made on, and a quarantined member was never evaluated and has no
+    such scores."""
     return {
         "schema_version": SCHEMA_VERSION,
         "community_version": community_version,
@@ -710,8 +1915,26 @@ def build_community_manifest(
         "selection_metric": selection_metric,
         "witness_metric": witness_metric,
         "members": members,
+        "quarantined": list(quarantined),
+        "quarantine_counts": quarantine_counts(quarantined),
         "architecture_signature": architecture_signature,
         "weights_sha256": weights_sha256,
+        # Stamped from the constant rather than taken as an argument: the app that
+        # writes the record is the only thing that knows which digest its own
+        # materialize_soup just computed, and a caller-supplied basis could disagree
+        # with the bytes. See CURRENT_DIGEST_BASIS for the lock-step rule.
+        "weights_sha256_basis": CURRENT_DIGEST_BASIS,
+        # #0070 requirements 3 and 4. ``non_learned`` says what the published checkpoint's
+        # diameter IS and that it was inherited rather than learned (build it with
+        # ``inherited_non_learned`` so the basis label travels with the float).
+        # ``member_non_learned`` is where the contributors' OWN measured diameters live —
+        # the ruling's "one operative value in the tensor, four honest values in the
+        # record". Both default to None rather than to {} or [], because an empty map and
+        # an absent one must stay distinguishable: a merge written before this field
+        # existed carries null, and reading that as "this soup had no contributor
+        # diameters" would be the same false-silence the row was filed about.
+        "non_learned": non_learned,
+        "member_non_learned": member_non_learned,
         "created_at": created_at,
     }
 
@@ -735,6 +1958,10 @@ def set_current_community(
         "version": community_version,
         "path": weights_path,
         "sha256": sha256,
+        # This pointer is a copy of the merge's digest and carries no created_at of
+        # its own, so without this stamp it is the one surface of the three that
+        # cannot be attributed from the record alone. Written unconditionally.
+        "sha256_basis": CURRENT_DIGEST_BASIS,
         "selection_metric": selection_metric,
         "witness_metric": witness_metric,
     }
@@ -781,12 +2008,86 @@ def _iso(ts: Optional[float]) -> Optional[str]:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+def _current_community_provenance(index: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Attribute ``current_community.sha256``, which carries no timestamp of its own.
+
+    The pointer is a copy of one merge's digest written by ``set_current_community``,
+    and before this change it recorded neither a basis nor a ``created_at`` — so it is
+    the one surface of the three that cannot be dated from itself. Borrow both from
+    the merge that published this version. If no merge matches, nothing is borrowed
+    and ``digest_basis`` reaches its own undetermined branch; the join is never
+    allowed to invent a basis the timeline does not support.
+    """
+    cur = index.get("current_community")
+    if not isinstance(cur, dict):
+        return None
+    record = dict(cur)
+    if record.get("sha256_basis") is None or record.get("created_at") is None:
+        for merge in index.get("merges") or []:
+            published = merge.get("published_version")
+            if published and published == record.get("version"):
+                if record.get("created_at") is None:
+                    record["created_at"] = merge.get("created_at")
+                if record.get("sha256_basis") is None:
+                    record["sha256_basis"] = merge.get("global_sha256_basis")
+                break
+    return digest_provenance(record, digest_key="sha256")
+
+
 def _assessed_ids(merge: Dict[str, Any]) -> List[str]:
     return [m["contribution_id"] for m in merge.get("members", [])]
 
 
 def _taken_ids(merge: Dict[str, Any]) -> List[str]:
     return [m["contribution_id"] for m in merge.get("members", []) if m.get("included")]
+
+
+def corrected_metric(metric: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A metric record whose ``aggregate_basis`` is retracted wording, restated — or
+    the record exactly as given.
+
+    Returns a **copy** when it corrects and the **same object** when it does not, so
+    "was this corrected?" is answerable by identity (``out is metric``) rather than by
+    re-comparing strings. Never mutates the argument: the stored index is the
+    historical record of what the campaign published, and this is the read path.
+
+    Anything that is not a dict carrying a known-retracted string passes through
+    untouched, including ``None`` — an empty or absent metric is a normal state here
+    (``witness_metric`` is None on a merge that admitted nothing) and must not become
+    an error on a path whose job is to render.
+    """
+    if not isinstance(metric, dict):
+        return metric
+    stored = metric.get("aggregate_basis")
+    if not isinstance(stored, str):
+        return metric
+    current = _RETRACTED_BASIS.get(stored)
+    if current is None:
+        return metric
+    out = dict(metric)
+    out["aggregate_basis"] = f"{current} {BASIS_CORRECTION_NOTE}"
+    return out
+
+
+def _corrected_community(community: Any) -> Any:
+    """``current_community`` with its two metric records corrected.
+
+    This one is easy to miss: ``current_community`` is projected through
+    ``pool_wire_state`` verbatim, so it carries its own ``selection_metric`` and
+    ``witness_metric`` that are NOT the merge records corrected alongside the soups.
+    Four of the six live pools have one.
+    """
+    if not isinstance(community, dict):
+        return community
+    out = dict(community)
+    changed = False
+    for field in ("selection_metric", "witness_metric"):
+        before = community.get(field)
+        after = corrected_metric(before)
+        if after is not before:
+            out[field] = after
+            changed = True
+    return out if changed else community
 
 
 def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str, Any]:
@@ -797,11 +2098,24 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
     admitted nothing: selection bar only, no witness), and enriched
     ``contributions[]`` stubs (disposition + which soup they merged into). Campaign-
     registry metadata the page owns (contributor demographics, licences, stewards,
-    description) is composed on the page, not here."""
+    description) is composed on the page, not here.
+
+    A contribution's ``weights_sha256`` is published because ``contribute()`` returns
+    it exactly once: a deposit whose response is lost — measured at 4 of 92 against a
+    1.2 GiB PUT — otherwise leaves the client unable to tell a landed upload from one
+    it must retry, and a retry duplicates the member and silently weights that site
+    2:1 in the uniform mean. Reading it back makes that question answerable."""
     alias = pool_artifact_id.split("/")[-1]
     merges = index.get("merges", [])
 
     soups: List[Dict[str, Any]] = []
+    # Which of the two digests each published head's global_sha256 is. Kept BESIDE
+    # soups[] rather than inside it: the soup record's field set is the page's
+    # 0.13.0-draft contract, pinned key-for-key against its fixture corpus
+    # (test_pool.py::test_soup_key_set), and a backend that quietly widens it is the
+    # mismatch SCHEMA_VERSION exists to make visible. This is an additive top-level
+    # key the page can adopt without a draft bump, joined on soup_id.
+    digest_provenance_by_soup: Dict[str, Any] = {}
     empty_merges: List[Dict[str, Any]] = []
     merged_into: Dict[str, str] = {}
     cumulative = 0
@@ -811,6 +2125,7 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         }
         if merge.get("published_version"):
             soup_id = f"soup-{len(soups)}"
+            digest_provenance_by_soup[soup_id] = digest_provenance(merge)
             taken = _taken_ids(merge)
             cumulative += len(taken)
             for cid in taken:
@@ -822,8 +2137,8 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
                 "merged_at": _iso(merge.get("created_at")),
                 "assessed": _assessed_ids(merge),
                 "contributions": taken,
-                "selection_metric": merge.get("selection_metric"),
-                "witness_metric": merge.get("witness_metric"),
+                "selection_metric": corrected_metric(merge.get("selection_metric")),
+                "witness_metric": corrected_metric(merge.get("witness_metric")),
                 "global_sha256": merge.get("global_sha256"),
                 "weights": None,
                 "transport": transport,
@@ -838,12 +2153,41 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
             empty_merges.append({
                 "merged_at": _iso(merge.get("created_at")),
                 "assessed": _assessed_ids(merge),
-                "selection_metric": merge.get("selection_metric"),
+                "selection_metric": corrected_metric(merge.get("selection_metric")),
                 "transport": transport,
             })
 
     decided = set(index.get("decided_contribution_ids", []))
     contributions = []
+    # Which of the digests each published ``weights_sha256`` is. Kept BESIDE
+    # contributions[] for the same reason soups[] is: that record's field set is
+    # pinned key-for-key by test_pool.py::test_contribution_key_set, and a backend
+    # that quietly widens it is the mismatch SCHEMA_VERSION exists to make visible.
+    # Joined on contribution_id.
+    #
+    # #0523: without this, the wire published the number with no basis beside it, so
+    # from outside the pool two digests computed under different bases were
+    # indistinguishable — the harm #0509's lede described, surviving #0509's fix
+    # because #0509 stamped what is STORED and this is what is PUBLISHED.
+    #
+    # Resolved by ``contribution_digest_provenance`` and NOT by the community-head
+    # resolver, which is the one thing this loop can get wrong invisibly. The first
+    # version of this code called ``digest_provenance(c, digest_key="weights_sha256",
+    # created_at_key="uploaded_at")`` and reasoned that answering "undetermined" for
+    # an unstamped record was the conservative choice. It is the opposite: on THIS
+    # surface the digest function never changed, so an absent stamp is the file basis
+    # as a PROOF (the history is quoted at CONTRIBUTION_DIGEST_BASIS), and refusing to
+    # attribute it tells a contributor their value cannot be explained when the code
+    # path explains it with certainty — #0509's harm in mirror image, and the option
+    # #0509 explicitly rejected. Passing ``uploaded_at`` made it worse: it split one
+    # unchanged code path into two answers on nothing but a deposit date.
+    #
+    # The absent case is still DECIDED rather than defaulted — a record with no digest
+    # at all resolves to DIGEST_BASIS_ABSENT ("no_digest"), never to the file basis —
+    # and that is a different question from an absent STAMP on a digest that exists.
+    # test_wire_basis_per_contribution.py pins both, and pins that reverting this call
+    # to the community-style one goes RED.
+    digest_provenance_by_contribution: Dict[str, Any] = {}
     for c in index.get("contributions", []):
         cid = c.get("contribution_id")
         if cid in merged_into:
@@ -852,10 +2196,20 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
             disposition = "excluded"
         else:
             disposition = "pending"
+        attribution = contribution_digest_provenance(c)
+        already = digest_provenance_by_contribution.get(cid)
+        if already is not None and already["basis"] != attribution["basis"]:
+            attribution = colliding_contribution_provenance()
+        digest_provenance_by_contribution[cid] = attribution
         contributions.append({
             "contribution_id": cid,
             "received_at": _iso(c.get("uploaded_at")),
-            "bytes_out": c.get("n_bytes"),
+            "weights_sha256": c.get("weights_sha256"),
+            # Published under the storage name on purpose: soup_admission fails
+            # open on a missing n_bytes, so the audit question is "did the pool
+            # record n_bytes?" and the view has to answer it under that word.
+            # bytes_out stays reserved for transport, one level up.
+            "n_bytes": c.get("n_bytes"),
             "n_train_images": c.get("n_train_images"),
             "samples_seen": c.get("samples_seen"),
             "disposition": disposition,
@@ -863,14 +2217,47 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         })
 
     baseline = index.get("baseline") or {}
+    # Two independent corrections land on this one projection and both have to survive:
+    # _corrected_community (#0418) rewrites the pointer's own selection_metric and
+    # witness_metric, which are NOT the merge records corrected alongside the soups,
+    # while sha256_provenance (#0417) says which of the two digests the pointer's sha256
+    # is. They are orthogonal, and the order between them is interchangeable — measured,
+    # not assumed: reversing these two statements leaves the app suite identical at 229
+    # passed, 2 skipped, because _corrected_community copies with dict(community) and so
+    # carries an already-attributed key through. The order below is the one that needs a
+    # single isinstance guard: _corrected_community returns a non-dict unchanged, so
+    # correcting first lets one guard cover the spread, whereas attributing first needs
+    # its own guard before the spread and another pass afterwards.
+    current_community = _corrected_community(index.get("current_community"))
+    if isinstance(current_community, dict):
+        current_community = {
+            **current_community,
+            "sha256_provenance": _current_community_provenance(index),
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "model_type": index.get("model_type"),
         "architecture_signature": index.get("architecture_signature"),
-        "current_community": index.get("current_community"),
+        "current_community": current_community,
         "merge_trigger": merge_trigger(),
-        "baseline_metric": baseline.get("witness_metric"),
+        "baseline_metric": corrected_metric(baseline.get("witness_metric")),
         "soups": soups,
         "empty_merges": empty_merges,
         "contributions": contributions,
+        # Additive, outside every field set the page pins. ``soups`` is keyed by
+        # soup_id; empty merges are absent from it because they publish no head and
+        # their projection carries no digest to attribute. ``contributions`` is keyed
+        # by contribution_id and carries one entry per DISTINCT published id, including
+        # those whose basis is absent or undetermined — a contribution missing from this
+        # map would be indistinguishable from one the pool does not hold, which is the
+        # ambiguity the map exists to remove. "Per distinct id" rather than "per
+        # published contribution": the two are the same count only while ids are unique,
+        # which is the pool's own invariant and not something this projection can
+        # enforce, and claiming the stronger property here is what let a collision
+        # publish one record's basis for another (colliding_contribution_provenance).
+        "digest_provenance": {
+            "soups": digest_provenance_by_soup,
+            "contributions": digest_provenance_by_contribution,
+            "current_community": _current_community_provenance(index),
+        },
     }

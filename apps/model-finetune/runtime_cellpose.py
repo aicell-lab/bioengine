@@ -21,6 +21,7 @@ decorator module stays introspectable with only ``bioengine[worker]`` + stdlib.
 import asyncio
 import gc
 import hashlib
+import importlib
 import os
 import subprocess
 import sys
@@ -35,6 +36,16 @@ import busy
 import numpy as np
 
 logger = bioengine.logger
+
+# The third-party top-level modules this runtime's own method bodies import.
+# Imported once at replica startup by the smoke test below so a replica whose
+# runtime_env install did not take fails instead of being advertised as ready
+# (#0371). Keep this list equal to what the bodies actually import: it is a
+# readiness gate, not a restatement of requirements-runtime-cellpose.txt, and a
+# module nothing imports would fail a replica that can serve every call.
+# ``numpy`` is absent on purpose — it is imported at module scope above, so a
+# replica missing it never constructs.
+_RUNTIME_IMPORTS = ("torch", "cellpose")
 
 # Match CellposeSAMWrapper's eval kwargs so served masks reproduce the exported
 # package's self-test output; diameter is cpsam's mean-diameter prior.
@@ -124,6 +135,62 @@ class CellposeRuntime:
     @bioengine.async_init
     async def _start_busy_log(self) -> None:
         self._busy.start()
+
+    @bioengine.smoke_test
+    async def _import_runtime_stack(self) -> None:
+        """Import this backend's ML stack once, at startup, and fail the replica if
+        it is not there (#0371).
+
+        A replica whose ``runtime_env`` install did not take answered the health
+        probe correctly and was advertised as ready while **every** call raised
+        ``ModuleNotFoundError: No module named 'cellpose'``: nothing on the health
+        path imports the ML stack. ``check_health`` runs ``async_init`` (the busy
+        log) and, because this deployment declares a GPU, retains a CUDA context
+        via ctypes on ``libcuda.so.1`` — which the NVIDIA container runtime injects
+        independently of the pip layer, so it succeeds on a replica with no torch.
+        This runtime declares no ``@bioengine.health_check``, so nothing else ran.
+
+        This is deliberately a smoke test and not a deeper ``ping()``: the entry
+        calls ``ping()`` with a 2 s timeout before every GPU call and importing
+        torch exceeds that, while a per-poll import of a heavy stack is its own
+        defect. The framework runs a smoke test once after ``async_init`` and
+        fails the replica when it raises, which makes the failure *visible*.
+
+        It is **not** a traffic gate, and not a bounded one either. Two layers:
+        ``check_health`` creates the task and tests ``.done()`` in the same call,
+        so poll 1 cannot fail, and Serve condemns a replica only after 3
+        consecutive failed checks (``REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD``)
+        — ≈90 s at this deployment's ``health_check_period_s=30.0``. Serve then
+        **replaces** the condemned replica and the cycle repeats indefinitely,
+        because its circuit breaker ``_terminally_failed()`` is gated on ``not
+        _replica_has_started``, which any successful start clears. Measured on
+        ``#0387`` over 100 health-check periods — that probe ran at
+        ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the 30 s
+        above: 105 calls, **0 failed**, 84 answered by a replica that already
+        knew its own smoke test had failed, across 22 distinct replica pids.
+
+        So what this buys is that the missing modules are **named in the replica
+        log on every cycle**, instead of nothing being said at all — not that
+        broken traffic stops. The import is not wasted work — the first real
+        call would do it anyway.
+
+        Reports every missing module rather than the first, because a half-installed
+        env usually lost more than one and the whole point is diagnosability.
+        """
+        missing: List[str] = []
+        for name in _RUNTIME_IMPORTS:
+            try:
+                importlib.import_module(name)
+            except Exception as e:
+                missing.append(f"{name} ({type(e).__name__}: {e})")
+        if missing:
+            raise RuntimeError(
+                "Cellpose runtime dependencies are not importable in this "
+                "replica's environment — the runtime_env install did not take: "
+                + "; ".join(missing)
+                + ". pip's own output is not in this app's logs; read "
+                "runtime_env_setup-*.log on the node."
+            )
 
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""
@@ -418,46 +485,139 @@ class CellposeRuntime:
             )
             time.sleep(_WEIGHTS_PUT_BACKOFF_S * 2**attempt)
 
-    def _fetch_member(self, key: str, url: str) -> Dict[str, Any]:
-        """Load a member state_dict, downloading on first use.
+    def _member_cache_path(self, key: str) -> Path:
+        """Where this replica caches the member at pool path ``key``."""
+        return self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+
+    def _ensure_member(self, key: str, url: str, expected_sha256: Optional[str]) -> Path:
+        """The member's file on local disk, downloading it on first use.
 
         The download is cached as a file, not as tensors: one download per member
         per replica, but no member stays resident between uses. Keyed by the
         immutable pool weights_path (content-addressed → no staleness). Written
         via a temporary name so an interrupted download cannot leave a truncated
-        file that every later aggregate would then fail to unpickle."""
-        import torch
+        file that every later aggregate would then fail to unpickle.
 
-        cached = self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+        A FRESH download is hashed here, against the digest the pool recorded, and
+        the bytes are discarded rather than cached if they disagree. That check is
+        on this path and not on the cache hit for two reasons. It is nearly free —
+        the bytes are already in memory, and hashing them again on every one of the
+        ~35 scoring passes a merge makes would add minutes of CPU to each merge for
+        a file nothing can have modified. And it is where the gap actually is:
+        ``verify_members`` hashes every member once per merge before any soup is
+        built, but the cache is evicted under memory pressure, so a member verified
+        in the preflight can be re-downloaded mid-merge. Without this, those bytes
+        would enter the soup having been checked only in an earlier incarnation.
+
+        ``expected_sha256`` may be None — a member quarantined for having no digest
+        never reaches here, but ``score_soup`` is also called directly by tests and
+        by the stock-base path, and inventing a digest for those would be worse than
+        recording that there was nothing to check against.
+        """
+        import pool
+
+        cached = self._member_cache_path(key)
         if cached.exists():
             os.utime(cached)  # mark as most-recently-used for _evict_members
-        else:
-            content = self._download_member(url)
-            self._soup_dl_bytes += len(content)
-            self._evict_members(incoming_bytes=len(content))
-            partial_file = cached.with_suffix(".part")
-            partial_file.write_bytes(content)
-            partial_file.rename(cached)
+            return cached
+        content = self._download_member(url)
+        if expected_sha256 is not None:
+            got = hashlib.sha256(content).hexdigest()
+            if got.lower() != str(expected_sha256).lower():
+                raise ValueError(
+                    f"member '{key}' downloaded as {len(content)} bytes hashing to "
+                    f"{got}, but the pool recorded {expected_sha256} for it. "
+                    f"Discarding the download rather than caching it: these are not "
+                    f"the bytes the contribution attested to."
+                )
+        self._soup_dl_bytes += len(content)
+        self._evict_members(incoming_bytes=len(content))
+        partial_file = cached.with_suffix(".part")
+        partial_file.write_bytes(content)
+        partial_file.rename(cached)
+        assert pool.sha256_file(cached) == hashlib.sha256(content).hexdigest(), (
+            f"member '{key}' does not read back as the bytes just written to "
+            f"{cached}; the member cache is not trustworthy on this replica."
+        )
+        return cached
+
+    def _fetch_member(
+        self, key: str, url: str, expected_sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Load a member state_dict, downloading on first use."""
+        import torch
+
+        cached = self._ensure_member(key, url, expected_sha256)
         return self._unwrap_sd(
             torch.load(cached, map_location="cpu", weights_only=False)
         )
 
-    def _build_soup(self, members: List[Dict[str, str]]):
-        """Uniform mean of member state_dicts; None when empty (= stock base)."""
+    async def verify_members(self, members: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Hash every member's bytes as they actually land on this replica.
+
+        Returns ``{"digests": {key: sha256}, ...}`` — the measurement only. It
+        decides nothing: the caller compares these against what the pool recorded
+        and owns what happens to a member that disagrees, which on the CPU entry is
+        a quarantine rather than an exception.
+
+        Every member is hashed on every merge, a cache hit included. That is the
+        literal reading of "verify on load" and it is the one worth paying for: the
+        cheaper version — trust the cache, hash only fresh downloads — makes the
+        guard's coverage depend on how warm the replica happens to be, so the first
+        merge after a deploy checks everything and the next one checks nothing, and
+        the difference is invisible in the output either way. The cost is one
+        sha256 per member per merge (~0.35 s for a 320 MB cpsam checkpoint),
+        against a merge that already spends minutes per scoring pass.
+
+        No extra download: the runtime has to fetch every member for the soup
+        anyway, and this populates the same cache those passes read.
+        """
+        import pool
+
+        digests: Dict[str, str] = {}
+        dl_before = self._soup_dl_bytes
+        async with self._soup_sem:
+            for m in members:
+                key = m["key"]
+                if key in digests:
+                    continue
+                path = await asyncio.to_thread(
+                    self._ensure_member, key, m["url"], m.get("sha256"))
+                digests[key] = await asyncio.to_thread(pool.sha256_file, path)
+        return {
+            "digests": digests,
+            "replica": self._replica_id(),
+            "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+        }
+
+    def _build_soup(self, members: List[Dict[str, str]],
+                    base_commitment: Optional[Dict[str, Any]] = None,
+                    member_non_learned: Optional[List[Dict[str, float]]] = None):
+        """Uniform mean of member state_dicts; None when empty (= stock base).
+
+        Learned tensors are averaged; non-learned ones (``diam_labels``) are carried
+        from the base unchanged, and a key the base does not declare fails the merge
+        (#0070).
+        """
         import pool
 
         if not members:
             return None
         return pool.uniform_soup(
-            [partial(self._fetch_member, m["key"], m["url"]) for m in members]
+            [partial(self._fetch_member, m["key"], m["url"], m.get("sha256"))
+             for m in members],
+            base=base_commitment,
+            member_non_learned=member_non_learned,
         )
 
     async def score_soup(
         self, members: List[Dict[str, str]], images: List[np.ndarray],
         labels: List[np.ndarray], diam_mean: float = 30.0,
+        base_commitment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split,
-        with the serving replica and the bytes this one call downloaded.
+        the per-image breakdown it is the mean of, and the serving replica plus the
+        bytes this one call downloaded.
         ``members`` is a list of ``{"key": weights_path, "url": presigned_get}``;
         empty scores the stock cpsam base. Downloads happen off-lock; the soup build
         is single-flight per replica, and segmentation holds the shared GPU lock — so
@@ -477,7 +637,8 @@ class CellposeRuntime:
             # ``_segment`` loads it from disk: once it is on disk the resident copy is
             # dead weight, and the lock wait below can be minutes.
             async with self._soup_sem:
-                soup = await asyncio.to_thread(self._build_soup, members)
+                soup = await asyncio.to_thread(
+                    partial(self._build_soup, members, base_commitment))
                 if soup is not None:
                     import torch
 
@@ -494,25 +655,66 @@ class CellposeRuntime:
         finally:
             if ckpt and ckpt.exists():
                 ckpt.unlink()
+        # Score once, reduce once. The caller publishes both halves and the pool
+        # refuses a record whose aggregate is not the mean of its vector, so these
+        # must be one measurement rather than two calls that agree today.
+        per_image = pool.per_image_instance_f1(masks, [np.asarray(lbl) for lbl in labels])
         return {
-            "f1": pool.mean_instance_f1(masks, [np.asarray(lbl) for lbl in labels]),
+            "f1": pool.mean_of_per_image(per_image),
+            "per_image": per_image,
             "replica": self._replica_id(),
             "soup_dl_bytes": self._soup_dl_bytes - dl_before,
         }
 
-    async def materialize_soup(self, members: List[Dict[str, str]], put_url: str) -> Dict[str, Any]:
+    async def materialize_soup(
+        self, members: List[Dict[str, str]], put_url: str,
+        base_commitment: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Build the uniform soup of ``members``, PUT it to the pool's presigned URL,
         and return its sha256 + byte size — so the head weights never traverse the
-        CPU entry. ``members`` must be non-empty (a published head always has one)."""
+        CPU entry. ``members`` must be non-empty (a published head always has one).
+
+        Also returns what the community manifest needs for #0070 requirement 4, because
+        this is the only place the members' weights are resident and reading them again
+        would mean re-downloading every one:
+
+        ``non_learned_inherited`` — the published checkpoint's own non-learned values,
+        read back off the SOUP rather than off the base, so the record reports what was
+        actually published rather than what was intended;
+        ``non_learned_source`` — the base those values came from, named, because
+        "inherited" with no source is not traceable;
+        ``member_non_learned`` — one entry per member, carrying the member's weights
+        ``key`` so the caller can map it to a contribution id (this runtime is given
+        paths and never learns contribution ids). Aligned with ``members`` by index and
+        asserted to be, since a silent misalignment would attribute a contributor's
+        diameter to the wrong contributor, which is worse than not recording it.
+        """
         import torch
 
         import pool
 
         dl_before = self._soup_dl_bytes
+        collected: List[Dict[str, float]] = []
         # Returns from inside the semaphore so the soup and the PUT's own copy of it
         # are both released before the next merge starts allocating.
         async with self._soup_sem:
-            soup = await asyncio.to_thread(self._build_soup, members)
+            soup = await asyncio.to_thread(
+                partial(self._build_soup, members, base_commitment,
+                        member_non_learned=collected))
+            # Read the non-learned values off the published soup while it is resident.
+            inherited = {
+                key: float(soup[key].detach().reshape(-1)[0])
+                for key in sorted(soup) if pool.is_non_weight_param(key)
+            }
+            if len(collected) != len(members):
+                raise RuntimeError(
+                    f"member_non_learned has {len(collected)} entries for "
+                    f"{len(members)} members, so a diameter cannot be attributed"
+                )
+            per_member = [
+                {"key": spec["key"], **vals}
+                for spec, vals in zip(members, collected)
+            ]
             # Digest the tensors, not the saved file: the random stem below lands in
             # every torch zip record name, so a file digest would differ on every
             # merge of the same members. The stem stays random for #0083.
@@ -529,14 +731,31 @@ class CellposeRuntime:
                 "sha256": sha, "n_bytes": n_bytes,
                 "replica": self._replica_id(),
                 "soup_dl_bytes": self._soup_dl_bytes - dl_before,
+                "non_learned_inherited": inherited,
+                "non_learned_source": (base_commitment or {}).get("source"),
+                "member_non_learned": per_member,
             }
 
-    async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
+    async def prepare_contribution(self, session_id: str, weights_put_url: str,
+                                   model_type: str = "cpsam") -> Dict[str, Any]:
         """Inspect a finished session's local cpsam checkpoint (architecture
         signature + L2 drift from the base it started from), PUT its weights to the
-        pool's presigned URL, and return the signature, drift, sha256s, byte size and
-        cellpose version. The checkpoint is torch + a runtime-local file, neither of
-        which the torch-free CPU entry can touch, so all of it happens here."""
+        pool's presigned URL, and return the signature, drift, sha256s, byte size,
+        cellpose version and the base commitment a fresh pool is bootstrapped from.
+        The checkpoint is torch + a runtime-local file, neither of
+        which the torch-free CPU entry can touch, so all of it happens here.
+
+        ``base_commitment`` is produced HERE for exactly that reason (#0070). The entry
+        writes it into ``pool_index.json`` at pool creation but cannot build it: a
+        commitment needs the base's own state_dict, and a constant or manifest-derived
+        value would reinstate the key-set assumption the ruling's amendment removed.
+        It rides on the existing return rather than a second call, because the base is
+        already resident here.
+
+        ``model_type`` only selects the stock base for a session that has no
+        ``init_checkpoint.pt``; it defaults to the same ``"cpsam"`` as
+        ``_base_state_dict`` so an older caller that omits it is unchanged.
+        """
         import torch
 
         import pool
@@ -555,15 +774,94 @@ class CellposeRuntime:
             out: Dict[str, Any] = {
                 "architecture_signature": pool.architecture_signature(sd),
                 "l2_from_base": None,
+                # #0122. Set in BOTH branches below, so a null here reaching the
+                # record means neither ran — not that this writer does not label.
+                "l2_from_base_basis": None,
                 "base_checkpoint_sha256": None,
+                "base_commitment": None,
             }
             if base_path.exists():
                 base_sd = _state(str(base_path))
                 out["l2_from_base"] = pool.state_dict_l2_from_base(sd, base_sd)
+                out["l2_from_base_basis"] = pool.L2_BASIS_SESSION_INIT
                 out["base_checkpoint_sha256"] = pool.sha256_file(str(base_path))
+                # The base this session actually started from, named by its own digest so
+                # a reader can identify the checkpoint rather than trust the label.
+                out["base_commitment"] = pool.base_commitment(
+                    base_sd,
+                    source="session_init_checkpoint:%s" % out["base_checkpoint_sha256"],
+                )
+                del base_sd
+            else:
+                # A stock-initialised session keeps no init_checkpoint.pt (the same root
+                # cause as #0122), so the base it started from is stock cellpose. Loading
+                # it here is the REAL base, not an assumed one -- which is the whole point
+                # of the amendment.
+                #
+                # CORRECTION (#0087, ruled 2026-11-15). This comment used to read "Peak
+                # memory is unchanged either way ... two state dicts in both cases and
+                # #0087's bound is not made worse". That was FALSE and it is worth saying
+                # why, because the mistake is easy to repeat: it compared this `else`
+                # branch to the sibling `if` branch, when the right comparator is what
+                # THIS path did before. Before #0070 there was no `else` at all, so a
+                # stock-initialised deposit held exactly ONE state dict. It now holds two.
+                # Reusing this row's own FU1 figures (one cpsam dict 1.1348 GiB, two
+                # 2.3060 GiB -- a REUSE, not a fresh measurement), this path went from
+                # ~1.13 GiB to ~2.31 GiB. #0087's bound was made worse, by this branch.
+                # That is why the whole computation now runs under `_soup_sem` below.
+                #
+                # WHY A CONSTRUCTED NET IS CORRECT HERE AND NOT ABOVE. base_commitment
+                # records float(tensor[0]), so handing it a bfloat16 tensor would widen
+                # the value and write the widened number into pool_index.json ONCE, at
+                # creation, never recomputed -- bf16(32.9281082153) is exactly 33.0.
+                # Measured 2026-11-14 on cpsam_v2: the stock checkpoint FILE is a bare
+                # 348-key OrderedDict containing NO key matching /diam/, and
+                # diam_labels/diam_mean exist only on the constructed net, as bfloat16 at
+                # exactly 30.0 (and bf16(30.0) == 30.0 exactly). So for the stock base
+                # there is no float32 source to prefer -- torch.load cannot return a value
+                # the file does not hold -- and the constructed net loses nothing.
+                # The branch ABOVE must stay on torch.load: a fine-tuned base DOES carry a
+                # learned diam_labels, where the widening would be lossy.
+                stock = self._base_state_dict(model_type)
+                # #0122 half 1: measure against the stock base that was actually
+                # used, so the field stops being null for exactly these deposits.
+                # The stock dict is already loaded here for base_commitment, so THIS
+                # line adds no load and no second resident copy. That much is true and
+                # stays; what was struck from the correction above is the further claim
+                # that the branch as a whole left #0087's bound untouched. Loading the
+                # stock base at all is what moved it; reusing it here does not move it
+                # again.
+                out["l2_from_base"] = pool.state_dict_l2_from_base(sd, stock)
+                out["l2_from_base_basis"] = pool.L2_BASIS_STOCK
+                out["base_commitment"] = pool.base_commitment(
+                    stock,
+                    source="cellpose:%s" % training.cellpose_base_model(model_type),
+                )
+                del stock
             return out
 
-        info = await asyncio.to_thread(_inspect)
+        # #0087, Option A (ruled 2026-11-15): the inspection holds up to TWO full cpsam
+        # state dicts, and until now it ran outside every lock and past every admission
+        # gate -- so a deposit's peak could sum with a concurrent merge's, and the replica
+        # could breach `memory_mb` with no merge of its own running at all.
+        #
+        # `_soup_sem` is the runtime's existing single-permit semaphore around the merge
+        # build. Taking it HERE makes the deposit and the merge mutually exclusive, so the
+        # replica's peak becomes max(merge, contribute) rather than their sum.
+        #
+        # What this does NOT do, stated because the close has to record the bound rather
+        # than an improvement: it does not reduce the single-path peak. Reusing this row's
+        # FU1 figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
+        # measurement), contribute alone still peaks at ~2.31 GiB. If max(merge,
+        # contribute) is still above what the admission gate assumes, that is a separate
+        # row, not a reason to widen this one.
+        #
+        # The cost is latency: the deposit RPC now waits for any in-flight merge before it
+        # starts its own torch load. That is the trade the ruling accepted -- a measured
+        # memory bound over an unmeasured latency improvement -- and the measurement of
+        # what it adds is on the row.
+        async with self._soup_sem:
+            info = await asyncio.to_thread(_inspect)
         weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)
         n_bytes = Path(ckpt).stat().st_size
 

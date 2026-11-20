@@ -1,7 +1,7 @@
 name: Test Suite
 
 # No workflow ran a test before this one, so the only gate on a merge was a
-# version comparison and a PR that broke the suite merged green (backlog #0223).
+# version comparison and a PR that broke the suite merged green.
 # The breakage that prompted it existed only in the COMBINATION of two
 # individually sound PRs, which is what a suite run on the merge result catches
 # and what a version check cannot see.
@@ -42,7 +42,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install test dependencies
         # requirements-test.txt brings pytest, pytest-asyncio and pytest-xdist,
@@ -55,7 +55,15 @@ jobs:
         # deliberately declares no imaging deps ("Hypha/S3 transport only"). It is
         # a test-only dependency, so it is installed here rather than added to the
         # bundle, which would change what the published artifact ships.
-        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow
+        # aiofiles is the opposite case: model-runner's bundle DOES declare it
+        # (requirements-entry.txt), but the worker image this job runs in does
+        # not ship it, and `_execute_test` imports it inside the function body —
+        # so the module imports fine and the failure only appears once a test
+        # actually calls it. Installing the one name keeps this step honest about
+        # what it is for; installing the whole entry requirements file would drag
+        # in bioimageio.core==0.11.0 and numpy==1.26.4 and re-resolve the image's
+        # own pins underneath the rest of the suite.
+        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow aiofiles
 
       - name: Run the suite
         # tests/end_to_end needs a live Hypha workspace and a real cluster.
@@ -101,7 +109,7 @@ jobs:
           print(f"OK: {ran} tests ran, {bad} failures")
           PY
 
-      - name: Run the app bundle suites
+      - name: Reconcile the app bundle registry
         # Each app under apps/ ships its own tests INSIDE the bundle that is
         # published to Hypha, so a consumer who downloads a committed version gets
         # them too. pytest never collected those: testpaths is ["tests"], so
@@ -111,11 +119,23 @@ jobs:
         # `return dict(rec)` left the repo suite green at 1177 passed while the
         # bundle's own suite reddened on a named case.
         #
-        # Only these two apps ship in-bundle tests today (10 files). -o testpaths
-        # overrides the ["tests"] default; -o addopts clears pytest.ini's xdist
-        # flags, which fight the per-app run.
+        # The set is not `apps/*`: some apps' suites need that app's own image,
+        # which this runner does not have. It is declared in
+        # .github/app-bundle-suites.json and checked against the tree here, so a
+        # NEW app shipping in-bundle tests fails this job instead of having them
+        # collected by nobody while every step reports success.
+        run: python3 .github/scripts/app_bundle_suites.py reconcile
+
+      - name: Run the app bundle suites
+        # The app list comes from the same registry the assert step reads, so the
+        # two cannot drift apart. -o testpaths overrides the ["tests"] default;
+        # -o addopts clears pytest.ini's xdist flags, which fight the per-app run.
         run: |
-          for app in model-finetune annotation-broker; do
+          # Captured on its own line on purpose: errexit does not fire on a failing
+          # command substitution inside a `for` word list, so inlining this would
+          # run the loop zero times and still exit 0.
+          apps=$(python3 .github/scripts/app_bundle_suites.py list)
+          for app in $apps; do
             echo "::group::$app"
             python -m pytest -p no:cacheprovider "apps/$app" -q \
               -o addopts="" -o testpaths="apps/$app" \
@@ -126,32 +146,8 @@ jobs:
       - name: Assert the app suites actually ran
         # Same reasoning as the step above for tests/: pytest exits 0 on a partial
         # collapse and a suite that collected nothing reports no failures. Read the
-        # counts out of the JUnit reports and refuse below a floor. Floors are set
-        # well under the measured counts on e16b63d (100 and 345) so ordinary test
-        # additions do not trip them, but a collapse to zero does.
+        # counts out of the JUnit reports and refuse below each app's floor. Floors
+        # are set well under the measured counts so ordinary test additions do not
+        # trip them, but a collapse to zero does.
         if: always()
-        run: |
-          python - <<'PY'
-          import glob, sys, xml.etree.ElementTree as ET
-          FLOOR = {"model-finetune": 90, "annotation-broker": 300}
-          reports = sorted(glob.glob("junit-app-*.xml"))
-          if len(reports) != len(FLOOR):
-              sys.exit(f"REFUSE: {len(reports)} app report(s), expected {len(FLOOR)}")
-          bad = 0
-          for p in reports:
-              app = p[len("junit-app-"):-len(".xml")]
-              root = ET.parse(p).getroot()
-              suites = root.findall("testsuite") or [root]
-              total = sum(int(s.get("tests", 0)) for s in suites)
-              skipped = sum(int(s.get("skipped", 0)) for s in suites)
-              f = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
-              ran = total - skipped
-              print(f"{app}: collected={total} skipped={skipped} ran={ran} failures+errors={f}")
-              if app not in FLOOR:
-                  print(f"REFUSE: no floor recorded for {app}"); bad += 1; continue
-              if ran < FLOOR[app]:
-                  print(f"REFUSE: {app} ran {ran}, below the floor of {FLOOR[app]}"); bad += 1
-              if f:
-                  print(f"REFUSE: {app} had {f} failure(s) or error(s)"); bad += 1
-          sys.exit(1 if bad else 0)
-          PY
+        run: python3 .github/scripts/app_bundle_suites.py assert-ran

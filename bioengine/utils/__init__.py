@@ -31,3 +31,8 @@ from .network import (
 )
 from .permissions import check_permissions, create_context
 from .requirements import get_pip_requirements, update_requirements
+from .stale_service import (
+    ReconnectingService,
+    reconnecting_service,
+    stale_service_kind,
+)

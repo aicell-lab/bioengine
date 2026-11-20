@@ -9,9 +9,10 @@ whole app through the same overloaded server.
 
 The contract now:
 
-* ``check_health`` reads local state only. The only Hypha-related reason
-  it fails is a registration that can never succeed (bad workspace, bad
-  client id, refused credentials) — surfaced via ``_registration_failure``.
+* The sibling gate reads local state only. The only Hypha-related reason
+  a replica is condemned is a registration that can never succeed (bad
+  workspace, bad client id, refused credentials) — surfaced via
+  ``_registration_failure`` and acted on off the event loop.
 * Connecting, registering and reconnecting live in a background
   maintenance task, where a failure costs a retry rather than a replica.
 * Anything that might clear on its own is retried indefinitely, including
@@ -64,28 +65,32 @@ class _FailingRegister:
         raise self.exc
 
 
-# ===== check_health touches no Hypha =====
+# ===== the sibling gate touches no Hypha =====
 
 
-def test_check_health_makes_no_hypha_calls() -> None:
-    src = inspect.getsource(_ProxyCls.check_health)
+def test_sibling_gate_makes_no_hypha_calls() -> None:
+    src = inspect.getsource(_ProxyCls._apply_sibling_gate)
     for call in ('echo("ping")', "get_service(", ".get_load(", ".get_num_pcs("):
         assert call not in src, (
-            f"check_health must not call {call} — a slow Hypha would condemn a "
+            f"the sibling gate must not call {call} — a slow Hypha would condemn a "
             f"replica that can still serve."
         )
 
 
-def test_check_health_does_not_register() -> None:
+def test_sibling_gate_does_not_register() -> None:
     """Registration is retryable work; it belongs in the background task."""
-    src = inspect.getsource(_ProxyCls.check_health)
+    src = inspect.getsource(_ProxyCls._apply_sibling_gate)
     assert "_register_services" not in src
-    assert "_ensure_maintenance_task" in src
+    starter = inspect.getsource(_ProxyCls._start_background_workers)
+    assert "_ensure_maintenance_task" in starter, (
+        "check_health used to start the maintenance task; with it gone the "
+        "constructor has to, or registration never happens at all"
+    )
 
 
 def test_ping_tolerance_machinery_is_gone() -> None:
     """The consecutive-failure counter only existed to soften the Hypha
-    calls that check_health no longer makes."""
+    calls the sibling gate no longer makes."""
     assert not hasattr(pd_module, "_MAX_CONSECUTIVE_PING_FAILURES")
     assert "_consecutive_ping_failures" not in inspect.getsource(_ProxyCls)
 
@@ -163,8 +168,8 @@ async def test_permanent_registration_failure_fails_the_replica() -> None:
     await inst._maintenance_tick()
 
     assert isinstance(inst._registration_failure, ConnectionAbortedError)
-    with pytest.raises(RuntimeError, match="failed permanently"):
-        await _ProxyCls.check_health(inst)
+    reason = _ProxyCls._unrecoverable_reason(inst)
+    assert reason is not None and "failed permanently" in reason
 
 
 @pytest.mark.asyncio

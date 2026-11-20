@@ -40,7 +40,7 @@ def test_mismatched_workspace_returns_false_and_logs_debug(
     assert not _belongs_to_worker_workspace(
         application_id="model-runner",
         app_data={"worker_workspace": "bioimage-io"},
-        current_workspace="ws-user-github|49943582",
+        current_workspace="ws-user-test|1",
         logger=_make_logger(),
     )
     debug_records = [r for r in caplog_at_debug.records if r.levelno == logging.DEBUG]

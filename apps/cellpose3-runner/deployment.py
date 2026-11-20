@@ -132,7 +132,16 @@ class Cellpose3Runner:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._s3 = await self._hypha.get_service("public/s3-storage")
+        # Cached for the replica's whole life, so a stale client id would hang
+        # every call to the full method timeout while `_health` below still
+        # reports healthy (a dead handle is not `None`). `put_file`/`get_file`
+        # only mint a presigned URL, so re-sending either is safe.
+        self._s3 = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/s3-storage",
+            repeatable=("put_file", "get_file"),
+            logger=logger,
+        )
         self._http = httpx.AsyncClient(timeout=60.0)
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
 

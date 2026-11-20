@@ -21,7 +21,7 @@ import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 import bioengine
 import busy
@@ -77,6 +77,142 @@ ModelType = Literal[
 # Model types served by the isolated Cellpose runtime rather than micro-sam.
 CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
 
+# Backends that cost a GPU. Each enabled one composes a runtime deployment
+# declaring gpu_memory_mb=-1, which the worker resolves to a WHOLE device
+# (bioengine/apps/builder.py), so the app's GPU floor is simply how many of
+# these are on. Named here because _gpu_placement_report has to count them.
+GPU_BACKENDS = ("microsam", "cellpose")
+
+
+def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
+    """Whether this cluster can place the GPU runtimes the enabled backends need.
+
+    Exists because getting this wrong is otherwise INVISIBLE from the running
+    system (#0370). Two enabled backends book two whole GPUs even to serve one
+    request; on a cluster whose second GPU is never free the second replica simply
+    never schedules. Measured 2026-11-13 on a one-GPU ``external-cluster`` worker: the
+    unplaceable runtime stays ``UPDATING`` with its replica ``STARTING``, the
+    application stays ``DEPLOYING``, and neither ever times out — so
+    ``deploy_app`` returns successfully, ``get_app_status`` reads like a slow
+    first start forever, and nothing names the mismatch or mentions
+    ``MODEL_FINETUNE_BACKENDS``. The worker's own resource check does say it, but
+    only in ``external-cluster`` mode does the deploy get that far, and it says it
+    in the WORKER's log — not in anything the app's caller can read.
+
+    Answered from the CPU entry on purpose: the entry deployment asks for no GPU,
+    so it is the one part of the app that is still alive to say why the rest is not.
+
+    TWO different numbers, because the two questions they answer have different
+    remedies and only one of them is a configuration mistake:
+
+    ``gpus_in_cluster``  ``ray.cluster_resources()`` — the TOTAL the cluster owns,
+                         free or not. Whether this app can EVER place its runtimes
+                         here is a fact about the total, so ``sufficient`` is keyed
+                         to it and to nothing else.
+    ``gpus_free``        ``ray.available_resources()`` — what is unbooked at the
+                         instant of the call. Reported in ``detail`` and
+                         deliberately NOT escalated. A momentary zero is normal:
+                         the app's own placed replicas hold whole devices, so once
+                         this app is running its free count is legitimately short
+                         by exactly what it booked, and on an elastic cluster a
+                         neighbour's job finishing changes the answer a second
+                         later. Keying ``sufficient`` to it would make this
+                         diagnostic cry wolf at the app itself.
+
+    So a cluster that owns enough but has none free right now reads
+    ``sufficient: True`` with a ``detail`` that says the runtimes pend until a
+    device is released — which is the whole of the answer an operator needs, with
+    no alarm attached (#0370, re-review).
+
+    Never raises and never blocks the deploy. ``sufficient`` is deliberately
+    three-valued, because "not enough" and "cannot tell" are different answers:
+
+    ``True``   the cluster advertises at least ``gpus_required`` in TOTAL;
+    ``False``  it advertises fewer — the deployment will pend forever, and
+               ``advice`` says what to set;
+    ``None``   unknown. Either no GPU node has reported in yet, which is the
+               NORMAL state on an elastic SLURM cluster before the autoscaler
+               provides one, or Ray's resource view could not be read at all.
+               Not an error either way: reporting a shortfall that is merely a
+               cold autoscaler would be a false alarm, which is the failure mode
+               this whole report exists to avoid repeating in the other direction.
+    """
+    enabled = set(enabled)
+    required = len([b for b in GPU_BACKENDS if b in enabled])
+    report: Dict[str, Any] = {
+        "backends_enabled": sorted(enabled),
+        "gpus_required": required,
+        "gpus_in_cluster": None,
+        "gpus_free": None,
+        "sufficient": None,
+        "detail": "",
+        "advice": "",
+    }
+    try:
+        import ray
+
+        total = float(ray.cluster_resources().get("GPU", 0.0))
+        free = float(ray.available_resources().get("GPU", 0.0))
+    except Exception as e:  # pragma: no cover - needs a Ray-less replica
+        report["detail"] = (
+            f"could not read the cluster's GPU capacity ({type(e).__name__}: {e})"
+        )
+        return report
+
+    report["gpus_in_cluster"] = total
+    report["gpus_free"] = free
+    if required == 0:
+        report["sufficient"] = True
+        report["detail"] = "no GPU backend is enabled, so no GPU is required"
+        return report
+    if total >= required:
+        report["sufficient"] = True
+        if free < required:
+            # Reported, never escalated: `sufficient` stays True and `advice` stays
+            # empty. See the two-numbers block above — the alternative warns at the
+            # app's own replicas and at every elastic cluster between jobs.
+            report["detail"] = (
+                f"{total:g} GPU(s) visible but {free:g} free right now; {required} "
+                f"required by {', '.join(sorted(enabled))} — the runtime(s) that "
+                "cannot be placed pend until a device is released. Not a "
+                "configuration problem: this cluster owns enough. If this app is "
+                "already running, its own GPU replicas are part of what is booked."
+            )
+        else:
+            report["detail"] = (
+                f"{total:g} GPU(s) visible, {free:g} free, {required} required by "
+                f"{', '.join(sorted(enabled))}"
+            )
+        return report
+    if total == 0:
+        report["detail"] = (
+            "no GPU has reported into the cluster yet, so whether the "
+            f"{required} required by {', '.join(sorted(enabled))} will be "
+            "placeable cannot be told from here. On an elastic (SLURM) cluster "
+            "this is the normal state until the autoscaler provides a GPU node."
+        )
+        return report
+
+    report["sufficient"] = False
+    report["detail"] = (
+        f"this cluster advertises {total:g} GPU(s) but the enabled backends "
+        f"({', '.join(sorted(enabled))}) need {required} — each GPU runtime books "
+        "a WHOLE device. The runtime(s) that cannot be placed stay UPDATING with a "
+        "replica STARTING and the application stays DEPLOYING, indefinitely: none "
+        "of that is a failure state and none of it times out, so the app looks "
+        "like it is still starting rather than stuck. Its Hypha service is never "
+        "registered while a sibling pends, so get_app_status is the only surface "
+        "that can answer — which is where you are reading this."
+    )
+    report["advice"] = (
+        "Deploy one backend: pass "
+        'application_env_vars={"*": {"MODEL_FINETUNE_BACKENDS": "cellpose"}} '
+        "(or \"microsam\") to deploy_app, or launch the worker from an image that "
+        "bakes it. Each single backend has a 1-GPU floor. See the app README, "
+        "'Selecting backends'."
+    )
+    return report
+
 # Which backends each start_training parameter actually affects. The training UI
 # reads this (via get_training_capabilities) to show a control only for the
 # selected model's backend. Parameters common to both are listed under both.
@@ -89,7 +225,13 @@ TRAINING_PARAM_BACKENDS = {
     "n_objects_per_batch": ["microsam"],
     "patch_size": ["microsam"],
     "diam_mean": ["cellpose"],
+    "train_tile_size": ["cellpose"],
 }
+
+# cellpose locks the training tile to its backbone: cpsam raises
+# ValueError for any bsize != 256 (cellpose/train.py), while cpdino is free and
+# defaults to 384. Keyed on the model_type the caller passes, not the backbone.
+CELLPOSE_FIXED_TILE_SIZE = {"cpsam": 256}
 
 
 def _read_pip(name: str) -> List[str]:
@@ -226,6 +368,30 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+class _RecognisedRedeposit(Exception):
+    """Internal control flow: the weights just uploaded are already in the pool.
+
+    Raised from *inside* ``contribute``'s ``async with self._staged(...)`` block
+    and caught immediately outside it, so the duplicate's already-minted
+    ``put_file`` manifest row unwinds down ``_staged``'s discard path — the one
+    that is already proven and already tested. Returning normally from inside
+    that block instead would leave the stage open holding a row whose bytes
+    never landed, and ``_staged``'s own docstring says what follows: every
+    later ``commit`` raises ``File '<path>' does not exist in the artifact``,
+    which ``_commit_with_retry`` misreads as the read-after-write 404 and
+    retries for ~62 s before re-raising. One retried deposit would then take
+    the whole pool down rather than just its own merge — strictly worse than
+    the double-weighting this is fixing. Never crosses the RPC boundary: the
+    caller sees a normal return with ``deduplicated: true``. #0376.
+    """
+
+    def __init__(self, existing: Dict[str, Any]) -> None:
+        super().__init__(
+            f"weights already deposited as '{existing.get('contribution_id')}'"
+        )
+        self.existing = existing
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -236,9 +402,20 @@ def _write_file_atomic(path: Path, content: bytes) -> None:
     # because the training/export task maps and the GPU semaphore are
     # replica-local; the records a caller polls are on disk, so a teardown
     # between calls is invisible to the frontend.
+    #
+    # initial_replicas is 1, not 0, so the entry can SPEAK at deploy time (#0370).
+    # Measured 2026-11-13 on a one-GPU external cluster with both backends on: a
+    # GPU runtime that cannot be placed leaves the app in DEPLOYING forever, the
+    # proxy registers its Hypha service only once every sibling is serviceable, so
+    # nothing can call the app — and with initial_replicas 0 nothing wakes the entry
+    # either, so the placement warning below is never written. One CPU-only replica
+    # at deploy time puts it in deployments.<entry>.logs, which get_app_status
+    # returns while the app is still DEPLOYING. min_replicas stays 0, so #0045's
+    # requirement ("should also scale down if not used") is untouched: this replica
+    # goes away after downscale_delay_s like any other.
     autoscaling_config={
         "min_replicas": 0,
-        "initial_replicas": 0,
+        "initial_replicas": 1,
         "max_replicas": 1,
         "downscale_delay_s": 600.0,
         "upscale_delay_s": 0.0,
@@ -312,10 +489,39 @@ class EntryApp:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._s3 = await self._hypha.get_service("public/s3-storage")
+        # Resolved once per replica and cached for its whole life, so a plain
+        # proxy pinned to a client id the server later forgets would hang every
+        # call to the full method timeout — and `_health` below tests `is None`,
+        # which a dead handle passes. `put_file`/`get_file` only mint a
+        # presigned URL, so both are safe to re-send after a call that may
+        # already have landed.
+        self._s3 = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/s3-storage",
+            repeatable=("put_file", "get_file"),
+            logger=logger,
+        )
         self._http = httpx.AsyncClient(timeout=60.0)
         self._busy.start()
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
+        self._log_gpu_placement()
+
+    def _log_gpu_placement(self) -> None:
+        """Say in the entry's own log whether the GPU runtimes can be placed (#0370).
+
+        This is the signal that was missing. The entry replica reaches HEALTHY on
+        any node, so these lines are in ``deployments.<entry>.logs`` — which
+        ``get_app_status`` already returns — while the GPU deployments the operator
+        is actually staring at are still reporting ``UPSCALING`` with no reason
+        attached. A warning only: an over-subscribed cluster is a deployment
+        mistake to be told about, not a reason to refuse to serve the CPU methods
+        that work fine.
+        """
+        report = _gpu_placement_report(self._enabled_backends)
+        if report["sufficient"] is False:
+            logger.warning(f"⚠ GPU placement: {report['detail']} {report['advice']}")
+        else:
+            logger.info(f"GPU placement: {report['detail']}")
 
     @bioengine.health_check
     async def _health(self) -> None:
@@ -963,7 +1169,15 @@ class EntryApp:
         CPU-side without waking a GPU), ``detected`` (live runtime probe),
         ``unavailable`` (backend runtime down → ``trainable`` is None), or
         ``disabled`` (backend not deployed on this worker → ``trainable`` is
-        False)."""
+        False).
+
+        Also returns ``placement``, which says whether this cluster has enough
+        GPUs for the backends that are enabled — each GPU runtime books a whole
+        device, so two backends need two GPUs. When it does not,
+        ``placement.sufficient`` is False and ``placement.advice`` names
+        ``MODEL_FINETUNE_BACKENDS``; without it the only symptom is a backend
+        reading ``unavailable`` forever while the deployment reports
+        ``UPSCALING``, which never times out (#0370)."""
         import training
 
         microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
@@ -998,6 +1212,11 @@ class EntryApp:
             },
             "models": models,
             "parameters": self._training_parameter_schema(),
+            # Why a backend reads 'runtime unavailable' when nothing is broken
+            # (#0370): on a cluster with fewer GPUs than enabled backends the
+            # runtime never schedules, and the only other symptom is a permanent
+            # UPSCALING that never times out. Answered CPU-side; never wakes a GPU.
+            "placement": _gpu_placement_report(self._enabled_backends),
         }
 
     def _training_parameter_schema(self) -> List[Dict[str, Any]]:
@@ -1049,6 +1268,15 @@ class EntryApp:
             "lower it on small GPUs, raise it on large ones (8 fits vit_b on 24GB)."),
         patch_size: int = Field(512, ge=16, description="micro-sam only: square training patch side (clamped to the smallest image)."),
         diam_mean: float = Field(30.0, gt=0, description="cellpose only (cpsam/cpdino): mean object diameter in pixels."),
+        train_tile_size: Optional[int] = Field(
+            None, ge=16, description="cellpose only: square training tile side (cellpose "
+            "'bsize'). Omit for the backbone's own default — 256 for cpsam, 384 for "
+            "cpdino. A smaller tile trains faster and in less VRAM, at some cost in "
+            "accuracy: measured on synthetic narrow-object data, 256 matched the 384 "
+            "default to within noise while 128 scored below it, so lower this when "
+            "training cost is the constraint rather than to improve a narrow-data fit. "
+            "cpsam accepts 256 and nothing else, so this is settable for "
+            "cpdino/cpdino-vitb only."),
         batch_size: int = Field(1, ge=1, description="Training batch size."),
         learning_rate: float = Field(1e-5, gt=0, description="AdamW learning rate."),
         val_fraction: float = Field(0.2, ge=0.0, le=0.9, description="Val split fraction when val is omitted."),
@@ -1112,6 +1340,16 @@ class EntryApp:
                 "init_from_pool."
             )
 
+        # Refuse here rather than let cellpose raise it: train_seg checks this only
+        # after data prep and after the run has taken the single GPU training slot.
+        fixed_tile = CELLPOSE_FIXED_TILE_SIZE.get(model_type)
+        if train_tile_size is not None and fixed_tile is not None and train_tile_size != fixed_tile:
+            raise ValueError(
+                f"{model_type} trains at a fixed tile size of {fixed_tile} — cellpose rejects "
+                f"any other value. Omit train_tile_size, or use a cpdino model type, which "
+                f"accepts it."
+            )
+
         pool_provenance = None
         if init_from_pool:
             init_checkpoint, pool_provenance = await self._resolve_pool_init(
@@ -1151,7 +1389,7 @@ class EntryApp:
             batch_size=batch_size, learning_rate=learning_rate, diam_mean=diam_mean,
             val_fraction=val_fraction, n_samples=n_samples,
             resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
-            pool_provenance=pool_provenance,
+            pool_provenance=pool_provenance, train_tile_size=train_tile_size,
             patch_shape=(patch_size, patch_size), num_workers=0,
             metrics=selected_metrics,
         )
@@ -1662,8 +1900,21 @@ class EntryApp:
             "version": manifest.get("community_version", community_version),
             "path": paths["weights"],
             "sha256": manifest.get("weights_sha256"),
-            "selection_metric": manifest.get("selection_metric"),
-            "witness_metric": manifest.get("witness_metric"),
+            # A published manifest is the SECOND stored surface reached only from here —
+            # it does not pass through pool_wire_state — so both of the corrections that
+            # the pool index gets have to be repeated at this chokepoint or they are
+            # absent from every named community version. Both callers come through here.
+            #
+            # #0417: the manifest carries this digest too, so say which of the two it is.
+            # It has its own created_at, so no join is needed.
+            # #0418: the manifest also carries the basis wording 0.27.15 retracted, so
+            # correcting only the pool index would still leave a contributor reading the
+            # withdrawn claim off a named version.
+            "sha256_provenance": pool.digest_provenance(
+                manifest, digest_key="weights_sha256"
+            ),
+            "selection_metric": pool.corrected_metric(manifest.get("selection_metric")),
+            "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
 
     async def _next_free_community_version(self, am, pool_artifact_id: str, index: Dict[str, Any]) -> str:
@@ -1760,8 +2011,11 @@ class EntryApp:
         signature, samples_seen, L2 drift from the base it started from,
         provenance) and appends a stub to the pool index — one commit per
         contribution, so lineage is fully traceable. Averaging happens later, in
-        the coordinator's aggregate step; this only deposits. cpsam(cellpose)
-        sessions only for now."""
+        the coordinator's aggregate step; this only deposits. Idempotent by
+        weights digest: re-depositing a checkpoint the pool already holds
+        appends nothing and returns the first deposit's record with
+        deduplicated=true, so a client that lost its response to a gateway
+        timeout can safely retry. cpsam(cellpose) sessions only for now."""
         import time as _time
 
         import pool
@@ -1799,6 +2053,18 @@ class EntryApp:
         uploaded_at = _time.time()
         paths = pool.contribution_paths(cid)
 
+        # Resolved once and used by both the stored metadata and the value
+        # returned to the caller, so the two records cannot date the same
+        # contribution differently. Empty is the same as unset here: an
+        # exported-but-empty var would otherwise stamp "" and read as a known
+        # version. Read out here rather than mid-block because the recognised
+        # re-deposit below returns without reaching the metadata build.
+        app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+
+        # Set by the except clause below, and the only thing that distinguishes
+        # the two return paths.
+        redeposited: Optional[Dict[str, Any]] = None
+
         am, client = await self._pool_service(pool_token)
         try:
             try:
@@ -1811,23 +2077,36 @@ class EntryApp:
                 # the torch-free CPU entry; the GPU runtime inspects it, PUTs the weights
                 # to the presigned URL, and returns the signature + hashes, so nothing
                 # large or torch-dependent crosses the entry.
-                info = await runtime.prepare_contribution(session_id, w_url)
+                info = await runtime.prepare_contribution(
+                    session_id, w_url, model_type=model_type)
                 signature = info["architecture_signature"]
                 if index is None:
                     # A fine-tune preserves the parameter layout, so the first
                     # contribution's signature is the pool's reference signature
                     # (equals stock cpsam). The pool artifact itself must already
                     # exist (created out-of-band with the pool_token's scope).
-                    index = pool.empty_index(model_type, signature)
+                    #
+                    # #0070: the base commitment is written HERE, once, at pool
+                    # creation. It is built on the runtime because a commitment needs
+                    # the base's state_dict and this entry is torch-free; passing it
+                    # through is what makes the pool mergeable at all, since
+                    # assert_base_commitment refuses a pool that records none and has
+                    # no fallback by ruling. A bootstrap that omitted it produced a
+                    # pool that could never merge.
+                    index = pool.empty_index(
+                        model_type, signature, info.get("base_commitment"))
                 else:
                     pool.assert_compatible(index, model_type=model_type, signature=signature)
 
-                # Resolved once and used by both the stored metadata and the value
-                # returned to the caller, so the two records cannot date the same
-                # contribution differently. Empty is the same as unset here: an
-                # exported-but-empty var would otherwise stamp "" and read as a
-                # known version.
-                app_version = os.environ.get("BIOENGINE_ARTIFACT_VERSION") or None
+                # Earliest point a re-deposit is knowable: the digest is computed
+                # from the bytes by prepare_contribution, which has already PUT
+                # them. Identity is the digest alone — see
+                # pool.find_contribution_by_digest for why metadata is not part of
+                # it, and why decided_contribution_ids is not consulted. Leaving by
+                # raise, never by return: see _RecognisedRedeposit. #0376.
+                existing = pool.find_contribution_by_digest(index, info["weights_sha256"])
+                if existing is not None:
+                    raise _RecognisedRedeposit(existing)
 
                 metadata = pool.build_contribution_metadata(
                     contribution_id=cid,
@@ -1840,6 +2119,10 @@ class EntryApp:
                     samples_seen=samples_seen,
                     training_params=params,
                     l2_from_base=info["l2_from_base"],
+                    # #0122. .get, not ["…"]: an older runtime replica that predates
+                    # the label still answers this call, and it should write a null
+                    # label — which reads as undetermined — rather than raise.
+                    l2_from_base_basis=info.get("l2_from_base_basis"),
                     dataset_fingerprint=dataset_fingerprint,
                     solo_val_metric=solo_val_metric,
                     weights_sha256=info["weights_sha256"],
@@ -1865,11 +2148,48 @@ class EntryApp:
                     "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
                 )).raise_for_status()
                 await self._commit_with_retry(am, pool_artifact_id)
+        except _RecognisedRedeposit as recognised:
+            # _staged has already discarded the stage on the way out, so the pool
+            # is left exactly as it was found: same members, no open edit, and no
+            # index PUT ever issued.
+            redeposited = recognised.existing
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
                 pass
+
+        if redeposited is not None:
+            # The bytes did cross the wire — prepare_contribution PUT them before
+            # anything could know they were a duplicate — so bytes_up counts them;
+            # that counter is "weight-bytes moved", and pretending they did not
+            # move would understate the cost of exactly the retries this handles.
+            # contributions does NOT move: the pool gained no member, and that is
+            # the number quoted as "deposits".
+            self._bump_transport(bytes_up=int(info["n_bytes"]))
+            return {
+                "schema_version": pool.SCHEMA_VERSION,
+                "app_version": app_version,
+                # The FIRST deposit's id, and the pool's own record of what it
+                # holds, so a client that lost its response to a gateway timeout
+                # ends up with the record it would have had. samples_seen is read
+                # back off the index for the same reason: if this retry reported a
+                # different count, the stored member is the one the soup will
+                # weight. l2_from_base comes from this call because the index does
+                # not carry it — it is recomputed from the same bytes against the
+                # same stock base, not read back from the first deposit.
+                "contribution_id": redeposited.get("contribution_id"),
+                "pool_artifact_id": pool_artifact_id,
+                "architecture_signature": redeposited.get("architecture_signature", signature),
+                "weights_sha256": info["weights_sha256"],
+                "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
+                "l2_from_base": info["l2_from_base"],
+                # #0122. The caller keeps THIS record, so it carries the label for
+                # the same reason the stored one does: a distance whose origin is
+                # not named is not comparable with anyone else's.
+                "l2_from_base_basis": info.get("l2_from_base_basis"),
+                "deduplicated": True,
+            }
 
         self._bump_transport(bytes_up=int(info["n_bytes"]), contributions=1)
         return {
@@ -1885,6 +2205,12 @@ class EntryApp:
             "weights_sha256": info["weights_sha256"],
             "samples_seen": samples_seen,
             "l2_from_base": info["l2_from_base"],
+            "l2_from_base_basis": info.get("l2_from_base_basis"),
+            # False, not absent, on the fresh path. A key present only when true
+            # cannot be dated: a client holding a response without it cannot tell
+            # "fresh deposit" from "a release that predates de-duplication" —
+            # the defect app_version exists to avoid (#0116, #0140). #0376.
+            "deduplicated": False,
         }
 
     @bioengine.method
@@ -1909,9 +2235,11 @@ class EntryApp:
         pool_token: str = Field(..., description="Token with read access to the pool. Scoped to the pool, not the app's own token."),
     ) -> Dict[str, Any]:
         """The pool's state projected onto the campaign-page wire contract
-        (schema_version 0.13.0-draft): merge_trigger, baseline_metric (role=witness),
+        (schema_version 0.15.0-draft): merge_trigger, baseline_metric (role=witness),
         soups[] (published merges), empty_merges[] (merges that admitted nothing),
-        and enriched contribution stubs. Role-tagged metrics come straight from
+        and enriched contribution stubs — each carrying that contribution's
+        weights_sha256, so a contributor whose deposit response was lost can tell a
+        landed upload from one it must retry. Role-tagged metrics come straight from
         storage — the role is a property of the artifact, not assigned here."""
         import pool
 
@@ -2011,6 +2339,7 @@ class EntryApp:
         witness_split: Dict[str, Any] = Field(..., description="{artifact_id, sha256} provenance of split B."),
         eps: float = Field(0.0, ge=0.0, description="Pre-registered non-degradation tolerance on split A (0 = strict). Do NOT tune post-hoc to hit an inclusion rate."),
         max_batch: int = Field(32, ge=1, description="Max newly-arrived candidates weighed at this merge; overflow is deferred (and re-scored) to the next."),
+        min_members: Optional[int] = Field(None, ge=1, description="Refuse to publish a head with fewer members than this. Default: the published head's own member count (1 if there is no head), so quarantining can never silently thin the soup."),
         diam_mean: float = Field(30.0, gt=0, description="Mean object diameter in pixels for auto-segmentation."),
     ) -> Dict[str, Any]:
         """Coordinator-only greedy merge — grow the community soup by full-weight
@@ -2089,12 +2418,26 @@ class EntryApp:
                     replica_dl.get(result["replica"], 0) + int(result["soup_dl_bytes"]))
                 return result
 
+            # What the pool recorded for each member's bytes, by path. Carried on
+            # every spec so the runtime can reject a bad FRESH download at the point
+            # it arrives — the preflight below hashes every member once per merge,
+            # but the member cache is evicted under memory pressure, so a member can
+            # be re-fetched mid-merge after it was verified.
+            sha_by_path: Dict[str, Any] = {
+                c.get("weights_path"): c.get("weights_sha256")
+                for c in index.get("contributions", [])
+            }
+
             async def _specs(paths: List[str]) -> List[Dict[str, str]]:
                 out = []
                 for p in paths:
                     if p not in url_cache:
                         url_cache[p] = await am.get_file(pool_artifact_id, file_path=p)
-                    out.append({"key": p, "url": url_cache[p]})
+                    spec = {"key": p, "url": url_cache[p]}
+                    recorded = sha_by_path.get(p)
+                    if pool.is_usable_digest(recorded):
+                        spec["sha256"] = recorded
+                    out.append(spec)
                 return out
 
             # Resume journal. A merge is 2*len(batch)+3 scoring passes and each pass
@@ -2118,18 +2461,56 @@ class EntryApp:
             wit_id = pool.split_identity(witness_split)
             splits = {gate_id: (gate_imgs, gate_gts), wit_id: (wit_imgs, wit_gts)}
 
-            async def _score(member_paths: List[str], split_id: str) -> float:
+            async def _score(member_paths: List[str], split_id: str) -> Dict[str, Any]:
+                """One scoring pass as ``{"f1": scalar, "per_image": vector}``.
+
+                Both halves go through the journal together. Returning only the
+                scalar and re-deriving the vector later is not available: a resumed
+                merge never runs the pass again, so a vector that is not banked here
+                is gone, and the published record would be missing its breakdown on
+                exactly the merges that were interrupted.
+                """
                 key = pool.score_key(split_id, member_paths)
                 if key in journal["scores"]:
-                    return float(journal["scores"][key])
+                    # usable_merge_journal() prunes any entry missing its vector, so a
+                    # hit on `scores` is a hit on both maps.
+                    return {"f1": float(journal["scores"][key]),
+                            "per_image": list(journal["per_image_scores"][key])}
                 imgs, gts = splits[split_id]
                 # A journal hit returns above without folding, which is correct: that
                 # pass transported nothing on this run.
-                value = _fold(await runtime.score_soup(
-                    await _specs(member_paths), imgs, gts, diam_mean))["f1"]
-                pool.record_score(journal, key, value)
+                scored = _fold(await runtime.score_soup(
+                    await _specs(member_paths), imgs, gts, diam_mean,
+                    base_commitment=index.get("base_commitment")))
+                value, per_image = float(scored["f1"]), list(scored["per_image"])
+                pool.record_score(journal, key, value, per_image=per_image)
                 await self._write_merge_journal(am, pool_artifact_id, journal)
-                return value
+                return {"f1": value, "per_image": per_image}
+
+            def _as_pass(metric: Dict[str, Any]) -> Dict[str, Any]:
+                """A previously published metric record read back as a scoring pass,
+                so a merge that reuses the baseline's number carries its breakdown too
+                rather than dropping to a bare scalar. A record written before this app
+                banked vectors has none, and ``.get`` is deliberate: an absent key and
+                a null value must read alike here, because they mean the same thing."""
+                return {"f1": float(metric["aggregate"]),
+                        "per_image": list(metric.get("per_image") or [])}
+
+            def _metric(role: str, scored: Dict[str, Any], basis: str) -> Dict[str, Any]:
+                """One metric record from one scoring pass, breakdown attached.
+
+                The vector and its basis are passed together or not at all, from one
+                place, so no call site can publish half the pair. It is empty only for
+                a number read back out of a pool written before this app measured
+                breakdowns; that publishes null rather than inventing a breakdown for
+                a number that was never measured with one.
+                """
+                vector = scored.get("per_image") or None
+                return pool.round_metric(
+                    role=role, aggregate=round(float(scored["f1"]), 4), aggregate_basis=basis,
+                    per_image=vector,
+                    per_image_basis=pool.PER_IMAGE_BASIS if vector else None,
+                )
 
             cc = pool.current_community(index)
             cur_member_ids: List[str] = []
@@ -2159,6 +2540,90 @@ class EntryApp:
             if refusal:
                 raise ValueError(f"aggregate() refused this merge: {refusal}")
 
+            # ---- Provenance, before a single byte is souped (#0139) ----------
+            #
+            # Until now nothing checked that a member's bytes were the bytes its
+            # contribution attested to. The digest was written at upload and then
+            # never read, so a member with no digest and a member whose digest was
+            # simply never checked produced the same published checkpoint, and
+            # neither was visible in anything the merge returned.
+            #
+            # A member that fails here is QUARANTINED, not fatal: it is excluded
+            # from the soup, left in the pool, and recorded with a machine-readable
+            # reason. The merge of the rest proceeds. Two deliberate consequences:
+            #
+            # - This runs AFTER soup_admission. Admission is a memory bound computed
+            #   from recorded sizes and nothing is downloaded to evaluate it;
+            #   verifying first would pull tens of gigabytes to the replica before
+            #   the check that says the merge cannot fit in RAM. Admission over the
+            #   unquarantined set is conservative — it refuses a superset — so the
+            #   order is safe in the direction that matters.
+            # - A quarantined CANDIDATE is still marked decided below, with the rest
+            #   of the batch. Leaving it undecided would re-download and re-flag it
+            #   on every future merge, and because undecided_contributions is
+            #   chronological and max_batch caps the batch, a growing head of
+            #   permanently-quarantined rows would starve real candidates out of
+            #   every batch forever. "Kept in the pool" means its record and its
+            #   weights stay in the artifact, not that it is re-weighed each time.
+            verify_records = [by_id[cid] for cid in cur_member_ids] + list(batch)
+            to_hash = pool.members_to_hash(verify_records)
+            actual_by_path: Dict[str, str] = {}
+            if to_hash:
+                actual_by_path = _fold(
+                    await runtime.verify_members(await _specs(to_hash)))["digests"]
+            _, quarantined = pool.digest_quarantine(verify_records, actual_by_path)
+            quarantined_ids = {q["contribution_id"] for q in quarantined}
+            q_counts = pool.quarantine_counts(quarantined)
+            floor = int(min_members) if min_members is not None else max(1, len(cur_member_ids))
+
+            for q in quarantined:
+                if q["reason"] == pool.QUARANTINE_DIGEST_MISMATCH:
+                    # Not a skip. The digest IS recorded and the bytes in the pool do
+                    # not hash to it, which means what is stored is not what was
+                    # deposited. Logged at error with everything a human needs to
+                    # open it as its own incident: which pool, which contribution,
+                    # and both hashes.
+                    logger.error(
+                        f"🚨 INTEGRITY: pool '{pool_artifact_id}' contribution "
+                        f"'{q['contribution_id']}' ({q['weights_path']}) hashes to "
+                        f"{q['actual_sha256']} but the pool recorded "
+                        f"{q['expected_sha256']}. Quarantined from this merge. The "
+                        f"stored bytes are not the bytes that were contributed; this "
+                        f"needs a human, not a retry."
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ Quarantined contribution '{q['contribution_id']}' "
+                        f"({q['weights_path']}): {q['reason']} — the pool records "
+                        f"{q['expected_sha256']!r} as its digest, which is not a "
+                        f"sha256, so its bytes cannot be checked against anything."
+                    )
+
+            # The head's own members are checked too, and a head that cannot be
+            # reconstituted stops the merge rather than quietly becoming a different
+            # soup under the same name. See head_integrity_refusal for why this one
+            # is fatal where a candidate's failure is not.
+            head_refusal = pool.head_integrity_refusal(
+                head_version=(cc or {}).get("version"),
+                head_member_ids=cur_member_ids,
+                quarantined_ids=quarantined_ids,
+                floor=floor,
+            )
+            if head_refusal:
+                raise ValueError(f"aggregate() refused this merge: {head_refusal}")
+
+            batch_all_ids = [c["contribution_id"] for c in batch]
+            cur_member_ids = [cid for cid in cur_member_ids if cid not in quarantined_ids]
+            cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
+            batch = [c for c in batch if c["contribution_id"] not in quarantined_ids]
+            cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
+            if quarantined:
+                logger.info(
+                    f"🔒 {len(quarantined)} member(s) quarantined from this merge "
+                    f"({q_counts}); {len(cur_member_ids)} head member(s) and "
+                    f"{len(batch)} candidate(s) carry a verified digest."
+                )
+
             # Stock baseline on A and B (anchor of the witness curve — the level to beat).
             baseline = index.get("baseline")
             if baseline is None:
@@ -2166,15 +2631,14 @@ class EntryApp:
                 stock_b = await _score([], wit_id)
                 baseline = {
                     "model": "stock-cpsam",
-                    "selection_metric": pool.round_metric(
-                        role="selection", aggregate=round(stock_a, 4), aggregate_basis=pool.SELECTION_BASIS),
-                    "witness_metric": pool.round_metric(
-                        role="witness", aggregate=round(stock_b, 4), aggregate_basis=pool.BASELINE_BASIS),
+                    "selection_metric": _metric("selection", stock_a, pool.SELECTION_BASIS),
+                    "witness_metric": _metric("witness", stock_b, pool.BASELINE_BASIS),
                     "created_at": time.time(),
                 }
 
-            cur_a = (await _score(cur_member_paths, gate_id)
-                     if cur_member_paths else baseline["selection_metric"]["aggregate"])
+            cur = (await _score(cur_member_paths, gate_id)
+                   if cur_member_paths else _as_pass(baseline["selection_metric"]))
+            cur_a = cur["f1"]
 
             # Best-first ordering: individual marginal of adding each candidate to the
             # current soup, on A. Re-scored against the CURRENT head (a stale solo
@@ -2182,17 +2646,23 @@ class EntryApp:
             marg = {}
             for c in batch:
                 cid = c["contribution_id"]
-                marg[cid] = await _score(cur_member_paths + [cand_path[cid]], gate_id)
+                marg[cid] = (await _score(cur_member_paths + [cand_path[cid]], gate_id))["f1"]
             ordered = sorted(batch, key=lambda c: marg[c["contribution_id"]], reverse=True)
 
             s_paths = list(cur_member_paths)
             s_ids = list(cur_member_ids)
             s_a = cur_a
+            # The admitted head's own scoring pass, carried alongside its scalar: the
+            # record published below must breakdown the number the gate actually
+            # decided on, and re-scoring the head afterwards to recover a vector would
+            # be a second pass that is not guaranteed to agree with the first.
+            s_pass = cur
             members_record: List[Dict[str, Any]] = []
             admitted: List[str] = []
             for c in ordered:
                 cid = c["contribution_id"]
-                trial_a = await _score(s_paths + [cand_path[cid]], gate_id)
+                trial = await _score(s_paths + [cand_path[cid]], gate_id)
+                trial_a = trial["f1"]
                 included = trial_a >= (s_a - eps)
                 members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
                                        "gate_score": round(trial_a, 4), "included": bool(included)})
@@ -2200,19 +2670,28 @@ class EntryApp:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)
                     s_a = trial_a
+                    s_pass = trial
                     admitted.append(cid)
 
             changed = bool(admitted)
             baseline_version = cc["version"] if (cc and cc.get("path")) else "stock-cpsam"
 
             if changed:
+                # Last gate before anything is written: a merge does not publish a
+                # thinner soup than it was told to, and it says so rather than
+                # shipping one quietly. With the default floor this cannot fire —
+                # the head's survivors already cleared it above and admitting only
+                # adds — so it is the explicit min_members that this enforces.
+                thin = pool.publish_floor_refusal(
+                    member_ids=s_ids, floor=floor, quarantined=quarantined)
+                if thin:
+                    raise ValueError(f"aggregate() refused this merge: {thin}")
                 new_version = await self._next_free_community_version(am, pool_artifact_id, index)
                 head_a = s_a
-                head_b = await _score(s_paths, wit_id)
-                sel_metric = pool.round_metric(
-                    role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.SELECTION_BASIS)
-                wit_metric = pool.round_metric(
-                    role="witness", aggregate=round(head_b, 4), aggregate_basis=pool.WITNESS_BASIS)
+                wit_pass = await _score(s_paths, wit_id)
+                head_b = wit_pass["f1"]
+                sel_metric = _metric("selection", s_pass, pool.SELECTION_BASIS)
+                wit_metric = _metric("witness", wit_pass, pool.WITNESS_BASIS)
                 paths = pool.community_paths(new_version)
                 # Crash-safe: commit weights + manifest FIRST (index still points at
                 # the old head), then repoint the index in a SECOND commit. The runtime
@@ -2220,15 +2699,55 @@ class EntryApp:
                 # never traverse the CPU entry.
                 async with self._staged(am, pool_artifact_id):
                     w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
-                    mat = _fold(await runtime.materialize_soup(await _specs(s_paths), w_url))
+                    mat = _fold(await runtime.materialize_soup(
+                        await _specs(s_paths), w_url,
+                        base_commitment=index.get("base_commitment")))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
+                    # #0070 requirement 4: the contributors' own measured diameters go in
+                    # the manifest. The runtime is given weights PATHS and never learns a
+                    # contribution id, so the mapping is made here, where s_paths and
+                    # s_ids are the parallel lists the gate built. An unmapped key RAISES
+                    # rather than recording a null id: a diameter attributed to the wrong
+                    # contributor, or to nobody, is worse than one not recorded, and this
+                    # is the only place the correspondence is checkable.
+                    # A runtime that predates #0070 returns no such keys. entry and the
+                    # Cellpose runtime are SEPARATE Ray deployments and can sit at
+                    # different app versions during a rolling update, so this must not
+                    # KeyError — and must not quietly write null either, because a reader
+                    # has to tell "this runtime did not report them" from "this soup had
+                    # no contributor diameters". The published weights are correct either
+                    # way: the carry-through happens inside uniform_soup.
+                    if "non_learned_inherited" in mat:
+                        _cid_of = dict(zip(s_paths, s_ids))
+                        member_nl = []
+                        for _nl in (mat.get("member_non_learned") or []):
+                            _cid = _cid_of.get(_nl.get("key"))
+                            if _cid is None:
+                                raise RuntimeError(
+                                    "materialize_soup returned a member key that is not "
+                                    f"among the admitted paths: {_nl.get('key')!r}")
+                            member_nl.append({
+                                "contribution_id": _cid,
+                                **{k: v for k, v in _nl.items() if k != "key"},
+                            })
+                        non_learned_block = pool.inherited_non_learned(
+                            mat["non_learned_inherited"],
+                            source=mat["non_learned_source"])
+                    else:
+                        member_nl = None
+                        non_learned_block = pool.unreported_non_learned(
+                            reason="the Cellpose runtime serving this merge returned no "
+                                   "non_learned_inherited field, so it predates #0070")
                     manifest = pool.build_community_manifest(
                         community_version=new_version, combine="uniform",
                         selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
                         selection_metric=sel_metric, witness_metric=wit_metric, members=members_record,
+                        quarantined=quarantined,
                         architecture_signature=index.get("architecture_signature"),
                         weights_sha256=head_sha, created_at=time.time(),
+                        non_learned=non_learned_block,
+                        member_non_learned=member_nl,
                     )
                     m_url = await am.put_file(pool_artifact_id, file_path=paths["manifest"])
                     (await self._http_retry("PUT", m_url, content=json.dumps(manifest).encode("utf-8"), timeout=120.0)).raise_for_status()
@@ -2246,8 +2765,7 @@ class EntryApp:
                 head_bytes_out = 0
                 # Nothing admitted: the selection metric records the bar the assessed
                 # set failed to beat; there is no witness point (nothing re-measured).
-                sel_metric = pool.round_metric(
-                    role="selection", aggregate=round(head_a, 4), aggregate_basis=pool.EMPTY_SELECTION_BASIS)
+                sel_metric = _metric("selection", cur, pool.EMPTY_SELECTION_BASIS)
                 wit_metric = None
 
             soup_bytes_down = sum(replica_dl.values())
@@ -2260,7 +2778,9 @@ class EntryApp:
             self._bump_transport(bytes_down=soup_bytes_down)
 
             index["baseline"] = baseline
-            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + [c["contribution_id"] for c in batch]
+            # batch_all_ids, not batch: a quarantined candidate is decided too. See
+            # the quarantine block above for why it is not left to be re-weighed.
+            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + batch_all_ids
             # bytes_in counts the assessed set (the batch weighed at this merge);
             # bytes_out is the published head, 0 when nothing was admitted. n_bytes is
             # written per contribution in a different function, so if any assessed member
@@ -2279,8 +2799,19 @@ class EntryApp:
             pool.append_merge(index, {
                 "published_version": new_version, "baseline_version": baseline_version,
                 "members": members_record,
+                # Kept out of "members": a members row reads "evaluated, not
+                # included" and carries the gate scores that decision rests on. A
+                # quarantined member was never evaluated and has no such scores, so
+                # filing it there would report an integrity failure as a rejection.
+                "quarantined": quarantined,
+                "quarantine_counts": q_counts,
                 "selection_metric": sel_metric, "witness_metric": wit_metric,
-                "global_sha256": head_sha, "transport": merge_transport,
+                "global_sha256": head_sha,
+                # Written unconditionally, null included: a basis that is absent when
+                # there is no digest reads the same as one absent because the app
+                # predates the stamp, which is the ambiguity it exists to remove.
+                "global_sha256_basis": pool.CURRENT_DIGEST_BASIS if head_sha else None,
+                "transport": merge_transport,
                 "deferred": deferred_ids, "created_at": time.time(),
             })
             async with self._staged(am, pool_artifact_id):
@@ -2300,8 +2831,26 @@ class EntryApp:
             "published_version": new_version,
             "admitted": admitted,
             "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
+            # Reported separately from "rejected" and from "admitted", and always
+            # present even when empty: a caller that wants to know whether this
+            # merge excluded anything on provenance grounds must not have to infer
+            # it from a count that only appears when it is non-zero.
+            "quarantined": quarantined,
+            "quarantine_counts": q_counts,
+            "n_admitted_members": len(s_ids),
+            "n_quarantined": len(quarantined),
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
+            # The digest of the head this call just published, and which of the two
+            # things it digests. This is the moment the #0417 false alarm happens —
+            # someone re-merges an identical member set, gets a number, compares it
+            # against a stored one and concludes corruption — so the attribution is
+            # returned here, where both numbers are in the caller's hands, and not
+            # only on a page they would have to go and read.
+            "global_sha256": head_sha,
+            "global_sha256_provenance": pool.digest_provenance(
+                {"global_sha256": head_sha, "global_sha256_basis": pool.CURRENT_DIGEST_BASIS}
+            ),
             "witness_metric": round(head_b, 4) if head_b is not None else None,
             "baseline": baseline,
             "n_members": len(s_ids),

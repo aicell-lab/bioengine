@@ -169,7 +169,10 @@ def async_init(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     Ray Serve replicas call ``check_health`` repeatedly; the framework
     invokes the marked method once on the first ``check_health`` call,
-    before traffic is admitted.
+    before traffic is admitted. That first call is made by Serve from
+    replica initialisation and is awaited, so raising here is an
+    initialisation failure rather than a health-check failure — which is
+    why this hook, unlike ``smoke_test``, really does gate traffic.
     """
     setattr(fn, _KIND_ATTR, "async_init")
     return fn
@@ -178,8 +181,20 @@ def async_init(fn: Callable[..., Any]) -> Callable[..., Any]:
 def smoke_test(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Mark a method as the startup smoke test.
 
-    Runs once after ``async_init``. If it raises, the replica is marked
-    unhealthy and Ray Serve never admits traffic.
+    Started once after ``async_init``, as a background task that the first
+    ``check_health`` call does not await. So the first call cannot see it
+    fail, the replica is admitted, and the failure is reported on a later
+    poll, after which Serve still needs three consecutive failed checks to
+    condemn the replica, the first of which lands immediately. So a replica
+    whose smoke test has failed keeps serving traffic for roughly two
+    ``health_check_period_s`` (~20 s at Ray's 10 s default). The deployment
+    still reads ``HEALTHY`` for that window; condemnation is what flips it to
+    ``UNHEALTHY``. Its replacement then repeats the whole cycle, so a smoke
+    test that fails every time is a restart loop that keeps answering
+    requests, not one bounded window.
+
+    It diagnoses a broken replica; it does not gate traffic. A check that has
+    to gate traffic belongs in ``async_init``.
     """
     setattr(fn, _KIND_ATTR, "smoke_test")
     return fn
@@ -246,7 +261,13 @@ def app(
             ``--enable-container-runtime`` (single-machine mode only).
         env_vars: Static env vars baked into the replica's runtime_env.
             Secrets passed at deploy time are layered on top.
-        max_ongoing_requests: Concurrent request cap per replica.
+        max_ongoing_requests: Concurrent request cap per replica of THIS
+            deployment. ``deploy_app`` takes a parameter of the same name
+            that is a different limit — how many callers the application's
+            proxy admits in total — and the two are independent, so setting
+            this one does not change what the proxy admits. ``get_app_status``
+            reports this value under ``deployments.<ClassName>`` and the
+            proxy's at the top level.
         ray_actor_options: Escape hatch for advanced Ray Serve options
             (e.g. ``resources={"custom": 1}``). Deep-merged on top of the
             flat args above.

@@ -9,11 +9,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from haikunator import Haikunator
 from hypha_rpc import connect_to_server
-from hypha_rpc.rpc import RemoteException, RemoteService
+from hypha_rpc.rpc import RemoteService
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 import ray
 from ray import serve
+from ray.exceptions import ActorDiedError
+
+# Imported rather than hardcoded so a Ray upgrade that moves these fails loudly
+# here instead of silently never detecting a lost controller again.
+from ray.serve._private.constants import SERVE_CONTROLLER_NAME, SERVE_NAMESPACE
 from ray.serve.config import AutoscalingConfig
 
 from bioengine import __version__
@@ -27,32 +32,9 @@ from bioengine.utils import (
     ensure_applications_collection,
     get_static_site_url,
     latest_committed_version,
+    stale_service_kind,
 )
 
-
-# A hypha_rpc service proxy is pinned to ONE client instance of the remote
-# service. That instance can change client id at any time — the artifact manager
-# re-registered under a new one with nothing restarted — and hypha_rpc's own
-# websocket reconnect does not re-resolve cached proxies, so every later call
-# addresses a client that no longer exists and hangs to timeout. Split by whether
-# the call can have reached the server: a send-side failure provably did not, so
-# retrying it is safe even for a write; a timeout or a mid-call disconnect may
-# already have landed, so retrying those could double-execute a create or commit.
-#
-# hypha_rpc 0.21.40 does ship a stale-service retry, but it is installed by
-# ``RPC.get_remote_service`` and so reaches only the workspace-manager proxy and
-# services fetched by ``client_id:service_id`` URI. A service resolved by name
-# through ``server.get_service`` arrives off the ordinary decode path as a plain
-# ObjectProxy with no retry on it — this handle included.
-_PROXY_NEVER_SENT_MARKERS = (
-    "failed to send the request",
-    "websocket reconnection timed out",
-)
-_PROXY_MAYBE_SENT_MARKERS = (
-    "client disconnected",
-    "method call timed out",
-    "service not found",
-)
 
 # Reads are safe to repeat even when the first attempt may already have run, so
 # they are retried on either failure kind. This matters because the call that
@@ -68,23 +50,6 @@ _RETRY_SAFE_READS = frozenset(
 # only these three can be silenced, and only on the retry — the first attempt
 # should still count as a real view.
 _SILENCEABLE_READS = frozenset({"read", "list", "get_file"})
-
-
-def _stale_proxy_kind(exc: BaseException) -> Optional[str]:
-    """``"never_sent"``, ``"maybe_sent"``, or ``None`` if not a stale-proxy failure."""
-    if isinstance(exc, RemoteException):
-        # Its message is ``"RemoteError:" + value + "\n" + remote traceback``, and
-        # the server runs hypha_rpc too, so any marker below can appear in that
-        # traceback. Arriving at all proves the remote handler ran.
-        return None
-    message = str(exc).lower()
-    if any(marker in message for marker in _PROXY_NEVER_SENT_MARKERS):
-        return "never_sent"
-    if isinstance(exc, asyncio.TimeoutError) or any(
-        marker in message for marker in _PROXY_MAYBE_SENT_MARKERS
-    ):
-        return "maybe_sent"
-    return None
 
 
 class _ReconnectingArtifactManager:
@@ -143,7 +108,7 @@ class _ReconnectingArtifactManager:
             try:
                 return await getattr(self._proxy, name)(*args, **kwargs)
             except Exception as exc:
-                kind = _stale_proxy_kind(exc)
+                kind = stale_service_kind(exc)
                 if kind is None:
                     raise
                 self._logger.warning(
@@ -175,13 +140,79 @@ def _is_serve_controller_gone(exc: BaseException) -> bool:
     or — when a cached client handle outlives the controller — "doesn't have
     a handle for <actor>". Both mean the controller must be re-bootstrapped
     by a fresh ``serve.run`` rather than merely reconnected.
+
+    A cached client whose controller is destroyed outright raises
+    ``ActorDiedError`` instead, carrying none of those strings. It is matched
+    on the actor it names rather than on the death text, and only for an
+    actual death: ``ActorUnavailableError`` means a live controller that is
+    briefly unreachable, which must not trigger a re-bootstrap.
+
+    A worker that outlives a genuine head restart gets a bare ``Exception``
+    naming only an actor id, which nothing here can identify. That one is
+    decided by ``_serve_controller_is_missing`` at the call site.
     """
     msg = str(exc).lower()
+    if isinstance(exc, ActorDiedError) and SERVE_CONTROLLER_NAME.lower() in msg:
+        return True
     return (
         "no serve instance running" in msg
         or "there is no serve instance" in msg
         or "doesn't have a handle for" in msg
     )
+
+
+def _serve_controller_is_missing() -> bool:
+    """Whether the Serve controller actor is absent from the Ray cluster.
+
+    ``serve.status`` is the only Serve API that passes
+    ``raise_if_no_controller_running=False`` (``ray/serve/api.py``), so a lost
+    controller makes it *return* an empty status rather than raise — and an
+    empty status is also exactly what a healthy cluster with no applications
+    returns. Asking Ray for the actor is what separates the two.
+
+    It is also the only reliable answer for the raising case: a worker that
+    survives a head restart gets a bare ``Exception`` reading "Failed to submit
+    task to actor … Can't find actor …", which names no controller and belongs
+    to no Serve-specific type, so nothing about the exception identifies it.
+
+    Anything other than a clean "not found" reports the controller present, so
+    an unrelated Ray failure can never trigger a recovery sweep.
+    """
+    if not ray.is_initialized():
+        # ray.get_actor would auto-start a local Ray instance here. A
+        # disconnected worker is check_connection's problem, not a lost
+        # controller, and a monitoring probe must not bring a cluster up.
+        return False
+    try:
+        ray.get_actor(SERVE_CONTROLLER_NAME, namespace=SERVE_NAMESPACE)
+        return False
+    except ValueError:
+        return True
+    except Exception:
+        return False
+
+
+async def _controller_is_missing_off_loop() -> bool:
+    """``_serve_controller_is_missing`` without blocking the event loop.
+
+    The predicate is a blocking Ray RPC. Called inline from the async monitor it
+    froze the whole worker process for the ~27 s a ``ray://`` actor lookup takes
+    against an unreachable head, which stops the heartbeat as well as the
+    monitoring.
+
+    The timeout bounds the tick, not the lookup: abandoning the await leaves the
+    thread running until Ray returns. Timing out therefore has to answer, and it
+    answers "present" — the same answer the predicate gives for anything that is
+    not a clean not-found. A head too unreachable to look up is also too
+    unreachable for the ``serve.run`` a recovery sweep would need.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_serve_controller_is_missing),
+            timeout=_CONTROLLER_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return False
 
 
 def _belongs_to_worker_workspace(
@@ -290,6 +321,12 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
+# How long one monitor tick waits for the controller actor lookup. Measured
+# 0.10-0.12 s against a live head and 27.4 s against an unreachable one, so
+# this is ~100x the healthy case and still far inside the worker's 120 s
+# heartbeat budget.
+_CONTROLLER_LOOKUP_TIMEOUT_SECONDS = 10.0
+
 # Mint a proxy's replacement Hypha token once this much of its life has passed.
 # It is a deploy-time credential with a 30-day TTL and a deploy is the only
 # thing that used to mint one, so an app the worker *adopted* rather than
@@ -330,6 +367,7 @@ PUBLIC_APP_STATUS_FIELDS = (
     "deployments",
     "gpu_enabled",
     "application_resources",
+    "resource_shortfall",
     "available_methods",
     "max_ongoing_requests",
     "scaling",
@@ -357,6 +395,9 @@ PUBLIC_DEPLOYMENT_FIELDS = (
     "message",
     "replica_states",
     "replicas",
+    # The per-replica cap the app's own source declares, and the top-level
+    # ``max_ongoing_requests`` it is so easily confused with is already public.
+    "max_ongoing_requests",
 )
 
 
@@ -377,6 +418,26 @@ def public_app_status(status: Dict[str, Any]) -> Dict[str, Any]:
     return public
 
 
+def _require_deployment_map(value: Any, parameter: str) -> Dict[str, Any]:
+    """Return a public deployment-keyed map, refusing anything that is not one.
+
+    Replaces the ``value or {}`` idiom these parameters used to normalise with.
+    ``or {}`` only rescues the FALSY wrong types: a truthy non-dict passes
+    straight through and dies on the next ``.get()``/``.items()`` with an
+    AttributeError naming neither the parameter nor the value (#0406). The
+    ``@schema_method`` annotations document the shape but do not enforce it, so
+    this is the only check between an RPC caller and that crash.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{parameter} must be a dict keyed by deployment name, or None; "
+            f"got {type(value).__name__}."
+        )
+    return value
+
+
 def _validate_scaling_map(
     scaling: Optional[Dict[str, Any]],
     user_deployment_names: Tuple[str, ...],
@@ -389,7 +450,7 @@ def _validate_scaling_map(
     rather than one naming the ``scaling`` entry they got wrong, which is the
     whole reason this validation exists.
     """
-    for dep_name, dep_scaling in (scaling or {}).items():
+    for dep_name, dep_scaling in _require_deployment_map(scaling, "scaling").items():
         if dep_name not in user_deployment_names:
             raise ValueError(
                 f"scaling key '{dep_name}' is not a user deployment in "
@@ -435,6 +496,46 @@ def _validate_scaling_map(
                     f"autoscaling_config key(s) {unknown_keys}; Ray "
                     f"Serve would drop them silently. Valid keys: "
                     f"{sorted(valid_keys)}."
+                )
+
+
+_DEPLOYMENT_LOG_KEYS = ("logs_tail", "n_previous_replica")
+
+
+def _validate_deployment_logs_map(
+    deployment_logs: Optional[Dict[str, Dict[str, int]]],
+) -> None:
+    """Reject a ``deployment_logs`` map before it reaches the proxy actor.
+
+    A pure helper so the boundary is testable without a cluster, like
+    ``_validate_scaling_map``. Unknown keys are refused rather than ignored for
+    the same reason unknown ``autoscaling_config`` keys are: ``override.get()``
+    drops them in silence, so ``{"logs_tails": 200}`` returns the default 30
+    lines and reads as the override having been applied.
+    """
+    for dep_name, override in _require_deployment_map(
+        deployment_logs, "deployment_logs"
+    ).items():
+        if not isinstance(override, dict):
+            raise ValueError(
+                f"deployment_logs entry for '{dep_name}' must be a dict; got "
+                f"{type(override).__name__}."
+            )
+        unknown_keys = sorted(set(override) - set(_DEPLOYMENT_LOG_KEYS))
+        if unknown_keys:
+            raise ValueError(
+                f"deployment_logs entry for '{dep_name}' has unknown key(s) "
+                f"{unknown_keys}; they would be ignored in silence. Valid "
+                f"keys: {list(_DEPLOYMENT_LOG_KEYS)}."
+            )
+        for key, value in override.items():
+            # No lower bound: proxy_actor.get_deployment_logs documents -1 as
+            # "the entire log" for tail and "all dead replicas" for
+            # n_previous_replica, so a >= 0 check would refuse a real feature.
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(
+                    f"deployment_logs entry for '{dep_name}' has {key}="
+                    f"{value!r}; must be an int."
                 )
 
 
@@ -738,7 +839,7 @@ class AppsManager:
 
     async def _check_resources(
         self, application_id: str, required_resources: Dict[str, int]
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         """
         Verify that sufficient resources are available for deploying an application.
 
@@ -761,12 +862,20 @@ class AppsManager:
             application_id: ID of the application being deployed (for logging)
             required_resources: Dictionary containing 'num_cpus', 'num_gpus', and 'memory' requirements
 
+        Returns:
+            None when a node has room. On an external cluster with no such node,
+            a report of the shortfall the deployment is proceeding in spite of,
+            for the caller to store and expose through ``get_app_status``.
+
         Raises:
             ValueError: If insufficient resources are available and cluster cannot scale
 
         Note:
             External clusters are assumed to have autoscaling capabilities, so only
-            warnings are issued rather than blocking deployment.
+            warnings are issued rather than blocking deployment. That assumption is
+            unverified at deploy time and false on a KubeRay cluster with in-tree
+            autoscaling disabled, where the deployment then waits for a node that
+            will never arrive — hence the returned report.
         """
         self.logger.debug(
             f"Checking resources for application '{application_id}': {required_resources}"
@@ -789,9 +898,13 @@ class AppsManager:
         # Wait for Ray cluster to be ready
         await self.ray_cluster.is_ready.wait()
 
-        for node_resource in self.ray_cluster.status["nodes"].values():
-            # TODO: This currently assumes one application fits on one node.
-            # For multi-node applications, replace this with aggregate placement-aware checks.
+        free_per_node = {}
+        for node_id, node_resource in self.ray_cluster.status["nodes"].items():
+            # Per-node is deliberate, not an unfinished aggregate check: an
+            # aggregate would loosen SLURM admission, the only mode that raises
+            # on this verdict, trading a clean rejection for a deployment that
+            # hangs with no failure state. The other modes gain nothing from it
+            # — one node on single-machine, and no gating on external-cluster.
             # For updates, add back the resources that will be freed
             used_cpu = max(
                 0, node_resource["used_cpu"] - current_resources["num_cpus"]
@@ -806,6 +919,12 @@ class AppsManager:
             free_cpu = max(0, node_resource["total_cpu"] - used_cpu)
             free_gpu = max(0, node_resource["total_gpu"] - used_gpu)
             free_memory = max(0, node_resource["total_memory"] - used_memory)
+
+            free_per_node[node_id] = {
+                "num_cpus": free_cpu,
+                "num_gpus": free_gpu,
+                "memory": free_memory,
+            }
 
             if (
                 free_cpu >= required_resources["num_cpus"]
@@ -864,6 +983,15 @@ class AppsManager:
                     "Assuming Ray autoscaling is available. "
                     f"Requested resources: {required_resources}"
                 )
+                return {
+                    "requested": dict(required_resources),
+                    "free_per_node": free_per_node,
+                    "cluster_free": {
+                        key: sum(node[key] for node in free_per_node.values())
+                        for key in ("num_cpus", "num_gpus", "memory")
+                    },
+                    "detected_at": time.time(),
+                }
 
     async def _deploy_application(
         self,
@@ -1124,6 +1252,35 @@ class AppsManager:
             )
         return out
 
+    @staticmethod
+    def _per_replica_ongoing_limit(
+        deployment_name: str, deployment_info: Dict[str, Any]
+    ) -> Optional[int]:
+        """One replica's concurrent-request cap, as Ray Serve holds it.
+
+        This is the ``@bioengine.app(max_ongoing_requests=...)`` the app author
+        declared. The application's top-level ``max_ongoing_requests`` is a
+        different limit under the same name — how many callers the proxy admits
+        for the whole instance — so without this field a reader had no way to
+        tell which of the two a number referred to, and the decorator's value
+        was reported nowhere at all.
+
+        None for the ProxyDeployment: the author writes no decorator on it (it
+        is absent from the app spec and from the scaling map for the same
+        reason), and its Serve-level cap is not the bound that governs client
+        calls — the top-level field is.
+
+        None, too, for anything non-integral. An unset field in a dumped
+        ``DeploymentSchema`` is the ``DEFAULT.VALUE`` enum member, which is not
+        JSON-serializable and would break the whole status payload over RPC.
+        """
+        if deployment_name == "ProxyDeployment":
+            return None
+        limit = (deployment_info.get("deployment_config") or {}).get(
+            "max_ongoing_requests"
+        )
+        return limit if isinstance(limit, int) and not isinstance(limit, bool) else None
+
     async def _get_deployment_status(
         self,
         application_id: str,
@@ -1149,6 +1306,9 @@ class AppsManager:
                 "message": deployment_info.get("message", ""),
                 "replica_states": replica_states,
                 "replicas": replicas,
+                "max_ongoing_requests": self._per_replica_ongoing_limit(
+                    deployment_name, deployment_info
+                ),
                 "logs": None,
             }
 
@@ -1520,6 +1680,12 @@ class AppsManager:
             ),
             "gpu_enabled": not application_info["disable_gpu"],
             "application_resources": application_info["application_resources"],
+            # Non-None only when no node had room at deploy time and the worker
+            # proceeded anyway on the autoscaling assumption. That state has no
+            # failure status and the app's own service never registers, so this
+            # is the only surface a caller has for it. ``.get`` because a
+            # recovered app's state dict predates the field.
+            "resource_shortfall": application_info.get("resource_shortfall"),
             "authorized_users": application_info["authorized_users"],
             "available_methods": application_info["available_methods"],
             "max_ongoing_requests": application_info["max_ongoing_requests"],
@@ -1801,6 +1967,12 @@ class AppsManager:
                     # custom static list passed at deploy time, which is not
                     # recoverable here either way.
                     "ice_servers": None,
+                    # Stays None: the shortfall is what _check_resources saw of
+                    # the cluster at the ORIGINAL deploy, and app_data does not
+                    # carry it, so an adopting worker would need historical
+                    # cluster state. Measuring it fresh would answer a different
+                    # question under the same key.
+                    "resource_shortfall": None,
                     "debug": app_data["debug"],
                     "deployment_task": None,
                     "is_deployed": is_deployed,
@@ -2027,6 +2199,11 @@ class AppsManager:
         - The moment the app is observed healthy again, the per-app backoff
           state is dropped — the next failure restarts from the initial delay.
 
+        A worker with no opted-in app does not take that path, but still probes
+        for a lost Serve controller and reports one; detection is what every
+        recovery and logging path here sits behind, and losing it was how a
+        head restart went unmentioned in the one log an operator reads.
+
         With initial=10 s, max=600 s the retry schedule is
         10, 20, 40, 80, 160, 320, 600, 600, 600 s … — fast for transient
         crashes (controller restart, replica OOM), bounded for persistent
@@ -2051,6 +2228,36 @@ class AppsManager:
             if app_info["auto_redeploy"]
         ]
         if not apps_to_redeploy:
+            # Noticing is not redeploying. auto_redeploy defaults to False, so
+            # a worker tracking only opted-out apps used to return here and
+            # never read Serve's state at all, which made controller loss
+            # undetectable for it rather than merely unactioned. The actor
+            # lookup is the question being asked and costs a fraction of the
+            # serve.status RPC the path below makes, so detection is reported
+            # on it alone. No recovery sweep follows — an app that asked not to
+            # be redeployed still is not.
+            #
+            # The cooldown gates the probe, not just the line: the lookup runs
+            # in a thread that outlives its own timeout, so asking once per
+            # cooldown rather than once per tick bounds both the added call
+            # rate and how often a tick can wait on an unreachable head. The
+            # timestamp is written only when something is reported — consuming
+            # it on a healthy tick would suppress the first real sweep for an
+            # app deployed with auto_redeploy between two ticks.
+            if (
+                self._deployed_applications
+                and time.time() - self._last_controller_recovery
+                >= _CONTROLLER_RECOVERY_COOLDOWN_SECONDS
+                and await _controller_is_missing_off_loop()
+            ):
+                self._last_controller_recovery = time.time()
+                self.logger.error(
+                    f"Ray Serve controller lost (Ray head restart?); "
+                    f"{len(self._deployed_applications)} tracked "
+                    f"application(s), none with auto_redeploy enabled, so this "
+                    f"worker will not re-establish any of them: "
+                    f"{sorted(self._deployed_applications)}."
+                )
             return
 
         # Get status of actively running deployments
@@ -2058,15 +2265,38 @@ class AppsManager:
         try:
             serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
         except Exception as exc:
-            if _is_serve_controller_gone(exc):
+            if (
+                _is_serve_controller_gone(exc)
+                or await _controller_is_missing_off_loop()
+            ):
                 # A Ray head restart wiped the Serve controller. The client
                 # reconnects (handles refreshed, cached Serve client dropped)
                 # but there is no controller until an app is (re)deployed, so
                 # redeploy the tracked apps in-place: serve.run bootstraps a
                 # fresh controller and recreates the replicas without cycling
                 # the pod.
+                #
+                # The actor lookup is the second half because the exception
+                # alone does not always identify the loss: a worker that
+                # outlives a head restart gets a bare Exception naming only an
+                # actor id. Asking whether the controller exists answers it
+                # whatever was raised, and says "present" on anything that is
+                # not a clean not-found, so an unrelated Ray failure cannot
+                # trigger a sweep.
                 await self._recover_from_controller_loss(apps_to_redeploy)
             raise
+
+        if not serve_status.applications and await _controller_is_missing_off_loop():
+            # Controller lost, but serve.status reported it as an empty status
+            # instead of raising, so the branch above never saw it. Left to the
+            # per-app loop below, every tracked app looks individually "absent
+            # from the status report" and is only recovered once each has worn
+            # through _MISSING_FROM_STATUS_TOLERANCE, under a reason naming the
+            # symptom rather than the cause. Skip that loop only when the sweep
+            # actually ran: when it is cooling down, falling through preserves
+            # the per-app path exactly as it behaves today.
+            if await self._recover_from_controller_loss(apps_to_redeploy):
+                return
 
         try:
             instance_details = (
@@ -2230,7 +2460,7 @@ class AppsManager:
 
     async def _recover_from_controller_loss(
         self, application_ids: List[str]
-    ) -> None:
+    ) -> bool:
         """Re-establish Ray Serve in-place after the controller was lost.
 
         A Ray head restart destroys the Serve controller; ``reconnect`` has
@@ -2240,27 +2470,37 @@ class AppsManager:
         deploy task blocks alive on an event, so we can't gate on it being
         idle; instead a cooldown rate-limits sweeps so an in-flight serve.run
         isn't stomped every tick. Apps recovered from a previous worker carry
-        no cached ``built_app``; they can't be rebuilt from here and are
-        skipped, so they stay down until something redeploys them.
+        no cached ``built_app``; they can't be rebuilt from here and stay down
+        until something redeploys them. They still go through
+        ``_fire_redeploy`` so that skip is logged rather than silent — the
+        incident that motivated this lost an adopted app and left nothing in
+        the worker's own logs to say so.
+
+        Returns:
+            Whether a sweep ran. ``False`` means the cooldown suppressed it,
+            which is what lets the caller fall back to the per-app path
+            instead of starving it.
         """
         now = time.time()
         if now - self._last_controller_recovery < _CONTROLLER_RECOVERY_COOLDOWN_SECONDS:
-            return
+            return False
         self._last_controller_recovery = now
         for application_id in application_ids:
             info = self._deployed_applications.get(application_id)
-            if not info or info.get("built_app") is None:
+            if not info:
                 continue
-            self.logger.error(
-                f"Ray Serve controller lost (Ray head restart?); "
-                f"re-establishing application '{application_id}' in-place."
-            )
+            if info.get("built_app") is not None:
+                self.logger.error(
+                    f"Ray Serve controller lost (Ray head restart?); "
+                    f"re-establishing application '{application_id}' in-place."
+                )
             self._fire_redeploy(
                 application_id,
                 info,
                 attempt=1,
                 reason="the Ray Serve controller was lost",
             )
+        return True
 
     def _fire_redeploy(
         self,
@@ -3046,7 +3286,7 @@ class AppsManager:
         ),
         max_ongoing_requests: int = Field(
             None,
-            description="Maximum number of concurrent requests this application instance can handle simultaneously. Higher values allow more parallelism but use more memory. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
+            description="How many callers the application's ProxyDeployment admits at once, across the whole instance — the limit the 'at capacity' rejection is counted against. Higher values allow more parallelism but use more memory. This is NOT the per-replica cap: `@bioengine.app(max_ongoing_requests=...)` in the app's own source is a separate Ray Serve limit on one replica of one deployment, and the two are independent: setting either does not change the other. get_app_status reports this one at the top level and each deployment's decorator value under `deployments.<ClassName>.max_ongoing_requests`. If not specified, uses 10 for a new application, or preserves the previous value if updating an existing application (only when application_id is specified).",
         ),
         proxy_memory_in_gb: float = Field(
             None,
@@ -3170,6 +3410,14 @@ class AppsManager:
             )
             user_id = context["user"]["id"]
 
+            # Ahead of check_connection below, so a wrong type is named even when
+            # the cluster is down: otherwise the caller is told "Ray cluster is not
+            # running" and never hears which argument of theirs was wrong. Placed
+            # after check_permissions so an unauthorised caller still gets
+            # PermissionError first. Re-checked at the call site below, which is
+            # where the key names are validated.
+            _require_deployment_map(scaling, "scaling")
+
             # Verify Ray is initialized
             await self.ray_cluster.check_connection()
 
@@ -3279,6 +3527,16 @@ class AppsManager:
 
             # Caller identity and admin users for injection into authorized_users by the builder
             user_email = context["user"].get("email", "")
+
+            # scaling's TYPE is checked outside _validate_scaling_map below: that
+            # one also checks the keys against the user @bioengine.app class
+            # names, which only exist after build() has minted a Hypha token and
+            # run the introspect Ray task. A wrong type would otherwise cost all
+            # of that before raising. The binding check is the copy hoisted above
+            # check_connection; this one is kept so the refusal does not depend on
+            # a single call site surviving a later edit, and because the update
+            # branch above can rebind scaling between the two.
+            _require_deployment_map(scaling, "scaling")
 
             # Validate application_kwargs
             if not isinstance(application_kwargs, dict):
@@ -3436,7 +3694,7 @@ class AppsManager:
                         )
 
             # Check resources before creating deployment task
-            await self._check_resources(
+            resource_shortfall = await self._check_resources(
                 application_id=application_id,
                 required_resources=app.metadata["resources"],
             )
@@ -3466,6 +3724,7 @@ class AppsManager:
                 "proxy_memory_in_gb": proxy_memory_in_gb,
                 "scaling": dict(app.scaling or {}),
                 "application_resources": app.metadata["resources"],
+                "resource_shortfall": resource_shortfall,
                 "authorized_users": app.metadata["authorized_users"],
                 "available_methods": app.metadata["available_methods"],
                 "static_site_url": static_site_url,
@@ -3773,6 +4032,8 @@ class AppsManager:
             app = await get_app_status(application_ids=["app1"])
             # Returns: {...} (single app status, not {"app1": {...}})
         """
+        _validate_deployment_logs_map(deployment_logs)
+
         # Determine which applications to check
         if application_ids is None:
             # Return status for all tracked applications

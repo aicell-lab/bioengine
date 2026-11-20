@@ -432,11 +432,14 @@ async def test_deploy_time_configuration_is_not_public():
 
 @pytest.mark.asyncio
 async def test_the_serve_controller_dump_does_not_cross_into_the_response():
-    """First barrier: ``_get_deployment_status`` names the fields it copies and
-    never reads ``deployment_config``, which is where ``runtime_env.env_vars``
-    — every raw _BIOENGINE_SECRET_* value, including the Hypha token — sits on
-    its way through this process. Planted ONLY in the controller dump here, so
-    the masking barrier cannot account for its absence."""
+    """First barrier: ``_get_deployment_status`` names the fields it copies, and
+    reads out of ``deployment_config`` exactly one integer — the deployment's
+    ``max_ongoing_requests``. Everything else there stays behind, including
+    ``runtime_env.env_vars``, which is where every raw _BIOENGINE_SECRET_* value
+    and the Hypha token sit on their way through this process. Planted ONLY in
+    the controller dump here, so the masking barrier cannot account for its
+    absence; that the one copied value is an integer and not its neighbours is
+    pinned in ``test_two_concurrency_layers_are_distinguishable``."""
     manager = make_manager(
         controller_env_vars={"_BIOENGINE_SECRET_HYPHA_TOKEN": SECRET_VALUE}
     )

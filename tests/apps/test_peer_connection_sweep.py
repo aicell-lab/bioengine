@@ -133,12 +133,15 @@ async def test_empty_map_is_a_noop() -> None:
     await obj._sweep_stale_peer_connections()  # must not raise
 
 
-def test_check_health_calls_sweep() -> None:
-    """The sweep hook must live inside check_health — that's the only
-    periodic entry point aiortc replicas expose. Missing this call means
-    the sweep never runs."""
-    src = inspect.getsource(_ProxyDeployment.check_health)
+def test_maintenance_loop_calls_sweep() -> None:
+    """The sweep must be reached from the periodic maintenance tick, which
+    is the only periodic entry point left now that the proxy defines no
+    check_health. Both links are asserted; either one alone makes the
+    sweep unreachable."""
+    src = inspect.getsource(_ProxyDeployment._rotate_webrtc_state)
     assert "_sweep_stale_peer_connections" in src
+    loop = inspect.getsource(_ProxyDeployment._maintenance_loop)
+    assert "_rotate_webrtc_state" in loop
 
 
 def test_state_changed_at_is_set_on_new_peer() -> None:

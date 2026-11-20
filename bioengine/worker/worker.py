@@ -450,6 +450,7 @@ class BioEngineWorker:
         # Dataset server configuration
         self.data_server: Optional[BioEngineDatasets] = None
         self.available_datasets = {}
+        self._data_server_unreachable = False
 
         try:
             # Attempt interactive login if no token provided
@@ -521,11 +522,29 @@ class BioEngineWorker:
             raise e
 
     def __del__(self):
-        if self.start_time:
-            self.logger.warning(
-                "BioEngineWorker is being garbage collected with partially/completely initialized components. "
-                "Consider calling stop() explicitly for proper cleanup."
-            )
+        # Read both attributes DEFENSIVELY, because __init__ can raise before either exists.
+        # When it does, CPython still calls __del__ on the half-constructed object, the bare
+        # `self.start_time` raises AttributeError, and Python prints `Exception ignored in:`
+        # plus a full traceback AFTER the real error. That traceback is the last thing the
+        # reader sees, so it reads as the diagnosis while the actual cause has scrolled past
+        # (#0584). Nothing is left broken by it -- the exit code is still the real failure --
+        # which is exactly why it misleads rather than announcing itself as noise.
+        #
+        # `getattr(..., None)` and not hasattr: it keeps the ORIGINAL truthiness test intact
+        # for the case that matters, so an object that HAS start_time behaves exactly as before
+        # and this guard cannot silently swallow the warning it exists to emit. `logger` is
+        # guarded for the same reason and is not hypothetical -- it is assigned during __init__
+        # too, so a failure early enough leaves it unset as well, and reaching for it here
+        # would re-raise from inside the handler for the first problem.
+        if not getattr(self, "start_time", None):
+            return
+        logger = getattr(self, "logger", None)
+        if logger is None:
+            return
+        logger.warning(
+            "BioEngineWorker is being garbage collected with partially/completely initialized components. "
+            "Consider calling stop() explicitly for proper cleanup."
+        )
 
     def _set_parameter(
         self,
@@ -802,20 +821,20 @@ class BioEngineWorker:
 
         try:
             await self.data_server.ping_data_server()
+            self._data_server_unreachable = False
         except Exception as e:
-            self.logger.error(f"Error while pinging dataset server: {e}")
-            self.logger.info("Clearing dataset server configuration.")
+            # Only the local handle is dropped. The discovery file is written by
+            # the data server at startup and removed by it at shutdown; workers
+            # are readers, and every worker on this workspace directory shares
+            # the one file, so deleting it here would take a reachable server
+            # away from all of them. Keeping it lets _discover_data_server
+            # re-read it and reconnect once the server answers again, which is
+            # also why this logs on the transition rather than every pass.
+            if not self._data_server_unreachable:
+                self.logger.error(f"Error while pinging dataset server: {e}")
+                self.logger.info("Clearing dataset server configuration.")
+                self._data_server_unreachable = True
             self.data_server = None
-            
-            current_data_server_file = (
-                self.workspace_dir / "datasets" / "bioengine_current_server"
-            )
-            if current_data_server_file.exists():
-                try:
-                    current_data_server_file.unlink()
-                    self.logger.info("Removed outdated data server configuration file.")
-                except Exception as unlink_e:
-                    self.logger.error(f"Failed to remove data server configuration file: {unlink_e}")
 
     async def _discover_data_server(self) -> None:
         """

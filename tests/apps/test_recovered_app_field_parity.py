@@ -67,6 +67,11 @@ LEGITIMATELY_NULL_AFTER_ADOPTION = {
     # wants — lossy only for a custom static list passed at deploy time, which
     # is not recoverable here either way.
     "ice_servers",
+    # A deploy-time observation: _check_resources ran against the cluster as it
+    # was when the app was deployed, and the recovery blob does not carry the
+    # result, so an adopting worker would need historical cluster state. A fresh
+    # measurement would answer a different question under the same key.
+    "resource_shortfall",
 }
 
 
@@ -161,7 +166,10 @@ async def _deployed_manager(**deploy_kwargs) -> AppsManager:
     manager._check_initialized = lambda: None
     manager.artifact_manager = MagicMock()
     manager.app_builder = SimpleNamespace(build=AsyncMock(return_value=_built_app()))
-    manager._check_resources = AsyncMock()
+    # return_value=None, not a bare AsyncMock: an unset AsyncMock returns a
+    # MagicMock, which is not None, so the deployed app recorded a Mock as its
+    # resource_shortfall and no null-parity assertion could ever hold.
+    manager._check_resources = AsyncMock(return_value=None)
     manager._cancel_deployment_process = AsyncMock()
     manager._deploy_application = AsyncMock()
     manager.ray_cluster.call_with_reconnect = AsyncMock()

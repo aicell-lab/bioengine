@@ -17,6 +17,19 @@ if TYPE_CHECKING:
 from .logger import create_logger
 
 
+# A collision here is either your own artifact or a stranger's, and this
+# function cannot tell which — so the message names both courses. Following
+# "bump the version" onto someone else's lineage publishes an unrelated bundle
+# as its newest version, and a committed version is never withdrawn.
+_COLLISION_ADVICE = (
+    "If this artifact is yours, bump the version in manifest.yaml. If that "
+    "version history is not yours, the id collided with someone else's "
+    "artifact, so choose a different id instead, because bumping would publish "
+    "your bundle as the newest version of a lineage you do not own, and a "
+    "committed version is never withdrawn."
+)
+
+
 def _enforce_version_increases(
     new_version: Optional[str],
     existing_versions: List[str],
@@ -44,8 +57,8 @@ def _enforce_version_increases(
         if str(new_version) in {str(v) for v in existing_versions}:
             raise ValueError(
                 f"Cannot upload '{artifact_id}' at version '{new_version}': "
-                f"that version already exists. Bump the version in "
-                f"manifest.yaml (existing: {existing_versions})."
+                f"that version already exists (existing: {existing_versions}). "
+                f"{_COLLISION_ADVICE}"
             )
         return
 
@@ -54,8 +67,8 @@ def _enforce_version_increases(
         raise ValueError(
             f"Cannot upload '{artifact_id}' at version '{new_version}': "
             f"must be strictly greater than the highest existing version "
-            f"'{highest_str}'. Bump the version in manifest.yaml "
-            f"(existing: {existing_versions})."
+            f"'{highest_str}' (existing: {existing_versions}). "
+            f"{_COLLISION_ADVICE}"
         )
 
 

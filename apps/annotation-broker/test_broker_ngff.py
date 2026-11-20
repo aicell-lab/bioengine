@@ -56,27 +56,50 @@ def _resolving_method(**_kw):
     return decorate
 
 
-def _install_runtime_stubs() -> list:
-    inserted = []
-    if "bioengine" not in sys.modules:
-        stub = types.ModuleType("bioengine")
-        stub.logger = logging.getLogger("test-broker")
-        stub.app = lambda **_kw: (lambda cls: cls)
-        stub.method = _resolving_method
-        stub.async_init = lambda fn: fn
-        stub.health_check = lambda fn: fn
-        sys.modules["bioengine"] = stub
-        inserted.append("bioengine")
-    if "hypha_rpc" not in sys.modules:
-        stub = types.ModuleType("hypha_rpc")
+_ABSENT = object()
 
-        async def _connect(*_a, **_kw):  # pragma: no cover - never called
-            raise AssertionError("tests must not connect to Hypha")
 
-        stub.connect_to_server = _connect
-        sys.modules["hypha_rpc"] = stub
-        inserted.append("hypha_rpc")
-    return inserted
+def _make_bioengine_stub():
+    stub = types.ModuleType("bioengine")
+    stub.logger = logging.getLogger("test-broker")
+    stub.app = lambda **_kw: (lambda cls: cls)
+    stub.method = _resolving_method
+    stub.async_init = lambda fn: fn
+    stub.health_check = lambda fn: fn
+    return stub
+
+
+def _make_hypha_rpc_stub():
+    stub = types.ModuleType("hypha_rpc")
+
+    async def _connect(*_a, **_kw):  # pragma: no cover - never called
+        raise AssertionError("tests must not connect to Hypha")
+
+    stub.connect_to_server = _connect
+    return stub
+
+
+def _install_runtime_stubs() -> dict:
+    """Install the stubs UNCONDITIONALLY, remembering what each name held before.
+
+    #0598: the previous version installed a stub only when the name was ABSENT, which
+    made this file's result depend on what ran before it in the same pytest process.
+    If another app's suite had already imported the REAL ``bioengine``, this file
+    inserted nothing and then imported ``broker`` against the real package, which does
+    not provide the resolving ``method`` decorator these tests rely on -- 23 failures
+    and 34 collection errors, against 0 when this suite ran first.
+
+    Installing unconditionally makes the import deterministic. Returning the PREVIOUS
+    value per name -- including ``_ABSENT`` -- is what keeps #0147's guarantee intact:
+    the restore below puts back exactly what was there, so this file still cannot leave
+    a fake ``bioengine`` behind for any other suite.
+    """
+    saved = {}
+    for name, factory in (("bioengine", _make_bioengine_stub),
+                          ("hypha_rpc", _make_hypha_rpc_stub)):
+        saved[name] = sys.modules.get(name, _ABSENT)
+        sys.modules[name] = factory()
+    return saved
 
 
 _stubbed = _install_runtime_stubs()
@@ -86,11 +109,16 @@ os.environ.setdefault("HYPHA_TOKEN", "test-token")
 
 import broker as bk  # noqa: E402  (must follow the stubs)
 
-# ``broker`` holds its own references now, so take the stubs back out. Leaving a
-# fake ``bioengine`` in sys.modules breaks every other app suite collected into
-# the same pytest process -- it imports the stub instead of the real package.
-for _name in _stubbed:
-    del sys.modules[_name]
+# ``broker`` holds its own references now, so put ``sys.modules`` back exactly as it
+# was. Leaving a fake ``bioengine`` here breaks every other app suite collected into
+# the same pytest process -- it imports the stub instead of the real package (#0147).
+# RESTORE, not delete: a plain ``del`` would evict a real module another suite had
+# already imported, which is the same harm in the other direction (#0598).
+for _name, _prev in _stubbed.items():
+    if _prev is _ABSENT:
+        del sys.modules[_name]
+    else:
+        sys.modules[_name] = _prev
 
 
 # ---------------------------------------------------------------------------

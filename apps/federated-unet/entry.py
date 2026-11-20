@@ -43,11 +43,11 @@ def _read_pip(name: str) -> List[str]:
 @bioengine.app(
     num_cpus=2,
     # Sized so the consortium's seven instances fit on two GPUs: 24576 / 5120
-    # admits 4 on Europa's RTX 3090, and on de.NBI (no VRAM_MB, so the worker
+    # admits 4 on the single-machine site's RTX 3090, and on de.NBI (no VRAM_MB, so the worker
     # falls back to a fraction) 5120 / 15360 = 0.33 admits 3 on one T4.
     gpu_memory_mb=5120,
     # Host RAM, not VRAM, is what bounds how many replicas a single-machine
-    # worker admits: Europa has 30 GiB of Ray memory shared across every app, so
+    # worker admits: the single-machine site has 30 GiB of Ray memory shared across every app, so
     # 8 GiB per replica capped it at three. A replica's real footprint is 0.65 GiB
     # idle and about 1 GiB more with a whole dataset resident — every image is
     # float32 at native resolution and the largest pool is ~650 of them.
@@ -99,7 +99,25 @@ class FederatedUNetSite:
         self._hypha = await connect_to_server(
             {"server_url": SERVER_URL, "token": self._hypha_token}
         )
-        self._artifact_manager = await self._hypha.get_service("public/artifact-manager")
+        # Cached for the replica's whole life and handed to every
+        # `CheckpointStore` (see `_store`), so a stale client id would hang
+        # every checkpoint read and write to the method timeout; this app has
+        # no `@bioengine.health_check` at all, so nothing else would notice.
+        # `CheckpointStore` calls `read`, `get_file`, `put_file` and `create`
+        # (checkpoints.py:98-129). Only the two reads are named: `repeatable`
+        # governs re-sending a call that MAY already have landed, and the
+        # worker's own wrapper for this same service deliberately does not
+        # replay `put_file` or `create` (`_RETRY_SAFE_READS` in
+        # `bioengine/apps/manager.py`), so neither is named here either. They
+        # still get the hang fixed — a failure that provably never left the
+        # process is replayed for every method, named or not — and give up only
+        # the retry on an ambiguous failure, which is today's behaviour.
+        self._artifact_manager = await bioengine.reconnecting_service(
+            self._hypha,
+            "public/artifact-manager",
+            repeatable=("read", "get_file"),
+            logger=logger,
+        )
         logger.info(f"[{self.site_name}] ready on {self._device}")
 
     @bioengine.smoke_test
