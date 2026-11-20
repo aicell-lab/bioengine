@@ -14,7 +14,7 @@ was spelled with a field name Ray Serve removed, so the effective target has
 always been Serve's default of 2 — at which a long training plus one
 concurrent inference asks for one replica, not two. This runtime has therefore
 never run training and inference on separate GPU replicas; whether to pin it to
-one replica or restore the eager target is open as a separate open question.
+one replica or restore the eager target is a separate open question.
 
 Import rule: heavy deps (``torch``, ``micro_sam``, ``segment_anything``) are
 imported inside method bodies so the ``@bioengine.app`` decorator module stays

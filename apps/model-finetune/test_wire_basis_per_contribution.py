@@ -1,7 +1,7 @@
 """every ``weights_sha256`` the wire publishes carries a basis beside it, and
 the basis it carries is the one the CONTRIBUTION resolver gives.
 
-the stored-basis stamp stamped ``weights_sha256_basis`` on every new stored contribution. But a
+The stored-basis change put ``weights_sha256_basis`` on every new stored contribution. But a
 bioimage.io client does not read the stored record; it reads what ``pool_wire_state``
 publishes, and that carried the number with no basis next to it — so from outside the
 pool, two digests computed under different bases stayed indistinguishable. That is the

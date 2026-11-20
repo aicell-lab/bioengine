@@ -224,7 +224,7 @@ def test_a_caller_supplied_basis_is_overridden_not_preserved() -> None:
 
     That claim was NOT enforced. Replacing the stamping assignment with a
     ``setdefault`` — leaving a caller's value in place — was measured GREEN on the
-    ``apps/model-finetune`` suite, the ``tests/`` suite and the GPU shortfall report's own gate during the
+    ``apps/model-finetune`` suite, the ``tests/`` suite and the GPU shortfall report's own gate during
     the stored-basis stamp review ("Arm E"). A control arm that stamps the WRONG constant at the same
     site is caught by 10 tests, so the suite discriminated the VALUE and not its
     PROVENANCE. This test pins the provenance.

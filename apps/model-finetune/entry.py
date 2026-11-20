@@ -1202,8 +1202,8 @@ class EntryApp:
             })
             # Long-running: this await holds one GPU runtime replica for the whole
             # training run, and a concurrent infer queues behind it on that same
-            # replica — at the effective target of 2 two calls in flight
-            # ask for one replica, not two.
+            # replica — at the effective target of 2, two calls in flight ask for
+            # one replica, not two.
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
             # so a session waiting here is not false-flagged STOPPED.
@@ -1288,10 +1288,10 @@ class EntryApp:
             },
             "models": models,
             "parameters": self._training_parameter_schema(),
-            # Why a backend reads 'runtime unavailable' when nothing is broken
-            #: on a cluster with fewer GPUs than enabled backends the
-            # runtime never schedules, and the only other symptom is a permanent
-            # UPSCALING that never times out. Answered CPU-side; never wakes a GPU.
+            # Why a backend reads 'runtime unavailable' when nothing is broken: on
+            # a cluster with fewer GPUs than enabled backends the runtime never
+            # schedules, and the only other symptom is a permanent UPSCALING that
+            # never times out. Answered CPU-side; never wakes a GPU.
             "placement": _gpu_placement_report(self._enabled_backends),
         }
 
@@ -2780,7 +2780,7 @@ class EntryApp:
                         base_commitment=index.get("base_commitment")))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
-                    # Requirement 4: the contributors' own measured diameters go in
+                    # Base-commitment requirement 4: the contributors' own measured diameters go in
                     # the manifest. The runtime is given weights PATHS and never learns a
                     # contribution id, so the mapping is made here, where s_paths and
                     # s_ids are the parallel lists the gate built. An unmapped key RAISES

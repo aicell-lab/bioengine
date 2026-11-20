@@ -1150,7 +1150,7 @@ def uniform_soup(
     before the accumulation loop allocates, so it costs one transient member and
     does not raise the steady-state peak.
 
-    Requirement 3, ruled 2026-11-14: a non-learned key (``NON_WEIGHT_PARAMS``,
+    Base-commitment requirement 3, ruled 2026-11-14: a non-learned key (``NON_WEIGHT_PARAMS``,
     e.g. ``diam_labels``) is carried through from ``base`` UNCHANGED and is never
     averaged. Averaging them produced 57.7405 for a four-member pool whose real
     per-site diameters were 29.711 / 54.986 / 28.912 / 117.353 — a field asserting a
@@ -1168,7 +1168,7 @@ def uniform_soup(
     Collected as plain floats off the tensor while the member is already resident, so
     it adds no second pass and retains nothing after ``del sd``.
 
-    Requirement 2: classification is TOTAL and fail-closed. Every member key
+    Base-commitment requirement 2: classification is TOTAL and fail-closed. Every member key
     must appear in ``base``, whose key set IS the architecture's own inventory, and a
     key in neither the base nor the declared non-learned set raises rather than being
     averaged. That is the property that stops this recurring: a future non-learned
@@ -1265,7 +1265,7 @@ def uniform_soup(
                       if key not in carried}
             acc = {key: torch.zeros_like(value, dtype=torch.float32)
                    for key, value in sd.items() if key not in carried}
-        # Requirement 4: the contributors' OWN diameters are not discarded, they
+        # Base-commitment requirement 4: the contributors' OWN diameters are not discarded, they
         # are recorded in the community manifest. Collected here, in loader order, so
         # the caller gets them without a second pass over every member's weights — the
         # merge already holds this state dict and will not hold it again. Scalars only,
@@ -1924,7 +1924,7 @@ def build_community_manifest(
         # materialize_soup just computed, and a caller-supplied basis could disagree
         # with the bytes. See CURRENT_DIGEST_BASIS for the lock-step rule.
         "weights_sha256_basis": CURRENT_DIGEST_BASIS,
-        # Requirements 3 and 4. ``non_learned`` says what the published checkpoint's
+        # Base-commitment requirements 3 and 4. ``non_learned`` says what the published checkpoint's
         # diameter IS and that it was inherited rather than learned (build it with
         # ``inherited_non_learned`` so the basis label travels with the float).
         # ``member_non_learned`` is where the contributors' OWN measured diameters live —

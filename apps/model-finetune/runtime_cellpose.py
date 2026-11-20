@@ -673,9 +673,9 @@ class CellposeRuntime:
         and return its sha256 + byte size — so the head weights never traverse the
         CPU entry. ``members`` must be non-empty (a published head always has one).
 
-        Also returns what the community manifest needs to record each contributor's
-        this is the only place the members' weights are resident and reading them again
-        would mean re-downloading every one:
+        Also returns what the community manifest needs for base-commitment requirement 4,
+        because this is the only place the members' weights are resident and reading them
+        again would mean re-downloading every one:
 
         ``non_learned_inherited`` — the published checkpoint's own non-learned values,
         read back off the SOUP rather than off the base, so the record reports what was

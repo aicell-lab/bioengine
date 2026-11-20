@@ -328,8 +328,8 @@ def test_collecting_is_opt_in_and_changes_nothing() -> None:
 
 
 def test_an_inherited_block_must_name_its_source() -> None:
-    """Under the base-commitment rules, reporting the float alone reproduces the
-    A reader cannot tell an inherited 30.0 from a coincidental one."""
+    """Under the base-commitment rules, reporting the float alone reproduces the defect
+    in the manifest. A reader cannot tell an inherited 30.0 from a coincidental one."""
     with pytest.raises(ValueError, match="named source"):
         pool.inherited_non_learned({"diam_labels": 30.0}, source="")
 
