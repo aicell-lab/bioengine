@@ -27,6 +27,13 @@ from ray.util.state.common import (
 from ray.util.state.exception import RayStateApiException
 
 logger = logging.getLogger("ray")
+
+#: How many DEAD actors one death-cause query may return. The query is filtered
+#: to dead actors and the result is intersected with this deployment's own
+#: replicas, so this is a safety bound on the response size rather than a tuning
+#: knob: 94 dead replicas were measured on a single live worker, so the ceiling
+#: is set well above the largest number actually seen.
+_DEAD_ACTOR_QUERY_LIMIT = 10_000
 date_format = "%Y-%m-%d %H:%M:%S %Z"
 
 
@@ -1191,7 +1198,58 @@ class BioEngineProxyActor:
 
         if not actors:
             return None
-        death_cause = getattr(actors[0], "death_cause", None)
+        return self._parse_death_cause(getattr(actors[0], "death_cause", None))
+
+    def _get_actor_death_causes(
+        self, actor_ids: List[str]
+    ) -> Dict[str, Optional[Dict[str, str]]]:
+        """Death causes for MANY actors in ONE GCS call.
+
+        This exists because picking a single dead replica is not a thing that
+        can be done correctly. Ray's ``ActorState`` carries **no death
+        timestamp** — measured against ray 2.55, the dataclass has no
+        end-time field at all — so "the most recently dead replica" is not
+        derivable from this data source, and the registration order that was
+        used instead let a deliberate scale-down mask a crash that happened
+        first.
+
+        Fetching every dead actor in one call removes the choice without the
+        per-replica cost that motivated making one: the expense was one GCS
+        lookup PER dead replica (94 dead replicas measured on one live
+        worker), and this is a single query however many there are.
+        """
+        wanted = set(actor_ids)
+        if not wanted:
+            return {}
+        try:
+            actors = self.state_api_client.list(
+                resource=StateResource.ACTORS,
+                options=ListApiOptions(
+                    limit=_DEAD_ACTOR_QUERY_LIMIT,
+                    timeout=DEFAULT_RPC_TIMEOUT,
+                    filters=[("state", "=", "DEAD")],
+                    detail=True,
+                    explain=False,
+                ),
+                raise_on_missing_output=False,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch death causes: {e}")
+            return {}
+        causes = {}
+        for actor in actors or []:
+            actor_id = getattr(actor, "actor_id", None)
+            if actor_id in wanted:
+                causes[actor_id] = self._parse_death_cause(
+                    getattr(actor, "death_cause", None)
+                )
+        return causes
+
+    @staticmethod
+    def _parse_death_cause(
+        death_cause: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        """Ray's nested death-cause payload, flattened to reason + message."""
         if not death_cause:
             return None
 
@@ -1306,7 +1364,10 @@ class BioEngineProxyActor:
             application_id: Name of the Ray Serve application.
             deployment_name: Name of the deployment within the application.
             n_previous_replica: Number of most recent dead replicas to include.
-                               Set to 0 to only get logs from active replicas.
+                               Set to 0 to omit replica LOGS; the death cause of
+                               every abnormally-dead replica is still reported,
+                               and deliberate stops are returned as a count under
+                               ``_deliberately_stopped_replicas``.
                                Set to -1 to get logs from all dead replicas.
                                Default is 0.
             tail: Number of lines to retrieve from the end of each log.
@@ -1382,24 +1443,50 @@ class BioEngineProxyActor:
             # had died — the same wrong-layer diagnosis this field exists to prevent,
             # one level up.
             #
-            # Only the MOST RECENT dead replica is described, and deliberately so:
-            # _get_actor_death_cause is a GCS lookup per replica, and a long-lived
-            # deployment accumulates them (94 dead replicas measured on one live
-            # worker). Attaching all of them on every default call would trade this
-            # blind spot for a cost regression on the hot path.
+            # EVERY abnormal death is reported, not one chosen replica.
+            #
+            # This used to describe only `dead_replica_ids[-1]`, to hold the cost
+            # to a single GCS lookup. That is registration order, not death
+            # order, and review measured what it costs: A registers and later
+            # dies of OOM, B is added by autoscaling and then deliberately
+            # scaled down, and the default reports B's RAY_KILL while A's OOM
+            # never appears. The operator reads "deliberate stop" and concludes
+            # nothing crashed — the wrong-layer diagnosis this field exists to
+            # prevent, reintroduced one level up.
+            #
+            # Ordering cannot be repaired: ray's ActorState carries no death
+            # timestamp, so "most recent" is not knowable here. So the choice is
+            # removed instead, and the cost objection is answered by fetching
+            # every dead actor in ONE query rather than one per replica.
+            #
+            # A deliberate RAY_KILL is still summarised rather than listed: it is
+            # the routine case, it is what floods a long-lived deployment, and
+            # it is never the thing an operator is hunting. A crash is never
+            # dropped to make room for one.
             #
             # No log lines are fetched, which is the expensive half: asking "did
-            # something die, and why" is one lookup, and asking "show me its output"
-            # stays behind n_previous_replica > 0.
+            # something die, and why" is one query, and asking "show me its
+            # output" stays behind n_previous_replica > 0.
             if dead_replica_ids:
-                replica_id = dead_replica_ids[-1]
-                actor_id = registered_replicas[replica_id][0]
-                logs[replica_id] = {
-                    "stdout": [],
-                    "stderr": [],
-                    "death_cause": self._get_actor_death_cause(actor_id),
-                    "logs_omitted": True,
+                actor_ids = {
+                    replica_id: registered_replicas[replica_id][0]
+                    for replica_id in dead_replica_ids
                 }
+                causes = self._get_actor_death_causes(list(actor_ids.values()))
+                deliberate = 0
+                for replica_id, actor_id in actor_ids.items():
+                    cause = causes.get(actor_id)
+                    if cause and cause.get("reason") == "RAY_KILL":
+                        deliberate += 1
+                        continue
+                    logs[replica_id] = {
+                        "stdout": [],
+                        "stderr": [],
+                        "death_cause": cause,
+                        "logs_omitted": True,
+                    }
+                if deliberate:
+                    logs["_deliberately_stopped_replicas"] = deliberate
             return logs
         # Add logs of the n most recent dead replicas (or all if n_previous_replica is -1)
         dead_replicas_to_fetch = (

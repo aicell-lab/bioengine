@@ -560,10 +560,11 @@ def logs(app_id, tail, as_json, worker_service_id, token, server_url):
             result = await worker.get_app_status(
                 application_ids=[app_id],
                 logs_tail=tail,
-                # Defaults to 0, which returns live replicas only — and a dead
-                # replica's logs and its death_cause are both attached past
-                # that early return. Without this the crashed replica is
-                # invisible to the one command run after a crash.
+                # Defaults to 0, which omits replica LOGS but still reports
+                # every abnormal death_cause. Asking for 1 is what adds the
+                # dead replica's stdout/stderr, which is where a Python
+                # traceback lives — the cause alone names Ray's exit reason
+                # (SYSTEM_ERROR), not the exception the replica raised.
                 n_previous_replica=1,
             )
         except Exception as exc:
@@ -606,7 +607,9 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
     recently dead replicas too, which the live replica list does not contain —
     but only for a caller that passed ``n_previous_replica > 0``. ``apps logs``
     does; ``apps status`` does not, because it fetches logs on every invocation
-    and each dead replica adds a GCS lookup to every poll.
+    and the LOGS are the expensive half. The death cause is not: every dead
+    actor is fetched in one state-API query regardless of how many there are,
+    so ``apps status`` does report an abnormal death without its logs.
 
     The field is *absent* rather than empty when the caller may not read it, so
     the withheld case must not print the same thing as "nothing logged yet".
