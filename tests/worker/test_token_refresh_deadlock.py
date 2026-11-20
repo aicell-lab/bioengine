@@ -1,4 +1,4 @@
-"""A worker must not deadlock when its minted token expires while disconnected (#0632).
+"""A worker must not deadlock when its minted token expires while disconnected.
 
 MEASURED FAILURE THIS PINS, deNBI 2026-11-18. A 6.5-hour network outage outlasted the 3-hour
 token the worker mints for itself. When the path returned the reconnect failed on
@@ -112,3 +112,65 @@ async def test_a_token_far_from_expiry_is_left_alone():
     await w._check_token_expiry()
     assert live.minted == 0
     assert w._token == "current"
+
+
+def _init_source():
+    import inspect
+
+    return inspect.getsource(BioEngineWorker.__init__)
+
+
+def test_the_bootstrap_copy_is_refreshed_after_an_interactive_login():
+    """A worker that logs in interactively must not keep the pre-login bootstrap copy.
+
+    __init__ captures the bootstrap credential from the constructor argument and the
+    environment. On the interactive-login path both are absent, so that capture is None and
+    the real credential arrives later, from login(). Without a second assignment the fallback
+    in _check_token_expiry has nothing to restore and the deadlock survives for exactly the
+    workers that never set HYPHA_TOKEN.
+
+    Read from __init__'s OWN source rather than the module's, so an assignment elsewhere in
+    worker.py cannot satisfy this.
+    """
+    src = _init_source()
+    i_login = src.find("self._token = login(")
+    assert i_login != -1, "the interactive-login assignment moved; re-anchor this arm"
+    assert "self._bootstrap_token = self._token" in src[i_login:], (
+        "the bootstrap copy is never refreshed after login(), so a worker started without a "
+        "token holds None and cannot fall back when its minted token expires offline"
+    )
+
+
+def test_the_pre_login_bootstrap_capture_is_still_present():
+    """CONTROL: the fix must ADD an assignment, not relocate the only one.
+
+    A worker given a token never enters the login branch, so the early capture is the one that
+    protects it. Had the assignment merely moved, the arm above would pass and this one fails.
+    """
+    src = _init_source()
+    i_login = src.find("self._token = login(")
+    assert i_login != -1
+    assert "self._bootstrap_token = self._token" in src[:i_login], (
+        "the capture that protects a worker started WITH a token was removed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_login_issued_credential_survives_a_mint_and_a_dead_connection():
+    """The end state the login path has to reach, driven through the real refresh step.
+
+    This arm does not by itself distinguish fixed from unfixed -- it is handed the post-fix
+    bootstrap value, and the source-order arm above is what discriminates. It is here because
+    the order assertion alone would not show that the restored credential is the useful one.
+    """
+    live = _LiveServer()
+    w = _worker(live, "login-issued-token", "login-issued-token", time.time() - 1)
+    await w._check_token_expiry()
+    assert w._token == "freshly-minted-token", "a healthy worker stopped minting"
+
+    w.server = _DeadServer()
+    w._token_expires_at = time.time() - 1
+    await w._check_token_expiry()
+    assert w._token == "login-issued-token", (
+        "fell back to nothing and kept the expired minted token, so the next reconnect fails"
+    )

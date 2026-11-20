@@ -407,11 +407,12 @@ class BioEngineWorker:
         self.workspace = workspace
         self._token = token or os.environ.get("HYPHA_TOKEN")
         # The credential the worker STARTED with, kept so it is never lost. _token below is
-        # overwritten by each short-lived token the worker mints for itself, and before #0632
-        # that overwrite destroyed the only copy of this one: a worker whose minted token
-        # expired while disconnected could not mint a replacement (minting needs the
-        # connection) and had nothing valid left to reconnect WITH. A restart cured it purely
-        # by re-reading this value from the environment, which is what proved it was still good.
+        # overwritten by each short-lived token the worker mints for itself, and that overwrite
+        # used to destroy the only copy of this one: a worker whose minted token expired while
+        # disconnected could not mint a replacement (minting needs the connection) and had
+        # nothing valid left to reconnect WITH. A restart cured it purely by re-reading this
+        # value from the environment, which is what proved it was still good. Re-assigned after
+        # an interactive login, which is where the real credential arrives.
         self._bootstrap_token = self._token
         self._token_expires_at = 0
         self.client_id = client_id
@@ -475,6 +476,10 @@ class BioEngineWorker:
                 print("Login completed successfully!")
                 print("=" * 60, end="\n\n")
                 self.logger.info("Interactive login completed successfully")
+                # __init__ captured the bootstrap copy before this point, where it was None.
+                # Without refreshing it here a worker that logged in interactively has nothing
+                # to fall back to when a minted token expires while the connection is down.
+                self._bootstrap_token = self._token
 
             # Initialize geo location with unknown placeholder; actual fetch happens in monitoring loop
             self.geo_location = {
@@ -1268,8 +1273,8 @@ class BioEngineWorker:
                 self._token_expires_at = user_info.expires_at
             except Exception as mint_error:
                 # Minting requires the very connection that is down, so the two preconditions
-                # are each other's and nothing in the monitoring loop can break the cycle
-                # (#0632). Fall back to the credential this worker started with: it is
+                # are each other's and nothing in the monitoring loop can break the cycle.
+                # Fall back to the credential this worker started with: it is
                 # long-lived, still held, and the next _check_service_registration tick
                 # reconnects with it. expires_at = 0 is deliberate -- once the connection is
                 # back this step runs again and mints a fresh short-lived token normally.
