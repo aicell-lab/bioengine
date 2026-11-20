@@ -326,7 +326,7 @@ def get_export(export_id: str) -> Dict[str, Any]:
 def _set_pdeathsig() -> None:
     """preexec_fn: ask the kernel to SIGKILL this child when its parent (the runtime
     replica) dies, so a training subprocess cannot outlive an OOM-killed supervisor
-    and orphan-hold the GPU (#0063). Linux-only (prctl PR_SET_PDEATHSIG=1); a no-op
+    and orphan-hold the GPU. Linux-only (prctl PR_SET_PDEATHSIG=1); a no-op
     elsewhere. Runs in the forked child before exec."""
     try:
         import ctypes

@@ -210,7 +210,7 @@ async def test_the_tile_size_reaches_the_subprocess_params(_sandbox_home, tile) 
 
 
 def test_the_worker_passes_it_to_train_seg_as_bsize() -> None:
-    """Clause 2's citation, as a runnable check rather than a line reference.
+    """The citation, as a runnable check rather than a line reference.
 
     Read from the AST, not by grepping for ``bsize``: a grep matches the comment above
     the keyword, and a line number stops being true on the next edit.

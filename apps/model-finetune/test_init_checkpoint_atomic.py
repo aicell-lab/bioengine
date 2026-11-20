@@ -6,8 +6,8 @@ name must never be observable at a length other than the full content's — a
 ``write_bytes`` there opens ``'wb'``, truncating the destination before it has the
 bytes to replace it with.
 
-WHY THIS TEST LOOKS LIKE THIS, because the obvious shapes do not discriminate
-(myco #0268). Asserting that ``_write_file_atomic`` was *called* passes on a revert
+WHY THIS TEST LOOKS LIKE THIS, because the obvious shapes do not discriminate.
+Asserting that ``_write_file_atomic`` was *called* passes on a revert
 that keeps the call and changes the target, so this asserts on the destination's
 CONTENT instead. And a successful write leaves the destination identical either
 way, so there is nothing to see unless the write fails partway — hence the fault

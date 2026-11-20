@@ -1,12 +1,12 @@
-"""#0523 — every ``weights_sha256`` the wire publishes carries a basis beside it, and
+"""every ``weights_sha256`` the wire publishes carries a basis beside it, and
 the basis it carries is the one the CONTRIBUTION resolver gives.
 
-`#0509` stamped ``weights_sha256_basis`` on every new stored contribution. But a
+The stored-basis change put ``weights_sha256_basis`` on every new stored contribution. But a
 bioimage.io client does not read the stored record; it reads what ``pool_wire_state``
 publishes, and that carried the number with no basis next to it — so from outside the
 pool, two digests computed under different bases stayed indistinguishable. That is the
-harm `#0509`'s own lede described, surviving `#0509`'s fix because one row is about
-what is STORED and this one is about what is PUBLISHED.
+harm the stored-basis stamp was meant to prevent, surviving its own fix because
+that change is about what is STORED and this one is about what is PUBLISHED.
 
 Read the payload BACK from the call rather than inspecting the writer: a test that
 asserts on the projection source would pass even if the key never reached the wire.
@@ -149,7 +149,7 @@ def test_the_unrecognised_fixture_basis_really_is_unrecognised() -> None:
 
 
 def test_every_published_digest_has_a_basis_beside_it() -> None:
-    """Clause 1. Read back from the call: one entry per published contribution.
+    """Read back from the call: one entry per published contribution.
 
     The length assertion is not redundant with the set comparison: sets collapse
     duplicate ids, so a map that dropped one of two entries sharing an id would still
@@ -272,7 +272,7 @@ def test_colliding_ids_that_agree_are_not_downgraded() -> None:
 
 
 def test_each_record_gets_its_own_basis_not_a_constant() -> None:
-    """Clause 3. Four records, three different bases, matched per id."""
+    """Four records, three different bases, matched per id."""
     prov = _by_contribution()
     assert prov["c-file"]["basis"] == pool.DIGEST_BASIS_FILE
     assert prov["c-unstamped"]["basis"] == pool.DIGEST_BASIS_FILE
@@ -321,7 +321,7 @@ def test_an_unstamped_contribution_is_the_file_basis_not_undetermined() -> None:
     """Named separately from the arm above because it is the specific regression, and a
     reader who sees only this name should know what went wrong.
 
-    An unstamped contribution is every deposit made before `#0509`'s stamping landed —
+    An unstamped contribution is every deposit made before the stored-basis stamp's stamping landed —
     the real backlog this attribution exists for. ``prepare_contribution`` has computed
     ``weights_sha256`` with ``sha256_file`` on every build that ever wrote one, so an
     absent stamp proves the file basis rather than leaving it open. Publishing
@@ -356,9 +356,9 @@ def test_the_deposit_date_does_not_change_the_answer() -> None:
 
 
 def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
-    """Clause 2. 'no digest stored' and 'a digest whose basis is known' must not read
+    """'no digest stored' and 'a digest whose basis is known' must not read
     the same, and the absent answer must be DIGEST_BASIS_ABSENT rather than a guess at
-    the file basis — a silent default is the defect #0509 was filed for.
+    the file basis — a silent default is the very defect that stamp prevents.
 
     Note the two absences this separates: no DIGEST at all (this record, and it is not
     attributable) versus no STAMP on a digest that exists (``c-unstamped``, and it is
@@ -370,7 +370,7 @@ def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
     assert absent == pool.DIGEST_BASIS_ABSENT
     assert absent != pool.CONTRIBUTION_DIGEST_BASIS, (
         "a record with no digest was published as if it carried the file basis; that "
-        "is the silent default this row exists to prevent"
+        "is the silent default this file exists to prevent"
     )
     # And the undetermined case is its own third answer, not folded into either.
     assert prov["c-badstamp"]["basis"] == pool.DIGEST_BASIS_UNDETERMINED
@@ -379,7 +379,7 @@ def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
 
 def test_the_note_is_written_about_a_contribution_not_the_community_head() -> None:
     """The explanation travels with the number, so a wrong explanation is worse than
-    the bare number this row set out to fix. ``DIGEST_BASIS_NOTES`` is written about
+    the bare number this file is about. ``DIGEST_BASIS_NOTES`` is written about
     the community head and three of its sentences are false of a contribution: the app
     did not name the contributor's checkpoint, "re-merge and compare" is not an
     operation that produces a contribution digest, and a contribution is not a merge
@@ -463,7 +463,7 @@ def test_the_pinned_contribution_field_set_is_not_widened() -> None:
 
 
 def test_the_sibling_maps_still_stand() -> None:
-    """The new key is added alongside, not in place of, what #0417 and #0509 put here."""
+    """The new key is added alongside, not in place of, what the digest-basis rule and the stored-basis stamp put here."""
     dp = _wire()["digest_provenance"]
     assert set(dp) == {"soups", "contributions", "current_community"}, (
         f"digest_provenance should carry exactly three joins, found {sorted(dp)}"

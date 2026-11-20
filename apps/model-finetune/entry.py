@@ -66,6 +66,11 @@ if "cellpose" in _ENABLED_BACKENDS:
 logger = bioengine.logger
 
 SERVER_URL = "https://hypha.aicell.io"
+# Ceiling on the liveness call in `_health`. Must stay well under the
+# deployment's `health_check_timeout_s=30.0`, so a hung Hypha connection is reported
+# as UNHEALTHY by this check rather than timing the check itself out. Matches
+# annotation-broker's `_HEALTH_CALL_TIMEOUT_S`, which guards the same shape.
+_HEALTH_CALL_TIMEOUT_S = 15.0
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal[
@@ -88,7 +93,7 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     """Whether this cluster can place the GPU runtimes the enabled backends need.
 
     Exists because getting this wrong is otherwise INVISIBLE from the running
-    system (#0370). Two enabled backends book two whole GPUs even to serve one
+    system. Two enabled backends book two whole GPUs even to serve one
     request; on a cluster whose second GPU is never free the second replica simply
     never schedules. Measured 2026-11-13 on a one-GPU ``external-cluster`` worker: the
     unplaceable runtime stays ``UPDATING`` with its replica ``STARTING``, the
@@ -122,7 +127,7 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     So a cluster that owns enough but has none free right now reads
     ``sufficient: True`` with a ``detail`` that says the runtimes pend until a
     device is released — which is the whole of the answer an operator needs, with
-    no alarm attached (#0370, re-review).
+    no alarm attached.
 
     Never raises and never blocks the deploy. ``sufficient`` is deliberately
     three-valued, because "not enough" and "cannot tell" are different answers:
@@ -382,7 +387,7 @@ class _RecognisedRedeposit(Exception):
     retries for ~62 s before re-raising. One retried deposit would then take
     the whole pool down rather than just its own merge — strictly worse than
     the double-weighting this is fixing. Never crosses the RPC boundary: the
-    caller sees a normal return with ``deduplicated: true``. #0376.
+    caller sees a normal return with ``deduplicated: true``.
     """
 
     def __init__(self, existing: Dict[str, Any]) -> None:
@@ -403,20 +408,54 @@ class _RecognisedRedeposit(Exception):
     # replica-local; the records a caller polls are on disk, so a teardown
     # between calls is invisible to the frontend.
     #
-    # initial_replicas is 1, not 0, so the entry can SPEAK at deploy time (#0370).
+    # initial_replicas is 1, not 0, so the entry can SPEAK at deploy time.
     # Measured 2026-11-13 on a one-GPU external cluster with both backends on: a
     # GPU runtime that cannot be placed leaves the app in DEPLOYING forever, the
     # proxy registers its Hypha service only once every sibling is serviceable, so
     # nothing can call the app — and with initial_replicas 0 nothing wakes the entry
     # either, so the placement warning below is never written. One CPU-only replica
     # at deploy time puts it in deployments.<entry>.logs, which get_app_status
-    # returns while the app is still DEPLOYING. min_replicas stays 0, so #0045's
+    # returns while the app is still DEPLOYING. min_replicas stays 0, so the scale-to-zero
     # requirement ("should also scale down if not used") is untouched: this replica
     # goes away after downscale_delay_s like any other.
+    #
+    # metrics_interval_s and look_back_period_s are declared because this deployment
+    # scales to ZERO, which makes the autoscaler's own sampling cadence the dominant
+    # term in what a caller waits for.
+    #
+    # Serve's defaults are metrics_interval_s=10.0 and look_back_period_s=30.0. With
+    # min_replicas 0 that means a request arriving at an idle app waits for the next
+    # handle->controller metrics push before the controller can even see that anything
+    # is queued, and then for a 30 s window to carry enough signal to decide. The cost
+    # was measured on this app's own cold-start path, varying ONLY this field:
+    #
+    #     metrics_interval_s = 10 (default)   phase A median 14.698 s
+    #     metrics_interval_s = 1              phase A median  2.142 s     6.9x
+    #
+    # where phase A is autoscale + placement + runtime_env, i.e. everything before the
+    # replica's actor exists. In production that cost is plain: on the deNBI
+    # watcher's own series the app answers in ~190-490 ms when a replica is already up
+    # and 9.7-12.6 s when it is not, with nothing in between -- a bimodal distribution
+    # whose slow mode IS this wait.
+    #
+    # 1.0 is used rather than the sibling's 2.0 because 1.0 is the value actually
+    # measured; 2.0 would be an interpolation. The cost is this ONE deployment's
+    # handle->controller push rate, max_replicas being 1, which is why this is the
+    # per-deployment field and not the worker-wide
+    # RAY_SERVE_HANDLE_AUTOSCALING_METRIC_PUSH_INTERVAL_S env var -- that one would
+    # change every deployment the worker hosts and is set elsewhere.
+    #
+    # Both keys are real AutoscalingConfig fields in Ray 2.55.1, asserted rather than
+    # assumed: AutoscalingConfig drops unknown keys instead of raising, so a
+    # renamed field would reach Serve and be lost with no warning. Verified in the
+    # worker image with a control -- `zzz_not_a_field` is absent from model_fields
+    # while these two are present, and both round-trip.
     autoscaling_config={
         "min_replicas": 0,
         "initial_replicas": 1,
         "max_replicas": 1,
+        "metrics_interval_s": 1.0,
+        "look_back_period_s": 10.0,
         "downscale_delay_s": 600.0,
         "upscale_delay_s": 0.0,
     },
@@ -491,10 +530,20 @@ class EntryApp:
         )
         # Resolved once per replica and cached for its whole life, so a plain
         # proxy pinned to a client id the server later forgets would hang every
-        # call to the full method timeout — and `_health` below tests `is None`,
-        # which a dead handle passes. `put_file`/`get_file` only mint a
+        # call to the full method timeout. `put_file`/`get_file` only mint a
         # presigned URL, so both are safe to re-send after a call that may
         # already have landed.
+        #
+        # `self._s3` IS wrapped and `self._hypha` above is deliberately NOT wrapped.
+        # That asymmetry is a decision, not an oversight, and this is where a reader
+        # meets it. `reconnecting_service` is a drop-in for `get_service(id)`: it
+        # re-resolves a service proxy, which is a different object from the connection
+        # it was resolved through, so it cannot be applied to `self._hypha` at all —
+        # and re-resolving anything through a dead connection fails the same way.
+        # What covers the connection instead is the bounded round trip in `_health`:
+        # it fails, Serve replaces the replica, and `_connect` runs again on a fresh
+        # connection. Replacing the connection is the only repair that works when the
+        # connection itself is what died.
         self._s3 = await bioengine.reconnecting_service(
             self._hypha,
             "public/s3-storage",
@@ -507,7 +556,7 @@ class EntryApp:
         self._log_gpu_placement()
 
     def _log_gpu_placement(self) -> None:
-        """Say in the entry's own log whether the GPU runtimes can be placed (#0370).
+        """Say in the entry's own log whether the GPU runtimes can be placed.
 
         This is the signal that was missing. The entry replica reaches HEALTHY on
         any node, so these lines are in ``deployments.<entry>.logs`` — which
@@ -529,6 +578,33 @@ class EntryApp:
         # CPU-only methods stay served when the runtime is down/scaling.
         if self._s3 is None:
             raise RuntimeError("S3 storage service not connected")
+        # The `is None` test above cannot fail on a DEAD handle. hypha_rpc pins a proxy
+        # to one client instance of the server; when that instance is gone every call
+        # fails at send time forever while the websocket underneath happily reconnects.
+        # A replica in that state keeps passing this check, stays in the Serve routing
+        # table, and turns every call into a full-method-timeout hang instead of a fast
+        # failure.
+        #
+        # So exercise the connection for real. `echo` is the cheapest call that proves
+        # it — it reaches the Hypha server and nothing else, touching neither S3 nor a
+        # GPU runtime — and it is the same probe `apps/model-runner/entry.py` uses in
+        # its own health path. Raising here makes Serve replace the replica, which
+        # rebuilds the connection; that is the remedy annotation-broker settled on
+        # after the 2026-08-24 outage (`broker.py` `_health`), and it is cheap for this
+        # app for the reason the autoscaling block above already relies on: the records
+        # a caller polls are on disk, so a teardown between calls is invisible to the
+        # frontend. Why the connection is covered this way rather than by wrapping it
+        # is recorded in `_connect`, at the call that wraps `self._s3`.
+        #
+        # Bounded well under `health_check_timeout_s=30.0` so a hung connection is
+        # reported as unhealthy rather than timing the check itself out, which Serve
+        # would otherwise surface as a less specific failure.
+        try:
+            await asyncio.wait_for(
+                self._hypha.echo("ping"), timeout=_HEALTH_CALL_TIMEOUT_S
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Hypha server connection unusable: {exc}") from exc
 
     def _runtime_for(self, model_type: Optional[str]):
         """Route to the backend that owns ``model_type`` (cpsam → CellposeRuntime,
@@ -1126,8 +1202,8 @@ class EntryApp:
             })
             # Long-running: this await holds one GPU runtime replica for the whole
             # training run, and a concurrent infer queues behind it on that same
-            # replica — at the effective target of 2 (#0091) two calls in flight
-            # ask for one replica, not two (#0097).
+            # replica — at the effective target of 2, two calls in flight ask for
+            # one replica, not two.
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
             # so a session waiting here is not false-flagged STOPPED.
@@ -1177,7 +1253,7 @@ class EntryApp:
         ``placement.sufficient`` is False and ``placement.advice`` names
         ``MODEL_FINETUNE_BACKENDS``; without it the only symptom is a backend
         reading ``unavailable`` forever while the deployment reports
-        ``UPSCALING``, which never times out (#0370)."""
+        ``UPSCALING``, which never times out."""
         import training
 
         microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
@@ -1212,10 +1288,10 @@ class EntryApp:
             },
             "models": models,
             "parameters": self._training_parameter_schema(),
-            # Why a backend reads 'runtime unavailable' when nothing is broken
-            # (#0370): on a cluster with fewer GPUs than enabled backends the
-            # runtime never schedules, and the only other symptom is a permanent
-            # UPSCALING that never times out. Answered CPU-side; never wakes a GPU.
+            # Why a backend reads 'runtime unavailable' when nothing is broken: on
+            # a cluster with fewer GPUs than enabled backends the runtime never
+            # schedules, and the only other symptom is a permanent UPSCALING that
+            # never times out. Answered CPU-side; never wakes a GPU.
             "placement": _gpu_placement_report(self._enabled_backends),
         }
 
@@ -1905,9 +1981,9 @@ class EntryApp:
             # the pool index gets have to be repeated at this chokepoint or they are
             # absent from every named community version. Both callers come through here.
             #
-            # #0417: the manifest carries this digest too, so say which of the two it is.
+            # The manifest carries this digest too, so say which of the two it is.
             # It has its own created_at, so no join is needed.
-            # #0418: the manifest also carries the basis wording 0.27.15 retracted, so
+            # The manifest also carries the basis wording 0.27.15 retracted, so
             # correcting only the pool index would still leave a contributor reading the
             # withdrawn claim off a named version.
             "sha256_provenance": pool.digest_provenance(
@@ -2086,12 +2162,12 @@ class EntryApp:
                     # (equals stock cpsam). The pool artifact itself must already
                     # exist (created out-of-band with the pool_token's scope).
                     #
-                    # #0070: the base commitment is written HERE, once, at pool
+                    # The base commitment is written HERE, once, at pool
                     # creation. It is built on the runtime because a commitment needs
                     # the base's state_dict and this entry is torch-free; passing it
                     # through is what makes the pool mergeable at all, since
                     # assert_base_commitment refuses a pool that records none and has
-                    # no fallback by ruling. A bootstrap that omitted it produced a
+                    # deliberately no fallback. A bootstrap that omitted it produced a
                     # pool that could never merge.
                     index = pool.empty_index(
                         model_type, signature, info.get("base_commitment"))
@@ -2103,7 +2179,7 @@ class EntryApp:
                 # them. Identity is the digest alone — see
                 # pool.find_contribution_by_digest for why metadata is not part of
                 # it, and why decided_contribution_ids is not consulted. Leaving by
-                # raise, never by return: see _RecognisedRedeposit. #0376.
+                # raise, never by return: see _RecognisedRedeposit.
                 existing = pool.find_contribution_by_digest(index, info["weights_sha256"])
                 if existing is not None:
                     raise _RecognisedRedeposit(existing)
@@ -2119,7 +2195,7 @@ class EntryApp:
                     samples_seen=samples_seen,
                     training_params=params,
                     l2_from_base=info["l2_from_base"],
-                    # #0122. .get, not ["…"]: an older runtime replica that predates
+                    # .get, not ["…"]: an older runtime replica that predates
                     # the label still answers this call, and it should write a null
                     # label — which reads as undetermined — rather than raise.
                     l2_from_base_basis=info.get("l2_from_base_basis"),
@@ -2184,7 +2260,7 @@ class EntryApp:
                 "weights_sha256": info["weights_sha256"],
                 "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
                 "l2_from_base": info["l2_from_base"],
-                # #0122. The caller keeps THIS record, so it carries the label for
+                # The caller keeps THIS record, so it carries the label for
                 # the same reason the stored one does: a distance whose origin is
                 # not named is not comparable with anyone else's.
                 "l2_from_base_basis": info.get("l2_from_base_basis"),
@@ -2209,7 +2285,7 @@ class EntryApp:
             # False, not absent, on the fresh path. A key present only when true
             # cannot be dated: a client holding a response without it cannot tell
             # "fresh deposit" from "a release that predates de-duplication" —
-            # the defect app_version exists to avoid (#0116, #0140). #0376.
+            # the defect app_version exists to avoid.
             "deduplicated": False,
         }
 
@@ -2540,7 +2616,7 @@ class EntryApp:
             if refusal:
                 raise ValueError(f"aggregate() refused this merge: {refusal}")
 
-            # ---- Provenance, before a single byte is souped (#0139) ----------
+            # ---- Provenance, before a single byte is souped ----------
             #
             # Until now nothing checked that a member's bytes were the bytes its
             # contribution attested to. The digest was written at upload and then
@@ -2704,14 +2780,14 @@ class EntryApp:
                         base_commitment=index.get("base_commitment")))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
-                    # #0070 requirement 4: the contributors' own measured diameters go in
+                    # The contributors' own measured diameters go in
                     # the manifest. The runtime is given weights PATHS and never learns a
                     # contribution id, so the mapping is made here, where s_paths and
                     # s_ids are the parallel lists the gate built. An unmapped key RAISES
                     # rather than recording a null id: a diameter attributed to the wrong
                     # contributor, or to nobody, is worse than one not recorded, and this
                     # is the only place the correspondence is checkable.
-                    # A runtime that predates #0070 returns no such keys. entry and the
+                    # A runtime that predates the base commitment returns no such keys. entry and the
                     # Cellpose runtime are SEPARATE Ray deployments and can sit at
                     # different app versions during a rolling update, so this must not
                     # KeyError — and must not quietly write null either, because a reader
@@ -2738,7 +2814,7 @@ class EntryApp:
                         member_nl = None
                         non_learned_block = pool.unreported_non_learned(
                             reason="the Cellpose runtime serving this merge returned no "
-                                   "non_learned_inherited field, so it predates #0070")
+                                   "non_learned_inherited field, so it predates the base commitment")
                     manifest = pool.build_community_manifest(
                         community_version=new_version, combine="uniform",
                         selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
@@ -2842,7 +2918,7 @@ class EntryApp:
             "deferred": deferred_ids,
             "gate_metric": round(head_a, 4),
             # The digest of the head this call just published, and which of the two
-            # things it digests. This is the moment the #0417 false alarm happens —
+            # things it digests. This is the moment the false alarm happens —
             # someone re-merges an identical member set, gets a number, compares it
             # against a stored one and concludes corruption — so the attribution is
             # returned here, where both numbers are in the caller's hands, and not
