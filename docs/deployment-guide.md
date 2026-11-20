@@ -60,6 +60,16 @@ spec:
 
 The worker image sets no `USER`, so a plain `docker run` is root and `0400` works. Production Kubernetes deployments generally are not root — the KTH chart runs `runAsNonRoot: true, runAsUser: 65534` — which is why `0400` alone is the wrong default to copy.
 
+> **Run as a uid that exists in `/etc/passwd`.** `65534` (`nobody`) does; an arbitrary
+> uid injected by the platform may not. Ray hands `virtualenv` an empty environment, so
+> `HOME` is unset while a `runtime_env` venv is built; with no passwd entry for the uid,
+> `platformdirs` has no source left for the home directory. From 4.12.1 it raises rather
+> than falling back, and **no new `runtime_env` venv can be built at all**:
+> `RuntimeError: could not determine the home directory for '~/.config'`. Already-cached
+> venvs keep working, so this surfaces only on a first-time deploy of an app with a new
+> `pip` spec. `requirements-worker.txt` pins `platformdirs<4.12` to keep the fallback;
+> if you lift that pin, either give the uid a passwd entry or set an absolute `HOME`.
+
 Substitute your own secret name and key. `items` maps a key in the Secret to a filename in the mount, so a Secret holding the token under `HYPHA_TOKEN` needs `- key: HYPHA_TOKEN`. Get it wrong and kubelet refuses to set the volume up at all (`FailedMount`, `references non-existent secret key`) and the container never starts; mark the volume `optional: true` and the file is simply absent, at which point the worker exits at startup with `Could not read --token-file`.
 
 `--token=$(HYPHA_TOKEN)` is the shape to avoid: Kubernetes expands it at render time, so the Deployment spec keeps only the placeholder and looks clean under `kubectl get deploy -o yaml` while the live process carries the value.
