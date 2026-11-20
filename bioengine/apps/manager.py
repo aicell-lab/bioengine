@@ -30,9 +30,13 @@ from bioengine.utils import (
     create_application_from_files,
     create_context,
     create_logger,
+    describe_deploy_arguments,
     ensure_applications_collection,
     get_static_site_url,
+    is_secret_env_var,
     latest_committed_version,
+    looks_like_secret,
+    SECRET_MASK,
     stale_service_kind,
 )
 
@@ -1289,6 +1293,8 @@ class AppsManager:
         n_previous_replica: int,
         logs_tail: int,
         deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
+        death_causes: Optional[Dict[str, Any]] = None,
+        death_cause_query_failed: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         overrides = deployment_logs_overrides or {}
         # Read once for the whole application. Never raises: a status this cannot
@@ -1338,7 +1344,36 @@ class AppsManager:
                     deployment_name=deployment_name,
                     n_previous_replica=this_prev,
                     tail=this_tail,
+                    death_causes=death_causes,
+                    death_cause_query_failed=death_cause_query_failed,
                 )
+                # The proxy returns the deliberate-stop COUNT alongside the replica entries.
+                # Lift it OUT of that map before any consumer sees it: `logs` is contracted as
+                # replica-id -> stream-dict and every consumer iterates it that way, so an int
+                # sitting in there is not a cosmetic wart -- it crashed `bioengine apps status`
+                # with `AttributeError: 'int' object has no attribute 'get'` for any deployment
+                # that had ever been scaled down, which is most long-lived ones.
+                #
+                # Rebuilt rather than popped: `pop` mutates the dict the CALLER handed us.
+                # Over RPC that dict is fresh each call so it never showed, but it made two
+                # tests sharing one module-level fixture order-dependent -- the first to run
+                # removed the key and the rest saw a map that had never had it. An input is
+                # not ours to edit.
+                if isinstance(deployment_logs, dict) and (
+                    "_deliberately_stopped_replicas" in deployment_logs
+                ):
+                    deployments_info[deployment_name]["deliberately_stopped_replicas"] = (
+                        deployment_logs["_deliberately_stopped_replicas"]
+                    )
+                    deployment_logs = {
+                        k: v
+                        for k, v in deployment_logs.items()
+                        if k != "_deliberately_stopped_replicas"
+                    }
+                if death_cause_query_failed:
+                    # So "no deaths shown" cannot be read as "nothing died". The reader has
+                    # to be able to tell an empty answer from an unanswered question.
+                    deployments_info[deployment_name]["death_causes_unavailable"] = True
                 deployments_info[deployment_name]["logs"] = deployment_logs
             except Exception as e:
                 self.logger.error(
@@ -1430,7 +1465,13 @@ class AppsManager:
                 if key.startswith("_"):
                     # Remove the underscore prefix and mask the value
                     new_key = key[1:]  # Remove first character (_)
-                    processed_vars[new_key] = "*****"
+                    processed_vars[new_key] = SECRET_MASK
+                elif looks_like_secret(value):
+                    # Credential-shaped value under an ordinary name. Mask it,
+                    # but do NOT touch the key: there is no prefix to strip, and
+                    # renaming it would make the status report disagree with
+                    # what the caller actually passed.
+                    processed_vars[key] = SECRET_MASK
                 else:
                     processed_vars[key] = value
 
@@ -1584,6 +1625,8 @@ class AppsManager:
         n_previous_replica: int,
         logs_tail: int,
         deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
+        death_causes: Optional[Dict[str, Any]] = None,
+        death_cause_query_failed: bool = False,
     ) -> Dict[str, Any]:
         """
         Application States: [NOT_STARTED, DEPLOYING, DEPLOY_FAILED, RUNNING, UNHEALTHY, DELETING]
@@ -1616,6 +1659,8 @@ class AppsManager:
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
                 deployment_logs_overrides=deployment_logs_overrides,
+                death_causes=death_causes,
+                death_cause_query_failed=death_cause_query_failed,
             )
         else:
             if application_info["is_deployed"].is_set():
@@ -3567,19 +3612,6 @@ class AppsManager:
                         f"Value for '{key}' in application_kwargs must be a dictionary."
                     )
 
-            kwargs_str = (
-                ", ".join(
-                    f"{deployment_class}("
-                    + ", ".join(
-                        [f"{key}={value!r}" for key, value in deployment_kwargs.items()]
-                    )
-                    + ")"
-                    for deployment_class, deployment_kwargs in application_kwargs.items()
-                )
-                if application_kwargs
-                else "None"
-            )
-
             # Validate application_env_vars
             if not isinstance(application_env_vars, dict):
                 raise ValueError(
@@ -3591,28 +3623,17 @@ class AppsManager:
                         f"Value for '{key}' in application_env_vars must be a dictionary."
                     )
 
-            # Construct the environment variables string, hide secret env vars starting with underscore as *****
-            env_vars_str = (
-                ", ".join(
-                    f"{deployment_class}: "
-                    + " ".join(
-                        [
-                            f"{key}={value!r}"
-                            for key, value in env_vars.items()
-                            if not key.startswith("_")
-                        ]
-                    )
-                    + " ".join(
-                        [
-                            f'{key}="*****"'
-                            for key in env_vars.keys()
-                            if key.startswith("_")
-                        ]
-                    )
-                    for deployment_class, env_vars in application_env_vars.items()
-                )
-                if application_env_vars
-                else "None"
+            # Both strings are built by `describe_deploy_arguments`, which masks a value
+            # whose key opts in with an underscore OR whose value is itself credential-
+            # shaped. Keying only on the name failed open for every spelling nobody
+            # anticipated, and this log outlives the pod that wrote it.
+            #
+            # It lives in utils.redaction rather than inline here so a test can render its
+            # OUTPUT and assert the secret literal is absent. Inline, the only testable
+            # property was "deploy_app mentions the matcher somewhere", which stayed true
+            # with the guard deleted from the cleartext half.
+            kwargs_str, env_vars_str = describe_deploy_arguments(
+                application_kwargs, application_env_vars
             )
 
             if is_update:
@@ -4071,6 +4092,31 @@ class AppsManager:
             await self.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote()
         )
 
+        # ONE cluster-wide dead-actor query for the whole call. The query takes no
+        # deployment filter -- it lists every DEAD actor regardless -- so running it
+        # inside each deployment repeated identical work once per deployment, per
+        # application. An application has four deployments, so a status over three
+        # applications issued twelve copies of the same query; this makes it one.
+        #
+        # None means the query FAILED, and that is passed down as None rather than as
+        # an empty map: the difference decides whether a deployment reports "nothing
+        # died" or declines to guess.
+        # Guarded: unguarded, a proxy RPC failure here would fail the WHOLE get_app_status,
+        # where a per-deployment failure used to degrade to a logged error. The flag is what
+        # the deployments are told, because `None` alone cannot say "the query failed" --
+        # it already means "no map supplied", and conflating them made a failed hoist re-query
+        # once per deployment.
+        death_causes = None
+        death_cause_query_failed = False
+        try:
+            death_causes = (
+                await self.ray_cluster.proxy_actor_handle.get_all_death_causes.remote()
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to fetch actor death causes: {e}")
+        if death_causes is None:
+            death_cause_query_failed = True
+
         # Iterate over applications to check
         status_tasks = [
             self._get_app_status(
@@ -4079,6 +4125,8 @@ class AppsManager:
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
                 deployment_logs_overrides=deployment_logs,
+                death_causes=death_causes,
+                death_cause_query_failed=death_cause_query_failed,
             )
             for application_id in apps_to_check
         ]
