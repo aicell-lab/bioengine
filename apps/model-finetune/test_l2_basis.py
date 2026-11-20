@@ -56,7 +56,7 @@ def test_a_labelled_stock_record_resolves_to_that_base() -> None:
 def test_no_distance_is_its_own_answer_not_undetermined() -> None:
     """"the pool holds no distance" and "the pool holds a distance whose origin is
     unknown" are different facts, and folding them together would lose the one
-    the basis label was filed about."""
+    the basis label exists to record."""
     assert pool.l2_basis({"l2_from_base": None}) == pool.L2_BASIS_ABSENT
     assert pool.l2_basis({}) == pool.L2_BASIS_ABSENT
     assert pool.L2_BASIS_ABSENT != pool.L2_BASIS_UNDETERMINED

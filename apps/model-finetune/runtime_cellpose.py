@@ -39,8 +39,8 @@ logger = bioengine.logger
 
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
-# runtime_env install did not take fails instead of being advertised as ready
-#. Keep this list equal to what the bodies actually import: it is a
+# runtime_env install did not take fails instead of being advertised as ready.
+# Keep this list equal to what the bodies actually import: it is a
 # readiness gate, not a restatement of requirements-runtime-cellpose.txt, and a
 # module nothing imports would fail a replica that can serve every call.
 # ``numpy`` is absent on purpose — it is imported at module scope above, so a
@@ -596,8 +596,7 @@ class CellposeRuntime:
         """Uniform mean of member state_dicts; None when empty (= stock base).
 
         Learned tensors are averaged; non-learned ones (``diam_labels``) are carried
-        from the base unchanged, and a key the base does not declare fails the merge
-       .
+        from the base unchanged, and a key the base does not declare fails the merge.
         """
         import pool
 
@@ -674,7 +673,7 @@ class CellposeRuntime:
         and return its sha256 + byte size — so the head weights never traverse the
         CPU entry. ``members`` must be non-empty (a published head always has one).
 
-        Also returns what the community manifest needs for requirement 4, because
+        Also returns what the community manifest needs to record each contributor's
         this is the only place the members' weights are resident and reading them again
         would mean re-downloading every one:
 

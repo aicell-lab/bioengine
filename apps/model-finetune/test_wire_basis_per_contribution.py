@@ -5,8 +5,8 @@ the stored-basis stamp stamped ``weights_sha256_basis`` on every new stored cont
 bioimage.io client does not read the stored record; it reads what ``pool_wire_state``
 publishes, and that carried the number with no basis next to it — so from outside the
 pool, two digests computed under different bases stayed indistinguishable. That is the
-harm the stored-basis stamp's own lede described, surviving the stored-basis stamp's fix because one row is about
-what is STORED and this one is about what is PUBLISHED.
+harm the stored-basis stamp was meant to prevent, surviving its own fix because
+that change is about what is STORED and this one is about what is PUBLISHED.
 
 Read the payload BACK from the call rather than inspecting the writer: a test that
 asserts on the projection source would pass even if the key never reached the wire.
@@ -358,7 +358,7 @@ def test_the_deposit_date_does_not_change_the_answer() -> None:
 def test_the_absent_case_is_distinguishable_from_the_known_case() -> None:
     """Clause 2. 'no digest stored' and 'a digest whose basis is known' must not read
     the same, and the absent answer must be DIGEST_BASIS_ABSENT rather than a guess at
-    the file basis — a silent default is the defect the stored-basis stamp was filed for.
+    the file basis — a silent default is the very defect that stamp prevents.
 
     Note the two absences this separates: no DIGEST at all (this record, and it is not
     attributable) versus no STAMP on a digest that exists (``c-unstamped``, and it is

@@ -114,11 +114,11 @@ class _Runtime:
         """``base_commitment`` accepted and ignored, as in ``score_soup`` above.
 
         The real method also returns ``non_learned_inherited``,
-        ``non_learned_source`` and ``member_non_learned`` for the base-commitment rules's
-        requirement 4. They are deliberately NOT invented here: ``aggregate()``
-        reads them with ``.get()``, so omitting them is tolerated, and a stub
-        that made them up would let a requirement-4 assertion pass against
-        values no runtime produced. Requirement 4 is driven in the the base-commitment rules suite,
+        ``non_learned_source`` and ``member_non_learned``, so the community manifest
+        can record each contributor's own diameter. They are NOT invented here:
+        ``aggregate()`` reads them with ``.get()``, so omitting them is tolerated,
+        and a stub that made them up would let such an assertion pass against
+        values no runtime produced. That property is driven in the base-commitment
         against the real builder.
         """
         return {"sha256": HEAD_SHA, "n_bytes": 2048,

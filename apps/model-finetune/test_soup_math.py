@@ -31,8 +31,8 @@ def _sd(value, dtype=torch.float32):
 def _commit(state_dict, source="test:stock-cpsam"):
     """A pool's recorded base commitment, built from a real state dict.
 
-    uniform_soup now reads the pool's RECORD rather than loading a checkpoint
-   , so every test states the base it is classifying against as
+    uniform_soup now reads the pool's RECORD rather than loading a checkpoint,
+   so every test states the base it is classifying against as
     data. Built through pool.base_commitment so the digest and the count in the test
     cannot disagree with the ones the merge computes.
     """
@@ -43,8 +43,8 @@ def _base(dtype=torch.float32):
     """The base checkpoint these members were fine-tuned from.
 
     ``uniform_soup`` takes it as a REQUIRED loader, because its key set is the
-    inventory every member key is classified against (requirement 2) and its
-    non-learned values are what the soup carries through (requirement 3). Passing it
+    inventory every member key is classified against, and its non-learned values
+    are what the soup carries through. Passing it
     explicitly in every test is the point: a default would be the "neither
     classifiable nor classified, so average it" hole the ruling closes.
     """
@@ -135,7 +135,7 @@ def test_an_empty_later_member_is_rejected_by_the_same_guard():
         pool.uniform_soup([lambda: _sd(10.0), lambda: _sd(10.0), dict], base=_commit(_base()))
 
 
-# ── l2_from_base is weight-only (requirement 2) ────────────────────────
+# ── l2_from_base is weight-only ──────────────────────────────────────────
 # diam_labels and diam_mean are registered as non-learned nn.Parameter
 # (cellpose_model.py:78-79), so they sit in the state dict as float32 scalars
 # with matching shapes and pass every dtype/shape filter the drift metric had.
@@ -200,7 +200,7 @@ def test_a_nonweight_name_does_not_swallow_a_real_weight() -> None:
     )
 
 
-# ── the merge carries the BASE diameter, never an average (req 1+3) ────
+# ── the merge carries the BASE diameter, never an average ────────────────
 # RULED 2026-11-14: the operative value in the tensor is the base checkpoint's,
 # unchanged; the contributors' own diameters are recorded in the community
 # manifest instead of being averaged into a number nobody measured.
@@ -328,7 +328,7 @@ def test_collecting_is_opt_in_and_changes_nothing() -> None:
 
 
 def test_an_inherited_block_must_name_its_source() -> None:
-    """the base-commitment rules's ruling: reporting the float alone reproduces the defect in the manifest.
+    """Under the base-commitment rules, reporting the float alone reproduces the
     A reader cannot tell an inherited 30.0 from a coincidental one."""
     with pytest.raises(ValueError, match="named source"):
         pool.inherited_non_learned({"diam_labels": 30.0}, source="")
@@ -430,7 +430,7 @@ def test_base_is_required_so_a_caller_cannot_default_into_averaging() -> None:
 
 
 def test_the_declared_non_learned_set_is_what_the_model_registers() -> None:
-    """requirement 1: one declaration, not two.
+    """One declaration, not two.
 
     cellpose_model.py registers these by iterating pool.NON_WEIGHT_PARAMS, so a
     non-learned Parameter cannot be added to the architecture without also being

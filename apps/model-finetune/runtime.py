@@ -53,8 +53,8 @@ _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
-# runtime_env install did not take fails instead of being advertised as ready
-#. Keep this list equal to what the bodies actually import: it is a
+# runtime_env install did not take fails instead of being advertised as ready.
+# Keep this list equal to what the bodies actually import: it is a
 # readiness gate, not a restatement of requirements-runtime.txt, and a module
 # nothing imports would fail a replica that can serve every call. ``numpy`` is
 # absent on purpose — it is imported at module scope above, so a replica missing
@@ -84,8 +84,8 @@ def _read_pip(name: str) -> List[str]:
         "initial_replicas": 1,
         "max_replicas": 3,
         # No target declared on purpose: the name this dict used is one Serve
-        # removed, so the effective target is Serve's default of 2 either way
-        #, and declaring 1.0 now is a behaviour change, not a fix.
+        # removed, so the effective target is Serve's default of 2 either way,
+        # and declaring 1.0 now is a behaviour change, not a fix.
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
         "downscale_delay_s": 600,

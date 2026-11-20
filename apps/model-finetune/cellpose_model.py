@@ -77,7 +77,7 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
 
         # Registered by iterating pool.NON_WEIGHT_PARAMS rather than by naming the
         # two fields, so the set the federated merge EXCLUDES and the set this
-        # wrapper CREATES are one list (requirement 1). Adding a non-learned
+        # wrapper CREATES are one list, declared once. Adding a non-learned
         # Parameter here without declaring it there is now impossible: there is
         # nowhere else to add it. requires_grad=False is the declaration that these
         # are not learned; it is not serialised into a state_dict, which is why the

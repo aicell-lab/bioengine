@@ -16,7 +16,7 @@ lose three cases and stay far above it. The invariant would have landed with not
 it, and a later refactor dropping the ``async with`` would have gone unnoticed.
 
 So the heavy dependencies are stubbed the way `bench_soup_concurrency.py` stubs them — the
-evidence for the single-flight change, the row that put `_soup_sem` around the merge in the first place. What is
+evidence for the single-flight change that first put `_soup_sem` around the merge.
 under test is the **semaphore around the allocating region**, not torch: the state dicts here
 are three-key dicts, because ordering is what is being asserted, not bytes.
 

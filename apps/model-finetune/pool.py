@@ -1144,7 +1144,7 @@ def uniform_soup(
     against the runtime's 12 GiB reservation and the replica was OOM-killed.
 
     ``base`` is a loader for the checkpoint the pool started from, and it is
-    REQUIRED rather than defaulted, which is the whole point of requirement 2:
+    REQUIRED rather than defaulted, and that is the whole point:
     a caller that cannot say what the base is must fail, not silently average. It is
     read once, reduced to its key set plus its non-learned values, and released
     before the accumulation loop allocates, so it costs one transient member and
@@ -1164,7 +1164,7 @@ def uniform_soup(
     LOADER ORDER — the caller zips it against the member specs it supplied, because
     this function is given loaders and never learns a contribution id. That ordering is
     the whole contract: an unordered map would lose which diameter belonged to whom,
-    which is the half of requirement 4 that makes the numbers worth keeping.
+    which is what makes the recorded numbers worth keeping.
     Collected as plain floats off the tensor while the member is already resident, so
     it adds no second pass and retains nothing after ``del sd``.
 

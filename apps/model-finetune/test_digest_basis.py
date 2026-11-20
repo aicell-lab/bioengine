@@ -706,7 +706,7 @@ class TestContributionsStampTheBasis:
         assert index["contributions"][1]["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
 
     def test_the_refused_duplicate_append_stamps_nothing(self):
-        """The the dedupe backstop dedupe backstop still fires, and the stamp does not reach the
+        """The dedupe backstop still fires, and the stamp does not reach the
         index on the path that raises."""
         index: Dict[str, Any] = {
             "contributions": [_contribution("c-first", CONTRIB_SHA, UPLOADED_OLD)]
@@ -976,8 +976,8 @@ class _Runtime:
 
     async def score_soup(self, specs, imgs, gts, diam_mean,
                          base_commitment=None) -> Dict[str, Any]:
-        # One per-image score per image of the split, as the real runtime returns
-        #. Uniform, so the mean is exactly the ``f1`` the caller chose —
+        # One per-image score per image of the split, as the real runtime returns.
+        # Uniform, so the mean is exactly the ``f1`` the caller chose —
         # aggregate() refuses a record whose aggregate is not the mean of the
         # vector beside it, so a stub returning an arbitrary vector would make
         # every branch below fail for a reason that is not under test here.
@@ -1138,7 +1138,7 @@ async def test_a_merge_that_admitted_nothing_stamps_a_null_basis_not_an_absent_o
 
 @pytest.mark.asyncio
 async def test_aggregate_returns_the_attribution_of_the_digest_it_just_published():
-    """The moment the the digest-basis rule false alarm actually happens: a caller re-merges an
+    """The moment the digest-basis rule's false alarm actually happens: a caller re-merges an
     identical member set, gets a number, and compares it against a stored one. Both
     numbers are in their hands HERE, so the attribution has to travel with the
     return value and not only on a page they would have to go and read."""
