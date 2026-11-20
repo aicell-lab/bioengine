@@ -645,6 +645,15 @@ def _echo_deployment_logs(dep_info: dict, indent: str = "") -> None:
         # older build still returns the old shape, and a status command must not crash on it.
         if not isinstance(streams, dict):
             continue
+        if "death_cause" in streams and not streams["death_cause"]:
+            # A dead replica whose cause Ray no longer holds. `if cause:` alone skipped
+            # it entirely, so the replica that died left NO trace in the output at all —
+            # indistinguishable from a deployment where nothing had died. The presence of
+            # the key is what marks a dead replica; its value is what Ray could still tell
+            # us, and "we know it died, we no longer know why" is a different statement
+            # from silence.
+            click.echo(f"{indent}[{replica_id}] died: cause unknown (no longer held by Ray)")
+            printed = True
         cause = streams.get("death_cause")
         if cause:
             # A replica killed mid-request writes no traceback, so its streams

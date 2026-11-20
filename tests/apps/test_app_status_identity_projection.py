@@ -122,6 +122,11 @@ def make_manager(
 
     ray_cluster = MagicMock()
     handle = ray_cluster.proxy_actor_handle
+    # get_app_status now fetches the cluster-wide dead-actor map ONCE per call and
+    # hands it to every deployment, instead of each deployment querying for itself.
+    # A MagicMock attribute is not awaitable, so a handle that does not mock this
+    # fails with `object MagicMock can't be used in 'await' expression`.
+    handle.get_all_death_causes.remote = AsyncMock(return_value={})
     # The Serve controller's dump carries deployment_config, and that is where
     # runtime_env.env_vars — every raw _BIOENGINE_SECRET_* value, including the
     # worker's Hypha token — lives on the way through this process.

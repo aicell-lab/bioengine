@@ -1288,6 +1288,7 @@ class AppsManager:
         n_previous_replica: int,
         logs_tail: int,
         deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
+        death_causes: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         overrides = deployment_logs_overrides or {}
         deployments_info = {}
@@ -1321,6 +1322,7 @@ class AppsManager:
                     deployment_name=deployment_name,
                     n_previous_replica=this_prev,
                     tail=this_tail,
+                    death_causes=death_causes,
                 )
                 # The proxy returns the deliberate-stop COUNT alongside the replica entries.
                 # Lift it OUT of that map before any consumer sees it: `logs` is contracted as
@@ -1590,6 +1592,7 @@ class AppsManager:
         n_previous_replica: int,
         logs_tail: int,
         deployment_logs_overrides: Optional[Dict[str, Dict[str, int]]] = None,
+        death_causes: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Application States: [NOT_STARTED, DEPLOYING, DEPLOY_FAILED, RUNNING, UNHEALTHY, DELETING]
@@ -1622,6 +1625,7 @@ class AppsManager:
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
                 deployment_logs_overrides=deployment_logs_overrides,
+                death_causes=death_causes,
             )
         else:
             if application_info["is_deployed"].is_set():
@@ -4077,6 +4081,19 @@ class AppsManager:
             await self.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote()
         )
 
+        # ONE cluster-wide dead-actor query for the whole call. The query takes no
+        # deployment filter -- it lists every DEAD actor regardless -- so running it
+        # inside each deployment repeated identical work once per deployment, per
+        # application. An application has four deployments, so a status over three
+        # applications issued twelve copies of the same query; this makes it one.
+        #
+        # None means the query FAILED, and that is passed down as None rather than as
+        # an empty map: the difference decides whether a deployment reports "nothing
+        # died" or declines to guess.
+        death_causes = (
+            await self.ray_cluster.proxy_actor_handle.get_all_death_causes.remote()
+        )
+
         # Iterate over applications to check
         status_tasks = [
             self._get_app_status(
@@ -4085,6 +4102,7 @@ class AppsManager:
                 n_previous_replica=n_previous_replica,
                 logs_tail=logs_tail,
                 deployment_logs_overrides=deployment_logs,
+                death_causes=death_causes,
             )
             for application_id in apps_to_check
         ]

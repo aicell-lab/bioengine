@@ -1221,6 +1221,24 @@ class BioEngineProxyActor:
         wanted = set(actor_ids)
         if not wanted:
             return {}
+        all_causes = self._all_dead_actor_causes()
+        if all_causes is None:
+            return None
+        return {aid: cause for aid, cause in all_causes.items() if aid in wanted}
+
+    @_touch_on_call
+    def get_all_death_causes(self) -> Optional[Dict[str, Optional[Dict[str, str]]]]:
+        """Every dead actor's cause, in ONE cluster-wide query. None if the query failed.
+
+        Public so ``AppsManager`` can fetch it once per ``get_app_status`` and hand the
+        same map to every deployment. The query does not take a deployment filter -- it
+        lists all DEAD actors regardless -- so calling it per deployment did identical
+        work N times for an application with N deployments.
+        """
+        return self._all_dead_actor_causes()
+
+    def _all_dead_actor_causes(self) -> Optional[Dict[str, Optional[Dict[str, str]]]]:
+        """The raw cluster-wide query. None on failure, never an empty dict for it."""
         try:
             actors = self.state_api_client.list(
                 resource=StateResource.ACTORS,
@@ -1234,12 +1252,17 @@ class BioEngineProxyActor:
                 raise_on_missing_output=False,
             )
         except Exception as e:
+            # None, not {}. An empty dict is indistinguishable from "the query ran and
+            # none of these actors has a recorded cause", and the caller turns that into
+            # one unexplained-death entry PER dead replica -- so a single failed lookup
+            # would invent N incidents out of nothing. The caller must be able to tell
+            # "we do not know" from "nothing died unexpectedly".
             logger.warning(f"Failed to fetch death causes: {e}")
-            return {}
+            return None
         causes = {}
         for actor in actors or []:
             actor_id = getattr(actor, "actor_id", None)
-            if actor_id in wanted:
+            if actor_id is not None:
                 causes[actor_id] = self._parse_death_cause(
                     getattr(actor, "death_cause", None)
                 )
@@ -1352,6 +1375,7 @@ class BioEngineProxyActor:
         deployment_name: str,
         n_previous_replica: int = 0,
         tail: int = 30,
+        death_causes: Optional[Dict[str, Optional[Dict[str, str]]]] = None,
     ) -> Dict[str, Dict[str, List[str]]]:
         """
         Get logs for all replicas of a Ray Serve deployment.
@@ -1372,6 +1396,17 @@ class BioEngineProxyActor:
                                Default is 0.
             tail: Number of lines to retrieve from the end of each log.
                   Use -1 to get the entire log. Default is 30.
+            death_causes: A pre-fetched actor-id -> cause map, or None to fetch one.
+                  The underlying query is CLUSTER-WIDE -- it lists every dead actor
+                  whatever deployment it belonged to -- so running it once per
+                  deployment repeats identical work for each one of an application's
+                  deployments. ``AppsManager`` fetches it ONCE per ``get_app_status``
+                  and passes it to every deployment. ``None`` here means "no map was
+                  supplied", which is not the same as the map being EMPTY: an empty
+                  map is a successful query that matched nothing, while a failed
+                  query also yields None from ``_get_actor_death_causes`` and makes
+                  this method report no deaths at all rather than invent unexplained
+                  ones.
 
         Returns:
             Dictionary mapping replica IDs to their log dictionaries:
@@ -1393,9 +1428,10 @@ class BioEngineProxyActor:
             returned as a count under ``_deliberately_stopped_replicas``.
 
             That count is the one key in this mapping whose value is NOT a replica
-            dict. ``AppsManager`` pops it into a sibling ``deliberately_stopped_replicas``
-            field on the deployment before any consumer sees it, because every consumer
-            iterates this mapping as replica-id -> stream-dict and an int in it raises
+            dict. ``AppsManager`` LIFTS it into a sibling ``deliberately_stopped_replicas``
+            field on the deployment before any consumer sees it -- rebuilding this
+            mapping rather than mutating the one returned here -- because every consumer
+            iterates it as replica-id -> stream-dict and an int in it raises
             ``AttributeError``. A caller invoking this method DIRECTLY gets the raw
             shape and must skip the key itself.
         """
@@ -1481,7 +1517,18 @@ class BioEngineProxyActor:
                     replica_id: registered_replicas[replica_id][0]
                     for replica_id in dead_replica_ids
                 }
-                causes = self._get_actor_death_causes(list(actor_ids.values()))
+                causes = (
+                    death_causes
+                    if death_causes is not None
+                    else self._get_actor_death_causes(list(actor_ids.values()))
+                )
+                if causes is None:
+                    # The lookup FAILED. Reporting every dead replica as an unexplained
+                    # death would turn one failed GCS call into N fabricated incidents,
+                    # and an operator cannot tell those from real ones. Say nothing about
+                    # deaths rather than saying something false; the warning is already
+                    # in the worker log.
+                    return logs
                 deliberate = 0
                 for replica_id, actor_id in actor_ids.items():
                     cause = causes.get(actor_id)
