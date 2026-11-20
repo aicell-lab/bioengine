@@ -31,8 +31,8 @@ def _sd(value, dtype=torch.float32):
 def _commit(state_dict, source="test:stock-cpsam"):
     """A pool's recorded base commitment, built from a real state dict.
 
-    uniform_soup now reads the pool's RECORD rather than loading a checkpoint
-    (#0070 option (b)), so every test states the base it is classifying against as
+    uniform_soup now reads the pool's RECORD rather than loading a checkpoint,
+    so every test states the base it is classifying against as
     data. Built through pool.base_commitment so the digest and the count in the test
     cannot disagree with the ones the merge computes.
     """
@@ -43,8 +43,8 @@ def _base(dtype=torch.float32):
     """The base checkpoint these members were fine-tuned from.
 
     ``uniform_soup`` takes it as a REQUIRED loader, because its key set is the
-    inventory every member key is classified against (#0070 requirement 2) and its
-    non-learned values are what the soup carries through (requirement 3). Passing it
+    inventory every member key is classified against, and its non-learned values
+    are what the soup carries through. Passing it
     explicitly in every test is the point: a default would be the "neither
     classifiable nor classified, so average it" hole the ruling closes.
     """
@@ -135,7 +135,7 @@ def test_an_empty_later_member_is_rejected_by_the_same_guard():
         pool.uniform_soup([lambda: _sd(10.0), lambda: _sd(10.0), dict], base=_commit(_base()))
 
 
-# ── l2_from_base is weight-only (#0070 requirement 2) ────────────────────────
+# ── l2_from_base is weight-only ──────────────────────────────────────────
 # diam_labels and diam_mean are registered as non-learned nn.Parameter
 # (cellpose_model.py:78-79), so they sit in the state dict as float32 scalars
 # with matching shapes and pass every dtype/shape filter the drift metric had.
@@ -200,7 +200,7 @@ def test_a_nonweight_name_does_not_swallow_a_real_weight() -> None:
     )
 
 
-# ── the merge carries the BASE diameter, never an average (#0070 req 1+3) ────
+# ── the merge carries the BASE diameter, never an average ────────────────
 # RULED 2026-11-14: the operative value in the tensor is the base checkpoint's,
 # unchanged; the contributors' own diameters are recorded in the community
 # manifest instead of being averaged into a number nobody measured.
@@ -328,7 +328,7 @@ def test_collecting_is_opt_in_and_changes_nothing() -> None:
 
 
 def test_an_inherited_block_must_name_its_source() -> None:
-    """#0070's ruling: reporting the float alone reproduces the defect in the manifest.
+    """Under the base-commitment rules, reporting the float alone reproduces the
     A reader cannot tell an inherited 30.0 from a coincidental one."""
     with pytest.raises(ValueError, match="named source"):
         pool.inherited_non_learned({"diam_labels": 30.0}, source="")
@@ -349,12 +349,12 @@ def test_an_unreported_block_is_distinguishable_from_an_inherited_one() -> None:
     "the runtime did not report them" must not read as "this soup had no contributor
     diameters". Different basis, and the reason is carried."""
     inh = pool.inherited_non_learned({"diam_labels": 30.0}, source="cellpose:cpsam_v2")
-    unr = pool.unreported_non_learned(reason="runtime predates #0070")
+    unr = pool.unreported_non_learned(reason="runtime predates the base-commitment rules")
 
     assert unr["basis"] != inh["basis"]
     assert unr["basis"] == pool.NON_LEARNED_UNREPORTED
     assert unr["values"] is None and unr["source"] is None
-    assert "runtime predates #0070" in unr["note"]
+    assert "runtime predates the base-commitment rules" in unr["note"]
     # The weights are not in question either way, and the note must say so, or an
     # operator reading an unreported block will suspect the checkpoint.
     assert "weights are unaffected" in unr["note"]
@@ -410,7 +410,7 @@ def test_a_member_missing_a_base_key_fails_the_merge() -> None:
 def test_a_pool_with_no_base_record_cannot_merge() -> None:
     """Option (b), ruled: a pool that records no base FAILS the merge, and there is
     deliberately no fallback to loading a stock base — a fallback would make the field
-    permanently optional. #0533 counts how many existing pools this blocks."""
+    permanently optional. A separate census counts how many existing pools this blocks."""
     with pytest.raises(ValueError, match="records no base commitment"):
         pool.uniform_soup([lambda: _sd(1.0)], base=None)
 
@@ -430,7 +430,7 @@ def test_base_is_required_so_a_caller_cannot_default_into_averaging() -> None:
 
 
 def test_the_declared_non_learned_set_is_what_the_model_registers() -> None:
-    """#0070 requirement 1: one declaration, not two.
+    """One declaration, not two.
 
     cellpose_model.py registers these by iterating pool.NON_WEIGHT_PARAMS, so a
     non-learned Parameter cannot be added to the architecture without also being
@@ -449,7 +449,7 @@ def test_the_declared_non_learned_set_is_what_the_model_registers() -> None:
 
 
 def test_the_published_digest_is_the_same_for_two_merges_of_the_same_members() -> None:
-    """#0104: a digest that changes for identical input is worse than no digest.
+    """a digest that changes for identical input is worse than no digest.
 
     Two merges of the same members must publish the same weights_sha256, or the
     obvious diagnostic — re-merge and compare — reports corruption where there

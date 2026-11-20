@@ -1,4 +1,4 @@
-"""Regression tests for #0370 — a GPU shortfall must be visible from the running app.
+"""Regression tests for the GPU shortfall report — a GPU shortfall must be visible from the running app.
 
 Both GPU runtimes declare ``gpu_memory_mb=-1`` (``runtime.py:65``,
 ``runtime_cellpose.py:79``), which ``bioengine/apps/builder.py:514-516`` resolves to
@@ -42,7 +42,7 @@ def _with_cluster_gpus(monkeypatch, total, free=_SAME):
     total and ``available_resources()`` is what is free, and the report keys its
     verdict to the first while reporting the second. A harness that set only a total
     could not express the shape the row was filed about — deNBI, 4 GPUs, 0 free —
-    which is the gap the re-review found (#0370). ``free`` defaults to ``total``,
+    which is the gap the re-review found. ``free`` defaults to ``total``,
     i.e. an idle cluster, so a case that is not about the distinction stays short.
 
     ``entry`` does not import ray at module scope — the report imports it lazily so a
@@ -205,7 +205,7 @@ def test_a_cluster_that_owns_enough_but_has_none_free_names_the_free_count(monke
     assert "pend" in report["detail"]
 
     # DELIBERATELY unchanged, and this is the half that is easy to get wrong in the
-    # other direction (#0370 re-review): a free shortfall is NOT a shortfall. The
+    # other direction: a free shortfall is NOT a shortfall. The
     # cluster owns enough, this app's own replicas are part of what books the
     # devices, and an elastic cluster is momentarily 0-free between jobs. Escalating
     # it would make the diagnostic fire at itself.
@@ -302,7 +302,7 @@ def _async_init_source() -> str:
 
 
 def test_the_placement_log_is_actually_called_at_startup() -> None:
-    """The warning is worth writing only if something writes it (#0370, re-review).
+    """The warning is worth writing only if something writes it.
 
     Replacing ``self._log_gpu_placement()`` in ``_connect`` with ``pass`` left the
     whole suite green at 139 passed, while a comment-only control arm was also green
@@ -424,14 +424,14 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     it into ``deployments.<entry>.logs``, which ``get_app_status`` returns throughout
     ``DEPLOYING``.
 
-    ``min_replicas`` must stay 0: #0045's brief is that an idle entry holds nothing on
+    ``min_replicas`` must stay 0: the scale-to-zero requirement's brief is that an idle entry holds nothing on
     an HPC login node. Both halves are asserted, because satisfying one by breaking the
     other is the easy mistake.
     """
     cfg = entry.EntryApp._deployment_config.autoscaling_config
-    assert cfg.min_replicas == 0, "#0045: an idle entry must still scale to zero"
+    assert cfg.min_replicas == 0, "an idle entry must still scale to zero"
     assert cfg.initial_replicas == 1, (
-        "#0370: with 0 the placement warning is never written on the cluster it is for"
+        "with 0 the placement warning is never written on the cluster it is for"
     )
     # CONTROL that the two contracts above are read off the LIVE resolved config rather
     # than a default-shaped object. For that to mean anything it has to assert a field
