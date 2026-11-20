@@ -171,13 +171,17 @@ def test_cause_survives_a_replica_whose_logs_cannot_be_read():
     assert logs["dd12spcw"]["death_cause"]["reason"] == "WORKER_DIED"
 
 
-def test_the_default_n_previous_replica_hides_the_cause_entirely():
-    """Why the CLI has to override it: at the default the dead replica is gone.
+def test_the_default_now_REPORTS_the_cause_without_the_logs():
+    """REPLACES a test that pinned the opposite, and the swap is deliberate.
 
-    ``get_deployment_logs`` returns early when ``n_previous_replica == 0``, and
-    both the dead replica's logs and its ``death_cause`` are attached after
-    that return. Every other test here passes ``-1``, so this is the one that
-    pins the behaviour a caller gets by default.
+    The previous version of this test asserted that at the default the dead
+    replica is absent and no ``death_cause`` appears anywhere — it pinned the
+    blind spot as intended behaviour, and explained that this is why the CLI
+    overrides the default. That blind spot was then decided to be a defect: a
+    caller using defaults saw no dead replica and concluded nothing had died,
+    which is this module's own failure mode one level up.
+
+    So the default now reports THAT a replica died and why, with no log lines.
     """
     actor = _deployment_actor(
         death_causes={"a_dead": _WORKER_DIED},
@@ -191,8 +195,84 @@ def test_the_default_n_previous_replica_hides_the_cause_entirely():
         application_id="soup",
         deployment_name="CellposeRuntime",
     )
+
+    assert set(logs) == {"live1", "dd12spcw"}
+    assert logs["dd12spcw"]["death_cause"]["reason"] == "WORKER_DIED"
+    # the cheap half only: no log lines are fetched at the default
+    assert logs["dd12spcw"]["stdout"] == []
+    assert logs["dd12spcw"]["stderr"] == []
+    assert logs["dd12spcw"]["logs_omitted"] is True
+    # and the live replica is untouched by any of this
+    assert "death_cause" not in logs["live1"]
+
+
+def test_a_deployment_with_NO_dead_replica_gains_nothing_and_asks_the_gcs_nothing():
+    """CONTROL. The default path must stay free when nothing has died."""
+    actor = _deployment_actor(
+        death_causes={},
+        alive={"live1": "a_live"},
+        registered={"live1": ("a_live", 1.0, "UTC")},
+    )
+    calls = []
+    inner = actor._get_actor_death_cause
+    actor._get_actor_death_cause = lambda actor_id: (calls.append(actor_id), inner(actor_id))[1]
+
+    logs = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
     assert set(logs) == {"live1"}
-    assert not any("death_cause" in streams for streams in logs.values())
+    assert calls == [], f"asked the GCS {len(calls)} time(s) with nothing dead"
+
+
+def test_the_default_costs_exactly_ONE_gcs_lookup_however_many_have_died():
+    """CONTROL, and the reason the default describes only the newest death.
+
+    ``_get_actor_death_cause`` is a GCS lookup per replica, and a long-lived
+    deployment accumulates them — 94 dead replicas were measured on one live
+    worker. Describing all of them on every default call would trade the blind
+    spot for a cost regression on the hot path, so the default is bounded to
+    one. Without this assertion the obvious implementation of the fix passes.
+    """
+    registered = {"live1": ("a_live", 1.0, "UTC")}
+    for i in range(40):
+        registered[f"dead{i:02d}"] = (f"a_dead{i:02d}", 2.0 + i, "UTC")
+
+    actor = _deployment_actor(
+        death_causes={f"a_dead{i:02d}": _WORKER_DIED for i in range(40)},
+        alive={"live1": "a_live"},
+        registered=registered,
+    )
+    calls = []
+    inner = actor._get_actor_death_cause
+    actor._get_actor_death_cause = lambda actor_id: (calls.append(actor_id), inner(actor_id))[1]
+
+    logs = actor.get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+    )
+    assert len(calls) == 1, f"{len(calls)} GCS lookups at the default with 40 dead replicas"
+
+    # Which ONE it describes must agree with the path that was already shipped:
+    # `n_previous_replica=1` has always meant "the most recent dead replica",
+    # ordered by registration. The default picking a different replica than
+    # n=1 would be its own bug, so this is asserted against that path rather
+    # than against a hardcoded id.
+    reference = _deployment_actor(
+        death_causes={f"a_dead{i:02d}": _WORKER_DIED for i in range(40)},
+        alive={"live1": "a_live"},
+        registered=registered,
+    ).get_deployment_logs(
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+        n_previous_replica=1,
+    )
+    most_recent = set(reference) - {"live1"}
+    assert set(logs) - {"live1"} == most_recent, (
+        f"default described {set(logs) - {'live1'}}, n_previous_replica=1 "
+        f"describes {most_recent}"
+    )
+    assert calls == [registered[most_recent.pop()][0]]
 
 
 def test_apps_logs_asks_for_the_dead_replica():

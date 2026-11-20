@@ -1324,6 +1324,10 @@ class BioEngineProxyActor:
             Error messages are included in stderr if log retrieval fails.
             Dead replicas additionally carry ``death_cause``
             (``{"reason", "message"}``, or None if Ray no longer holds one).
+            At the default ``n_previous_replica=0`` the most recent dead replica
+            is still reported, with empty log lists and ``logs_omitted: True``,
+            so a caller using defaults learns that something died and why
+            without paying for its logs.
         """
         logs = {}
 
@@ -1360,9 +1364,6 @@ class BioEngineProxyActor:
                     "stderr": [f"Error retrieving logs: {str(e)}"],
                 }
 
-        if n_previous_replica == 0:
-            return logs
-
         # Logs of previously registered replicas
         registered_replicas = self.application_replicas.get(application_id, {}).get(
             deployment_name, {}
@@ -1372,6 +1373,34 @@ class BioEngineProxyActor:
             for replica_id in registered_replicas.keys()
             if replica_id not in active_replicas
         ]
+
+        if n_previous_replica == 0:
+            # Report THAT a replica died and why, without its logs.
+            #
+            # The default used to return here outright, so a caller using default
+            # arguments saw no dead replica and no death_cause and concluded nothing
+            # had died — the same wrong-layer diagnosis this field exists to prevent,
+            # one level up.
+            #
+            # Only the MOST RECENT dead replica is described, and deliberately so:
+            # _get_actor_death_cause is a GCS lookup per replica, and a long-lived
+            # deployment accumulates them (94 dead replicas measured on one live
+            # worker). Attaching all of them on every default call would trade this
+            # blind spot for a cost regression on the hot path.
+            #
+            # No log lines are fetched, which is the expensive half: asking "did
+            # something die, and why" is one lookup, and asking "show me its output"
+            # stays behind n_previous_replica > 0.
+            if dead_replica_ids:
+                replica_id = dead_replica_ids[-1]
+                actor_id = registered_replicas[replica_id][0]
+                logs[replica_id] = {
+                    "stdout": [],
+                    "stderr": [],
+                    "death_cause": self._get_actor_death_cause(actor_id),
+                    "logs_omitted": True,
+                }
+            return logs
         # Add logs of the n most recent dead replicas (or all if n_previous_replica is -1)
         dead_replicas_to_fetch = (
             dead_replica_ids[::-1]
