@@ -259,7 +259,7 @@ class TestProvenance:
         out = pool.digest_provenance(_merge(created_at=CUTOFF - 1))
         assert out["basis"] == pool.DIGEST_BASIS_FILE
         assert out["reproducible_by_re_merge"] is False
-        # The clause: the reader is TOLD WHY, not left to infer corruption.
+        # The contract: the reader is TOLD WHY, not left to infer corruption.
         note = out["note"]
         assert "filename" in note
         assert "not evidence about the weights" in note

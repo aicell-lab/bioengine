@@ -14,7 +14,7 @@ checkpoint into two deposits; it can only hide the double weight. Comparing a
 caller-supplied field as well (``dataset_fingerprint``) would let a retry defeat
 de-duplication by accident.
 
-Two things are asserted that the requirement does not ask for, because
+Two things are asserted beyond what is strictly required, because
 "one member remains" is satisfied by a run that left the artifact unusable:
 
 * the stage was DISCARDED, and

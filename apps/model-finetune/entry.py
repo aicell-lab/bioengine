@@ -2780,7 +2780,7 @@ class EntryApp:
                         base_commitment=index.get("base_commitment")))
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
-                    # Base-commitment requirement 4: the contributors' own measured diameters go in
+                    # The contributors' own measured diameters go in
                     # the manifest. The runtime is given weights PATHS and never learns a
                     # contribution id, so the mapping is made here, where s_paths and
                     # s_ids are the parallel lists the gate built. An unmapped key RAISES

@@ -201,7 +201,7 @@ def test_a_nonweight_name_does_not_swallow_a_real_weight() -> None:
 
 
 # ── the merge carries the BASE diameter, never an average ────────────────
-# RULED 2026-11-14: the operative value in the tensor is the base checkpoint's,
+# The operative value in the tensor is the base checkpoint's,
 # unchanged; the contributors' own diameters are recorded in the community
 # manifest instead of being averaged into a number nobody measured.
 #
@@ -218,7 +218,7 @@ def _pool_loaders():
 
 
 def test_the_merge_carries_the_base_diameter_unchanged() -> None:
-    """Requirement 3: one operative value in the tensor, and it is traceable.
+    """One operative value in the tensor, and it is traceable.
 
     The base model's diameter is the prior the soup inherited, and the soup did
     not learn a diameter, so it is the only number here that describes something
@@ -284,11 +284,11 @@ def test_the_soup_does_not_alias_the_base_tensors() -> None:
     assert float(base_sd["diam_labels"][0]) == pytest.approx(BASE_DIAM, rel=1e-9)
 
 
-# ── requirement 4: the contributors' own diameters are RECORDED, not discarded ──
+# ── the contributors' own diameters are RECORDED, not discarded ──
 
 
 def test_member_diameters_are_collected_in_loader_order() -> None:
-    """Requirement 4. Order is the contract: the caller zips this against the member
+    """Order is the contract: the caller zips this against the member
     specs it supplied, because uniform_soup is given loaders and never learns a
     contribution id. An unordered map would lose which diameter belonged to whom.
     """
@@ -360,11 +360,11 @@ def test_an_unreported_block_is_distinguishable_from_an_inherited_one() -> None:
     assert "weights are unaffected" in unr["note"]
 
 
-# ── requirement 2: unclassifiable keys FAIL the merge, never get averaged ────
+# ── unclassifiable keys FAIL the merge, never get averaged ────
 
 
 def test_a_key_absent_from_the_base_fails_the_merge() -> None:
-    """Requirement 2, and the property that stops this recurring.
+    """The total-classification rule, and the property that stops this recurring.
 
     A future non-learned nn.Parameter added to the architecture is a key an
     existing pool's base does not have. It must break the merge rather than being
@@ -423,7 +423,7 @@ def test_a_pool_with_no_base_record_cannot_merge() -> None:
 
 
 def test_base_is_required_so_a_caller_cannot_default_into_averaging() -> None:
-    """Requirement 2 at the API boundary: there is no base-less call. A default
+    """The same rule at the API boundary: there is no base-less call. A default
     would be the "neither classifiable nor classified, so average it" hole."""
     with pytest.raises(TypeError):
         pool.uniform_soup([lambda: _sd(1.0)])  # type: ignore[call-arg]

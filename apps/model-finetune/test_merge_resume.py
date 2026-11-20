@@ -142,7 +142,7 @@ def _merge(members, journal, killed_at=None):
 
 
 def test_resume_after_a_kill_pays_only_for_the_passes_it_lost():
-    """The clause: a kill mid-merge leaves a resumable checkpoint rather than
+    """The contract: a kill mid-merge leaves a resumable checkpoint rather than
     returning nothing."""
     members = [f"m{i}.pt" for i in range(16)]
 
@@ -207,7 +207,7 @@ def test_no_scoring_call_bypasses_the_journal():
     assert "_write_merge_journal(" in inside_score
 
 
-# ── up-front admission (the second disjunct) ──────────────────────────
+# ── up-front admission ──────────────────────────
 
 GIB = 1024 ** 3
 

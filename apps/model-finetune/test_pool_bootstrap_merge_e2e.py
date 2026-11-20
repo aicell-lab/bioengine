@@ -222,7 +222,7 @@ async def test_a_pool_bootstrapped_BY_CONTRIBUTE_can_merge(fake_training: None) 
     # The defect the base-commitment rules fix: the base's diameter is carried, NOT averaged. 30.0 vs 47.0.
     assert float(soup["diam_labels"][0]) == pytest.approx(BASE_DIAM)
     assert float(soup["diam_labels"][0]) != pytest.approx((M1_DIAM + M2_DIAM) / 2)
-    # Requirement 4: the contributors' own diameters survive, in loader order.
+    # The contributors' own diameters survive, in loader order.
     assert [c["diam_labels"] for c in collected] == [M1_DIAM, M2_DIAM]
     assert set(soup) == set(_BASE_SD)
 

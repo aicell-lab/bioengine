@@ -1,7 +1,7 @@
 """the contribute path's state-dict inspection must run under ``_soup_sem``.
 
 `prepare_contribution` holds up to TWO full cpsam state dicts while it inspects a finished
-session's checkpoint. Until Option A (ruled 2026-11-15) that work ran outside every lock and
+session's checkpoint. Until this change that work ran outside every lock and
 past every admission gate, so a deposit's peak could sum with a concurrent merge's and the
 replica could breach ``memory_mb`` with no merge of its own running. Option A takes the
 runtime's existing single-permit ``_soup_sem`` around the inspection, so the replica's peak

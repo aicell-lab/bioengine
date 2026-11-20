@@ -673,7 +673,7 @@ class CellposeRuntime:
         and return its sha256 + byte size — so the head weights never traverse the
         CPU entry. ``members`` must be non-empty (a published head always has one).
 
-        Also returns what the community manifest needs for base-commitment requirement 4,
+        Also returns what the community manifest needs,
         because this is the only place the members' weights are resident and reading them
         again would mean re-downloading every one:
 
@@ -797,7 +797,7 @@ class CellposeRuntime:
                 # it here is the REAL base, not an assumed one -- which is the whole point
                 # of the amendment.
                 #
-                # CORRECTION (ruled 2026-11-15). This comment used to read "Peak
+                # CORRECTION. This comment used to read "Peak
                 # memory is unchanged either way ... two state dicts in both cases and
                 # this bound is not made worse". That was FALSE and it is worth saying
                 # why, because the mistake is easy to repeat: it compared this `else`
@@ -839,7 +839,7 @@ class CellposeRuntime:
                 del stock
             return out
 
-        # Option A (ruled 2026-11-15): the inspection holds up to TWO full cpsam
+        # The inspection holds up to TWO full cpsam
         # state dicts, and until now it ran outside every lock and past every admission
         # gate -- so a deposit's peak could sum with a concurrent merge's, and the replica
         # could breach `memory_mb` with no merge of its own running at all.
@@ -850,10 +850,10 @@ class CellposeRuntime:
         #
         # What this does NOT do, stated because what matters is the bound rather
         # than an improvement: it does not reduce the single-path peak. Reusing the measured
-        # FU1 figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
+        # figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
         # measurement), contribute alone still peaks at ~2.31 GiB. If max(merge,
         # contribute) is still above what the admission gate assumes, that is a separate
-        # row, not a reason to widen this one.
+        # concern, not a reason to widen this one.
         #
         # The cost is latency: the deposit RPC now waits for any in-flight merge before it
         # starts its own torch load. That is the trade the ruling accepted -- a measured
