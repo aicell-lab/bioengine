@@ -1,5 +1,5 @@
 """A ``custom_environment=True`` test on an image with no conda must REFUSE,
-not come back as a failed verdict on the model (myco #0527).
+not come back as a failed verdict on the model.
 
 The code used to spawn a bare ``mamba``, documented as "both binaries ship in
 the replica image at ``/home/ray/anaconda3/bin/``" — true of the
@@ -374,7 +374,7 @@ async def test_a_custom_env_run_still_returns_a_normal_report_where_conda_exists
 async def test_a_failure_inside_the_try_is_rendered_as_a_report_about_the_model(
     tmp_path, monkeypatch
 ):
-    """The pre-fix shape, pinned on purpose — this is what #0527 was.
+    """The pre-fix shape, pinned on purpose — this is what the bug looked like.
 
     With the guard bypassed (a conda implementation resolves) a spawn failure
     from the env build lands in ``_execute_test``'s ``except Exception``, which
