@@ -464,6 +464,31 @@ def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
     # Control: if the allow-list matched nothing at all the assertions above would be vacuous.
     assert loads, f"{name!r} is never loaded -- the helper's result goes nowhere"
 
+    # The allow-list above guards the NAME. It does not, on its own, stop the OBJECT being
+    # reached through the thing that now holds it:
+    #     built = BuiltApp(..., runtime_env=runtime_env)
+    #     built.runtime_env["env_vars"].update({...})      # name still loaded only twice
+    #     return built
+    # So require the BuiltApp(...) call to BE the returned value: constructed and handed off in
+    # one expression, with no name bound to it that anything could go through.
+    builtapp_calls = [
+        n for n in ast.walk(build)
+        if isinstance(n, ast.Call)
+        and (getattr(n.func, "id", None) or getattr(n.func, "attr", None))
+        in ("BuiltApp", "BuiltApplication")
+    ]
+    assert len(builtapp_calls) == 1, (
+        f"expected one BuiltApp(...) construction in build(), found {len(builtapp_calls)}"
+    )
+    call = builtapp_calls[0]
+    parent = parents.get(id(call))
+    assert isinstance(parent, ast.Return), (
+        f"BuiltApp(...) at line {call.lineno} is not the value of a `return` (its parent is "
+        f"{type(parent).__name__}). Bound to a name first, the runtime_env dict can be reached "
+        "through that name — `built.runtime_env[\"env_vars\"].update(...)` — without ever "
+        "loading the guarded name again"
+    )
+
 
 def test_build_derives_replica_env_vars_from_the_FULL_env_vars(monkeypatch):
     """Leg 2, build side, the other call site — structural, because ``build()`` is not drivable.
