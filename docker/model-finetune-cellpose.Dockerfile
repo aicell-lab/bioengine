@@ -4,9 +4,11 @@
 # download/install that otherwise runs on first startup.
 #
 # Fast-start but NOT air-gapped: pip re-resolves direct VCS references however
-# they are baked, so the two git+https pins in requirements-runtime-cellpose.txt
-# are re-cloned on every deploy and the install fails with no network. A site
-# needing an offline deploy has to vendor those two.
+# they are baked, so the two git+https pins in
+# apps/model-finetune/requirements-runtime-cellpose.txt (dinov3 and
+# segment-anything, each pinned to a commit) are re-cloned on every deploy and the
+# install fails with no network. A site needing an offline deploy has to vendor
+# those two.
 #
 # Published as ONE general GHCR package, ghcr.io/aicell-lab/model-finetune, with
 # a per-backend tag suffix (e.g. 0.21.0-cellpose). This file builds the CELLPOSE
