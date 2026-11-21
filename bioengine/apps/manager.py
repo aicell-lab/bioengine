@@ -4346,10 +4346,14 @@ class AppsManager:
             the error entry and every abnormally dead replica on default arguments. Treating
             an absent ``timezone`` as UTC is a guess, not a default.
 
-            Two counts live BESIDE ``logs`` rather than inside it, and both are easy to miss:
+            Two counts live BESIDE ``logs`` rather than inside it, and both are easy to miss.
+            **Both are present only sometimes**, so read them with ``.get`` — indexing either
+            raises on a perfectly healthy deployment:
 
                 deployments[<class_name>].deliberately_stopped_replicas = <int>
-                deployments[<class_name>].death_causes_unavailable = True   # when present
+                                                      # only when NON-ZERO; absent means none
+                deployments[<class_name>].death_causes_unavailable = True
+                                                      # only when the cause lookup FAILED
 
             The first is lifted out of the logs map before this method returns, precisely so a
             caller iterating ``logs`` never meets an int where it expects a record — the proxy's
@@ -4357,6 +4361,17 @@ class AppsManager:
             ``_deliberately_stopped_replicas``, so a caller of THAT must handle it. The second
             exists so "no deaths shown" cannot be read as "nothing died": an empty answer and an
             unanswered question are different, and only this key distinguishes them.
+
+            **AND NONE OF THE THREE REACHES AN UNAUTHORIZED CALLER AT ALL.** For a caller outside
+            the application's roster, ``public_app_status`` keeps only
+            ``PUBLIC_DEPLOYMENT_FIELDS`` — ``status``, ``message``, ``replica_states``,
+            ``replicas``, ``max_ongoing_requests`` — so ``logs``,
+            ``deliberately_stopped_replicas`` and ``death_causes_unavailable`` are **absent**.
+            There their absence means WITHHELD: not "zero", not "no deaths", not "nothing to
+            show". A client that cannot tell those apart reports a healthy application as having
+            no logs and no stopped replicas when it simply was not entitled to see them. Check
+            whether you are an admin or named in ``authorized_users`` before reading an absence
+            as a value.
 
             When ``timezone`` IS present it names the zone of the timestamps INSIDE the
             ``stdout``/``stderr`` text — the replica's local zone, not necessarily UTC.

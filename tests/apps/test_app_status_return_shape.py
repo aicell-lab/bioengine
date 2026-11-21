@@ -386,3 +386,92 @@ def test_the_documented_EXAMPLE_runs_over_the_REAL_map_without_raising():
         "placement is wrong in the other direction"
     )
     assert "_deliberately_stopped_replicas" not in logs
+
+
+# ── absence is not a value: the two conditional siblings, and the public view ──
+#
+# The failure mode these arms exist for is the one this module is about: a key that is
+# sometimes absent, documented as though it were always present, so a caller reads the
+# absence as a number. Both are asserted against the real producer and the real public
+# filter rather than against the prose, because prose checked against prose is a closed loop.
+
+
+def test_the_conditional_SIBLINGS_are_documented_as_conditional():
+    """`deliberately_stopped_replicas` is set only when NON-ZERO and
+    `death_causes_unavailable` only when the lookup FAILED, so indexing either raises on a
+    healthy deployment. The docstring has to say so, or a caller writes `dep[...]`."""
+    doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    assert "only when NON-ZERO" in doc or "only when non-zero" in doc, (
+        "the docstring shows deliberately_stopped_replicas unconditionally; it is present only "
+        "when non-zero, so a caller indexing it gets KeyError on a deployment never scaled down"
+    )
+    assert "only when the cause lookup FAILED" in doc or "when present" in doc, (
+        "the docstring does not mark death_causes_unavailable as conditional"
+    )
+
+
+def test_the_count_really_IS_absent_when_nothing_was_stopped():
+    """The producer's side of the same claim: no stopped replicas, no key.
+
+    Pins the docstring to behaviour rather than to its own wording — if the producer ever
+    started emitting a zero, the documentation would be the thing that is wrong.
+    """
+    from tests.cli.test_apps_logs_command import (
+        DEPLOYMENT,
+        LIVE_REPLICA,
+        PROXY_LOGS,
+        PROXY_LOGS_WITH_STOPPED_COUNT,
+        _deployments,
+    )
+
+    with_count = _deployments(PROXY_LOGS_WITH_STOPPED_COUNT, [LIVE_REPLICA])[DEPLOYMENT]
+    without = _deployments(PROXY_LOGS, [LIVE_REPLICA])[DEPLOYMENT]
+    assert "deliberately_stopped_replicas" in with_count, (
+        "the fixture that HAS stopped replicas did not produce the count -- this arm would be "
+        "vacuous"
+    )
+    assert "deliberately_stopped_replicas" not in without, (
+        "the count is present when nothing was stopped, so the docstring's 'only when non-zero' "
+        "is wrong -- and a caller cannot distinguish 'none' from 'not reported'"
+    )
+
+
+def test_the_PUBLIC_view_withholds_logs_and_BOTH_siblings():
+    """An unauthorized caller gets none of the three, and their absence means WITHHELD.
+
+    This is the sharpest form of the row's theme: outside the roster, `public_app_status` keeps
+    only PUBLIC_DEPLOYMENT_FIELDS, so a client that reads a missing count as "none stopped" or a
+    missing `logs` as "no logs" reports a healthy application as idle when it was simply not
+    entitled to look.
+    """
+    status = {
+        "status": "RUNNING",
+        "deployments": {
+            "MyApp": {
+                "status": "HEALTHY",
+                "message": "",
+                "replica_states": {"RUNNING": 1},
+                "replicas": [],
+                "max_ongoing_requests": 10,
+                "logs": {"r1": {"stdout": ["x"], "stderr": [], "timezone": "CET"}},
+                "deliberately_stopped_replicas": 3,
+                "death_causes_unavailable": True,
+            }
+        },
+    }
+    public = manager_mod.public_app_status(status)
+    dep = public["deployments"]["MyApp"]
+    for withheld in ("logs", "deliberately_stopped_replicas", "death_causes_unavailable"):
+        assert withheld not in dep, (
+            f"{withheld!r} reached an unauthorized caller; the public view is supposed to "
+            f"withhold it"
+        )
+    # CONTROL: the public fields DO survive, so the arm is not passing on an empty dict
+    for kept in ("status", "message", "replica_states", "replicas", "max_ongoing_requests"):
+        assert kept in dep, f"the public view dropped {kept!r} too, so this arm proves nothing"
+
+    doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    assert "WITHHELD" in doc.upper(), (
+        "the docstring does not say that an absence in the public view means withheld rather "
+        "than zero, which is the reading that makes a healthy app look idle"
+    )
