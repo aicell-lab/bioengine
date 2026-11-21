@@ -169,8 +169,8 @@ def _apply_env_fence() -> None:
     at import — captures whatever is set at that moment, and no later
     ``os.environ.pop`` can reach a value already bound to a module global. Before
     this, the fence ran after the import and a single-machine replica could keep
-    the worker's own credential despite having been fenced (found by review of
-    #0535's first cut).
+    the worker's own credential despite having been fenced. Found by review of
+    this fence's first implementation.
 
     MUST be called AFTER the env-apply loop. Called before it, the apply puts the
     inherited value straight back.
