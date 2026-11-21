@@ -346,6 +346,118 @@ def test_submit_does_NOT_leak_the_secrets_into_the_task_runtime_env(monkeypatch)
     assert secret_value not in repr(submitted), "a secret reached the task runtime_env"
 
 
+def _build_fn() -> ast.AST:
+    builder_src = (
+        pathlib.Path(__file__).resolve().parents[2] / "bioengine" / "apps" / "builder.py"
+    )
+    tree = ast.parse(builder_src.read_text())
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "build"),
+        None,
+    )
+    assert fn is not None, "builder.py has no `build` -- the anchor moved, not the fix"
+    return fn
+
+
+def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
+    """Leg 1 at its CALL SITE, not just at the helper. This is the hole round 3 found.
+
+    Excluding the token inside ``_build_submit_runtime_env`` is worthless if ``build()`` then
+    rebinds or edits the dict before handing it on. The reviewer's mutant did exactly that — one
+    line after the helper call, putting the token back into the runtime_env of BOTH Ray tasks and
+    reverting the whole fix — and 19 tests passed on it, because every other arm in this file
+    builds its runtime_env from the helper directly and never sees what ``build()`` passes to
+    ``BuiltApp``.
+
+    So this asserts the name is bound ONCE from the helper, never reassigned, never mutated in
+    place, and is the same name handed to both consumers.
+    """
+    build = _build_fn()
+
+    bindings = [
+        t.id
+        for n in ast.walk(build)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "attr", None) == "_build_submit_runtime_env"
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    ]
+    assert len(bindings) == 1, (
+        f"expected exactly one `<name> = self._build_submit_runtime_env(...)`, found {bindings}"
+    )
+    name = bindings[0]
+
+    # 1. Never REBOUND. The round-3 mutant was `runtime_env = {**runtime_env, ...}`.
+    rebinds = [
+        n.lineno
+        for n in ast.walk(build)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name) and t.id == name
+    ]
+    assert len(rebinds) == 1, (
+        f"{name!r} is assigned {len(rebinds)} times in build() (lines {rebinds}); it must be bound "
+        "once from _build_submit_runtime_env and never reassigned, or the token exclusion can be "
+        "undone after the helper returns"
+    )
+    walrus = [
+        n.lineno for n in ast.walk(build)
+        if isinstance(n, ast.NamedExpr) and getattr(n.target, "id", None) == name
+    ]
+    assert not walrus, f"{name!r} is rebound by a walrus at {walrus}"
+
+    # 2. Never MUTATED IN PLACE. Not in the mutant, but the same hole: a subscript assignment or
+    #    an .update() reaches the dict without rebinding the name.
+    subscript_writes = [
+        n.lineno
+        for n in ast.walk(build)
+        if isinstance(n, (ast.Assign, ast.AugAssign))
+        for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+        if isinstance(t, ast.Subscript)
+        and isinstance(t.value, ast.Name)
+        and t.value.id == name
+    ]
+    assert not subscript_writes, (
+        f"{name}[...] is written at {subscript_writes}; that edits the dict the tasks receive "
+        "without rebinding the name"
+    )
+    mutators = [
+        n.lineno
+        for n in ast.walk(build)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == name
+        and n.func.attr in {"update", "setdefault", "pop", "clear"}
+    ]
+    assert not mutators, f"{name}.update()/setdefault()/pop() called at {mutators}"
+
+    # 3. That same name is what BOTH consumers get.
+    to_builtapp = [
+        n.lineno
+        for n in ast.walk(build)
+        if isinstance(n, ast.Call)
+        and (getattr(n.func, "id", None) or getattr(n.func, "attr", None))
+        in ("BuiltApp", "BuiltApplication")
+        and any(k.arg == "runtime_env" and isinstance(k.value, ast.Name) and k.value.id == name
+                for k in n.keywords)
+    ]
+    assert to_builtapp, (
+        f"BuiltApp is not constructed with runtime_env={name} -- it gets something else, so what "
+        "the helper excluded does not reach the build task"
+    )
+    to_introspect = [
+        n.lineno
+        for n in ast.walk(build)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) == "_introspect_via_ray_task"
+        and any(isinstance(a, ast.Name) and a.id == name for a in n.args)
+    ]
+    assert to_introspect, f"the introspect task is not submitted with {name}"
+
+
 def test_build_derives_replica_env_vars_from_the_FULL_env_vars(monkeypatch):
     """Leg 2, build side, the other call site — structural, because ``build()`` is not drivable.
 
@@ -354,16 +466,7 @@ def test_build_derives_replica_env_vars_from_the_FULL_env_vars(monkeypatch):
     asserts that ``replica_env_vars`` comes *from* ``split_secret_env_vars``; this pins WHICH dict
     goes in, which is what the round-2 mutant changed.
     """
-    builder_src = (
-        pathlib.Path(__file__).resolve().parents[2] / "bioengine" / "apps" / "builder.py"
-    )
-    tree = ast.parse(builder_src.read_text())
-    build = next(
-        (n for n in ast.walk(tree)
-         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "build"),
-        None,
-    )
-    assert build is not None, "builder.py has no `build` -- the anchor moved, not the fix"
+    build = _build_fn()
 
     # The local name bound from self._build_env_vars(...)
     bound = [
