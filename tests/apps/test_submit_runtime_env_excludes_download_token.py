@@ -27,18 +27,20 @@ still reaches every process that reads it. Break leg 2 or 3 and private-artifact
 silently — it falls back to anonymous read, which succeeds for public artifacts, so a public-only
 smoke test would not notice.
 
-TWO REVIEW ROUNDS SHAPED LEG 2, and both found the same kind of gap — a guard on the thing that
-changed, with nothing guarding the thing that makes the change safe:
+LEG 2 IS THE ONE THAT NEEDS THE MOST COVER, because the failure mode is a guard on the thing that
+changed with nothing guarding the thing that makes the change safe. Three one-line edits are known
+to break the token's delivery while leaving every assertion about leg 1 green, so each is pinned
+here as a permanent red-maker:
 
-  * Round 1: leg 2 was absent entirely. The red-maker ``task_env_vars =
-    dict(submit_runtime_env["env_vars"])`` passed every test here while breaking every
-    private-artifact introspect.
-  * Round 2: leg 2's build side tested the **helper** and not the **call site**. Asserting that
-    ``split_secret_env_vars`` keeps the key says nothing about whether anyone calls it with the
-    right dict, or passes its result on. Two call-site mutants survived green:
-    ``split_secret_env_vars(runtime_env["env_vars"])`` in ``build()``, and handing
-    ``built_app.runtime_env["env_vars"]`` instead of ``built_app.replica_env_vars`` at ``submit``'s
-    ``.remote()``. Either removes the token from the build task's only channel.
+  * ``task_env_vars = dict(submit_runtime_env["env_vars"])`` — reinstates the excluded key by
+    copying the dict the exclusion just built, and breaks every private-artifact introspect.
+  * ``split_secret_env_vars(runtime_env["env_vars"])`` in ``build()`` — a correct helper called
+    with the wrong dict. Asserting that ``split_secret_env_vars`` keeps the key says nothing about
+    whether any caller passes it the right mapping, or passes its result on.
+  * handing ``built_app.runtime_env["env_vars"]`` instead of ``built_app.replica_env_vars`` at
+    ``submit``'s ``.remote()`` — removes the token from the build task's only channel.
+
+The lesson generalises: guard the CONSUMER, not the producer, and walk every hop between them.
 
 Legs 1 and 2 are behavioural wherever the function can be driven: ``_build_submit_runtime_env``
 touches no instance state, ``_introspect_via_ray_task`` touches none either, and ``submit`` needs
