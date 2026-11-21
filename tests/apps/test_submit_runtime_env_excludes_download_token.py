@@ -16,7 +16,8 @@ WHAT THIS GUARDS, in three legs that only make sense together:
   2. The token must still reach each task by its other channel: the env mapping passed as a task
      **argument**. For introspect that is ``task_env_vars``, which must be derived from the full
      ``env_vars`` and *not* from ``submit_runtime_env["env_vars"]``; for the build task it is
-     ``BuiltApp.replica_env_vars``, which ``split_secret_env_vars`` must keep the key in.
+     ``BuiltApp.replica_env_vars``, which ``split_secret_env_vars`` must keep the key in **and**
+     which ``submit`` must be the thing actually handed to ``.remote()``.
   3. Both tasks must keep applying that mapping onto ``os.environ`` *before* calling
      ``_ensure_source``.
 
@@ -26,14 +27,26 @@ still reaches every process that reads it. Break leg 2 or 3 and private-artifact
 silently — it falls back to anonymous read, which succeeds for public artifacts, so a public-only
 smoke test would not notice.
 
-Leg 2's first half was missing from the first version of this file, and a reviewer's red-maker —
-``task_env_vars = dict(submit_runtime_env["env_vars"])`` — passed every test here while breaking
-every private-artifact introspect.
+TWO REVIEW ROUNDS SHAPED LEG 2, and both found the same kind of gap — a guard on the thing that
+changed, with nothing guarding the thing that makes the change safe:
 
-Legs 1 and 2 are behavioural: neither ``_build_submit_runtime_env`` nor ``_introspect_via_ray_task``
-touches instance state, so both are called directly, with ``ray`` faked for the latter. Leg 3 is
-structural (AST), for the reason the sibling file states: ``build()`` is a large async method no
-test in this suite drives, and the two task functions run only inside a Ray worker.
+  * Round 1: leg 2 was absent entirely. The red-maker ``task_env_vars =
+    dict(submit_runtime_env["env_vars"])`` passed every test here while breaking every
+    private-artifact introspect.
+  * Round 2: leg 2's build side tested the **helper** and not the **call site**. Asserting that
+    ``split_secret_env_vars`` keeps the key says nothing about whether anyone calls it with the
+    right dict, or passes its result on. Two call-site mutants survived green:
+    ``split_secret_env_vars(runtime_env["env_vars"])`` in ``build()``, and handing
+    ``built_app.runtime_env["env_vars"]`` instead of ``built_app.replica_env_vars`` at ``submit``'s
+    ``.remote()``. Either removes the token from the build task's only channel.
+
+Legs 1 and 2 are behavioural wherever the function can be driven: ``_build_submit_runtime_env``
+touches no instance state, ``_introspect_via_ray_task`` touches none either, and ``submit`` needs
+only a logger and a stubbed secret store — so all three are called for real with ``ray`` faked. The
+one exception is ``build()`` itself, a ~290-line async method no test in this suite drives (the
+sibling file says the same of it): the argument it passes to ``split_secret_env_vars`` is pinned
+structurally instead, by AST, which is enough to fail the mutant above. Leg 3 is structural for the
+same reason — the two task functions only run inside a Ray worker.
 
 WHAT THIS DOES NOT CATCH, stated so nobody reads it as wider than it is:
 
@@ -219,7 +232,11 @@ def test_the_token_is_NOT_in_the_runtime_env_the_task_is_submitted_with(monkeypa
 
 
 def test_split_secret_env_vars_KEEPS_the_token_for_the_build_task():
-    """Leg 2, build side. ``BuiltApp.replica_env_vars`` is that task's only channel."""
+    """Leg 2, build side, HELPER only. Not sufficient on its own — see the two tests below.
+
+    This says the helper keeps the key. It says nothing about whether anyone calls it with the
+    right dict, or passes its result to the task. Round 2 found both of those unguarded.
+    """
     from bioengine.apps.builder import split_secret_env_vars
 
     fixture = _env_vars_fixture()
@@ -230,6 +247,148 @@ def test_split_secret_env_vars_KEEPS_the_token_for_the_build_task():
     assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in secret_env_vars, (
         "routing it through the proxy actor would not work: the setup hook reads "
         "os.environ before __init__"
+    )
+
+
+def _built_app(replica_env_vars: dict, runtime_env: dict):
+    """A BuiltApp carrying only what ``submit`` reads off it."""
+    from bioengine.apps.builder import BuiltApp
+
+    return BuiltApp(
+        metadata={},
+        spec={"classes": {}},
+        translated_kwargs={},
+        proxy_args={},
+        runtime_env=runtime_env,
+        bioengine_uri="gcs://_ray_pkg_deadbeef.zip",
+        proxy_pip=[],
+        user_replica_framework_pip=[],
+        replica_env_vars=replica_env_vars,
+        replica_secret_env_vars={"HYPHA_TOKEN": "not-a-real-secret-xyz789"},
+        proxy_memory_in_gb=1.0,
+        scaling={},
+    )
+
+
+def _drive_submit(monkeypatch, built_app):
+    """Call the real ``AppBuilder.submit`` and return what ``.remote()`` received.
+
+    ``submit`` reads only ``self.logger`` and ``self._store_replica_secrets``, so an uninitialised
+    instance with those two supplied drives the real method — no AppBuilder construction, no Hypha,
+    no Ray.
+    """
+    import asyncio
+    import logging
+
+    from bioengine.apps import builder as builder_mod
+
+    calls = []
+    monkeypatch.setattr(builder_mod, "ray", _FakeRay(calls, {"status": "ok"}))
+
+    inst = builder_mod.AppBuilder.__new__(builder_mod.AppBuilder)
+    inst.logger = logging.getLogger("test-0795")
+    stored = []
+
+    async def _fake_store(application_id, secret_env_vars):
+        stored.append((application_id, secret_env_vars))
+
+    inst._store_replica_secrets = _fake_store
+
+    asyncio.run(builder_mod.AppBuilder.submit(inst, built_app, "my-app"))
+    assert len(calls) == 1, f"expected one .remote() call, got {len(calls)}"
+    assert stored, "submit did not store the replica secrets -- the method did not really run"
+    return calls[0]
+
+
+def test_submit_hands_the_task_the_dict_that_CARRIES_the_token(monkeypatch):
+    """Leg 2, build side, CALL SITE. The mutant round 2 found lives here.
+
+    The ``runtime_env`` given to the BuiltApp deliberately LACKS the token, exactly as
+    ``_build_submit_runtime_env`` now produces it. So handing ``built_app.runtime_env["env_vars"]``
+    to ``.remote()`` instead of ``built_app.replica_env_vars`` fails here — and that swap is
+    otherwise silent, because a token-less sync falls back to anonymous read.
+
+    The token is located by VALUE across every positional argument rather than by index: an index
+    would break on any reordering of a 11-argument call and would then be fixed by renumbering
+    rather than by noticing.
+    """
+    fixture = _env_vars_fixture()
+    token = fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY]
+    runtime_env = _submit_runtime_env(fixture)
+    assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in runtime_env["env_vars"], (
+        "control: the runtime_env must already lack the token, or this arm cannot tell the "
+        "two candidate dicts apart"
+    )
+    replica_env_vars = {k: v for k, v in fixture.items()
+                        if not k.startswith(_SECRET_ENV_VAR_PREFIX)}
+
+    call = _drive_submit(monkeypatch, _built_app(replica_env_vars, runtime_env))
+
+    carriers = [a for a in call["args"]
+                if isinstance(a, dict) and a.get(_ARTIFACT_DOWNLOAD_TOKEN_KEY) == token]
+    assert carriers, (
+        "no argument handed to the build task carries the download token; the task would sync "
+        "source anonymously and every private-artifact deploy would fail"
+    )
+
+
+def test_submit_does_NOT_leak_the_secrets_into_the_task_runtime_env(monkeypatch):
+    """The property that was already there, so fixing the call site cannot regress it."""
+    fixture = _env_vars_fixture()
+    runtime_env = _submit_runtime_env(fixture)
+    replica_env_vars = {k: v for k, v in fixture.items()
+                        if not k.startswith(_SECRET_ENV_VAR_PREFIX)}
+    call = _drive_submit(monkeypatch, _built_app(replica_env_vars, runtime_env))
+
+    submitted = call["options"]["runtime_env"]
+    assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in submitted.get("env_vars", {})
+    secret_value = "not-a-real-secret-xyz789"
+    assert secret_value not in repr(submitted), "a secret reached the task runtime_env"
+
+
+def test_build_derives_replica_env_vars_from_the_FULL_env_vars(monkeypatch):
+    """Leg 2, build side, the other call site — structural, because ``build()`` is not drivable.
+
+    ``build()`` must call ``split_secret_env_vars`` on the dict ``_build_env_vars`` returned, not on
+    ``runtime_env["env_vars"]`` (which no longer carries the token). The sibling file already
+    asserts that ``replica_env_vars`` comes *from* ``split_secret_env_vars``; this pins WHICH dict
+    goes in, which is what the round-2 mutant changed.
+    """
+    builder_src = (
+        pathlib.Path(__file__).resolve().parents[2] / "bioengine" / "apps" / "builder.py"
+    )
+    tree = ast.parse(builder_src.read_text())
+    build = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "build"),
+        None,
+    )
+    assert build is not None, "builder.py has no `build` -- the anchor moved, not the fix"
+
+    # The local name bound from self._build_env_vars(...)
+    bound = [
+        t.id
+        for n in ast.walk(build)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "attr", None) == "_build_env_vars"
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    ]
+    assert len(bound) == 1, f"expected one assignment from _build_env_vars, found {bound}"
+
+    calls = [
+        n for n in ast.walk(build)
+        if isinstance(n, ast.Call)
+        and (getattr(n.func, "id", None) or getattr(n.func, "attr", None))
+        == "split_secret_env_vars"
+    ]
+    assert len(calls) == 1, f"expected one split_secret_env_vars call in build(), found {len(calls)}"
+    arg = calls[0].args[0]
+    assert isinstance(arg, ast.Name) and arg.id == bound[0], (
+        f"build() calls split_secret_env_vars on {ast.dump(arg)[:60]} rather than on the "
+        f"{bound[0]!r} that _build_env_vars returned. runtime_env['env_vars'] no longer carries "
+        "the download token, so splitting that instead silently strips it from every replica."
     )
 
 
