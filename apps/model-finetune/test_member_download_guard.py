@@ -1,4 +1,4 @@
-"""#0139 — a member re-downloaded mid-merge is checked where it lands.
+"""a member re-downloaded mid-merge is checked where it lands.
 
 ``aggregate()`` hashes every member once per merge before any soup is built. That
 alone is not enough, and the gap is easy to miss: the member cache is evicted under
@@ -157,7 +157,7 @@ def _seed_cache(rt, key: str, payload: bytes) -> Path:
 
 @pytest.mark.asyncio
 async def test_a_cached_member_is_hashed_from_its_BYTES_not_its_recorded_digest(tmp_path):
-    """The clause this row exists for: ``verify_members`` must hash what is on
+    """What this file exists to check: ``verify_members`` must hash what is on
     disk, every merge, cache hit included.
 
     The failure it guards is one line and ships green: returning ``m["sha256"]``

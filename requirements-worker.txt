@@ -4,6 +4,12 @@ haikunator==2.1.0
 httpx[http2]==0.28.1
 hypha-rpc==0.21.40
 numpy==1.26.4
+# Ray hands `virtualenv` an EMPTY environment on Linux (virtualenv_utils.py sets
+# env = {}; os.environ.copy() is the _WIN32-only branch), so HOME is unset in that
+# subprocess whatever the container holds. platformdirs 4.12.1+ then RAISES instead
+# of falling back when the uid has no /etc/passwd entry, and no new runtime_env venv
+# can be built. Cached venvs are unaffected, so it only bites a first-time deploy.
+platformdirs<4.12
 protobuf>=4,<7  # Ray Serve 2.55 touches FieldDescriptor.label, removed in protobuf 7
 pydantic==2.12.0
 pydantic-core==2.41.1

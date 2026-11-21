@@ -39,8 +39,8 @@ logger = bioengine.logger
 
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
-# runtime_env install did not take fails instead of being advertised as ready
-# (#0371). Keep this list equal to what the bodies actually import: it is a
+# runtime_env install did not take fails instead of being advertised as ready.
+# Keep this list equal to what the bodies actually import: it is a
 # readiness gate, not a restatement of requirements-runtime-cellpose.txt, and a
 # module nothing imports would fail a replica that can serve every call.
 # ``numpy`` is absent on purpose — it is imported at module scope above, so a
@@ -94,7 +94,7 @@ def _read_pip(name: str) -> List[str]:
     # One replica, not autoscaled. Serve chooses which replica to stop from node
     # occupancy and replica age only, never from work in progress, so a second replica
     # makes the one holding a live merge removable — and min_replicas bounds the count,
-    # not the identity (#0088). A burst is absorbed by one replica regardless, since
+    # not the identity. A burst is absorbed by one replica regardless, since
     # max_ongoing_requests admits ten of them before an upscale can take any.
     autoscaling_config={
         "min_replicas": 1,
@@ -139,7 +139,7 @@ class CellposeRuntime:
     @bioengine.smoke_test
     async def _import_runtime_stack(self) -> None:
         """Import this backend's ML stack once, at startup, and fail the replica if
-        it is not there (#0371).
+        it is not there.
 
         A replica whose ``runtime_env`` install did not take answered the health
         probe correctly and was advertised as ready while **every** call raised
@@ -164,7 +164,7 @@ class CellposeRuntime:
         **replaces** the condemned replica and the cycle repeats indefinitely,
         because its circuit breaker ``_terminally_failed()`` is gated on ``not
         _replica_has_started``, which any successful start clears. Measured on
-        ``#0387`` over 100 health-check periods — that probe ran at
+        a probe deployment over 100 health-check periods — that probe ran at
         ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the 30 s
         above: 105 calls, **0 failed**, 84 answered by a replica that already
         knew its own smoke test had failed, across 22 distinct replica pids.
@@ -596,8 +596,7 @@ class CellposeRuntime:
         """Uniform mean of member state_dicts; None when empty (= stock base).
 
         Learned tensors are averaged; non-learned ones (``diam_labels``) are carried
-        from the base unchanged, and a key the base does not declare fails the merge
-        (#0070).
+        from the base unchanged, and a key the base does not declare fails the merge.
         """
         import pool
 
@@ -674,9 +673,9 @@ class CellposeRuntime:
         and return its sha256 + byte size — so the head weights never traverse the
         CPU entry. ``members`` must be non-empty (a published head always has one).
 
-        Also returns what the community manifest needs for #0070 requirement 4, because
-        this is the only place the members' weights are resident and reading them again
-        would mean re-downloading every one:
+        Also returns what the community manifest needs,
+        because this is the only place the members' weights are resident and reading them
+        again would mean re-downloading every one:
 
         ``non_learned_inherited`` — the published checkpoint's own non-learned values,
         read back off the SOUP rather than off the base, so the record reports what was
@@ -717,7 +716,7 @@ class CellposeRuntime:
             ]
             # Digest the tensors, not the saved file: the random stem below lands in
             # every torch zip record name, so a file digest would differ on every
-            # merge of the same members. The stem stays random for #0083.
+            # merge of the same members. The stem stays random.
             sha = await asyncio.to_thread(pool.state_dict_digest, soup)
             path = self._soup_dir() / f"head-{uuid.uuid4().hex}.pt"
             await asyncio.to_thread(lambda: torch.save(soup, str(path)))
@@ -745,10 +744,10 @@ class CellposeRuntime:
         The checkpoint is torch + a runtime-local file, neither of
         which the torch-free CPU entry can touch, so all of it happens here.
 
-        ``base_commitment`` is produced HERE for exactly that reason (#0070). The entry
+        ``base_commitment`` is produced HERE for exactly that reason. The entry
         writes it into ``pool_index.json`` at pool creation but cannot build it: a
         commitment needs the base's own state_dict, and a constant or manifest-derived
-        value would reinstate the key-set assumption the ruling's amendment removed.
+        value would reinstate the key-set assumption the design dropped.
         It rides on the existing return rather than a second call, because the base is
         already resident here.
 
@@ -774,7 +773,7 @@ class CellposeRuntime:
             out: Dict[str, Any] = {
                 "architecture_signature": pool.architecture_signature(sd),
                 "l2_from_base": None,
-                # #0122. Set in BOTH branches below, so a null here reaching the
+                # Set in BOTH branches below, so a null here reaching the
                 # record means neither ran — not that this writer does not label.
                 "l2_from_base_basis": None,
                 "base_checkpoint_sha256": None,
@@ -794,20 +793,20 @@ class CellposeRuntime:
                 del base_sd
             else:
                 # A stock-initialised session keeps no init_checkpoint.pt (the same root
-                # cause as #0122), so the base it started from is stock cellpose. Loading
+                # cause), so the base it started from is stock cellpose. Loading
                 # it here is the REAL base, not an assumed one -- which is the whole point
                 # of the amendment.
                 #
-                # CORRECTION (#0087, ruled 2026-11-15). This comment used to read "Peak
+                # CORRECTION. This comment used to read "Peak
                 # memory is unchanged either way ... two state dicts in both cases and
-                # #0087's bound is not made worse". That was FALSE and it is worth saying
+                # this bound is not made worse". That was FALSE and it is worth saying
                 # why, because the mistake is easy to repeat: it compared this `else`
                 # branch to the sibling `if` branch, when the right comparator is what
-                # THIS path did before. Before #0070 there was no `else` at all, so a
+                # THIS path did before. Before the base commitment there was no `else` at all, so a
                 # stock-initialised deposit held exactly ONE state dict. It now holds two.
-                # Reusing this row's own FU1 figures (one cpsam dict 1.1348 GiB, two
+                # Reusing the measured figures (one cpsam dict 1.1348 GiB, two
                 # 2.3060 GiB -- a REUSE, not a fresh measurement), this path went from
-                # ~1.13 GiB to ~2.31 GiB. #0087's bound was made worse, by this branch.
+                # ~1.13 GiB to ~2.31 GiB. The memory bound was made worse, by this branch.
                 # That is why the whole computation now runs under `_soup_sem` below.
                 #
                 # WHY A CONSTRUCTED NET IS CORRECT HERE AND NOT ABOVE. base_commitment
@@ -823,12 +822,12 @@ class CellposeRuntime:
                 # The branch ABOVE must stay on torch.load: a fine-tuned base DOES carry a
                 # learned diam_labels, where the widening would be lossy.
                 stock = self._base_state_dict(model_type)
-                # #0122 half 1: measure against the stock base that was actually
+                # Half 1: measure against the stock base that was actually
                 # used, so the field stops being null for exactly these deposits.
                 # The stock dict is already loaded here for base_commitment, so THIS
                 # line adds no load and no second resident copy. That much is true and
                 # stays; what was struck from the correction above is the further claim
-                # that the branch as a whole left #0087's bound untouched. Loading the
+                # that the branch as a whole left the memory bound untouched. Loading the
                 # stock base at all is what moved it; reusing it here does not move it
                 # again.
                 out["l2_from_base"] = pool.state_dict_l2_from_base(sd, stock)
@@ -840,7 +839,7 @@ class CellposeRuntime:
                 del stock
             return out
 
-        # #0087, Option A (ruled 2026-11-15): the inspection holds up to TWO full cpsam
+        # The inspection holds up to TWO full cpsam
         # state dicts, and until now it ran outside every lock and past every admission
         # gate -- so a deposit's peak could sum with a concurrent merge's, and the replica
         # could breach `memory_mb` with no merge of its own running at all.
@@ -849,17 +848,17 @@ class CellposeRuntime:
         # build. Taking it HERE makes the deposit and the merge mutually exclusive, so the
         # replica's peak becomes max(merge, contribute) rather than their sum.
         #
-        # What this does NOT do, stated because the close has to record the bound rather
-        # than an improvement: it does not reduce the single-path peak. Reusing this row's
-        # FU1 figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
+        # What this does NOT do, stated because what matters is the bound rather
+        # than an improvement: it does not reduce the single-path peak. Reusing the measured
+        # figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
         # measurement), contribute alone still peaks at ~2.31 GiB. If max(merge,
         # contribute) is still above what the admission gate assumes, that is a separate
-        # row, not a reason to widen this one.
+        # concern, not a reason to widen this one.
         #
         # The cost is latency: the deposit RPC now waits for any in-flight merge before it
-        # starts its own torch load. That is the trade the ruling accepted -- a measured
+        # starts its own torch load. That is the trade accepted here -- a measured
         # memory bound over an unmeasured latency improvement -- and the measurement of
-        # what it adds is on the row.
+        # what it adds is recorded with those figures.
         async with self._soup_sem:
             info = await asyncio.to_thread(_inspect)
         weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)

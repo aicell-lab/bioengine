@@ -47,7 +47,31 @@ RUN pip install --no-deps .
 #                -f docker/worker.Dockerfile -t bioengine-worker:dev .
 # ---------------------------------------------------------------------------
 ARG RAY_VERSION=2.55.1
-RUN pip install "ray[client,serve]==${RAY_VERSION}"
+# CONSTRAINED, because this layer does not see requirements-worker.txt's pins. Ray pulls in
+# virtualenv, virtualenv declares a platformdirs FLOOR, and pip is free to satisfy that floor
+# by upgrading straight over the pin installed above -- silently, with the build still green,
+# and the passwd-less-uid bug back on the next rebuild. A constraint makes pip ERROR instead.
+#
+# The constraint is EXTRACTED from the requirements file rather than restated, so the two
+# cannot drift; `grep` exits non-zero and fails the build if the pin is ever removed, which is
+# the case where a restated copy would have gone quietly out of date. The whole file cannot be
+# used as a constraints file: it carries an extra (`httpx[http2]`), which pip rejects there.
+RUN grep -E '^platformdirs' requirements-worker.txt > /tmp/platformdirs-constraint.txt && \
+    pip install -c /tmp/platformdirs-constraint.txt "ray[client,serve]==${RAY_VERSION}" && \
+    rm -f /tmp/platformdirs-constraint.txt
+
+# THE REGRESSION GATE. The constraint above stops the one path we know about; this catches any
+# other. It builds a venv the way Ray does -- empty environment, uid with NO passwd entry -- and
+# a non-zero exit fails the BUILD rather than shipping an image whose first runtime_env deploy
+# fails on a cluster. 61234 is arbitrary and deliberately absent from /etc/passwd; /tmp is 1777
+# so it is writable. `env -i` clears PATH, hence the absolute interpreter.
+USER 61234:61234
+RUN env -i /usr/local/bin/python -m virtualenv /tmp/venv-passwdless-gate > /tmp/gate.log 2>&1 \
+    || { echo "REGRESSION: a uid with no passwd entry can no longer build a venv -- the" >&2; \
+         echo "platformdirs pin has been defeated, and no new runtime_env venv will build." >&2; \
+         tail -20 /tmp/gate.log >&2; exit 1; }
+USER root
+RUN rm -rf /tmp/venv-passwdless-gate /tmp/gate.log
 
 # Surface the active Ray version inside the image for diagnostics
 ENV BIOENGINE_RAY_VERSION=${RAY_VERSION}

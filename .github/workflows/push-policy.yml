@@ -22,7 +22,7 @@ jobs:
   pr-only-paths:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -49,6 +49,7 @@ jobs:
           fi
 
           violations=0
+          unknown=0
           for sha in $commits; do
             changed=$(git diff-tree --no-commit-id --name-only -r -m "$sha")
             hit=$(printf '%s\n' "$changed" | bash .github/hooks/match-pr-only.sh)
@@ -60,8 +61,13 @@ jobs:
             prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" \
                     --jq 'length' 2>/dev/null || echo "unknown")
 
-            if [ "$prs" = "unknown" ]; then
-              echo "::warning title=Push policy::could not determine whether ${sha} came from a pull request; not counting it"
+            # A commit this job could not judge fails the job. Counting it as
+            # clean would report "Push policy: clean." for a push that was never
+            # checked, which reads exactly like a real pass.
+            if ! [[ "$prs" =~ ^[0-9]+$ ]]; then
+              unknown=$((unknown + 1))
+              echo "::error title=Push policy::could not determine whether ${sha} came from a pull request (API answer: ${prs}); it touches PR-only paths:"
+              printf '%s\n' "$hit" | sort -u | sed 's/^/    /'
               continue
             fi
             if [ "$prs" -gt 0 ]; then
@@ -78,6 +84,12 @@ jobs:
             echo
             echo "${violations} commit(s) bypassed the pull-request requirement."
             echo "See .github/hooks/README.md — installing the pre-push hook catches this before the push."
+            exit 1
+          fi
+          if [ "$unknown" -gt 0 ]; then
+            echo
+            echo "${unknown} commit(s) touching PR-only paths could not be checked, so this push is NOT known to be clean."
+            echo "Re-run this workflow once the GitHub API answers."
             exit 1
           fi
           echo "Push policy: clean."

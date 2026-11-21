@@ -12,7 +12,7 @@ a multiple of one member's size so the number is independent of member size. Run
 
 Exits non-zero if the current combine's peak grows with member count, so it is a
 regression gate and not just a report. ``--mode before`` reproduces the pre-fix
-algorithm for contrast; it is the discrimination control for the flat row, and it
+algorithm for contrast; it is the discrimination control for the flatness property, and it
 is expected to FAIL the flatness check.
 """
 

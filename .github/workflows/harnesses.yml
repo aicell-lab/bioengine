@@ -1,0 +1,76 @@
+name: Harnesses
+
+# Runs the re-runnable demonstrations that guard the repository's own
+# gates. Nothing else ran them, so a harness could sit red on main unnoticed:
+# the pre-push hook control did, at 9 passed and 2 failed.
+#
+#   .github/scripts/test_check_app_artifact_version.sh  the apps/ version gate
+#   .github/scripts/test_app_bundle_suites.sh           app-bundle test discovery
+#   .github/scripts/test_check_draft_bump.sh           the draft version-rung check
+#   .github/hooks/tests/control.sh                      the pre-push hook
+#
+# All of them run even when an earlier one fails, so one red harness cannot hide
+# another, and the job fails if ANY of them exits non-zero. The app harness
+# reads the live Hypha server for its first five cases, so a Hypha outage
+# turns this job red. That is the intended direction: a gate that could not
+# be checked is not reported as checked.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harnesses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install what the gate scripts import
+        run: python -m pip install --quiet packaging pyyaml
+
+      - name: Run every harness
+        env:
+          # control.sh and the app harness build throwaway commits.
+          GIT_AUTHOR_NAME: harness
+          GIT_AUTHOR_EMAIL: harness@users.noreply.github.com
+          GIT_COMMITTER_NAME: harness
+          GIT_COMMITTER_EMAIL: harness@users.noreply.github.com
+        run: |
+          set -uo pipefail
+          failed=0
+          ran=0
+          for h in \
+              .github/scripts/test_check_app_artifact_version.sh \
+              .github/scripts/test_app_bundle_suites.sh \
+              .github/scripts/test_check_draft_bump.sh \
+              .github/hooks/tests/control.sh; do
+            echo "::group::$h"
+            if [ ! -f "$h" ]; then
+              echo "::error title=Harnesses::$h is missing, so it was NOT run"
+              failed=$((failed + 1))
+              echo "::endgroup::"
+              continue
+            fi
+            bash "$h"
+            rc=$?
+            ran=$((ran + 1))
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error title=Harnesses::$h exited $rc"
+              failed=$((failed + 1))
+            else
+              echo "ok: $h"
+            fi
+          done
+          echo "harnesses run: $ran of 3, failed: $failed"
+          [ "$failed" -eq 0 ]
