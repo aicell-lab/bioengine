@@ -3,11 +3,16 @@
 # the pins resolve as already satisfied and the app skips the multi-GB
 # download/install that otherwise runs on first startup.
 #
-# Fast-start but NOT air-gapped: pip re-resolves direct VCS references however
-# they are baked, so the two git+https pins in
+# Fast-start but NOT air-gapped: the two git+https pins in
 # apps/model-finetune/requirements-runtime-cellpose.txt (dinov3 and
-# segment-anything, each pinned to a commit) are re-cloned on every deploy and the
-# install fails with no network. A site needing an offline deploy has to vendor
+# segment-anything, each pinned to a commit) are re-cloned on every deploy, so
+# the install fails with no network. Measured rather than assumed, and the
+# reason is narrower than "pip always re-clones": pip re-runs `git clone` for a
+# direct VCS reference instead of reusing the baked install, and because
+# PIP_NO_CACHE_DIR=1 is set below there is no wheel cache to serve it from
+# either. With that variable unset, a second resolve IS served from the cache
+# with no clone — so the no-network failure is a property of this image's
+# environment as much as of pip. A site needing an offline deploy has to vendor
 # those two.
 #
 # Published as ONE general GHCR package, ghcr.io/aicell-lab/model-finetune, with
