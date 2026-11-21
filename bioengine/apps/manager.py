@@ -4325,19 +4325,35 @@ class AppsManager:
             deeper than the rest and are easy to mis-read:
 
             ``deployments`` maps the user's ``@bioengine.app`` class name to that
-            deployment's state, and its ``logs`` key is keyed again, BY REPLICA ID:
+            deployment's state. Its ``logs`` key is keyed again, mostly by replica id — but
+            NOT every entry is a replica record, and the records do not all carry the same
+            keys. Handle four shapes:
 
-                deployments[<class_name>].logs[<replica_id>] = {
-                    "stdout": ..., "stderr": ...,
-                    "creation_timestamp": <epoch float>,
-                    "timezone": <tz name, e.g. "CET">,
+                logs[<replica_id>] = {                    # a live replica
+                    "stdout": list[str], "stderr": list[str],
+                    "creation_timestamp": <epoch float>,  # ONLY when known
+                    "timezone": <tz name, e.g. "CET">,    # ONLY when known
                 }
+                logs[<replica_id>] = {                    # abnormally dead; the DEFAULT
+                    "stdout": [], "stderr": [],           # n_previous_replica=0 shape
+                    "death_cause": ..., "logs_omitted": True,
+                }                                         # no timezone, no timestamp
+                logs["error"] = "<message>"               # retrieval failed: a STRING value
+                logs["_deliberately_stopped_replicas"] = <int>   # a COUNT, not a replica
 
-            ``timezone`` is always present and names the zone of the timestamps INSIDE the
-            ``stdout`` and ``stderr`` text — it is the replica's local zone and is NOT
-            necessarily UTC. Comparing those timestamps against a UTC clock without applying
-            it yields an offset error in the direction that makes recent log lines look old.
-            ``creation_timestamp`` is a plain epoch value and needs no such handling.
+            So a loop over ``logs.items()`` must not assume the value is a record, and a
+            record must not be assumed to carry ``timezone``: it is added only when the
+            replica's zone is known, which excludes the error entry and every abnormally
+            dead replica on default arguments. Treating an absent ``timezone`` as UTC is a
+            guess, not a default.
+
+            When ``timezone`` IS present it names the zone of the timestamps INSIDE the
+            ``stdout``/``stderr`` text — the replica's local zone, not necessarily UTC.
+            Comparing those against a UTC clock without applying it shifts every line by the
+            offset; which way depends on the offset's sign, and for a zone ahead of UTC the
+            lines land in the future, so an "age" computed from them can come out negative.
+            ``creation_timestamp``, when present, is a plain epoch value and is the field to
+            prefer for arithmetic.
 
         Raises:
             RuntimeError: If Ray cluster connection is unavailable
@@ -4361,10 +4377,16 @@ class AppsManager:
             # Returns: {"app1": {...}}
             app = status["app1"]
 
-            # Replica logs are two levels below the deployment, and carry their own zone
+            # Replica logs are two levels below the deployment. Not every entry is a
+            # record, and a record need not carry a zone — so check both.
             logs = app["deployments"]["MyApp"]["logs"]
-            for replica_id, streams in logs.items():
-                streams["stdout"], streams["stderr"], streams["timezone"]
+            if isinstance(logs.get("error"), str):
+                ...                                   # retrieval failed; no replicas here
+            for replica_id, rec in logs.items():
+                if not isinstance(rec, dict):
+                    continue                          # e.g. _deliberately_stopped_replicas
+                lines = rec.get("stdout", []) + rec.get("stderr", [])
+                zone = rec.get("timezone")            # may be absent; do NOT assume UTC
         """
         _validate_deployment_logs_map(deployment_logs)
 

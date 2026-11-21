@@ -157,9 +157,116 @@ def test_the_method_really_has_no_single_id_branch():
     returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
     assert returns, "get_app_status returns nothing -- the anchor moved"
     # Every return is either the keyed mapping or an empty dict; none indexes a single element.
+    # The unwrap can be spelled many ways -- output[ids[0]], list(output.values())[0],
+    # next(iter(output.values())). Review beat a "[0] not in source" check with the third.
+    # So allow-list the RETURNED EXPRESSION instead: it must be a bare Name or an empty dict
+    # literal, which no unwrap can be.
     for r in returns:
+        v = r.value
+        ok = (
+            isinstance(v, ast.Name)
+            or (isinstance(v, ast.Dict) and not v.keys)
+        )
         seg = (ast.get_source_segment(src, r) or "").strip()
-        assert "[0]" not in seg, (
-            f"a return in get_app_status indexes an element ({seg!r}); that is the unwrap the "
-            f"docstring used to promise, and the docs must change with it"
+        assert ok, (
+            f"get_app_status returns {type(v).__name__} ({seg!r}) rather than the keyed mapping "
+            f"or an empty dict; any expression here is an unwrap or a transform, and the "
+            f"documentation has to change with it"
+        )
+
+
+def test_the_docstring_does_NOT_name_one_DIRECTION_for_the_timezone_error():
+    """F2. The direction depends on the sign of the offset, so naming one is wrong half the time.
+
+    An earlier wording said ignoring the zone makes lines "look old". For a zone AHEAD of UTC --
+    CET, the case this was written for -- a local timestamp read as UTC lands in the FUTURE, so
+    the lines look NEWER and a computed age can come out negative. Naming either direction
+    contradicts the other case, so the docstring must describe the dependence instead.
+    """
+    lowered = _docstring()
+    for wrong in ("look old", "looks old", "look older", "appear old"):
+        assert wrong not in lowered, (
+            f"the docstring claims ignoring the timezone makes lines {wrong!r}; for a zone ahead "
+            f"of UTC the opposite happens, which is the case this was written for"
+        )
+    assert "sign" in lowered or "depends on" in lowered, (
+        "the docstring names no dependence for the direction of the timezone error, so a reader "
+        "cannot tell which way their own cluster's offset shifts things"
+    )
+
+
+def test_the_docstring_does_NOT_claim_timezone_is_ALWAYS_present():
+    """F1. It is not, and a consumer told otherwise defaults it to UTC.
+
+    get_actor_logs adds the key only when the zone is known, get_deployment_logs passes None
+    when replica_info is missing, and the abnormally-dead-replica entry at the DEFAULT
+    n_previous_replica=0 carries neither timezone nor creation_timestamp. So a deployment with a
+    crashed replica returns, on default arguments, an entry with no zone.
+    """
+    lowered = _docstring()
+    for overclaim in ("always present", "is always", "every replica record carries a timezone"):
+        assert overclaim not in lowered, (
+            f"the docstring says {overclaim!r} of timezone; it is conditional in the code, and a "
+            f"consumer that believes this labels zone-less entries UTC"
+        )
+    assert "only when known" in lowered or "may be absent" in lowered, (
+        "the docstring does not say timezone can be absent, so the conditional stays invisible"
+    )
+
+
+def test_the_docstring_documents_the_NON_RECORD_entries_in_the_logs_map():
+    """F3. Not every value under `logs` is a replica record, and the worked example must survive
+    the ones that are not: a string under "error", and an int count under
+    "_deliberately_stopped_replicas". A loop that indexes every value as a dict raises on both.
+    """
+    doc = manager_mod.AppsManager.get_app_status.__doc__ or ""
+    normalised = " ".join(doc.split())
+    # Assert the DISTINCTIVE forms from the shape enumeration, not bare words. Measured: a
+    # mutation deleting the enumeration still passed when this checked for "error" and
+    # "_deliberately_stopped_replicas", because the Examples block mentions both -- the same
+    # "satisfied by the wrong occurrence" failure that an earlier arm here had.
+    for needed in (
+        'logs["error"] = "<message>"',
+        'logs["_deliberately_stopped_replicas"] = <int>',
+        '"death_cause"',
+        '"logs_omitted": True',
+    ):
+        assert " ".join(needed.split()) in normalised, (
+            f"the docstring's shape enumeration no longer gives {needed!r}, so a caller writing "
+            f"the obvious loop over logs.items() breaks on real payloads"
+        )
+    lowered = _docstring()
+    assert "list[str]" in lowered, (
+        "the docstring does not give the stream type; stdout/stderr are list[str] "
+        "(stdout.splitlines()), and a consumer assuming a string gets nothing from a list"
+    )
+
+
+def test_the_documented_EXAMPLE_survives_every_shape_the_docstring_names():
+    """The example is the part a reader copies, so run it against the awkward shapes.
+
+    Builds the three non-trivial values the docstring enumerates and executes the example's
+    own logic over them. A loop that assumed every value were a record would raise here.
+    """
+    logs = {
+        "live-1": {"stdout": ["a"], "stderr": ["b"], "timezone": "CET",
+                   "creation_timestamp": 1.0},
+        "dead-1": {"stdout": [], "stderr": [], "death_cause": "OOM", "logs_omitted": True},
+        "_deliberately_stopped_replicas": 1,
+    }
+    seen = {}
+    for replica_id, rec in logs.items():
+        if not isinstance(rec, dict):
+            continue
+        lines = rec.get("stdout", []) + rec.get("stderr", [])
+        seen[replica_id] = (len(lines), rec.get("timezone"))
+    assert seen == {"live-1": (2, "CET"), "dead-1": (0, None)}, seen
+
+    # and the error shape, where the VALUE is a string
+    err = {"error": "Error retrieving logs: boom"}
+    assert isinstance(err.get("error"), str)
+    for replica_id, rec in err.items():
+        assert not isinstance(rec, dict), (
+            "the error entry is a string value; a caller that indexes it as a record raises "
+            "TypeError, which is why the docstring has to name this shape"
         )
