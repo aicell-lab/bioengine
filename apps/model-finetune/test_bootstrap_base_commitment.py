@@ -41,7 +41,7 @@ def _complete_commitment():
     }
 
 
-# === the no-fallback rule, which is the ruling's and not negotiable ==================
+# === the no-fallback rule, which is not negotiable ==================
 
 def test_bootstrapped_index_with_a_commitment_is_mergeable():
     idx = pool.empty_index("cpsam", SIG, _complete_commitment())
@@ -56,7 +56,7 @@ def test_bootstrapped_index_with_a_commitment_is_mergeable():
 def test_bootstrapped_index_without_a_commitment_still_raises():
     """The defect's signature: this is what a pool created by the old call site looked like.
 
-    It must RAISE rather than fall back to loading a stock base, which the ruling forbids
+    It must RAISE rather than fall back to loading a stock base, which is forbidden
     because a fallback makes the field permanently optional.
     """
     idx = pool.empty_index("cpsam", SIG)

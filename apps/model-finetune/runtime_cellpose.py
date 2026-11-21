@@ -673,7 +673,7 @@ class CellposeRuntime:
         and return its sha256 + byte size — so the head weights never traverse the
         CPU entry. ``members`` must be non-empty (a published head always has one).
 
-        Also returns what the community manifest needs for base-commitment requirement 4,
+        Also returns what the community manifest needs,
         because this is the only place the members' weights are resident and reading them
         again would mean re-downloading every one:
 
@@ -747,7 +747,7 @@ class CellposeRuntime:
         ``base_commitment`` is produced HERE for exactly that reason. The entry
         writes it into ``pool_index.json`` at pool creation but cannot build it: a
         commitment needs the base's own state_dict, and a constant or manifest-derived
-        value would reinstate the key-set assumption the ruling's amendment removed.
+        value would reinstate the key-set assumption the design dropped.
         It rides on the existing return rather than a second call, because the base is
         already resident here.
 
@@ -797,14 +797,14 @@ class CellposeRuntime:
                 # it here is the REAL base, not an assumed one -- which is the whole point
                 # of the amendment.
                 #
-                # CORRECTION (ruled 2026-11-15). This comment used to read "Peak
+                # CORRECTION. This comment used to read "Peak
                 # memory is unchanged either way ... two state dicts in both cases and
                 # this bound is not made worse". That was FALSE and it is worth saying
                 # why, because the mistake is easy to repeat: it compared this `else`
                 # branch to the sibling `if` branch, when the right comparator is what
                 # THIS path did before. Before the base commitment there was no `else` at all, so a
                 # stock-initialised deposit held exactly ONE state dict. It now holds two.
-                # Reusing this row's own FU1 figures (one cpsam dict 1.1348 GiB, two
+                # Reusing the measured figures (one cpsam dict 1.1348 GiB, two
                 # 2.3060 GiB -- a REUSE, not a fresh measurement), this path went from
                 # ~1.13 GiB to ~2.31 GiB. The memory bound was made worse, by this branch.
                 # That is why the whole computation now runs under `_soup_sem` below.
@@ -839,7 +839,7 @@ class CellposeRuntime:
                 del stock
             return out
 
-        # Option A (ruled 2026-11-15): the inspection holds up to TWO full cpsam
+        # The inspection holds up to TWO full cpsam
         # state dicts, and until now it ran outside every lock and past every admission
         # gate -- so a deposit's peak could sum with a concurrent merge's, and the replica
         # could breach `memory_mb` with no merge of its own running at all.
@@ -848,17 +848,17 @@ class CellposeRuntime:
         # build. Taking it HERE makes the deposit and the merge mutually exclusive, so the
         # replica's peak becomes max(merge, contribute) rather than their sum.
         #
-        # What this does NOT do, stated because the close has to record the bound rather
-        # than an improvement: it does not reduce the single-path peak. Reusing this row's
-        # FU1 figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
+        # What this does NOT do, stated because what matters is the bound rather
+        # than an improvement: it does not reduce the single-path peak. Reusing the measured
+        # figures (one cpsam dict 1.1348 GiB, two 2.3060 GiB -- a REUSE, not a fresh
         # measurement), contribute alone still peaks at ~2.31 GiB. If max(merge,
         # contribute) is still above what the admission gate assumes, that is a separate
-        # row, not a reason to widen this one.
+        # concern, not a reason to widen this one.
         #
         # The cost is latency: the deposit RPC now waits for any in-flight merge before it
-        # starts its own torch load. That is the trade the ruling accepted -- a measured
+        # starts its own torch load. That is the trade accepted here -- a measured
         # memory bound over an unmeasured latency improvement -- and the measurement of
-        # what it adds is on the row.
+        # what it adds is recorded with those figures.
         async with self._soup_sem:
             info = await asyncio.to_thread(_inspect)
         weights_sha256 = await asyncio.to_thread(pool.sha256_file, ckpt)

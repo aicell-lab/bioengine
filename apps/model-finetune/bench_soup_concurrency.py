@@ -14,7 +14,7 @@ once, plus peak RSS. Run::
 
 Exits non-zero if more than one merge gets in, so it is a regression gate and not
 just a report. ``--mode before`` replaces the semaphore with a no-op to reproduce
-the pre-fix behaviour; it is the discrimination control for the single-flight row
+the pre-fix behaviour; it is the discrimination control for the single-flight property
 and is expected to FAIL the gate. If it does not, the harness cannot tell the two
 apart and its pass means nothing.
 

@@ -19,7 +19,7 @@ apart, not four copies of one case:
   first two: it is a possible integrity incident and a human has to see it, and a
   single code for both would bury it inside the boring case forever.
 
-The last case is the one the whole row turns on. Before this change the merge
+The last case is the one this file turns on. Before this change the merge
 hashed nothing on load, so ``c-mismatch`` and ``c-good`` produced byte-identical
 behaviour and an identical published checkpoint.
 """
@@ -106,7 +106,8 @@ class TestDigestQuarantine:
         assert len(quarantined) == 3
 
     def test_absent_and_null_share_one_reason_and_the_mismatch_does_not(self):
-        """The ruling's first implementability condition, as an assertion. If this
+        """Absent and null must share one reason, and a digest mismatch must not,
+        as an assertion. If this
         ever goes green with all three reasons equal, a reader filtering the
         community manifest for integrity incidents finds every legacy record and
         gives up on the filter."""
@@ -144,7 +145,7 @@ class TestDigestQuarantine:
         assert quarantined == []
 
     def test_a_member_nobody_hashed_raises_rather_than_being_admitted(self):
-        """The load-bearing line. The failure this row exists to prevent is souping
+        """The load-bearing line. The failure this check exists to prevent is souping
         bytes that nothing checked; a version of ``digest_quarantine`` that treated
         an unhashed member as "nothing to compare against, carry on" would restore
         that failure exactly, and every other test in this file would still pass."""
@@ -302,7 +303,7 @@ class TestManifestCarriesTheQuarantine:
     def test_a_clean_merge_still_states_that_it_was_clean(self):
         """The field is present and empty rather than absent. Absence would be
         indistinguishable from a writer that predates this change, which is the
-        exact ambiguity the row was filed about."""
+        exact ambiguity this check is about."""
         man = self._manifest([])
         assert man["quarantined"] == []
         assert man["quarantine_counts"][pool.QUARANTINE_DIGEST_MISMATCH] == 0

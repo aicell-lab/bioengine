@@ -58,6 +58,13 @@ def manager_with_both_layers(
     """A manager whose two layers hold deliberately different numbers."""
     manager = make_manager(authorized_users={"*": [ADMIN]})
     manager._deployed_applications[APP_ID]["max_ongoing_requests"] = proxy_cap
+    # get_app_status now fetches the cluster-wide dead-actor map ONCE per call and
+    # hands it to every deployment, instead of each deployment querying for itself.
+    # A MagicMock attribute is not awaitable, so a handle that does not mock this
+    # fails with `object MagicMock can't be used in 'await' expression`.
+    manager.ray_cluster.proxy_actor_handle.get_all_death_causes.remote = AsyncMock(
+        return_value={}
+    )
     manager.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote = (
         AsyncMock(
             return_value={
