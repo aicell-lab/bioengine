@@ -87,9 +87,13 @@ _ACCESS_REQUEST_DECISIONS = ("grant", "deny", "clear")
 # has to keep answering without a token. The deployed Kubernetes *startup*
 # probe curls it and greps ``is_ready``: gating the method fails every worker's
 # startup for 18 x 30 s and then crash-loops it permanently. Only the startup
-# probe — the deployed liveness probe is a local ``kill -0 1``, for the reason
-# recorded on _check_service_registration below; the manifests the website's
-# worker guide generates do curl ``get_status`` from both. Beyond the probes:
+# probe — the deployed liveness probe reads the monitoring loop's heartbeat file
+# via ``python -m bioengine.heartbeat`` and never calls this method, for the
+# reason recorded on _check_service_registration below; the manifests the
+# website's worker guide generates do curl ``get_status`` from both. No
+# readinessProbe is deployed on the Kubernetes deployment this was read from,
+# so there the startup probe is the only consumer of ``is_ready``. Beyond the
+# probes:
 # the worker-list cards read ``geo_location`` and ``bioengine_version``, and the
 # CLI's cluster view and the KTH gpu-cuda-watch script read ``ray_cluster``.
 #
@@ -434,7 +438,9 @@ class BioEngineWorker:
         # reports the worker not-ready, so dashboards and callers can see a
         # degraded worker. The loop keeps running and usually recovers; a
         # loop that has stopped running entirely is caught by the heartbeat
-        # file instead, since a frozen loop never reaches this counter.
+        # file instead, since a frozen loop never reaches this counter. Only
+        # the Kubernetes liveness probe reads that file, so under Apptainer on
+        # SLURM and in a plain ``docker run`` a frozen loop restarts no worker.
         self._monitor_consecutive_errors = 0
         self._monitor_degraded_threshold = 5
 
@@ -1167,12 +1173,13 @@ class BioEngineWorker:
         feeds the monitoring loop's degraded counter; at the degraded threshold
         ``get_status`` reports the worker not-ready.
 
-        Nothing acts on that report today. The deployed liveness probe is a
-        local PID check that never reads readiness, and ``get_status`` is
-        served by the very registration that has been evicted, so in the case
-        this check exists for there is no one left to ask. Escalating is
-        therefore a log line and a status flag, not a restart; the restart
-        needs an external consumer that does not yet exist.
+        Nothing acts on that report today. The deployed liveness probe reads
+        the monitoring loop's heartbeat file and never reads readiness, and
+        ``get_status`` is served by the very registration that has been
+        evicted, so in the case this check exists for there is no one left to
+        ask. Escalating is therefore a log line and a status flag, not a
+        restart; the restart needs an external consumer that does not yet
+        exist.
 
         The grace is a deadline, not a budget, and it measures **continuous**
         unreachability: any successful probe resets it. A flapping connection
