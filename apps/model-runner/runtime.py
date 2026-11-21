@@ -272,11 +272,23 @@ for line in sys.stdin:
         }
         if default_blocksize_parameter:
             result = pipeline.predict_sample_with_blocking(sample, **skips)
-        elif cellpose and _fits_whole(pipeline.model_description, sample):
-            # Nothing to tile, and blocking would still pad the outer boundary
-            # by the declared halo, which the model segments into extra cells
-            # along the border. The skip flags are a matched pair: cropping
-            # fires unconditionally and would remove a halo never added.
+        elif _fits_whole(pipeline.model_description, sample):
+            # Nothing to tile, and the default path would still pad the outer
+            # boundary by the declared halo. The skip flags are a matched pair:
+            # cropping fires unconditionally and would remove a halo never added.
+            #
+            # NOT gated on ``cellpose``, deliberately. ``_fits_whole`` is a
+            # general predicate over the model's declared axes, and the harm is
+            # general too, in two different ways:
+            #   - Cellpose segments the padded border into extra cells.
+            #   - A model with FIXED space extents is handed a tensor of the
+            #     wrong size and refuses outright, so the request fails rather
+            #     than degrading. A 256x256 input to a fixed-256 model becomes
+            #     320x320 under a halo of 32 and the model rejects it, which is
+            #     what made such models unreachable from every client.
+            # Gating the skip on Cellpose sent every other fits-whole model down
+            # the ``else`` branch below, which calls predict_sample_without_blocking
+            # WITHOUT these flags and therefore still pads.
             result = pipeline.predict_sample_without_blocking(
                 sample,
                 skip_input_padding=True,
