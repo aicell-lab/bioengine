@@ -6,14 +6,13 @@
 # Fast-start but NOT air-gapped: the two git+https pins in
 # apps/model-finetune/requirements-runtime-cellpose.txt (dinov3 and
 # segment-anything, each pinned to a commit) are re-cloned on every deploy, so
-# the install fails with no network. Measured rather than assumed, and the
-# reason is narrower than "pip always re-clones": pip re-runs `git clone` for a
-# direct VCS reference instead of reusing the baked install, and because
-# PIP_NO_CACHE_DIR=1 is set below there is no wheel cache to serve it from
-# either. With that variable unset, a second resolve IS served from the cache
-# with no clone — so the no-network failure is a property of this image's
-# environment as much as of pip. A site needing an offline deploy has to vendor
-# those two.
+# the install fails with no network. The reason is the BUILD, not the deploy:
+# pip re-resolves a direct VCS reference instead of reusing the baked install,
+# and PIP_NO_CACHE_DIR=1 is set below ahead of every `pip install` in this file,
+# so the image never stores a wheel for those two to fall back on. A deploy
+# therefore re-clones whatever IT sets PIP_NO_CACHE_DIR to — unsetting it at
+# deploy time does not help, because there is nothing cached in the image to
+# serve. Only vendoring those two pins removes the network requirement.
 #
 # Published as ONE general GHCR package, ghcr.io/aicell-lab/model-finetune, with
 # a per-backend tag suffix (e.g. 0.21.0-cellpose). This file builds the CELLPOSE
