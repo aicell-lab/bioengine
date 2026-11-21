@@ -15,6 +15,7 @@ back: the behaviour is asserted, and the docstring is asserted not to claim the 
 import ast
 import asyncio
 import inspect
+import re
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -295,3 +296,93 @@ def test_the_docstring_does_NOT_put_the_COUNTS_inside_the_logs_map():
     assert "deliberately_stopped_replicas" in normalised, (
         "the count is not documented at all, so a caller cannot find it on either surface"
     )
+
+
+# ── doc vs REALITY: run the documented shapes against what the producer EMITS ──
+#
+# Review's sharpest point about the previous version of this file was not the wrong shape
+# itself but WHY these arms could not catch it: one built its logs dict by hand and ran a
+# COPY of the documented loop, so it could only ever confirm what the docstring said; and
+# the other REQUIRED the false literal, so it would have gone red on the correct fix. Both
+# are closed loops around the documentation.
+#
+# So this arm takes the logs map from the real producer -- AppsManager._get_deployment_status
+# via the fixture that already exercises the lift -- and checks the docstring against it.
+
+
+def _real_logs_map():
+    """The logs map as the worker really builds it, including the stopped-count case."""
+    from tests.cli.test_apps_logs_command import (
+        DEPLOYMENT,
+        LIVE_REPLICA,
+        PROXY_LOGS_WITH_STOPPED_COUNT,
+        _deployments,
+    )
+
+    deployments = _deployments(PROXY_LOGS_WITH_STOPPED_COUNT, [LIVE_REPLICA])
+    return deployments[DEPLOYMENT]
+
+
+def test_every_logs_KEY_the_docstring_names_can_ACTUALLY_occur():
+    """The docstring must not name a key under `logs` that the producer removes.
+
+    This is the arm whose absence let `_deliberately_stopped_replicas` be documented as a
+    logs entry: the worker lifts it out, so no caller of get_app_status can ever meet it
+    there, and a reader told otherwise looks for the count, fails to find it, and concludes
+    "never scaled down".
+    """
+    dep = _real_logs_map()
+    logs = dep["logs"]
+    doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+
+    # Every quoted logs[...] key in the docstring must be a key the producer CAN emit.
+    quoted = set(re.findall(r'logs\["([^"]+)"\]', doc))
+    assert quoted, "the docstring quotes no logs[...] key at all -- this arm would be vacuous"
+    emittable = set(logs.keys()) | {"error"}   # "error" comes from the failure branch
+    bad = sorted(k for k in quoted if k not in emittable and not k.startswith("<"))
+    assert not bad, (
+        f"the docstring names logs key(s) {bad} that the producer does not emit; the real map "
+        f"here holds {sorted(logs)}. A reader looking there finds nothing and draws the wrong "
+        f"conclusion -- which is this issue's own failure mode"
+    )
+
+    # And specifically: the lifted count must NOT be claimed as a logs key.
+    assert "_deliberately_stopped_replicas" not in quoted, (
+        "the docstring claims the stopped count appears under logs; the worker lifts it out "
+        "into a sibling field before returning"
+    )
+
+
+def test_the_documented_EXAMPLE_runs_over_the_REAL_map_without_raising():
+    """Run the documented loop over the producer's output, not over a hand-built dict.
+
+    The previous arm built its own logs dict, so it validated the example against itself. This
+    one takes the real map -- which contains a live replica, an abnormally dead replica with
+    death_cause/logs_omitted, and has had the count lifted out -- and executes the documented
+    access pattern over it.
+    """
+    dep = _real_logs_map()
+    logs = dep["logs"]
+    assert logs, "the producer returned an empty logs map -- this arm would be vacuous"
+
+    seen = {}
+    for replica_id, rec in logs.items():
+        if not isinstance(rec, dict):
+            continue
+        lines = rec.get("stdout", []) + rec.get("stderr", [])
+        seen[replica_id] = (len(lines), rec.get("timezone"))
+    assert seen, "the documented loop extracted nothing from a non-empty real map"
+
+    # the zone-less dead replica must be among them, with no timezone -- the F1 case, live
+    zoneless = [r for r, (_, tz) in seen.items() if tz is None]
+    assert zoneless, (
+        "no entry in the real map lacks a timezone, so the 'ONLY when known' wording is "
+        "untested against the producer"
+    )
+
+    # and the counts really are siblings, which is what the docstring now says
+    assert "deliberately_stopped_replicas" in dep, (
+        "the producer does not expose the count as a sibling of logs, so the docstring's "
+        "placement is wrong in the other direction"
+    )
+    assert "_deliberately_stopped_replicas" not in logs
