@@ -37,10 +37,10 @@ CONTEXT = {"user": {"id": "tester", "email": "tester@example.org"}}
 def _built_app():
     """The minimum a BuiltApp needs to get through the record construction.
 
-    The required keys are the ones ``deploy_app`` reads by SUBSCRIPT (a missing one is a
-    KeyError); the three it reads with ``.get`` are optional. Enumerated from the method's
-    own AST rather than discovered one KeyError at a time, so a key added to the record
-    later fails this stub loudly instead of being quietly absent.
+    The keys below are the ones ``deploy_app`` reads by SUBSCRIPT, where a missing key is a
+    ``KeyError``; the three it reads with ``.get`` are optional and omitted. Because the set is
+    exactly the subscripted ones, a key added to the record later fails this stub loudly rather
+    than being quietly absent.
     """
     return SimpleNamespace(
         metadata={
