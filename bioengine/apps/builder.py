@@ -94,6 +94,15 @@ _USER_REPLICA_FRAMEWORK_PACKAGES = ["httpx", "hypha-rpc"]
 #: token (anonymous read).
 _DOWNLOAD_TOKEN_TTL_SECONDS = 3600 * 24 * 30
 
+#: Env-var name carrying that token. Named rather than spelled inline because
+#: it has to be *excluded* from one composed ``runtime_env`` while staying in
+#: the dicts handed to Ray tasks as arguments — see
+#: :meth:`AppBuilder._build_submit_runtime_env`. It is deliberately NOT
+#: ``_SECRET_ENV_VAR_PREFIX``-prefixed: the setup hook reads it from
+#: ``os.environ`` before ``__init__``, so it cannot come through the proxy
+#: actor like the other secrets do.
+_ARTIFACT_DOWNLOAD_TOKEN_KEY = "BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN"
+
 #: Prefix marking an env var as a deploy-time secret. Values under it are kept
 #: out of every ``runtime_env`` the worker composes and are delivered to
 #: replicas through the proxy actor instead; ``bioengine._app.mixin`` strips the
@@ -296,7 +305,7 @@ class AppBuilder:
                 f"/artifacts/{alias}/files"
             )
             if download_token:
-                env_vars["BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN"] = download_token
+                env_vars[_ARTIFACT_DOWNLOAD_TOKEN_KEY] = download_token
 
         if self.worker_service_id:
             env_vars["BIOENGINE_WORKER_SERVICE_ID"] = self.worker_service_id
@@ -353,6 +362,32 @@ class AppBuilder:
         in external-cluster mode wedges the worker's asyncio loop talking
         to the ray-client gRPC bridge. Hypha downloads sidestep that.
 
+        ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` is deliberately **excluded** from
+        this dict, and this is the only ``runtime_env`` it used to ride in that
+        nothing needs it to. Both tasks composed from this dict receive their
+        env mapping as a plain task **argument** and apply it onto their own
+        ``os.environ`` *before* calling ``_ensure_source``:
+        ``introspect_app_in_ray_task`` gets ``task_env_vars`` (derived in
+        :meth:`_introspect_via_ray_task` from the full ``env_vars``, not from
+        here) and ``build_and_run_application`` gets
+        ``BuiltApp.replica_env_vars``. A task argument travels through the
+        object store; only ``runtime_env`` is materialised by Ray's
+        ``runtime_env_agent``, which writes what it materialises into a
+        plaintext per-node log. So dropping the key here removes a 30-day
+        workspace-read credential from that log without removing it from any
+        process that reads it.
+
+        This rests on the apply-before-``_ensure_source`` ordering in both
+        tasks. ``tests/apps/test_submit_runtime_env_excludes_download_token.py``
+        asserts that ordering alongside the exclusion, so a refactor that drops
+        an apply loop fails there rather than silently breaking source sync.
+
+        The per-replica deployments are a different surface and still carry the
+        token (via ``BuiltApp.replica_env_vars`` at bind time) — a Serve replica
+        has no argument channel, its setup hook reads ``os.environ``. Removing
+        it there needs a credential-free way to materialise the source and is
+        not part of this change.
+
         ``pip`` is the BioEngine baseline only — every module containing
         ``@bioengine.app`` (and anything they transitively import at top
         level) is required to be importable with just ``bioengine[worker]``
@@ -370,6 +405,7 @@ class AppBuilder:
             k: v
             for k, v in env_vars.items()
             if not k.startswith(_SECRET_ENV_VAR_PREFIX)
+            and k != _ARTIFACT_DOWNLOAD_TOKEN_KEY
         }
         return {
             "pip": base_pip,
