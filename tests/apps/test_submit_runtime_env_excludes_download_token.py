@@ -8,22 +8,32 @@ deliberately unprefixed, because the replica setup hook reads it from ``os.envir
 ``__init__`` and so cannot be served by the proxy actor.
 ``test_bind_time_runtime_env_excludes_secrets.py`` says as much and defers this key to here.
 
-WHAT THIS GUARDS, in two halves that only make sense together:
+WHAT THIS GUARDS, in three legs that only make sense together:
 
   1. ``_build_submit_runtime_env`` must not put the key in the dict it returns. That dict is the
      ``runtime_env`` of the introspect Ray task *and* — it is the same object — of the
      ``build_and_run_application`` task.
-  2. Both of those tasks must keep applying their env mapping, which arrives as a task
-     **argument**, onto ``os.environ`` *before* calling ``_ensure_source``. Half 1 is only safe
-     because of half 2: a task argument travels through the object store rather than through
-     runtime_env materialisation, so the token still reaches every process that reads it. Drop an
-     apply loop and source sync breaks for private artifacts — which is precisely the regression a
-     reviewer of half 1 would be looking for, so the two assertions live in one file.
+  2. The token must still reach each task by its other channel: the env mapping passed as a task
+     **argument**. For introspect that is ``task_env_vars``, which must be derived from the full
+     ``env_vars`` and *not* from ``submit_runtime_env["env_vars"]``; for the build task it is
+     ``BuiltApp.replica_env_vars``, which ``split_secret_env_vars`` must keep the key in.
+  3. Both tasks must keep applying that mapping onto ``os.environ`` *before* calling
+     ``_ensure_source``.
 
-Half 1 is behavioural: ``_build_submit_runtime_env`` touches no instance state, so it is called
-directly. Half 2 is structural (AST), for the reason the sibling file states: ``build()`` is a
-large async method no test in this suite drives, and the two task functions run only inside a Ray
-worker.
+Leg 1 is only safe because of legs 2 and 3, so all three live in one file. A task argument travels
+through the object store rather than through runtime_env materialisation, which is why the token
+still reaches every process that reads it. Break leg 2 or 3 and private-artifact source sync fails
+silently — it falls back to anonymous read, which succeeds for public artifacts, so a public-only
+smoke test would not notice.
+
+Leg 2's first half was missing from the first version of this file, and a reviewer's red-maker —
+``task_env_vars = dict(submit_runtime_env["env_vars"])`` — passed every test here while breaking
+every private-artifact introspect.
+
+Legs 1 and 2 are behavioural: neither ``_build_submit_runtime_env`` nor ``_introspect_via_ray_task``
+touches instance state, so both are called directly, with ``ray`` faked for the latter. Leg 3 is
+structural (AST), for the reason the sibling file states: ``build()`` is a large async method no
+test in this suite drives, and the two task functions run only inside a Ray worker.
 
 WHAT THIS DOES NOT CATCH, stated so nobody reads it as wider than it is:
 
@@ -76,7 +86,7 @@ def _submit_runtime_env(env_vars: dict) -> dict:
     return AppBuilder._build_submit_runtime_env(None, env_vars)
 
 
-# ───────────────────────── half 1: the exclusion ──────────────────────────────
+# ───────────────────────── leg 1: the exclusion ───────────────────────────────
 
 
 def test_the_download_token_is_absent_from_the_task_runtime_env():
@@ -117,7 +127,113 @@ def test_the_fixture_actually_carries_the_token():
     assert _ARTIFACT_DOWNLOAD_TOKEN_KEY in _env_vars_fixture()
 
 
-# ──────────── half 2: the ordering that makes the exclusion safe ──────────────
+# ─────── leg 2: the token still reaches each task by its OTHER channel ────────
+
+
+class _FakeRemoteFunction:
+    def __init__(self, recorder, options):
+        self._recorder = recorder
+        self._options = options
+
+    def remote(self, *args, **kwargs):
+        self._recorder.append({"args": args, "kwargs": kwargs, "options": self._options})
+        return "object-ref-sentinel"
+
+
+class _FakeRay:
+    """Just enough of ``ray`` to drive ``_introspect_via_ray_task`` in-process."""
+
+    class exceptions:
+        class RayTaskError(Exception):
+            pass
+
+    def __init__(self, recorder, result):
+        self._recorder = recorder
+        self._result = result
+
+    def remote(self, **options):
+        return lambda fn: _FakeRemoteFunction(self._recorder, dict(options, fn=fn))
+
+    def get(self, ref):
+        assert ref == "object-ref-sentinel", f"unexpected ref {ref!r}"
+        return self._result
+
+
+def _drive_introspect(monkeypatch, env_vars, submit_runtime_env):
+    """Call the real ``_introspect_via_ray_task`` and return what ``.remote()`` got."""
+    import asyncio
+
+    from bioengine.apps import builder as builder_mod
+
+    calls = []
+    monkeypatch.setattr(
+        builder_mod, "ray", _FakeRay(calls, {"spec": {}, "source_signature": "sig"})
+    )
+    out = asyncio.run(
+        builder_mod.AppBuilder._introspect_via_ray_task(
+            None, "mod:Entry", env_vars, submit_runtime_env
+        )
+    )
+    assert out == {"spec": {}, "source_signature": "sig"}
+    assert len(calls) == 1, f"expected one .remote() call, got {len(calls)}"
+    return calls[0]
+
+
+def test_the_introspect_task_ARGUMENT_still_carries_the_token(monkeypatch):
+    """Leg 2. The task argument is the channel; without it, private sync goes anonymous.
+
+    The ``submit_runtime_env`` handed in is the REAL one, built by the function under test in
+    leg 1 — so it genuinely lacks the token. Deriving ``task_env_vars`` from it (the shape a
+    reviewer's red-maker used) therefore fails here while leaving leg 1 and leg 3 green.
+    """
+    fixture = _env_vars_fixture()
+    submit_runtime_env = _submit_runtime_env(fixture)
+    assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in submit_runtime_env["env_vars"], (
+        "control: the runtime_env must already lack the token, or this arm cannot "
+        "distinguish the two possible sources of task_env_vars"
+    )
+
+    call = _drive_introspect(monkeypatch, fixture, submit_runtime_env)
+    entry_id, task_env_vars = call["args"]
+    assert entry_id == "mod:Entry"
+    assert task_env_vars.get(_ARTIFACT_DOWNLOAD_TOKEN_KEY) == (
+        fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY]
+    ), "the introspect task would sync source anonymously and fail on a private artifact"
+
+
+def test_the_introspect_task_argument_still_excludes_the_SECRETS(monkeypatch):
+    """The pre-existing property of that same dict, so fixing leg 2 cannot regress it."""
+    fixture = _env_vars_fixture()
+    call = _drive_introspect(monkeypatch, fixture, _submit_runtime_env(fixture))
+    _, task_env_vars = call["args"]
+    assert not [k for k in task_env_vars if k.startswith(_SECRET_ENV_VAR_PREFIX)]
+
+
+def test_the_token_is_NOT_in_the_runtime_env_the_task_is_submitted_with(monkeypatch):
+    """Ties the two channels together at the one call site that uses both."""
+    fixture = _env_vars_fixture()
+    call = _drive_introspect(monkeypatch, fixture, _submit_runtime_env(fixture))
+    submitted = call["options"]["runtime_env"]
+    assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in submitted["env_vars"]
+    assert fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY] not in repr(submitted)
+
+
+def test_split_secret_env_vars_KEEPS_the_token_for_the_build_task():
+    """Leg 2, build side. ``BuiltApp.replica_env_vars`` is that task's only channel."""
+    from bioengine.apps.builder import split_secret_env_vars
+
+    fixture = _env_vars_fixture()
+    replica_env_vars, secret_env_vars = split_secret_env_vars(fixture)
+    assert replica_env_vars.get(_ARTIFACT_DOWNLOAD_TOKEN_KEY) == (
+        fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY]
+    ), "the build task would sync source anonymously and fail on a private artifact"
+    assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in secret_env_vars, (
+        "routing it through the proxy actor would not work: the setup hook reads "
+        "os.environ before __init__"
+    )
+
+
+# ──────────── leg 3: the ordering that makes the exclusion safe ────────────────
 
 
 def _fn(name: str) -> ast.AST:

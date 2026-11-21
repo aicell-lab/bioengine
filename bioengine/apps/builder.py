@@ -354,8 +354,11 @@ class AppBuilder:
         Ray's per-field inheritance of the worker's job-level py_modules
         (set by :meth:`bioengine.cluster.ray_cluster.RayCluster.connect`).
         It materialises the user app source itself via
-        :func:`bioengine._app.replica_init._ensure_source` using the
-        ``BIOENGINE_*`` env_vars below — same flow as Ray Serve replicas.
+        :func:`bioengine._app.replica_init._ensure_source` — same flow as Ray
+        Serve replicas. It reads the ``BIOENGINE_*`` keys from its own
+        ``os.environ``, which it populates from the env mapping it is handed as
+        a task *argument*; most of those keys are also in the dict below, but
+        the download token deliberately is not (next paragraph).
 
         Task-level ``py_modules`` would need a ``gcs://`` URI Ray could
         accept; producing one requires ``upload_package_if_needed``, which
@@ -363,8 +366,8 @@ class AppBuilder:
         to the ray-client gRPC bridge. Hypha downloads sidestep that.
 
         ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` is deliberately **excluded** from
-        this dict, and this is the only ``runtime_env`` it used to ride in that
-        nothing needs it to. Both tasks composed from this dict receive their
+        this dict. Of the ``runtime_env``\\ s the token used to ride in, this is
+        the one no consumer depends on. Both tasks composed from this dict receive their
         env mapping as a plain task **argument** and apply it onto their own
         ``os.environ`` *before* calling ``_ensure_source``:
         ``introspect_app_in_ray_task`` gets ``task_env_vars`` (derived in
@@ -429,6 +432,15 @@ class AppBuilder:
         passing into the task to keep secrets out of Ray's logs; the
         introspect task only needs the download URL/token + APP_DIR +
         VERSION, none of which is secret-prefixed.
+
+        ``task_env_vars`` is derived from ``env_vars`` — the full dict — and
+        **must not** be derived from ``submit_runtime_env["env_vars"]``, which
+        deliberately has ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` removed (see
+        :meth:`_build_submit_runtime_env`). This argument is the channel that
+        carries the token to the task; the task applies it onto its own
+        ``os.environ`` before syncing source. Sourcing it from the runtime_env
+        instead would make every private-artifact introspect sync anonymously
+        and fail, and would do so silently.
         """
         task_env_vars = {
             k: v
