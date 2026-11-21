@@ -15,6 +15,7 @@ failing to look.
 
 Torch-free on purpose: this must run in any image, including one without cellpose.
 """
+
 import ast
 import pathlib
 
@@ -43,6 +44,7 @@ def _complete_commitment():
 
 # === the no-fallback rule, which is not negotiable ==================
 
+
 def test_bootstrapped_index_with_a_commitment_is_mergeable():
     idx = pool.empty_index("cpsam", SIG, _complete_commitment())
     assert idx["base_commitment"] is not None
@@ -65,7 +67,9 @@ def test_bootstrapped_index_without_a_commitment_still_raises():
         pool.assert_base_commitment(idx["base_commitment"])
 
 
-@pytest.mark.parametrize("missing", ["non_learned", "key_set_sha256", "key_count", "source"])
+@pytest.mark.parametrize(
+    "missing", ["non_learned", "key_set_sha256", "key_count", "source"]
+)
 def test_an_incomplete_commitment_raises_naming_the_field(missing):
     c = _complete_commitment()
     c[missing] = None
@@ -74,6 +78,7 @@ def test_an_incomplete_commitment_raises_naming_the_field(missing):
 
 
 # === the structural guards: a writer that does not exist ============================
+
 
 def _calls_to(tree, func_name):
     """Every Call node whose callee attribute or name is `func_name`."""
@@ -100,7 +105,9 @@ def test_every_production_empty_index_call_passes_a_base_commitment():
     # CONTROL on the finder itself: if the call site is ever renamed or removed, an empty
     # list would make every assertion below vacuously true and this test would pass while
     # checking nothing.
-    assert calls, "no empty_index call found in entry.py - this test has stopped looking"
+    assert (
+        calls
+    ), "no empty_index call found in entry.py - this test has stopped looking"
     for call in calls:
         n = len(call.args) + len(call.keywords)
         assert n >= 3, (
@@ -138,17 +145,23 @@ def test_base_commitment_does_not_quantize_what_it_is_given():
     """
     torch = pytest.importorskip("torch")
     exact = 32.9281082153
-    f32 = {"diam_labels": torch.tensor([exact], dtype=torch.float32),
-           "net.weight": torch.zeros(2, dtype=torch.float32)}
+    f32 = {
+        "diam_labels": torch.tensor([exact], dtype=torch.float32),
+        "net.weight": torch.zeros(2, dtype=torch.float32),
+    }
     rec = pool.base_commitment(f32, source="test:float32")
     # float32 cannot hold the decimal exactly either, so compare against what float32
     # itself round-trips to -- asserting the literal would test Python's parser, not this.
-    assert rec["non_learned"]["diam_labels"] == float(torch.tensor([exact], dtype=torch.float32)[0])
+    assert rec["non_learned"]["diam_labels"] == float(
+        torch.tensor([exact], dtype=torch.float32)[0]
+    )
 
     # CONTROL: the same value through bfloat16 is 33.0, so the assertion above is
     # discriminating rather than true for any dtype.
-    bf16 = {"diam_labels": torch.tensor([exact], dtype=torch.bfloat16),
-            "net.weight": torch.zeros(2, dtype=torch.float32)}
+    bf16 = {
+        "diam_labels": torch.tensor([exact], dtype=torch.bfloat16),
+        "net.weight": torch.zeros(2, dtype=torch.float32),
+    }
     rec_bf16 = pool.base_commitment(bf16, source="test:bfloat16")
     assert rec_bf16["non_learned"]["diam_labels"] == 33.0
     assert rec["non_learned"]["diam_labels"] != rec_bf16["non_learned"]["diam_labels"]
@@ -162,10 +175,17 @@ def test_prepare_contribution_advertises_the_commitment_and_the_model_type():
     would otherwise be unbuildable.
     """
     tree = ast.parse((HERE / "runtime_cellpose.py").read_text())
-    fn = next((n for n in ast.walk(tree)
-               if isinstance(n, ast.AsyncFunctionDef) and n.name == "prepare_contribution"),
-              None)
-    assert fn is not None, "prepare_contribution not found - this test has stopped looking"
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "prepare_contribution"
+        ),
+        None,
+    )
+    assert (
+        fn is not None
+    ), "prepare_contribution not found - this test has stopped looking"
     arg_names = [a.arg for a in fn.args.args]
     assert "model_type" in arg_names, (
         "prepare_contribution takes no model_type, so the entry cannot say which stock "

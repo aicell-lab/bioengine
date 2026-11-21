@@ -124,9 +124,7 @@ def test_the_underscore_form_is_still_masked_AND_still_renamed_in_status():
 def test_an_unprefixed_secret_keeps_its_KEY_in_status():
     """There is no prefix to strip, and renaming it would make the status
     report disagree with what the caller actually passed."""
-    out = _manager()._filter_secret_env_vars(
-        {"Entry": {"TOKEN": SECRET_SHAPED["jwt"]}}
-    )
+    out = _manager()._filter_secret_env_vars({"Entry": {"TOKEN": SECRET_SHAPED["jwt"]}})
     assert list(out["Entry"]) == ["TOKEN"]
     assert out["Entry"]["TOKEN"] == SECRET_MASK
 
@@ -178,9 +176,7 @@ def test_the_deploy_log_decides_by_VALUE_and_not_by_name_alone():
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "startswith"
-        and any(
-            isinstance(a, ast.Constant) and a.value == "_" for a in node.args
-        )
+        and any(isinstance(a, ast.Constant) and a.value == "_" for a in node.args)
     ]
     assert not startswith_underscore, (
         "the deploy log gates on key.startswith('_') again — that is the rule "
@@ -198,7 +194,9 @@ def test_the_deploy_log_decides_by_VALUE_and_not_by_name_alone():
 from bioengine.utils.redaction import SECRET_MASK, describe_deploy_arguments
 
 HF_SECRET = "hf_" + "A" * 30
-JWT_SECRET = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+JWT_SECRET = (
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+)
 PAT_SECRET = "github_pat_" + "B" * 30
 
 
@@ -275,14 +273,18 @@ def test_a_secret_NESTED_in_a_kwarg_dict_is_masked():
 
 
 def test_a_secret_NESTED_in_a_kwarg_list_is_masked():
-    kwargs_str, _ = describe_deploy_arguments({"M": {"tokens": [HF_SECRET, "public"]}}, {})
+    kwargs_str, _ = describe_deploy_arguments(
+        {"M": {"tokens": [HF_SECRET, "public"]}}, {}
+    )
     assert HF_SECRET not in kwargs_str, kwargs_str
     assert SECRET_MASK in kwargs_str, kwargs_str
 
 
 def test_a_secret_nested_in_an_ENV_VAR_container_is_masked_too():
     """env_vars takes the same path, so it must not be fixed on one side only."""
-    _, env_vars_str = describe_deploy_arguments({}, {"App": {"CFG": {"inner": JWT_SECRET}}})
+    _, env_vars_str = describe_deploy_arguments(
+        {}, {"App": {"CFG": {"inner": JWT_SECRET}}}
+    )
     assert JWT_SECRET not in env_vars_str, env_vars_str
     assert SECRET_MASK in env_vars_str, env_vars_str
 
@@ -295,7 +297,8 @@ def test_scalar_non_strings_are_still_never_masked():
     values must stay readable too.
     """
     kwargs_str, _ = describe_deploy_arguments(
-        {"M": {"n": 4, "flag": True, "nothing": None, "shape": {"w": 256, "h": 256}}}, {}
+        {"M": {"n": 4, "flag": True, "nothing": None, "shape": {"w": 256, "h": 256}}},
+        {},
     )
     assert SECRET_MASK not in kwargs_str, kwargs_str
     assert "n=4" in kwargs_str and "flag=True" in kwargs_str, kwargs_str

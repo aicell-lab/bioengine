@@ -105,7 +105,9 @@ def _make_manager(state: str, recorder: dict) -> AppsManager:
     manager.artifact_manager.read = AsyncMock(return_value={"versions": []})
 
     existing = STATES[state]
-    manager._deployed_applications = {} if existing is None else {APP_ID: dict(existing)}
+    manager._deployed_applications = (
+        {} if existing is None else {APP_ID: dict(existing)}
+    )
 
     env_builder = _env_var_builder()
 

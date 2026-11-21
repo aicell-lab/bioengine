@@ -11,6 +11,7 @@ Three source kinds, matching the two halves of the claim:
 Views are built lazily. Indexing a deep pyramid costs a walk of its whole IFD
 chain, so a catalog of many files must not do that at startup.
 """
+
 from __future__ import annotations
 
 import logging
@@ -30,8 +31,19 @@ logger = logging.getLogger("omezarr-view")
 # Extensions a recipe has a chance with. Not a support claim — open_view still
 # has to succeed, and the catalog reports the ones that did not.
 IMAGE_SUFFIXES = {
-    ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".btf",
-    ".czi", ".lif", ".nd2", ".lsm", ".oib", ".oif", ".ims", ".dv",
+    ".tif",
+    ".tiff",
+    ".ome.tif",
+    ".ome.tiff",
+    ".btf",
+    ".czi",
+    ".lif",
+    ".nd2",
+    ".lsm",
+    ".oib",
+    ".oif",
+    ".ims",
+    ".dv",
 }
 
 
@@ -75,9 +87,14 @@ class DatasetEntry:
                     if base is None:
                         raise ViewError(
                             f"derived view '{self.id}' needs dataset "
-                            f"'{self.derived_from}', which is not in the catalog")
-                    self.view = DerivedView(self.id, base.ensure_view(), self.title,
-                                            **(self.derived_config or {}))
+                            f"'{self.derived_from}', which is not in the catalog"
+                        )
+                    self.view = DerivedView(
+                        self.id,
+                        base.ensure_view(),
+                        self.title,
+                        **(self.derived_config or {}),
+                    )
                 else:
                     self.view = open_view(self.id, self.source, self.title, self.recipe)
             except Exception as e:
@@ -129,18 +146,20 @@ def _from_local_dir(spec: Dict[str, Any]) -> List[DatasetEntry]:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or not _is_image(path.name):
             continue
-        entries.append(DatasetEntry(
-            id=_slug(path.stem),
-            source=str(path),
-            title=path.stem,
-            location="local",
-            recipe=spec.get("recipe", "auto"),
-            licence=spec.get("licence"),
-            attribution=spec.get("attribution"),
-            source_page=spec.get("source_page"),
-            size_bytes=path.stat().st_size,
-            token=spec.get("token"),
-        ))
+        entries.append(
+            DatasetEntry(
+                id=_slug(path.stem),
+                source=str(path),
+                title=path.stem,
+                location="local",
+                recipe=spec.get("recipe", "auto"),
+                licence=spec.get("licence"),
+                attribution=spec.get("attribution"),
+                source_page=spec.get("source_page"),
+                size_bytes=path.stat().st_size,
+                token=spec.get("token"),
+            )
+        )
     logger.info("local_dir %s -> %d file(s)", root, len(entries))
     return entries
 
@@ -155,25 +174,31 @@ def _from_remote_prefix(spec: Dict[str, Any]) -> List[DatasetEntry]:
         fs = fsspec.filesystem(protocol, anon=spec.get("anonymous", True))
         names = fs.find(url.split("://", 1)[-1] if protocol in ("s3", "gs") else url)
     except Exception as e:
-        logger.warning("remote_prefix %s not listable (%s); "
-                       "use remote_files with explicit URLs instead", url, e)
+        logger.warning(
+            "remote_prefix %s not listable (%s); "
+            "use remote_files with explicit URLs instead",
+            url,
+            e,
+        )
         return []
     entries = []
     for name in names:
         if not _is_image(name):
             continue
         full = f"{protocol}://{name}" if protocol in ("s3", "gs") else name
-        entries.append(DatasetEntry(
-            id=_slug(Path(name).stem),
-            source=full,
-            title=Path(name).stem,
-            location="remote",
-            recipe=spec.get("recipe", "auto"),
-            licence=spec.get("licence"),
-            attribution=spec.get("attribution"),
-            source_page=spec.get("source_page"),
-            token=spec.get("token"),
-        ))
+        entries.append(
+            DatasetEntry(
+                id=_slug(Path(name).stem),
+                source=full,
+                title=Path(name).stem,
+                location="remote",
+                recipe=spec.get("recipe", "auto"),
+                licence=spec.get("licence"),
+                attribution=spec.get("attribution"),
+                source_page=spec.get("source_page"),
+                token=spec.get("token"),
+            )
+        )
     logger.info("remote_prefix %s -> %d file(s)", url, len(entries))
     return entries
 
@@ -189,7 +214,9 @@ def _remote_size(url: str) -> Optional[int]:
         return None
 
 
-def _resolve_token(item: Dict[str, Any], spec: Dict[str, Any]) -> tuple[Optional[str], bool]:
+def _resolve_token(
+    item: Dict[str, Any], spec: Dict[str, Any]
+) -> tuple[Optional[str], bool]:
     """Return (token, ok). A named-but-unset token env var fails closed."""
     env_name = item.get("token_env", spec.get("token_env"))
     if env_name:
@@ -220,23 +247,28 @@ def _from_files(spec: Dict[str, Any]) -> List[DatasetEntry]:
         if not ok:
             logger.warning(
                 "%s names token_env %r but it is unset; skipping rather than "
-                "serving it unprotected", url,
-                item.get("token_env", spec.get("token_env")))
+                "serving it unprotected",
+                url,
+                item.get("token_env", spec.get("token_env")),
+            )
             continue
-        entries.append(DatasetEntry(
-            id=item.get("id") or _slug(url.rsplit("/", 1)[-1].split(".")[0]),
-            source=url,
-            title=item.get("title") or url.rsplit("/", 1)[-1],
-            location="remote" if remote else "local",
-            recipe=item.get("recipe", spec.get("recipe", "auto")),
-            licence=item.get("licence", spec.get("licence")),
-            attribution=item.get("attribution", spec.get("attribution")),
-            source_page=item.get("source_page", spec.get("source_page")),
-            size_bytes=(item.get("size_bytes")
-                        or (_remote_size(url) if remote
-                            else Path(url).stat().st_size)),
-            token=token,
-        ))
+        entries.append(
+            DatasetEntry(
+                id=item.get("id") or _slug(url.rsplit("/", 1)[-1].split(".")[0]),
+                source=url,
+                title=item.get("title") or url.rsplit("/", 1)[-1],
+                location="remote" if remote else "local",
+                recipe=item.get("recipe", spec.get("recipe", "auto")),
+                licence=item.get("licence", spec.get("licence")),
+                attribution=item.get("attribution", spec.get("attribution")),
+                source_page=item.get("source_page", spec.get("source_page")),
+                size_bytes=(
+                    item.get("size_bytes")
+                    or (_remote_size(url) if remote else Path(url).stat().st_size)
+                ),
+                token=token,
+            )
+        )
     logger.info("files -> %d entr(ies)", len(entries))
     return entries
 
@@ -247,28 +279,39 @@ def _from_derived(spec: Dict[str, Any]) -> List[DatasetEntry]:
     for item in spec["views"]:
         item = dict(item)
         base_id = item.pop("from")
-        config = {k: item.pop(k) for k in
-                  ("target_spacing_um", "target_scale", "channels", "dtype",
-                   "normalise") if k in item}
+        config = {
+            k: item.pop(k)
+            for k in (
+                "target_spacing_um",
+                "target_scale",
+                "channels",
+                "dtype",
+                "normalise",
+            )
+            if k in item
+        }
         token, ok = _resolve_token(item, spec)
         if not ok:
-            logger.warning("derived view %s names an unset token_env; skipping",
-                           item.get("id"))
+            logger.warning(
+                "derived view %s names an unset token_env; skipping", item.get("id")
+            )
             continue
-        entries.append(DatasetEntry(
-            id=item.get("id") or f"{base_id}-derived",
-            # Left blank until the view is built, when the report fills in the
-            # underlying file; the card already names the base dataset.
-            source="",
-            title=item.get("title") or f"{base_id} (derived)",
-            location="computed",
-            licence=item.get("licence", spec.get("licence")),
-            attribution=item.get("attribution", spec.get("attribution")),
-            source_page=item.get("source_page", spec.get("source_page")),
-            token=token,
-            derived_from=base_id,
-            derived_config=config,
-        ))
+        entries.append(
+            DatasetEntry(
+                id=item.get("id") or f"{base_id}-derived",
+                # Left blank until the view is built, when the report fills in the
+                # underlying file; the card already names the base dataset.
+                source="",
+                title=item.get("title") or f"{base_id} (derived)",
+                location="computed",
+                licence=item.get("licence", spec.get("licence")),
+                attribution=item.get("attribution", spec.get("attribution")),
+                source_page=item.get("source_page", spec.get("source_page")),
+                token=token,
+                derived_from=base_id,
+                derived_config=config,
+            )
+        )
     logger.info("derived -> %d view(s)", len(entries))
     return entries
 

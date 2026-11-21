@@ -7,6 +7,7 @@ Hypha server. The network-facing helpers are either monkey-patched at the
 ``_list_source_files`` / ``_download_file`` seam (sync-logic tests) or driven
 through a fake ``urlopen`` (listing/download tests).
 """
+
 from __future__ import annotations
 
 import io
@@ -131,9 +132,7 @@ def test_unchanged_timestamps_skip_download(replica_env, fake_hypha) -> None:
     assert fake_hypha["downloads"] == []
 
 
-def test_changed_timestamp_redownloads_only_that_file(
-    replica_env, fake_hypha
-) -> None:
+def test_changed_timestamp_redownloads_only_that_file(replica_env, fake_hypha) -> None:
     app_dir, _env = replica_env
     replica_init.setup_replica_environment()
     fake_hypha["downloads"].clear()

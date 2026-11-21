@@ -74,14 +74,16 @@ def list_dirs_on_node(
             if latest_mtime is None or st.st_mtime > latest_mtime:
                 latest_mtime = st.st_mtime
         application_id = (
-            entry.name[len(prefix):] if entry.name.startswith(prefix) else None
+            entry.name[len(prefix) :] if entry.name.startswith(prefix) else None
         )
         result.append(
             {
                 "name": entry.name,
                 "application_id": application_id,
                 "path": str(entry),
-                "is_running": application_id in running_set if application_id else False,
+                "is_running": (
+                    application_id in running_set if application_id else False
+                ),
                 "size_bytes": size,
                 "last_used_unix": latest_mtime,
                 "node_id": node_id,

@@ -16,6 +16,7 @@ Chunks are re-encoded to zlib on the way out because that is the one codec
 every Zarr client has, including numcodecs.js in the browser. The source
 codecs (LZW here) have no browser implementation.
 """
+
 from __future__ import annotations
 
 import io
@@ -107,11 +108,16 @@ class BaseView:
                     f"{FULL_COVERAGE_CHUNK_BUDGET}. A partial sample of a tissue "
                     "section is spatially biased at any pixel count, so no "
                     "window is published and the range shown is the declared "
-                    "bit depth. Raise OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS to measure it.")
-                self.mapping.unmapped = [m for m in self.mapping.unmapped
-                                         if not m.startswith("display windows")]
-                self.mapping.miss("display windows (contrast limits)",
-                                  self.display_sample_note)
+                    "bit depth. Raise OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS to measure it."
+                )
+                self.mapping.unmapped = [
+                    m
+                    for m in self.mapping.unmapped
+                    if not m.startswith("display windows")
+                ]
+                self.mapping.miss(
+                    "display windows (contrast limits)", self.display_sample_note
+                )
                 self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
                 return
             sample = _sample_for_display(self, level)
@@ -143,17 +149,25 @@ class BaseView:
         ]
         self.mapping.miss(
             "display windows (contrast limits)",
-            ("the source declares them; this view publishes windows measured "
-             "from the pixels instead (1-99.8 percentiles of a coarse level), "
-             "and the declared values are recorded but not applied")
-            if declared else
-            ("not declared in the source; view computes 1-99.8 percentiles "
-             "from a coarse level"))
+            (
+                (
+                    "the source declares them; this view publishes windows measured "
+                    "from the pixels instead (1-99.8 percentiles of a coarse level), "
+                    "and the declared values are recorded but not applied"
+                )
+                if declared
+                else (
+                    "not declared in the source; view computes 1-99.8 percentiles "
+                    "from a coarse level"
+                )
+            ),
+        )
         self.build_timings["sample_display_range_s"] = time.perf_counter() - t0
         self.display_sample_note = (
             f"every chunk of level {level} ({n_chunks} chunk reads, in "
             "parallel) — full spatial coverage, because a partial sample of a "
-            "tissue section is biased at any pixel count")
+            "tissue section is biased at any pixel count"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +240,9 @@ class ReferenceView(BaseView):
         # A multi-series file serves ONE series; silently picking the first and
         # saying nothing would hide the rest from the reader entirely.
         source_md.mark("scenes")
-        source_md.scenes = [getattr(x, "name", None) or f"series {i}"
-                            for i, x in enumerate(tf.series)]
+        source_md.scenes = [
+            getattr(x, "name", None) or f"series {i}" for i, x in enumerate(tf.series)
+        ]
         source_md.served_scene = source_md.scenes[series]
         attrs, self.mapping = build_ngff_attrs(source_md)
         self.build_timings["synthesise_metadata_s"] = time.perf_counter() - t0
@@ -238,7 +253,9 @@ class ReferenceView(BaseView):
             refs = {(k if k.startswith(".") else f"0/{k}"): v for k, v in refs.items()}
             refs["0/.zarray"] = refs.pop(".zarray", refs.get("0/.zarray"))
             refs.pop(".zattrs", None)
-            refs["0/.zattrs"] = json.dumps({"_ARRAY_DIMENSIONS": list(self.axes.upper())})
+            refs["0/.zattrs"] = json.dumps(
+                {"_ARRAY_DIMENSIONS": list(self.axes.upper())}
+            )
         refs[".zgroup"] = json.dumps({"zarr_format": 2})
         refs[".zattrs"] = json.dumps(attrs)
 
@@ -332,9 +349,13 @@ class ReferenceView(BaseView):
             "index_keys": len(self.refs),
             "build_reads": (
                 "file headers only to build the index; then a bounded pixel "
-                "sample to set display range — " + getattr(
-                    self, "display_sample_note",
-                    "a few small windows per channel, not a whole level")),
+                "sample to set display range — "
+                + getattr(
+                    self,
+                    "display_sample_note",
+                    "a few small windows per channel, not a whole level",
+                )
+            ),
             "index_copies_pixel_data": False,
             "build_timings_s": {k: round(v, 3) for k, v in self.build_timings.items()},
             "direct_client_access": True,
@@ -348,7 +369,8 @@ class ReferenceView(BaseView):
                     "original file directly and the server is not in the data "
                     "path (zero-copy). Browsers cannot decode the source codec, "
                     "so the HTTP endpoint they use transcodes each chunk to "
-                    "zlib and is not zero-copy."),
+                    "zlib and is not zero-copy."
+                ),
                 **self.mapping.as_sentences(),
             },
         }
@@ -396,17 +418,19 @@ class BioIOView(BaseView):
         self._meta = {
             ".zgroup": json.dumps({"zarr_format": 2}).encode(),
             ".zattrs": json.dumps(self.attrs).encode(),
-            "0/.zarray": json.dumps({
-                "zarr_format": 2,
-                "shape": self.shape,
-                "chunks": self.chunks,
-                "dtype": self.dtype.str,
-                "compressor": OUT_COMPRESSOR.get_config(),
-                "dimension_separator": "/",
-                "fill_value": 0,
-                "filters": None,
-                "order": "C",
-            }).encode(),
+            "0/.zarray": json.dumps(
+                {
+                    "zarr_format": 2,
+                    "shape": self.shape,
+                    "chunks": self.chunks,
+                    "dtype": self.dtype.str,
+                    "compressor": OUT_COMPRESSOR.get_config(),
+                    "dimension_separator": "/",
+                    "fill_value": 0,
+                    "filters": None,
+                    "order": "C",
+                }
+            ).encode(),
             "0/.zattrs": json.dumps(
                 {"_ARRAY_DIMENSIONS": list(self.axes.upper())}
             ).encode(),
@@ -517,7 +541,8 @@ class BioIOView(BaseView):
                     "file was not converted or copied. This format has no "
                     "chunk layout that can be addressed as byte ranges, so "
                     "there is no zero-copy tier: every read goes through the "
-                    "server, one image plane at a time."),
+                    "server, one image plane at a time."
+                ),
                 **self.mapping.as_sentences(),
             },
         }
@@ -545,8 +570,9 @@ def _default_fetcher(attempts: int = 5, max_inflight: int = 8):
             http2=False,
             timeout=120,
             follow_redirects=True,
-            limits=httpx.Limits(max_connections=max_inflight * 2,
-                                max_keepalive_connections=max_inflight),
+            limits=httpx.Limits(
+                max_connections=max_inflight * 2, max_keepalive_connections=max_inflight
+            ),
         )
 
     state = {"client": _new()}
@@ -582,13 +608,14 @@ def _default_fetcher(attempts: int = 5, max_inflight: int = 8):
                 return r.content
             except (httpx.TransportError, httpx.HTTPStatusError, RuntimeError) as e:
                 last = e
-                if isinstance(e, httpx.HTTPStatusError) and \
-                        e.response.status_code not in (429, 500, 502, 503, 504):
+                if isinstance(
+                    e, httpx.HTTPStatusError
+                ) and e.response.status_code not in (429, 500, 502, 503, 504):
                     raise
                 if isinstance(e, RuntimeError) and "closed" not in str(e):
                     raise
                 _reset(client)
-                time.sleep(0.25 * (2 ** attempt))
+                time.sleep(0.25 * (2**attempt))
         raise RuntimeError(f"range read failed after {attempts} attempts: {last}")
 
     return fetch
@@ -606,8 +633,9 @@ def _default_fetcher(attempts: int = 5, max_inflight: int = 8):
 # in space, so any partial sample stays biased however many pixels it draws.
 # So: read a level in FULL when that is affordable, and when it is not, say the
 # window is unmeasured rather than publish one that is wrong on most channels.
-FULL_COVERAGE_CHUNK_BUDGET = int(os.environ.get(
-    "OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS", "512"))
+FULL_COVERAGE_CHUNK_BUDGET = int(
+    os.environ.get("OMEZARR_VIEW_DISPLAY_SCAN_CHUNKS", "512")
+)
 SAMPLE_FETCH_WORKERS = 12
 
 
@@ -685,11 +713,17 @@ def _sample_for_display(view: "BaseView", level: int) -> np.ndarray:
                 sel = []
                 for i, a in enumerate(axes):
                     if i == yi:
-                        sel.append(slice(gy * chunks[yi],
-                                         min((gy + 1) * chunks[yi], shape[yi])))
+                        sel.append(
+                            slice(
+                                gy * chunks[yi], min((gy + 1) * chunks[yi], shape[yi])
+                            )
+                        )
                     elif i == xi:
-                        sel.append(slice(gx * chunks[xi],
-                                         min((gx + 1) * chunks[xi], shape[xi])))
+                        sel.append(
+                            slice(
+                                gx * chunks[xi], min((gx + 1) * chunks[xi], shape[xi])
+                            )
+                        )
                     elif a == "c":
                         sel.append(c)
                     else:
@@ -732,8 +766,9 @@ class _ViewStore(dict):
         return 0
 
 
-def open_view(dataset_id: str, source: str, title: Optional[str] = None,
-              recipe: str = "auto") -> BaseView:
+def open_view(
+    dataset_id: str, source: str, title: Optional[str] = None, recipe: str = "auto"
+) -> BaseView:
     """Open ``source`` with the best available recipe.
 
     ``auto`` prefers the reference index (zero-copy, and it works remotely),

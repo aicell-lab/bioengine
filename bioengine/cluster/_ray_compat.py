@@ -28,6 +28,7 @@ This module is the single grep target for Ray private-API access in
 BioEngine; if Ray ever ships a public equivalent, swap the imports here
 and the call sites do not change.
 """
+
 from typing import Optional
 
 from ray._private.state import GlobalState  # noqa: F401

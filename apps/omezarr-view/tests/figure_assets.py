@@ -11,6 +11,7 @@ Writes into --out (default analysis/results/omezarr_view/figure_assets/):
   auth_evidence.{json,txt}    the request/response matrix for the auth demo
   mechanism.json              one tile -> one range read, with the real offsets
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,9 +31,12 @@ TIMEOUT = 900
 def provenance(base: str) -> Dict[str, Any]:
     def _git(*args: str) -> str:
         try:
-            return subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[3]), *args],
-                                  capture_output=True, text=True,
-                                  timeout=10).stdout.strip()
+            return subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parents[3]), *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
         except Exception:
             return "unknown"
 
@@ -43,7 +47,7 @@ def provenance(base: str) -> Dict[str, Any]:
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "generator": "apps/omezarr-view/tests/figure_assets.py",
         "note": "client and server share a host; the endpoint is reached through "
-                "its public tunnel, so each request pays a tunnel round trip.",
+        "its public tunnel, so each request pays a tunnel round trip.",
     }
 
 
@@ -87,12 +91,17 @@ def metadata_reports(client, base: str, datasets: List[str], out: Path) -> List[
             "MAPPED",
         ]
         for k, v in (mapping.get("mapped") or {}).items():
-            lines.append(f"  {k}: {json.dumps(v) if isinstance(v, (dict, list)) else v}")
+            lines.append(
+                f"  {k}: {json.dumps(v) if isinstance(v, (dict, list)) else v}"
+            )
         lines += ["", "NOT MAPPED"]
         for m in mapping.get("not_mapped") or []:
             lines.append(f"  {m}")
-        lines += ["", f"[generated {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
-                      f"from {base}/api/datasets/{ds}]"]
+        lines += [
+            "",
+            f"[generated {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+            f"from {base}/api/datasets/{ds}]",
+        ]
         path = directory / f"{ds}.txt"
         path.write_text("\n".join(lines) + "\n")
         written.append(path)
@@ -117,18 +126,21 @@ def mechanism(client, base: str, dataset: str, out: Path) -> Path:
         url, offset, length = entry
         level = key.split("/", 1)[0]
         shape = info["level_shapes"][int(level)]
-        examples.append({
-            "zarr_key": key,
-            "level": int(level),
-            "level_shape": shape,
-            "chunk_shape": json.loads(
-                fetch(client, base, f"zarr/{dataset}/{level}/.zarray").text)["chunks"],
-            "url": url,
-            "byte_offset": offset,
-            "byte_length": length,
-            "byte_length_kb": round(length / 1024, 1),
-            "fraction_of_file": length / source_bytes if source_bytes else None,
-        })
+        examples.append(
+            {
+                "zarr_key": key,
+                "level": int(level),
+                "level_shape": shape,
+                "chunk_shape": json.loads(
+                    fetch(client, base, f"zarr/{dataset}/{level}/.zarray").text
+                )["chunks"],
+                "url": url,
+                "byte_offset": offset,
+                "byte_length": length,
+                "byte_length_kb": round(length / 1024, 1),
+                "fraction_of_file": length / source_bytes if source_bytes else None,
+            }
+        )
 
     payload = {
         "provenance": provenance(base),
@@ -149,15 +161,19 @@ def mechanism(client, base: str, dataset: str, out: Path) -> Path:
             "One 512x512 tile of this 39.4 GiB file is one range read of about "
             f"{round(examples[0]['byte_length']/1024)} KB at byte offset "
             f"{examples[0]['byte_offset']}. Nothing is pre-computed and nothing "
-            "is stored twice." if examples else None),
+            "is stored twice."
+            if examples
+            else None
+        ),
     }
     path = out / "mechanism.json"
     path.write_text(json.dumps(payload, indent=1) + "\n")
     return path
 
 
-def auth_evidence(client, base: str, dataset: str, token: str, out: Path,
-                  direct_base: str = None) -> List[Path]:
+def auth_evidence(
+    client, base: str, dataset: str, token: str, out: Path, direct_base: str = None
+) -> List[Path]:
     """Run the auth matrix and record what each request actually returned.
 
     Run against BOTH the public URL and the process directly when a direct
@@ -172,14 +188,38 @@ def auth_evidence(client, base: str, dataset: str, token: str, out: Path,
         ("dataset metadata, no token", "GET", f"api/datasets/{dataset}", None, None),
         ("zarr .zattrs, no token", "GET", f"zarr/{dataset}/.zattrs", None, None),
         ("chunk, no token", "GET", f"zarr/{dataset}/{chunk}", None, None),
-        ("thumbnail, no token", "GET", f"api/datasets/{dataset}/thumbnail.png", None, None),
+        (
+            "thumbnail, no token",
+            "GET",
+            f"api/datasets/{dataset}/thumbnail.png",
+            None,
+            None,
+        ),
         ("chunk, wrong bearer", "GET", f"zarr/{dataset}/{chunk}", "wrong-token", None),
-        ("chunk, wrong path token", "GET", f"t/wrong-token/zarr/{dataset}/{chunk}", None, None),
-        ("dataset metadata, correct bearer", "GET", f"api/datasets/{dataset}", token, None),
+        (
+            "chunk, wrong path token",
+            "GET",
+            f"t/wrong-token/zarr/{dataset}/{chunk}",
+            None,
+            None,
+        ),
+        (
+            "dataset metadata, correct bearer",
+            "GET",
+            f"api/datasets/{dataset}",
+            token,
+            None,
+        ),
         ("zarr .zattrs, correct bearer", "GET", f"zarr/{dataset}/.zattrs", token, None),
         ("chunk, correct bearer", "GET", f"zarr/{dataset}/{chunk}", token, None),
         ("chunk, correct query token", "GET", f"zarr/{dataset}/{chunk}", None, token),
-        ("chunk, correct path token", "GET", f"t/{token}/zarr/{dataset}/{chunk}", None, None),
+        (
+            "chunk, correct path token",
+            "GET",
+            f"t/{token}/zarr/{dataset}/{chunk}",
+            None,
+            None,
+        ),
     ]
     rows = []
     for label, _method, path, bearer, query in cases:
@@ -191,15 +231,24 @@ def auth_evidence(client, base: str, dataset: str, token: str, out: Path,
             entries = r.json().get("datasets", [])
             hit = next((e for e in entries if e["id"] == dataset), None)
             redacted = bool(hit and hit.get("redacted"))
-        rows.append({
-            "case": label,
-            "path": f"/{path}" if not query else f"/{path}?token=<token>",
-            "credential": ("bearer" if bearer else "query" if query
-                           else "path" if path.startswith("t/") else "none"),
-            "status": r.status_code,
-            "bytes": len(r.content),
-            "catalog_entry_redacted": redacted,
-        })
+        rows.append(
+            {
+                "case": label,
+                "path": f"/{path}" if not query else f"/{path}?token=<token>",
+                "credential": (
+                    "bearer"
+                    if bearer
+                    else (
+                        "query"
+                        if query
+                        else "path" if path.startswith("t/") else "none"
+                    )
+                ),
+                "status": r.status_code,
+                "bytes": len(r.content),
+                "catalog_entry_redacted": redacted,
+            }
+        )
 
     direct_rows = []
     if direct_base:
@@ -216,16 +265,20 @@ def auth_evidence(client, base: str, dataset: str, token: str, out: Path,
         "provenance": provenance(base),
         "dataset": dataset,
         "cases": rows,
-        "direct_to_process": {
-            "base": direct_base,
-            "cases": direct_rows,
-            "why": "The capability-URL proxy in front of the public mount does "
-                   "not forward the Authorization header, so bearer auth is "
-                   "unavailable through that URL and returns 401 even for a "
-                   "correct token. Against the app itself the same bearer "
-                   "succeeds. The app supports all three credential forms; the "
-                   "deployment in front of it decides which survive.",
-        } if direct_base else None,
+        "direct_to_process": (
+            {
+                "base": direct_base,
+                "cases": direct_rows,
+                "why": "The capability-URL proxy in front of the public mount does "
+                "not forward the Authorization header, so bearer auth is "
+                "unavailable through that URL and returns 401 even for a "
+                "correct token. Against the app itself the same bearer "
+                "succeeds. The app supports all three credential forms; the "
+                "deployment in front of it decides which survive.",
+            }
+            if direct_base
+            else None
+        ),
     }
     jpath = out / "auth_evidence.json"
     jpath.write_text(json.dumps(payload, indent=1) + "\n")
@@ -235,21 +288,31 @@ def auth_evidence(client, base: str, dataset: str, token: str, out: Path,
     for r in rows:
         extra = ""
         if r["catalog_entry_redacted"] is not None:
-            extra = ("  (catalog entry REDACTED)" if r["catalog_entry_redacted"]
-                     else "  (catalog entry full)")
-        lines.append(f"  {r['case']:<{width}}  ->  {r['status']}"
-                     f"{'  ' + str(r['bytes']) + ' B' if r['status'] == 200 else ''}{extra}")
+            extra = (
+                "  (catalog entry REDACTED)"
+                if r["catalog_entry_redacted"]
+                else "  (catalog entry full)"
+            )
+        lines.append(
+            f"  {r['case']:<{width}}  ->  {r['status']}"
+            f"{'  ' + str(r['bytes']) + ' B' if r['status'] == 200 else ''}{extra}"
+        )
     if direct_rows:
         lines += ["", "Same matrix against the app directly (no proxy in front):", ""]
         for r in direct_rows:
             lines.append(f"  {r['case']:<{width}}  ->  {r['status']}")
-        lines += ["",
-                  "The bearer rows differ because the capability-URL proxy does not",
-                  "forward the Authorization header. The app accepts all three",
-                  "credential forms; the deployment decides which survive, and a",
-                  "viewer needs the path form regardless."]
-    lines += ["", f"[generated {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
-                  f"from {base}]"]
+        lines += [
+            "",
+            "The bearer rows differ because the capability-URL proxy does not",
+            "forward the Authorization header. The app accepts all three",
+            "credential forms; the deployment decides which survive, and a",
+            "viewer needs the path form regardless.",
+        ]
+    lines += [
+        "",
+        f"[generated {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+        f"from {base}]",
+    ]
     tpath = out / "auth_evidence.txt"
     tpath.write_text("\n".join(lines) + "\n")
     return [jpath, tpath]
@@ -268,44 +331,53 @@ def latency_tables(out: Path, sources: Dict[str, Path]) -> Path:
             if "error" in d:
                 continue
             for level, v in (d.get("per_chunk") or {}).items():
-                rows.append({
-                    "dataset": d["dataset"],
-                    "recipe": d.get("recipe"),
-                    "location": d.get("location"),
-                    "level": level,
-                    "chunk_shape": v.get("chunk_shape"),
-                    "cold_median_ms": (v.get("cold") or {}).get("median_ms"),
-                    "cold_n": (v.get("cold") or {}).get("n"),
-                    "warm_median_ms": (v.get("warm_cache_hit") or {}).get("median_ms"),
-                    "warm_n": (v.get("warm_cache_hit") or {}).get("n"),
-                    "served_bytes_per_chunk": v.get("mean_served_chunk_bytes"),
-                    "warm_definition": "server chunk-cache hit, per the X-View-Cache "
-                                       "header; not a client or browser cache",
-                    "raw_record": sources[kind].name,
-                })
+                rows.append(
+                    {
+                        "dataset": d["dataset"],
+                        "recipe": d.get("recipe"),
+                        "location": d.get("location"),
+                        "level": level,
+                        "chunk_shape": v.get("chunk_shape"),
+                        "cold_median_ms": (v.get("cold") or {}).get("median_ms"),
+                        "cold_n": (v.get("cold") or {}).get("n"),
+                        "warm_median_ms": (v.get("warm_cache_hit") or {}).get(
+                            "median_ms"
+                        ),
+                        "warm_n": (v.get("warm_cache_hit") or {}).get("n"),
+                        "served_bytes_per_chunk": v.get("mean_served_chunk_bytes"),
+                        "warm_definition": "server chunk-cache hit, per the X-View-Cache "
+                        "header; not a client or browser cache",
+                        "raw_record": sources[kind].name,
+                    }
+                )
         return rows
 
     tables["tables"]["per_chunk_latency"] = rows_from(raw_served, "served")
     if "derived" in sources and sources["derived"].exists():
         tables["tables"]["per_chunk_latency_derived"] = rows_from(
-            json.loads(sources["derived"].read_text()), "derived")
+            json.loads(sources["derived"].read_text()), "derived"
+        )
 
     build_rows = []
     for d in raw_served.get("datasets", []):
         if "error" in d:
             continue
         p = d.get("point_to_first_tile") or {}
-        build_rows.append({
-            "dataset": d["dataset"],
-            "recipe": d.get("recipe"),
-            "build_wall_s": d.get("build_wall_s"),
-            "server_build_timings_s": d.get("server_build_timings_s"),
-            "first_viewable_tile_s": (d.get("first_viewable_tile") or {}).get("seconds"),
-            "first_viewable_tile_note": "coarsest level, the tile a viewer draws "
-                                        "first; a full-resolution tile is in the "
-                                        "per-chunk table",
-            "raw_record": sources["served"].name,
-        })
+        build_rows.append(
+            {
+                "dataset": d["dataset"],
+                "recipe": d.get("recipe"),
+                "build_wall_s": d.get("build_wall_s"),
+                "server_build_timings_s": d.get("server_build_timings_s"),
+                "first_viewable_tile_s": (d.get("first_viewable_tile") or {}).get(
+                    "seconds"
+                ),
+                "first_viewable_tile_note": "coarsest level, the tile a viewer draws "
+                "first; a full-resolution tile is in the "
+                "per-chunk table",
+                "raw_record": sources["served"].name,
+            }
+        )
     tables["tables"]["point_to_first_tile"] = build_rows
 
     tables["binding_rules"] = [
@@ -326,15 +398,16 @@ def latency_tables(out: Path, sources: Dict[str, Path]) -> Path:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
-    ap.add_argument("--out", default="analysis/"
-                                     "results/omezarr_view/figure_assets")
-    ap.add_argument("--raw", default="analysis/"
-                                     "results/omezarr_view/raw")
+    ap.add_argument("--out", default="analysis/" "results/omezarr_view/figure_assets")
+    ap.add_argument("--raw", default="analysis/" "results/omezarr_view/raw")
     ap.add_argument("--token-file", default=".demo-token")
     ap.add_argument("--protected", default="protected-mousebrain")
     ap.add_argument("--mechanism-dataset", default="idr0106")
-    ap.add_argument("--direct-base", default="http://localhost:8842",
-                    help="the app itself, bypassing any auth proxy")
+    ap.add_argument(
+        "--direct-base",
+        default="http://localhost:8842",
+        help="the app itself, bypassing any auth proxy",
+    )
     ap.add_argument("datasets", nargs="+")
     args = ap.parse_args()
 
@@ -347,12 +420,18 @@ def main() -> int:
     written += metadata_reports(client, args.base, args.datasets, out)
     written.append(mechanism(client, args.base, args.mechanism_dataset, out))
     token = Path(args.token_file).read_text().strip()
-    written += auth_evidence(client, args.base, args.protected, token, out,
-                             direct_base=args.direct_base)
-    written.append(latency_tables(out, {
-        "served": raw / "served_measurements.json",
-        "derived": raw / "served_derived.json",
-    }))
+    written += auth_evidence(
+        client, args.base, args.protected, token, out, direct_base=args.direct_base
+    )
+    written.append(
+        latency_tables(
+            out,
+            {
+                "served": raw / "served_measurements.json",
+                "derived": raw / "served_derived.json",
+            },
+        )
+    )
 
     for p in written:
         print(p)

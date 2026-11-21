@@ -71,7 +71,9 @@ class BioEngineDatasets:
 
     # Path of the per-host discovery file written by the data server.
     # Class attribute so refresh() / _resolve_service_url() use the same path.
-    _CURRENT_SERVER_FILE = Path.home() / ".bioengine" / "datasets" / "bioengine_current_server"
+    _CURRENT_SERVER_FILE = (
+        Path.home() / ".bioengine" / "datasets" / "bioengine_current_server"
+    )
 
     def __init__(
         self,
@@ -178,9 +180,7 @@ class BioEngineDatasets:
         self._resolve_service_url(initial=False)
         return self.service_url
 
-    async def _with_url_recovery(
-        self, op: Callable[[], Awaitable[Any]]
-    ) -> Any:
+    async def _with_url_recovery(self, op: Callable[[], Awaitable[Any]]) -> Any:
         """Run ``op``; on transport error, refresh the URL and retry once.
 
         Catches the connection/read/timeout shapes that signal the cached
@@ -206,9 +206,7 @@ class BioEngineDatasets:
             if new_url is None:
                 # No new URL available; nothing more we can do.
                 raise
-            self.logger.info(
-                f"Data server re-discovered at '{new_url}'; retrying."
-            )
+            self.logger.info(f"Data server re-discovered at '{new_url}'; retrying.")
             return await op()
 
     async def set_chunk_cache_size_gb(self, gb: int) -> None:
@@ -436,7 +434,9 @@ class BioEngineDatasets:
         _file_path = Path(file_path)
 
         if _file_path.suffix == ".zarr":
-            if not await self._zarr_store_exists(dataset_id, _file_path.as_posix(), token):
+            if not await self._zarr_store_exists(
+                dataset_id, _file_path.as_posix(), token
+            ):
                 raise ValueError(
                     f"Zarr store '{_file_path.as_posix()}' not found in dataset '{dataset_id}'"
                 )
@@ -447,7 +447,10 @@ class BioEngineDatasets:
             available_files = await self.list_files(
                 dataset_id=dataset_id, dir_path=lookup_dir, token=token
             )
-            if _file_path.as_posix() not in available_files and _file_path.name not in available_files:
+            if (
+                _file_path.as_posix() not in available_files
+                and _file_path.name not in available_files
+            ):
                 raise ValueError(
                     f"File '{_file_path.as_posix()}' not found in dataset '{dataset_id}'"
                 )

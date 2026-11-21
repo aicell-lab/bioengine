@@ -14,6 +14,7 @@ Two invariants matter:
   worker dictates those versions; an app pinning its own is how two
   hypha-rpc versions ended up running on one node.
 """
+
 from __future__ import annotations
 
 import logging

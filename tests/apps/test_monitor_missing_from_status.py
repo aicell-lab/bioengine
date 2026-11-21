@@ -113,9 +113,7 @@ async def _tick(manager: AppsManager, state: str | None) -> None:
 
 
 def _warnings(caplog) -> list[str]:
-    return [
-        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-    ]
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
 
 
 def test_the_tolerance_is_finite_and_above_one() -> None:

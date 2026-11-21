@@ -58,9 +58,9 @@ def test_watchdog_never_consults_the_event_loop() -> None:
     for name in ("_unrecoverable_reason", "_liveness_watchdog"):
         src = inspect.getsource(getattr(_ProxyCls, name))
         assert "await " not in src, f"{name} must not await — it runs off-loop"
-        assert "get_event_loop" not in src and "get_running_loop" not in src, (
-            f"{name} must not reach for the event loop"
-        )
+        assert (
+            "get_event_loop" not in src and "get_running_loop" not in src
+        ), f"{name} must not reach for the event loop"
         assert not inspect.iscoroutinefunction(getattr(_ProxyCls, name))
 
 
@@ -151,7 +151,8 @@ def test_permanent_registration_failure_is_unrecoverable() -> None:
 
 def test_wedged_controller_read_past_deadline_is_unrecoverable() -> None:
     inst = _bare_proxy(
-        _sibling_read_started_at=time.monotonic() - (pd_module._SIBLING_READ_DEADLINE_S + 1.0),
+        _sibling_read_started_at=time.monotonic()
+        - (pd_module._SIBLING_READ_DEADLINE_S + 1.0),
         _sibling_read_job_running=True,
     )
     reason = inst._unrecoverable_reason()

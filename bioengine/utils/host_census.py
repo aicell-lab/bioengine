@@ -275,7 +275,8 @@ def gpu_co_tenancy_warning(
         return None
 
     roster = "; ".join(
-        f"{worker_id} (device {', '.join(ids)})" for worker_id, ids in collisions.items()
+        f"{worker_id} (device {', '.join(ids)})"
+        for worker_id, ids in collisions.items()
     )
     return (
         f"GPU device(s) handed to this worker are also held by another BioEngine worker on "

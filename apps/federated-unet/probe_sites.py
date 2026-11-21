@@ -15,7 +15,12 @@ from workers import resolve_worker
 SITES = {
     os.environ.get("FEDUNET_SITE_A_WORKER", "<workspace>/bioengine-worker"): (
         "HYPHA_TOKEN",
-        ["fedunet-bbbc038-fluo", "fedunet-bbbc039", "fedunet-nuinsseg", "fedunet-pooled"],
+        [
+            "fedunet-bbbc038-fluo",
+            "fedunet-bbbc039",
+            "fedunet-nuinsseg",
+            "fedunet-pooled",
+        ],
     ),
     "bioimage-io/bioengine-worker-denbi": (
         "BIOIMAGE_IO_TOKEN",

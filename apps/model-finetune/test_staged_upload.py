@@ -145,7 +145,9 @@ def test_a_404_is_a_verdict_and_is_not_retried(monkeypatch, weights, no_sleep):
     assert len(seen) == 1
 
 
-def test_exhausted_attempts_reraise_rather_than_returning_quietly(monkeypatch, weights, no_sleep):
+def test_exhausted_attempts_reraise_rather_than_returning_quietly(
+    monkeypatch, weights, no_sleep
+):
     """The caller must see the failure. A retry loop that falls off its end returns
     None, which reads to ``materialize_soup`` as a completed upload."""
     import runtime_cellpose
@@ -230,7 +232,9 @@ def test_a_failing_discard_does_not_mask_the_original_error():
 
     async def body():
         async with _staged_of(_Entry())(am, "ws/pool"):
-            raise HTTPError("https://pool.invalid/put", 504, "Gateway Timeout", {}, None)
+            raise HTTPError(
+                "https://pool.invalid/put", 504, "Gateway Timeout", {}, None
+            )
 
     with pytest.raises(HTTPError) as got:
         asyncio.run(body())

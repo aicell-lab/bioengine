@@ -138,9 +138,9 @@ async def test_one_workers_ping_failure_leaves_the_other_worker_serving(
 
     monkeypatch.setattr(worker_module, "BioEngineDatasets", cls_b)
     await monitoring_pass(worker_b)
-    assert len(worker_b.available_datasets) == 4, (
-        "worker B lost a data server that was still healthy"
-    )
+    assert (
+        len(worker_b.available_datasets) == 4
+    ), "worker B lost a data server that was still healthy"
 
     # Worker A's own view degrades, which is correct for A and is the
     # presence assertion that keeps the two above from passing vacuously: if
@@ -188,9 +188,9 @@ async def test_a_standing_failure_is_logged_once_not_every_pass(
         for _ in range(5):
             await monitoring_pass(worker_a)
     first_outage = [r for r in caplog.records if "pinging dataset server" in r.message]
-    assert len(first_outage) == 1, (
-        f"five failing passes produced {len(first_outage)} error lines"
-    )
+    assert (
+        len(first_outage) == 1
+    ), f"five failing passes produced {len(first_outage)} error lines"
 
     # Re-armed by recovery: a second outage must report again rather than be
     # swallowed by the flag that silenced the first.
@@ -200,9 +200,9 @@ async def test_a_standing_failure_is_logged_once_not_every_pass(
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger="test"):
         await monitoring_pass(worker_a)
-    assert [r for r in caplog.records if "pinging dataset server" in r.message], (
-        "a second outage after a recovery was never reported"
-    )
+    assert [
+        r for r in caplog.records if "pinging dataset server" in r.message
+    ], "a second outage after a recovery was never reported"
 
 
 async def test_the_data_server_remains_the_only_writer_of_the_file():
@@ -215,16 +215,20 @@ async def test_the_data_server_remains_the_only_writer_of_the_file():
 
     # Positive control first: an emptied or moved file satisfies every absence
     # assertion below while proving nothing.
-    assert "bioengine_current_server" in source, "the discovery path is gone from worker.py"
+    assert (
+        "bioengine_current_server" in source
+    ), "the discovery path is gone from worker.py"
     assert "_discover_data_server" in source
     # And a second one, opposite-signed: worker.py DOES write the two files it
     # owns, so "no writes found" would mean the scan is broken, not that the
     # worker is well behaved.
-    assert [n for n, line in enumerate(lines, 1) if ".write_text(" in line], (
-        "the write scan matched nothing at all, so its silence means nothing"
-    )
+    assert [
+        n for n, line in enumerate(lines, 1) if ".write_text(" in line
+    ], "the write scan matched nothing at all, so its silence means nothing"
 
-    deletes = [f"{n}: {line.strip()}" for n, line in enumerate(lines, 1) if ".unlink()" in line]
+    deletes = [
+        f"{n}: {line.strip()}" for n, line in enumerate(lines, 1) if ".unlink()" in line
+    ]
     assert not deletes, f"worker.py deletes a file it does not own: {deletes}"
 
     discovery_refs = [

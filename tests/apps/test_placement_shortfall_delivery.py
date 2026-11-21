@@ -10,6 +10,7 @@ output. Both directions are asserted -- a deployment that cannot be placed repor
 it, and a cold wake-up does not -- because an arm that only ever looks for the true
 case would also pass against a projection that hardcoded ``True``.
 """
+
 from __future__ import annotations
 
 import json

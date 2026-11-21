@@ -112,8 +112,12 @@ async def test_two_merges_on_one_pool_do_not_overlap() -> None:
 
     assert len(log) == 4, f"both merges must have run the span; got {log}"
     assert not _overlaps(log), f"two merges held one pool at once: {log}"
-    assert log == [("enter", "ws/p"), ("exit", "ws/p"),
-                   ("enter", "ws/p"), ("exit", "ws/p")]
+    assert log == [
+        ("enter", "ws/p"),
+        ("exit", "ws/p"),
+        ("enter", "ws/p"),
+        ("exit", "ws/p"),
+    ]
 
 
 @pytest.mark.asyncio

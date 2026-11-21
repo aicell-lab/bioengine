@@ -23,6 +23,7 @@ The shape assertions read the source rather than driving Ray Serve's
 health loop live; the behavioural ones drive ``_maintenance_tick``
 directly, which is why it is factored out of the sleeping loop.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -318,9 +319,9 @@ def test_register_services_calls_reset_before_connect() -> None:
     connect_call = re.search(r"connect_to_server\(", src)
     assert reset_call is not None, "expected an actual _reset_server_connection() call"
     assert connect_call is not None, "expected a connect_to_server(...) call"
-    assert reset_call.start() < connect_call.start(), (
-        "_reset_server_connection() must be awaited BEFORE connect_to_server()"
-    )
+    assert (
+        reset_call.start() < connect_call.start()
+    ), "_reset_server_connection() must be awaited BEFORE connect_to_server()"
 
 
 def test_reset_server_connection_is_idempotent_and_bounded() -> None:

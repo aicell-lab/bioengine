@@ -156,7 +156,10 @@ def test_ray_actor_options_extra_deep_merged():
     @bioengine.app(
         num_cpus=1,
         pip=["pandas"],
-        ray_actor_options={"resources": {"custom": 1}, "runtime_env": {"pip": ["numpy"]}},
+        ray_actor_options={
+            "resources": {"custom": 1},
+            "runtime_env": {"pip": ["numpy"]},
+        },
     )
     class App:
         pass
@@ -253,7 +256,6 @@ class _CompositionRuntimeA:
 class _CompositionEntry:
     def __init__(self, runtime_a: _CompositionRuntimeA, batch_size: int = 32):
         self.runtime_a = runtime_a
-
 
 
 def test_composition_params_extracted_from_type_hints():

@@ -165,7 +165,9 @@ class FederatedUNetSite:
                 # the proxy that unpickles this reply has no torch installed.
                 "version": str(torch.__version__),
                 "device": self._device.type,
-                "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                "cuda_device": (
+                    torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+                ),
                 "cuda_version": torch.version.cuda,
             },
             "host": {
@@ -180,10 +182,16 @@ class FederatedUNetSite:
     @bioengine.method
     async def prepare_data(
         self,
-        n_train: Optional[int] = Field(55, description="Training images per dataset; null takes everything left after the test and val blocks"),
+        n_train: Optional[int] = Field(
+            55,
+            description="Training images per dataset; null takes everything left after the test and val blocks",
+        ),
         n_val: int = Field(15, description="Validation images per dataset"),
         n_test: int = Field(25, description="Held-out test images per dataset"),
-        split_seed: int = Field(20260905, description="Seed for the train/val/test partition; identical across sites and arms"),
+        split_seed: int = Field(
+            20260905,
+            description="Seed for the train/val/test partition; identical across sites and arms",
+        ),
     ) -> Dict[str, Any]:
         """Download this site's dataset(s) into the replica and cut the splits.
 
@@ -218,7 +226,10 @@ class FederatedUNetSite:
     @bioengine.method
     async def init_model(
         self,
-        seed: int = Field(0, description="Seed for parameter initialisation; identical across sites so round 0 starts from one common model"),
+        seed: int = Field(
+            0,
+            description="Seed for parameter initialisation; identical across sites so round 0 starts from one common model",
+        ),
     ) -> Dict[str, Any]:
         """Build a freshly initialised model, discarding any current weights."""
         from unet import ARCH, build_model, signature
@@ -242,8 +253,13 @@ class FederatedUNetSite:
         batch_size: int = Field(8, description="Crops per step"),
         crop: int = Field(256, description="Training crop size in pixels"),
         seed: int = Field(0, description="Seed for crop sampling and augmentation"),
-        tag: str = Field("", description="Free-form label recorded in this site's history"),
-        domain_balanced: bool = Field(False, description="Draw a domain uniformly and then an image within it, instead of drawing uniformly over the site's pooled images; only differs on a site holding more than one domain"),
+        tag: str = Field(
+            "", description="Free-form label recorded in this site's history"
+        ),
+        domain_balanced: bool = Field(
+            False,
+            description="Draw a domain uniformly and then an image within it, instead of drawing uniformly over the site's pooled images; only differs on a site holding more than one domain",
+        ),
     ) -> Dict[str, Any]:
         """Run local training on this site's data. Nothing leaves the site."""
         from training import train_steps
@@ -258,8 +274,15 @@ class FederatedUNetSite:
 
         def _work() -> Dict[str, Any]:
             return train_steps(
-                self._model, pairs, steps=steps, lr=lr, batch_size=batch_size,
-                crop=crop, device=self._device, seed=seed, groups=groups,
+                self._model,
+                pairs,
+                steps=steps,
+                lr=lr,
+                batch_size=batch_size,
+                crop=crop,
+                device=self._device,
+                seed=seed,
+                groups=groups,
             )
 
         async with self._lock:
@@ -272,7 +295,10 @@ class FederatedUNetSite:
                 n_train_images=len(pairs),
                 datasets=list(self._data),
                 wall_time_s=time.time() - started,
-                lr=lr, batch_size=batch_size, crop=crop, seed=seed,
+                lr=lr,
+                batch_size=batch_size,
+                crop=crop,
+                seed=seed,
                 domain_balanced=domain_balanced,
             )
             self._history.append(result)
@@ -281,7 +307,9 @@ class FederatedUNetSite:
     @bioengine.method
     async def evaluate(
         self,
-        split: str = Field("test", description="Which split to score: train, val or test"),
+        split: str = Field(
+            "test", description="Which split to score: train, val or test"
+        ),
     ) -> Dict[str, Any]:
         """Score the current weights on a local split, per dataset and per image."""
         from training import evaluate as run_eval
@@ -314,8 +342,12 @@ class FederatedUNetSite:
     @bioengine.method
     async def push_weights(
         self,
-        run_artifact_id: str = Field(..., description="Artifact holding this run's checkpoints"),
-        path: str = Field(..., description="File path inside the artifact, e.g. round_01/site-a.pt"),
+        run_artifact_id: str = Field(
+            ..., description="Artifact holding this run's checkpoints"
+        ),
+        path: str = Field(
+            ..., description="File path inside the artifact, e.g. round_01/site-a.pt"
+        ),
         note: str = Field("", description="Recorded in the transport log"),
     ) -> Dict[str, Any]:
         """Serialise the current weights and write them to the run artifact.
@@ -334,14 +366,19 @@ class FederatedUNetSite:
         payload = buffer.getvalue()
         n_train = sum(len(d["train"]) for d in self._data.values())
         entry = await self._store(run_artifact_id).put(
-            path, payload, kind="model_weights", note=note or f"{self.site_name} weights"
+            path,
+            payload,
+            kind="model_weights",
+            note=note or f"{self.site_name} weights",
         )
         return {**entry, "n_train_images": n_train, "site": self.site_name}
 
     @bioengine.method
     async def pull_weights(
         self,
-        run_artifact_id: str = Field(..., description="Artifact holding this run's checkpoints"),
+        run_artifact_id: str = Field(
+            ..., description="Artifact holding this run's checkpoints"
+        ),
         path: str = Field(..., description="File path inside the artifact to load"),
         note: str = Field("", description="Recorded in the transport log"),
     ) -> Dict[str, Any]:
@@ -353,7 +390,9 @@ class FederatedUNetSite:
         payload = await self._store(run_artifact_id).get(
             path, kind="model_weights", note=note or f"{self.site_name} sync"
         )
-        state_dict = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
+        state_dict = torch.load(
+            io.BytesIO(payload), map_location="cpu", weights_only=True
+        )
         async with self._lock:
             if self._model is None:
                 self._model = build_model(seed=0)
@@ -365,7 +404,12 @@ class FederatedUNetSite:
                     f"({len(incoming)} vs {len(current)} tensors)"
                 )
             self._model.load_state_dict(state_dict)
-        return {"loaded": path, "bytes": len(payload), "n_tensors": len(incoming), "site": self.site_name}
+        return {
+            "loaded": path,
+            "bytes": len(payload),
+            "n_tensors": len(incoming),
+            "site": self.site_name,
+        }
 
     @bioengine.method
     async def get_transport_log(self) -> Dict[str, Any]:
@@ -408,18 +452,32 @@ class FederatedUNetSite:
             self._model.to(self._device).eval()
             for image, mask in pairs:
                 height, width = image.shape
-                padded = np.pad(image, ((0, (-height) % 16), (0, (-width) % 16)), mode="reflect")
+                padded = np.pad(
+                    image, ((0, (-height) % 16), (0, (-width) % 16)), mode="reflect"
+                )
                 with torch.no_grad():
-                    tensor = torch.from_numpy(padded).unsqueeze(0).unsqueeze(0).to(self._device)
-                    probs = torch.sigmoid(self._model(tensor))[0, 0, :height, :width].cpu().numpy()
+                    tensor = (
+                        torch.from_numpy(padded)
+                        .unsqueeze(0)
+                        .unsqueeze(0)
+                        .to(self._device)
+                    )
+                    probs = (
+                        torch.sigmoid(self._model(tensor))[0, 0, :height, :width]
+                        .cpu()
+                        .numpy()
+                    )
                 row = np.concatenate([image, mask, probs], axis=1)
                 tiles.append((row * 255).clip(0, 255).astype(np.uint8))
             widthmax = max(t.shape[1] for t in tiles)
             padded_tiles = [
-                np.pad(t, ((0, 0), (0, widthmax - t.shape[1])), constant_values=0) for t in tiles
+                np.pad(t, ((0, 0), (0, widthmax - t.shape[1])), constant_values=0)
+                for t in tiles
             ]
             buffer = io.BytesIO()
-            Image.fromarray(np.concatenate(padded_tiles, axis=0)).save(buffer, format="PNG")
+            Image.fromarray(np.concatenate(padded_tiles, axis=0)).save(
+                buffer, format="PNG"
+            )
             return buffer.getvalue()
 
         if self._model is None:

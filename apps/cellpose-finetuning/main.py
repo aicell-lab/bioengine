@@ -310,9 +310,9 @@ def _apply_clahe(img_array: npt.NDArray[Any]) -> npt.NDArray[Any]:
         arr_min = float(arr.min())
         arr_max = float(arr.max())
         if arr_max > arr_min:
-            arr = ((arr.astype(np.float32) - arr_min) / (arr_max - arr_min) * 255).astype(
-                np.uint8
-            )
+            arr = (
+                (arr.astype(np.float32) - arr_min) / (arr_max - arr_min) * 255
+            ).astype(np.uint8)
         else:
             arr = np.zeros(arr.shape, dtype=np.uint8)
     # Apply CLAHE
@@ -649,7 +649,9 @@ async def ensure_published_model_local_session(model_reference: str) -> str:
     selected_remote: str | None = None
     for preferred in preferred_filenames:
         matches = [
-            p for p in candidate_files if Path(p).name == preferred and not p.endswith("/")
+            p
+            for p in candidate_files
+            if Path(p).name == preferred and not p.endswith("/")
         ]
         if matches:
             matches.sort(key=lambda p: (p.count("/"), len(p)))
@@ -658,7 +660,9 @@ async def ensure_published_model_local_session(model_reference: str) -> str:
 
     if selected_remote is None:
         pth_like = [
-            p for p in candidate_files if p.lower().endswith(".pth") and not p.endswith("/")
+            p
+            for p in candidate_files
+            if p.lower().endswith(".pth") and not p.endswith("/")
         ]
         if pth_like:
             pth_like.sort(key=lambda p: (p.count("/"), len(p)))
@@ -919,13 +923,17 @@ class SessionStatus(TypedDict, total=False):
     n_train: int  # Number of training samples
     n_test: int  # Number of test samples
     start_time: str  # Training start time (ISO format)
-    last_continued_time: str | None  # Time of last restart/continue (ISO format), None if never continued
+    last_continued_time: (
+        str | None
+    )  # Time of last restart/continue (ISO format), None if never continued
     current_epoch: int  # Current epoch number (1-indexed)
     total_epochs: int  # Total number of epochs
     elapsed_seconds: float  # Elapsed time in seconds
     current_batch: int  # Current batch number within epoch (0-indexed)
     total_batches: int  # Total number of batches per epoch
-    current_loss: float | None  # Most recent per-epoch training loss (last element of train_losses)
+    current_loss: (
+        float | None
+    )  # Most recent per-epoch training loss (last element of train_losses)
     exported_artifact_id: str  # Artifact ID if model has been exported
     model_modified: bool  # Flag indicating if model was modified since last export
     model: str
@@ -935,7 +943,9 @@ class SessionStatus(TypedDict, total=False):
     weight_decay: float
     min_train_masks: int
     validation_interval: int | None
-    user_id: str | None  # Stable owner key (Hypha account `parent`, falls back to per-token `id`)
+    user_id: (
+        str | None
+    )  # Stable owner key (Hypha account `parent`, falls back to per-token `id`)
     label: str | None  # Annotation label (e.g. "cells") used for this training session
 
 
@@ -963,7 +973,9 @@ class SessionStatusWithId(TypedDict, total=False):
     elapsed_seconds: float
     current_batch: int
     total_batches: int
-    current_loss: float | None  # Most recent per-epoch training loss (last element of train_losses)
+    current_loss: (
+        float | None
+    )  # Most recent per-epoch training loss (last element of train_losses)
     exported_artifact_id: str
     model_modified: bool
     model: str
@@ -2091,8 +2103,12 @@ def run_blocking_task(
                 dataset_split["test_files"],
                 dataset_split["test_labels_files"],
             ):
-                img = _load_label_array(img_path)  # images are now TIFFs (CLAHE or original)
-                lbl = _load_label_array(lbl_path)  # labels may still be palette PNGs if skipped
+                img = _load_label_array(
+                    img_path
+                )  # images are now TIFFs (CLAHE or original)
+                lbl = _load_label_array(
+                    lbl_path
+                )  # labels may still be palette PNGs if skipped
 
                 # Run inference with the trained model
                 mask_pred = cellpose_model.eval(
@@ -2207,7 +2223,9 @@ async def finetune_cellpose(
         # internal loader (cv2.imread) can read them correctly.  Palette-mode
         # PNGs produced by BioImage.IO Colab are otherwise expanded to BGRA by
         # cv2, which destroys the integer label indices and corrupts training.
-        logger.info("Session %s: Normalising label files to integer TIFF format", session_id)
+        logger.info(
+            "Session %s: Normalising label files to integer TIFF format", session_id
+        )
         update_status(
             session_id,
             StatusType.PREPARING,
@@ -2230,7 +2248,9 @@ async def finetune_cellpose(
         )
 
         if training_params.get("enable_clahe"):
-            logger.info("Session %s: Applying CLAHE preprocessing to images", session_id)
+            logger.info(
+                "Session %s: Applying CLAHE preprocessing to images", session_id
+            )
             update_status(
                 session_id,
                 StatusType.PREPARING,
@@ -2716,7 +2736,14 @@ def match_image_annotation_pairs(
     def _annotation_key(path: str) -> str:
         basename = Path(path).name
         key = _strip_known_suffixes(basename).lower()
-        for marker in ("_mask", "-mask", "_label", "-label", "_annotation", "-annotation"):
+        for marker in (
+            "_mask",
+            "-mask",
+            "_label",
+            "-label",
+            "_annotation",
+            "-annotation",
+        ):
             if key.endswith(marker):
                 key = key[: -len(marker)]
                 break
@@ -2964,9 +2991,7 @@ async def make_training_pairs_from_metadata(
 
     n_take = resolve_n_samples(n_samples, len(train_pairs_raw))
     if n_take is not None and n_take < len(train_pairs_raw):
-        subset_idx = np.random.default_rng().permutation(len(train_pairs_raw))[
-            :n_take
-        ]
+        subset_idx = np.random.default_rng().permutation(len(train_pairs_raw))[:n_take]
         train_pairs_raw = [train_pairs_raw[i] for i in subset_idx]
 
     train_pairs = await download_pairs_from_artifact(
@@ -3063,6 +3088,7 @@ def create_dataset_split(
     Raises:
         ValueError: If no training pairs are provided
     """
+
     def _mask_has_foreground_label(mask_path: Path) -> bool:
         """Return True when the mask contains any label value greater than zero."""
         from PIL import Image
@@ -3079,7 +3105,9 @@ def create_dataset_split(
 
         if mask.ndim == 3 and mask.shape[-1] in (3, 4):
             rgb = mask[..., :3]
-            if np.all(rgb[..., 0] == rgb[..., 1]) and np.all(rgb[..., 1] == rgb[..., 2]):
+            if np.all(rgb[..., 0] == rgb[..., 1]) and np.all(
+                rgb[..., 1] == rgb[..., 2]
+            ):
                 mask = rgb[..., 0]
 
         if mask.ndim != 2:
@@ -3777,6 +3805,7 @@ async def _images_from_artifact(
         suffix = local_img.suffix.lower()
         if suffix in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
             from PIL import Image
+
             img_arr = np.array(Image.open(local_img))
             # Ensure CHW layout expected by Cellpose when image is multi-channel
             if img_arr.ndim == 3 and img_arr.shape[2] in (3, 4):
@@ -3942,7 +3971,7 @@ class CellposeFinetune:
         """Initialize directories and defaults for the service."""
         if "HYPHA_TOKEN" not in os.environ:
             raise RuntimeError("HYPHA_TOKEN environment variable is not set.")
-            
+
         get_sessions_path().mkdir(parents=True, exist_ok=True)
         self.pretrained_models = PretrainedModel.values()
         self.executors = {}
@@ -4690,8 +4719,11 @@ class CellposeFinetune:
 
             if filt is not None and session_data.get("status_type") not in filt:
                 continue
-            
-            if artifact_filt is not None and session_data.get("dataset_artifact_id") not in artifact_filt:
+
+            if (
+                artifact_filt is not None
+                and session_data.get("dataset_artifact_id") not in artifact_filt
+            ):
                 continue
 
             if label_filt is not None and session_data.get("label") not in label_filt:
@@ -4764,10 +4796,14 @@ class CellposeFinetune:
         if isinstance(status_types, dict):
             wrapped = status_types
             status_types = wrapped.get("status_types", None)
-            dataset_artifact_ids = wrapped.get("dataset_artifact_ids", dataset_artifact_ids)
+            dataset_artifact_ids = wrapped.get(
+                "dataset_artifact_ids", dataset_artifact_ids
+            )
             labels = wrapped.get("labels", labels)
             limit = wrapped.get("limit", limit)
-        return await asyncio.to_thread(self._list_sessions_sync, status_types, limit, dataset_artifact_ids, labels)
+        return await asyncio.to_thread(
+            self._list_sessions_sync, status_types, limit, dataset_artifact_ids, labels
+        )
 
     @bioengine.method
     async def delete_training_session(
@@ -4851,7 +4887,14 @@ class CellposeFinetune:
                 "Optional list of model authors. Each entry requires `name` and "
                 "may include `affiliation`."
             ),
-            examples=[[{"name": "Nils Mechtel", "affiliation": "KTH Royal Institute of Technology"}]],
+            examples=[
+                [
+                    {
+                        "name": "Nils Mechtel",
+                        "affiliation": "KTH Royal Institute of Technology",
+                    }
+                ]
+            ],
         ),
         uploader: dict[str, Any] | None = Field(
             None,
@@ -5374,7 +5417,9 @@ BSD-3-Clause (Cellpose license)
             for artifact in artifacts:
                 manifest = artifact.get("manifest", {}) or {}
                 config = artifact.get("config", {}) or {}
-                artifact_dataset_id = manifest.get("training_dataset_id") or config.get("training_dataset_id")
+                artifact_dataset_id = manifest.get("training_dataset_id") or config.get(
+                    "training_dataset_id"
+                )
                 if artifact_dataset_id == dataset_id:
                     # Build model info
                     model_id = artifact["id"]
@@ -5575,7 +5620,9 @@ BSD-3-Clause (Cellpose license)
                 images = []
 
             if enable_clahe and images:
-                logger.info("Applying CLAHE preprocessing to %d inference images", len(images))
+                logger.info(
+                    "Applying CLAHE preprocessing to %d inference images", len(images)
+                )
                 images = [_apply_clahe(img) for img in images]
 
             return _predict_and_encode(

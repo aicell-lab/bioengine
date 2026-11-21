@@ -87,8 +87,8 @@ def test_clahe_is_adaptive_not_one_global_curve() -> None:
     img = np.empty((128, 128), dtype=np.uint8)
     img[:, :64] = 40
     img[:, 64:] = 200
-    img[30:40, 20:30] = 128   # the same grey, in the dark half
-    img[30:40, 84:94] = 128   # ...and in the bright half
+    img[30:40, 20:30] = 128  # the same grey, in the dark half
+    img[30:40, 84:94] = 128  # ...and in the bright half
 
     out = entry._clahe_numpy(img)
 
@@ -162,7 +162,7 @@ def _pair(h=32, w=32, n_objects=3, seed=0):
     img = rng.integers(0, 255, (h, w), dtype=np.uint8)
     lbl = np.zeros((h, w), dtype=np.uint16)
     for k in range(1, n_objects + 1):
-        lbl[k * 4:k * 4 + 3, 2:6] = k
+        lbl[k * 4 : k * 4 + 3, 2:6] = k
     return img, lbl
 
 
@@ -189,8 +189,9 @@ async def test_one_unreachable_source_does_not_sink_the_batch() -> None:
     """The contract that makes preflight worth calling: a dataset with one dead
     file reports which one, instead of raising and telling you nothing."""
     img, lbl = _pair()
-    r = _Replica({"i0": img, "i1": RuntimeError("404 Not Found")},
-                 {"l0": lbl, "l1": lbl})
+    r = _Replica(
+        {"i0": img, "i1": RuntimeError("404 Not Found")}, {"l0": lbl, "l1": lbl}
+    )
 
     out = await _run(r, train_images=["i0", "i1"], train_labels=["l0", "l1"])
 
@@ -256,8 +257,9 @@ async def test_clahe_forces_staging_and_reaches_the_staged_array() -> None:
     img, lbl = _pair(seed=5)
     r = _Replica({"i": img}, {"l": lbl})
 
-    out = await _run(r, train_images=["i"], train_labels=["l"],
-                     stage=False, enable_clahe=True)
+    out = await _run(
+        r, train_images=["i"], train_labels=["l"], stage=False, enable_clahe=True
+    )
 
     assert out["staged"] is True and out["clahe_applied"] is True
     assert "train_images" in out

@@ -350,9 +350,7 @@ def test_unauthenticated_caller_cannot_resolve(tmp_path):
 def test_non_approver_cannot_list_requests(tmp_path):
     client, _ = build(tmp_path)
     client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
-    assert (
-        client.get("/access-requests", headers=auth("tok-member")).status_code == 403
-    )
+    assert client.get("/access-requests", headers=auth("tok-member")).status_code == 403
 
 
 # ---------------------------------------------------------------------------
@@ -372,15 +370,11 @@ def test_an_admin_added_at_runtime_can_decide_immediately(tmp_path):
     """The gate (A) failed: a list snapshotted at startup would still refuse."""
     client, _ = build(tmp_path)
     client.post("/datasets/blood-atlas/access-request", headers=auth("tok-stranger"))
-    assert (
-        client.get("/access-requests", headers=auth("tok-member")).status_code == 403
-    )
+    assert client.get("/access-requests", headers=auth("tok-member")).status_code == 403
 
     WORKER_ADMINS.add("tok-member")  # stands in for the worker's add_admin_user
 
-    assert (
-        client.get("/access-requests", headers=auth("tok-member")).status_code == 200
-    )
+    assert client.get("/access-requests", headers=auth("tok-member")).status_code == 200
     assert (
         client.post(
             "/access-requests/blood-atlas/resolve",
@@ -465,7 +459,9 @@ def test_an_unreachable_worker_does_not_revoke_dataset_access(tmp_path):
         == 200
     )
     assert (
-        client.get("/datasets/blood-atlas/files", headers=auth("tok-member")).status_code
+        client.get(
+            "/datasets/blood-atlas/files", headers=auth("tok-member")
+        ).status_code
         == 200
     )
 
@@ -512,31 +508,36 @@ def connect_recorder(monkeypatch, check_access_returns=True, raises=None):
 def test_is_worker_admin_skips_the_connection_without_a_token(monkeypatch):
     """An anonymous caller is never an admin, so don't spend a websocket on it."""
     calls = connect_recorder(monkeypatch)
-    assert asyncio.run(is_worker_admin(None, "ws/w:bioengine-worker", "http://h")) is False
+    assert (
+        asyncio.run(is_worker_admin(None, "ws/w:bioengine-worker", "http://h")) is False
+    )
     assert calls == []
 
 
 def test_is_worker_admin_sends_the_callers_own_token(monkeypatch):
     calls = connect_recorder(monkeypatch, check_access_returns=True)
-    assert asyncio.run(
-        is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h")
-    ) is True
+    assert (
+        asyncio.run(is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h"))
+        is True
+    )
     assert ("connect", "tok-caller") in calls
     assert ("get_service", "ws/w:bioengine-worker") in calls
 
 
 def test_is_worker_admin_relays_a_negative_verdict(monkeypatch):
     connect_recorder(monkeypatch, check_access_returns=False)
-    assert asyncio.run(
-        is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h")
-    ) is False
+    assert (
+        asyncio.run(is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h"))
+        is False
+    )
 
 
 def test_is_worker_admin_fails_closed_when_the_worker_is_unreachable(monkeypatch):
     connect_recorder(monkeypatch, raises=RuntimeError("Service not found"))
-    assert asyncio.run(
-        is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h")
-    ) is False
+    assert (
+        asyncio.run(is_worker_admin("tok-caller", "ws/w:bioengine-worker", "http://h"))
+        is False
+    )
 
 
 def test_approver_lists_every_request_oldest_first(tmp_path):
@@ -601,9 +602,12 @@ def test_grant_opens_file_listing_and_file_bytes(tmp_path):
         headers=auth("tok-owner"),
     )
 
-    assert "notes.txt" in client.get(
-        "/datasets/blood-atlas/files", headers=auth("tok-stranger")
-    ).json()
+    assert (
+        "notes.txt"
+        in client.get(
+            "/datasets/blood-atlas/files", headers=auth("tok-stranger")
+        ).json()
+    )
     bytes_response = client.get(
         "/data/blood-atlas/notes.txt", headers=auth("tok-stranger")
     )
@@ -620,7 +624,9 @@ def test_grant_is_scoped_to_the_dataset_it_was_made_on(tmp_path):
         headers=auth("tok-owner"),
     )
     assert (
-        client.get("/datasets/other-set/files", headers=auth("tok-stranger")).status_code
+        client.get(
+            "/datasets/other-set/files", headers=auth("tok-stranger")
+        ).status_code
         == 403
     )
 
@@ -655,7 +661,9 @@ def test_grant_does_not_displace_the_manifest_allowlist(tmp_path):
         headers=auth("tok-owner"),
     )
     assert (
-        client.get("/datasets/blood-atlas/files", headers=auth("tok-member")).status_code
+        client.get(
+            "/datasets/blood-atlas/files", headers=auth("tok-member")
+        ).status_code
         == 200
     )
 
@@ -799,9 +807,7 @@ def test_a_grant_survives_a_restart(tmp_path):
         headers=auth("tok-owner"),
     )
 
-    fresh_client, fresh_store = build(
-        tmp_path / "second", store_file=store_file
-    )
+    fresh_client, fresh_store = build(tmp_path / "second", store_file=store_file)
     assert fresh_store.granted_users("blood-atlas") == ["Mixed.Case@Example.invalid"]
     assert (
         fresh_client.get(

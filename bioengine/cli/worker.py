@@ -11,6 +11,7 @@ Examples:
   bioengine worker logs -f
   bioengine worker stop
 """
+
 from __future__ import annotations
 
 import glob
@@ -74,6 +75,7 @@ def resolve_memory(memory: str) -> Optional[str]:
     if value == AUTO_MEMORY:
         return _auto_memory_limit()
     return memory.strip()
+
 
 # Only the GPU flag differs between docker and podman (deployment-guide.md).
 _GPU_FLAGS = {
@@ -241,7 +243,9 @@ _SECRET_OPTION_HINTS = ("token", "password", "secret")
 
 
 def _is_secret_option(arg: str) -> bool:
-    return arg.startswith("-") and any(hint in arg.lower() for hint in _SECRET_OPTION_HINTS)
+    return arg.startswith("-") and any(
+        hint in arg.lower() for hint in _SECRET_OPTION_HINTS
+    )
 
 
 def redact_secrets(command: List[str]) -> List[str]:
@@ -379,7 +383,10 @@ def worker_group():
     help="Container name, used by 'bioengine worker stop' and 'logs'.",
 )
 @click.option(
-    "--shm-size", default=DEFAULT_SHM_SIZE, show_default=True, help="Shared memory size."
+    "--shm-size",
+    default=DEFAULT_SHM_SIZE,
+    show_default=True,
+    help="Shared memory size.",
 )
 @click.option(
     "--memory",
@@ -401,7 +408,9 @@ def worker_group():
     default=None,
     help="Request GPUs. Defaults to on when nvidia-smi is present.",
 )
-@click.option("--detach", "-d", is_flag=True, help="Run the container in the background.")
+@click.option(
+    "--detach", "-d", is_flag=True, help="Run the container in the background."
+)
 @click.option(
     "--token",
     envvar=["HYPHA_TOKEN", "BIOENGINE_TOKEN"],

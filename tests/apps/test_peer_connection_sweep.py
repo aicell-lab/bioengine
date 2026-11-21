@@ -13,6 +13,7 @@ peers that have been stuck too long in a non-``connected`` transient
 state. These tests pin the timeouts, the state matrix, and the
 integration hook into ``check_health``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -86,7 +87,8 @@ async def test_sweeps_stuck_handshake() -> None:
 async def test_sweeps_stuck_connecting() -> None:
     obj = _make_instance()
     cid = _add_peer(
-        obj, "connecting",
+        obj,
+        "connecting",
         _ProxyDeployment._PEER_STUCK_HANDSHAKE_TIMEOUT_SECONDS + 10,
     )
     await obj._sweep_stale_peer_connections()
@@ -97,7 +99,8 @@ async def test_sweeps_stuck_connecting() -> None:
 async def test_sweeps_stuck_disconnected() -> None:
     obj = _make_instance()
     cid = _add_peer(
-        obj, "disconnected",
+        obj,
+        "disconnected",
         _ProxyDeployment._PEER_STUCK_DISCONNECTED_TIMEOUT_SECONDS + 10,
     )
     pc = obj._active_peer_connections[cid]["peer_connection"]

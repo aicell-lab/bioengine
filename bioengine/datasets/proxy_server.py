@@ -314,7 +314,9 @@ async def _authenticate_user(
     user_info = await parse_token(token, cached_user_info)
     user_id = user_info.get("id", "")
     if not user_id:
-        raise HTTPException(status_code=401, detail="Could not determine user identity from token")
+        raise HTTPException(
+            status_code=401, detail="Could not determine user identity from token"
+        )
     safe_uid = re.sub(r"[^a-zA-Z0-9_-]", "_", user_id)
     return user_id, safe_uid
 
@@ -541,7 +543,9 @@ def _build_app(
         authorization: Optional[str] = Header(None),
     ):
         if dataset_id not in datasets:
-            raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Dataset '{dataset_id}' not found"
+            )
 
         try:
             user_info = await parse_token(
@@ -566,7 +570,9 @@ def _build_app(
         if not filename:
             raise HTTPException(status_code=400, detail="filename must not be empty")
         if "/" in filename or "\\" in filename or filename in (".", ".."):
-            raise HTTPException(status_code=400, detail="filename must not contain path separators")
+            raise HTTPException(
+                status_code=400, detail="filename must not contain path separators"
+            )
 
     def _validate_path(path: str, base_dir: Path) -> Path:
         """Validate a relative path (slashes allowed) and return the resolved absolute path.
@@ -653,7 +659,9 @@ def _build_app(
 
         content = await request.body()
         await asyncio.to_thread(file_path.write_bytes, content)
-        logger.info(f"Saved '{filename}' to '{dataset_id}' ({len(content)} bytes) by '{user_id}'")
+        logger.info(
+            f"Saved '{filename}' to '{dataset_id}' ({len(content)} bytes) by '{user_id}'"
+        )
 
         return {
             "dataset_id": dataset_id,
@@ -689,7 +697,9 @@ def _build_app(
 
         scan_dir = _validate_path(dir_path, save_dir) if dir_path else save_dir
         if not scan_dir.exists() or not scan_dir.is_dir():
-            raise HTTPException(status_code=404, detail=f"Directory '{dir_path}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Directory '{dir_path}' not found"
+            )
 
         files = []
         for root, dirs, filenames in os.walk(scan_dir):
@@ -767,9 +777,7 @@ def _add_access_request_routes(
     ``AccessRequestStore.approvers``.
     """
 
-    async def _requester(
-        authorization: Optional[str], token: Optional[str]
-    ) -> tuple:
+    async def _requester(authorization: Optional[str], token: Optional[str]) -> tuple:
         """``(key, email, user_id)`` for a caller who may file a request."""
         user_info = await parse_token(
             resolve_token(authorization, token), cached_user_info
@@ -871,9 +879,7 @@ def _add_access_request_routes(
         authorization: Optional[str] = Header(None),
     ):
         """List every request across every dataset, oldest first."""
-        await _require_approver(
-            authorization, token, "listing dataset access requests"
-        )
+        await _require_approver(authorization, token, "listing dataset access requests")
         return access_requests.list_all()
 
     @app.post("/access-requests/{dataset_id}/resolve")
@@ -954,7 +960,9 @@ def start_proxy_server(
         if log_file is None:
             log_dir = Path.home() / ".bioengine" / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"bioengine_datasets_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            log_file = (
+                log_dir / f"bioengine_datasets_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            )
         else:
             log_file = Path(log_file).resolve()
             log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -965,7 +973,9 @@ def start_proxy_server(
     logger = create_logger("ProxyServer", log_file=log_file)
 
     # Client auto-discovery file — fixed location read by BioEngineDatasets("auto")
-    current_server_file = Path.home() / ".bioengine" / "datasets" / "bioengine_current_server"
+    current_server_file = (
+        Path.home() / ".bioengine" / "datasets" / "bioengine_current_server"
+    )
     try:
         current_server_file.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:

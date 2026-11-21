@@ -130,7 +130,9 @@ def test_an_unusable_token_degrades_to_the_public_view(tmp_path):
     assert manifest["name"] == "Blood Cell Atlas"
 
 
-def test_a_public_dataset_still_lists_while_the_auth_server_is_down(tmp_path, monkeypatch):
+def test_a_public_dataset_still_lists_while_the_auth_server_is_down(
+    tmp_path, monkeypatch
+):
     """An expired token in an app replica, or a brief Hypha outage, must not
     break the one dataset operation that never needed a token."""
     client = build(tmp_path, [{"id": "open", "authorized_users": ["*"]}])
@@ -208,17 +210,21 @@ def test_a_dataset_with_no_optional_fields_lists_cleanly(tmp_path):
 
 
 def test_a_named_member_sees_the_whole_manifest(tmp_path):
-    manifest = build(tmp_path).get("/datasets", headers=auth("tok-member")).json()[
-        "blood-atlas"
-    ]
+    manifest = (
+        build(tmp_path)
+        .get("/datasets", headers=auth("tok-member"))
+        .json()["blood-atlas"]
+    )
     assert manifest["authorized_users"] == [MEMBER]
     assert manifest["internal_contact"] == "pi@example.invalid"
 
 
 def test_an_authenticated_outsider_sees_only_the_public_view(tmp_path):
-    manifest = build(tmp_path).get("/datasets", headers=auth("tok-outsider")).json()[
-        "blood-atlas"
-    ]
+    manifest = (
+        build(tmp_path)
+        .get("/datasets", headers=auth("tok-outsider"))
+        .json()["blood-atlas"]
+    )
     assert "authorized_users" not in manifest
 
 

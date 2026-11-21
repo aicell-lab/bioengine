@@ -27,6 +27,7 @@ Messages are Serve's own, copied from ``_check_and_update_transitioning_replicas
 source, so a Serve rewording fails here instead of quietly turning every reading into
 "no pair".
 """
+
 from __future__ import annotations
 
 import inspect
@@ -193,7 +194,9 @@ class TestVramIsTheGpuRequirementOnThisPlatform:
         # unreadable status from becoming a verdict. Kept as the defensive case it
         # is, and labelled so nobody mistakes it for the real-data path above.
         nodes = {"n1": {"total_cpu": 4.0, "total_gpu": 1.0, "total_memory": GIB}}
-        assert placement_shortfall(_slow_allocation({"VRAM_MB": 80000}, {}), nodes) == {}
+        assert (
+            placement_shortfall(_slow_allocation({"VRAM_MB": 80000}, {}), nodes) == {}
+        )
 
 
 class TestCapacity:
@@ -225,7 +228,10 @@ class TestParsing:
         assert available == {"CPU": 0.0}
 
     def test_a_requirement_exactly_filling_a_node_is_not_a_shortfall(self):
-        assert placement_shortfall(_slow_allocation({"CPU": 4.0}, {}), ONE_SMALL_NODE) == {}
+        assert (
+            placement_shortfall(_slow_allocation({"CPU": 4.0}, {}), ONE_SMALL_NODE)
+            == {}
+        )
 
     def test_every_short_resource_is_named_not_just_the_first(self):
         message = _slow_allocation({"CPU": 16, "GPU": 4, "memory": 8}, {})
@@ -281,7 +287,10 @@ class TestNoVerdictWithoutEvidence:
     def test_a_bundle_list_would_otherwise_have_looked_short(self):
         # A bundle must fit on one node and arrives as a JSON list; deliberately not
         # interpreted rather than guessed at.
-        assert placement_shortfall(_slow_allocation([{"GPU": 4}], {}), ONE_SMALL_NODE) == {}
+        assert (
+            placement_shortfall(_slow_allocation([{"GPU": 4}], {}), ONE_SMALL_NODE)
+            == {}
+        )
 
 
 class TestProjection:

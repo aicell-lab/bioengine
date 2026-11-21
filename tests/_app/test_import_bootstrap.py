@@ -11,6 +11,7 @@ populated tmp_path, patching ``setup_replica_environment`` to put a tiny
 user package on ``sys.path``, and asserting that an import of a name
 that didn't exist before the finder fired now resolves.
 """
+
 from __future__ import annotations
 
 import importlib
