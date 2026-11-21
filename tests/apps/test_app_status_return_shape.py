@@ -560,3 +560,64 @@ def test_the_docstring_does_NOT_say_an_absent_count_means_NONE():
     assert "n_previous_replica" in doc, (
         "the docstring does not name the parameter that decides whether the count exists"
     )
+
+
+def test_counting_RAY_KILL_entries_does_not_recover_the_number_stopped():
+    """The listing is a PAGE, not a total — so it cannot stand in for the missing count.
+
+    On the n_previous_replica path the stopped replicas appear individually, but only the
+    `n_previous_replica` most recent of them (all only at -1). A caller who, finding no count,
+    falls back to counting RAY_KILL entries gets the page size rather than the number stopped —
+    the same absence-as-value mistake one step along.
+
+    Driven through the real ProxyActor with FIVE stopped replicas and a page size of two.
+    """
+    from tests.test_replica_death_cause import _RAY_KILL, _deployment_actor
+
+    registered = {f"stop{i}": (f"a_stop{i}", 2.0 + i, "UTC") for i in range(5)}
+    registered["live1"] = ("a_live", 1.0, "UTC")
+    causes = {f"a_stop{i}": _RAY_KILL for i in range(5)}
+
+    paged = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(
+        application_id="soup", deployment_name="CellposeRuntime", n_previous_replica=2
+    )
+    kills = [
+        r for r, rec in paged.items()
+        if isinstance(rec, dict)
+        and (rec.get("death_cause") or {}).get("reason") == "RAY_KILL"
+    ]
+    assert "_deliberately_stopped_replicas" not in paged, (
+        "a count appeared on the paged path, which would make this arm pointless"
+    )
+    assert len(kills) == 2, (
+        f"expected the page size (2) RAY_KILL entries, got {len(kills)} ({sorted(kills)}) -- if "
+        f"this is 5 the listing is not bounded and the docstring's 'page size, not a total' is "
+        f"wrong"
+    )
+
+    # the DEFAULT path knows the real number, which is what makes the page misleading
+    counted = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(application_id="soup", deployment_name="CellposeRuntime")
+    assert counted.get("_deliberately_stopped_replicas") == 5, (
+        f"the default path did not count all five, so the contrast this arm rests on is absent: "
+        f"{counted.get('_deliberately_stopped_replicas')!r}"
+    )
+    assert len(kills) < counted["_deliberately_stopped_replicas"], (
+        "the paged listing is not smaller than the true count, so counting entries would in fact "
+        "recover the number and the docstring's warning would be unnecessary"
+    )
+
+
+def test_the_docstring_says_the_listing_is_BOUNDED_not_a_total():
+    """The wording half: without it, a reader fills the gap by counting entries."""
+    doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    assert "page size, not a total" in doc, (
+        "the docstring does not say the RAY_KILL listing is bounded by n_previous_replica, so a "
+        "reader who finds no count will count entries and get the page size"
+    )
+    assert "most recent" in doc, (
+        "the docstring does not say WHICH of the stopped replicas are listed"
+    )

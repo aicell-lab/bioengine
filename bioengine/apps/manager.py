@@ -4357,8 +4357,12 @@ class AppsManager:
 
               * ``n_previous_replica != 0`` (including a per-deployment override in
                 ``deployment_logs``, which this method's own example uses). On that path the
-                stopped replicas are listed INDIVIDUALLY as ``logs`` entries carrying
-                ``death_cause`` with reason ``RAY_KILL``, and no count is emitted at all; or
+                stopped replicas appear as ``logs`` entries carrying ``death_cause`` with
+                reason ``RAY_KILL``, and no count is emitted at all — **but only the
+                ``n_previous_replica`` most recent of them**, and all of them only at ``-1``.
+                So counting ``RAY_KILL`` entries does NOT recover the number stopped: a
+                deployment scaled down thirty times, queried with ``n_previous_replica=3``,
+                shows three such entries and no count. The bound is a page size, not a total; or
               * the death-cause lookup failed, which ``death_causes_unavailable`` marks.
 
             So read an absent count as **"none, or not counted on this query"**. A caller that
@@ -4366,7 +4370,9 @@ class AppsManager:
             as having been scaled down never — which is the same mistake as reading an absent
             ``timezone`` as UTC.
 
-            ``death_causes_unavailable`` is set only when the cause lookup FAILED:
+            The two fields themselves, for reference — ``deliberately_stopped_replicas`` as
+            described above, and ``death_causes_unavailable`` set only when the cause lookup
+            FAILED:
 
                 deployments[<class_name>].deliberately_stopped_replicas = <int>
                 deployments[<class_name>].death_causes_unavailable = True
