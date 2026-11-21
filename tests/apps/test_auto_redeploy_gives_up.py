@@ -68,7 +68,11 @@ def _serve_status(state: str, *, also: dict | None = None):
     return SimpleNamespace(applications=apps)
 
 
-def _app_entry(entry: str = ENTRY, last_updated_at: float = 1.0) -> dict:
+def _app_entry(
+    entry: str = ENTRY,
+    last_updated_at: float = 1.0,
+    auto_redeploy: bool = True,
+) -> dict:
     is_deployed = asyncio.Event()
     is_deployed.set()
     return {
@@ -78,7 +82,11 @@ def _app_entry(entry: str = ENTRY, last_updated_at: float = 1.0) -> dict:
         "last_updated_at": last_updated_at,
         "artifact_id": "bioimage-io/model-runner",
         "version": VERSION,
-        "auto_redeploy": True,
+        # Defaults to True so every arm written before this parameter existed is
+        # unchanged. The bound arm below passes the value RESOLVED BY THE REAL
+        # GUARD instead, which is what ties the bound to the new default rather
+        # than to a constant a test chose.
+        "auto_redeploy": auto_redeploy,
         "entry_deployment_name": entry,
         "built_app": SimpleNamespace(
             spec={"entry_id": f"deployment:{entry}", "classes": {}}
@@ -87,7 +95,7 @@ def _app_entry(entry: str = ENTRY, last_updated_at: float = 1.0) -> dict:
     }
 
 
-def _make_manager(*, extra_app: bool = False) -> AppsManager:
+def _make_manager(*, extra_app: bool = False, auto_redeploy: bool = True) -> AppsManager:
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test.giveup")
     manager.server = None
@@ -95,7 +103,7 @@ def _make_manager(*, extra_app: bool = False) -> AppsManager:
     manager._missing_from_status = {}
     manager._deleted_pending_redeploy = set()
     manager._identity_warned = set()
-    manager._deployed_applications = {APP_ID: _app_entry()}
+    manager._deployed_applications = {APP_ID: _app_entry(auto_redeploy=auto_redeploy)}
     if extra_app:
         manager._deployed_applications[OTHER_APP_ID] = _app_entry("FineTune")
 
@@ -680,3 +688,155 @@ async def test_a_give_up_on_REAL_failures_still_says_they_failed(clock, caplog) 
     assert len(errors) == 1
     assert "auto-redeploys all failed" in errors[0], errors[0]
     assert "could not run" not in errors[0], errors[0]
+
+
+# ── the bound and the new default, joined ────────────────────────────────────
+#
+# The arms above establish that a never-recovering app is given up on after
+# _REDEPLOY_MAX_ATTEMPTS, given auto_redeploy True. They do NOT establish that an
+# application deployed with the argument OMITTED gets that treatment, because the
+# fixture chose True itself. That is the whole safety argument of defaulting the
+# flag on: the default is only acceptable BECAUSE the attempts are bounded, so the
+# two have to be shown to meet.
+#
+# So resolve the value the way production resolves it -- by executing deploy_app's
+# own new-application guard with auto_redeploy=None -- and feed THAT into the
+# bounded monitor.
+
+
+def _resolved_default_for_an_omitted_argument() -> bool:
+    """Run deploy_app's real new-application guard with the argument omitted.
+
+    Executes the production source segment, not a copy of it: if the guard stops
+    defaulting to True, or stops being an `is None` guard, this returns something
+    other than True and the arm below fails rather than silently testing a
+    constant.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    src = inspect.getsource(_manager_module)
+    tree = ast.parse(src)
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "deploy_app"
+        ),
+        None,
+    )
+    assert fn is not None, "manager.py has no deploy_app -- the anchor moved, not the fix"
+
+    blocks = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        t = node.test
+        if not (
+            isinstance(t, ast.Compare)
+            and isinstance(t.left, ast.Name)
+            and t.left.id == "auto_redeploy"
+            and len(t.ops) == 1
+            and isinstance(t.ops[0], ast.Is)
+            and isinstance(t.comparators[0], ast.Constant)
+            and t.comparators[0].value is None
+        ):
+            continue
+        seg = ast.get_source_segment(src, node)
+        if seg and "existing_app" not in seg:
+            blocks.append(seg)
+
+    assert len(blocks) == 1, (
+        f"expected exactly one new-application `auto_redeploy is None` guard, found "
+        f"{len(blocks)}"
+    )
+    ns = {"auto_redeploy": None}
+    exec(textwrap.dedent(blocks[0]), {}, ns)
+    return ns["auto_redeploy"]
+
+
+@pytest.mark.asyncio
+async def test_an_app_deployed_with_the_ARGUMENT_OMITTED_is_still_given_up_on(
+    clock, caplog
+) -> None:
+    """THE JOIN. An omitted argument now means auto_redeploy on, and that is only
+    safe because the attempts are bounded. This drives the real monitor with the
+    value the real guard produces for an omitted argument."""
+    resolved = _resolved_default_for_an_omitted_argument()
+    assert resolved is True, (
+        f"deploy_app's new-application guard resolves an OMITTED auto_redeploy to "
+        f"{resolved!r}, not True -- this arm is about the default being ON"
+    )
+
+    manager = _make_manager(auto_redeploy=resolved)
+
+    with caplog.at_level(logging.ERROR, logger="test.giveup"):
+        for _ in range(_REDEPLOY_MAX_ATTEMPTS * 3):
+            await _tick(manager, "DEPLOY_FAILED")
+            clock.advance_past_the_backoff()
+
+    fired = manager._deploy_application.await_count
+    assert fired == _REDEPLOY_MAX_ATTEMPTS, (
+        f"an app deployed with the argument omitted fired {fired} redeploys against a "
+        f"cap of {_REDEPLOY_MAX_ATTEMPTS}"
+    )
+    assert fired > 1, "nothing was retried, so this arm proves nothing about a cap"
+
+    # The attempt count is FROZEN at the cap, read from the monitor's own budget.
+    budget = manager._redeploy_backoff.get(APP_ID) or {}
+    assert budget.get("consecutive_failures") == _REDEPLOY_MAX_ATTEMPTS, (
+        f"the attempt count is {budget.get('consecutive_failures')!r}, not frozen at "
+        f"{_REDEPLOY_MAX_ATTEMPTS}"
+    )
+
+    # And the give-up is PUBLISHED, read where _get_app_status reads it.
+    assert _status_field(manager) is not None, (
+        "an app deployed with the argument omitted stopped being retried without "
+        "auto_redeploy_exhausted_at being set, so no caller can tell"
+    )
+
+    errors = _errors(caplog)
+    assert len(errors) == 1, f"expected exactly ONE give-up line, got {len(errors)}"
+    assert "Giving up" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_the_OPT_OUT_is_never_retried_at_all_so_the_bound_is_not_what_protects_it(
+    clock, monkeypatch
+) -> None:
+    """CONTROL on the arm above. An explicit False must not be retried even once.
+
+    Without this, the join arm would pass against a worker that ignores
+    auto_redeploy entirely and retries everything up to the cap -- which is the
+    same observable as "the default is on" for the one app the join arm watches.
+
+    A worker whose only app opted out takes the no-apps-to-redeploy branch, which
+    probes for a lost Serve controller before returning. That probe needs
+    `_last_controller_recovery` and would otherwise do a real actor lookup, so it
+    is stubbed the way the controller-loss arms stub it. Stubbing it `False` --
+    controller present -- keeps this arm about redeploys and nothing else.
+    """
+    manager = _make_manager(auto_redeploy=False)
+    manager._last_controller_recovery = 0.0
+
+    async def _controller_present() -> bool:
+        return False
+
+    monkeypatch.setattr(
+        _manager_module, "_controller_is_missing_off_loop", _controller_present
+    )
+
+    for _ in range(_REDEPLOY_MAX_ATTEMPTS * 3):
+        await _tick(manager, "DEPLOY_FAILED")
+        clock.advance_past_the_backoff()
+
+    assert manager._deploy_application.await_count == 0, (
+        f"an app with auto_redeploy=False was redeployed "
+        f"{manager._deploy_application.await_count} time(s)"
+    )
+    assert _status_field(manager) is None, (
+        "an app that opted out reports auto_redeploy_exhausted_at, which says the "
+        "worker gave up retrying something it never retried"
+    )
