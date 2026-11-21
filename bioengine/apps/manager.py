@@ -4252,7 +4252,7 @@ class AppsManager:
         self,
         application_ids: Optional[List[str]] = Field(
             None,
-            description="List of application IDs to retrieve status for. If not provided, status for all deployed applications will be returned. If a list with only one application ID is provided, only that application's status is returned directly (not nested in a dictionary).",
+            description="List of application IDs to retrieve status for. If not provided, status for all deployed applications will be returned. The result is always a dictionary keyed by application id, including when exactly one id is requested, so a caller never has to branch on how many it asked for.",
         ),
         logs_tail: int = Field(
             30,
@@ -4309,15 +4309,35 @@ class AppsManager:
         Args:
             application_ids: Optional list of specific application IDs to query.
                            If None, returns status for all tracked applications.
-                           If a list with exactly one application ID, returns only
-                           that application's status directly (not wrapped in a dictionary).
 
         Returns:
-            - If application_ids is None or contains multiple IDs: Dictionary mapping
-              application IDs to their detailed status information.
-            - If application_ids contains exactly one ID: The status information for
-              that single application (not nested in a dictionary).
-            - Empty dictionary if no applications match the criteria (when application_ids is None).
+            Always a dictionary KEYED BY application id, whatever the query — including a
+            query naming exactly one application. Empty when application_ids is None and
+            nothing is deployed.
+
+            The shape does not special-case a single id, so a caller never has to branch on
+            how many it asked for:
+
+                status = await get_app_status(application_ids=["app1"])
+                app = status["app1"]
+
+            Each value has the fields built by ``_get_app_status``. Two of them are nested
+            deeper than the rest and are easy to mis-read:
+
+            ``deployments`` maps the user's ``@bioengine.app`` class name to that
+            deployment's state, and its ``logs`` key is keyed again, BY REPLICA ID:
+
+                deployments[<class_name>].logs[<replica_id>] = {
+                    "stdout": ..., "stderr": ...,
+                    "creation_timestamp": <epoch float>,
+                    "timezone": <tz name, e.g. "CET">,
+                }
+
+            ``timezone`` is always present and names the zone of the timestamps INSIDE the
+            ``stdout`` and ``stderr`` text — it is the replica's local zone and is NOT
+            necessarily UTC. Comparing those timestamps against a UTC clock without applying
+            it yields an offset error in the direction that makes recent log lines look old.
+            ``creation_timestamp`` is a plain epoch value and needs no such handling.
 
         Raises:
             RuntimeError: If Ray cluster connection is unavailable
@@ -4336,9 +4356,15 @@ class AppsManager:
             apps = await get_app_status(application_ids=["app1", "app2"])
             # Returns: {"app1": {...}, "app2": {...}}
 
-            # Get single application (returns status directly)
-            app = await get_app_status(application_ids=["app1"])
-            # Returns: {...} (single app status, not {"app1": {...}})
+            # Get a single application — STILL keyed by its id, not unwrapped
+            status = await get_app_status(application_ids=["app1"])
+            # Returns: {"app1": {...}}
+            app = status["app1"]
+
+            # Replica logs are two levels below the deployment, and carry their own zone
+            logs = app["deployments"]["MyApp"]["logs"]
+            for replica_id, streams in logs.items():
+                streams["stdout"], streams["stderr"], streams["timezone"]
         """
         _validate_deployment_logs_map(deployment_logs)
 
