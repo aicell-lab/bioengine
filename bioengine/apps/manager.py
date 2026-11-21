@@ -2694,8 +2694,15 @@ class AppsManager:
         application_info: Dict[str, Any],
         attempt: int,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Schedule a redeploy task, logging what triggered it.
+
+        Returns True when a redeploy was actually started, False when the attempt
+        was counted against the cap but nothing ran — an application recovered
+        from a previous worker carries no built application, so there is nothing
+        to resubmit. The caller tallies the Falses so the give-up line can say
+        that attempts "could not run" rather than that redeploys "failed".
+
 
         ``reason`` is what makes an incident readable afterwards: an explicit
         UNHEALTHY verdict and a missing status entry are different failures and
