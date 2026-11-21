@@ -4358,11 +4358,17 @@ class AppsManager:
               * ``n_previous_replica != 0`` (including a per-deployment override in
                 ``deployment_logs``, which this method's own example uses). On that path the
                 stopped replicas appear as ``logs`` entries carrying ``death_cause`` with
-                reason ``RAY_KILL``, and no count is emitted at all — **but only the
-                ``n_previous_replica`` most recent of them**, and all of them only at ``-1``.
-                So counting ``RAY_KILL`` entries does NOT recover the number stopped: a
-                deployment scaled down thirty times, queried with ``n_previous_replica=3``,
-                shows three such entries and no count. The bound is a page size, not a total; or
+                reason ``RAY_KILL``, and no count is emitted at all — **but the page is the
+                ``n_previous_replica`` most recently REGISTERED dead replicas, of ANY cause**,
+                and all of them only at ``-1``. Two things follow. Counting ``RAY_KILL``
+                entries does NOT recover the number stopped: a deployment scaled down thirty
+                times, queried with ``n_previous_replica=3``, shows three such entries and no
+                count — the bound is a page size, not a total. And abnormal deaths take up
+                room in that same page, so with ``n_previous_replica=3`` and two recent
+                crashes a single ``RAY_KILL`` entry can be all that is left of thirty stops.
+                "Most recently registered" is also not "most recently dead": Ray's
+                ``ActorState`` carries no death timestamp, so death order is not knowable
+                here at all; or
               * the death-cause lookup failed, which ``death_causes_unavailable`` marks.
 
             So read an absent count as **"none, or not counted on this query"**. A caller that

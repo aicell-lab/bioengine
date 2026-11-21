@@ -565,8 +565,8 @@ def test_the_docstring_does_NOT_say_an_absent_count_means_NONE():
 def test_counting_RAY_KILL_entries_does_not_recover_the_number_stopped():
     """The listing is a PAGE, not a total — so it cannot stand in for the missing count.
 
-    On the n_previous_replica path the stopped replicas appear individually, but only the
-    `n_previous_replica` most recent of them (all only at -1). A caller who, finding no count,
+    On the n_previous_replica path the stopped replicas appear individually, but only within a
+    page of `n_previous_replica` dead replicas (all only at -1). A caller who, finding no count,
     falls back to counting RAY_KILL entries gets the page size rather than the number stopped —
     the same absence-as-value mistake one step along.
 
@@ -618,8 +618,85 @@ def test_the_docstring_says_the_listing_is_BOUNDED_not_a_total():
         "the docstring does not say the RAY_KILL listing is bounded by n_previous_replica, so a "
         "reader who finds no count will count entries and get the page size"
     )
-    assert "most recent" in doc, (
-        "the docstring does not say WHICH of the stopped replicas are listed"
+    assert "most recently REGISTERED dead replicas, of ANY cause" in doc, (
+        "the docstring does not say WHICH dead replicas the page contains. 'most recent' alone "
+        "is wrong twice: the page is taken over dead replicas of every cause, not the RAY_KILL "
+        "ones, and it is registration order rather than death order"
+    )
+    assert "death order is not knowable" in doc, (
+        "the docstring does not say that death order is unknowable here, so a reader takes "
+        "'most recently registered' to be a proxy for 'most recently dead'"
+    )
+
+
+def test_an_ABNORMAL_death_takes_up_room_in_the_page_so_a_RAY_KILL_can_be_squeezed_OUT():
+    """The page is over ALL dead replicas, not over the deliberately-stopped ones.
+
+    This is the reading the old wording ("the n_previous_replica most recent of them", where
+    "them" were the stopped replicas) licensed: that asking for n previous replicas yields n
+    stopped ones. It does not. Crashes occupy the same page, so a deployment that really was
+    scaled down can show ZERO RAY_KILL entries at a page size of two — and a caller who takes
+    the listing as the stopped set then reports no deliberate stops at all.
+
+    Registration order is what decides, and `_deployment_actor` registers in dict order, so the
+    two crashes are registered LAST and the page of two is exactly them.
+
+    Driven through the real ProxyActor.
+    """
+    from tests.test_replica_death_cause import _OOM, _RAY_KILL, _deployment_actor
+
+    registered = {
+        "stopped1": ("a_stop1", 2.0, "UTC"),
+        "stopped2": ("a_stop2", 3.0, "UTC"),
+        "crashed1": ("a_crash1", 4.0, "UTC"),
+        "crashed2": ("a_crash2", 5.0, "UTC"),
+        "live1": ("a_live", 1.0, "UTC"),
+    }
+    causes = {
+        "a_stop1": _RAY_KILL,
+        "a_stop2": _RAY_KILL,
+        "a_crash1": _OOM,
+        "a_crash2": _OOM,
+    }
+
+    paged = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(
+        application_id="soup", deployment_name="CellposeRuntime", n_previous_replica=2
+    )
+    reasons = {
+        r: (rec.get("death_cause") or {}).get("reason")
+        for r, rec in paged.items()
+        if isinstance(rec, dict) and rec.get("death_cause")
+    }
+    assert len(reasons) == 2, (
+        f"expected a page of two dead replicas, got {len(reasons)}: {reasons!r} -- if this is 4 "
+        f"the page bound is not applied and the rest of this arm means nothing"
+    )
+    assert "RAY_KILL" not in reasons.values(), (
+        f"a RAY_KILL entry survived a page of two filled by the two most recently registered "
+        f"replicas, both of which crashed: {reasons!r}. Either the page is taken over the "
+        f"deliberately-stopped replicas only -- which is what the OLD docstring wording said "
+        f"and this arm exists to refute -- or the ordering is not registration order"
+    )
+
+    # CONTROL: two replicas really WERE stopped deliberately, so the absence above is the page
+    # bound and not an input with no stops in it.
+    counted = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(application_id="soup", deployment_name="CellposeRuntime")
+    assert counted.get("_deliberately_stopped_replicas") == 2, (
+        f"the default path did not report two deliberate stops, so this arm cannot show that "
+        f"the page HID them: {counted.get('_deliberately_stopped_replicas')!r}"
+    )
+
+
+def test_the_docstring_warns_that_a_CRASH_can_crowd_a_stop_out_of_the_page():
+    """The wording half of the arm above."""
+    doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    assert "abnormal deaths take up room in that same page" in doc, (
+        "the docstring does not say that abnormal deaths share the page with the RAY_KILL "
+        "entries, so a reader takes a page of n to hold n stopped replicas"
     )
 
 
