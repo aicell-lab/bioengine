@@ -5,10 +5,11 @@ while one already RUNNING rides it out. So the app that dies is the one nobody
 is watching yet, and it stays dead until a human notices. This was observed in
 production as a 19-hour outage of that exact shape.
 
-Defaulting it on used to be a trade: a dead app for indefinite retries. It is
-not any more, because attempts are bounded and the worker reports
-``auto_redeploy_exhausted_at`` when it gives up. **This default must not land
-without that bound**, which is why one test here asserts the bound exists.
+Defaulting it on is only a safe trade because the retries are finite: attempts are
+bounded and the worker reports ``auto_redeploy_exhausted_at`` when it gives up, so
+the alternative to a dead app is a bounded number of retries and not an indefinite
+one. **This default is not correct without that bound**, which is why one test here
+asserts the bound exists.
 
 THE OVER-REACH ARMS ARE THE POINT. A flip that also overrode an explicit
 ``auto_redeploy=False``, or that forced an UPDATE's inherited value to True,
@@ -156,8 +157,8 @@ def test_startup_applications_inherit_the_default_rather_than_setting_their_own(
 
 # ─────────────────── behavioural: the decision is EXECUTED ───────────────────
 #
-# Every arm above is a source-text or AST assertion, and two one-line mutants defeat them
-# with two one-line mutants that both passed 8/8:
+# Every arm above is a source-text or AST assertion, and a source-text assertion cannot see
+# what a value becomes. Two one-line edits satisfy all of them while inverting the behaviour:
 #   M1  an unconditional `auto_redeploy = True` after the guard, so an explicit False is overridden
 #   M2  storing `"auto_redeploy": False` in the deployed-app record whatever the argument said
 # The arms below run the real decision and pin its assignment sites, so both go red.
@@ -234,17 +235,17 @@ def test_the_UPDATE_path_INHERITS_and_an_explicit_value_SURVIVES_it():
 def _auto_redeploy_stores(scope):
     """Every node that WRITES the name ``auto_redeploy`` anywhere in ``scope``.
 
-    Keyed on the Name node's context being a Store, NOT on the statement's type. That choice is
-    what makes this an allow-list rather than a list of shapes somebody thought of: one predicate
-    covers plain assignment, a tuple or list target (``auto_redeploy, _ = True, None``), an
-    annotated assignment (``auto_redeploy: bool = True``), an augmented assignment, a walrus
+    Keyed on the Name node's context being a Store, NOT on the statement's type. That is what
+    makes this an allow-list rather than an enumeration of statement types: one predicate covers
+    plain assignment, a tuple or list target (``auto_redeploy, _ = True, None``), an annotated
+    assignment (``auto_redeploy: bool = True``), an augmented assignment, a walrus
     (``(auto_redeploy := True)``), a ``for`` target, a ``with ... as`` target and a comprehension
     target, because every one of them puts a Store-context Name in the tree.
 
-    An earlier version of this helper matched ``ast.Assign`` with ``ast.Name`` targets. Two
-    one-line mutants beat it while every test stayed green: a tuple target, because the target is
-    then a Tuple and not a Name, and an annotated assignment, because that is an AnnAssign and
-    never an Assign at all. Both override an explicit ``auto_redeploy=False``.
+    Matching ``ast.Assign`` with ``ast.Name`` targets instead is not equivalent, and the
+    difference is load-bearing: a tuple target makes the target a ``Tuple`` and not a ``Name``,
+    and an annotated assignment is an ``AnnAssign`` and never an ``Assign`` at all, so neither is
+    visible to that predicate -- while both override an explicit ``auto_redeploy=False``.
 
     ``except ... as auto_redeploy`` is covered separately: it carries the name as a plain string
     on the handler, with no Name node to find.
@@ -282,9 +283,10 @@ def test_EVERY_write_of_auto_redeploy_in_deploy_app_is_BEHIND_a_None_guard():
 
 
 def test_the_guard_finder_SEES_every_write_form_a_mutant_could_use():
-    """Guards the guard. If `_auto_redeploy_stores` stopped seeing a form, the arm above would
-    pass for a mutant using it -- the failure that produced this test. So assert the finder
-    counts a write in each form, on synthetic source rather than on production code."""
+    """Guards the guard. The arm above is only as strong as what `_auto_redeploy_stores` can
+    see: a write in a form the finder misses is a write the allow-list reports as absent, which
+    is a silent pass rather than a failure. So assert the finder counts a write in each form, on
+    synthetic source rather than on production code."""
     forms = {
         "plain": "auto_redeploy = True",
         "tuple": "auto_redeploy, _ = True, None",
@@ -358,24 +360,30 @@ def test_the_deployed_record_STORES_THE_VARIABLE_not_a_constant():
 
 
 def test_the_RECORD_is_written_ONLY_by_the_dict_literal_and_nothing_else():
-    """Allow-list over the STRING, because an allow-list over write SHAPES keeps losing.
+    """Allow-list over the STRING, because the name-write allow-list cannot reach this.
 
     Enumerating the ways a value can be bound to the NAME ``auto_redeploy`` catches an
     assignment, a tuple target, an annotation, an augmented assignment and a walrus -- and
-    still misses a write that never touches the name at all:
+    still cannot see a write that never touches the name at all:
 
         self._deployed_applications[application_id]["auto_redeploy"] = True
 
-    That is a Subscript target, not a Name, so no amount of Name-write enumeration sees it,
-    and it overrides the recorded value after the dict literal has honoured the caller. It was
-    measured surviving the whole file. ``.update({"auto_redeploy": True})``,
-    ``setdefault`` and ``setattr`` are the same defect one step further along, and adding each
-    to a list of shapes is the mistake that produced this test.
+    That is a Subscript target, not a Name, so no amount of Name-write enumeration sees it, and
+    it overrides the recorded value after the dict literal has honoured the caller.
+    ``.update({"auto_redeploy": True})`` and ``setdefault`` are the same defect one step further
+    along, so enumerating those statement types is not the fix either.
 
     So invert it: count the string constants equal to ``"auto_redeploy"`` inside ``deploy_app``
-    and require each to be one of the two legitimate uses. Any route that writes the key --
-    subscript, update, setdefault -- must mention the string to do it, so it shows up here
-    whatever syntax it uses.
+    and require each to be one of the two legitimate uses. A route that writes the key by
+    naming it -- subscript, ``update``, ``setdefault`` -- has to mention the string to find it,
+    so it surfaces here whichever of those it uses.
+
+    LIMIT, because this arm must not be read as more than it is: a key the code COMPUTES rather
+    than names is invisible to any string match. ``record["auto_" + "redeploy"] = True`` passes
+    this arm and every other arm in this file. That one is caught behaviourally instead, by
+    reading ``auto_redeploy`` back off a live worker for an explicitly opted-out deploy, where
+    it reports True for a caller that asked for False. CI does not run that arm, so this file
+    does not close that route and does not claim to.
 
     The two legitimate uses:
       1. the key of the record dict literal, whose value must be the resolved NAME
