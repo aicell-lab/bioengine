@@ -401,12 +401,15 @@ def test_the_conditional_SIBLINGS_are_documented_as_conditional():
     `death_causes_unavailable` only when the lookup FAILED, so indexing either raises on a
     healthy deployment. The docstring has to say so, or a caller writes `dep[...]`."""
     doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
-    assert "only when NON-ZERO" in doc or "only when non-zero" in doc, (
-        "the docstring shows deliberately_stopped_replicas unconditionally; it is present only "
-        "when non-zero, so a caller indexing it gets KeyError on a deployment never scaled down"
+    assert "present only sometimes" in doc, (
+        "the docstring does not say the two sibling fields are conditional, so a caller indexes "
+        "them and gets KeyError on a perfectly healthy deployment"
     )
-    assert "only when the cause lookup FAILED" in doc or "when present" in doc, (
-        "the docstring does not mark death_causes_unavailable as conditional"
+    assert "read them with ``.get``" in doc or "read them with .get" in doc, (
+        "the docstring does not tell the reader how to read a conditional field safely"
+    )
+    assert "only when the cause lookup FAILED" in doc, (
+        "the docstring does not say when death_causes_unavailable is set"
     )
 
 
@@ -474,4 +477,86 @@ def test_the_PUBLIC_view_withholds_logs_and_BOTH_siblings():
     assert "WITHHELD" in doc.upper(), (
         "the docstring does not say that an absence in the public view means withheld rather "
         "than zero, which is the reading that makes a healthy app look idle"
+    )
+
+
+# ── the count is a SUMMARY of one query shape, not a fact about the deployment ──
+
+
+def test_the_count_is_ABSENT_on_a_non_default_n_previous_replica_even_though_replicas_WERE_stopped():
+    """`absent` cannot mean "none": the count only exists on the default query.
+
+    The proxy emits `_deliberately_stopped_replicas` in exactly one place, under
+    `n_previous_replica == 0`. On any other value the stopped replicas are listed
+    INDIVIDUALLY with `death_cause` reason RAY_KILL and no count is produced — so a caller
+    that asked for previous replicas, or that set a per-deployment `n_previous_replica`
+    override (this method's own example does), gets no count for a deployment that really
+    was scaled down.
+
+    Driven through the REAL ProxyActor.get_deployment_logs, because the arm above stubs it
+    and therefore cannot see this branch at all.
+    """
+    from tests.test_replica_death_cause import _RAY_KILL, _deployment_actor
+
+    registered = {
+        "stopped1": ("a_stopped1", 2.0, "UTC"),
+        "live1": ("a_live", 1.0, "UTC"),
+    }
+    causes = {"a_stopped1": _RAY_KILL}
+
+    # the DEFAULT path: a count, and no individual entry for the stopped replica
+    default_logs = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+        # _deployment_actor registers under exactly these ids; anything else finds no
+        # replicas at all and the arm would pass for the wrong reason.
+    ).get_deployment_logs(application_id="soup", deployment_name="CellposeRuntime")
+    assert default_logs.get("_deliberately_stopped_replicas") == 1, (
+        f"the default path did not summarise the stopped replica: {sorted(default_logs)}"
+    )
+    assert "stopped1" not in default_logs, (
+        "the default path listed the stopped replica individually as well as counting it"
+    )
+
+    # n_previous_replica=1: NO count, and the stopped replica listed individually
+    listed_logs = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(
+        application_id="soup", deployment_name="CellposeRuntime", n_previous_replica=1
+    )
+    assert "_deliberately_stopped_replicas" not in listed_logs, (
+        f"a count appeared on the n_previous_replica=1 path, so the docstring's claim that the "
+        f"count is default-path-only is wrong: {sorted(listed_logs)}"
+    )
+    assert "stopped1" in listed_logs, (
+        f"the stopped replica is neither counted nor listed on this path, so it is invisible: "
+        f"{sorted(listed_logs)}"
+    )
+    assert (listed_logs["stopped1"].get("death_cause") or {}).get("reason") == "RAY_KILL", (
+        "the individually-listed stopped replica does not carry its RAY_KILL cause, so a caller "
+        "cannot recover what the count would have told them"
+    )
+
+    # The two query shapes DISAGREE about the same deployment -- which is the whole point.
+    assert ("_deliberately_stopped_replicas" in default_logs) != (
+        "_deliberately_stopped_replicas" in listed_logs
+    ), "both query shapes behaved the same, so this arm would prove nothing"
+
+
+def test_the_docstring_does_NOT_say_an_absent_count_means_NONE():
+    """The wording half of the arm above. "absent means none" is false and false in the
+    direction this module exists to correct: it turns "not counted on this query" into a
+    measurement of zero."""
+    doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    for wrong in ("absent means none", "absent means zero", "absence means none"):
+        assert wrong not in doc.lower(), (
+            f"the docstring says {wrong!r} of deliberately_stopped_replicas; the count is a "
+            f"summary of the default query only, so a caller reading that reports a deployment "
+            f"scaled down thirty times as never scaled down"
+        )
+    assert "not counted on this query" in doc.lower(), (
+        "the docstring does not say what an absent count actually means, so a reader fills the "
+        "gap with 'none'"
+    )
+    assert "n_previous_replica" in doc, (
+        "the docstring does not name the parameter that decides whether the count exists"
     )

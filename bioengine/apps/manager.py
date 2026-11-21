@@ -4346,14 +4346,30 @@ class AppsManager:
             the error entry and every abnormally dead replica on default arguments. Treating
             an absent ``timezone`` as UTC is a guess, not a default.
 
-            Two counts live BESIDE ``logs`` rather than inside it, and both are easy to miss.
+            Two fields live BESIDE ``logs`` rather than inside it, and both are easy to miss.
             **Both are present only sometimes**, so read them with ``.get`` — indexing either
-            raises on a perfectly healthy deployment:
+            raises on a perfectly healthy deployment. And for the count, **absent never simply
+            means "none"**:
+
+            ``deliberately_stopped_replicas`` is a SUMMARY produced only on the default
+            ``n_previous_replica=0`` path, and only when the death-cause lookup succeeded. So it
+            is absent — while replicas really were stopped deliberately — whenever
+
+              * ``n_previous_replica != 0`` (including a per-deployment override in
+                ``deployment_logs``, which this method's own example uses). On that path the
+                stopped replicas are listed INDIVIDUALLY as ``logs`` entries carrying
+                ``death_cause`` with reason ``RAY_KILL``, and no count is emitted at all; or
+              * the death-cause lookup failed, which ``death_causes_unavailable`` marks.
+
+            So read an absent count as **"none, or not counted on this query"**. A caller that
+            reads it as "none stopped" will report a deployment that was scaled down thirty times
+            as having been scaled down never — which is the same mistake as reading an absent
+            ``timezone`` as UTC.
+
+            ``death_causes_unavailable`` is set only when the cause lookup FAILED:
 
                 deployments[<class_name>].deliberately_stopped_replicas = <int>
-                                                      # only when NON-ZERO; absent means none
                 deployments[<class_name>].death_causes_unavailable = True
-                                                      # only when the cause lookup FAILED
 
             The first is lifted out of the logs map before this method returns, precisely so a
             caller iterating ``logs`` never meets an int where it expects a record — the proxy's
