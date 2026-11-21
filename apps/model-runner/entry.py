@@ -19,7 +19,6 @@ Heavier helper modules:
   keep models from being evicted mid-inference
 """
 
-
 import asyncio
 import json
 import logging
@@ -294,6 +293,7 @@ class EntryDeployment:
         # Replica identifier for logging.
         try:
             from ray import serve as _serve
+
             _ctx = _serve.get_replica_context()
             self.replica_id = _ctx.replica_tag
         except Exception:
@@ -458,7 +458,8 @@ class EntryDeployment:
         report_versions = {
             str(row[0]): str(row[1])
             for row in report.get("env", [])
-            if isinstance(row, (list, tuple)) and len(row) >= 2
+            if isinstance(row, (list, tuple))
+            and len(row) >= 2
             and str(row[0]) in current_versions
         }
         return all(
@@ -1161,9 +1162,7 @@ class EntryDeployment:
         }
         return job
 
-    def _new_infer_job(
-        self, model_id: str, return_download_url: bool
-    ) -> dict:
+    def _new_infer_job(self, model_id: str, return_download_url: bool) -> dict:
         """Create an infer-job record, register it and return it. Sweeps
         expired jobs on the way in.
         """
@@ -1302,10 +1301,7 @@ class EntryDeployment:
             if job["state"] not in ("completed", "failed", "cancelled"):
                 self._adopt_unfinished_infer_job(job, request_dir)
             completed_at = job["completed_at"]
-            if (
-                completed_at is None
-                or (now - completed_at) > self._INFER_JOBS_TTL_SEC
-            ):
+            if completed_at is None or (now - completed_at) > self._INFER_JOBS_TTL_SEC:
                 shutil.rmtree(request_dir, ignore_errors=True)
                 discarded += 1
                 continue
@@ -1726,9 +1722,7 @@ class EntryDeployment:
         """
         import re
 
-        match = re.search(
-            r"could not read Username for '(https://[^'/]+)", stderr_text
-        )
+        match = re.search(r"could not read Username for '(https://[^'/]+)", stderr_text)
         if not match or "git clone" not in stderr_text:
             return None
         host = match.group(1).split("//", 1)[1]
@@ -1862,9 +1856,7 @@ class EntryDeployment:
         import aiofiles
 
         timeout = httpx.Timeout(60.0, read=300.0)
-        async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True
-        ) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async with client.stream("GET", url, headers=headers) as resp:
                 resp.raise_for_status()
                 async with aiofiles.open(dest, "wb") as f:
@@ -1885,9 +1877,11 @@ class EntryDeployment:
         is in place and (when a sha is declared) verified.
         """
         if await asyncio.to_thread(local_path.exists):
-            if not expected_sha or await asyncio.to_thread(
-                self._sha256_file, local_path
-            ) == expected_sha:
+            if (
+                not expected_sha
+                or await asyncio.to_thread(self._sha256_file, local_path)
+                == expected_sha
+            ):
                 logger.info(
                     f"✅ Reusing cached HF weight for '{model_id}' [{fmt}]: "
                     f"{local_path.name}"
@@ -1903,9 +1897,7 @@ class EntryDeployment:
             f"🤗 Downloading gated HF weight for '{model_id}' [{fmt}] from {url}"
         )
         try:
-            await self._stream_download(
-                url, tmp, {"Authorization": f"Bearer {token}"}
-            )
+            await self._stream_download(url, tmp, {"Authorization": f"Bearer {token}"})
         except Exception as e:
             await asyncio.to_thread(tmp.unlink, True)
             logger.error(
@@ -1984,9 +1976,7 @@ class EntryDeployment:
             changed = True
 
         if changed:
-            rewritten = await asyncio.to_thread(
-                yaml.safe_dump, rdf, sort_keys=False
-            )
+            rewritten = await asyncio.to_thread(yaml.safe_dump, rdf, sort_keys=False)
             async with aiofiles.open(rdf_path, "w") as f:
                 await f.write(rewritten)
             logger.info(
@@ -2248,7 +2238,9 @@ class EntryDeployment:
         response = None
         rdf_url = None
         for rdf_name in ("bioimageio.yaml", "rdf.yaml"):
-            rdf_url = f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/{rdf_name}"
+            rdf_url = (
+                f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/{rdf_name}"
+            )
             response = await self.model_cache._get_url_with_retry(
                 rdf_url, params={"stage": str(stage).lower()}
             )
@@ -2305,7 +2297,9 @@ class EntryDeployment:
             return None
 
         doc_url = f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/{doc_path}"
-        logger.info(f"📄 Downloading documentation '{doc_path}' for model '{model_id}'.")
+        logger.info(
+            f"📄 Downloading documentation '{doc_path}' for model '{model_id}'."
+        )
 
         response = await self.model_cache._get_url_with_retry(
             doc_url, params={"stage": str(stage).lower()}
@@ -2320,7 +2314,9 @@ class EntryDeployment:
         try:
             response.raise_for_status()
         except Exception as e:
-            logger.warning(f"⚠️ Failed to download documentation for model '{model_id}': {e}")
+            logger.warning(
+                f"⚠️ Failed to download documentation for model '{model_id}': {e}"
+            )
             return None
 
         logger.info(f"✅ Successfully downloaded documentation for model '{model_id}'.")
@@ -2481,9 +2477,9 @@ class EntryDeployment:
         if custom_environment is None:
             model_alias = model_id.rsplit("/", 1)[-1]
             prior_report = await self._read_published_report(model_alias, stage)
-            custom_environment = (
-                (prior_report or {}).get("test_environment") == "custom"
-            )
+            custom_environment = (prior_report or {}).get(
+                "test_environment"
+            ) == "custom"
 
         # Publishing is authorized by the CALLER's identity; the write itself
         # still uses the app's own bioimage-io token. Authorization and
@@ -2511,9 +2507,7 @@ class EntryDeployment:
                 # Failure surfaces via ``result = {"error": ...}`` so the
                 # progress dict shape stays uniform across success and
                 # failure (no separate ``error`` field).
-                self._update_test_job(
-                    job, state="failed", result={"error": str(exc)}
-                )
+                self._update_test_job(job, state="failed", result={"error": str(exc)})
 
         job["_task"] = asyncio.create_task(_bg_execute())
         return job["job_id"]
@@ -2904,9 +2898,7 @@ class EntryDeployment:
                     "returned to the caller regardless."
                 )
             else:
-                published = await self._upload_test_report(
-                    model_id, stage, test_report
-                )
+                published = await self._upload_test_report(model_id, stage, test_report)
             test_report["published"] = published
 
         return test_report
@@ -3056,9 +3048,7 @@ class EntryDeployment:
             self._MODELS_COLLECTION,
         ):
             try:
-                artifact = await self.artifact_manager.read(
-                    artifact_id, silent=True
-                )
+                artifact = await self.artifact_manager.read(artifact_id, silent=True)
             except Exception:
                 continue
             permissions = (artifact.get("config") or {}).get("permissions") or {}
@@ -3087,9 +3077,7 @@ class EntryDeployment:
             return False
 
         model_alias = model_id.rsplit("/", 1)[-1]
-        report_artifact_id = (
-            f"{self._TEST_REPORTS_WORKSPACE}/test-report-{model_alias}"
-        )
+        report_artifact_id = f"{self._TEST_REPORTS_WORKSPACE}/test-report-{model_alias}"
         slot = "staged" if stage else "published"
         file_path = f"{slot}/test_report.json"
 
@@ -3190,9 +3178,7 @@ class EntryDeployment:
                     edit_kwargs["type"] = "published-model"
                 elif model_confirmed_unpublished:
                     edit_kwargs["type"] = "staged-model"
-                await self.artifact_manager.edit(
-                    report_artifact_id, **edit_kwargs
-                )
+                await self.artifact_manager.edit(report_artifact_id, **edit_kwargs)
                 # A model with no committed version keeps no published report:
                 # published uploads are blocked upstream, so a leftover published
                 # file is never overwritten and would strand the report on the
@@ -3331,9 +3317,7 @@ class EntryDeployment:
             registry = self._infer_jobs
         else:
             registry = (
-                self._test_jobs
-                if request_id in self._test_jobs
-                else self._infer_jobs
+                self._test_jobs if request_id in self._test_jobs else self._infer_jobs
             )
         job = registry.get(request_id)
         if job is None:
@@ -3565,7 +3549,6 @@ class EntryDeployment:
                     f"{type(value).__name__})."
                 )
 
-
         job = self._new_infer_job(
             model_id=model_id, return_download_url=bool(return_download_url)
         )
@@ -3685,9 +3668,7 @@ class EntryDeployment:
                 exc = RuntimeError(
                     f"Runtime call failed for request {request_id!r}: {exc}"
                 )
-            logger.error(
-                f"❌ Infer run {request_id!r} for '{model_id}' failed: {exc}"
-            )
+            logger.error(f"❌ Infer run {request_id!r} for '{model_id}' failed: {exc}")
             # Clean up any staged on-disk data — we don't want it
             # sitting around after failure.
             if self._inference_dir is not None:
@@ -3696,9 +3677,7 @@ class EntryDeployment:
                     str(self._inference_dir / request_id),
                     ignore_errors=True,
                 )
-            self._update_infer_job(
-                job, state="failed", result={"error": str(exc)}
-            )
+            self._update_infer_job(job, state="failed", result={"error": str(exc)})
             # Re-creates the request dir holding nothing but ``job.json``,
             # so the caller still gets the error after a replica swap
             # instead of a bare "unknown request_id".
@@ -3750,17 +3729,14 @@ class EntryDeployment:
             job["_result_materialized"] = True
             await self._persist_infer_job(job)
             # The presigned URLs are the durable copy now.
-            await asyncio.to_thread(
-                shutil.rmtree, str(output_dir), ignore_errors=True
-            )
+            await asyncio.to_thread(shutil.rmtree, str(output_dir), ignore_errors=True)
         else:
             job["result"] = outputs
             job["_result_materialized"] = True
             await self._persist_infer_job(job)
 
         logger.info(
-            f"📤 Materialized {len(outputs)} output(s) for request "
-            f"{request_id!r}."
+            f"📤 Materialized {len(outputs)} output(s) for request " f"{request_id!r}."
         )
 
     @bioengine.method
@@ -3815,12 +3791,7 @@ class EntryDeployment:
         # reading a completed job's outputs off disk exactly once, then
         # holding them in memory. A ``failed`` state already has the
         # error stored via ``_execute_infer``, so nothing to materialise.
-        if (
-            job["state"] == "completed"
-            and not job["_result_materialized"]
-        ):
+        if job["state"] == "completed" and not job["_result_materialized"]:
             await self._materialize_infer_result(job)
 
         return self._infer_job_progress(job)
-
-

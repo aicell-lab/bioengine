@@ -37,7 +37,7 @@ import types
 from pathlib import Path
 from typing import Any, Dict
 
-MEMBER_BYTES = 1024 ** 3
+MEMBER_BYTES = 1024**3
 PAGE = os.sysconf("SC_PAGE_SIZE")
 
 
@@ -144,10 +144,12 @@ async def run(rtc, n_merges: int, scratch: Path, bypass: bool) -> Dict[str, Any]
 
     sampler = asyncio.ensure_future(sample())
     started = time.time()
-    results = await asyncio.gather(*[
-        runtime.materialize_soup([{"id": f"m{i}"}], "http://bench.invalid/put")
-        for i in range(n_merges)
-    ])
+    results = await asyncio.gather(
+        *[
+            runtime.materialize_soup([{"id": f"m{i}"}], "http://bench.invalid/put")
+            for i in range(n_merges)
+        ]
+    )
     wall = time.time() - started
     stop = True
     await asyncio.gather(sampler, return_exceptions=True)
@@ -164,8 +166,12 @@ async def run(rtc, n_merges: int, scratch: Path, bypass: bool) -> Dict[str, Any]
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("current", "before"), default="current",
-                    help="'before' bypasses the semaphore — the discrimination control")
+    ap.add_argument(
+        "--mode",
+        choices=("current", "before"),
+        default="current",
+        help="'before' bypasses the semaphore — the discrimination control",
+    )
     ap.add_argument("--merges", type=int, default=4)
     ap.add_argument("--scratch", default="/tmp/bench_soup_concurrency")
     args = ap.parse_args()
@@ -179,8 +185,10 @@ def main() -> int:
     print(f"merges driven       : {args.merges}")
     print(f"merges completed    : {res['completed']}")
     print(f"MAX CONCURRENT      : {res['max_concurrent']}")
-    print(f"peak RSS            : {res['peak_bytes'] / 1024 ** 3:.3f} GiB "
-          f"({res['peak_members']:.2f} members)")
+    print(
+        f"peak RSS            : {res['peak_bytes'] / 1024 ** 3:.3f} GiB "
+        f"({res['peak_members']:.2f} members)"
+    )
     print(f"wall                : {res['wall_s']}s")
     print(f"leaked soup files   : {res['leaked_files'] or 'none'}")
 

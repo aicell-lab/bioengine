@@ -189,9 +189,7 @@ class Cellpose3Runner:
             resp.raise_for_status()
             files = resp.json()
         except Exception as e:
-            logger.warning(
-                f"⚠️ Could not fetch remote freshness for '{model_id}': {e}"
-            )
+            logger.warning(f"⚠️ Could not fetch remote freshness for '{model_id}': {e}")
             return None
         stamps = [
             f["last_modified"] for f in files if f.get("last_modified") is not None
@@ -266,8 +264,7 @@ class Cellpose3Runner:
             unknown = set(updates) - declared[attr]
             if unknown:
                 raise ValueError(
-                    f"model declares no {attr} op named: "
-                    + ", ".join(sorted(unknown))
+                    f"model declares no {attr} op named: " + ", ".join(sorted(unknown))
                 )
             dropped = {k for k, v in updates.items() if v is None}
             if dropped and dropped != set(updates):
@@ -411,9 +408,7 @@ class Cellpose3Runner:
             result = self._pipeline.predict_sample_with_blocking(sample, **skips)
         else:
             result = self._pipeline.predict_sample_without_blocking(sample, **skips)
-        return {
-            str(key): member.data.data for key, member in result.members.items()
-        }
+        return {str(key): member.data.data for key, member in result.members.items()}
 
     # === Async infer-job registry (mirrors model-runner submit/poll) ===
 
@@ -717,9 +712,7 @@ class Cellpose3Runner:
     @bioengine.method
     async def get_infer_status(
         self,
-        request_id: str = Field(
-            ..., description="Request id returned by ``infer()``."
-        ),
+        request_id: str = Field(..., description="Request id returned by ``infer()``."),
     ) -> Dict[str, Union[int, float, dict, None]]:
         """Return the progress dict for an infer request.
 
@@ -758,9 +751,7 @@ class Cellpose3Runner:
     @bioengine.method
     async def cancel_request(
         self,
-        request_id: str = Field(
-            ..., description="Request id returned by ``infer()``."
-        ),
+        request_id: str = Field(..., description="Request id returned by ``infer()``."),
     ) -> Dict[str, Union[int, float, dict, None]]:
         """Cancel a still-queued infer request; return its progress dict.
 

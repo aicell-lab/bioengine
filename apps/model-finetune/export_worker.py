@@ -123,8 +123,12 @@ def main(session_id: str, export_dir: str) -> None:
 
     zip_path = export_path / f"{_slug(name)}.zip"
     export_sam_model(
-        image=image, label_image=label_image, model_type=model_type,
-        name=name, output_path=str(zip_path), checkpoint_path=str(ckpt),
+        image=image,
+        label_image=label_image,
+        model_type=model_type,
+        name=name,
+        output_path=str(zip_path),
+        checkpoint_path=str(ckpt),
         **export_kwargs,
     )
 
@@ -142,7 +146,8 @@ def main(session_id: str, export_dir: str) -> None:
 
     files = [
         {"name": f.relative_to(pkg_dir).as_posix(), "size": f.stat().st_size}
-        for f in sorted(pkg_dir.rglob("*")) if f.is_file()
+        for f in sorted(pkg_dir.rglob("*"))
+        if f.is_file()
     ]
     result = {
         "package_dir": str(pkg_dir),

@@ -232,9 +232,7 @@ def _walk(
             "method_schemas": _sanitise_schemas(
                 getattr(user_cls, "_bioengine_method_schemas", [])
             ),
-            "lifecycle_methods": dict(
-                getattr(user_cls, "_bioengine_lifecycle", {})
-            ),
+            "lifecycle_methods": dict(getattr(user_cls, "_bioengine_lifecycle", {})),
             "gpu_memory_mb": getattr(user_cls, "_bioengine_gpu_memory_mb", None),
             "init_params": init_params,
         }
@@ -253,9 +251,7 @@ def _describe_init(user_cls: type) -> tuple[List[Dict[str, Any]], List[tuple]]:
     # ``user_cls.__init__`` was replaced by ``wrap_init`` from mixin.py,
     # so its ``__globals__`` point at the mixin module, not the user's.
     # Eval forward refs against the user class's defining module instead.
-    eval_globals = getattr(
-        sys.modules.get(user_cls.__module__), "__dict__", {}
-    )
+    eval_globals = getattr(sys.modules.get(user_cls.__module__), "__dict__", {})
 
     init_params: List[Dict[str, Any]] = []
     child_refs: List[tuple] = []
@@ -485,9 +481,7 @@ def _apply_scaling(cls: Any, per_class: Dict[str, Any]) -> Any:
     if per_class_autoscale:
         return cls.options(autoscaling_config=per_class_autoscale)
     if per_class_replicas is not None:
-        return cls.options(
-            num_replicas=per_class_replicas, autoscaling_config=None
-        )
+        return cls.options(num_replicas=per_class_replicas, autoscaling_config=None)
     return cls
 
 

@@ -95,7 +95,9 @@ def _app_entry(
     }
 
 
-def _make_manager(*, extra_app: bool = False, auto_redeploy: bool = True) -> AppsManager:
+def _make_manager(
+    *, extra_app: bool = False, auto_redeploy: bool = True
+) -> AppsManager:
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test.giveup")
     manager.server = None
@@ -270,9 +272,9 @@ async def test_giving_up_on_one_app_does_not_touch_another(clock) -> None:
         clock.advance_past_the_backoff()
 
     assert _status_field(manager, APP_ID) is not None
-    assert _status_field(manager, OTHER_APP_ID) is None, (
-        "a RUNNING app acquired a give-up marker from its neighbour's failures"
-    )
+    assert (
+        _status_field(manager, OTHER_APP_ID) is None
+    ), "a RUNNING app acquired a give-up marker from its neighbour's failures"
 
 
 # ── ARM 2: an app that does recover still comes back, unaided ────────────────
@@ -293,9 +295,9 @@ async def test_an_app_that_recovers_comes_back_without_a_human(clock) -> None:
         await _tick(manager, "DEPLOY_FAILED")
         clock.advance_past_the_backoff()
 
-    assert manager._deploy_application.await_count == failures, (
-        "the app was not being retried at all before it recovered"
-    )
+    assert (
+        manager._deploy_application.await_count == failures
+    ), "the app was not being retried at all before it recovered"
     assert _status_field(manager) is None, "gave up while still inside the cap"
 
     await _tick(manager, "RUNNING")
@@ -322,9 +324,9 @@ async def test_a_flapping_app_never_accumulates_its_way_to_a_give_up(clock) -> N
         await _tick(manager, "RUNNING")
         clock.advance_past_the_backoff()
 
-    assert _status_field(manager) is None, (
-        "an app that recovered after every single failure was given up on"
-    )
+    assert (
+        _status_field(manager) is None
+    ), "an app that recovered after every single failure was given up on"
 
 
 # ── the give-up is readable from the status surface, not only the log ────────
@@ -398,9 +400,9 @@ async def test_the_give_up_IS_IN_the_status_payload_a_caller_receives() -> None:
         logs_tail=30,
     )
 
-    assert "auto_redeploy_exhausted_at" in status, (
-        "the key is absent from the payload, so no caller can see the give-up"
-    )
+    assert (
+        "auto_redeploy_exhausted_at" in status
+    ), "the key is absent from the payload, so no caller can see the give-up"
     assert status["auto_redeploy_exhausted_at"] == 1795221171.0, (
         f"the payload reports {status['auto_redeploy_exhausted_at']!r} instead of the "
         f"recorded give-up time — a version that always reports None passes a "
@@ -528,9 +530,9 @@ async def test_the_startup_retry_loop_is_bounded_too(monkeypatch) -> None:
         [{"artifact_id": "bioimage-io/never-coming-back"}]
     )
 
-    assert attempts["n"] == _REDEPLOY_MAX_ATTEMPTS, (
-        f"made {attempts['n']} attempts against a cap of {_REDEPLOY_MAX_ATTEMPTS}"
-    )
+    assert (
+        attempts["n"] == _REDEPLOY_MAX_ATTEMPTS
+    ), f"made {attempts['n']} attempts against a cap of {_REDEPLOY_MAX_ATTEMPTS}"
     # CONTROL: the loop must have RUN. Returning immediately also satisfies
     # "<= cap", and a startup app never retried once is the opposite defect.
     assert attempts["n"] > 1, "nothing was retried, so this proves nothing about a cap"
@@ -568,9 +570,9 @@ async def test_the_startup_give_up_is_announced(monkeypatch, caplog) -> None:
     errors = _errors(caplog)
     assert len(errors) == 1, f"expected one give-up line, got {len(errors)}"
     assert "Giving up" in errors[0]
-    assert "never-coming-back" in errors[0], (
-        "the line does not name the application, so an operator cannot act on it"
-    )
+    assert (
+        "never-coming-back" in errors[0]
+    ), "the line does not name the application, so an operator cannot act on it"
 
 
 # ── an explicit redeploy after a give-up gets its retries back ──────────────
@@ -599,7 +601,9 @@ async def test_an_explicit_redeploy_after_a_give_up_is_retried_again(clock) -> N
         await _tick(manager, "DEPLOY_FAILED")
         clock.advance_past_the_backoff()
 
-    assert _status_field(manager) is not None, "the arm needs a give-up to have happened"
+    assert (
+        _status_field(manager) is not None
+    ), "the arm needs a give-up to have happened"
     manager._deploy_application.reset_mock()
 
     # Replace the tracking entry the way deploy_app does — a NEW
@@ -609,9 +613,9 @@ async def test_an_explicit_redeploy_after_a_give_up_is_retried_again(clock) -> N
     # defect. The exhausted entry is deliberately left in place so the monitor
     # has to notice for itself that it belongs to a previous deploy.
     stale = dict(manager._redeploy_backoff.get(APP_ID) or {})
-    assert stale.get("consecutive_failures") == _REDEPLOY_MAX_ATTEMPTS, (
-        f"the arm needs an exhausted budget to still be present, got {stale}"
-    )
+    assert (
+        stale.get("consecutive_failures") == _REDEPLOY_MAX_ATTEMPTS
+    ), f"the arm needs an exhausted budget to still be present, got {stale}"
     manager._deployed_applications[APP_ID] = _app_entry(last_updated_at=2.0)
 
     await _tick(manager, "DEPLOY_FAILED")
@@ -621,9 +625,9 @@ async def test_an_explicit_redeploy_after_a_give_up_is_retried_again(clock) -> N
         "all — the stale attempt counter sent the first failure straight to the "
         "give-up branch"
     )
-    assert _status_field(manager) is None, (
-        "the fresh deploy is already marked exhausted"
-    )
+    assert (
+        _status_field(manager) is None
+    ), "the fresh deploy is already marked exhausted"
 
 
 # ── the give-up message must describe what actually happened ────────────────
@@ -654,9 +658,9 @@ async def test_a_give_up_on_SKIPPED_attempts_does_not_claim_redeploys_failed(
     # CONTROL: nothing may actually have been deployed, or the arm is testing
     # the wrong path entirely.
     manager._deploy_application.assert_not_awaited()
-    assert any("skipping auto-redeploy" in r.getMessage() for r in caplog.records), (
-        "the skip path was never taken, so this arm says nothing about it"
-    )
+    assert any(
+        "skipping auto-redeploy" in r.getMessage() for r in caplog.records
+    ), "the skip path was never taken, so this arm says nothing about it"
 
     errors = _errors(caplog)
     assert len(errors) == 1, f"expected one give-up line, got {len(errors)}"
@@ -664,9 +668,9 @@ async def test_a_give_up_on_SKIPPED_attempts_does_not_claim_redeploys_failed(
     assert "auto-redeploys all failed" not in errors[0], (
         "the give-up still claims redeploys failed when none ever ran: " + errors[0]
     )
-    assert "recovered from a previous worker" in errors[0], (
-        "the line does not say WHY nothing ran, so an operator cannot act on it"
-    )
+    assert (
+        "recovered from a previous worker" in errors[0]
+    ), "the line does not say WHY nothing ran, so an operator cannot act on it"
 
 
 @pytest.mark.asyncio
@@ -727,7 +731,9 @@ def _resolved_default_for_an_omitted_argument() -> bool:
         ),
         None,
     )
-    assert fn is not None, "manager.py has no deploy_app -- the anchor moved, not the fix"
+    assert (
+        fn is not None
+    ), "manager.py has no deploy_app -- the anchor moved, not the fix"
 
     blocks = []
     for node in ast.walk(fn):

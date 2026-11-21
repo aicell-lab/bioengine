@@ -151,7 +151,9 @@ class _FakeRemoteFunction:
         self._options = options
 
     def remote(self, *args, **kwargs):
-        self._recorder.append({"args": args, "kwargs": kwargs, "options": self._options})
+        self._recorder.append(
+            {"args": args, "kwargs": kwargs, "options": self._options}
+        )
         return "object-ref-sentinel"
 
 
@@ -298,7 +300,9 @@ def _drive_submit(monkeypatch, built_app):
 
     asyncio.run(builder_mod.AppBuilder.submit(inst, built_app, "my-app"))
     assert len(calls) == 1, f"expected one .remote() call, got {len(calls)}"
-    assert stored, "submit did not store the replica secrets -- the method did not really run"
+    assert (
+        stored
+    ), "submit did not store the replica secrets -- the method did not really run"
     return calls[0]
 
 
@@ -321,13 +325,17 @@ def test_submit_hands_the_task_the_dict_that_CARRIES_the_token(monkeypatch):
         "control: the runtime_env must already lack the token, or this arm cannot tell the "
         "two candidate dicts apart"
     )
-    replica_env_vars = {k: v for k, v in fixture.items()
-                        if not k.startswith(_SECRET_ENV_VAR_PREFIX)}
+    replica_env_vars = {
+        k: v for k, v in fixture.items() if not k.startswith(_SECRET_ENV_VAR_PREFIX)
+    }
 
     call = _drive_submit(monkeypatch, _built_app(replica_env_vars, runtime_env))
 
-    carriers = [a for a in call["args"]
-                if isinstance(a, dict) and a.get(_ARTIFACT_DOWNLOAD_TOKEN_KEY) == token]
+    carriers = [
+        a
+        for a in call["args"]
+        if isinstance(a, dict) and a.get(_ARTIFACT_DOWNLOAD_TOKEN_KEY) == token
+    ]
     assert carriers, (
         "no argument handed to the build task carries the download token; the task would sync "
         "source anonymously and every private-artifact deploy would fail"
@@ -338,8 +346,9 @@ def test_submit_does_NOT_leak_the_secrets_into_the_task_runtime_env(monkeypatch)
     """The property that was already there, so fixing the call site cannot regress it."""
     fixture = _env_vars_fixture()
     runtime_env = _submit_runtime_env(fixture)
-    replica_env_vars = {k: v for k, v in fixture.items()
-                        if not k.startswith(_SECRET_ENV_VAR_PREFIX)}
+    replica_env_vars = {
+        k: v for k, v in fixture.items() if not k.startswith(_SECRET_ENV_VAR_PREFIX)
+    }
     call = _drive_submit(monkeypatch, _built_app(replica_env_vars, runtime_env))
 
     submitted = call["options"]["runtime_env"]
@@ -350,12 +359,19 @@ def test_submit_does_NOT_leak_the_secrets_into_the_task_runtime_env(monkeypatch)
 
 def _build_fn() -> ast.AST:
     builder_src = (
-        pathlib.Path(__file__).resolve().parents[2] / "bioengine" / "apps" / "builder.py"
+        pathlib.Path(__file__).resolve().parents[2]
+        / "bioengine"
+        / "apps"
+        / "builder.py"
     )
     tree = ast.parse(builder_src.read_text())
     fn = next(
-        (n for n in ast.walk(tree)
-         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "build"),
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "build"
+        ),
         None,
     )
     assert fn is not None, "builder.py has no `build` -- the anchor moved, not the fix"
@@ -398,9 +414,9 @@ def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
         for t in n.targets
         if isinstance(t, ast.Name)
     ]
-    assert len(bindings) == 1, (
-        f"expected exactly one `<name> = self._build_submit_runtime_env(...)`, found {bindings}"
-    )
+    assert (
+        len(bindings) == 1
+    ), f"expected exactly one `<name> = self._build_submit_runtime_env(...)`, found {bindings}"
     name, bind_line = bindings[0]
 
     # Parent map: ast gives no parent links, and the whole assertion is about what encloses
@@ -427,16 +443,23 @@ def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
         "reassigned — a rebinding after the helper returns undoes the token exclusion"
     )
     assert not others, f"{name!r} appears in an unexpected context: {others}"
-    walrus = [n.lineno for n in ast.walk(build)
-              if isinstance(n, ast.NamedExpr) and getattr(n.target, "id", None) == name]
+    walrus = [
+        n.lineno
+        for n in ast.walk(build)
+        if isinstance(n, ast.NamedExpr) and getattr(n.target, "id", None) == name
+    ]
     assert not walrus, f"{name!r} is rebound by a walrus at {walrus}"
 
     # Every LOAD must be one of exactly two consumers.
     def classify(node):
         parent = parents.get(id(node))
         if isinstance(parent, ast.Call):
-            fname = getattr(parent.func, "attr", None) or getattr(parent.func, "id", None)
-            if fname == "_introspect_via_ray_task" and any(a is node for a in parent.args):
+            fname = getattr(parent.func, "attr", None) or getattr(
+                parent.func, "id", None
+            )
+            if fname == "_introspect_via_ray_task" and any(
+                a is node for a in parent.args
+            ):
                 return "introspect"
         if isinstance(parent, ast.keyword) and parent.arg == "runtime_env":
             grand = parents.get(id(parent))
@@ -474,20 +497,21 @@ def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
     # So require the BuiltApp(...) call to BE the returned value: constructed and handed off in
     # one expression, with no name bound to it that anything could go through.
     builtapp_calls = [
-        n for n in ast.walk(build)
+        n
+        for n in ast.walk(build)
         if isinstance(n, ast.Call)
         and (getattr(n.func, "id", None) or getattr(n.func, "attr", None))
         in ("BuiltApp", "BuiltApplication")
     ]
-    assert len(builtapp_calls) == 1, (
-        f"expected one BuiltApp(...) construction in build(), found {len(builtapp_calls)}"
-    )
+    assert (
+        len(builtapp_calls) == 1
+    ), f"expected one BuiltApp(...) construction in build(), found {len(builtapp_calls)}"
     call = builtapp_calls[0]
     parent = parents.get(id(call))
     assert isinstance(parent, ast.Return), (
         f"BuiltApp(...) at line {call.lineno} is not the value of a `return` (its parent is "
         f"{type(parent).__name__}). Bound to a name first, the runtime_env dict can be reached "
-        "through that name — `built.runtime_env[\"env_vars\"].update(...)` — without ever "
+        'through that name — `built.runtime_env["env_vars"].update(...)` — without ever '
         "loading the guarded name again"
     )
 
@@ -512,15 +536,20 @@ def test_build_derives_replica_env_vars_from_the_FULL_env_vars(monkeypatch):
         for t in n.targets
         if isinstance(t, ast.Name)
     ]
-    assert len(bound) == 1, f"expected one assignment from _build_env_vars, found {bound}"
+    assert (
+        len(bound) == 1
+    ), f"expected one assignment from _build_env_vars, found {bound}"
 
     calls = [
-        n for n in ast.walk(build)
+        n
+        for n in ast.walk(build)
         if isinstance(n, ast.Call)
         and (getattr(n.func, "id", None) or getattr(n.func, "attr", None))
         == "split_secret_env_vars"
     ]
-    assert len(calls) == 1, f"expected one split_secret_env_vars call in build(), found {len(calls)}"
+    assert (
+        len(calls) == 1
+    ), f"expected one split_secret_env_vars call in build(), found {len(calls)}"
     arg = calls[0].args[0]
     assert isinstance(arg, ast.Name) and arg.id == bound[0], (
         f"build() calls split_secret_env_vars on {ast.dump(arg)[:60]} rather than on the "
@@ -535,9 +564,14 @@ def test_build_derives_replica_env_vars_from_the_FULL_env_vars(monkeypatch):
 def _fn(name: str) -> ast.AST:
     tree = ast.parse(BOOTSTRAP.read_text())
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
             return node
-    raise AssertionError(f"bootstrap.py has no `{name}` -- the anchor moved, not the fix")
+    raise AssertionError(
+        f"bootstrap.py has no `{name}` -- the anchor moved, not the fix"
+    )
 
 
 def _apply_loop_lines(fn: ast.AST, param: str) -> list:
@@ -602,7 +636,9 @@ def test_the_apply_loop_runs_BEFORE_ensure_source(task_name, param):
     fn = _fn(task_name)
     loops = _apply_loop_lines(fn, param)
     calls = _ensure_source_call_lines(fn)
-    assert calls, f"{task_name} no longer calls _ensure_source -- this assertion would be vacuous"
+    assert (
+        calls
+    ), f"{task_name} no longer calls _ensure_source -- this assertion would be vacuous"
     assert loops, f"{task_name} has no apply loop -- covered by the test above"
     assert min(loops) < min(calls), (
         f"{task_name} calls _ensure_source at line {min(calls)} before applying {param} at "

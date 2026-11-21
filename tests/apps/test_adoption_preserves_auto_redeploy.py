@@ -80,7 +80,9 @@ def _manager(app_data):
     handle.update_authorized_users.remote = AsyncMock(return_value=None)
 
     status = SimpleNamespace(
-        applications={APP_ID: SimpleNamespace(deployments={"ProxyDeployment": object()})}
+        applications={
+            APP_ID: SimpleNamespace(deployments={"ProxyDeployment": object()})
+        }
     )
 
     async def call_with_reconnect(fn, *args, **kwargs):
@@ -98,7 +100,9 @@ def _manager(app_data):
     m.ray_cluster = ray_cluster
 
     m.server = SimpleNamespace(
-        config=SimpleNamespace(workspace=WORKSPACE, public_base_url="https://example.invalid")
+        config=SimpleNamespace(
+            workspace=WORKSPACE, public_base_url="https://example.invalid"
+        )
     )
     return m
 
@@ -120,7 +124,8 @@ def _recovered(m):
 @pytest.mark.asyncio
 async def test_an_adopted_app_that_OPTED_OUT_comes_back_opted_out():
     """The dangerous direction: an app that asked not to be redeployed must not come back
-    redeploying, because the worker would then restart it forever against its owner's wish."""
+    redeploying, because the worker would then restart it forever against its owner's wish.
+    """
     m = _manager(_app_data(False))
     await m.recover_deployed_applications()
     got = _recovered(m)
@@ -250,14 +255,17 @@ def test_the_WRITER_and_the_READER_agree_on_the_key_and_it_is_REQUIRED():
     builder_src = inspect.getsource(builder_mod)
     manager_src = inspect.getsource(manager_mod)
 
-    assert f'"{KEY}": {KEY},' in builder_src.replace("'", '"'), (
-        f"builder.py does not stamp {KEY!r} as a dict entry holding the same-named variable"
-    )
+    assert f'"{KEY}": {KEY},' in builder_src.replace(
+        "'", '"'
+    ), f"builder.py does not stamp {KEY!r} as a dict entry holding the same-named variable"
 
     fn = next(
-        (n for n in ast.walk(ast.parse(manager_src))
-         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-         and n.name == "recover_deployed_applications"),
+        (
+            n
+            for n in ast.walk(ast.parse(manager_src))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "recover_deployed_applications"
+        ),
         None,
     )
     assert fn is not None, "manager.py has no recover_deployed_applications"
@@ -271,9 +279,14 @@ def test_the_WRITER_and_the_READER_agree_on_the_key_and_it_is_REQUIRED():
     )
     # ...and REQUIRED, so a blob without it refuses rather than defaulting.
     required = next(
-        (n for n in ast.walk(fn)
-         if isinstance(n, ast.Set)
-         and any(isinstance(e, ast.Constant) and e.value == "artifact_id" for e in n.elts)),
+        (
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Set)
+            and any(
+                isinstance(e, ast.Constant) and e.value == "artifact_id" for e in n.elts
+            )
+        ),
         None,
     )
     assert required is not None, "could not find recovery's required_keys set"
@@ -308,52 +321,64 @@ async def _blob_from_the_real_builder(auto_redeploy):
     b.server = SimpleNamespace(
         generate_token=AsyncMock(return_value="download-token"),
         config=SimpleNamespace(
-            workspace=WORKSPACE, client_id="worker-1", public_base_url="https://example.invalid",
+            workspace=WORKSPACE,
+            client_id="worker-1",
+            public_base_url="https://example.invalid",
             user={"id": "tester"},
         ),
     )
-    b._load_manifest = AsyncMock(return_value=(
-        {
-            "entry": "entry:EntryApp",
-            "name": "Adopted App",
-            "description": "an app",
-            "id": "adopted",
-            "type": "ray-serve",
-            "format_version": "0.6.0",
-        },
-        "1.0.0",
-    ))
-    b._introspect_via_ray_task = AsyncMock(return_value={
-        # build() reads introspect_result["spec"] and checks its format_version against
-        # the module's own SPEC_FORMAT_VERSION, so take that constant from the module
-        # rather than hard-coding a string that would rot independently of it.
-        "spec": {
-            "entry_id": "entry:EntryApp",
-            # The class shape a real introspect returns: validate_kwargs_against_spec
-            # reads init_params, and the resource helpers read resources.
-            "classes": {
-                "entry:EntryApp": {
-                    "methods": {"ping": {}},
-                    "resources": {},
-                    "init_params": [],
-                    # a LIST of dicts, each with a "name" - build() does [m["name"] for m in ...]
-                    "method_schemas": [{"name": "ping"}],
-                    "lifecycle_methods": {"smoke_test": None, "health_check": None},
-                }
+    b._load_manifest = AsyncMock(
+        return_value=(
+            {
+                "entry": "entry:EntryApp",
+                "name": "Adopted App",
+                "description": "an app",
+                "id": "adopted",
+                "type": "ray-serve",
+                "format_version": "0.6.0",
             },
-            "format_version": builder_mod.SPEC_FORMAT_VERSION,
-        },
-        "source_signature": "sig-1",
-    })
+            "1.0.0",
+        )
+    )
+    b._introspect_via_ray_task = AsyncMock(
+        return_value={
+            # build() reads introspect_result["spec"] and checks its format_version against
+            # the module's own SPEC_FORMAT_VERSION, so take that constant from the module
+            # rather than hard-coding a string that would rot independently of it.
+            "spec": {
+                "entry_id": "entry:EntryApp",
+                # The class shape a real introspect returns: validate_kwargs_against_spec
+                # reads init_params, and the resource helpers read resources.
+                "classes": {
+                    "entry:EntryApp": {
+                        "methods": {"ping": {}},
+                        "resources": {},
+                        "init_params": [],
+                        # a LIST of dicts, each with a "name" - build() does [m["name"] for m in ...]
+                        "method_schemas": [{"name": "ping"}],
+                        "lifecycle_methods": {"smoke_test": None, "health_check": None},
+                    }
+                },
+                "format_version": builder_mod.SPEC_FORMAT_VERSION,
+            },
+            "source_signature": "sig-1",
+        }
+    )
     b._build_env_vars = MagicMock(return_value={})
     b._build_submit_runtime_env = MagicMock(return_value={"env_vars": {}})
     b._resolve_authorized_users = MagicMock(return_value=["*"])
-    b._translate_kwargs_keys = MagicMock(side_effect=lambda kwargs, *a, **k: dict(kwargs or {}))
-    b._sum_resources = MagicMock(return_value={"num_cpus": 1, "num_gpus": 0, "memory": 1 << 30})
+    b._translate_kwargs_keys = MagicMock(
+        side_effect=lambda kwargs, *a, **k: dict(kwargs or {})
+    )
+    b._sum_resources = MagicMock(
+        return_value={"num_cpus": 1, "num_gpus": 0, "memory": 1 << 30}
+    )
     b._apply_gpu_memory = MagicMock(side_effect=lambda res, *a, **k: res)
     b._get_cluster_gpu_sizing = AsyncMock(return_value={})
     # returns a PAIR: (recovery_env_vars, redacted_env_var_keys)
-    b._sanitize_recovery_env_vars = MagicMock(side_effect=lambda ev, *a, **k: (dict(ev or {}), {}))
+    b._sanitize_recovery_env_vars = MagicMock(
+        side_effect=lambda ev, *a, **k: (dict(ev or {}), {})
+    )
     b._bioengine_gcs_uri = MagicMock(return_value="gcs://_ray_pkg_test.zip")
 
     built = await b.build(

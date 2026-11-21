@@ -142,7 +142,10 @@ def test_the_unrecognised_fixture_basis_really_is_unrecognised() -> None:
     }
     assert (
         pool.contribution_digest_basis(
-            {"weights_sha256": _SHA_BADSTAMP, "weights_sha256_basis": _UNRECOGNISED_BASIS}
+            {
+                "weights_sha256": _SHA_BADSTAMP,
+                "weights_sha256_basis": _UNRECOGNISED_BASIS,
+            }
         )
         == pool.DIGEST_BASIS_UNDETERMINED
     )
@@ -169,7 +172,9 @@ def test_every_published_digest_has_a_basis_beside_it() -> None:
         f"attributed-but-unpublished {sorted(attributed - published)}"
     )
     assert published, "the fixture published no contributions, so this proves nothing"
-    assert len(wire["digest_provenance"]["contributions"]) == len(wire["contributions"]), (
+    assert len(wire["digest_provenance"]["contributions"]) == len(
+        wire["contributions"]
+    ), (
         f"{len(wire['contributions'])} contributions published but "
         f"{len(wire['digest_provenance']['contributions'])} attributed; ids that "
         "collide or are None collapse in the map and leave a published digest with no "
@@ -263,7 +268,8 @@ def test_colliding_ids_that_agree_are_not_downgraded() -> None:
     same basis are attributed with it: the map's answer is then true of both, and
     refusing to give it would lose a correct statement to a rule about ids."""
     wire = pool.pool_wire_state(
-        _colliding_index(pool.CONTRIBUTION_DIGEST_BASIS), pool_artifact_id=POOL_ARTIFACT_ID
+        _colliding_index(pool.CONTRIBUTION_DIGEST_BASIS),
+        pool_artifact_id=POOL_ARTIFACT_ID,
     )
     entry = wire["digest_provenance"]["contributions"]["c-twice"]
     assert entry["basis"] == pool.DIGEST_BASIS_FILE
@@ -465,9 +471,11 @@ def test_the_pinned_contribution_field_set_is_not_widened() -> None:
 def test_the_sibling_maps_still_stand() -> None:
     """The new key is added alongside, not in place of, what the digest-basis rule and the stored-basis stamp put here."""
     dp = _wire()["digest_provenance"]
-    assert set(dp) == {"soups", "contributions", "current_community"}, (
-        f"digest_provenance should carry exactly three joins, found {sorted(dp)}"
-    )
+    assert set(dp) == {
+        "soups",
+        "contributions",
+        "current_community",
+    }, f"digest_provenance should carry exactly three joins, found {sorted(dp)}"
 
 
 def test_an_unheld_contribution_is_absent_from_the_map() -> None:

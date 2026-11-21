@@ -162,10 +162,8 @@ async def test_create_and_delete_artifacts(
         ), "Created demo artifact ID should match manifest ID and workspace"
 
         # Create composition-demo artifact
-        created_composition_artifact_id = (
-            await bioengine_worker_service.upload_app(
-                files=composition_app_files
-            )
+        created_composition_artifact_id = await bioengine_worker_service.upload_app(
+            files=composition_app_files
         )
 
         # Verify artifact creation returned the correct ID
@@ -201,10 +199,8 @@ async def test_create_and_delete_artifacts(
             updated_demo_artifact_id == demo_artifact_id
         ), "Updated demo artifact ID should match original"
 
-        updated_composition_artifact_id = (
-            await bioengine_worker_service.upload_app(
-                files=bump_manifest_version(composition_app_files, updated_version)
-            )
+        updated_composition_artifact_id = await bioengine_worker_service.upload_app(
+            files=bump_manifest_version(composition_app_files, updated_version)
         )
         assert (
             updated_composition_artifact_id == composition_artifact_id
@@ -260,9 +256,7 @@ async def test_create_and_delete_artifacts(
         # Delete both artifacts
         await bioengine_worker_service.delete_app(artifact_id=demo_artifact_id)
 
-        await bioengine_worker_service.delete_app(
-            artifact_id=composition_artifact_id
-        )
+        await bioengine_worker_service.delete_app(artifact_id=composition_artifact_id)
 
         # Verify artifacts no longer exist
         available_artifacts = await bioengine_worker_service.list_apps()
@@ -280,9 +274,7 @@ async def test_create_and_delete_artifacts(
         cleanup_errors = []
         if demo_artifact_id and not test_completed:
             try:
-                await bioengine_worker_service.delete_app(
-                    artifact_id=demo_artifact_id
-                )
+                await bioengine_worker_service.delete_app(artifact_id=demo_artifact_id)
             except Exception as e:
                 cleanup_errors.append(
                     f"Failed to cleanup demo artifact {demo_artifact_id}: {e}"
@@ -504,8 +496,8 @@ async def test_startup_application(
                 service_ids, dict
             ), f"service_ids should be a dictionary for '{application_id}'"
             for key in ("websocket_service_id", "webrtc_service_id"):
-                assert (
-                    service_ids.get(key)
+                assert service_ids.get(
+                    key
                 ), f"Running application '{application_id}' should have a {key}"
 
         # Validate resource allocation structure
@@ -778,9 +770,7 @@ async def test_deploy_app_locally(
         # Cleanup: Ensure applications are undeployed (even if test fails)
         for app_id in deployed_app_ids:
             try:
-                await bioengine_worker_service.stop_app(
-                    application_id=app_id
-                )
+                await bioengine_worker_service.stop_app(application_id=app_id)
                 print(f"Undeployed application: {app_id}")
             except Exception as e:
                 warnings.warn(f"Failed to undeploy application {app_id}: {e}")
@@ -860,9 +850,7 @@ async def test_deploy_app_from_artifact(
             ), f"Artifact ID mismatch: expected {artifact_id}, got {created_artifact_id}"
 
             # Create the artifact
-            result_artifact_id = await bioengine_worker_service.upload_app(
-                files=files
-            )
+            result_artifact_id = await bioengine_worker_service.upload_app(files=files)
             assert (
                 result_artifact_id == artifact_id
             ), f"Created artifact ID should match expected: {artifact_id}"
@@ -964,9 +952,7 @@ async def test_deploy_app_from_artifact(
         # Cleanup: Delete all created artifacts (even if test fails)
         for artifact_id in artifact_ids:
             try:
-                await bioengine_worker_service.delete_app(
-                    artifact_id=artifact_id
-                )
+                await bioengine_worker_service.delete_app(artifact_id=artifact_id)
                 print(f"Deleted artifact: {artifact_id}")
             except Exception as e:
                 warnings.warn(f"Failed to delete artifact {artifact_id}: {e}")
@@ -974,9 +960,7 @@ async def test_deploy_app_from_artifact(
         # Cleanup: Ensure applications are undeployed (even if test fails)
         for app_id in deployed_app_ids:
             try:
-                await bioengine_worker_service.stop_app(
-                    application_id=app_id
-                )
+                await bioengine_worker_service.stop_app(application_id=app_id)
                 print(f"Undeployed application: {app_id}")
             except Exception as e:
                 warnings.warn(f"Failed to undeploy application {app_id}: {e}")
@@ -1164,9 +1148,9 @@ async def test_call_composition_app_functions(
         "disable_gpu": True,
     }
 
-    app_id = (
-        await bioengine_worker_service.deploy_app(**composition_app_config)
-    )["application_id"]
+    app_id = (await bioengine_worker_service.deploy_app(**composition_app_config))[
+        "application_id"
+    ]
 
     try:
         # Wait for deployment to complete

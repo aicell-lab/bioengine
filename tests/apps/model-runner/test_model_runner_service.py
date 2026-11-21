@@ -30,7 +30,6 @@ def _is_gpu_error(exc: Exception) -> bool:
     return GPU_UNAVAILABLE_MSG in str(exc)
 
 
-
 async def _run_test(model_runner, timeout_s: int = 1800, **kwargs) -> dict:
     """Submit a test run and return its report.
 
@@ -65,9 +64,7 @@ async def test_search_models_returns_list(model_runner):
 
 @pytest.mark.asyncio
 async def test_search_models_with_keywords(model_runner):
-    results = await model_runner.search_models(
-        keywords=["segmentation"], limit=10
-    )
+    results = await model_runner.search_models(keywords=["segmentation"], limit=10)
     assert isinstance(results, list)
     for item in results:
         assert "model_id" in item
@@ -278,9 +275,7 @@ async def test_model_test_gpu_unavailable_raises_clear_error(model_runner):
 @pytest.mark.asyncio
 @pytest.mark.requires_gpu
 async def test_infer_with_numpy_array(model_runner, test_image_array):
-    result = await model_runner.infer(
-        model_id=TEST_MODEL_ID, inputs=test_image_array
-    )
+    result = await model_runner.infer(model_id=TEST_MODEL_ID, inputs=test_image_array)
     assert isinstance(result, dict)
     assert len(result) > 0
     for v in result.values():

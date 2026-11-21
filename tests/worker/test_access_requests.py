@@ -41,7 +41,11 @@ OTHER = create_context("other-id", "other@example.org")
 # Hypha reports email=None and flags is_anonymous for a caller with no token,
 # and mints a fresh random id per anonymous connection.
 ANONYMOUS = {
-    "user": {"id": "anonymouz-torpid-lobster-52790260", "email": None, "is_anonymous": True}
+    "user": {
+        "id": "anonymouz-torpid-lobster-52790260",
+        "email": None,
+        "is_anonymous": True,
+    }
 }
 
 
@@ -68,9 +72,7 @@ def _worker(tmp_path, admin_users, founding=None, enabled=True, **attrs):
     worker.admin_users = list(admin_users)
     worker._admin_users_file = tmp_path / "admin_users.json"
     worker._worker_user_email = "worker@service.internal"
-    worker._founding_admin_users = tuple(
-        admin_users if founding is None else founding
-    )
+    worker._founding_admin_users = tuple(admin_users if founding is None else founding)
     worker._wildcard_admin_users_warned = False
     worker.enable_access_requests = enabled
     worker._access_requests_file = tmp_path / "access_requests.json"
@@ -158,9 +160,10 @@ async def test_every_user_named_at_startup_is_protected_not_just_the_first(tmp_p
 
     # A user who is not a starting user is still removable, so the guard is not
     # simply refusing everything.
-    assert await worker.remove_admin_user(
-        user="admin@example.org", context=FIRST
-    ) == ["first@example.org", "second@example.org"]
+    assert await worker.remove_admin_user(user="admin@example.org", context=FIRST) == [
+        "first@example.org",
+        "second@example.org",
+    ]
 
 
 def test_the_starting_users_are_captured_before_the_overlay_is_loaded(
@@ -193,9 +196,7 @@ def test_a_store_that_dropped_a_starting_user_is_repaired_on_load(tmp_path):
         ["founder@example.org"],
         founding=("founder@example.org",),
     )
-    (tmp_path / "admin_users.json").write_text(
-        json.dumps(["usurper@example.org"])
-    )
+    (tmp_path / "admin_users.json").write_text(json.dumps(["usurper@example.org"]))
 
     worker._load_persisted_admin_users()
 
@@ -239,9 +240,7 @@ def test_a_wildcard_seed_never_reaches_the_admin_list(short_workspace_dir):
 def test_a_wildcard_in_the_persisted_store_is_dropped_too(tmp_path):
     """The store overrides the seed, so it is a second way in."""
     worker = _worker(tmp_path, ["admin@example.org"], founding=())
-    (tmp_path / "admin_users.json").write_text(
-        json.dumps(["admin@example.org", "*"])
-    )
+    (tmp_path / "admin_users.json").write_text(json.dumps(["admin@example.org", "*"]))
 
     worker._load_persisted_admin_users()
 
@@ -356,12 +355,11 @@ def test_the_toggle_reaches_the_constructor_from_the_command_line(monkeypatch):
 
     from bioengine.worker.__main__ import create_parser, get_args_by_group
 
-    monkeypatch.setattr(
-        sys, "argv", ["bioengine.worker", "--mode", "single-machine"]
+    monkeypatch.setattr(sys, "argv", ["bioengine.worker", "--mode", "single-machine"])
+    assert (
+        get_args_by_group(create_parser())["Core Options"]["enable_access_requests"]
+        is False
     )
-    assert get_args_by_group(create_parser())["Core Options"][
-        "enable_access_requests"
-    ] is False
 
     monkeypatch.setattr(
         sys,
@@ -385,7 +383,9 @@ def test_the_toggle_reaches_the_constructor_from_the_command_line(monkeypatch):
 async def test_a_non_admin_can_request_access_once(tmp_path):
     worker = _worker(tmp_path, ["admin@example.org"], founding=())
 
-    request = await worker.request_admin_access(reason="new group member", context=REQUESTER)
+    request = await worker.request_admin_access(
+        reason="new group member", context=REQUESTER
+    )
 
     assert request["email"] == "requester@example.org"
     assert request["status"] == "pending"

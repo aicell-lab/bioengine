@@ -27,7 +27,10 @@ def _load(path, *names):
     tree = ast.parse(path.read_text())
     wanted = []
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in names
+        ):
             wanted.append(node)
         elif isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id in names for t in node.targets

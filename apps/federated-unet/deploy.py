@@ -35,8 +35,14 @@ SITE_A_LABEL = os.environ.get("FEDUNET_SITE_A_LABEL", "site-a")
 DENBI = "bioimage-io/bioengine-worker-denbi"
 
 WORKERS = {
-    SITE_A: {"token_key": "HYPHA_TOKEN", "description": "single-machine worker (site A)"},
-    DENBI: {"token_key": "BIOIMAGE_IO_TOKEN", "description": "de.NBI cloud worker, Germany"},
+    SITE_A: {
+        "token_key": "HYPHA_TOKEN",
+        "description": "single-machine worker (site A)",
+    },
+    DENBI: {
+        "token_key": "BIOIMAGE_IO_TOKEN",
+        "description": "de.NBI cloud worker, Germany",
+    },
 }
 
 #: How many replicas of this app each worker admits **with the cluster to
@@ -84,7 +90,14 @@ LAYOUTS = {
         # NuInsSeg archive, so it goes on the worker with the larger disk.
         "pooled": (
             SITE_A,
-            ["bbbc038-fluo", "bbbc038-histo", "bbbc039", "cellbindb", "nuinsseg", "kromp"],
+            [
+                "bbbc038-fluo",
+                "bbbc038-histo",
+                "bbbc039",
+                "cellbindb",
+                "nuinsseg",
+                "kromp",
+            ],
         ),
     },
     # Two modalities out of BBBC038, with the fluorescence pool cut into three
@@ -160,7 +173,9 @@ def instances(layout_name: str):
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", default="0.4.3")
-    parser.add_argument("--layout", choices=sorted(LAYOUTS), default="acquisition-4site")
+    parser.add_argument(
+        "--layout", choices=sorted(LAYOUTS), default="acquisition-4site"
+    )
     parser.add_argument("--only", nargs="+", default=None)
     args = parser.parse_args()
 
@@ -171,7 +186,10 @@ async def main() -> None:
     for name in selected:
         worker_prefix, datasets, role = layout[name]
         server = await connect_to_server(
-            {"server_url": SERVER_URL, "token": env[WORKERS[worker_prefix]["token_key"]]}
+            {
+                "server_url": SERVER_URL,
+                "token": env[WORKERS[worker_prefix]["token_key"]],
+            }
         )
         worker = await resolve_worker(server, worker_prefix)
         deployed = await worker.deploy_app(
@@ -203,10 +221,15 @@ async def main() -> None:
         for name in selected:
             worker_prefix = layout[name][0]
             server = await connect_to_server(
-                {"server_url": SERVER_URL, "token": env[WORKERS[worker_prefix]["token_key"]]}
+                {
+                    "server_url": SERVER_URL,
+                    "token": env[WORKERS[worker_prefix]["token_key"]],
+                }
             )
             worker = await resolve_worker(server, worker_prefix)
-            record = (await worker.get_app_status([f"fedunet-{name}"])).get(f"fedunet-{name}", {})
+            record = (await worker.get_app_status([f"fedunet-{name}"])).get(
+                f"fedunet-{name}", {}
+            )
             states[name] = record.get("status", "GONE")
             if states[name] not in ("RUNNING", "DEPLOYING", "NOT_STARTED"):
                 print(f"\n{name} -> {states[name]}")
@@ -216,7 +239,9 @@ async def main() -> None:
         if all(s == "RUNNING" for s in states.values()):
             print("all RUNNING")
             return
-        if any(s not in ("RUNNING", "DEPLOYING", "NOT_STARTED") for s in states.values()):
+        if any(
+            s not in ("RUNNING", "DEPLOYING", "NOT_STARTED") for s in states.values()
+        ):
             sys.exit(1)
     sys.exit("timed out")
 

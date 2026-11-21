@@ -118,7 +118,11 @@ class _FakeEnv:
     """The smallest thing ``pin_bioimageio_conda_env`` accepts."""
 
     def __init__(self, dependencies, name="sam"):
-        self._data = {"name": name, "channels": ["conda-forge"], "dependencies": dependencies}
+        self._data = {
+            "name": name,
+            "channels": ["conda-forge"],
+            "dependencies": dependencies,
+        }
 
     def model_dump(self, mode="python"):
         import copy
@@ -163,10 +167,14 @@ def test_the_bound_excludes_the_first_version_measured_to_break(ns):
     name, _, constraint = spec.partition("<")
     assert name.strip() == "pydantic", spec
     s = packaging.SpecifierSet(spec[len("pydantic") :])
-    assert s.contains("2.12.0"), f"{spec} must allow the version the standard runtime uses"
+    assert s.contains(
+        "2.12.0"
+    ), f"{spec} must allow the version the standard runtime uses"
     assert s.contains("2.13.5"), f"{spec} must allow 2.13.5, measured OK"
     assert not s.contains("2.14.0"), f"{spec} must exclude 2.14.0, measured to raise"
-    assert not s.contains("2.14.3"), f"{spec} must exclude 2.14.3, the version the env solved"
+    assert not s.contains(
+        "2.14.3"
+    ), f"{spec} must exclude 2.14.3, the version the env solved"
 
 
 def test_a_conda_level_pydantic_is_replaced_not_left_to_be_solved(ns):
@@ -268,9 +276,9 @@ def test_the_pydantic_bound_is_a_literal_not_a_derived_version(ns):
             isinstance(t, ast.Name) and t.id == "CUSTOM_ENV_PYDANTIC_PIN"
             for t in node.targets
         ):
-            assert isinstance(node.value, ast.Constant), (
-                "the bound must be a plain literal, not a computed value"
-            )
+            assert isinstance(
+                node.value, ast.Constant
+            ), "the bound must be a plain literal, not a computed value"
             break
     else:  # pragma: no cover - the ns fixture would have failed first
         pytest.fail("CUSTOM_ENV_PYDANTIC_PIN is not a module-level assignment")
@@ -310,9 +318,9 @@ def test_neither_call_site_builds_its_own_pydantic_pin():
     assert "pin_bioimageio_conda_env(" in runtime_src
     # the bound is assigned exactly once, in runtime.py, and entry.py never rebinds it
     assert _assignments_of(RUNTIME, "CUSTOM_ENV_PYDANTIC_PIN") == 1
-    assert _assignments_of(ENTRY, "CUSTOM_ENV_PYDANTIC_PIN") == 0, (
-        "entry.py must not restate the bound; it inherits it through the function"
-    )
+    assert (
+        _assignments_of(ENTRY, "CUSTOM_ENV_PYDANTIC_PIN") == 0
+    ), "entry.py must not restate the bound; it inherits it through the function"
 
 
 def _assignments_of(path, name):
@@ -320,7 +328,9 @@ def _assignments_of(path, name):
     n = 0
     for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, ast.Assign):
-            n += sum(1 for t in node.targets if isinstance(t, ast.Name) and t.id == name)
+            n += sum(
+                1 for t in node.targets if isinstance(t, ast.Name) and t.id == name
+            )
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and node.target.id == name:
                 n += 1
@@ -339,7 +349,7 @@ def test_the_prose_guard_can_actually_fail():
         fh.write(
             '"""A docstring mentioning version("pydantic") must NOT count."""\n'
             "from importlib.metadata import version\n"
-            "# a comment with version(\"pydantic\") must NOT count either\n"
+            '# a comment with version("pydantic") must NOT count either\n'
             'PIN = "pydantic<" + version("pydantic")\n'
         )
         tmp = pathlib.Path(fh.name)
@@ -361,9 +371,15 @@ def test_the_pin_is_what_puts_pydantic_in_the_pip_section(ns):
     mention pydantic, and the test would be attesting to the wrong thing.
     """
     pip = _pip_of(_pin(ns, ["micro_sam"]))
-    others = [p for p in pip if ns["_is_pydantic_req"](p) and p != ns["CUSTOM_ENV_PYDANTIC_PIN"]]
+    others = [
+        p
+        for p in pip
+        if ns["_is_pydantic_req"](p) and p != ns["CUSTOM_ENV_PYDANTIC_PIN"]
+    ]
     assert others == [], others
-    assert [p for p in pip if ns["_is_pydantic_req"](p)] == [ns["CUSTOM_ENV_PYDANTIC_PIN"]]
+    assert [p for p in pip if ns["_is_pydantic_req"](p)] == [
+        ns["CUSTOM_ENV_PYDANTIC_PIN"]
+    ]
 
 
 # ------------------------------- the OTHER two inputs to the hash, and the pin's expiry
@@ -414,16 +430,12 @@ def _exact_pin(requirements_text, distribution):
 
 def _core_pins(texts):
     """``{deployment: pinned bioimageio.core}`` for a mapping of deployment -> text."""
-    return {
-        name: _exact_pin(text, "bioimageio.core") for name, text in texts.items()
-    }
+    return {name: _exact_pin(text, "bioimageio.core") for name, text in texts.items()}
 
 
 def _spec_pins(texts):
     """``{deployment: pinned bioimageio.spec}`` for a mapping of deployment -> text."""
-    return {
-        name: _exact_pin(text, "bioimageio.spec") for name, text in texts.items()
-    }
+    return {name: _exact_pin(text, "bioimageio.spec") for name, text in texts.items()}
 
 
 def test_both_deployments_pin_the_same_bioimageio_core():

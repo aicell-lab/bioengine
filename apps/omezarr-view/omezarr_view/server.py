@@ -14,6 +14,7 @@ CORS is open because a viewer runs on someone else's origin. Protected
 datasets take a bearer token, or ``?token=`` for clients that cannot set a
 header — the same two-door scheme ``bioengine/datasets/proxy_server.py`` uses.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +39,7 @@ from .tiles import TileRenderer
 
 logger = logging.getLogger("omezarr-view")
 
+
 def _find_frontend() -> Optional[Path]:
     """Locate the static pages.
 
@@ -48,10 +50,12 @@ def _find_frontend() -> Optional[Path]:
     500 that says nothing.
     """
     here = Path(__file__).resolve()
-    for candidate in (here.parent.parent / "frontend",
-                      here.parent / "frontend",
-                      Path.cwd() / "frontend",
-                      Path.cwd() / "omezarr-view" / "frontend"):
+    for candidate in (
+        here.parent.parent / "frontend",
+        here.parent / "frontend",
+        Path.cwd() / "frontend",
+        Path.cwd() / "omezarr-view" / "frontend",
+    ):
         if (candidate / "index.html").is_file():
             return candidate
     return None
@@ -99,12 +103,17 @@ class ChunkCache:
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
-            return {"entries": len(self._items), "bytes": self._bytes,
-                    "hits": self.hits, "misses": self.misses}
+            return {
+                "entries": len(self._items),
+                "bytes": self._bytes,
+                "hits": self.hits,
+                "misses": self.misses,
+            }
 
 
-def _is_authorised(entry: DatasetEntry, authorization: Optional[str],
-                   token: Optional[str]) -> bool:
+def _is_authorised(
+    entry: DatasetEntry, authorization: Optional[str], token: Optional[str]
+) -> bool:
     if not entry.is_protected:
         return True
     supplied = token
@@ -113,8 +122,9 @@ def _is_authorised(entry: DatasetEntry, authorization: Optional[str],
     return supplied == entry.token
 
 
-def _authorise(entry: DatasetEntry, authorization: Optional[str],
-               token: Optional[str]) -> None:
+def _authorise(
+    entry: DatasetEntry, authorization: Optional[str], token: Optional[str]
+) -> None:
     if not _is_authorised(entry, authorization, token):
         raise HTTPException(401, f"dataset '{entry.id}' requires a token")
 
@@ -136,9 +146,9 @@ def _redacted(summary: Dict[str, Any]) -> Dict[str, Any]:
         "indexed": False,
         "redacted": True,
         "note": "title and structure withheld; supply a token to see them. "
-                "NOTE the id itself is public — every route needs it — and ids "
-                "derived from filenames leak what the filename said, so set an "
-                "explicit id for anything sensitive.",
+        "NOTE the id itself is public — every route needs it — and ids "
+        "derived from filenames leak what the filename said, so set an "
+        "explicit id for anything sensitive.",
     }
 
 
@@ -173,9 +183,12 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
     thumbnails: Dict[str, bytes] = {}
     cache = ChunkCache(int(os.getenv("OMEZARR_VIEW_CACHE_BYTES", 512 << 20)))
     renderers: Dict[str, TileRenderer] = {}
-    annotations_dir = Path(os.getenv(
-        "OMEZARR_VIEW_ANNOTATIONS",
-        Path(config_path).resolve().parent / "annotations"))
+    annotations_dir = Path(
+        os.getenv(
+            "OMEZARR_VIEW_ANNOTATIONS",
+            Path(config_path).resolve().parent / "annotations",
+        )
+    )
 
     app = FastAPI(title="BioEngine OME-Zarr view", docs_url="/api/docs")
     app.add_middleware(
@@ -200,7 +213,7 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         root = str(request.base_url).rstrip("/")
         host = request.headers.get("x-forwarded-host") or request.url.hostname or ""
         if root.startswith("http://") and not host.startswith(("localhost", "127.")):
-            root = "https://" + root[len("http://"):]
+            root = "https://" + root[len("http://") :]
         return root
 
     def entry_or_404(dataset_id: str) -> DatasetEntry:
@@ -235,37 +248,54 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         return out
 
     @app.get("/api/datasets/{dataset_id}/tilegrid.json")
-    async def tilegrid(dataset_id: str,
-                       authorization: Optional[str] = Header(None),
-                       token: Optional[str] = Query(None)):
+    async def tilegrid(
+        dataset_id: str,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         entry = entry_or_404(dataset_id)
         _authorise(entry, authorization, token)
         renderer = await renderer_for(entry)
         return await asyncio.to_thread(renderer.grid)
 
     @app.get("/tiles/{dataset_id}/{zoom}/{tx}/{ty}.png")
-    async def tile(request: Request, dataset_id: str, zoom: int, tx: int, ty: int,
-                   channels: Optional[str] = Query(None),
-                   authorization: Optional[str] = Header(None),
-                   token: Optional[str] = Query(None)):
+    async def tile(
+        request: Request,
+        dataset_id: str,
+        zoom: int,
+        tx: int,
+        ty: int,
+        channels: Optional[str] = Query(None),
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         """RGB tiles, so tile-based clients (OpenLayers, Leaflet) can consume
         the same lazy view that Zarr clients read directly."""
         entry = entry_or_404(dataset_id)
         _authorise(entry, authorization, token)
         renderer = await renderer_for(entry)
-        picked = ([int(c) for c in channels.split(",") if c.strip().isdigit()]
-                  if channels else None)
-        png = await asyncio.to_thread(renderer.render, zoom, tx, ty,
-                                      _indices(request), picked)
+        picked = (
+            [int(c) for c in channels.split(",") if c.strip().isdigit()]
+            if channels
+            else None
+        )
+        png = await asyncio.to_thread(
+            renderer.render, zoom, tx, ty, _indices(request), picked
+        )
         if png is None:
             raise HTTPException(404, "no such tile")
-        return Response(png, media_type="image/png",
-                        headers={"Cache-Control": "public, max-age=3600"})
+        return Response(
+            png,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
 
     @app.get("/api/datasets/{dataset_id}/annotations")
-    async def get_annotations(dataset_id: str,
-                              authorization: Optional[str] = Header(None),
-                              token: Optional[str] = Query(None)):
+    async def get_annotations(
+        dataset_id: str,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         entry = entry_or_404(dataset_id)
         _authorise(entry, authorization, token)
         path = annotations_dir / f"{entry.id}.geojson"
@@ -274,9 +304,12 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         return json.loads(path.read_text())
 
     @app.put("/api/datasets/{dataset_id}/annotations")
-    async def put_annotations(dataset_id: str, payload: Dict[str, Any],
-                              authorization: Optional[str] = Header(None),
-                              token: Optional[str] = Query(None)):
+    async def put_annotations(
+        dataset_id: str,
+        payload: Dict[str, Any],
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         """Annotations are stored beside the catalog, never in the image.
 
         The source file stays the untouched record — that is the whole claim —
@@ -297,9 +330,12 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "datasets": len(catalog.entries),
-                "chunk_cache": cache.stats(),
-                "pages": "on-disk" if FRONTEND else "bundled"}
+        return {
+            "status": "ok",
+            "datasets": len(catalog.entries),
+            "chunk_cache": cache.stats(),
+            "pages": "on-disk" if FRONTEND else "bundled",
+        }
 
     def _page(name: str) -> HTMLResponse:
         # On disk when running from a checkout, so editing the HTML is live.
@@ -313,7 +349,8 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
                 503,
                 "static pages are neither on disk nor bundled; run "
                 "`python -m omezarr_view.bundle`. The JSON API at /api/datasets "
-                "and the zarr endpoints at /zarr/{id} work regardless")
+                "and the zarr endpoints at /zarr/{id} work regardless",
+            )
         if name not in PAGES:
             raise HTTPException(404, f"no page {name!r}")
         return HTMLResponse(PAGES[name])
@@ -323,9 +360,11 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         return _page("index.html")
 
     @app.get("/api/datasets")
-    async def list_datasets(request: Request,
-                            authorization: Optional[str] = Header(None),
-                            token: Optional[str] = Query(None)):
+    async def list_datasets(
+        request: Request,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         root = base_url(request)
         out = []
         for entry in catalog.entries.values():
@@ -338,9 +377,12 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         return {"title": catalog.title, "datasets": out, "vizarr": VIZARR}
 
     @app.get("/api/datasets/{dataset_id}")
-    async def get_dataset(request: Request, dataset_id: str,
-                          authorization: Optional[str] = Header(None),
-                          token: Optional[str] = Query(None)):
+    async def get_dataset(
+        request: Request,
+        dataset_id: str,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         entry = entry_or_404(dataset_id)
         _authorise(entry, authorization, token)
         await build_view(entry)
@@ -349,7 +391,9 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         summary["zarr_url"] = f"{root}/zarr/{entry.id}"
         summary["vizarr_url"] = f"{VIZARR}?source={summary['zarr_url']}"
         view = entry.view
-        channels = ((view.attrs.get("omero") or {}).get("channels") or []) if view else []
+        channels = (
+            ((view.attrs.get("omero") or {}).get("channels") or []) if view else []
+        )
         if channels:
             # Neuroglancer ignores the omero block, so a client building a
             # Neuroglancer link needs the measured window handed to it.
@@ -357,9 +401,11 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         return summary
 
     @app.get("/api/datasets/{dataset_id}/reference.json")
-    async def reference(dataset_id: str,
-                        authorization: Optional[str] = Header(None),
-                        token: Optional[str] = Query(None)):
+    async def reference(
+        dataset_id: str,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         entry = entry_or_404(dataset_id)
         _authorise(entry, authorization, token)
         view = await build_view(entry)
@@ -372,21 +418,27 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         return JSONResponse(view.raw_reference())
 
     @app.get("/api/datasets/{dataset_id}/thumbnail.png")
-    async def thumbnail(dataset_id: str,
-                        authorization: Optional[str] = Header(None),
-                        token: Optional[str] = Query(None)):
+    async def thumbnail(
+        dataset_id: str,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         entry = entry_or_404(dataset_id)
         _authorise(entry, authorization, token)
         if dataset_id not in thumbnails:
             view = await build_view(entry)
             array = await asyncio.to_thread(view.thumbnail_array)
             thumbnails[dataset_id] = await asyncio.to_thread(_thumbnail_png, array)
-        return Response(thumbnails[dataset_id], media_type="image/png",
-                        headers={"Cache-Control": "public, max-age=3600"})
+        return Response(
+            thumbnails[dataset_id],
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
 
     @app.get("/t/{path_token}/zarr/{dataset_id}/{key:path}")
-    async def zarr_key_path_token(request: Request, path_token: str,
-                                  dataset_id: str, key: str):
+    async def zarr_key_path_token(
+        request: Request, path_token: str, dataset_id: str, key: str
+    ):
         """Token in the path, not the query.
 
         A viewer builds chunk URLs by appending the key to the store root, so
@@ -398,9 +450,12 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
 
     @app.get("/zarr/{dataset_id}")
     @app.get("/zarr/{dataset_id}/")
-    async def zarr_root(request: Request, dataset_id: str,
-                        authorization: Optional[str] = Header(None),
-                        token: Optional[str] = Query(None)):
+    async def zarr_root(
+        request: Request,
+        dataset_id: str,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         # Must declare its own credential params and pass real values through:
         # calling zarr_key as a plain function handed FastAPI's Header/Query
         # sentinel objects to the authoriser, which then raised instead of
@@ -408,9 +463,13 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
         return await zarr_key(request, dataset_id, ".zgroup", authorization, token)
 
     @app.get("/zarr/{dataset_id}/{key:path}")
-    async def zarr_key(request: Request, dataset_id: str, key: str,
-                       authorization: Optional[str] = Header(None),
-                       token: Optional[str] = Query(None)):
+    async def zarr_key(
+        request: Request,
+        dataset_id: str,
+        key: str,
+        authorization: Optional[str] = Header(None),
+        token: Optional[str] = Query(None),
+    ):
         entry = entry_or_404(dataset_id)
         _authorise(entry, authorization, token)
         view = await build_view(entry)
@@ -447,16 +506,24 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
 def main() -> None:
     import uvicorn
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    config = os.getenv("OMEZARR_VIEW_CONFIG",
-                       str(Path(__file__).resolve().parent.parent / "datasets.yaml"))
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    config = os.getenv(
+        "OMEZARR_VIEW_CONFIG",
+        str(Path(__file__).resolve().parent.parent / "datasets.yaml"),
+    )
     # Behind a tunnel/proxy the app must build its own public URLs from the
     # forwarded headers, otherwise every zarr_url it hands out points at
     # localhost and nothing outside the host can open the view.
-    uvicorn.run(create_app(config), host="0.0.0.0",
-                port=int(os.getenv("PORT", "8842")), log_level="info",
-                proxy_headers=True, forwarded_allow_ips="*")
+    uvicorn.run(
+        create_app(config),
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8842")),
+        log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
 
 
 if __name__ == "__main__":

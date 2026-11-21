@@ -74,6 +74,7 @@ def _make_files(artifact_id: str, version: str):
 
 # ── fixtures ────────────────────────────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture(scope="module")
 async def hypha_client():
     token = os.environ.get("BIOIMAGE_IO_TOKEN") or os.environ.get("HYPHA_TOKEN")
@@ -97,6 +98,7 @@ async def artifact_manager(hypha_client):
 
 # ── tests ───────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_upload_app_commits_manifest_version(worker, artifact_manager):
     """upload_app must commit the artifact under the version in manifest.yaml."""
@@ -110,10 +112,14 @@ async def test_upload_app_commits_manifest_version(worker, artifact_manager):
         pass
 
     try:
-        saved_id = await worker.upload_app(files=_make_files(artifact_alias, test_version))
+        saved_id = await worker.upload_app(
+            files=_make_files(artifact_alias, test_version)
+        )
         assert saved_id == artifact_id, f"Unexpected artifact ID: {saved_id}"
 
-        artifact = await artifact_manager.read(artifact_id=artifact_id, version=test_version)
+        artifact = await artifact_manager.read(
+            artifact_id=artifact_id, version=test_version
+        )
         assert artifact is not None
         assert artifact.manifest.get("version") == test_version
     finally:
@@ -124,7 +130,9 @@ async def test_upload_app_commits_manifest_version(worker, artifact_manager):
 
 
 @pytest.mark.asyncio
-async def test_upload_app_new_version_creates_isolated_snapshot(worker, artifact_manager):
+async def test_upload_app_new_version_creates_isolated_snapshot(
+    worker, artifact_manager
+):
     """Bumping the version creates a new isolated snapshot; old tag still readable."""
     artifact_alias = "version-bump-test-pytest"
     artifact_id = f"bioimage-io/{artifact_alias}"

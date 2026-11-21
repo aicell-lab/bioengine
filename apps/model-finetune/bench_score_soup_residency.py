@@ -109,8 +109,11 @@ def _load_runtime():
 
 
 async def _old_score_soup(
-    self, members: List[Dict[str, str]], images: List[Any],
-    labels: List[Any], diam_mean: float = 30.0,
+    self,
+    members: List[Dict[str, str]],
+    images: List[Any],
+    labels: List[Any],
+    diam_mean: float = 30.0,
 ) -> Dict[str, Any]:
     """The pre-fix ``score_soup`` body, kept only as this benchmark's control.
 
@@ -136,8 +139,11 @@ async def _old_score_soup(
             gk = {"diameter": diam_mean}
             masks = []
             for image in images:
-                masks.append(await asyncio.to_thread(
-                    self._segment, image, gk, str(ckpt) if ckpt else None, "cpsam"))
+                masks.append(
+                    await asyncio.to_thread(
+                        self._segment, image, gk, str(ckpt) if ckpt else None, "cpsam"
+                    )
+                )
         finally:
             if ckpt and ckpt.exists():
                 ckpt.unlink()
@@ -150,8 +156,15 @@ async def _old_score_soup(
     }
 
 
-async def _drive(rtc, n_calls: int, member_bytes: int, scratch: Path,
-                 mode: str, build_s: float, segment_s: float) -> Dict[str, Any]:
+async def _drive(
+    rtc,
+    n_calls: int,
+    member_bytes: int,
+    scratch: Path,
+    mode: str,
+    build_s: float,
+    segment_s: float,
+) -> Dict[str, Any]:
     scratch.mkdir(parents=True, exist_ok=True)
     for stale in scratch.iterdir():
         stale.unlink()
@@ -209,8 +222,14 @@ async def _drive(rtc, n_calls: int, member_bytes: int, scratch: Path,
     }
 
 
-def _run_point(n_calls: int, member_bytes: int, scratch: str, mode: str,
-               build_s: float, segment_s: float) -> None:
+def _run_point(
+    n_calls: int,
+    member_bytes: int,
+    scratch: str,
+    mode: str,
+    build_s: float,
+    segment_s: float,
+) -> None:
     rtc = _load_runtime()
     res = asyncio.get_event_loop().run_until_complete(
         _drive(rtc, n_calls, member_bytes, Path(scratch), mode, build_s, segment_s)
@@ -220,35 +239,64 @@ def _run_point(n_calls: int, member_bytes: int, scratch: str, mode: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("after", "before"), default="after",
-                    help="'before' runs the pre-fix body — the discrimination control")
+    ap.add_argument(
+        "--mode",
+        choices=("after", "before"),
+        default="after",
+        help="'before' runs the pre-fix body — the discrimination control",
+    )
     ap.add_argument("--member-mb", type=int, default=256)
     ap.add_argument("--calls", type=int, nargs="+", default=[1, 2, 4, 8])
     ap.add_argument("--scratch", default="/tmp/bench_score_soup_residency")
-    ap.add_argument("--build-seconds", type=float, default=BUILD_SECONDS,
-                    help="stand-in for member download + average; raise it to size "
-                         "the semaphore's starvation cost against segmentation")
+    ap.add_argument(
+        "--build-seconds",
+        type=float,
+        default=BUILD_SECONDS,
+        help="stand-in for member download + average; raise it to size "
+        "the semaphore's starvation cost against segmentation",
+    )
     ap.add_argument("--segment-seconds", type=float, default=SEGMENT_SECONDS)
     ap.add_argument("--_point", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     member_bytes = args.member_mb * 1024 * 1024
     if args._point:
-        _run_point(args._point, member_bytes, args.scratch, args.mode,
-                   args.build_seconds, args.segment_seconds)
+        _run_point(
+            args._point,
+            member_bytes,
+            args.scratch,
+            args.mode,
+            args.build_seconds,
+            args.segment_seconds,
+        )
         return 0
 
-    print(f"mode={args.mode}  member={args.member_mb} MiB  "
-          f"build={args.build_seconds}s segment={args.segment_seconds}s  "
-          f"peak RSS as a multiple of one member")
+    print(
+        f"mode={args.mode}  member={args.member_mb} MiB  "
+        f"build={args.build_seconds}s segment={args.segment_seconds}s  "
+        f"peak RSS as a multiple of one member"
+    )
     rows, failures = [], []
     for n in args.calls:
         out = subprocess.run(
-            [sys.executable, __file__, "--mode", args.mode, "--_point", str(n),
-             "--member-mb", str(args.member_mb), "--scratch", args.scratch,
-             "--build-seconds", str(args.build_seconds),
-             "--segment-seconds", str(args.segment_seconds)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                __file__,
+                "--mode",
+                args.mode,
+                "--_point",
+                str(n),
+                "--member-mb",
+                str(args.member_mb),
+                "--scratch",
+                args.scratch,
+                "--build-seconds",
+                str(args.build_seconds),
+                "--segment-seconds",
+                str(args.segment_seconds),
+            ],
+            capture_output=True,
+            text=True,
         )
         if out.returncode != 0:
             print(f"  calls={n:<3} CHILD FAILED rc={out.returncode}\n{out.stderr}")
@@ -256,9 +304,11 @@ def main() -> int:
         point = json.loads(out.stdout.strip().splitlines()[-1])
         ratio = point["peak_bytes"] / member_bytes
         rows.append((n, ratio, point))
-        print(f"  calls={n:<3} peak={point['peak_bytes'] / 1024 ** 3:6.2f} GiB  "
-              f"{ratio:5.2f}x   max concurrent builds={point['max_concurrent_builds']}  "
-              f"wall={point['wall_s']}s")
+        print(
+            f"  calls={n:<3} peak={point['peak_bytes'] / 1024 ** 3:6.2f} GiB  "
+            f"{ratio:5.2f}x   max concurrent builds={point['max_concurrent_builds']}  "
+            f"wall={point['wall_s']}s"
+        )
         if point["completed"] != n:
             failures.append(f"calls={n}: only {point['completed']}/{n} completed")
         if point["max_concurrent_builds"] > 1:
@@ -267,11 +317,15 @@ def main() -> int:
                 "once; aggregate()'s admission check sizes ONE resident soup"
             )
         if point["leaked_files"]:
-            failures.append(f"calls={n}: soup files left behind: {point['leaked_files']}")
+            failures.append(
+                f"calls={n}: soup files left behind: {point['leaked_files']}"
+            )
 
     growth = rows[-1][1] - rows[0][1]
-    print(f"  growth {rows[0][0]}->{rows[-1][0]} concurrent calls = {growth:+.2f}x "
-          f"(budget {MAX_GROWTH}x)")
+    print(
+        f"  growth {rows[0][0]}->{rows[-1][0]} concurrent calls = {growth:+.2f}x "
+        f"(budget {MAX_GROWTH}x)"
+    )
     if growth > MAX_GROWTH:
         failures.append(
             f"peak grew {growth:+.2f}x from {rows[0][0]} to {rows[-1][0]} concurrent "
@@ -285,8 +339,10 @@ def main() -> int:
         if args.mode == "before":
             print("  (expected for --mode before: this is the discrimination control)")
         return 1
-    print("\nPASS — scoring peak RSS is flat in concurrent callers, "
-          "and soup builds are single-flight")
+    print(
+        "\nPASS — scoring peak RSS is flat in concurrent callers, "
+        "and soup builds are single-flight"
+    )
     return 0
 
 

@@ -90,14 +90,18 @@ def digest(state_dict: Dict[str, torch.Tensor]) -> str:
     return hasher.hexdigest()
 
 
-def fedavg(state_dicts: List[Dict[str, torch.Tensor]], weights: List[float]) -> Dict[str, torch.Tensor]:
+def fedavg(
+    state_dicts: List[Dict[str, torch.Tensor]], weights: List[float]
+) -> Dict[str, torch.Tensor]:
     """Sample-count-weighted average of parameter tensors (McMahan et al.)."""
     if not state_dicts:
         raise ValueError("nothing to merge")
     reference = signature(state_dicts[0])
     for i, sd in enumerate(state_dicts[1:], start=1):
         if signature(sd) != reference:
-            raise ValueError(f"checkpoint {i} has a different architecture than checkpoint 0")
+            raise ValueError(
+                f"checkpoint {i} has a different architecture than checkpoint 0"
+            )
     total = float(sum(weights))
     if total <= 0:
         raise ValueError("merge weights must sum to a positive number")

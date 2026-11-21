@@ -287,7 +287,10 @@ async def monitor_training(
                 train_losses = [float(loss) for loss in status["train_losses"]]
                 test_losses_raw = status.get("test_losses")
                 test_losses = (
-                    [float(loss) if loss is not None else None for loss in test_losses_raw]
+                    [
+                        float(loss) if loss is not None else None
+                        for loss in test_losses_raw
+                    ]
                     if isinstance(test_losses_raw, list)
                     else None
                 )

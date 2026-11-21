@@ -110,8 +110,7 @@ def test_call_site_passes_the_whole_stderr_not_the_display_tail():
     for call in calls:
         arg = call.args[0]
         assert isinstance(arg, ast.Name), (
-            "argument must be the undecorated stderr, got "
-            f"{ast.dump(arg)[:80]}"
+            "argument must be the undecorated stderr, got " f"{ast.dump(arg)[:80]}"
         )
 
 
@@ -120,7 +119,4 @@ def test_silent_on_unrelated_solver_failure(explain):
 
 
 def test_requires_a_git_clone_not_just_an_auth_prompt(explain):
-    assert (
-        explain("fatal: could not read Username for 'https://example.com'\n")
-        is None
-    )
+    assert explain("fatal: could not read Username for 'https://example.com'\n") is None

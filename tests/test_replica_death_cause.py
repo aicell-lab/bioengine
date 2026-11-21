@@ -72,7 +72,7 @@ def _actor(death_causes):
 
     def _list(resource, options, raise_on_missing_output):
         actor.gcs_calls += 1
-        (field, _, value), = options.filters
+        ((field, _, value),) = options.filters
         if field == "state":
             # The BULK query: every dead actor, which the caller intersects with
             # its own replicas. Modelled rather than special-cased, because the
@@ -228,7 +228,10 @@ def test_a_deployment_with_NO_dead_replica_gains_nothing_and_asks_the_gcs_nothin
     )
     calls = []
     inner = actor._get_actor_death_cause
-    actor._get_actor_death_cause = lambda actor_id: (calls.append(actor_id), inner(actor_id))[1]
+    actor._get_actor_death_cause = lambda actor_id: (
+        calls.append(actor_id),
+        inner(actor_id),
+    )[1]
 
     logs = actor.get_deployment_logs(
         application_id="soup",
@@ -265,15 +268,15 @@ def test_the_default_costs_exactly_ONE_gcs_QUERY_however_many_have_died():
         application_id="soup",
         deployment_name="CellposeRuntime",
     )
-    assert actor.gcs_calls == 1, (
-        f"{actor.gcs_calls} GCS queries at the default with 40 dead replicas"
-    )
+    assert (
+        actor.gcs_calls == 1
+    ), f"{actor.gcs_calls} GCS queries at the default with 40 dead replicas"
 
     # ...and all 40 are reported, because every one of them died abnormally.
     described = set(logs) - {"live1", "_deliberately_stopped_replicas"}
-    assert described == {f"dead{i:02d}" for i in range(40)}, (
-        f"described {len(described)} of 40 abnormal deaths"
-    )
+    assert described == {
+        f"dead{i:02d}" for i in range(40)
+    }, f"described {len(described)} of 40 abnormal deaths"
 
 
 def test_many_deliberate_stops_are_summarised_not_listed():
@@ -337,9 +340,14 @@ def test_apps_logs_asks_for_the_dead_replica():
     async def _connect(*args, **kwargs):
         return SimpleNamespace(get_app_status=_get_app_status)
 
-    with patch.object(
-        apps_cli, "require_worker", lambda w, t, s: ("http://srv", "ws/worker", "tok")
-    ), patch.object(apps_cli, "connect_worker", _connect):
+    with (
+        patch.object(
+            apps_cli,
+            "require_worker",
+            lambda w, t, s: ("http://srv", "ws/worker", "tok"),
+        ),
+        patch.object(apps_cli, "connect_worker", _connect),
+    ):
         result = CliRunner().invoke(apps_cli.logs, ["soup"])
 
     assert result.exit_code == 0, result.output
@@ -428,7 +436,7 @@ def test_a_routine_scale_down_cannot_hide_a_crash_at_the_default():
         death_causes={"a_oom": _OOM, "b_kill": _RAY_KILL},
         alive={"c_live": "a_c"},
         registered={
-            "a_crashed": ("a_oom", 1.0, "UTC"),   # registered FIRST, died of OOM
+            "a_crashed": ("a_oom", 1.0, "UTC"),  # registered FIRST, died of OOM
             "b_stopped": ("b_kill", 2.0, "UTC"),  # registered LAST, deliberate stop
             "c_live": ("a_c", 3.0, "UTC"),
         },
@@ -477,9 +485,9 @@ def test_clause_2_the_exception_is_carried_by_the_LOGS_not_by_the_cause():
         deployment_name="CellposeRuntime",
         n_previous_replica=1,
     )
-    assert any("IncompleteRead" in line for line in with_logs["crashed"]["stderr"]), (
-        "the exception is not reachable even with logs requested"
-    )
+    assert any(
+        "IncompleteRead" in line for line in with_logs["crashed"]["stderr"]
+    ), "the exception is not reachable even with logs requested"
     assert with_logs["crashed"]["death_cause"]["reason"] == "WORKER_DIED"
     # ...and the cause ALONE does not name it — which is why the clause needs
     # the logs path, not the default.
@@ -510,7 +518,8 @@ def _raising_deployment_actor(registered, alive):
     actor.application_replicas = {"app": {"D": registered}}
     actor.get_deployment_replicas = lambda application_id, deployment_name: alive
     actor.get_actor_logs = lambda actor_id, tail, timezone, creation_timestamp: {
-        "stdout": [], "stderr": []
+        "stdout": [],
+        "stderr": [],
     }
     return actor
 
@@ -528,15 +537,18 @@ def test_a_failed_hoisted_query_is_not_re_run_per_deployment():
     """
     registered = {"dead1": ("actor-1", 0.0), "dead2": ("actor-2", 0.0)}
     total = 0
-    for _ in range(4):                       # four deployments, as one application has
+    for _ in range(4):  # four deployments, as one application has
         actor = _raising_deployment_actor(registered, alive={})
         logs = actor.get_deployment_logs(
-            application_id="app", deployment_name="D",
-            n_previous_replica=0, tail=30,
-            death_causes=None, death_cause_query_failed=True,
+            application_id="app",
+            deployment_name="D",
+            n_previous_replica=0,
+            tail=30,
+            death_causes=None,
+            death_cause_query_failed=True,
         )
         total += actor.gcs_calls
-        assert logs == {}, logs      # and it invents no unexplained deaths
+        assert logs == {}, logs  # and it invents no unexplained deaths
 
     assert total == 0, (
         "a failed hoisted query was re-run %d time(s) across 4 deployments; the hoist is "
@@ -552,7 +564,9 @@ def test_without_the_flag_a_deployment_still_fetches_for_itself():
     """
     actor = _raising_deployment_actor({"dead1": ("actor-1", 0.0)}, alive={})
     actor.get_deployment_logs(
-        application_id="app", deployment_name="D",
-        n_previous_replica=0, tail=30,
+        application_id="app",
+        deployment_name="D",
+        n_previous_replica=0,
+        tail=30,
     )
     assert actor.gcs_calls == 1, actor.gcs_calls

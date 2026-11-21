@@ -15,6 +15,7 @@ outlast every caller that caused it instead of draining as callers give up.
 
 Each test below names which of the two it fails without.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -81,7 +82,9 @@ class _Method:
         return _Response(self.handle, self.handle.hold)
 
 
-def _proxy(max_ongoing: int, max_queued: int, timeout_s, hold: float = 0.0) -> ProxyDouble:
+def _proxy(
+    max_ongoing: int, max_queued: int, timeout_s, hold: float = 0.0
+) -> ProxyDouble:
     """A proxy with only the admission path wired up.
 
     Built with ``__new__`` rather than ``__init__`` on purpose: the real constructor wants a Hypha
@@ -113,7 +116,9 @@ def _proxy(max_ongoing: int, max_queued: int, timeout_s, hold: float = 0.0) -> P
 
 
 def _fn(p: ProxyDouble):
-    return p._create_deployment_function({"name": "infer", "description": "", "parameters": {}})
+    return p._create_deployment_function(
+        {"name": "infer", "description": "", "parameters": {}}
+    )
 
 
 CTX = {"user": {"id": "u1", "email": "u1@example.com"}}
@@ -130,8 +135,12 @@ async def test_a_second_call_waits_instead_of_being_refused():
     fn = _fn(p)
     results = await asyncio.gather(fn(context=CTX), fn(context=CTX))
     assert results == ["ok", "ok"]
-    assert p.entry_deployment_handle.calls == 2, "the queued call never reached the entry handle"
-    assert "rejected" not in p.usage, "a call that fits in the queue must not be recorded rejected"
+    assert (
+        p.entry_deployment_handle.calls == 2
+    ), "the queued call never reached the entry handle"
+    assert (
+        "rejected" not in p.usage
+    ), "a call that fits in the queue must not be recorded rejected"
 
 
 @pytest.mark.asyncio
@@ -148,7 +157,8 @@ async def test_the_queue_is_bounded_and_the_overflow_is_still_refused():
     errors = [r for r in settled if isinstance(r, BaseException)]
     assert len(errors) == 1, "exactly one of three should overflow, got %r" % (settled,)
     assert "queue" in str(errors[0]).lower(), (
-        "the refusal must say the queue was full, not just the concurrency limit: %s" % errors[0]
+        "the refusal must say the queue was full, not just the concurrency limit: %s"
+        % errors[0]
     )
     assert p.usage.count("rejected") == 1
 
@@ -168,9 +178,9 @@ async def test_a_wedged_call_releases_its_slot_on_the_timeout():
     assert p.usage.count("failed") == 1
 
     p.entry_deployment_handle.hold = 0.0
-    assert await asyncio.wait_for(fn(context=CTX), timeout=5) == "ok", (
-        "the slot was not released, so a later caller inherits the wedge"
-    )
+    assert (
+        await asyncio.wait_for(fn(context=CTX), timeout=5) == "ok"
+    ), "the slot was not released, so a later caller inherits the wedge"
 
 
 @pytest.mark.asyncio
@@ -212,7 +222,9 @@ async def test_the_timeout_cancels_the_call_and_not_only_the_wait():
     with pytest.raises(TimeoutError):
         await fn(context=CTX)
     assert p.entry_deployment_handle.responses, "no response object was created"
-    assert p.entry_deployment_handle.responses[-1].cancelled, (
+    assert p.entry_deployment_handle.responses[
+        -1
+    ].cancelled, (
         "the call was abandoned but never cancelled, so the replica keeps working"
     )
 
@@ -244,7 +256,10 @@ def _remote_error(cause: BaseException):
     with a placeholder there cannot tell "the message survived" from "the message was discarded",
     so it would report the bug fixed either way.
     """
-    tb = "Traceback (most recent call last):\n  ...\n%s: %s" % (type(cause).__name__, cause)
+    tb = "Traceback (most recent call last):\n  ...\n%s: %s" % (
+        type(cause).__name__,
+        cause,
+    )
     return RayTaskError("slow", tb, cause).as_instanceof_cause()
 
 
@@ -259,17 +274,21 @@ async def test_an_apps_own_timeout_error_is_not_claimed_by_the_proxy_bound():
     wrong system.
     """
     p = _proxy(max_ongoing=1, max_queued=1, timeout_s=10, hold=0.0)
-    p.entry_deployment_handle.raises = _remote_error(TimeoutError("upstream read timed out"))
+    p.entry_deployment_handle.raises = _remote_error(
+        TimeoutError("upstream read timed out")
+    )
     fn = _fn(p)
     with pytest.raises(Exception) as got:
         await fn(context=CTX)
-    assert isinstance(got.value, RayTaskError), (
-        "the app's error was replaced by a bare TimeoutError: %r" % (got.value,)
-    )
-    assert "upstream read timed out" in str(got.value), "the app's own message was discarded"
-    assert "did not complete within" not in str(got.value), (
-        "the caller was told the proxy bound expired, but it never did"
-    )
+    assert isinstance(
+        got.value, RayTaskError
+    ), "the app's error was replaced by a bare TimeoutError: %r" % (got.value,)
+    assert "upstream read timed out" in str(
+        got.value
+    ), "the app's own message was discarded"
+    assert "did not complete within" not in str(
+        got.value
+    ), "the caller was told the proxy bound expired, but it never did"
 
 
 @pytest.mark.asyncio
@@ -283,11 +302,15 @@ async def test_an_apps_own_timeout_error_is_not_cancelled():
     "our bound expired" rather than "something named TimeoutError happened".
     """
     p = _proxy(max_ongoing=1, max_queued=1, timeout_s=10, hold=0.0)
-    p.entry_deployment_handle.raises = _remote_error(TimeoutError("upstream read timed out"))
+    p.entry_deployment_handle.raises = _remote_error(
+        TimeoutError("upstream read timed out")
+    )
     fn = _fn(p)
     with pytest.raises(Exception):
         await fn(context=CTX)
-    assert not p.entry_deployment_handle.responses[-1].cancelled, (
+    assert not p.entry_deployment_handle.responses[
+        -1
+    ].cancelled, (
         "a call that failed on its own was cancelled as if the proxy bound had expired"
     )
 

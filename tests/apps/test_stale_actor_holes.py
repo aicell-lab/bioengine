@@ -312,7 +312,9 @@ async def test_the_warning_rearms_once_the_app_verifies_again(caplog) -> None:
 
     with caplog.at_level(logging.WARNING, logger="test.holes"):
         await manager.monitor_applications()
-        manager._verify_running_identities = AsyncMock(return_value=(VERSION, True, True))
+        manager._verify_running_identities = AsyncMock(
+            return_value=(VERSION, True, True)
+        )
         await manager.monitor_applications()
         manager._verify_running_identities = AsyncMock(
             return_value=(VERSION, True, False)
@@ -459,9 +461,9 @@ async def test_a_failed_build_leaves_the_running_app_alone() -> None:
         )
 
     assert events == [("build", None)]
-    assert manager._deployed_applications[APP_ID]["is_deployed"].is_set(), (
-        "The old app is still serving, so it must still read as deployed."
-    )
+    assert manager._deployed_applications[APP_ID][
+        "is_deployed"
+    ].is_set(), "The old app is still serving, so it must still read as deployed."
 
 
 # ───────────────────── the fingerprint both sides must agree on ─────────────────────

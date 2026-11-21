@@ -19,6 +19,7 @@ Two pins:
   (source inspection — the public method is ``@schema_method``-wrapped and
   composes Ray + Hypha state that is impractical to reconstruct here).
 """
+
 from __future__ import annotations
 
 import asyncio

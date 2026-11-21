@@ -150,9 +150,7 @@ async def test_a_named_admin_still_edits_the_list_on_a_wildcard_worker(tmp_path)
 
 async def test_the_workers_own_identity_cannot_be_removed(tmp_path):
     """_connect_to_server re-inserts it, so removal would revert silently."""
-    worker = _bare_worker(
-        tmp_path, ["worker@service.internal", "admin@example.org"]
-    )
+    worker = _bare_worker(tmp_path, ["worker@service.internal", "admin@example.org"])
 
     with pytest.raises(ValueError, match="restored on the next reconnect"):
         await worker.remove_admin_user(user="worker@service.internal", context=ADMIN)

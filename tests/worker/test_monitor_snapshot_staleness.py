@@ -124,7 +124,10 @@ async def test_a_snapshot_just_inside_the_deadline_is_still_ready():
     that is failing but still cycling sleeps up to the backoff maximum
     between passes and must not be called frozen."""
     assert await is_ready_of(worker_with_snapshot(time.time() - 1)) is True
-    assert await is_ready_of(worker_with_snapshot(time.time() - BACKOFF_MAX_SECONDS)) is True
+    assert (
+        await is_ready_of(worker_with_snapshot(time.time() - BACKOFF_MAX_SECONDS))
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +140,7 @@ async def test_zero_capacity_but_fresh_is_still_ready():
     fresh snapshot. The retracted capacity gate reported this not-ready,
     which would have been false for every idle slurm worker. Opposite-signed
     control: this fails if readiness is ever gated on contents again."""
-    worker = worker_with_snapshot(
-        time.time(), cluster=IDLE_SLURM_CLUSTER, nodes={}
-    )
+    worker = worker_with_snapshot(time.time(), cluster=IDLE_SLURM_CLUSTER, nodes={})
     assert await is_ready_of(worker) is True
 
 
@@ -147,9 +148,7 @@ async def test_full_capacity_but_stale_is_not_ready():
     """The other half of the pair: capacity is maximal and the snapshot is
     old. Together with the test above this shows the gate reads the age and
     ignores the contents — neither test alone could establish that."""
-    worker = worker_with_snapshot(
-        time.time() - (STALE_AFTER + 1), cluster=BUSY_CLUSTER
-    )
+    worker = worker_with_snapshot(time.time() - (STALE_AFTER + 1), cluster=BUSY_CLUSTER)
     assert await is_ready_of(worker) is False
 
 

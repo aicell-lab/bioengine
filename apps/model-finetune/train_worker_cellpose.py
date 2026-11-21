@@ -112,7 +112,9 @@ def _instance_scores(gts, preds, thresholds):
     return out
 
 
-def _evaluate_validation(model, val_image_files, val_label_files, want_pixel, want_instance):
+def _evaluate_validation(
+    model, val_image_files, val_label_files, want_pixel, want_instance
+):
     """Score the fine-tuned net on the validation split, returning
     ``(pixel_metrics, instance_metrics)`` — each None when not requested and
     ``{"error": ...}`` when it could not be computed. One inference pass feeds
@@ -132,16 +134,22 @@ def _evaluate_validation(model, val_image_files, val_label_files, want_pixel, wa
         return both({"error": "needs validation data (val_images/val_labels)"})
     try:
         imgs = [np.asarray(cpio.imread(f)) for f in val_image_files]
-        gts = [np.squeeze(np.asarray(cpio.imread(f))).astype(np.int32)
-               for f in val_label_files]
-        preds = [np.asarray(m).astype(np.int32)
-                 for m in model.eval(imgs, normalize=True, rescale=False)[0]]
+        gts = [
+            np.squeeze(np.asarray(cpio.imread(f))).astype(np.int32)
+            for f in val_label_files
+        ]
+        preds = [
+            np.asarray(m).astype(np.int32)
+            for m in model.eval(imgs, normalize=True, rescale=False)[0]
+        ]
     except Exception as exc:
         return both({"error": f"validation inference failed: {str(exc)[:240]}"})
 
-    counts = {"n_val": len(gts),
-              "n_true": sum(int(g.max()) for g in gts),
-              "n_pred": sum(int(p.max()) for p in preds)}
+    counts = {
+        "n_val": len(gts),
+        "n_true": sum(int(g.max()) for g in gts),
+        "n_pred": sum(int(p.max()) for p in preds),
+    }
     pixel = instance = None
     if want_pixel:
         try:
@@ -150,8 +158,9 @@ def _evaluate_validation(model, val_image_files, val_label_files, want_pixel, wa
             pixel = {"error": str(exc)[:300]}
     if want_instance:
         try:
-            instance = dict(counts, **_instance_scores(
-                gts, preds, training.INSTANCE_IOU_THRESHOLDS))
+            instance = dict(
+                counts, **_instance_scores(gts, preds, training.INSTANCE_IOU_THRESHOLDS)
+            )
         except Exception as exc:
             instance = {"error": str(exc)[:300]}
     return pixel, instance
@@ -200,7 +209,9 @@ def main(session_id: str) -> None:
 
     training.write_status(session_id, status="TRAINING", message="training started")
     stop = threading.Event()
-    heartbeat = threading.Thread(target=_heartbeat, args=(session_id, stop), daemon=True)
+    heartbeat = threading.Thread(
+        target=_heartbeat, args=(session_id, stop), daemon=True
+    )
     heartbeat.start()
 
     try:
@@ -221,29 +232,41 @@ def main(session_id: str) -> None:
 
         result = train_seg(
             net,
-            train_files=p["train_images"], train_labels_files=p["train_labels"],
-            test_files=p["val_images"], test_labels_files=p["val_labels"],
-            save_path=str(sdir), model_name="model",
-            n_epochs=p["n_epochs"], learning_rate=p["learning_rate"],
-            weight_decay=p.get("weight_decay", 0.1), batch_size=p.get("batch_size", 1),
+            train_files=p["train_images"],
+            train_labels_files=p["train_labels"],
+            test_files=p["val_images"],
+            test_labels_files=p["val_labels"],
+            save_path=str(sdir),
+            model_name="model",
+            n_epochs=p["n_epochs"],
+            learning_rate=p["learning_rate"],
+            weight_decay=p.get("weight_decay", 0.1),
+            batch_size=p.get("batch_size", 1),
             min_train_masks=p.get("min_train_masks", 1),
             # None keeps cellpose's own per-backbone default: 256 for cpsam,
             # 384 for cpdino. cpsam rejects any other value outright.
             bsize=p.get("train_tile_size"),
-            normalize=True, rescale=False,
+            normalize=True,
+            rescale=False,
         )
         stop.set()
         # Stock train_seg returns (model_path, train_losses, test_losses); capture
         # defensively so a signature change can't break the run.
         train_losses, test_losses = [], []
-        if "loss" in metrics_requested and isinstance(result, (tuple, list)) and len(result) >= 3:
+        if (
+            "loss" in metrics_requested
+            and isinstance(result, (tuple, list))
+            and len(result) >= 3
+        ):
             train_losses, test_losses = _loss_list(result[1]), _loss_list(result[2])
             # Stock train_seg validates only every validation_interval epochs and
             # returns 0.0 for the off-cadence epochs; a real segmentation test loss
             # is never exactly 0.0, so surface those as null — a consumer must not
             # read a non-validated epoch as a test loss of 0.0 (verified on deNBI:
             # a 4-epoch run gave [11.05, 0, 0, 0] = validated at epoch 0 only).
-            test_losses = [None if (v is not None and v == 0.0) else v for v in test_losses]
+            test_losses = [
+                None if (v is not None and v == 0.0) else v for v in test_losses
+            ]
         ok = training.checkpoint_path(session_id).exists()
         cell_diameters = None
         pixel_metrics = instance_metrics = None
@@ -253,7 +276,9 @@ def main(session_id: str) -> None:
             except Exception:
                 cell_diameters = None
             pixel_metrics, instance_metrics = _evaluate_validation(
-                model, p.get("val_images"), p.get("val_labels"),
+                model,
+                p.get("val_images"),
+                p.get("val_labels"),
                 want_pixel="pixel" in metrics_requested,
                 want_instance="instance" in metrics_requested,
             )
@@ -265,8 +290,13 @@ def main(session_id: str) -> None:
         training.write_status(
             session_id,
             status="COMPLETED" if ok else "FAILED",
-            message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
-            end_time=time.time(), terminated_by="child",
+            message=(
+                "checkpoint saved"
+                if ok
+                else "training finished but no checkpoint was produced"
+            ),
+            end_time=time.time(),
+            terminated_by="child",
             n_epochs_completed=p["n_epochs"] if ok else None,
             n_epochs_completed_basis="floor_if_completed" if ok else None,
             cell_diameters=cell_diameters,
@@ -279,8 +309,11 @@ def main(session_id: str) -> None:
     except Exception as e:
         stop.set()
         training.write_status(
-            session_id, status="FAILED", message=str(e)[:800],
-            traceback=traceback.format_exc()[-2500:], end_time=time.time(),
+            session_id,
+            status="FAILED",
+            message=str(e)[:800],
+            traceback=traceback.format_exc()[-2500:],
+            end_time=time.time(),
             terminated_by="child",
         )
         raise

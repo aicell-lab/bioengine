@@ -276,9 +276,7 @@ def test_a_dropped_dashboard_connection_serves_the_last_good_snapshot(
 
 def test_an_unexpected_fetch_error_is_not_swallowed(monkeypatch):
     totals = {"n1": {"CPU": 8.0, "GPU": 1.0, "accelerator_type:G": 1.0}}
-    actor = _actor(
-        totals, dashboard_error=RuntimeError("bug"), monkeypatch=monkeypatch
-    )
+    actor = _actor(totals, dashboard_error=RuntimeError("bug"), monkeypatch=monkeypatch)
 
     with pytest.raises(RuntimeError, match="bug"):
         actor.get_cluster_state()

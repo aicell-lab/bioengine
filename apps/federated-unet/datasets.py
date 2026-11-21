@@ -35,7 +35,7 @@ DATASETS: Dict[str, Dict[str, str]] = {
         "url": "https://github.com/stardist/stardist/releases/download/0.1.0/dsb2018.zip",
         "objects": "fluorescence cell nuclei (many small round objects)",
         "source": "BBBC038v1 (Kaggle 2018 Data Science Bowl), fluorescence subset "
-                  "as repackaged by StarDist (repo BSD-3-Clause)",
+        "as repackaged by StarDist (repo BSD-3-Clause)",
         "licence": "CC0",
         "citation": "Caicedo et al., Nature Methods, 2019",
     },
@@ -139,7 +139,8 @@ def _extract(archive: Path, target: Path) -> Path:
     target.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive) as zf:
         members = [
-            n for n in zf.namelist()
+            n
+            for n in zf.namelist()
             if "__MACOSX" not in n and "/.svn/" not in n and not n.endswith("/")
         ]
         zf.extractall(target, members=members)
@@ -167,7 +168,9 @@ def _fetch_text(url: str) -> str:
         return response.read().decode("utf-8", "replace")
 
 
-def _load_dsb2018(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _load_dsb2018(
+    slot: Path, spec: Dict[str, str]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     import tifffile
 
     root = _extract(_download(spec["url"], slot / "images.zip"), slot / "images")
@@ -177,12 +180,18 @@ def _load_dsb2018(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np
         mask_path = root / "dsb2018" / "train" / "masks" / image_path.name
         if not mask_path.exists():
             continue
-        pairs.append((_normalize(tifffile.imread(image_path)),
-                      (tifffile.imread(mask_path) > 0).astype(np.float32)))
+        pairs.append(
+            (
+                _normalize(tifffile.imread(image_path)),
+                (tifffile.imread(mask_path) > 0).astype(np.float32),
+            )
+        )
     return pairs
 
 
-def _load_bbbc010(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _load_bbbc010(
+    slot: Path, spec: Dict[str, str]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     import imageio.v3 as iio
     import tifffile
 
@@ -206,8 +215,9 @@ def _load_bbbc010(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np
         mask = iio.imread(mask_path)
         if mask.ndim == 3:
             mask = mask[..., 0]
-        pairs.append((_normalize(tifffile.imread(by_well[well])),
-                      (mask > 0).astype(np.float32)))
+        pairs.append(
+            (_normalize(tifffile.imread(by_well[well])), (mask > 0).astype(np.float32))
+        )
     return pairs
 
 
@@ -244,7 +254,9 @@ def _signal(rgb: np.ndarray, modality: str) -> np.ndarray:
     return rgb.mean(-1)
 
 
-def _load_bbbc038(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _load_bbbc038(
+    slot: Path, spec: Dict[str, str]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     import imageio.v3 as iio
 
     modality = spec["modality"]
@@ -270,7 +282,9 @@ def _load_bbbc038(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np
     return pairs
 
 
-def _load_bbbc039(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _load_bbbc039(
+    slot: Path, spec: Dict[str, str]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     import imageio.v3 as iio
     import tifffile
 
@@ -293,7 +307,9 @@ def _load_bbbc039(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np
     return pairs
 
 
-def _load_nuinsseg(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _load_nuinsseg(
+    slot: Path, spec: Dict[str, str]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     import imageio.v3 as iio
 
     # 48,399 entries of which 1,330 are wanted, so the archive is read in place
@@ -302,7 +318,8 @@ def _load_nuinsseg(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, n
     pairs = []
     with zipfile.ZipFile(archive) as zf:
         for member in sorted(
-            n for n in zf.namelist()
+            n
+            for n in zf.namelist()
             if "/tissue images/" in n and n.lower().endswith(".png")
         ):
             organ, _, stem = member.split("/")[0], None, Path(member).stem
@@ -311,13 +328,20 @@ def _load_nuinsseg(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, n
             label = f"{organ}/label masks modify/{stem}.tif"
             if label not in zf.namelist():
                 continue
-            rgb = iio.imread(io.BytesIO(zf.read(member)))[..., :3].astype(np.float32) / 255.0
+            rgb = (
+                iio.imread(io.BytesIO(zf.read(member)))[..., :3].astype(np.float32)
+                / 255.0
+            )
             mask = iio.imread(io.BytesIO(zf.read(label))) > 0
-            pairs.append((_normalize(_signal(rgb, "histology")), mask.astype(np.float32)))
+            pairs.append(
+                (_normalize(_signal(rgb, "histology")), mask.astype(np.float32))
+            )
     return pairs
 
 
-def _load_cellbindb(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _load_cellbindb(
+    slot: Path, spec: Dict[str, str]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     import tifffile
 
     base = spec["url"]
@@ -343,12 +367,17 @@ def _load_cellbindb(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, 
         # this one client, so the per-image percentile normalisation is doing
         # real work here rather than only rescaling.
         pairs.append(
-            (_normalize(tifffile.imread(image)), (tifffile.imread(label) > 0).astype(np.float32))
+            (
+                _normalize(tifffile.imread(image)),
+                (tifffile.imread(label) > 0).astype(np.float32),
+            )
         )
     return pairs
 
 
-def _load_kromp(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _load_kromp(
+    slot: Path, spec: Dict[str, str]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     import tifffile
 
     base = spec["url"]
@@ -358,7 +387,9 @@ def _load_kromp(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.n
     # One of the 80 rows carries the literal string "null" in every metadata
     # column and is not one of the 42 train / 37 test annotated fields.
     members = sorted(
-        row["Files"] for row in rows if row.get("Files") and row.get("Diagnosis") != "null"
+        row["Files"]
+        for row in rows
+        if row.get("Files") and row.get("Diagnosis") != "null"
     )
     pairs = []
     for member in members:
@@ -372,11 +403,15 @@ def _load_kromp(slot: Path, spec: Dict[str, str]) -> List[Tuple[np.ndarray, np.n
         # DAPI signal in blue alone, so averaging the channels would dilute it
         # by three against the greyscale files.
         signal = raw[..., 2] if raw.ndim == 3 else raw
-        pairs.append((_normalize(signal), (tifffile.imread(label) > 0).astype(np.float32)))
+        pairs.append(
+            (_normalize(signal), (tifffile.imread(label) > 0).astype(np.float32))
+        )
     return pairs
 
 
-LOADERS: Dict[str, Callable[[Path, Dict[str, str]], List[Tuple[np.ndarray, np.ndarray]]]] = {
+LOADERS: Dict[
+    str, Callable[[Path, Dict[str, str]], List[Tuple[np.ndarray, np.ndarray]]]
+] = {
     "dsb2018-fluo": _load_dsb2018,
     "bbbc010-worms": _load_bbbc010,
     "bbbc038-fluo": _load_bbbc038,
@@ -444,7 +479,9 @@ def load_dataset(
     pairs = LOADERS[name](slot, spec)
 
     if not pairs:
-        raise RuntimeError(f"dataset {name!r} extracted but no image/mask pairs were found")
+        raise RuntimeError(
+            f"dataset {name!r} extracted but no image/mask pairs were found"
+        )
     if n_train is None:
         # Natural size: every image the client has that is not held out. Test and
         # val stay at fixed counts so no client's readout is noisier than
@@ -469,8 +506,12 @@ def load_dataset(
     test_idx = order[block : block + n_test]
     rest = np.concatenate([order[:block], order[block + n_test :]])
     cuts = {
-        "train": np.concatenate([rest[k * block : k * block + n_train] for k in shards]),
-        "val": np.concatenate([rest[k * block + n_train : (k + 1) * block] for k in shards]),
+        "train": np.concatenate(
+            [rest[k * block : k * block + n_train] for k in shards]
+        ),
+        "val": np.concatenate(
+            [rest[k * block + n_train : (k + 1) * block] for k in shards]
+        ),
         "test": test_idx,
     }
     splits = {k: [pairs[i] for i in idx] for k, idx in cuts.items()}
@@ -485,7 +526,9 @@ def load_dataset(
         "source": spec["source"],
         "licence": spec["licence"],
         "citation": spec["citation"],
-        "mean_foreground_fraction": float(np.mean([m.mean() for _, m in splits["train"]])),
+        "mean_foreground_fraction": float(
+            np.mean([m.mean() for _, m in splits["train"]])
+        ),
         # Recorded per arm; a mismatch between arms means they were not scored
         # on the same images and the comparison has to be thrown away.
         "split_fingerprint": hashlib.sha256(

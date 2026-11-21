@@ -27,6 +27,7 @@ inside hypha_rpc — it surfaces only when the call is MADE. See `_DeadServer` b
 written that way for this reason. A fake that merely sets the attribute to None lets a
 liveness-guard "fix" pass every unit arm here and then fail the live reproduction.
 """
+
 import time
 
 import pytest
@@ -62,6 +63,7 @@ class _LiveServer:
     async def parse_token(self, _token):
         class _Info:
             expires_at = time.time() + 3600 * 3
+
         return _Info()
 
 
@@ -74,14 +76,17 @@ def _worker(server, token, bootstrap, expires_at):
     w.workspace = "ws"
     w.client_id = "cid"
     import logging
+
     w.logger = logging.getLogger("test_token_refresh")
     return w
 
 
 @pytest.mark.asyncio
 async def test_dead_connection_falls_back_to_the_bootstrap_token_without_raising():
-    w = _worker(_DeadServer(), "expired-minted-token", "long-lived-bootstrap", time.time() - 1)
-    await w._check_token_expiry()          # must not raise
+    w = _worker(
+        _DeadServer(), "expired-minted-token", "long-lived-bootstrap", time.time() - 1
+    )
+    await w._check_token_expiry()  # must not raise
     assert w._token == "long-lived-bootstrap", (
         "the worker did not restore the credential it started with, so the next reconnect "
         "would reuse the expired minted token and the deadlock survives"
@@ -101,8 +106,10 @@ async def test_healthy_connection_still_mints_on_schedule(caplog):
 
 @pytest.mark.asyncio
 async def test_dead_connection_with_bootstrap_already_in_use_is_a_quiet_no_op():
-    w = _worker(_DeadServer(), "long-lived-bootstrap", "long-lived-bootstrap", time.time() - 1)
-    await w._check_token_expiry()          # must not raise
+    w = _worker(
+        _DeadServer(), "long-lived-bootstrap", "long-lived-bootstrap", time.time() - 1
+    )
+    await w._check_token_expiry()  # must not raise
     assert w._token == "long-lived-bootstrap"
 
 
@@ -152,9 +159,9 @@ def test_the_pre_login_bootstrap_capture_is_still_present():
     src = _init_source()
     i_login = src.find("self._token = login(")
     assert i_login != -1
-    assert "self._bootstrap_token = self._token" in src[:i_login], (
-        "the capture that protects a worker started WITH a token was removed"
-    )
+    assert (
+        "self._bootstrap_token = self._token" in src[:i_login]
+    ), "the capture that protects a worker started WITH a token was removed"
 
 
 @pytest.mark.asyncio
@@ -173,9 +180,9 @@ async def test_a_login_issued_credential_survives_a_mint_and_a_dead_connection()
     w.server = _DeadServer()
     w._token_expires_at = time.time() - 1
     await w._check_token_expiry()
-    assert w._token == "login-issued-token", (
-        "fell back to nothing and kept the expired minted token, so the next reconnect fails"
-    )
+    assert (
+        w._token == "login-issued-token"
+    ), "fell back to nothing and kept the expired minted token, so the next reconnect fails"
 
 
 async def test_the_fallback_SAYS_so_at_warning_level(caplog):
@@ -188,7 +195,9 @@ async def test_the_fallback_SAYS_so_at_warning_level(caplog):
     """
     import logging
 
-    w = _worker(_DeadServer(), "expired-minted-token", "long-lived-bootstrap", time.time() - 1)
+    w = _worker(
+        _DeadServer(), "expired-minted-token", "long-lived-bootstrap", time.time() - 1
+    )
     with caplog.at_level(logging.WARNING, logger=w.logger.name):
         await w._check_token_expiry()
 

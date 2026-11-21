@@ -73,7 +73,9 @@ def _manager() -> AppsManager:
     m._deployed_applications = {}
     m._deployment_lock = asyncio.Lock()
     m._check_initialized = MagicMock()
-    m._get_full_artifact_id = MagicMock(side_effect=lambda artifact_id, **_: artifact_id)
+    m._get_full_artifact_id = MagicMock(
+        side_effect=lambda artifact_id, **_: artifact_id
+    )
     m._generate_application_id = MagicMock(return_value=APP_ID)
     m._check_resources = AsyncMock(return_value=None)
     m._deploy_application = AsyncMock()

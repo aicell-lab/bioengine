@@ -15,12 +15,15 @@ async def resolve_worker(server, prefix: str):
     matches = [
         service["id"]
         for service in await server.list_services(workspace)
-        if service["id"].startswith(prefix) and service["id"].endswith(":bioengine-worker")
+        if service["id"].startswith(prefix)
+        and service["id"].endswith(":bioengine-worker")
     ]
     if not matches:
         raise RuntimeError(f"no worker matching {prefix!r}")
     workers = [await server.get_service(match) for match in matches]
-    heads = {(await worker.get_status())["ray_cluster"]["head_address"] for worker in workers}
+    heads = {
+        (await worker.get_status())["ray_cluster"]["head_address"] for worker in workers
+    }
     if len(heads) != 1:
         raise RuntimeError(
             f"{prefix!r} matches workers on different Ray clusters {heads}: {matches}"

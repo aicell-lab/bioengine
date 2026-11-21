@@ -124,8 +124,10 @@ def check_lockstep(head_ref: str) -> list[str]:
             f"bioengine/_version.py __version__ ({module_version}) does not match "
             f"pyproject.toml version ({project_version}). Bump both together."
         ]
-    print(f"✅ worker: bioengine/_version.py in sync with pyproject.toml "
-          f"({project_version})")
+    print(
+        f"✅ worker: bioengine/_version.py in sync with pyproject.toml "
+        f"({project_version})"
+    )
     return []
 
 
@@ -137,9 +139,7 @@ def main() -> int:
 
     try:
         print(f"Comparing {args.base_ref}...{args.head_ref}")
-        changed = git(
-            "diff", "--name-only", args.base_ref, args.head_ref
-        ).splitlines()
+        changed = git("diff", "--name-only", args.base_ref, args.head_ref).splitlines()
         print("Changed files:")
         for path in changed:
             print(f" - {path}")

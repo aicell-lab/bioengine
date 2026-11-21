@@ -215,7 +215,9 @@ class RayCluster:
         # Version-suffix the actor name so workers on different BioEngine
         # versions get their own detached actor — they don't fight over the
         # same one. Strip characters that aren't safe in a Ray actor name.
-        _safe_version = re.sub(r"[^a-zA-Z0-9_]", "_", bioengine.__version__ or "unknown")
+        _safe_version = re.sub(
+            r"[^a-zA-Z0-9_]", "_", bioengine.__version__ or "unknown"
+        )
         self.proxy_actor_name = f"BIOENGINE_PROXY_ACTOR_{_safe_version}"
         self.cluster_status_history = OrderedDict()
         self.max_status_history_length = 100
@@ -751,9 +753,7 @@ class RayCluster:
         if visible:
             query.append(f"--id={visible}")
         try:
-            result = subprocess.run(
-                query, capture_output=True, text=True, timeout=15
-            )
+            result = subprocess.run(query, capture_output=True, text=True, timeout=15)
         except (FileNotFoundError, subprocess.SubprocessError):
             return None
         if result.returncode != 0:
@@ -778,9 +778,7 @@ class RayCluster:
                 reserved_gb=reserved_gb,
                 mem_total_bytes=meminfo["MemTotal"],
                 mem_available_bytes=meminfo["MemAvailable"],
-                budget_fraction=self.ray_cluster_config[
-                    "head_memory_budget_fraction"
-                ],
+                budget_fraction=self.ray_cluster_config["head_memory_budget_fraction"],
             )
         except Exception as e:
             self.logger.debug(f"Could not check the head memory budget: {e}")
@@ -849,9 +847,7 @@ class RayCluster:
                 own=self._own_advertisement(),
                 co_tenants=co_tenants,
                 mem_total_bytes=read_meminfo()["MemTotal"],
-                budget_fraction=self.ray_cluster_config[
-                    "head_memory_budget_fraction"
-                ],
+                budget_fraction=self.ray_cluster_config["head_memory_budget_fraction"],
             )
         except Exception as e:
             self.logger.debug(f"Could not check host co-tenancy: {e}")
@@ -1114,9 +1110,7 @@ class RayCluster:
                     timeout=15.0,
                 )
             except Exception as e:
-                self.logger.warning(
-                    f"Failed to fetch Ray head-node geo location: {e}"
-                )
+                self.logger.warning(f"Failed to fetch Ray head-node geo location: {e}")
 
             return context
         except Exception as e:
@@ -1174,8 +1168,7 @@ class RayCluster:
             adopted = {
                 process.pid
                 for process, _, _, _ in candidates
-                if process.pid not in claimed
-                and process.info["ppid"] in claimed
+                if process.pid not in claimed and process.info["ppid"] in claimed
             }
             if not adopted:
                 break
@@ -1297,9 +1290,7 @@ class RayCluster:
             )
 
         async with self._connect_lock:
-            self.logger.warning(
-                "Reconnecting Ray Client to refresh stale handles..."
-            )
+            self.logger.warning("Reconnecting Ray Client to refresh stale handles...")
             try:
                 await asyncio.to_thread(ray.shutdown)
             except Exception as e:
@@ -1435,9 +1426,8 @@ class RayCluster:
                 self.cluster_status_history.popitem(last=False)
 
             # Retry until the lookup returns a real country; the actor caches success.
-            if (
-                self.head_geo_location is None
-                or not self.head_geo_location.get("country_name")
+            if self.head_geo_location is None or not self.head_geo_location.get(
+                "country_name"
             ):
                 try:
                     self.head_geo_location = await asyncio.wait_for(
@@ -1445,9 +1435,7 @@ class RayCluster:
                         timeout=15.0,
                     )
                 except Exception as e:
-                    self.logger.debug(
-                        f"Head-node geo location retry failed: {e}"
-                    )
+                    self.logger.debug(f"Head-node geo location retry failed: {e}")
 
             # Check if SLURM workers need to scale
             if self.slurm_workers:

@@ -138,6 +138,4 @@ def test_the_smoke_test_docstring_does_not_promise_a_traffic_gate() -> None:
     # ``async_init`` is the hook that really does gate traffic: Serve awaits
     # its first ``check_health`` inside replica initialisation, so the
     # contrast the smoke-test docstring draws has to stay true of both.
-    assert "before traffic is admitted" in " ".join(
-        (async_init.__doc__ or "").split()
-    )
+    assert "before traffic is admitted" in " ".join((async_init.__doc__ or "").split())

@@ -6,6 +6,7 @@ Shared helpers for BioEngine CLI.
 - JSON output formatting
 - Error formatting
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -27,6 +28,7 @@ MODEL_RUNNER_SERVICE_ID = "bioimage-io/model-runner"
 
 # ── Async runner ────────────────────────────────────────────────────────────
 
+
 def run_async(coro):
     """Run an async coroutine from a synchronous Click command."""
     return asyncio.run(coro)
@@ -34,15 +36,20 @@ def run_async(coro):
 
 def async_command(f):
     """Decorator: makes a Click command that returns a coroutine work synchronously."""
+
     @wraps(f)
     def wrapper(*args, **kwargs):
         return asyncio.run(f(*args, **kwargs))
+
     return wrapper
 
 
 # ── Connection ───────────────────────────────────────────────────────────────
 
-async def connect_service(server_url: str, service_id: str, token: Optional[str] = None):
+
+async def connect_service(
+    server_url: str, service_id: str, token: Optional[str] = None
+):
     """
     Connect to Hypha and return any service proxy by ID.
 
@@ -62,19 +69,21 @@ async def connect_service(server_url: str, service_id: str, token: Optional[str]
         if "Multiple services found" not in str(exc):
             raise
         # Multiple replicas registered — list and pick the first match
-        workspace = service_id.split("/")[0] if "/" in service_id else server.config.workspace
+        workspace = (
+            service_id.split("/")[0] if "/" in service_id else server.config.workspace
+        )
         alias = service_id.split("/", 1)[-1]
         async with httpx.AsyncClient(follow_redirects=True) as client:
             r = await client.get(f"{server_url}/{workspace}/services", timeout=15)
             r.raise_for_status()
             services = r.json()
         matches = [
-            f"{workspace}/{s['id']}"
-            for s in services
-            if alias in s.get("id", "")
+            f"{workspace}/{s['id']}" for s in services if alias in s.get("id", "")
         ]
         if not matches:
-            raise RuntimeError(f"No service matching '{service_id}' found in workspace '{workspace}'") from exc
+            raise RuntimeError(
+                f"No service matching '{service_id}' found in workspace '{workspace}'"
+            ) from exc
         return await server.get_service(matches[0])
 
 
@@ -83,12 +92,15 @@ async def connect_model_runner(server_url: str, token: Optional[str] = None):
     return await connect_service(server_url, MODEL_RUNNER_SERVICE_ID, token)
 
 
-async def connect_worker(server_url: str, worker_service_id: str, token: Optional[str] = None):
+async def connect_worker(
+    server_url: str, worker_service_id: str, token: Optional[str] = None
+):
     """Connect to Hypha and return the BioEngine worker service proxy."""
     return await connect_service(server_url, worker_service_id, token)
 
 
 # ── Image I/O ────────────────────────────────────────────────────────────────
+
 
 def read_image(path: str) -> np.ndarray:
     """
@@ -122,9 +134,11 @@ def read_image(path: str) -> np.ndarray:
             return data[keys[0]]
         elif suffix in (".tif", ".tiff"):
             import tifffile
+
             return tifffile.imread(str(p))
         elif suffix == ".png":
             from PIL import Image
+
             img = Image.open(str(p))
             return np.array(img)
         else:
@@ -159,14 +173,18 @@ def write_image(array: np.ndarray, path: str) -> None:
             np.save(str(p), array)
         elif suffix in (".tif", ".tiff"):
             import tifffile
+
             tifffile.imwrite(str(p), array)
         elif suffix == ".png":
             from PIL import Image
+
             if array.dtype != np.uint8:
                 # Normalise to uint8
                 arr_min, arr_max = array.min(), array.max()
                 if arr_max > arr_min:
-                    array = ((array - arr_min) / (arr_max - arr_min) * 255).astype(np.uint8)
+                    array = ((array - arr_min) / (arr_max - arr_min) * 255).astype(
+                        np.uint8
+                    )
                 else:
                     array = np.zeros_like(array, dtype=np.uint8)
             Image.fromarray(array).save(str(p))
@@ -182,6 +200,7 @@ def write_image(array: np.ndarray, path: str) -> None:
 
 
 # ── Upload helper (for infer via HTTP path) ──────────────────────────────────
+
 
 async def upload_array(service, array: np.ndarray) -> str:
     """
@@ -202,6 +221,7 @@ async def upload_array(service, array: np.ndarray) -> str:
 
 # ── Download helper ───────────────────────────────────────────────────────────
 
+
 async def download_array(url: str) -> np.ndarray:
     """Download a .npy file from a presigned S3 URL and return as numpy array."""
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -211,6 +231,7 @@ async def download_array(url: str) -> np.ndarray:
 
 
 # ── Output formatting ─────────────────────────────────────────────────────────
+
 
 def print_json(data: Any) -> None:
     """Print data as pretty-printed JSON to stdout."""
@@ -222,8 +243,10 @@ def print_table(rows: list, headers: list) -> None:
     if not rows:
         click.echo("(no results)")
         return
-    col_widths = [max(len(str(h)), max(len(str(r[i])) for r in rows))
-                  for i, h in enumerate(headers)]
+    col_widths = [
+        max(len(str(h)), max(len(str(r[i])) for r in rows))
+        for i, h in enumerate(headers)
+    ]
     sep = "  ".join("-" * w for w in col_widths)
     header_line = "  ".join(str(h).ljust(w) for h, w in zip(headers, col_widths))
     click.echo(header_line)
@@ -274,6 +297,7 @@ def error_exit(msg: str, hint: str = "") -> None:
 
 
 # ── Env helpers ───────────────────────────────────────────────────────────────
+
 
 def get_server_url(ctx_param: Optional[str]) -> str:
     """Resolve server URL from CLI flag → env var → default.
