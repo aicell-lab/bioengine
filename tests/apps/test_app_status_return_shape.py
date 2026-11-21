@@ -36,14 +36,23 @@ def _manager(app_ids):
     m._may_read_app_identity = MagicMock(return_value=True)
     # One status object per app, distinguishable so a wrong mapping is visible.
     m._get_app_status = AsyncMock(
-        side_effect=lambda application_id, **kw: {"status": "RUNNING", "echo": application_id}
+        side_effect=lambda application_id, **kw: {
+            "status": "RUNNING",
+            "echo": application_id,
+        }
     )
     ray_cluster = MagicMock()
     ray_cluster.check_connection = AsyncMock()
     ray_cluster.call_with_reconnect = AsyncMock(return_value={})
-    ray_cluster.proxy_actor_handle.get_serve_instance_details.remote = AsyncMock(return_value={})
-    ray_cluster.proxy_actor_handle.get_replica_identities.remote = AsyncMock(return_value={})
-    ray_cluster.proxy_actor_handle.get_replica_death_causes.remote = AsyncMock(return_value={})
+    ray_cluster.proxy_actor_handle.get_serve_instance_details.remote = AsyncMock(
+        return_value={}
+    )
+    ray_cluster.proxy_actor_handle.get_replica_identities.remote = AsyncMock(
+        return_value={}
+    )
+    ray_cluster.proxy_actor_handle.get_replica_death_causes.remote = AsyncMock(
+        return_value={}
+    )
     m.ray_cluster = ray_cluster
     m.server = SimpleNamespace(config=SimpleNamespace(workspace="ws", client_id="c"))
     return m
@@ -79,7 +88,9 @@ async def test_TWO_ids_are_keyed_the_same_way_so_a_caller_never_branches():
 async def test_the_ONE_and_TWO_id_shapes_are_THE_SAME_shape():
     """The property that actually matters to a caller, asserted as one statement rather than
     inferred from the two arms above: the same access path works for either."""
-    one = await _manager(["app1"]).get_app_status(application_ids=["app1"], context=CONTEXT)
+    one = await _manager(["app1"]).get_app_status(
+        application_ids=["app1"], context=CONTEXT
+    )
     two = await _manager(["app1", "app2"]).get_app_status(
         application_ids=["app1", "app2"], context=CONTEXT
     )
@@ -150,8 +161,12 @@ def test_the_method_really_has_no_single_id_branch():
     to be revisited together with it."""
     src = inspect.getsource(manager_mod)
     fn = next(
-        (n for n in ast.walk(ast.parse(src))
-         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "get_app_status"),
+        (
+            n
+            for n in ast.walk(ast.parse(src))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "get_app_status"
+        ),
         None,
     )
     assert fn is not None, "manager.py has no get_app_status"
@@ -164,10 +179,7 @@ def test_the_method_really_has_no_single_id_branch():
     # literal, which no unwrap can be.
     for r in returns:
         v = r.value
-        ok = (
-            isinstance(v, ast.Name)
-            or (isinstance(v, ast.Dict) and not v.keys)
-        )
+        ok = isinstance(v, ast.Name) or (isinstance(v, ast.Dict) and not v.keys)
         seg = (ast.get_source_segment(src, r) or "").strip()
         assert ok, (
             f"get_app_status returns {type(v).__name__} ({seg!r}) rather than the keyed mapping "
@@ -205,14 +217,18 @@ def test_the_docstring_does_NOT_claim_timezone_is_ALWAYS_present():
     crashed replica returns, on default arguments, an entry with no zone.
     """
     lowered = _docstring()
-    for overclaim in ("always present", "is always", "every replica record carries a timezone"):
+    for overclaim in (
+        "always present",
+        "is always",
+        "every replica record carries a timezone",
+    ):
         assert overclaim not in lowered, (
             f"the docstring says {overclaim!r} of timezone; it is conditional in the code, and a "
             f"consumer that believes this labels zone-less entries UTC"
         )
-    assert "only when known" in lowered or "may be absent" in lowered, (
-        "the docstring does not say timezone can be absent, so the conditional stays invisible"
-    )
+    assert (
+        "only when known" in lowered or "may be absent" in lowered
+    ), "the docstring does not say timezone can be absent, so the conditional stays invisible"
 
 
 def test_the_docstring_documents_the_NON_RECORD_entries_in_the_logs_map():
@@ -255,9 +271,18 @@ def test_the_documented_EXAMPLE_survives_every_shape_the_docstring_names():
     own logic over them. A loop that assumed every value were a record would raise here.
     """
     logs = {
-        "live-1": {"stdout": ["a"], "stderr": ["b"], "timezone": "CET",
-                   "creation_timestamp": 1.0},
-        "dead-1": {"stdout": [], "stderr": [], "death_cause": "OOM", "logs_omitted": True},
+        "live-1": {
+            "stdout": ["a"],
+            "stderr": ["b"],
+            "timezone": "CET",
+            "creation_timestamp": 1.0,
+        },
+        "dead-1": {
+            "stdout": [],
+            "stderr": [],
+            "death_cause": "OOM",
+            "logs_omitted": True,
+        },
         "_deliberately_stopped_replicas": 1,
     }
     seen = {}
@@ -288,14 +313,16 @@ def test_the_docstring_does_NOT_put_the_COUNTS_inside_the_logs_map():
     still carry the prefixed key, so the distinction is between the two surfaces rather than
     between present and absent.
     """
-    normalised = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    normalised = " ".join(
+        (manager_mod.AppsManager.get_app_status.__doc__ or "").split()
+    )
     assert 'logs["_deliberately_stopped_replicas"]' not in normalised, (
         "the docstring places the count INSIDE the logs map; get_app_status lifts it out before "
         "returning, so a caller told this looks for an int that is never there"
     )
-    assert "deliberately_stopped_replicas" in normalised, (
-        "the count is not documented at all, so a caller cannot find it on either surface"
-    )
+    assert (
+        "deliberately_stopped_replicas" in normalised
+    ), "the count is not documented at all, so a caller cannot find it on either surface"
 
 
 # ── doc vs REALITY: run the documented shapes against what the producer EMITS ──
@@ -337,8 +364,10 @@ def test_every_logs_KEY_the_docstring_names_can_ACTUALLY_occur():
 
     # Every quoted logs[...] key in the docstring must be a key the producer CAN emit.
     quoted = set(re.findall(r'logs\["([^"]+)"\]', doc))
-    assert quoted, "the docstring quotes no logs[...] key at all -- this arm would be vacuous"
-    emittable = set(logs.keys()) | {"error"}   # "error" comes from the failure branch
+    assert (
+        quoted
+    ), "the docstring quotes no logs[...] key at all -- this arm would be vacuous"
+    emittable = set(logs.keys()) | {"error"}  # "error" comes from the failure branch
     bad = sorted(k for k in quoted if k not in emittable and not k.startswith("<"))
     assert not bad, (
         f"the docstring names logs key(s) {bad} that the producer does not emit; the real map "
@@ -405,12 +434,12 @@ def test_the_conditional_SIBLINGS_are_documented_as_conditional():
         "the docstring does not say the two sibling fields are conditional, so a caller indexes "
         "them and gets KeyError on a perfectly healthy deployment"
     )
-    assert "read them with ``.get``" in doc or "read them with .get" in doc, (
-        "the docstring does not tell the reader how to read a conditional field safely"
-    )
-    assert "only when the cause lookup FAILED" in doc, (
-        "the docstring does not say when death_causes_unavailable is set"
-    )
+    assert (
+        "read them with ``.get``" in doc or "read them with .get" in doc
+    ), "the docstring does not tell the reader how to read a conditional field safely"
+    assert (
+        "only when the cause lookup FAILED" in doc
+    ), "the docstring does not say when death_causes_unavailable is set"
 
 
 def test_the_count_really_IS_absent_when_nothing_was_stopped():
@@ -464,14 +493,26 @@ def test_the_PUBLIC_view_withholds_logs_and_BOTH_siblings():
     }
     public = manager_mod.public_app_status(status)
     dep = public["deployments"]["MyApp"]
-    for withheld in ("logs", "deliberately_stopped_replicas", "death_causes_unavailable"):
+    for withheld in (
+        "logs",
+        "deliberately_stopped_replicas",
+        "death_causes_unavailable",
+    ):
         assert withheld not in dep, (
             f"{withheld!r} reached an unauthorized caller; the public view is supposed to "
             f"withhold it"
         )
     # CONTROL: the public fields DO survive, so the arm is not passing on an empty dict
-    for kept in ("status", "message", "replica_states", "replicas", "max_ongoing_requests"):
-        assert kept in dep, f"the public view dropped {kept!r} too, so this arm proves nothing"
+    for kept in (
+        "status",
+        "message",
+        "replica_states",
+        "replicas",
+        "max_ongoing_requests",
+    ):
+        assert (
+            kept in dep
+        ), f"the public view dropped {kept!r} too, so this arm proves nothing"
 
     doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
     assert "WITHHELD" in doc.upper(), (
@@ -506,16 +547,18 @@ def test_the_count_is_ABSENT_on_a_non_default_n_previous_replica_even_though_rep
 
     # the DEFAULT path: a count, and no individual entry for the stopped replica
     default_logs = _deployment_actor(
-        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+        death_causes=causes,
+        alive={"live1": "a_live"},
+        registered=registered,
         # _deployment_actor registers under exactly these ids; anything else finds no
         # replicas at all and the arm would pass for the wrong reason.
     ).get_deployment_logs(application_id="soup", deployment_name="CellposeRuntime")
-    assert default_logs.get("_deliberately_stopped_replicas") == 1, (
-        f"the default path did not summarise the stopped replica: {sorted(default_logs)}"
-    )
-    assert "stopped1" not in default_logs, (
-        "the default path listed the stopped replica individually as well as counting it"
-    )
+    assert (
+        default_logs.get("_deliberately_stopped_replicas") == 1
+    ), f"the default path did not summarise the stopped replica: {sorted(default_logs)}"
+    assert (
+        "stopped1" not in default_logs
+    ), "the default path listed the stopped replica individually as well as counting it"
 
     # n_previous_replica=1: NO count, and the stopped replica listed individually
     listed_logs = _deployment_actor(
@@ -531,7 +574,9 @@ def test_the_count_is_ABSENT_on_a_non_default_n_previous_replica_even_though_rep
         f"the stopped replica is neither counted nor listed on this path, so it is invisible: "
         f"{sorted(listed_logs)}"
     )
-    assert (listed_logs["stopped1"].get("death_cause") or {}).get("reason") == "RAY_KILL", (
+    assert (listed_logs["stopped1"].get("death_cause") or {}).get(
+        "reason"
+    ) == "RAY_KILL", (
         "the individually-listed stopped replica does not carry its RAY_KILL cause, so a caller "
         "cannot recover what the count would have told them"
     )
@@ -557,9 +602,9 @@ def test_the_docstring_does_NOT_say_an_absent_count_means_NONE():
         "the docstring does not say what an absent count actually means, so a reader fills the "
         "gap with 'none'"
     )
-    assert "n_previous_replica" in doc, (
-        "the docstring does not name the parameter that decides whether the count exists"
-    )
+    assert (
+        "n_previous_replica" in doc
+    ), "the docstring does not name the parameter that decides whether the count exists"
 
 
 def test_counting_RAY_KILL_entries_does_not_recover_the_number_stopped():
@@ -584,13 +629,14 @@ def test_counting_RAY_KILL_entries_does_not_recover_the_number_stopped():
         application_id="soup", deployment_name="CellposeRuntime", n_previous_replica=2
     )
     kills = [
-        r for r, rec in paged.items()
+        r
+        for r, rec in paged.items()
         if isinstance(rec, dict)
         and (rec.get("death_cause") or {}).get("reason") == "RAY_KILL"
     ]
-    assert "_deliberately_stopped_replicas" not in paged, (
-        "a count appeared on the paged path, which would make this arm pointless"
-    )
+    assert (
+        "_deliberately_stopped_replicas" not in paged
+    ), "a count appeared on the paged path, which would make this arm pointless"
     assert len(kills) == 2, (
         f"expected the page size (2) RAY_KILL entries, got {len(kills)} ({sorted(kills)}) -- if "
         f"this is 5 the listing is not bounded and the docstring's 'page size, not a total' is "
@@ -713,21 +759,26 @@ def test_a_failed_cause_lookup_OMITS_the_dead_replicas_rather_than_listing_them_
     """
     from tests.test_replica_death_cause import _RAY_KILL, _deployment_actor
 
-    registered = {"stopped1": ("a_stopped1", 2.0, "UTC"), "live1": ("a_live", 1.0, "UTC")}
+    registered = {
+        "stopped1": ("a_stopped1", 2.0, "UTC"),
+        "live1": ("a_live", 1.0, "UTC"),
+    }
     causes = {"a_stopped1": _RAY_KILL}
 
     failed = _deployment_actor(
         death_causes=causes, alive={"live1": "a_live"}, registered=registered
     ).get_deployment_logs(
-        application_id="soup", deployment_name="CellposeRuntime", death_cause_query_failed=True
+        application_id="soup",
+        deployment_name="CellposeRuntime",
+        death_cause_query_failed=True,
     )
     assert "stopped1" not in failed, (
         f"the dead replica was listed despite the cause lookup having failed, so 'absent from "
         f"logs altogether' is wrong: {sorted(failed)}"
     )
-    assert "_deliberately_stopped_replicas" not in failed, (
-        "a count was produced despite the failed lookup"
-    )
+    assert (
+        "_deliberately_stopped_replicas" not in failed
+    ), "a count was produced despite the failed lookup"
 
     # CONTROL: the same input with a WORKING lookup must say something about that replica,
     # otherwise the absence above is a property of the fixture rather than of the failure.
