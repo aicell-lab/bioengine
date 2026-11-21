@@ -5,12 +5,12 @@ for itself leaves it holding an expired credential. When the path returns the re
 "Authentication error: The token has expired", and the refresh step then CRASHED:
 
     Monitoring step 'token_expiry' failed: 'NoneType' object is not callable
-    worker.py:1216 in _check_token_expiry
+    `_check_token_expiry` in the worker's monitoring loop
 
 304 consecutive monitoring failures and climbing, on a pod that was 1/1 Running with
 RESTARTS=0. A restart cured it instantly by re-reading HYPHA_TOKEN from the environment -- a
 credential valid for a further 177 days -- which is what proved the worker was holding a good
-token the whole time and had thrown it away at worker.py:1244.
+token the whole time and had thrown it away when the mint overwrote it.
 
 THE THREE ARMS AND WHY EACH IS NEEDED
 
@@ -20,10 +20,12 @@ THE THREE ARMS AND WHY EACH IS NEEDED
              "fix" that simply disabled refreshing would pass the other two.
   no-op      bootstrap token already in use -> must not raise and must not thrash.
 
-`self.server` is deliberately a stand-in whose `generate_token` attribute is None rather than
-absent, because that is the measured shape: after an auth failure the object survives and its
-RPC methods do not, so `hasattr` is true, the attribute is None, and CALLING it is what raises.
-A test using a plain `None` server would pass against the unfixed code and prove nothing.
+`self.server` is deliberately a stand-in whose `generate_token` is a LIVE callable that
+raises when called, because that is the measured shape: after an auth failure the client object
+survives, `generate_token` is still a function and `callable()` is True, and the None is deeper
+inside hypha_rpc — it surfaces only when the call is MADE. See `_DeadServer` below, which is
+written that way for this reason. A fake that merely sets the attribute to None lets a
+liveness-guard "fix" pass every unit arm here and then fail the live reproduction.
 """
 import time
 
@@ -174,3 +176,29 @@ async def test_a_login_issued_credential_survives_a_mint_and_a_dead_connection()
     assert w._token == "login-issued-token", (
         "fell back to nothing and kept the expired minted token, so the next reconnect fails"
     )
+
+
+async def test_the_fallback_SAYS_so_at_warning_level(caplog):
+    """CLAUSE 2's operator-visible half, which nothing here asserted.
+
+    Falling back silently would fix the deadlock and leave the operator with no
+    way to know a mint had failed — the same invisible-recovery problem the row
+    is about, one level down. The live loop's log showed this text; no unit arm
+    pinned it, so a reword or a drop to debug level would have gone unnoticed.
+    """
+    import logging
+
+    w = _worker(_DeadServer(), "expired-minted-token", "long-lived-bootstrap", time.time() - 1)
+    with caplog.at_level(logging.WARNING, logger=w.logger.name):
+        await w._check_token_expiry()
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "the fallback happened silently: no WARNING was emitted"
+    text = " ".join(r.getMessage() for r in warnings)
+    assert "Could not mint a Hypha token" in text, f"unexpected warning text: {text!r}"
+    assert "token this worker started with" in text, (
+        "the warning does not say WHICH credential it fell back to, which is the "
+        f"part an operator needs: {text!r}"
+    )
+    # ...and the fallback really happened, so this is not just a log assertion.
+    assert w._token == "long-lived-bootstrap"
