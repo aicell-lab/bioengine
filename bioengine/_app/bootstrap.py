@@ -154,6 +154,52 @@ def introspect_app(entry_id: str) -> Dict[str, Any]:
     }
 
 
+
+
+def _apply_env_fence() -> None:
+    """Remove env vars the worker asked this process NOT to hold.
+
+    Shares the contract of the replica-side pop in ``_app/mixin.py``: the worker
+    names the keys in ``BIOENGINE_FENCED_ENV_KEYS`` and this side removes them,
+    so an older worker that names none makes this a no-op.
+
+    WHY IT IS CALLED HERE TOO, and not only before ``__init__``. These tasks
+    apply ``env_vars`` onto their own process and then IMPORT the user's module.
+    Module-level code — ``TOKEN = os.getenv("HYPHA_TOKEN")``, or a client built
+    at import — captures whatever is set at that moment, and no later
+    ``os.environ.pop`` can reach a value already bound to a module global. Before
+    this, the fence ran after the import and a single-machine replica could keep
+    the worker's own credential despite having been fenced. Found by review of
+    this fence's first implementation.
+
+    MUST be called AFTER the env-apply loop. Called before it, the apply puts the
+    inherited value straight back.
+
+    LIMIT, disclosed rather than implied: this scrubs ``os.environ`` only.
+    ``/proc/self/environ`` is a snapshot taken at exec and is NOT rewritten by
+    ``os.environ.pop`` — measured. Anything that reads the raw file, or a child
+    process that inherited before the pop, still sees the value. The fence is a
+    guard against ordinary ``os.environ`` reads, not a secure erase.
+    """
+    # Imported here, not at module scope: this module imports inside functions
+    # by convention (see the apps guide's "Why Import Inside Methods?").
+    import os
+
+    fenced = [
+        key
+        for key in os.environ.get("BIOENGINE_FENCED_ENV_KEYS", "").split(",")
+        if key
+    ]
+    for key in fenced:
+        os.environ.pop(key, None)
+    if fenced:
+        # Names only; a fenced key has no value worth logging by definition.
+        print(
+            f"BioEngine: removed {len(fenced)} inherited env var(s) before import: "
+            f"{', '.join(sorted(fenced))}",
+            flush=True,
+        )
+
 def introspect_app_in_ray_task(
     entry_id: str,
     env_vars: Dict[str, str],
@@ -179,6 +225,9 @@ def introspect_app_in_ray_task(
     # process env somehow already carries a prior build's values.
     for key, value in env_vars.items():
         os.environ[key] = value
+
+    # Fence BEFORE importing user code (see _apply_env_fence).
+    _apply_env_fence()
 
     app_dir = Path(env_vars["BIOENGINE_APP_DIR"])
     version = env_vars.get("BIOENGINE_ARTIFACT_VERSION", "")
@@ -550,6 +599,9 @@ def build_and_run_application(
     # Overwrite (not setdefault) so this build's values win.
     for key, value in replica_env_vars.items():
         os.environ[key] = value
+
+    # Fence BEFORE importing user code (see _apply_env_fence).
+    _apply_env_fence()
 
     # ``_setup_replica`` also sets this, but only once the user's ``__init__``
     # is already running, so anything the replica logs before then took the

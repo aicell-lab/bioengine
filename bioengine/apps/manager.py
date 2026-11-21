@@ -2129,6 +2129,11 @@ class AppsManager:
                     # the token is not in the blob. Updating a recovered app
                     # therefore has to pass hypha_token again.
                     "hypha_token": None,
+                    # Carried so adoption does not silently drop the fence: the
+                    # token cannot be in the blob, but the INTENT can.
+                    "hypha_token_fenced": bool(
+                        app_data.get("hypha_token_fenced")
+                    ),
                     "disable_gpu": app_data["disable_gpu"],
                     "max_ongoing_requests": app_data["max_ongoing_requests"],
                     "proxy_memory_in_gb": app_data.get("proxy_memory_in_gb", 0.5),
@@ -3779,6 +3784,18 @@ class AppsManager:
                 # would silently hand the app back the token it asked to drop.
                 if hypha_token is None:
                     hypha_token = existing_app["hypha_token"]
+                    # An ADOPTED app has hypha_token None because the blob holds no
+                    # secret -- not because it was deployed without a fence. Inheriting
+                    # the None alone emits no fence and hands the replicas the worker's
+                    # own credential. The recorded intent distinguishes the two.
+                    if hypha_token is None and existing_app.get("hypha_token_fenced"):
+                        hypha_token = ""
+                        self.logger.info(
+                            f"Update to application '{application_id}' omitted "
+                            f"hypha_token and the running instance was deployed "
+                            f"fenced; re-applying the fence rather than inheriting "
+                            f"an absent token."
+                        )
                 elif hypha_token == "" and existing_app["hypha_token"]:
                     self.logger.info(
                         f"Update to application '{application_id}' carries an "
@@ -4021,6 +4038,7 @@ class AppsManager:
                 "application_env_vars": app.metadata["application_env_vars"],
                 "redacted_env_var_keys": {},
                 "hypha_token": hypha_token,
+                "hypha_token_fenced": hypha_token == "",
                 "disable_gpu": disable_gpu,
                 "max_ongoing_requests": max_ongoing_requests,
                 "proxy_memory_in_gb": proxy_memory_in_gb,
