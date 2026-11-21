@@ -3456,7 +3456,7 @@ class AppsManager:
         ),
         auto_redeploy: bool = Field(
             None,
-            description="If set to true, the worker's monitoring loop fires a fresh deploy_app whenever Ray Serve reports this application as DEPLOY_FAILED, UNHEALTHY, or missing. Subsequent failures back off exponentially per-app (10s, 20s, 40s, … capped at 10 min) so a persistently broken app does not retry-storm; the backoff clears the moment the app is observed healthy again. If not specified, uses False for a new application, or preserves the previous setting if updating an existing application (only when application_id is specified).",
+            description="If set to true, the worker's monitoring loop fires a fresh deploy_app whenever Ray Serve reports this application as DEPLOY_FAILED, UNHEALTHY, or missing. Subsequent failures back off exponentially per-app (10s, 20s, 40s, … capped at 10 min) so a persistently broken app does not retry-storm; the backoff clears the moment the app is observed healthy again. If not specified, uses True for a new application (including --startup-applications entries), or preserves the previous setting if updating an existing application (only when application_id is specified). Pass false explicitly to opt out. Attempts are bounded: after repeated consecutive failures the worker gives up and reports auto_redeploy_exhausted_at rather than retrying forever.",
         ),
         debug: bool = Field(
             None,
@@ -3679,7 +3679,24 @@ class AppsManager:
                 if proxy_memory_in_gb is None:
                     proxy_memory_in_gb = 0.5
                 if auto_redeploy is None:
-                    auto_redeploy = False
+                    # TRUE by default. A sub-minute Hypha outage permanently kills
+                    # a replica that is still STARTING, while one already RUNNING
+                    # rides it out — so the app that dies is the one nobody is
+                    # watching yet, and it stays dead until a human notices. The
+                    # row this came from was filed on a 19-hour outage of exactly
+                    # that shape.
+                    #
+                    # Defaulting this on used to mean trading a dead app for
+                    # indefinite retries. It no longer does: attempts are bounded
+                    # to _REDEPLOY_MAX_ATTEMPTS consecutive failures, after which
+                    # the worker gives up, logs it, and reports
+                    # auto_redeploy_exhausted_at on the app's status. This default
+                    # MUST NOT land without that bound.
+                    #
+                    # An explicit auto_redeploy=False still opts out, and an UPDATE
+                    # that omits the argument still preserves whatever the running
+                    # instance had — handled above, not here.
+                    auto_redeploy = True
                 if debug is None:
                     debug = False
                 # ice_servers defaults to None (fetch from URL)
