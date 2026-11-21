@@ -361,22 +361,34 @@ def _build_fn() -> ast.AST:
 
 
 def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
-    """Leg 1 at its CALL SITE, not just at the helper. This is the hole round 3 found.
+    """Leg 1 at its CALL SITE. Asserts an ALLOW-LIST of uses, not a list of forbidden shapes.
 
     Excluding the token inside ``_build_submit_runtime_env`` is worthless if ``build()`` then
-    rebinds or edits the dict before handing it on. The reviewer's mutant did exactly that — one
-    line after the helper call, putting the token back into the runtime_env of BOTH Ray tasks and
-    reverting the whole fix — and 19 tests passed on it, because every other arm in this file
-    builds its runtime_env from the helper directly and never sees what ``build()`` passes to
-    ``BuiltApp``.
+    rebinds or edits the dict before handing it on. Round 1 of this review supplied the rebinding
+    mutant (``runtime_env = {**runtime_env, ...}``), which passed 19/19 before any guard existed.
 
-    So this asserts the name is bound ONCE from the helper, never reassigned, never mutated in
-    place, and is the same name handed to both consumers.
+    The first guard enumerated the write shapes it forbade — subscript assignment and
+    ``.update()``/``.setdefault()``/``.pop()``/``.clear()`` on the name. Round 2 defeated it twice
+    with one-liners acting ONE LEVEL DOWN, where the receiver is an ``ast.Subscript`` rather than
+    an ``ast.Name``, so neither check could see them:
+
+        runtime_env["env_vars"][_ARTIFACT_DOWNLOAD_TOKEN_KEY] = download_token
+        runtime_env["env_vars"].update({...unprefixed env_vars...})
+
+    An alias (``ev = runtime_env["env_vars"]; ev[KEY] = ...``) evades a shape list the same way.
+    Enumerating bad shapes can only ever cover the ones imagined; so this asserts the good ones
+    instead.
+
+    THE RULE: the bound name is loaded EXACTLY at its two consumers and nowhere else — as a direct
+    positional argument of ``_introspect_via_ray_task(...)`` and as the ``runtime_env=`` keyword of
+    ``BuiltApp(...)``. Any other load — under a ``Subscript``, under an ``Attribute``, into another
+    variable, into an f-string — fails, whether or not anyone thought of it. Nothing can reach the
+    dict without first loading the name.
     """
     build = _build_fn()
 
     bindings = [
-        t.id
+        (t.id, n.lineno)
         for n in ast.walk(build)
         if isinstance(n, ast.Assign)
         and isinstance(n.value, ast.Call)
@@ -387,75 +399,70 @@ def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
     assert len(bindings) == 1, (
         f"expected exactly one `<name> = self._build_submit_runtime_env(...)`, found {bindings}"
     )
-    name = bindings[0]
+    name, bind_line = bindings[0]
 
-    # 1. Never REBOUND. The round-3 mutant was `runtime_env = {**runtime_env, ...}`.
-    rebinds = [
-        n.lineno
-        for n in ast.walk(build)
-        if isinstance(n, ast.Assign)
-        for t in n.targets
-        if isinstance(t, ast.Name) and t.id == name
-    ]
-    assert len(rebinds) == 1, (
-        f"{name!r} is assigned {len(rebinds)} times in build() (lines {rebinds}); it must be bound "
-        "once from _build_submit_runtime_env and never reassigned, or the token exclusion can be "
-        "undone after the helper returns"
+    # Parent map: ast gives no parent links, and the whole assertion is about what encloses
+    # each use.
+    parents = {}
+    for node in ast.walk(build):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    stores, loads, others = [], [], []
+    for n in ast.walk(build):
+        if not (isinstance(n, ast.Name) and n.id == name):
+            continue
+        if isinstance(n.ctx, ast.Store):
+            stores.append(n.lineno)
+        elif isinstance(n.ctx, ast.Load):
+            loads.append(n)
+        else:
+            others.append((n.lineno, type(n.ctx).__name__))
+
+    # Bound once, never rebound, never deleted.
+    assert stores == [bind_line], (
+        f"{name!r} is stored at {stores}; it must be bound once, at line {bind_line}, and never "
+        "reassigned — a rebinding after the helper returns undoes the token exclusion"
     )
-    walrus = [
-        n.lineno for n in ast.walk(build)
-        if isinstance(n, ast.NamedExpr) and getattr(n.target, "id", None) == name
-    ]
+    assert not others, f"{name!r} appears in an unexpected context: {others}"
+    walrus = [n.lineno for n in ast.walk(build)
+              if isinstance(n, ast.NamedExpr) and getattr(n.target, "id", None) == name]
     assert not walrus, f"{name!r} is rebound by a walrus at {walrus}"
 
-    # 2. Never MUTATED IN PLACE. Not in the mutant, but the same hole: a subscript assignment or
-    #    an .update() reaches the dict without rebinding the name.
-    subscript_writes = [
-        n.lineno
-        for n in ast.walk(build)
-        if isinstance(n, (ast.Assign, ast.AugAssign))
-        for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
-        if isinstance(t, ast.Subscript)
-        and isinstance(t.value, ast.Name)
-        and t.value.id == name
-    ]
-    assert not subscript_writes, (
-        f"{name}[...] is written at {subscript_writes}; that edits the dict the tasks receive "
-        "without rebinding the name"
-    )
-    mutators = [
-        n.lineno
-        for n in ast.walk(build)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and isinstance(n.func.value, ast.Name)
-        and n.func.value.id == name
-        and n.func.attr in {"update", "setdefault", "pop", "clear"}
-    ]
-    assert not mutators, f"{name}.update()/setdefault()/pop() called at {mutators}"
+    # Every LOAD must be one of exactly two consumers.
+    def classify(node):
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.Call):
+            fname = getattr(parent.func, "attr", None) or getattr(parent.func, "id", None)
+            if fname == "_introspect_via_ray_task" and any(a is node for a in parent.args):
+                return "introspect"
+        if isinstance(parent, ast.keyword) and parent.arg == "runtime_env":
+            grand = parents.get(id(parent))
+            if isinstance(grand, ast.Call) and (
+                getattr(grand.func, "id", None) or getattr(grand.func, "attr", None)
+            ) in ("BuiltApp", "BuiltApplication"):
+                return "builtapp"
+        return None
 
-    # 3. That same name is what BOTH consumers get.
-    to_builtapp = [
-        n.lineno
-        for n in ast.walk(build)
-        if isinstance(n, ast.Call)
-        and (getattr(n.func, "id", None) or getattr(n.func, "attr", None))
-        in ("BuiltApp", "BuiltApplication")
-        and any(k.arg == "runtime_env" and isinstance(k.value, ast.Name) and k.value.id == name
-                for k in n.keywords)
-    ]
-    assert to_builtapp, (
-        f"BuiltApp is not constructed with runtime_env={name} -- it gets something else, so what "
-        "the helper excluded does not reach the build task"
+    seen, illegal = {}, []
+    for node in loads:
+        kind = classify(node)
+        if kind is None:
+            parent = parents.get(id(node))
+            illegal.append((node.lineno, type(parent).__name__))
+        else:
+            seen.setdefault(kind, []).append(node.lineno)
+
+    assert not illegal, (
+        f"{name!r} is loaded somewhere other than its two consumers, at "
+        f"{[f'line {ln} under {p}' for ln, p in illegal]}. Every use must be a direct argument of "
+        "_introspect_via_ray_task(...) or the runtime_env= keyword of BuiltApp(...); anything else "
+        "can reach the dict and undo the exclusion"
     )
-    to_introspect = [
-        n.lineno
-        for n in ast.walk(build)
-        if isinstance(n, ast.Call)
-        and getattr(n.func, "attr", None) == "_introspect_via_ray_task"
-        and any(isinstance(a, ast.Name) and a.id == name for a in n.args)
-    ]
-    assert to_introspect, f"the introspect task is not submitted with {name}"
+    assert "introspect" in seen, f"the introspect task is never submitted with {name!r}"
+    assert "builtapp" in seen, f"BuiltApp is never constructed with runtime_env={name}"
+    # Control: if the allow-list matched nothing at all the assertions above would be vacuous.
+    assert loads, f"{name!r} is never loaded -- the helper's result goes nowhere"
 
 
 def test_build_derives_replica_env_vars_from_the_FULL_env_vars(monkeypatch):
