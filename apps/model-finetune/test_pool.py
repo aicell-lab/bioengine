@@ -39,25 +39,62 @@ import pool
 
 # Field-sets pinned from the fixture corpus; unchanged between 0.13.0-draft and
 # 0.15.0-draft, re-verified against the latter.
-ROUNDMETRIC_KEYS = {
-    "role", "name", "aggregate", "aggregate_basis", "aggregate_scope",
-    "higher_is_better", "n_sites_scored", "n_datasets_scored", "per_site",
-    "per_site_basis", "aggregate_withheld",
+#
+# WIRE_ROUNDMETRIC_KEYS is the page's own record at rung 0.15.0-draft — the eleven
+# fields the corpus carries. ROUNDMETRIC_KEYS is what THIS backend writes, which is
+# those eleven plus the per-image breakdown. The two are separate constants because
+# they answer different questions, and collapsing them is what makes an additive
+# backend field look like a schema break: the corpus genuinely does not carry
+# per_image, and asserting equality against it would go RED for a record that is
+# correct. The relation that holds, and that the corpus test asserts, is that the
+# backend writes every key the page's record has and the only extras are these.
+PER_IMAGE_KEYS = {"per_image", "per_image_basis"}
+WIRE_ROUNDMETRIC_KEYS = {
+    "role",
+    "name",
+    "aggregate",
+    "aggregate_basis",
+    "aggregate_scope",
+    "higher_is_better",
+    "n_sites_scored",
+    "n_datasets_scored",
+    "per_site",
+    "per_site_basis",
+    "aggregate_withheld",
 }
+ROUNDMETRIC_KEYS = WIRE_ROUNDMETRIC_KEYS | PER_IMAGE_KEYS
 SOUP_KEYS = {
-    "soup_id", "index", "merged_at", "assessed", "contributions",
-    "selection_metric", "witness_metric", "global_sha256", "weights",
-    "transport", "community_model",
+    "soup_id",
+    "index",
+    "merged_at",
+    "assessed",
+    "contributions",
+    "selection_metric",
+    "witness_metric",
+    "global_sha256",
+    "weights",
+    "transport",
+    "community_model",
 }
 EMPTY_MERGE_KEYS = {"merged_at", "assessed", "selection_metric", "transport"}
 MERGE_TRIGGER_KEYS = {
-    "kind", "contributions_per_merge", "next_merge_at", "decided_by", "agent",
+    "kind",
+    "contributions_per_merge",
+    "next_merge_at",
+    "decided_by",
+    "agent",
 }
 COMMUNITY_MODEL_KEYS = {"artifact_id", "version", "url", "n_contributions_cumulative"}
 TRANSPORT_KEYS = {"bytes_in", "bytes_out", "n_transfers", "sources_complete"}
 CONTRIBUTION_KEYS = {
-    "contribution_id", "received_at", "n_bytes", "n_train_images",
-    "samples_seen", "disposition", "merged_into",
+    "contribution_id",
+    "received_at",
+    "weights_sha256",
+    "n_bytes",
+    "n_train_images",
+    "samples_seen",
+    "disposition",
+    "merged_into",
 }
 
 POOL_ID = "bioimage-io/cellpose-sam-community"
@@ -72,7 +109,12 @@ SOUP1_A, SOUP1_B = 0.8300, 0.8478
 
 
 def _member(cid, score, included):
-    return {"contribution_id": cid, "marginal_score": score, "gate_score": score, "included": included}
+    return {
+        "contribution_id": cid,
+        "marginal_score": score,
+        "gate_score": score,
+        "included": included,
+    }
 
 
 def _synthetic_index():
@@ -83,67 +125,134 @@ def _synthetic_index():
     baseline = {
         "model": "stock-cpsam",
         "selection_metric": pool.round_metric(
-            role="selection", aggregate=0.62, aggregate_basis=pool.SELECTION_BASIS),
+            role="selection", aggregate=0.62, aggregate_basis=pool.SELECTION_BASIS
+        ),
         "witness_metric": pool.round_metric(
-            role="witness", aggregate=BASELINE_B, aggregate_basis=pool.BASELINE_BASIS),
+            role="witness", aggregate=BASELINE_B, aggregate_basis=pool.BASELINE_BASIS
+        ),
         "created_at": 1_750_000_000.0,
     }
     merges = [
         {
-            "published_version": "v1", "baseline_version": "stock-cpsam",
-            "members": [_member("alpha-0", SOUP0_A, True), _member("beta-0", 0.70, False)],
+            "published_version": "v1",
+            "baseline_version": "stock-cpsam",
+            "members": [
+                _member("alpha-0", SOUP0_A, True),
+                _member("beta-0", 0.70, False),
+            ],
             "selection_metric": pool.round_metric(
-                role="selection", aggregate=SOUP0_A, aggregate_basis=pool.SELECTION_BASIS),
+                role="selection",
+                aggregate=SOUP0_A,
+                aggregate_basis=pool.SELECTION_BASIS,
+            ),
             "witness_metric": pool.round_metric(
-                role="witness", aggregate=SOUP0_B, aggregate_basis=pool.WITNESS_BASIS),
+                role="witness", aggregate=SOUP0_B, aggregate_basis=pool.WITNESS_BASIS
+            ),
             "global_sha256": "a" * 64,
-            "transport": {"bytes_in": 2_600_000_000, "bytes_out": 1_300_000_000,
-                          "n_transfers": 3, "sources_complete": True},
-            "deferred": [], "created_at": 1_750_100_000.0,
+            "transport": {
+                "bytes_in": 2_600_000_000,
+                "bytes_out": 1_300_000_000,
+                "n_transfers": 3,
+                "sources_complete": True,
+            },
+            "deferred": [],
+            "created_at": 1_750_100_000.0,
         },
         {
-            "published_version": None, "baseline_version": "v1",
+            "published_version": None,
+            "baseline_version": "v1",
             "members": [_member("gamma-0", 0.66, False)],
             "selection_metric": pool.round_metric(
-                role="selection", aggregate=EMPTY_BAR_A, aggregate_basis=pool.EMPTY_SELECTION_BASIS),
+                role="selection",
+                aggregate=EMPTY_BAR_A,
+                aggregate_basis=pool.EMPTY_SELECTION_BASIS,
+            ),
             "witness_metric": None,
             "global_sha256": None,
-            "transport": {"bytes_in": 1_300_000_000, "bytes_out": 0,
-                          "n_transfers": 1, "sources_complete": True},
-            "deferred": [], "created_at": 1_750_200_000.0,
+            "transport": {
+                "bytes_in": 1_300_000_000,
+                "bytes_out": 0,
+                "n_transfers": 1,
+                "sources_complete": True,
+            },
+            "deferred": [],
+            "created_at": 1_750_200_000.0,
         },
         {
-            "published_version": "v2", "baseline_version": "v1",
+            "published_version": "v2",
+            "baseline_version": "v1",
             "members": [_member("delta-0", SOUP1_A, True)],
             "selection_metric": pool.round_metric(
-                role="selection", aggregate=SOUP1_A, aggregate_basis=pool.SELECTION_BASIS),
+                role="selection",
+                aggregate=SOUP1_A,
+                aggregate_basis=pool.SELECTION_BASIS,
+            ),
             "witness_metric": pool.round_metric(
-                role="witness", aggregate=SOUP1_B, aggregate_basis=pool.WITNESS_BASIS),
+                role="witness", aggregate=SOUP1_B, aggregate_basis=pool.WITNESS_BASIS
+            ),
             "global_sha256": "b" * 64,
-            "transport": {"bytes_in": 1_300_000_000, "bytes_out": 1_300_000_000,
-                          "n_transfers": 2, "sources_complete": True},
-            "deferred": [], "created_at": 1_750_300_000.0,
+            "transport": {
+                "bytes_in": 1_300_000_000,
+                "bytes_out": 1_300_000_000,
+                "n_transfers": 2,
+                "sources_complete": True,
+            },
+            "deferred": [],
+            "created_at": 1_750_300_000.0,
         },
     ]
     return {
         "schema_version": pool.SCHEMA_VERSION,
         "model_type": "cpsam",
         "architecture_signature": "sig123",
-        "current_community": {"version": "v2", "path": "community/v2/weights.pt",
-                              "sha256": "b" * 64,
-                              "selection_metric": merges[2]["selection_metric"],
-                              "witness_metric": merges[2]["witness_metric"]},
+        "current_community": {
+            "version": "v2",
+            "path": "community/v2/weights.pt",
+            "sha256": "b" * 64,
+            "selection_metric": merges[2]["selection_metric"],
+            "witness_metric": merges[2]["witness_metric"],
+        },
         "contributions": [
-            {"contribution_id": "alpha-0", "uploaded_at": 1_750_050_000.0,
-             "n_bytes": 1_300_000_000, "n_train_images": 400, "samples_seen": 4000},
-            {"contribution_id": "beta-0", "uploaded_at": 1_750_060_000.0,
-             "n_bytes": 1_300_000_000, "n_train_images": 200, "samples_seen": 2000},
-            {"contribution_id": "gamma-0", "uploaded_at": 1_750_150_000.0,
-             "n_bytes": 1_300_000_000, "n_train_images": 100, "samples_seen": 1000},
-            {"contribution_id": "delta-0", "uploaded_at": 1_750_250_000.0,
-             "n_bytes": 1_300_000_000, "n_train_images": 300, "samples_seen": 3000},
-            {"contribution_id": "epsilon-0", "uploaded_at": 1_750_350_000.0,
-             "n_bytes": 1_300_000_000, "n_train_images": 500, "samples_seen": 5000},
+            {
+                "contribution_id": "alpha-0",
+                "weights_sha256": "a1" * 32,
+                "uploaded_at": 1_750_050_000.0,
+                "n_bytes": 1_300_000_000,
+                "n_train_images": 400,
+                "samples_seen": 4000,
+            },
+            {
+                "contribution_id": "beta-0",
+                "weights_sha256": "b2" * 32,
+                "uploaded_at": 1_750_060_000.0,
+                "n_bytes": 1_300_000_000,
+                "n_train_images": 200,
+                "samples_seen": 2000,
+            },
+            {
+                "contribution_id": "gamma-0",
+                "weights_sha256": "c3" * 32,
+                "uploaded_at": 1_750_150_000.0,
+                "n_bytes": 1_300_000_000,
+                "n_train_images": 100,
+                "samples_seen": 1000,
+            },
+            {
+                "contribution_id": "delta-0",
+                "weights_sha256": "d4" * 32,
+                "uploaded_at": 1_750_250_000.0,
+                "n_bytes": 1_300_000_000,
+                "n_train_images": 300,
+                "samples_seen": 3000,
+            },
+            {
+                "contribution_id": "epsilon-0",
+                "weights_sha256": "e5" * 32,
+                "uploaded_at": 1_750_350_000.0,
+                "n_bytes": 1_300_000_000,
+                "n_train_images": 500,
+                "samples_seen": 5000,
+            },
         ],
         "decided_contribution_ids": ["alpha-0", "beta-0", "gamma-0", "delta-0"],
         "baseline": baseline,
@@ -167,8 +276,12 @@ class TestRoundMetric:
 
     def test_holdout_scope_refuses_per_site_map(self):
         with pytest.raises(ValueError):
-            pool.round_metric(role="witness", aggregate=0.5, aggregate_basis="x",
-                              per_site={"site-1": 0.5})
+            pool.round_metric(
+                role="witness",
+                aggregate=0.5,
+                aggregate_basis="x",
+                per_site={"site-1": 0.5},
+            )
 
     def test_selection_and_witness_share_the_metric_name(self):
         s = pool.round_metric(role="selection", aggregate=0.5, aggregate_basis="a")
@@ -212,7 +325,9 @@ class TestWireShape:
     def test_community_model_url(self, wire):
         s0 = wire["soups"][0]
         assert s0["community_model"]["artifact_id"] == POOL_ID
-        assert s0["community_model"]["url"] == "#/models/cellpose-sam-community?version=v1"
+        assert (
+            s0["community_model"]["url"] == "#/models/cellpose-sam-community?version=v1"
+        )
 
     def test_merged_at_is_iso_utc_millis(self, wire):
         merged_at = wire["soups"][0]["merged_at"]
@@ -283,8 +398,11 @@ class TestContributionDisposition:
 def _witness_curve(wire):
     """The values the page would plot on the improvement curve: the aggregate of
     every soup metric tagged ``role='witness'`` — the page's own selection rule."""
-    return [s["witness_metric"]["aggregate"]
-            for s in wire["soups"] if s["witness_metric"]["role"] == "witness"]
+    return [
+        s["witness_metric"]["aggregate"]
+        for s in wire["soups"]
+        if s["witness_metric"]["role"] == "witness"
+    ]
 
 
 def _selection_values(wire):
@@ -319,7 +437,8 @@ class TestDirectionalGuard:
         idx = _synthetic_index()
         merge0 = idx["merges"][0]
         merge0["witness_metric"] = pool.round_metric(
-            role="witness", aggregate=SOUP0_A, aggregate_basis=pool.WITNESS_BASIS)
+            role="witness", aggregate=SOUP0_A, aggregate_basis=pool.WITNESS_BASIS
+        )
         corrupted = pool.pool_wire_state(idx, pool_artifact_id=POOL_ID)
         # Tag still reads witness, so a tag-only check would pass...
         assert corrupted["soups"][0]["witness_metric"]["role"] == "witness"
@@ -341,7 +460,7 @@ class TestDirectionalGuard:
         "from PAGE_RUNGS rather than assuming the branch tip still sits on "
         "it. The rung itself is checked "
         "unconditionally by test_schema_version_is_the_rung_this_backend_"
-        "targets, so this skip no longer hides a wrong SCHEMA_VERSION (#0419)"
+        "targets, so this skip no longer hides a wrong SCHEMA_VERSION"
     ),
 )
 def test_matches_fixture_corpus():
@@ -362,14 +481,31 @@ def test_matches_fixture_corpus():
         f"{BACKEND_TARGETS_RUNG!r} — wrong corpus, not a backend defect"
     )
     assert set(prog["merge_trigger"]) == MERGE_TRIGGER_KEYS
-    assert set(prog["baseline_metric"]) == ROUNDMETRIC_KEYS
     soup = prog["soups"][1]
     assert set(soup) == SOUP_KEYS
     assert set(soup["community_model"]) == COMMUNITY_MODEL_KEYS
     assert set(soup["transport"]) == TRANSPORT_KEYS
-    assert set(soup["selection_metric"]) == ROUNDMETRIC_KEYS
-    assert set(soup["witness_metric"]) == ROUNDMETRIC_KEYS
     assert set(prog["empty_merges"][0]) == EMPTY_MERGE_KEYS
+    # The metric records are checked by RELATION, not equality: the corpus is the
+    # page's record and does not carry the per-image breakdown this backend adds.
+    # Equality here would report an additive backend field as a corpus mismatch —
+    # and would equally hide a field this backend FAILED to write, since both
+    # directions collapse into one failing assertion.
+    for where, metric in (
+        ("baseline_metric", prog["baseline_metric"]),
+        ("selection_metric", soup["selection_metric"]),
+        ("witness_metric", soup["witness_metric"]),
+    ):
+        keys = set(metric)
+        assert keys - ROUNDMETRIC_KEYS == set(), (
+            f"the corpus's {where} carries {sorted(keys - ROUNDMETRIC_KEYS)}, which "
+            f"this backend never writes — the page's record has moved"
+        )
+        assert ROUNDMETRIC_KEYS - keys <= PER_IMAGE_KEYS, (
+            f"this backend writes {sorted(ROUNDMETRIC_KEYS - keys - PER_IMAGE_KEYS)} "
+            f"on {where} and the corpus does not — a backend-only field that is not "
+            f"the per-image breakdown is a schema break, not an addition"
+        )
 
 
 # ── soup member cache eviction (pool.evict_lru_to_cap) ───────────────────────
@@ -403,8 +539,12 @@ def test_incoming_bytes_make_room_before_the_write(tmp_path):
     _cached_member(tmp_path, "member-b.pt", 100, mtime=2_000)
 
     assert pool.evict_lru_to_cap(tmp_path, "member-*.pt", cap_bytes=250) == 0
-    assert pool.evict_lru_to_cap(
-        tmp_path, "member-*.pt", cap_bytes=250, incoming_bytes=100) == 1
+    assert (
+        pool.evict_lru_to_cap(
+            tmp_path, "member-*.pt", cap_bytes=250, incoming_bytes=100
+        )
+        == 1
+    )
 
 
 def test_under_cap_evicts_nothing(tmp_path):
@@ -438,13 +578,14 @@ def test_cap_is_actually_enforced_not_just_approached(tmp_path):
     assert remaining == ["member-8.pt", "member-9.pt"]
 
 
-# ── a deposit record must always name the app version that wrote it (#0116) ──
+# ── a deposit record must always name the app version that wrote it ──
 #
 # 0.27.6 moved every ``l2_from_base`` value without touching ``schema_version``,
 # so the record's shape cannot date its own contents. These pin the field that
 # can. The null case is the load-bearing one: an ABSENT key is what a pre-0116
 # writer produces, so writing the key with None is the only thing that tells
 # "this writer did not know its version" apart from "this writer did not stamp".
+
 
 def _metadata(app_version):
     return pool.build_contribution_metadata(
@@ -485,9 +626,9 @@ def test_app_version_does_not_collide_with_the_other_version_fields():
     assert m["schema_version"] == pool.SCHEMA_VERSION
     # ...and that the constant is itself the rung this backend targets. Without
     # this line the assertion above is satisfied by both sides being wrong
-    # together, which is the whole of #0419. This line carries no weight of its
+    # together, which is the whole of the schema-version guard. This line carries no weight of its
     # own unless BACKEND_TARGETS_RUNG is independent of pool.SCHEMA_VERSION —
-    # see test_the_targeted_rung_is_written_down_and_not_derived (#0442), which
+    # see test_the_targeted_rung_is_written_down_and_not_derived, which
     # is what keeps it so. It is the quieter of the two sites a derivation
     # silences, and the one nobody had reported.
     assert _major_minor(m["schema_version"]) == BACKEND_TARGETS_RUNG
@@ -559,7 +700,7 @@ PAGE_RUNGS = {
 
 # The rung whose SHAPE this backend implements. This is NOT derived from
 # pool.SCHEMA_VERSION — that is the point. Deriving it would recreate the
-# self-referential assertion #0419 is about, where the fixture agrees with
+# self-referential assertion the schema-version guard is about, where the fixture agrees with
 # whatever the constant happens to hold.
 #
 # Bumping the wire contract is therefore a TWO-SIDED edit, deliberately: move
@@ -606,7 +747,7 @@ def _rung_violation(schema_version: str) -> str | None:
 
 
 def test_schema_version_is_the_rung_this_backend_targets():
-    """The assertion #0419 found missing. Compares the constant against an
+    """The assertion the schema-version guard found missing. Compares the constant against an
     independently-recorded rung, not against itself."""
     assert _rung_violation(pool.SCHEMA_VERSION) is None, _rung_violation(
         pool.SCHEMA_VERSION
@@ -637,13 +778,13 @@ def _a_rung_the_page_has_never_defined() -> str:
 
 
 def test_the_check_rejects_a_superseded_page_rung():
-    """#0114's actual defect, pinned so it cannot recur silently. 0.14.0-draft
+    """the schema-version defect's actual defect, pinned so it cannot recur silently. 0.14.0-draft
     is a real rung the page committed for the dropped-synchronous-arm shape."""
     # The pin's premise, stated so a future bump to 0.14 fails with a reason
     # rather than cryptically. A rung already committed stays committed, so
     # this is the only way the historical fact below can stop applying.
     assert BACKEND_TARGETS_RUNG != "0.14", (
-        "this test pins #0114's defect, whose premise is that the backend does "
+        "this test pins the schema-version defect's defect, whose premise is that the backend does "
         "NOT target 0.14; if it now deliberately does, rewrite the pin against "
         "whichever rung was superseded — do not delete it"
     )
@@ -661,9 +802,9 @@ def test_the_check_rejects_a_rung_the_page_never_defined():
     rung = _a_rung_the_page_has_never_defined()
     why = _rung_violation(f"{rung}.0-draft")
     assert why is not None, f"{rung}.0-draft was accepted — the check cannot go red"
-    assert "not a rung the page has ever committed" in why, (
-        f"the rejection does not say WHY {rung} is wrong: {why!r}"
-    )
+    assert (
+        "not a rung the page has ever committed" in why
+    ), f"the rejection does not say WHY {rung} is wrong: {why!r}"
     # ...and it must say so for a different reason than a collision does, or the
     # two failure modes are indistinguishable in a red run.
     assert "2026-" not in why
@@ -680,7 +821,7 @@ def test_the_check_ignores_the_patch_and_the_draft_suffix():
 
 
 def test_the_check_is_not_self_referential(monkeypatch):
-    """The regression guard for #0419 itself. If someone later rewrites the
+    """The regression guard for the schema-version guard itself. If someone later rewrites the
     rung check to read pool.SCHEMA_VERSION on both sides, every test above
     still passes and this one fails."""
     monkeypatch.setattr(pool, "SCHEMA_VERSION", "0.14.0-draft")
@@ -691,7 +832,7 @@ def test_the_check_is_not_self_referential(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# ...and the target must be WRITTEN DOWN, not computed (#0442)
+# ...and the target must be WRITTEN DOWN, not computed
 # ---------------------------------------------------------------------------
 #
 # The test above monkeypatches pool.SCHEMA_VERSION AFTER import, so it can only
@@ -699,11 +840,11 @@ def test_the_check_is_not_self_referential(monkeypatch):
 # from pool.SCHEMA_VERSION at module level instead — a one-line change that
 # reads like a tidy-up — and the derived value FREEZES at import, before any
 # monkeypatch runs. The comparison is the constant against itself again, one
-# level up from where #0419 removed it, and the test above can only redden when
+# level up from where the schema-version guard removed it, and the test above can only redden when
 # the frozen value already IS the rung it patches to.
 #
 # Measured 2026-11-13, sweeping the derivation over all thirteen rungs PAGE_RUNGS
-# records (harness .dev/verify/0442/sweep-rung-derivation.sh): exactly ONE goes
+# records: exactly ONE goes
 # red (0.14, and only because test_the_check_rejects_a_superseded_page_rung
 # hardcodes that rung as its premise). Twelve stay fully GREEN, of which eleven
 # are wrong values a revert could land on. That 1-of-13 is an artefact of one
@@ -736,9 +877,7 @@ def _module_level_value_node(name: str) -> ast.expr:
         stmt.value
         for stmt in tree.body
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None
-        for target in (
-            stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-        )
+        for target in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target])
         if isinstance(target, ast.Name) and target.id == name
     ]
     # Exactly one, because grading the first of two would silently grade the
@@ -793,7 +932,7 @@ def _not_written_down(name: str, live_value: object) -> str | None:
 
 
 def test_the_targeted_rung_is_written_down_and_not_derived():
-    """#0442. The new check is "the target is not derived from the constant it
+    """The new check is "the target is not derived from the constant it
     guards" — NOT "the target equals this specific table". Only the first
     survives a legitimate rung bump; the second is the shape that just failed."""
     why = _not_written_down("BACKEND_TARGETS_RUNG", BACKEND_TARGETS_RUNG)
@@ -814,14 +953,14 @@ def test_this_guard_can_actually_refuse_a_derivation():
 
     They assert an absence, so on their own they are equally consistent with
     "nothing is derived" and "the instrument cannot see a derivation". This runs
-    the same predicate over the exact one-line derivation #0442 is about and
+    the same predicate over the exact one-line derivation the rung-target rule is about and
     requires it to come back refused, naming the expression it refused.
     """
     derivation = 'BACKEND_TARGETS_RUNG = ".".join(pool.SCHEMA_VERSION.split(".")[:2])'
     is_literal, _ = _written_down(ast.parse(derivation).body[0].value)
     assert not is_literal, (
         f"the predicate accepted {derivation!r} as written down, so it cannot "
-        f"refuse the derivation #0442 is about and the two tests above are green "
+        f"refuse the derivation the rung-target rule is about and the two tests above are green "
         f"for no reason"
     )
     # ...and it must still ACCEPT a plain literal, or it refuses everything and
@@ -834,3 +973,35 @@ def test_this_guard_can_actually_refuse_a_derivation():
         "the predicate refused a plain string literal, so it would refuse every "
         "legitimate rung too"
     )
+
+
+# ---------------------------------------------------------------------------
+# The wire-digest change: the wire view must publish the digest the index already holds.
+# ---------------------------------------------------------------------------
+
+
+def test_every_contribution_publishes_its_stored_weights_digest(wire):
+    """The fixture gives all five contributions DISTINCT digests, so this cannot
+    pass against a hardcoded value or a constant leaked from a sibling row — which
+    is the discrimination that matters here, the projection having previously
+    dropped the field rather than mangled it."""
+    stored = {
+        c["contribution_id"]: c["weights_sha256"]
+        for c in _synthetic_index()["contributions"]
+    }
+    published = {
+        c["contribution_id"]: c.get("weights_sha256") for c in wire["contributions"]
+    }
+    assert published == stored
+    assert len(set(published.values())) == len(published)
+
+
+def test_a_contribution_without_a_stored_digest_publishes_null_rather_than_raising():
+    """Control on the choice of `.get()` over a subscript here. The merge path
+    subscripts, because souping unchecked bytes is the harm it guards; this is a
+    page projection, where one absent field must not take the whole view down."""
+    idx = _synthetic_index()
+    del idx["contributions"][0]["weights_sha256"]
+    wire = pool.pool_wire_state(idx, pool_artifact_id=POOL_ID)
+    assert wire["contributions"][0]["weights_sha256"] is None
+    assert wire["contributions"][1]["weights_sha256"] == "b2" * 32

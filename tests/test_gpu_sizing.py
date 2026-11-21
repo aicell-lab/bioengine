@@ -139,8 +139,14 @@ def test_request_larger_than_smallest_gpu_rejected():
 def test_sum_resources_keeps_fractional_num_gpus():
     """Epsilon and fractional reservations must not truncate to zero, or the
     SLURM autoscaler sees an app with no GPU demand at all."""
-    spec = _spec(8000, {"num_cpus": 1, "num_gpus": _GPU_HANDLE_EPSILON,
-                        "resources": {"VRAM_MB": 8000}})
+    spec = _spec(
+        8000,
+        {
+            "num_cpus": 1,
+            "num_gpus": _GPU_HANDLE_EPSILON,
+            "resources": {"VRAM_MB": 8000},
+        },
+    )
     totals = AppBuilder._sum_resources(spec, proxy_memory_in_gb=1)
     assert totals["num_gpus"] > 0
     assert totals["VRAM_MB"] == 8000

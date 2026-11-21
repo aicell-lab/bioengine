@@ -9,6 +9,7 @@ code into the deployment (this served stale model-runner tagging after a KTH
 worker cycle). The helper drops exactly the app-source modules so the next
 import reads the new code, and leaves framework / stdlib modules alone.
 """
+
 from __future__ import annotations
 
 import importlib

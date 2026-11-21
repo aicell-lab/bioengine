@@ -420,7 +420,6 @@ def validate_manifest(manifest: Dict[str, Any]) -> None:
         )
 
 
-
 def validate_artifact_id(
     manifest: Dict[str, Any],
     workspace: str,
@@ -746,7 +745,9 @@ async def commit_artifact(
     except Exception as e:
         raise RuntimeError(f"Failed to commit artifact '{artifact_id}': {e}")
 
-    logger.info(f"Successfully committed artifact '{artifact_id}' (version={version or 'latest'})")
+    logger.info(
+        f"Successfully committed artifact '{artifact_id}' (version={version or 'latest'})"
+    )
 
 
 def get_static_site_url(artifact_id: str, server_url: str) -> str:
@@ -766,7 +767,6 @@ def get_static_site_url(artifact_id: str, server_url: str) -> str:
     """
     workspace, alias = artifact_id.split("/", 1)
     return f"{server_url}/{workspace}/view/{alias}/"
-
 
 
 async def create_application_from_files(

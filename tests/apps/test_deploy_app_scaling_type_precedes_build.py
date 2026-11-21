@@ -1,4 +1,4 @@
-"""A non-dict ``scaling`` must be refused before any Ray call (#0406).
+"""A non-dict ``scaling`` must be refused before any Ray call.
 
 ``tests/apps/test_deploy_app_validates_scaling.py`` pins that ``deploy_app``
 calls ``_validate_scaling_map``. That validator cannot be the whole boundary for

@@ -131,7 +131,9 @@ class SlackNotifier:
             # Surface the Slack error rather than returning a success-shaped dict.
             raise RuntimeError(f"chat.postMessage failed: {body.get('error')}")
 
-        logger.info(f"Sent Slack DM to {target} (channel {channel}, ts {body.get('ts')})")
+        logger.info(
+            f"Sent Slack DM to {target} (channel {channel}, ts {body.get('ts')})"
+        )
         return {
             "ok": True,
             "channel": channel,

@@ -6,6 +6,7 @@ pin that argv: the shape documented in docs/deployment-guide.md for each
 runtime, worker arguments forwarded verbatim, and the auth token never
 appearing on a command line where `ps` would show it.
 """
+
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,7 +95,9 @@ def test_apptainer_binds_instead_of_mounting():
     command = _build("apptainer", gpus=True)
     assert command[:2] == ["apptainer", "exec"]
     assert "--nv" in command
-    assert command[command.index("--bind") + 1] == f"{WORKSPACE}:{CONTAINER_WORKSPACE_DIR}"
+    assert (
+        command[command.index("--bind") + 1] == f"{WORKSPACE}:{CONTAINER_WORKSPACE_DIR}"
+    )
     assert f"docker://{IMAGE}" in command
     # No container to name, detach or size — those flags belong to docker/podman.
     for flag in ("--name", "--detach", "--shm-size", "--user"):
@@ -128,7 +131,9 @@ def test_no_tty_is_requested_when_stdin_is_not_one():
 
 def test_a_non_interactive_invocation_does_not_ask_for_a_tty():
     """CliRunner's stdin is not a terminal, the same as CI, nohup or systemd."""
-    result = _run(["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"])
+    result = _run(
+        ["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"]
+    )
     assert result.exit_code == 0, result.output
     tokens = result.output.split()
     assert "-it" not in tokens
@@ -191,7 +196,10 @@ def test_a_dry_run_does_not_print_a_secret_worker_argument():
 
 
 def test_an_inline_secret_argument_is_redacted_too():
-    assert redact_secrets(["docker", f"--token={FAKE_TOKEN}"]) == ["docker", "--token=<redacted>"]
+    assert redact_secrets(["docker", f"--token={FAKE_TOKEN}"]) == [
+        "docker",
+        "--token=<redacted>",
+    ]
 
 
 def test_redaction_keeps_the_named_environment_passthrough_readable():
@@ -199,7 +207,9 @@ def test_redaction_keeps_the_named_environment_passthrough_readable():
 
 
 def test_a_dry_run_still_prints_a_runnable_command():
-    result = _run(["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"])
+    result = _run(
+        ["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"]
+    )
     assert result.output.startswith("docker run --rm")
     assert IMAGE in result.output
 
@@ -240,7 +250,9 @@ def test_no_worker_arguments_still_starts_the_worker_module():
 
 
 def test_the_image_is_pinned_to_the_installed_version():
-    result = _run(["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"])
+    result = _run(
+        ["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"]
+    )
     assert result.exit_code == 0, result.output
     assert f"{DEFAULT_IMAGE_REPO}:{__version__}" in result.output
 
@@ -275,7 +287,8 @@ def test_a_missing_runtime_is_refused_when_actually_starting(monkeypatch):
 def test_stop_and_logs_refuse_runtimes_without_named_containers(monkeypatch):
     """On an apptainer-only host there is no container name to act on."""
     monkeypatch.setattr(
-        "bioengine.cli.worker.shutil.which", lambda name: name if name == "apptainer" else None
+        "bioengine.cli.worker.shutil.which",
+        lambda name: name if name == "apptainer" else None,
     )
     for command in ("stop", "logs"):
         result = _run([command])
@@ -294,7 +307,9 @@ def test_every_subcommand_is_reachable(command):
 
 
 def _fake_runtime(monkeypatch, existing_container: str):
-    monkeypatch.setattr("bioengine.cli.worker.shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        "bioengine.cli.worker.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
     monkeypatch.setattr(
         "bioengine.cli.worker.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(stdout=existing_container),
@@ -426,9 +441,13 @@ def _container_environment(runtime, command, env):
     if runtime == "apptainer":
         prefix = "APPTAINERENV_"
         return {
-            name[len(prefix) :]: value for name, value in env.items() if name.startswith(prefix)
+            name[len(prefix) :]: value
+            for name, value in env.items()
+            if name.startswith(prefix)
         }
-    return {name: env.get(name) for flag, name in zip(command, command[1:]) if flag == "-e"}
+    return {
+        name: env.get(name) for flag, name in zip(command, command[1:]) if flag == "-e"
+    }
 
 
 def _start(monkeypatch, tmp_path, runtime, extra_args=(), env=None):
@@ -482,7 +501,9 @@ def test_no_token_means_no_passthrough(monkeypatch, tmp_path):
     assert "HYPHA_TOKEN" not in _container_environment("docker", command, env)
 
 
-def test_the_token_is_masked_in_a_dry_run_and_delivered_in_a_real_one(monkeypatch, tmp_path):
+def test_the_token_is_masked_in_a_dry_run_and_delivered_in_a_real_one(
+    monkeypatch, tmp_path
+):
     printed = _run(
         [
             "start",
@@ -510,17 +531,23 @@ def test_the_token_is_masked_in_a_dry_run_and_delivered_in_a_real_one(monkeypatc
 def _fake_nvidia_smi(monkeypatch, present: bool):
     monkeypatch.setattr(
         "bioengine.cli.worker.shutil.which",
-        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" and present else None,
+        lambda name: (
+            "/usr/bin/nvidia-smi" if name == "nvidia-smi" and present else None
+        ),
     )
 
 
 @pytest.mark.parametrize("nvidia_smi_present", [True, False])
-def test_nvidia_smi_decides_whether_gpus_are_requested_by_default(monkeypatch, nvidia_smi_present):
+def test_nvidia_smi_decides_whether_gpus_are_requested_by_default(
+    monkeypatch, nvidia_smi_present
+):
     """Neither --gpus nor --no-gpus is given, so the default consults _has_gpu()."""
     _fake_nvidia_smi(monkeypatch, nvidia_smi_present)
     assert _has_gpu() is nvidia_smi_present
 
-    result = _run(["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"])
+    result = _run(
+        ["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"]
+    )
     assert result.exit_code == 0, result.output
     assert ("--gpus=all" in result.output) is nvidia_smi_present
 
@@ -530,7 +557,16 @@ def test_an_explicit_gpu_choice_overrides_the_host(monkeypatch, nvidia_smi_prese
     _fake_nvidia_smi(monkeypatch, nvidia_smi_present)
     for flag, expected in (("--gpus", True), ("--no-gpus", False)):
         result = _run(
-            ["start", "--runtime", "docker", flag, "--dry-run", "--", "--mode", "single-machine"]
+            [
+                "start",
+                "--runtime",
+                "docker",
+                flag,
+                "--dry-run",
+                "--",
+                "--mode",
+                "single-machine",
+            ]
         )
         assert result.exit_code == 0, result.output
         assert ("--gpus=all" in result.output) is expected
@@ -686,6 +722,7 @@ def test_podman_and_apptainer_are_untouched(fake_nvidia_host):
 # --runtime singularity was rejected by the Choice. The CLI surface this
 # launcher uses is identical; only the env-forwarding prefix differs.
 
+
 def test_singularity_is_an_accepted_runtime():
     from bioengine.cli.worker import _RUNTIME_PREFERENCE
 
@@ -736,7 +773,9 @@ def test_docker_and_podman_get_no_sif_prefixes():
     for runtime in ("docker", "podman"):
         env = _subprocess_env(runtime, FAKE_TOKEN, None)
         assert env["HYPHA_TOKEN"] == FAKE_TOKEN
-        assert not [k for k in env if k.startswith(("APPTAINERENV_", "SINGULARITYENV_"))]
+        assert not [
+            k for k in env if k.startswith(("APPTAINERENV_", "SINGULARITYENV_"))
+        ]
 
 
 def test_every_detected_runtime_is_also_an_accepted_choice():
@@ -761,7 +800,7 @@ def test_every_detected_runtime_is_also_an_accepted_choice():
     assert {"auto", "native"} <= accepted
 
 
-# ── Host resource census (svamp #0066) ───────────────────────────────────────
+# ── Host resource census ───────────────────────────────────────
 #
 # The census only works if every worker on the host mounts the SAME directory,
 # which is why the launcher owns it rather than each site's deployment template.
@@ -784,10 +823,8 @@ def test_the_worker_advertises_under_its_container_name():
     Without it the worker falls back to its hostname, which under docker is the
     container id — unique, but unrecognisable in "co-tenant 8da84e16af4c".
     """
-    env = _subprocess_env(
-        "docker", None, None, "bioengine-worker-europa", census=True
-    )
-    assert env["BIOENGINE_WORKER_ID"] == "bioengine-worker-europa"
+    env = _subprocess_env("docker", None, None, "bioengine-worker-dev", census=True)
+    assert env["BIOENGINE_WORKER_ID"] == "bioengine-worker-dev"
     assert env["BIOENGINE_HOST_CENSUS_DIR"] == CONTAINER_CENSUS_DIR
 
 
@@ -817,14 +854,25 @@ def test_no_census_leaves_the_command_untouched():
 def test_the_census_flag_reaches_the_command():
     """The positive half of the two opt-out tests below, which pass unchanged if
     the flag never wires anything at all."""
-    result = _run(["start", "--dry-run", "--runtime", "docker", "--", "--mode", "single-machine"])
+    result = _run(
+        ["start", "--dry-run", "--runtime", "docker", "--", "--mode", "single-machine"]
+    )
     assert result.exit_code == 0
     assert CONTAINER_CENSUS_DIR in result.output
 
 
 def test_no_census_opts_out_from_the_flag():
     result = _run(
-        ["start", "--dry-run", "--runtime", "docker", "--no-census", "--", "--mode", "single-machine"]
+        [
+            "start",
+            "--dry-run",
+            "--runtime",
+            "docker",
+            "--no-census",
+            "--",
+            "--mode",
+            "single-machine",
+        ]
     )
     assert result.exit_code == 0
     assert CONTAINER_CENSUS_DIR not in result.output
@@ -832,10 +880,14 @@ def test_no_census_opts_out_from_the_flag():
 
 def test_native_mode_has_no_census_mount():
     """A native worker reads the host directly; there is no container to bind."""
-    result = _run(["start", "--dry-run", "--runtime", "native", "--", "--mode", "single-machine"])
+    result = _run(
+        ["start", "--dry-run", "--runtime", "native", "--", "--mode", "single-machine"]
+    )
     assert result.exit_code == 0
     assert CONTAINER_CENSUS_DIR not in result.output
-# ── Container memory limit (svamp #0125) ─────────────────────────────────────
+
+
+# ── Container memory limit ─────────────────────────────────────
 #
 # Ray sizes its memory monitor from `min(cgroup limit, host total)`. With no
 # cgroup limit it reads the host's total, so an unlimited worker only starts
@@ -863,7 +915,9 @@ def test_docker_gets_a_limit_by_default():
     """The default is 'auto', so a worker started with no thought about memory
     still gets a cgroup limit — which is the whole point. Without one Ray sizes
     its monitor from host total and only sheds tasks at 95% of the machine."""
-    result = _run(["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"])
+    result = _run(
+        ["start", "--runtime", "docker", "--dry-run", "--", "--mode", "single-machine"]
+    )
     assert result.exit_code == 0, result.output
     assert "--memory" in result.output
 
@@ -892,8 +946,17 @@ def test_an_explicit_limit_is_refused_rather_than_dropped_for_sif_runtimes():
     """
     for runtime in ("apptainer", "singularity", "native"):
         result = _run(
-            ["start", "--runtime", runtime, "--memory", "32g", "--dry-run",
-             "--", "--mode", "single-machine"]
+            [
+                "start",
+                "--runtime",
+                runtime,
+                "--memory",
+                "32g",
+                "--dry-run",
+                "--",
+                "--mode",
+                "single-machine",
+            ]
         )
         assert result.exit_code != 0, f"{runtime} accepted --memory silently"
         assert "--memory is not supported" in result.output
@@ -908,17 +971,36 @@ def test_the_default_does_not_refuse_those_runtimes():
     """
     for runtime in ("apptainer", "singularity", "native"):
         result = _run(
-            ["start", "--runtime", runtime, "--dry-run", "--", "--mode", "single-machine"]
+            [
+                "start",
+                "--runtime",
+                runtime,
+                "--dry-run",
+                "--",
+                "--mode",
+                "single-machine",
+            ]
         )
-        assert result.exit_code == 0, f"{runtime} failed on the default: {result.output}"
+        assert (
+            result.exit_code == 0
+        ), f"{runtime} failed on the default: {result.output}"
         assert "--memory" not in result.output
 
 
 def test_explicitly_disabling_it_is_not_refused_either():
     """'none' is the operator agreeing there is no limit, not asking for one."""
     result = _run(
-        ["start", "--runtime", "apptainer", "--memory", "none", "--dry-run",
-         "--", "--mode", "single-machine"]
+        [
+            "start",
+            "--runtime",
+            "apptainer",
+            "--memory",
+            "none",
+            "--dry-run",
+            "--",
+            "--mode",
+            "single-machine",
+        ]
     )
     assert result.exit_code == 0, result.output
     assert "--memory" not in result.output

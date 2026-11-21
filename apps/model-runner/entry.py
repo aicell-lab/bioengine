@@ -19,7 +19,6 @@ Heavier helper modules:
   keep models from being evicted mid-inference
 """
 
-
 import asyncio
 import json
 import logging
@@ -43,7 +42,13 @@ from pydantic import Field
 from bioengine import __version__
 
 from model_cache import BioimageioPackage, ModelCache
-from runtime import SINGLE_INPUT_KEY, RuntimeDeployment, pin_bioimageio_conda_env
+from runtime import (
+    CONDA_IMPLEMENTATIONS,
+    SINGLE_INPUT_KEY,
+    RuntimeDeployment,
+    pin_bioimageio_conda_env,
+    resolve_conda_binary,
+)
 
 
 logger = logging.getLogger("ray.serve")
@@ -288,6 +293,7 @@ class EntryDeployment:
         # Replica identifier for logging.
         try:
             from ray import serve as _serve
+
             _ctx = _serve.get_replica_context()
             self.replica_id = _ctx.replica_tag
         except Exception:
@@ -452,7 +458,8 @@ class EntryDeployment:
         report_versions = {
             str(row[0]): str(row[1])
             for row in report.get("env", [])
-            if isinstance(row, (list, tuple)) and len(row) >= 2
+            if isinstance(row, (list, tuple))
+            and len(row) >= 2
             and str(row[0]) in current_versions
         }
         return all(
@@ -562,12 +569,16 @@ class EntryDeployment:
         """Scrubbed env with mamba's env-prefix + package cache
         redirected to the replica's writable HOME.
 
-        ``/home/ray/anaconda3/envs/`` and ``/home/ray/.mamba/pkgs``
-        are on a read-only mount inside the Ray worker pod. HOME is
+        A conda implementation's default env prefix and package cache
+        (``$CONDA_PREFIX/envs/``, ``~/.mamba/pkgs``)
+        are not writable cross-replica inside the Ray worker pod. HOME is
         set by ``bioengine._app.replica_init`` to
         ``<app_dir>/home/`` on the app's PVC, which is
         cross-replica RWX under the bioengine layout, so envs built
         by EntryDeployment are visible to RuntimeDeployment on the same path.
+
+        This used to cite ``/home/ray/anaconda3/envs/``, the
+        ``rayproject/ray`` layout no image this repo builds has (myco #0527).
         """
         env_vars = self._safe_subprocess_env()
         mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
@@ -621,10 +632,17 @@ class EntryDeployment:
         conda hardlinks package files from ``pkgs/`` into each env, so
         removing an env frees almost nothing until the now-unreferenced
         packages go too. Best-effort; never raises.
+
+        A no-op when no conda implementation is installed: there is then no
+        package cache to clean, and spawning a missing binary would only log a
+        confusing ``FileNotFoundError`` from the housekeeping path (#0527).
         """
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            return
         try:
             proc = await asyncio.create_subprocess_exec(
-                "mamba",
+                conda_bin,
                 "clean",
                 "--packages",
                 "--tarballs",
@@ -647,10 +665,16 @@ class EntryDeployment:
         warnings on failure but never raises, since the caller
         (sweep + LRU eviction) shouldn't fail the whole test call
         because one stale env couldn't be reaped.
+
+        A no-op when no conda implementation is installed — nothing built the
+        env, so nothing here can reap it (#0527).
         """
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            return
         try:
             proc = await asyncio.create_subprocess_exec(
-                "mamba",
+                conda_bin,
                 "env",
                 "remove",
                 "-n",
@@ -1138,9 +1162,7 @@ class EntryDeployment:
         }
         return job
 
-    def _new_infer_job(
-        self, model_id: str, return_download_url: bool
-    ) -> dict:
+    def _new_infer_job(self, model_id: str, return_download_url: bool) -> dict:
         """Create an infer-job record, register it and return it. Sweeps
         expired jobs on the way in.
         """
@@ -1279,10 +1301,7 @@ class EntryDeployment:
             if job["state"] not in ("completed", "failed", "cancelled"):
                 self._adopt_unfinished_infer_job(job, request_dir)
             completed_at = job["completed_at"]
-            if (
-                completed_at is None
-                or (now - completed_at) > self._INFER_JOBS_TTL_SEC
-            ):
+            if completed_at is None or (now - completed_at) > self._INFER_JOBS_TTL_SEC:
                 shutil.rmtree(request_dir, ignore_errors=True)
                 discarded += 1
                 continue
@@ -1656,14 +1675,21 @@ class EntryDeployment:
         *inside* their own prefix, then marked so the probe runs once. Every
         env built here has ``bioimageio.core`` pinned into its pip section by
         ``pin_bioimageio_conda_env``, so the console script is always expected.
+
+        With no conda implementation installed an unmarked directory is
+        reported as NOT existing: the completeness probe cannot be run, and an
+        unverifiable env must not be admitted as usable (#0527).
         """
         env_dir = self._conda_envs_dir() / env_name
         if (env_dir / self._ENV_COMPLETE_MARKER).exists():
             return True
         if not env_dir.is_dir():
             return False
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            return False
         proc = await asyncio.create_subprocess_exec(
-            "mamba",
+            conda_bin,
             "run",
             "-n",
             env_name,
@@ -1696,9 +1722,7 @@ class EntryDeployment:
         """
         import re
 
-        match = re.search(
-            r"could not read Username for '(https://[^'/]+)", stderr_text
-        )
+        match = re.search(r"could not read Username for '(https://[^'/]+)", stderr_text)
         if not match or "git clone" not in stderr_text:
             return None
         host = match.group(1).split("//", 1)[1]
@@ -1733,8 +1757,21 @@ class EntryDeployment:
         ``--file=<path>``, not stdin) and awaits the child. On non-zero
         exit, raises either a translated explanation or the last ~1 KB of
         the child's stderr.
+
+        Raises a named error, rather than ``FileNotFoundError: 'mamba'`` from
+        the spawn, when no conda implementation is installed (#0527).
+        ``_execute_test`` refuses the whole call before reaching here; this
+        keeps the precondition stated at the spawn site too.
         """
         import tempfile
+
+        conda_bin = resolve_conda_binary()
+        if conda_bin is None:
+            raise RuntimeError(
+                f"cannot build the conda env for weight format {wf!r}: none of "
+                f"{list(CONDA_IMPLEMENTATIONS)} is installed in this replica's "
+                "image, so custom_environment=True cannot be served here"
+            )
 
         with tempfile.NamedTemporaryFile(
             mode="wb", suffix=".yaml", delete=False
@@ -1753,9 +1790,9 @@ class EntryDeployment:
                 await self._mamba_env_remove(env_name, env_vars)
                 shutil.rmtree(env_dir, ignore_errors=True)
 
-            logger.info(f"🐍 mamba env create ({wf!r}) → {env_name}")
+            logger.info(f"🐍 {conda_bin} env create ({wf!r}) → {env_name}")
             proc = await asyncio.create_subprocess_exec(
-                "mamba",
+                conda_bin,
                 "env",
                 "create",
                 "--yes",
@@ -1819,9 +1856,7 @@ class EntryDeployment:
         import aiofiles
 
         timeout = httpx.Timeout(60.0, read=300.0)
-        async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True
-        ) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async with client.stream("GET", url, headers=headers) as resp:
                 resp.raise_for_status()
                 async with aiofiles.open(dest, "wb") as f:
@@ -1842,9 +1877,11 @@ class EntryDeployment:
         is in place and (when a sha is declared) verified.
         """
         if await asyncio.to_thread(local_path.exists):
-            if not expected_sha or await asyncio.to_thread(
-                self._sha256_file, local_path
-            ) == expected_sha:
+            if (
+                not expected_sha
+                or await asyncio.to_thread(self._sha256_file, local_path)
+                == expected_sha
+            ):
                 logger.info(
                     f"✅ Reusing cached HF weight for '{model_id}' [{fmt}]: "
                     f"{local_path.name}"
@@ -1860,9 +1897,7 @@ class EntryDeployment:
             f"🤗 Downloading gated HF weight for '{model_id}' [{fmt}] from {url}"
         )
         try:
-            await self._stream_download(
-                url, tmp, {"Authorization": f"Bearer {token}"}
-            )
+            await self._stream_download(url, tmp, {"Authorization": f"Bearer {token}"})
         except Exception as e:
             await asyncio.to_thread(tmp.unlink, True)
             logger.error(
@@ -1941,9 +1976,7 @@ class EntryDeployment:
             changed = True
 
         if changed:
-            rewritten = await asyncio.to_thread(
-                yaml.safe_dump, rdf, sort_keys=False
-            )
+            rewritten = await asyncio.to_thread(yaml.safe_dump, rdf, sort_keys=False)
             async with aiofiles.open(rdf_path, "w") as f:
                 await f.write(rewritten)
             logger.info(
@@ -2205,7 +2238,9 @@ class EntryDeployment:
         response = None
         rdf_url = None
         for rdf_name in ("bioimageio.yaml", "rdf.yaml"):
-            rdf_url = f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/{rdf_name}"
+            rdf_url = (
+                f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/{rdf_name}"
+            )
             response = await self.model_cache._get_url_with_retry(
                 rdf_url, params={"stage": str(stage).lower()}
             )
@@ -2262,7 +2297,9 @@ class EntryDeployment:
             return None
 
         doc_url = f"{self.server_url}/bioimage-io/artifacts/{model_id}/files/{doc_path}"
-        logger.info(f"📄 Downloading documentation '{doc_path}' for model '{model_id}'.")
+        logger.info(
+            f"📄 Downloading documentation '{doc_path}' for model '{model_id}'."
+        )
 
         response = await self.model_cache._get_url_with_retry(
             doc_url, params={"stage": str(stage).lower()}
@@ -2277,7 +2314,9 @@ class EntryDeployment:
         try:
             response.raise_for_status()
         except Exception as e:
-            logger.warning(f"⚠️ Failed to download documentation for model '{model_id}': {e}")
+            logger.warning(
+                f"⚠️ Failed to download documentation for model '{model_id}': {e}"
+            )
             return None
 
         logger.info(f"✅ Successfully downloaded documentation for model '{model_id}'.")
@@ -2346,7 +2385,7 @@ class EntryDeployment:
         ),
         custom_environment: Optional[bool] = Field(
             None,
-            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). If False, run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference. If left None (default), inherit the environment of the model's prior report for the matching slot (staged report for stage=True, published for stage=False) — so a model last tested in its custom env is re-tested in the custom env automatically — falling back to False when no prior report exists.",
+            description="If True, run the test inside the conda environment declared by the model's own weights description (``bioimageio.core`` ``runtime_env='as-described'``, backed by ``mamba`` or ``conda`` for env creation; the env is cached on the shared PVC and LRU-evicted under a size ceiling, not removed per call). Requires one of those to be installed in the deployed image: where neither is, the call is refused with an error saying so and no test report is produced, rather than returning a failed report that looks like a verdict on the model. If False, run in the model-runner RuntimeDeployment's own venv — the same interpreter that serves inference. If left None (default), inherit the environment of the model's prior report for the matching slot (staged report for stage=True, published for stage=False) — so a model last tested in its custom env is re-tested in the custom env automatically — falling back to False when no prior report exists.",
         ),
         cache: Literal["skip", "check", "reuse"] = Field(
             "check",
@@ -2438,9 +2477,9 @@ class EntryDeployment:
         if custom_environment is None:
             model_alias = model_id.rsplit("/", 1)[-1]
             prior_report = await self._read_published_report(model_alias, stage)
-            custom_environment = (
-                (prior_report or {}).get("test_environment") == "custom"
-            )
+            custom_environment = (prior_report or {}).get(
+                "test_environment"
+            ) == "custom"
 
         # Publishing is authorized by the CALLER's identity; the write itself
         # still uses the app's own bioimage-io token. Authorization and
@@ -2468,9 +2507,7 @@ class EntryDeployment:
                 # Failure surfaces via ``result = {"error": ...}`` so the
                 # progress dict shape stays uniform across success and
                 # failure (no separate ``error`` field).
-                self._update_test_job(
-                    job, state="failed", result={"error": str(exc)}
-                )
+                self._update_test_job(job, state="failed", result={"error": str(exc)})
 
         job["_task"] = asyncio.create_task(_bg_execute())
         return job["job_id"]
@@ -2548,6 +2585,35 @@ class EntryDeployment:
             )
             custom_environment = False
             job["custom_environment"] = False
+
+        # Refuse a custom-env run this image cannot serve, instead of letting
+        # it fail as a verdict on the model (myco #0527).
+        #
+        # Without this, the first thing to happen is
+        # ``FileNotFoundError: 'mamba'`` from the env build below — inside the
+        # ``try`` that turns any exception into a *fallback test report*:
+        # ``status="failed"``, ``name="bioimageio format validation"``, the
+        # traceback as its one unnamed detail. That object is shaped like a
+        # verdict on the model and is not one. It is already kept out of the
+        # collection and the cache by ``report_is_trustworthy=False``, but it
+        # is still what the caller is handed and what the UI renders.
+        #
+        # Deliberately AFTER the downgrade above, so the check runs on the
+        # *effective* mode: a model declaring no environment.yaml falls back to
+        # standard and must keep working on an image with no conda at all.
+        # Also before ``_prebuild_conda_envs``, so nothing is spent on an env
+        # solve that cannot start.
+        if custom_environment and resolve_conda_binary() is None:
+            raise RuntimeError(
+                f"Cannot test '{model_id}' with custom_environment=True: this "
+                f"model-runner image installs none of "
+                f"{list(CONDA_IMPLEMENTATIONS)}, so the conda environment the "
+                f"model declares cannot be built. This is a limitation of the "
+                f"deployment, not a fault in the model — no test was run and "
+                f"no report was produced. Re-run with "
+                f"custom_environment=False to test in the serving runtime's "
+                f"own environment."
+            )
 
         # Use context manager to track access and prevent eviction during test
         async with package:
@@ -2832,9 +2898,7 @@ class EntryDeployment:
                     "returned to the caller regardless."
                 )
             else:
-                published = await self._upload_test_report(
-                    model_id, stage, test_report
-                )
+                published = await self._upload_test_report(model_id, stage, test_report)
             test_report["published"] = published
 
         return test_report
@@ -2984,9 +3048,7 @@ class EntryDeployment:
             self._MODELS_COLLECTION,
         ):
             try:
-                artifact = await self.artifact_manager.read(
-                    artifact_id, silent=True
-                )
+                artifact = await self.artifact_manager.read(artifact_id, silent=True)
             except Exception:
                 continue
             permissions = (artifact.get("config") or {}).get("permissions") or {}
@@ -3015,9 +3077,7 @@ class EntryDeployment:
             return False
 
         model_alias = model_id.rsplit("/", 1)[-1]
-        report_artifact_id = (
-            f"{self._TEST_REPORTS_WORKSPACE}/test-report-{model_alias}"
-        )
+        report_artifact_id = f"{self._TEST_REPORTS_WORKSPACE}/test-report-{model_alias}"
         slot = "staged" if stage else "published"
         file_path = f"{slot}/test_report.json"
 
@@ -3118,9 +3178,7 @@ class EntryDeployment:
                     edit_kwargs["type"] = "published-model"
                 elif model_confirmed_unpublished:
                     edit_kwargs["type"] = "staged-model"
-                await self.artifact_manager.edit(
-                    report_artifact_id, **edit_kwargs
-                )
+                await self.artifact_manager.edit(report_artifact_id, **edit_kwargs)
                 # A model with no committed version keeps no published report:
                 # published uploads are blocked upstream, so a leftover published
                 # file is never overwritten and would strand the report on the
@@ -3259,9 +3317,7 @@ class EntryDeployment:
             registry = self._infer_jobs
         else:
             registry = (
-                self._test_jobs
-                if request_id in self._test_jobs
-                else self._infer_jobs
+                self._test_jobs if request_id in self._test_jobs else self._infer_jobs
             )
         job = registry.get(request_id)
         if job is None:
@@ -3493,7 +3549,6 @@ class EntryDeployment:
                     f"{type(value).__name__})."
                 )
 
-
         job = self._new_infer_job(
             model_id=model_id, return_download_url=bool(return_download_url)
         )
@@ -3613,9 +3668,7 @@ class EntryDeployment:
                 exc = RuntimeError(
                     f"Runtime call failed for request {request_id!r}: {exc}"
                 )
-            logger.error(
-                f"❌ Infer run {request_id!r} for '{model_id}' failed: {exc}"
-            )
+            logger.error(f"❌ Infer run {request_id!r} for '{model_id}' failed: {exc}")
             # Clean up any staged on-disk data — we don't want it
             # sitting around after failure.
             if self._inference_dir is not None:
@@ -3624,9 +3677,7 @@ class EntryDeployment:
                     str(self._inference_dir / request_id),
                     ignore_errors=True,
                 )
-            self._update_infer_job(
-                job, state="failed", result={"error": str(exc)}
-            )
+            self._update_infer_job(job, state="failed", result={"error": str(exc)})
             # Re-creates the request dir holding nothing but ``job.json``,
             # so the caller still gets the error after a replica swap
             # instead of a bare "unknown request_id".
@@ -3678,17 +3729,14 @@ class EntryDeployment:
             job["_result_materialized"] = True
             await self._persist_infer_job(job)
             # The presigned URLs are the durable copy now.
-            await asyncio.to_thread(
-                shutil.rmtree, str(output_dir), ignore_errors=True
-            )
+            await asyncio.to_thread(shutil.rmtree, str(output_dir), ignore_errors=True)
         else:
             job["result"] = outputs
             job["_result_materialized"] = True
             await self._persist_infer_job(job)
 
         logger.info(
-            f"📤 Materialized {len(outputs)} output(s) for request "
-            f"{request_id!r}."
+            f"📤 Materialized {len(outputs)} output(s) for request " f"{request_id!r}."
         )
 
     @bioengine.method
@@ -3743,12 +3791,7 @@ class EntryDeployment:
         # reading a completed job's outputs off disk exactly once, then
         # holding them in memory. A ``failed`` state already has the
         # error stored via ``_execute_infer``, so nothing to materialise.
-        if (
-            job["state"] == "completed"
-            and not job["_result_materialized"]
-        ):
+        if job["state"] == "completed" and not job["_result_materialized"]:
             await self._materialize_infer_result(job)
 
         return self._infer_job_progress(job)
-
-

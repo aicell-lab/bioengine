@@ -27,6 +27,7 @@ STATUS_STALE_SECONDS = 600
 
 # === session paths + file-backed status ===
 
+
 def sessions_root() -> Path:
     # Under the container's mounted ~/.bioengine so sessions survive restarts.
     root = Path.home() / ".bioengine" / "micro_sam_sessions"
@@ -124,19 +125,31 @@ def min_training_vram_mb(model_type: str) -> int:
 # Machine-readable grouping keys the training UI keys off instead of string-matching
 # model_type: ``family`` groups by architecture, ``size`` is the capacity tier.
 MODEL_FAMILY = {
-    "vit_t_lm": "lm", "vit_b_lm": "lm", "vit_l_lm": "lm",
+    "vit_t_lm": "lm",
+    "vit_b_lm": "lm",
+    "vit_l_lm": "lm",
     "vit_t_em_organelles": "em_organelles",
     "vit_b_em_organelles": "em_organelles",
     "vit_l_em_organelles": "em_organelles",
-    "vit_b": "sam", "vit_l": "sam", "vit_h": "sam",
-    "cpsam": "cpsam", "cpdino": "cpdino", "cpdino-vitb": "cpdino",
+    "vit_b": "sam",
+    "vit_l": "sam",
+    "vit_h": "sam",
+    "cpsam": "cpsam",
+    "cpdino": "cpdino",
+    "cpdino-vitb": "cpdino",
 }
 MODEL_SIZE = {
-    "vit_t_lm": "tiny", "vit_t_em_organelles": "tiny",
-    "vit_b_lm": "base", "vit_b_em_organelles": "base", "vit_b": "base",
+    "vit_t_lm": "tiny",
+    "vit_t_em_organelles": "tiny",
+    "vit_b_lm": "base",
+    "vit_b_em_organelles": "base",
+    "vit_b": "base",
     "cpdino-vitb": "base",
-    "vit_l_lm": "large", "vit_l_em_organelles": "large", "vit_l": "large",
-    "cpsam": "large", "cpdino": "large",
+    "vit_l_lm": "large",
+    "vit_l_em_organelles": "large",
+    "vit_l": "large",
+    "cpsam": "large",
+    "cpdino": "large",
     "vit_h": "huge",
 }
 
@@ -239,15 +252,21 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
 def get_status(session_id: str) -> Dict[str, Any]:
     st = read_status(session_id)
     if not st:
-        return {"session_id": session_id, "status": "UNKNOWN", "message": "no such session"}
+        return {
+            "session_id": session_id,
+            "status": "UNKNOWN",
+            "message": "no such session",
+        }
     st["session_id"] = session_id
     st["checkpoint_available"] = checkpoint_path(session_id).exists()
     if st.get("start_time"):
         end = st.get("end_time") or time.time()
         st["elapsed_s"] = round(end - st["start_time"], 1)
     # A run with no live thread that hasn't updated in a while is stale → stopped.
-    if st.get("status") in ("PREPARING", "TRAINING") and \
-            time.time() - st.get("updated_at", 0) > STATUS_STALE_SECONDS:
+    if (
+        st.get("status") in ("PREPARING", "TRAINING")
+        and time.time() - st.get("updated_at", 0) > STATUS_STALE_SECONDS
+    ):
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
     return st
@@ -315,8 +334,11 @@ def get_export(export_id: str) -> Dict[str, Any]:
     while the build is genuinely alive.
     """
     rec = read_export(export_id)
-    if rec and rec.get("status") in ("PENDING", "BUILDING") and \
-            time.time() - rec.get("updated_at", 0) > STATUS_STALE_SECONDS:
+    if (
+        rec
+        and rec.get("status") in ("PENDING", "BUILDING")
+        and time.time() - rec.get("updated_at", 0) > STATUS_STALE_SECONDS
+    ):
         rec["status"] = "FAILED"
         rec["message"] = "failed"
         rec["error"] = "the export was interrupted before the package was staged"
@@ -326,7 +348,7 @@ def get_export(export_id: str) -> Dict[str, Any]:
 def _set_pdeathsig() -> None:
     """preexec_fn: ask the kernel to SIGKILL this child when its parent (the runtime
     replica) dies, so a training subprocess cannot outlive an OOM-killed supervisor
-    and orphan-hold the GPU (#0063). Linux-only (prctl PR_SET_PDEATHSIG=1); a no-op
+    and orphan-hold the GPU. Linux-only (prctl PR_SET_PDEATHSIG=1); a no-op
     elsewhere. Runs in the forked child before exec."""
     try:
         import ctypes
@@ -338,8 +360,12 @@ def _set_pdeathsig() -> None:
 
 
 def run_cancellable_subprocess(
-    argv: List[str], session_id: str, cwd: Optional[str] = None,
-    env: Optional[Dict[str, str]] = None, poll: float = 2.0, grace: float = 10.0,
+    argv: List[str],
+    session_id: str,
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    poll: float = 2.0,
+    grace: float = 10.0,
 ) -> Tuple[int, str, bool]:
     """Run a training subprocess that a concurrent ``stop_training`` can kill.
 
@@ -355,7 +381,12 @@ def run_cancellable_subprocess(
     stopped = False
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
-            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
             preexec_fn=_set_pdeathsig,
         )
         while True:
@@ -381,6 +412,7 @@ def run_cancellable_subprocess(
 
 # === annotation interpretation ===
 
+
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
@@ -402,7 +434,11 @@ def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.nd
         geom = feature.get("geometry") or {}
         gtype = geom.get("type")
         coords = geom.get("coordinates") or []
-        polygons = [coords] if gtype == "Polygon" else (list(coords) if gtype == "MultiPolygon" else [])
+        polygons = (
+            [coords]
+            if gtype == "Polygon"
+            else (list(coords) if gtype == "MultiPolygon" else [])
+        )
         for poly in polygons:
             if not poly:
                 continue
@@ -487,7 +523,11 @@ def materialize_pairs(
     sdir = session_dir(session_id)
 
     def keep(pairs):
-        return [(im, lb) for im, lb in pairs if lb is not None and int(np.asarray(lb).max()) > 0]
+        return [
+            (im, lb)
+            for im, lb in pairs
+            if lb is not None and int(np.asarray(lb).max()) > 0
+        ]
 
     train = keep(train)
     val = keep(val) if val else []
@@ -528,13 +568,19 @@ def materialize_pairs(
     ph = (min(patch_shape[0], min_h), min(patch_shape[1], min_w))
 
     return {
-        "train_images": train_imgs, "train_labels": train_lbls,
-        "val_images": val_imgs, "val_labels": val_lbls,
-        "patch_shape": ph, "n_train": len(train_imgs), "n_val": len(val_imgs),
+        "train_images": train_imgs,
+        "train_labels": train_lbls,
+        "val_images": val_imgs,
+        "val_labels": val_lbls,
+        "patch_shape": ph,
+        "n_train": len(train_imgs),
+        "n_val": len(val_imgs),
         "val_reused_train": val_reused_train,
     }
 
+
 # === training params (written by the entry, read by train_worker.py) ===
+
 
 def _params_path(session_id: str) -> Path:
     return session_dir(session_id) / "training_params.json"

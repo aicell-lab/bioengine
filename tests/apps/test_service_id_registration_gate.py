@@ -24,6 +24,7 @@ The contract now:
   successor that claims the record and then never registers withholds a
   working address for as long as the predecessor keeps serving it.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -216,6 +217,11 @@ def _bare_actor() -> object:
     actor.replica_identities = {}
     actor.service_registrations = {}
     actor._pending_tokens = {}
+    # clear_application_replicas pops this too, and object.__new__ skips __init__, so without it
+    # both clearing tests raise AttributeError rather than asserting anything. Set here beside the
+    # other five rather than guarded at the pop: a defensive pop would let production tolerate the
+    # attribute being genuinely absent, which is a real bug worth crashing on.
+    actor._app_secret_env_vars = {}
     return actor
 
 

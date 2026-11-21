@@ -10,6 +10,7 @@ directly: given a stale app-source module in ``sys.modules`` and fresh source on
 disk, the purge drops exactly the app-source modules so the next import reads
 the new code, and leaves framework / stdlib modules untouched.
 """
+
 from __future__ import annotations
 
 import importlib

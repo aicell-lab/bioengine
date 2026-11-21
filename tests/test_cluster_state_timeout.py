@@ -1,5 +1,5 @@
 """The ``get_cluster_state`` round trip is bounded, so a silent Ray head
-cannot wedge the monitoring loop (#0137).
+cannot wedge the monitoring loop.
 
 The monitoring steps are sequential awaits. An unbounded wait here stops the
 whole pass, which is where application recovery and proxy-token renewal live,
@@ -8,7 +8,7 @@ while apps drift away and tokens expire.
 
 Nothing here asserts anything about cluster capacity. ``total_cpu == 0`` and an
 empty ``nodes`` map are the correct idle reading for a SLURM worker, and gating
-on them was retracted on #0135.
+on them was retracted.
 """
 
 import ast
@@ -21,9 +21,12 @@ import pytest
 
 from bioengine.cluster import ray_cluster as rc_mod
 from bioengine.cluster.ray_cluster import RayCluster
-from bioengine.heartbeat import MISSED_PASSES_BEFORE_STALE, heartbeat_stale_after_seconds
+from bioengine.heartbeat import (
+    MISSED_PASSES_BEFORE_STALE,
+    heartbeat_stale_after_seconds,
+)
 
-# What a reconnect is EXPECTED to cost, which is not a ceiling on it (#0229).
+# What a reconnect is EXPECTED to cost, which is not a ceiling on it.
 # Two terms, and only one is a bound: the geo lookup is a real
 # ``asyncio.wait_for(..., timeout=15.0)``, while RECONNECT_BUDGET_S = 15.0 is a
 # retry BUDGET — connect_with_retry starts no new attempt past it, but its own
@@ -236,7 +239,7 @@ def test_no_unbounded_get_cluster_state_await_is_left_anywhere():
     Two earlier versions of this test were each too narrow by one step, and the
     second one shipped. It first walked ``ray_cluster`` alone while claiming
     "every call site", and a fourth site that already existed in
-    ``slurm_workers`` sat outside its field of view until #0137's second
+    ``slurm_workers`` sat outside its field of view until a second review
     refusal. Naming the pair fixed that case and left the shape: a raw await
     added to any third module would have been just as invisible, and three
     others hold the handle (``apps/manager``, ``apps/proxy_deployment``,
@@ -259,7 +262,9 @@ def test_no_unbounded_get_cluster_state_await_is_left_anywhere():
     sources = sorted(_package_root().rglob("*.py"))
     # A zero below has to mean "no raw call", never "walked nothing": if the
     # discovery breaks, every assertion after it passes vacuously.
-    assert len(sources) > 20, f"only found {len(sources)} sources under {_package_root()}"
+    assert (
+        len(sources) > 20
+    ), f"only found {len(sources)} sources under {_package_root()}"
 
     found = {}
     for path in sources:

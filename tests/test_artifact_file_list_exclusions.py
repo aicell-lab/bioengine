@@ -3,7 +3,7 @@
 A committed artifact version is immutable and is exactly what a deploy runs, so a
 git-ignored local leftover swept into the file list is permanent and does not
 appear in git. ``bioimage-io/model-finetune`` 0.27.3 shipped four
-``.pytest_cache/`` files that way while 0.27.1 was clean, which is #0085.
+``.pytest_cache/`` files that way while 0.27.1 was clean.
 
 Most of these exercise the pure helper against real temporary directories, so
 they need no Hypha server. The last one is live-gated and goes the whole way to
@@ -105,7 +105,7 @@ def test_dot_git_is_excluded_when_the_directory_is_a_repository_root(tmp_path):
     would publish ``.git/config`` — and a remote URL there can carry a token."""
     app = _app(tmp_path)
     _git_init(app)
-    (app / ".git" / "config").write_text("[remote \"origin\"]\n")
+    (app / ".git" / "config").write_text('[remote "origin"]\n')
 
     names = _names(app)
     assert not [n for n in names if n.startswith(".git/")]
@@ -157,7 +157,7 @@ async def test_a_committed_version_does_not_carry_a_gitignored_file(
         "version: 1.0.0\n"
         "entry: entry:EntryApp\n"
         "authors:\n"
-        "  - {name: \"Test\"}\n"
+        '  - {name: "Test"}\n'
         "license: MIT\n"
         "authorized_users:\n"
         '  - "*"\n'
@@ -176,7 +176,9 @@ async def test_a_committed_version_does_not_carry_a_gitignored_file(
         capture_output=True,
         text=True,
     )
-    assert staged.returncode == 0, "the staging step did nothing: git does not ignore it"
+    assert (
+        staged.returncode == 0
+    ), "the staging step did nothing: git does not ignore it"
 
     files = create_file_list_from_directory(app)
     workspace = hypha_client.config.workspace

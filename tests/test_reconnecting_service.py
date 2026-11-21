@@ -17,6 +17,7 @@ name in ``async_init`` has the same handle and none of that protection:
 apps hit it today, with no wrapper, and it passes either way. The rest exercise
 the wrapper, so this module cannot even import on ``origin/main``.
 """
+
 from __future__ import annotations
 
 import asyncio

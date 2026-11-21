@@ -61,9 +61,7 @@ def test_help_example_survives_a_single_directive(flag):
         f"directive parses too; got {tokens[0]!r}"
     )
     first_directive = tokens[0].split("=", 1)[1].split()[0]
-    args = create_parser().parse_args(
-        ["--mode", "slurm", f"{flag}={first_directive}"]
-    )
+    args = create_parser().parse_args(["--mode", "slurm", f"{flag}={first_directive}"])
     value = getattr(args, flag.lstrip("-").replace("-", "_"))
     assert value == first_directive
 
@@ -77,6 +75,4 @@ def test_space_separated_single_directive_is_still_rejected(flag):
     which is the signal to revisit the '=' advice rather than trust it.
     """
     with pytest.raises(SystemExit):
-        create_parser().parse_args(
-            ["--mode", "slurm", flag, "--reservation=safe"]
-        )
+        create_parser().parse_args(["--mode", "slurm", flag, "--reservation=safe"])

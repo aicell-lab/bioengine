@@ -1,4 +1,4 @@
-"""``get_app_status`` must actually CALL the deployment_logs validator (#0406).
+"""``get_app_status`` must actually CALL the deployment_logs validator.
 
 ``tests/test_deployment_logs_validation.py`` covers the helper thoroughly, but
 every case there imports it directly and none drives ``get_app_status`` — which

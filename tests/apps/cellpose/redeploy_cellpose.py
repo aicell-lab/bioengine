@@ -57,9 +57,7 @@ async def redeploy(artifact_id: str, application_id: str):
         import pprint
 
         for i in range(10):
-            app_status = await worker.get_app_status(
-                application_ids=[application_id]
-            )
+            app_status = await worker.get_app_status(application_ids=[application_id])
             print(f"DEBUG: Status check {i}:")
             pprint.pprint(app_status, indent=2)
 

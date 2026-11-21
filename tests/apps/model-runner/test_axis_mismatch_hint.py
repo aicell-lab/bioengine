@@ -3,9 +3,9 @@
 bioimageio raises ``ValueError("Array shape (...) does not map to axes [AxisInfo(...)]")``.
 It is accurate and unactionable: it reprs the model's axis objects and leaves the caller to
 work out which axis is wrong. A workshop participant hit exactly that on 2026-11-11 with a
-grayscale image against Cellpose-SAM (myco #0308).
+grayscale image against Cellpose-SAM.
 
-THE FIXTURE IS REPRODUCED, NOT TRANSCRIBED. The production log that prompted this issue
+THE FIXTURE IS REPRODUCED, NOT TRANSCRIBED. The production log from the 2026-11-11 workshop run
 shows the message elided with "..."; a parser written against the elided form would have
 been a guess, so it was not. The text below is the full message as the real code path
 emits it, captured by running ``create_sample_for_model`` — the call ``runtime.py`` makes
@@ -50,7 +50,7 @@ REAL = (
 )
 
 # The SAME capture, for a plain 2-D grayscale array — what ``iio.imread`` of a grayscale
-# PNG actually yields, and the shape this issue's own live arm logged on 2026-11-11.
+# PNG actually yields, and the shape the live arm logged on 2026-11-11.
 # Captured in the same run as REAL above, not derived from it; the integrity test below
 # asserts the two differ only in the shape tuple.
 REAL_2D = (
@@ -74,9 +74,7 @@ def _load(path, *names):
             and any(isinstance(t, ast.Name) and t.id in names for t in node.targets)
         )
     ]
-    found = {
-        n.name if hasattr(n, "name") else n.targets[0].id for n in wanted
-    }
+    found = {n.name if hasattr(n, "name") else n.targets[0].id for n in wanted}
     if found != set(names):
         pytest.fail(f"missing {sorted(set(names) - found)} in {path.name}")
     # ONE namespace, used as both globals and locals. With two, the module-level regex
@@ -98,10 +96,12 @@ def hint():
 def test_the_real_workshop_message_names_the_channel_axis(hint):
     """The whole point: the caller is told which axis and what to do about it."""
     got = hint(REAL)
-    assert got is not None, "the message that prompted #0308 was not recognised"
+    assert got is not None, "the real grayscale message was not recognised"
     assert "'channel' axis must be exactly 3 but the array supplies 1" in got
     assert "grayscale" in got
-    assert "np.repeat(arr, 3, axis=1)" in got, "the remedy must be runnable, not described"
+    assert (
+        "np.repeat(arr, 3, axis=1)" in got
+    ), "the remedy must be runnable, not described"
 
 
 def test_the_original_error_is_kept_verbatim(hint):
@@ -123,12 +123,14 @@ def test_a_shape_that_satisfies_every_axis_is_not_reported(hint):
     the point here is that the helper's own test is "does any axis fall outside its
     bounds", not "did the string contain the word channel".
     """
-    conforming = REAL.replace("Array shape (1, 1, 807, 696)", "Array shape (1, 3, 807, 696)")
+    conforming = REAL.replace(
+        "Array shape (1, 1, 807, 696)", "Array shape (1, 3, 807, 696)"
+    )
     assert hint(conforming) is None
 
 
 def test_a_space_axis_below_its_minimum_is_reported_without_the_channel_remedy(hint):
-    """#0293's shape, which is a different axis — the hint must follow the data.
+    """A sub-minimum SPACE axis, which is a different axis — the hint must follow the data.
 
     A hint that always said "channel" would pass the first test and be wrong here, so
     this is what holds the two apart.
@@ -154,7 +156,10 @@ def test_the_step_field_is_parsed_but_does_not_change_the_verdict(hint):
     stepped = REAL.replace("min=256, max=None, step=None", "min=256, max=None, step=16")
     assert stepped != REAL, "the substitution must actually change the string"
     assert hint(stepped) is not None
-    assert hint(stepped).split("Original error")[0] == hint(REAL).split("Original error")[0]
+    assert (
+        hint(stepped).split("Original error")[0]
+        == hint(REAL).split("Original error")[0]
+    )
 
 
 def test_a_length_mismatch_names_no_axis_but_still_states_the_requirement(hint):
@@ -166,7 +171,7 @@ def test_a_length_mismatch_names_no_axis_but_still_states_the_requirement(hint):
     the shape that arrived are still true, though, and they are the actionable half.
 
     This test used to assert ``hint(ragged) is None`` and so pinned the gap shut: the
-    2-D grayscale upload — this issue's own reproduction — went through this branch and
+    2-D grayscale upload — the shape reproduced from that run — went through this branch and
     came out byte-identical to the unfixed code. Keeping the "no axis is named" property
     asserted preserves what the guard is actually for.
     """
@@ -191,13 +196,15 @@ def test_the_real_2d_grayscale_upload_is_given_the_requirement_and_a_remedy(hint
     conforming array.
     """
     got = hint(REAL_2D)
-    assert got is not None, "the shape this issue actually reproduced was not recognised"
+    assert (
+        got is not None
+    ), "the shape reproduced from the workshop run was not recognised"
     assert "axis must be" not in got, "2 sizes against 4 axes cannot name an axis"
     assert "2 dimensions but this model declares 4 axes" in got
     assert "carries no channel axis at all" in got
-    assert "np.repeat(arr[np.newaxis, np.newaxis], 3, axis=1)" in got, (
-        "the remedy must be runnable: two leading axes added, then the channel replicated"
-    )
+    assert (
+        "np.repeat(arr[np.newaxis, np.newaxis], 3, axis=1)" in got
+    ), "the remedy must be runnable: two leading axes added, then the channel replicated"
     assert REAL_2D in got
 
 
@@ -208,5 +215,7 @@ def test_the_2d_fixture_differs_from_the_4d_one_only_in_the_shape(hint):
     identical; if a future recapture changes one and not the other, the two tests above
     would be measuring different models and nothing would say so.
     """
-    assert REAL_2D == REAL.replace("Array shape (1, 1, 807, 696)", "Array shape (807, 696)")
+    assert REAL_2D == REAL.replace(
+        "Array shape (1, 1, 807, 696)", "Array shape (807, 696)"
+    )
     assert REAL_2D != REAL

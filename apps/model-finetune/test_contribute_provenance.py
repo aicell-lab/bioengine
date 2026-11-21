@@ -7,10 +7,10 @@ apart from one written before versions were stamped at all (``pool.py``,
 0.27.6 moved every ``l2_from_base`` value without changing the record's shape, so
 two responses of the same shape can hold values computed by different releases.
 
-The stored ``metadata.json`` carried ``app_version`` from 0.27.14 (#0116). The dict
+The stored ``metadata.json`` carried ``app_version`` from 0.27.14. The dict
 returned to the caller did not — and that dict, not the stored file, is what a
 depositing site keeps. A campaign auditing 92 saved responses found five shapes it
-could not date and had to reconstruct provenance by joining across arms (#0140).
+could not date and had to reconstruct provenance by joining across arms.
 
 Asserted on the real ``contribute`` coroutine with its collaborators stubbed, and by
 comparing the returned value against the metadata bytes actually PUT — not against a
@@ -54,16 +54,25 @@ def fake_training(monkeypatch: pytest.MonkeyPatch) -> None:
     about what the two records agree on, not about reading a real session."""
     mod = types.ModuleType("training")
     mod.get_status = lambda sid: {
-        "status": "COMPLETED", "model_type": "cpsam",
-        "n_epochs_completed": 2, "n_train_inputs": 5,
+        "status": "COMPLETED",
+        "model_type": "cpsam",
+        "n_epochs_completed": 2,
+        "n_train_inputs": 5,
     }
     mod.session_backend = lambda sid: "cellpose"
-    mod.read_training_params = lambda sid: {"model_type": "cpsam", "init_checkpoint": "stock"}
+    mod.read_training_params = lambda sid: {
+        "model_type": "cpsam",
+        "init_checkpoint": "stock",
+    }
     monkeypatch.setitem(sys.modules, "training", mod)
 
 
 class _Runtime:
-    async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
+    # model_type is accepted because the entry passes it: the base commitment is
+    # built on the runtime, so the entry has to say which stock base to fall back to.
+    async def prepare_contribution(
+        self, session_id: str, weights_put_url: str, model_type: str = "cpsam"
+    ) -> Dict[str, Any]:
         return {
             "architecture_signature": "sig-1",
             "base_checkpoint_sha256": "b" * 64,
@@ -71,6 +80,12 @@ class _Runtime:
             "l2_from_base": 0.5,
             "weights_sha256": _DIGEST,
             "n_bytes": 1218617275,
+            "base_commitment": {
+                "non_learned": {"diam_labels": 30.0, "diam_mean": 30.0},
+                "key_set_sha256": "c" * 64,
+                "key_count": 350,
+                "source": "session_init_checkpoint:" + "b" * 64,
+            },
         }
 
 
@@ -126,7 +141,7 @@ class _Stub:
     def _staged(self, am: Any, artifact_id: str):
         """The REAL staging context manager, bound here rather than faked.
 
-        #0134 moved ``contribute``'s staging into ``_staged``; a hand-rolled double
+        the staging change moved ``contribute``'s staging into ``_staged``; a hand-rolled double
         would keep passing if it stopped discarding on failure, which is the whole
         point of that change.
         """
@@ -157,7 +172,9 @@ async def _deposit(monkeypatch: pytest.MonkeyPatch, app_version: Optional[str]):
 
 
 @pytest.mark.asyncio
-async def test_returned_record_carries_app_version(monkeypatch: pytest.MonkeyPatch, fake_training: None) -> None:
+async def test_returned_record_carries_app_version(
+    monkeypatch: pytest.MonkeyPatch, fake_training: None
+) -> None:
     """The defect: the caller's copy could not be dated at all."""
     returned, _ = await _deposit(monkeypatch, "0.27.16")
     assert "app_version" in returned, (
@@ -203,7 +220,7 @@ async def test_empty_env_var_is_unset_in_both_records(
 async def test_the_digest_the_campaign_found_null_is_still_recorded_in_both(
     monkeypatch: pytest.MonkeyPatch, fake_training: None
 ) -> None:
-    """#0140's report claimed the digest could be written null. It cannot on this path:
+    """the undatable-response report's report claimed the digest could be written null. It cannot on this path:
     it comes from ``sha256_file``, which returns a hexdigest or raises. Pinned here so a
     future refactor cannot quietly make null reachable."""
     returned, stored = await _deposit(monkeypatch, "0.27.16")

@@ -17,6 +17,7 @@ server's chunk cache make whichever ran second look fast.
 
 CPU only by design.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,9 +38,12 @@ import numpy as np
 def provenance(base: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     def _git(*a: str) -> str:
         try:
-            return subprocess.run(["git", "-C", "/data/nmechtel/bioengine", *a],
-                                  capture_output=True, text=True,
-                                  timeout=10).stdout.strip()
+            return subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parents[3]), *a],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
         except Exception:
             return "unknown"
 
@@ -60,8 +64,9 @@ def provenance(base: str, extra: Dict[str, Any]) -> Dict[str, Any]:
 # crops
 
 
-def plan_crops(shape: List[int], axes: str, n: int, size: int,
-               seed: int, zs: List[Any]) -> List[Tuple[int, ...]]:
+def plan_crops(
+    shape: List[int], axes: str, n: int, size: int, seed: int, zs: List[Any]
+) -> List[Tuple[int, ...]]:
     """Pick crop origins over a GIVEN set of z planes.
 
     The z planes are passed in rather than drawn here so that each measured
@@ -115,8 +120,9 @@ def run_lazy(arr, crops, axes, size) -> Tuple[List[np.ndarray], float]:
     return got, time.perf_counter() - t0
 
 
-def run_prefetch(arr, crops, axes, size, workers: int,
-                 depth: int) -> Tuple[List[np.ndarray], float]:
+def run_prefetch(
+    arr, crops, axes, size, workers: int, depth: int
+) -> Tuple[List[np.ndarray], float]:
     """Fetch ahead into a bounded queue while the consumer works.
 
     The queue is bounded so this stays a prefetcher and does not quietly become
@@ -171,8 +177,12 @@ def build_unet(in_ch: int):
     import torch.nn as nn
 
     def block(a, b):
-        return nn.Sequential(nn.Conv2d(a, b, 3, padding=1), nn.ReLU(inplace=True),
-                             nn.Conv2d(b, b, 3, padding=1), nn.ReLU(inplace=True))
+        return nn.Sequential(
+            nn.Conv2d(a, b, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(b, b, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
 
     class TinyUNet(nn.Module):
         def __init__(self, ch=16):
@@ -188,6 +198,7 @@ def build_unet(in_ch: int):
 
         def forward(self, x):
             import torch
+
             c1 = self.d1(x)
             c2 = self.d2(self.pool(c1))
             b = self.bott(self.pool(c2))
@@ -198,8 +209,9 @@ def build_unet(in_ch: int):
     return TinyUNet()
 
 
-def train(crops_data: List[np.ndarray], steps: int, batch: int,
-          seed: int) -> Dict[str, Any]:
+def train(
+    crops_data: List[np.ndarray], steps: int, batch: int, seed: int
+) -> Dict[str, Any]:
     """Self-supervised denoising. No label, and therefore no quality claim."""
     import torch
 
@@ -227,8 +239,8 @@ def train(crops_data: List[np.ndarray], steps: int, batch: int,
 
     return {
         "objective": "self-supervised denoising (MSE of reconstruction from a "
-                     "noised copy); no labels, and no claim is made about what "
-                     "the model learned",
+        "noised copy); no labels, and no claim is made about what "
+        "the model learned",
         "model": "tiny U-Net, 2 down / 2 up, base 16 channels",
         "parameters": params,
         "steps": steps,
@@ -257,9 +269,10 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--seed", type=int, default=17)
     ap.add_argument("--scratch", default=".training_demo")
-    ap.add_argument("--out", default="/data/nmechtel/bioengine-paper/analysis/"
-                                     "results/omezarr_view/figure_assets/"
-                                     "training_demo.json")
+    ap.add_argument(
+        "--out",
+        default="analysis/" "results/omezarr_view/figure_assets/" "training_demo.json",
+    )
     args = ap.parse_args()
 
     import httpx
@@ -268,8 +281,9 @@ def main() -> int:
     info = httpx.get(f"{args.base}/api/datasets/{args.dataset}", timeout=900).json()
     axes = info["axes"].lower()
     shape = info["level_shapes"][0]
-    group = zarr.open_group(zarr.storage.FSStore(f"{args.base}/zarr/{args.dataset}"),
-                            mode="r")
+    group = zarr.open_group(
+        zarr.storage.FSStore(f"{args.base}/zarr/{args.dataset}"), mode="r"
+    )
     arr = group["0"]
 
     # Three disjoint sets over DISJOINT Z PLANES, same size, same sampling.
@@ -280,8 +294,9 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
     zi = axes.index("z") if "z" in axes else None
     if zi is not None:
-        pool = rng.choice(shape[zi], size=min(args.z_planes * 3, shape[zi]),
-                          replace=False)
+        pool = rng.choice(
+            shape[zi], size=min(args.z_planes * 3, shape[zi]), replace=False
+        )
         groups = np.array_split(pool, 3)
     else:
         groups = [[None]] * 3
@@ -289,8 +304,10 @@ def main() -> int:
         name: plan_crops(shape, axes, n, args.size, args.seed + k, list(groups[k]))
         for k, name in enumerate(("lazy", "prefetch", "local"))
     }
-    z_used = {name: sorted(int(z) for z in groups[k])
-              for k, name in enumerate(("lazy", "prefetch", "local"))}
+    z_used = {
+        name: sorted(int(z) for z in groups[k])
+        for k, name in enumerate(("lazy", "prefetch", "local"))
+    }
 
     scratch = Path(args.scratch)
     scratch.mkdir(exist_ok=True)
@@ -298,53 +315,68 @@ def main() -> int:
 
     print("lazy ...", flush=True)
     lazy_data, lazy_s = run_lazy(arr, sets["lazy"], axes, args.size)
-    results["lazy"] = {"crops": n, "seconds": round(lazy_s, 2),
-                       "samples_per_s": round(n / lazy_s, 3)}
+    results["lazy"] = {
+        "crops": n,
+        "seconds": round(lazy_s, 2),
+        "samples_per_s": round(n / lazy_s, 3),
+    }
 
     print("prefetch ...", flush=True)
-    pf_data, pf_s = run_prefetch(arr, sets["prefetch"], axes, args.size,
-                                 args.workers, args.queue_depth)
-    results["prefetch"] = {"crops": n, "seconds": round(pf_s, 2),
-                           "samples_per_s": round(n / pf_s, 3),
-                           "workers": args.workers, "queue_depth": args.queue_depth}
+    pf_data, pf_s = run_prefetch(
+        arr, sets["prefetch"], axes, args.size, args.workers, args.queue_depth
+    )
+    results["prefetch"] = {
+        "crops": n,
+        "seconds": round(pf_s, 2),
+        "samples_per_s": round(n / pf_s, 3),
+        "workers": args.workers,
+        "queue_depth": args.queue_depth,
+    }
 
     print("materialise + local ...", flush=True)
     mat = materialise(arr, sets["local"], axes, args.size, scratch / "crops.npy")
     local_data, local_s = run_local(scratch / "crops.npy")
     results["local_copy"] = {
-        "crops": n, "seconds": round(local_s, 3),
+        "crops": n,
+        "seconds": round(local_s, 3),
         "samples_per_s": round(n / local_s, 1),
         "materialisation": {
             "seconds": round(mat["seconds"], 2),
             "bytes": mat["bytes"],
             "note": "the one-off cost of making the local copy, paid before any "
-                    "of its throughput can be enjoyed; the lazy view pays none "
-                    "of it",
+            "of its throughput can be enjoyed; the lazy view pays none "
+            "of it",
         },
     }
 
     print("training ...", flush=True)
-    results["training"] = train(lazy_data + pf_data, args.steps, args.batch,
-                                args.seed)
+    results["training"] = train(lazy_data + pf_data, args.steps, args.batch, args.seed)
 
-    cache = httpx.get(f"{args.base}/api/datasets/{args.dataset}",
-                      timeout=900).json().get("source_chunk_cache")
+    cache = (
+        httpx.get(f"{args.base}/api/datasets/{args.dataset}", timeout=900)
+        .json()
+        .get("source_chunk_cache")
+    )
 
     payload = {
-        "provenance": provenance(args.base, {
-            "dataset": args.dataset,
-            "dataset_recipe": info.get("recipe"),
-            "dataset_shape": shape,
-            "crop_size": args.size,
-            "crops_per_condition": n,
-            "z_planes_per_condition": args.z_planes,
-            "z_planes_used": z_used,
-        }),
+        "provenance": provenance(
+            args.base,
+            {
+                "dataset": args.dataset,
+                "dataset_recipe": info.get("recipe"),
+                "dataset_shape": shape,
+                "crop_size": args.size,
+                "crops_per_condition": n,
+                "z_planes_per_condition": args.z_planes,
+                "z_planes_used": z_used,
+            },
+        ),
         "what_this_shows": (
             "A model trained on batches read through the served OME-Zarr view of "
             "a remote file that was never converted. The training is real and the "
             "loss trace is recorded; no claim is made about model quality, and "
-            "the objective is label-free for that reason."),
+            "the objective is label-free for that reason."
+        ),
         "throughput": results,
         "source_chunk_cache_after": cache,
         "binding_rules": [
@@ -356,13 +388,15 @@ def main() -> int:
             "are reported beside it and must be quoted with it.",
             "CPU only. No GPU was used.",
             "No training-quality claim follows from this run.",
-            "Throughput is site-specific: europa to Google Cloud Storage.",
+            "Throughput is site-specific: measured from one host to Google Cloud Storage.",
         ],
     }
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(payload, indent=1) + "\n")
     print(json.dumps({k: v for k, v in results.items() if k != "training"}, indent=1))
-    print("training:", {k: v for k, v in results["training"].items()
-                        if k != "loss_trace"})
+    print(
+        "training:", {k: v for k, v in results["training"].items() if k != "loss_trace"}
+    )
     print("->", args.out)
     return 0
 

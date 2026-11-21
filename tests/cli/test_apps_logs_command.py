@@ -155,9 +155,7 @@ def invoke(monkeypatch):
     def _invoke(command: list, status: dict):
         worker = MagicMock()
         worker.get_app_status = AsyncMock(return_value={APP_ID: status})
-        monkeypatch.setattr(
-            apps_cli, "connect_worker", AsyncMock(return_value=worker)
-        )
+        monkeypatch.setattr(apps_cli, "connect_worker", AsyncMock(return_value=worker))
         result = CliRunner().invoke(
             apps_cli.apps_group,
             [*command, "--worker", WORKER, "--token", TOKEN],
@@ -341,7 +339,7 @@ OTHER_DEPLOYMENT = "RuntimeApp"
 
 
 def test_a_per_deployment_override_reaches_the_proxy_and_a_missing_one_falls_back():
-    """Site 4 of #0212: the per-deployment override has to arrive at the proxy call.
+    """Site 4: the per-deployment override has to arrive at the proxy call.
 
     ``this_prev``/``this_tail`` are computed and then forwarded, and nothing in the
     suite had ever looked at what the proxy was actually asked for — no test names
@@ -397,3 +395,143 @@ def test_a_per_deployment_override_reaches_the_proxy_and_a_missing_one_falls_bac
     # and the one with no override, which must still get the top-level defaults
     assert by_dep[OTHER_DEPLOYMENT]["n_previous_replica"] == 2
     assert by_dep[OTHER_DEPLOYMENT]["tail"] == 100
+
+
+# ── The deliberate-stop COUNT, which is not a replica ─────────────────────────
+
+# What `get_deployment_logs` really returns at the DEFAULT n_previous_replica=0 for a
+# deployment that has a crashed replica and has also been scaled down at some point. The
+# count is the one entry in this map whose value is not a replica dict, and that is the
+# whole hazard: every consumer walks this map as replica-id -> stream-dict.
+PROXY_LOGS_WITH_STOPPED_COUNT = {
+    **PROXY_LOGS,
+    "CellposeApp#deadOOM": {
+        "stdout": [],
+        "stderr": [],
+        "death_cause": {
+            "reason": "OOM",
+            "message": "Task was killed due to the node running low on memory.",
+        },
+        "logs_omitted": True,
+    },
+    "_deliberately_stopped_replicas": 3,
+}
+
+
+def test_apps_status_does_not_crash_on_the_deliberate_stop_count(invoke):
+    """The RED-maker for the shipped crash.
+
+    The count used to be delivered INSIDE the replica map as a bare int, so
+    ``streams.get("death_cause")`` raised ``AttributeError: 'int' object has no attribute
+    'get'`` and ``bioengine apps status`` died for ANY deployment that had ever been
+    scaled down -- which is most long-lived ones. The existing CLI tests stayed green
+    because their maps are hand-built and contain only replica dicts; this one renders
+    what the worker actually produces, through the real ``_get_deployment_status``.
+    """
+    output = invoke(["status", APP_ID], _status(PROXY_LOGS_WITH_STOPPED_COUNT))
+    assert "object has no attribute" not in output, output
+    assert "Traceback" not in output, output
+    # and the crashed replica is still reported, so "did not crash" is not the whole claim
+    assert "OOM" in output, output
+
+
+def test_the_deliberate_stop_count_is_reported_not_silently_dropped(invoke):
+    """Lifting it out of the map must not throw the information away.
+
+    Skipping non-dict entries alone would stop the crash and lose the count, which reads
+    to an operator exactly like a deployment that was never scaled down.
+    """
+    output = invoke(["status", APP_ID], _status(PROXY_LOGS_WITH_STOPPED_COUNT))
+    assert "3 replica(s) stopped deliberately" in output, output
+
+
+def test_the_count_is_lifted_out_of_the_replica_map_by_the_worker():
+    """The map the worker hands on must contain replica entries and nothing else.
+
+    Asserted on the producer rather than the printer: a consumer-side guard protects the
+    one consumer that has it, while this keeps the contract true for every other reader,
+    including the dashboard.
+    """
+    deployments = _deployments(PROXY_LOGS_WITH_STOPPED_COUNT, [LIVE_REPLICA])
+    logs = deployments[DEPLOYMENT]["logs"]
+    assert "_deliberately_stopped_replicas" not in logs, logs
+    for replica_id, streams in logs.items():
+        assert isinstance(streams, dict), (replica_id, streams)
+    assert deployments[DEPLOYMENT]["deliberately_stopped_replicas"] == 3
+
+
+# ── A dead replica whose cause Ray no longer holds ────────────────────────────
+
+PROXY_LOGS_WITH_CAUSELESS_DEAD = {
+    **PROXY_LOGS,
+    "CellposeApp#goneCause": {
+        "stdout": [],
+        "stderr": [],
+        "death_cause": None,  # the query ran; Ray simply no longer has the cause
+        "logs_omitted": True,
+    },
+}
+
+
+def test_a_dead_replica_with_no_recorded_cause_is_still_reported(invoke):
+    """RED-maker: `if cause:` skipped it, so the replica left no trace at all.
+
+    A death we cannot explain and a deployment where nothing died are different facts,
+    and the output has to keep them apart. Asserting on the replica ID is the point --
+    a test that only checked "something was printed" passes on the broken version,
+    because the LIVE replica's log lines are printed either way.
+    """
+    output = invoke(["status", APP_ID], _status(PROXY_LOGS_WITH_CAUSELESS_DEAD))
+    assert "CellposeApp#goneCause" in output, output
+    assert "cause unknown" in output, output
+
+
+# ── The cluster-wide dead-actor query is fetched ONCE, not per deployment ─────
+
+
+def _deployments_counting(proxy_logs: dict, replicas: list, n_deployments: int):
+    """Drive `_get_deployment_status` over N deployments, recording each proxy call."""
+    manager = object.__new__(AppsManager)
+    manager.logger = logging.getLogger("test")
+    ray_cluster = MagicMock()
+    ray_cluster.proxy_actor_handle.get_deployment_logs.remote = AsyncMock(
+        return_value=proxy_logs
+    )
+    manager.ray_cluster = ray_cluster
+    details = _serve_details(replicas)
+    one = details["deployments"][DEPLOYMENT]
+    details["deployments"] = {
+        f"{DEPLOYMENT}{i}": dict(one) for i in range(n_deployments)
+    }
+    shared = {"actor-1": {"reason": "OOM", "message": "boom"}}
+    asyncio.run(
+        manager._get_deployment_status(
+            application_id=APP_ID,
+            application_details=details,
+            n_previous_replica=0,
+            logs_tail=100,
+            death_causes=shared,
+        )
+    )
+    return ray_cluster.proxy_actor_handle, shared
+
+
+def test_the_dead_actor_map_is_passed_to_every_deployment_not_refetched():
+    """The cost ruling, asserted by counting.
+
+    The underlying query is CLUSTER-WIDE — it lists every DEAD actor whatever deployment
+    it belonged to — so issuing it inside each deployment repeated identical work once per
+    deployment, per application. It is fetched once per `get_app_status` now and handed
+    down, so each deployment call must carry the SAME map and no deployment may fetch its
+    own.
+    """
+    handle, shared = _deployments_counting(PROXY_LOGS, [LIVE_REPLICA], 4)
+    calls = handle.get_deployment_logs.remote.call_args_list
+    assert len(calls) == 4, calls
+    for call in calls:
+        assert call.kwargs["death_causes"] is shared, call.kwargs
+    # and nothing re-ran the cluster-wide query per deployment
+    assert handle.get_all_death_causes.remote.call_count == 0, (
+        "a deployment fetched its own dead-actor map; that is the per-deployment cost "
+        "the hoist exists to remove"
+    )

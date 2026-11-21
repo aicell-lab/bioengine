@@ -2,7 +2,7 @@
 
 Every exception below is the *verbatim* message a real failure produced against
 ``https://hypha.aicell.io`` with ``hypha_rpc 0.21.40``, only the client ids kept
-(#0407). That matters because the shape was not what the module was built for: a
+That matters because the shape was not what the module was built for: a
 handle resolved by name whose target client has gone does not fail send-side and
 does not time out — the server answers with an error envelope, which hypha_rpc
 decodes into a ``RemoteException``. ``origin/main`` short-circuited on that type
@@ -22,6 +22,7 @@ the server generated has none, because nothing ran to trace.
 discrimination control. Without it, dropping the traceback test and matching the
 message would still pass every other case here.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -36,10 +37,14 @@ _ROUTING_REFUSAL = RemoteException(
 )
 # Measured. hypha_rpc's own peer_not_found handler rejects pending calls with
 # this instead, when the server notifies rather than replying.
-_PEER_NOT_CONNECTED = ConnectionError("Peer bioimage-io/bdeNa83tqUgQbsxJLsSP2m is not connected")
+_PEER_NOT_CONNECTED = ConnectionError(
+    "Peer bioimage-io/bdeNa83tqUgQbsxJLsSP2m is not connected"
+)
 # Measured, and the shape that already classified correctly: the peer dropped
 # while the handler was running, so it may have landed.
-_DROPPED_MID_CALL = ConnectionError("Client disconnected: bioimage-io/frMataFKYW48hyszts58PT")
+_DROPPED_MID_CALL = ConnectionError(
+    "Client disconnected: bioimage-io/frMataFKYW48hyszts58PT"
+)
 
 _HANDLER_TRACEBACK = (
     "Traceback (most recent call last):\n"
@@ -102,7 +107,9 @@ def test_a_handler_propagating_a_real_stale_error_is_not_retried():
 
 
 def test_an_ordinary_handler_error_is_still_not_a_stale_failure():
-    assert stale_service_kind(_remote("KeyError: 'manifest'", _HANDLER_TRACEBACK)) is None
+    assert (
+        stale_service_kind(_remote("KeyError: 'manifest'", _HANDLER_TRACEBACK)) is None
+    )
 
 
 @pytest.mark.parametrize(

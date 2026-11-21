@@ -1,7 +1,8 @@
 {
   "run": {
     "annotation-broker": 300,
-    "model-finetune": 90
+    "model-finetune": 90,
+    "model-runner": 6
   },
   "skip": {}
 }

@@ -3,6 +3,7 @@
 This wrapper provides a PyTorch nn.Module interface for Cellpose 4.0.7 models
 that is compatible with the BioImage.io model format.
 """
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -76,8 +77,12 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
         self.net = Transformer(dtype=dtype).to(self.device)
 
         # Set diameter parameters
-        self.net.diam_labels = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
-        self.net.diam_mean = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
+        self.net.diam_labels = nn.Parameter(
+            torch.tensor([diam_mean]), requires_grad=False
+        )
+        self.net.diam_mean = nn.Parameter(
+            torch.tensor([diam_mean]), requires_grad=False
+        )
 
         # Cellpose model parameters
         self.nclasses = 3
@@ -97,15 +102,17 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
         """
         from collections import namedtuple
 
-        Incompatible = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
+        Incompatible = namedtuple(
+            "IncompatibleKeys", ["missing_keys", "unexpected_keys"]
+        )
 
         # Load the state dict into the network
         result = self.net.load_state_dict(state_dict, strict=strict)
 
         # Update diameter parameters from loaded weights
-        if hasattr(self.net, 'diam_mean'):
+        if hasattr(self.net, "diam_mean"):
             self.diam_mean = self.net.diam_mean.data.cpu().numpy()[0]
-        if hasattr(self.net, 'diam_labels'):
+        if hasattr(self.net, "diam_labels"):
             self.diam_labels = self.net.diam_labels.data.cpu().numpy()[0]
 
         return result
@@ -153,10 +160,12 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
                 img_np = np.concatenate([img_np, img_np, img_np], axis=2)
             elif img_np.shape[2] == 2:
                 # Add a zero channel
-                img_np = np.concatenate([img_np, np.zeros_like(img_np[:,:,0:1])], axis=2)
+                img_np = np.concatenate(
+                    [img_np, np.zeros_like(img_np[:, :, 0:1])], axis=2
+                )
             elif img_np.shape[2] > 3:
                 # Use first 3 channels
-                img_np = img_np[:,:,:3]
+                img_np = img_np[:, :, :3]
 
             image_list.append(img_np)
 
@@ -177,7 +186,9 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
 
         # Convert masks to tensor
         if isinstance(masks_list, list):
-            masks = torch.stack([torch.from_numpy(np.array(m, dtype=np.float32)) for m in masks_list])
+            masks = torch.stack(
+                [torch.from_numpy(np.array(m, dtype=np.float32)) for m in masks_list]
+            )
         else:
             masks = torch.from_numpy(np.array(masks_list, dtype=np.float32))
 
@@ -199,11 +210,7 @@ if __name__ == "__main__":
     test_image = torch.randn(1, 3, 256, 256)
 
     # Initialize model
-    model = CellposeSAMWrapper(
-        diam_mean=30.0,
-        gpu=False,
-        use_bfloat16=False
-    )
+    model = CellposeSAMWrapper(diam_mean=30.0, gpu=False, use_bfloat16=False)
 
     # Note: To actually use this, you need to load trained weights:
     # model.load_state_dict(torch.load("path/to/model"))

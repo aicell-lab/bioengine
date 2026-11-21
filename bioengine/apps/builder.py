@@ -94,6 +94,59 @@ _USER_REPLICA_FRAMEWORK_PACKAGES = ["httpx", "hypha-rpc"]
 #: token (anonymous read).
 _DOWNLOAD_TOKEN_TTL_SECONDS = 3600 * 24 * 30
 
+#: Env-var name carrying that token. Named rather than spelled inline because
+#: it has to be *excluded* from one composed ``runtime_env`` while staying in
+#: the dicts handed to Ray tasks as arguments — see
+#: :meth:`AppBuilder._build_submit_runtime_env`. It is deliberately NOT
+#: ``_SECRET_ENV_VAR_PREFIX``-prefixed: the setup hook reads it from
+#: ``os.environ`` before ``__init__``, so it cannot come through the proxy
+#: actor like the other secrets do.
+_ARTIFACT_DOWNLOAD_TOKEN_KEY = "BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN"
+
+#: Prefix marking an env var as a deploy-time secret. Values under it are kept
+#: out of every ``runtime_env`` the worker composes and are delivered to
+#: replicas through the proxy actor instead; ``bioengine._app.mixin`` strips the
+#: prefix replica-side. Spelled out there too — the replica gets bioengine as
+#: raw source and must not import this module to learn one string.
+_SECRET_ENV_VAR_PREFIX = "_BIOENGINE_SECRET_"
+
+
+def split_secret_env_vars(
+    env_vars: Dict[str, str],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Separate the replicas' env_vars from their secrets.
+
+    Returns ``(replica_env_vars, secret_env_vars)``: the first is safe to put
+    in a ``runtime_env``, the second must not be. Ray's runtime_env_agent
+    writes every runtime_env it materialises into a plaintext per-node log, so
+    a credential delivered that way is readable by anything that can read the
+    log and outlives the replica that used it. The secrets go to the proxy
+    actor instead (``AppBuilder.submit``) and the replica fetches them there
+    (``bioengine._app.mixin``), with the prefix stripped since nothing is
+    being hidden from a UI any more.
+
+    ``BIOENGINE_SECRET_KEYS`` names what was sent, values excluded, so a
+    replica whose fetch comes back short can say which key it was missing
+    rather than letting the user's ``__init__`` run without it.
+
+    One function because this is the single invariant the fix rests on: every
+    dict reaching a ``runtime_env`` comes out of here.
+    """
+    replica_env_vars = {
+        key: value
+        for key, value in env_vars.items()
+        if not key.startswith(_SECRET_ENV_VAR_PREFIX)
+    }
+    secret_env_vars = {
+        key[len(_SECRET_ENV_VAR_PREFIX) :]: value
+        for key, value in env_vars.items()
+        if key.startswith(_SECRET_ENV_VAR_PREFIX)
+    }
+    if secret_env_vars:
+        replica_env_vars["BIOENGINE_SECRET_KEYS"] = ",".join(sorted(secret_env_vars))
+    return replica_env_vars, secret_env_vars
+
+
 #: Tiny GPU reservation used only to bind a physical device (and populate
 #: ``CUDA_VISIBLE_DEVICES``) when packing is driven by the ``VRAM_MB`` custom
 #: resource. The ``VRAM_MB`` reservation — not this fraction — bounds how many
@@ -220,12 +273,12 @@ class AppBuilder:
         env_vars: Dict[str, str] = {}
         env_vars.update(non_secret_env_vars)
         for key, value in secret_env_vars.items():
-            env_vars[f"_BIOENGINE_SECRET_{key}"] = value
+            env_vars[f"{_SECRET_ENV_VAR_PREFIX}{key}"] = value
 
         # Empty string is the caller's explicit "deploy without a token" — it
         # must leave HYPHA_TOKEN genuinely absent, not present and empty.
         if hypha_token:
-            env_vars["_BIOENGINE_SECRET_HYPHA_TOKEN"] = hypha_token
+            env_vars[f"{_SECRET_ENV_VAR_PREFIX}HYPHA_TOKEN"] = hypha_token
 
         worker_workspace = (
             self.server.config.workspace if self.server is not None else "local"
@@ -253,7 +306,7 @@ class AppBuilder:
                 f"/artifacts/{alias}/files"
             )
             if download_token:
-                env_vars["BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN"] = download_token
+                env_vars[_ARTIFACT_DOWNLOAD_TOKEN_KEY] = download_token
 
         if self.worker_service_id:
             env_vars["BIOENGINE_WORKER_SERVICE_ID"] = self.worker_service_id
@@ -302,13 +355,42 @@ class AppBuilder:
         Ray's per-field inheritance of the worker's job-level py_modules
         (set by :meth:`bioengine.cluster.ray_cluster.RayCluster.connect`).
         It materialises the user app source itself via
-        :func:`bioengine._app.replica_init._ensure_source` using the
-        ``BIOENGINE_*`` env_vars below — same flow as Ray Serve replicas.
+        :func:`bioengine._app.replica_init._ensure_source` — same flow as Ray
+        Serve replicas. It reads the ``BIOENGINE_*`` keys from its own
+        ``os.environ``, which it populates from the env mapping it is handed as
+        a task *argument*; most of those keys are also in the dict below, but
+        the download token deliberately is not (next paragraph).
 
         Task-level ``py_modules`` would need a ``gcs://`` URI Ray could
         accept; producing one requires ``upload_package_if_needed``, which
         in external-cluster mode wedges the worker's asyncio loop talking
         to the ray-client gRPC bridge. Hypha downloads sidestep that.
+
+        ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` is deliberately **excluded** from
+        this dict. Of the ``runtime_env``\\ s the token used to ride in, this is
+        the one no consumer depends on. Both tasks composed from this dict receive their
+        env mapping as a plain task **argument** and apply it onto their own
+        ``os.environ`` *before* calling ``_ensure_source``:
+        ``introspect_app_in_ray_task`` gets ``task_env_vars`` (derived in
+        :meth:`_introspect_via_ray_task` from the full ``env_vars``, not from
+        here) and ``build_and_run_application`` gets
+        ``BuiltApp.replica_env_vars``. A task argument travels through the
+        object store; only ``runtime_env`` is materialised by Ray's
+        ``runtime_env_agent``, which writes what it materialises into a
+        plaintext per-node log. So dropping the key here removes a 30-day
+        workspace-read credential from that log without removing it from any
+        process that reads it.
+
+        This rests on the apply-before-``_ensure_source`` ordering in both
+        tasks. ``tests/apps/test_submit_runtime_env_excludes_download_token.py``
+        asserts that ordering alongside the exclusion, so a refactor that drops
+        an apply loop fails there rather than silently breaking source sync.
+
+        The per-replica deployments are a different surface and still carry the
+        token (via ``BuiltApp.replica_env_vars`` at bind time) — a Serve replica
+        has no argument channel, its setup hook reads ``os.environ``. Removing
+        it there needs a credential-free way to materialise the source and is
+        not part of this change.
 
         ``pip`` is the BioEngine baseline only — every module containing
         ``@bioengine.app`` (and anything they transitively import at top
@@ -324,7 +406,10 @@ class AppBuilder:
             extras=["worker"],
         )
         task_env = {
-            k: v for k, v in env_vars.items() if not k.startswith("_BIOENGINE_SECRET_")
+            k: v
+            for k, v in env_vars.items()
+            if not k.startswith(_SECRET_ENV_VAR_PREFIX)
+            and k != _ARTIFACT_DOWNLOAD_TOKEN_KEY
         }
         return {
             "pip": base_pip,
@@ -348,9 +433,20 @@ class AppBuilder:
         passing into the task to keep secrets out of Ray's logs; the
         introspect task only needs the download URL/token + APP_DIR +
         VERSION, none of which is secret-prefixed.
+
+        ``task_env_vars`` is derived from ``env_vars`` — the full dict — and
+        **must not** be derived from ``submit_runtime_env["env_vars"]``, which
+        deliberately has ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` removed (see
+        :meth:`_build_submit_runtime_env`). This argument is the channel that
+        carries the token to the task; the task applies it onto its own
+        ``os.environ`` before syncing source. Sourcing it from the runtime_env
+        instead would make every private-artifact introspect sync anonymously
+        and fail, and would do so silently.
         """
         task_env_vars = {
-            k: v for k, v in env_vars.items() if not k.startswith("_BIOENGINE_SECRET_")
+            k: v
+            for k, v in env_vars.items()
+            if not k.startswith(_SECRET_ENV_VAR_PREFIX)
         }
         try:
             return await asyncio.to_thread(
@@ -441,10 +537,7 @@ class AppBuilder:
         totals["memory"] += int(proxy_memory_in_gb * (1024**3))
         # num_gpus stays a float: fractional and epsilon reservations round to
         # zero as ints, which would understate the app's GPU demand.
-        return {
-            k: (float(v) if k == "num_gpus" else int(v))
-            for k, v in totals.items()
-        }
+        return {k: (float(v) if k == "num_gpus" else int(v)) for k, v in totals.items()}
 
     async def _get_cluster_gpu_sizing(self) -> Dict[str, Any]:
         """Ask the proxy actor how to size GPU reservations on this cluster.
@@ -472,6 +565,35 @@ class AppBuilder:
         sizing = dict(sizing)
         sizing["elastic_gpu_cluster"] = self.elastic_gpu_cluster
         return sizing
+
+    async def _store_replica_secrets(
+        self, application_id: str, secret_env_vars: Dict[str, str]
+    ) -> None:
+        """Hand the app's secrets to the proxy actor for its replicas to fetch.
+
+        Raises rather than letting the deploy proceed: every replica would
+        reach ``__init__`` without the credential it was promised, which fails
+        per replica with an error pointing at the user's code instead of here.
+        Unlike :meth:`_get_cluster_gpu_sizing` there is no safe fallback — a
+        whole GPU is a worse reservation, a missing token is a broken app.
+        """
+        if not secret_env_vars:
+            return
+        if not self.proxy_actor_name:
+            raise RuntimeError(
+                f"Cannot deploy '{application_id}' with "
+                f"{len(secret_env_vars)} secret env var(s) "
+                f"({', '.join(sorted(secret_env_vars))}): no proxy actor is "
+                "configured to deliver them to the replicas."
+            )
+        proxy = ray.get_actor(name=self.proxy_actor_name, namespace="bioengine")
+        await asyncio.to_thread(
+            ray.get,
+            proxy.set_app_secret_env_vars.remote(
+                application_id=application_id,
+                secret_env_vars=secret_env_vars,
+            ),
+        )
 
     @staticmethod
     def _apply_gpu_memory(
@@ -587,7 +709,7 @@ class AppBuilder:
 
     @staticmethod
     def _sanitize_recovery_env_vars(
-        application_env_vars: Dict[str, Dict[str, str]]
+        application_env_vars: Dict[str, Dict[str, str]],
     ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, List[str]]]:
         """Strip secret-like keys from proxy app_data, and name what was stripped.
 
@@ -627,9 +749,7 @@ class AppBuilder:
         last_updated_by: Optional[str] = None,
         auto_redeploy: bool = False,
         ice_servers: Optional[List[Dict[str, Any]]] = None,
-        authorized_users: Optional[
-            Union[Dict[str, List[str]], List[str]]
-        ] = None,
+        authorized_users: Optional[Union[Dict[str, List[str]], List[str]]] = None,
         deploying_user: Optional[tuple] = None,
         admin_users: Optional[List[str]] = None,
         scaling: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -700,8 +820,13 @@ class AppBuilder:
             k: v for k, v in flat_env_vars.items() if not k.startswith("_")
         }
         env_vars = self._build_env_vars(
-            application_id, artifact_id, version,
-            non_secret_env_vars, secret_env_vars, hypha_token, download_token,
+            application_id,
+            artifact_id,
+            version,
+            non_secret_env_vars,
+            secret_env_vars,
+            hypha_token,
+            download_token,
         )
         runtime_env = self._build_submit_runtime_env(env_vars)
 
@@ -844,8 +969,7 @@ class AppBuilder:
             "proxy_service_token_ttl_seconds": proxy_service_token_ttl_seconds,
         }
         self.logger.info(
-            f"Introspected '{application_id}' "
-            f"(methods: {available_methods})"
+            f"Introspected '{application_id}' " f"(methods: {available_methods})"
         )
         # Compute the proxy + user-replica pip lists here on the worker.
         # ``get_pip_requirements`` uses ``importlib.metadata`` which only
@@ -876,17 +1000,17 @@ class AppBuilder:
             extras=[],
         )
         # The env_vars dict the worker assembled above (HYPHA_SERVER_URL,
-        # HYPHA_WORKSPACE, HYPHA_ARTIFACT_*, BIOENGINE_*, plus the
-        # ``_BIOENGINE_SECRET_*`` secrets including HYPHA_TOKEN) only
-        # made it onto the introspect Ray task's ``runtime_env``. The
-        # per-replica deployments don't carry it: the @bioengine.app
-        # decorator preserves whatever static ``env_vars`` the author
-        # put in ``ray_actor_options`` but cannot see anything computed
-        # at deploy time. Without this, user code that reads
-        # ``os.getenv('HYPHA_TOKEN')`` at ``__init__`` crashes the
-        # replica. Pass the worker-side env_vars through so bootstrap
-        # merges them into every deployment's runtime_env at bind time.
-        replica_env_vars = env_vars
+        # HYPHA_WORKSPACE, HYPHA_ARTIFACT_*, BIOENGINE_*) only made it
+        # onto the introspect Ray task's ``runtime_env``. The per-replica
+        # deployments don't carry it: the @bioengine.app decorator
+        # preserves whatever static ``env_vars`` the author put in
+        # ``ray_actor_options`` but cannot see anything computed at deploy
+        # time. Pass the worker-side env_vars through so bootstrap merges
+        # them into every deployment's runtime_env at bind time.
+        #
+        # The secrets deliberately do NOT travel this way — see
+        # ``split_secret_env_vars``.
+        replica_env_vars, replica_secret_env_vars = split_secret_env_vars(env_vars)
 
         return BuiltApp(
             metadata=metadata,
@@ -898,6 +1022,7 @@ class AppBuilder:
             proxy_pip=proxy_pip,
             user_replica_framework_pip=user_replica_framework_pip,
             replica_env_vars=replica_env_vars,
+            replica_secret_env_vars=replica_secret_env_vars,
             proxy_memory_in_gb=proxy_memory_in_gb,
             scaling=dict(scaling or {}),
         )
@@ -914,6 +1039,11 @@ class AppBuilder:
         No worker-side cleanup needed: the worker never wrote anything to
         its own filesystem. Replicas sync source per file from Hypha.
         """
+        # Before serve.run, because that is what starts the replicas that
+        # fetch them.
+        await self._store_replica_secrets(
+            application_id, built_app.replica_secret_env_vars
+        )
         # The Ray Client server unpickles ``.remote(...)`` args in a
         # per-client runtime_env that ships bioengine via ``py_modules``
         # but no ``pip`` — so any class ref in the pickle stream whose
@@ -979,6 +1109,7 @@ class BuiltApp:
         "proxy_pip",
         "user_replica_framework_pip",
         "replica_env_vars",
+        "replica_secret_env_vars",
         "proxy_memory_in_gb",
         "scaling",
     )
@@ -994,6 +1125,7 @@ class BuiltApp:
         proxy_pip: List[str],
         user_replica_framework_pip: List[str],
         replica_env_vars: Dict[str, str],
+        replica_secret_env_vars: Dict[str, str],
         proxy_memory_in_gb: float,
         scaling: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
@@ -1006,6 +1138,9 @@ class BuiltApp:
         self.proxy_pip = proxy_pip
         self.user_replica_framework_pip = user_replica_framework_pip
         self.replica_env_vars = replica_env_vars
+        # Never merged into a runtime_env. ``AppBuilder.submit`` hands these to
+        # the proxy actor, which is where replicas fetch them.
+        self.replica_secret_env_vars = replica_secret_env_vars
         self.proxy_memory_in_gb = proxy_memory_in_gb
         # Map of {user_deployment_class_name: {num_replicas, autoscaling_config}}.
         # An absent class gets no override, so it keeps what its own

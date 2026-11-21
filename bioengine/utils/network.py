@@ -191,9 +191,7 @@ def get_internal_ip() -> str:
         if private:
             # Prefer 10.x and 172.16-31.x over 192.168.x (compute clusters
             # typically use the larger private blocks).
-            private.sort(
-                key=lambda a: 0 if not a.startswith("192.168.") else 1
-            )
+            private.sort(key=lambda a: 0 if not a.startswith("192.168.") else 1)
             return private[0]
         return addresses[0]
 

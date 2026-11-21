@@ -11,10 +11,10 @@ subprocess gets the whole GPU.
 
 Autoscaling declares ``max_replicas=3``. The per-replica target it also declared
 was spelled with a field name Ray Serve removed, so the effective target has
-always been Serve's default of 2 (#0091) — at which a long training plus one
+always been Serve's default of 2 — at which a long training plus one
 concurrent inference asks for one replica, not two. This runtime has therefore
 never run training and inference on separate GPU replicas; whether to pin it to
-one replica or restore the eager target is open as #0097.
+one replica or restore the eager target is a separate open question.
 
 Import rule: heavy deps (``torch``, ``micro_sam``, ``segment_anything``) are
 imported inside method bodies so the ``@bioengine.app`` decorator module stays
@@ -53,8 +53,8 @@ _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
-# runtime_env install did not take fails instead of being advertised as ready
-# (#0371). Keep this list equal to what the bodies actually import: it is a
+# runtime_env install did not take fails instead of being advertised as ready.
+# Keep this list equal to what the bodies actually import: it is a
 # readiness gate, not a restatement of requirements-runtime.txt, and a module
 # nothing imports would fail a replica that can serve every call. ``numpy`` is
 # absent on purpose — it is imported at module scope above, so a replica missing
@@ -84,8 +84,8 @@ def _read_pip(name: str) -> List[str]:
         "initial_replicas": 1,
         "max_replicas": 3,
         # No target declared on purpose: the name this dict used is one Serve
-        # removed, so the effective target is Serve's default of 2 either way
-        # (#0091), and declaring 1.0 now is a behaviour change, not a fix (#0097).
+        # removed, so the effective target is Serve's default of 2 either way,
+        # and declaring 1.0 now is a behaviour change, not a fix.
         "metrics_interval_s": 2.0,
         "look_back_period_s": 10.0,
         "downscale_delay_s": 600,
@@ -105,7 +105,7 @@ class RuntimeApp:
         self.start_time = time.time()
         # Serialises ALL GPU work (serving + training) within a replica. The queue
         # it creates is what the autoscaler measures, but at the effective target
-        # of 2 (#0091) a single concurrent call waits here rather than adding a
+        # of 2 a single concurrent call waits here rather than adding a
         # replica; it takes three in flight to ask for a second one.
         self._gpu_lock = asyncio.Lock()
         self._predictor = None
@@ -128,7 +128,7 @@ class RuntimeApp:
     @bioengine.smoke_test
     async def _import_runtime_stack(self) -> None:
         """Import this backend's ML stack once, at startup, and fail the replica if
-        it is not there (#0371).
+        it is not there.
 
         A replica whose ``runtime_env`` install did not take answered the health
         probe correctly and was advertised as ready while **every** call raised
@@ -153,7 +153,7 @@ class RuntimeApp:
         **replaces** the condemned replica and the cycle repeats indefinitely,
         because its circuit breaker ``_terminally_failed()`` is gated on ``not
         _replica_has_started``, which any successful start clears. Measured on
-        ``#0387`` over 100 health-check periods — that probe ran at
+        a probe deployment over 100 health-check periods — that probe ran at
         ``health_check_period_s=1.0``, so ≈100 s in all, **not** 100 × the 30 s
         above: 105 calls, **0 failed**, 84 answered by a replica that already
         knew its own smoke test had failed, across 22 distinct replica pids.
@@ -265,11 +265,22 @@ class RuntimeApp:
         arch = "vit_" + model_type.split("_")[1]
         cache = Path.home() / ".bioengine" / "micro_sam_zoo_cache" / model_type
         base = f"{_ZOO_BASE_URL}/{nickname}/{version}/files"
-        enc = pooch.retrieve(f"{base}/{arch}.pt", known_hash=None, fname=f"{arch}.pt", path=cache)
-        dec = pooch.retrieve(f"{base}/{arch}_decoder.pt", known_hash=None, fname=f"{arch}_decoder.pt", path=cache)
+        enc = pooch.retrieve(
+            f"{base}/{arch}.pt", known_hash=None, fname=f"{arch}.pt", path=cache
+        )
+        dec = pooch.retrieve(
+            f"{base}/{arch}_decoder.pt",
+            known_hash=None,
+            fname=f"{arch}_decoder.pt",
+            path=cache,
+        )
         src = cache / "source.json"
         if not src.exists():
-            src.write_text(json.dumps({"id": nickname, "version": version, "model_type": model_type}))
+            src.write_text(
+                json.dumps(
+                    {"id": nickname, "version": version, "model_type": model_type}
+                )
+            )
         return enc, dec
 
     def _ensure_model(self, model_type: str, checkpoint: Optional[str] = None):
@@ -285,7 +296,9 @@ class RuntimeApp:
         key = (model_type, checkpoint)
         if key != self._loaded_key:
             self._release_model()
-            label = f"{model_type}" + (f" (finetuned: {checkpoint})" if checkpoint else "")
+            label = f"{model_type}" + (
+                f" (finetuned: {checkpoint})" if checkpoint else ""
+            )
             logger.info(f"🔄 Loading μSAM model '{label}' on {device}...")
             if checkpoint is None and model_type in ZOO_MODELS:
                 # get_predictor_and_segmenter has no decoder_path, so pre-load the
@@ -294,11 +307,16 @@ class RuntimeApp:
 
                 enc, dec = self._zoo_weights(model_type)
                 predictor, state = get_sam_model(
-                    model_type=model_type, checkpoint_path=enc, decoder_path=dec,
-                    device=device, return_state=True,
+                    model_type=model_type,
+                    checkpoint_path=enc,
+                    decoder_path=dec,
+                    device=device,
+                    return_state=True,
                 )
                 predictor, segmenter = get_predictor_and_segmenter(
-                    model_type=model_type, predictor=predictor, state=state,
+                    model_type=model_type,
+                    predictor=predictor,
+                    state=state,
                     segmentation_mode=None,
                 )
             else:
@@ -337,8 +355,12 @@ class RuntimeApp:
         predictor, segmenter = self._ensure_model(model_type, checkpoint)
         image = self._to_image_format(image)
         labels = automatic_instance_segmentation(
-            predictor=predictor, segmenter=segmenter, input_path=image,
-            ndim=2, verbose=False, **generate_kwargs,
+            predictor=predictor,
+            segmenter=segmenter,
+            input_path=image,
+            ndim=2,
+            verbose=False,
+            **generate_kwargs,
         )
         return np.asarray(labels).astype(np.int32)
 
@@ -362,8 +384,15 @@ class RuntimeApp:
             "mask_threshold": float(sam.mask_threshold),
         }
 
-    def _auto_segment_from_embedding(self, model_type, features, input_size, original_size,
-                                     generate_kwargs, checkpoint):
+    def _auto_segment_from_embedding(
+        self,
+        model_type,
+        features,
+        input_size,
+        original_size,
+        generate_kwargs,
+        checkpoint,
+    ):
         """Run the AIS decoder on a **precomputed** SAM embedding (no encoder pass).
         Blocking — call under the GPU lock. For the AIS generalist models; matches
         the image path, where ``generate`` returns the instance-label array directly.
@@ -399,17 +428,27 @@ class RuntimeApp:
             sam.to("cpu")
             try:
                 onnx_model = SamOnnxModel(
-                    model=sam, return_single_mask=True,
-                    use_stability_score=False, return_extra_metrics=False,
+                    model=sam,
+                    return_single_mask=True,
+                    use_stability_score=False,
+                    return_extra_metrics=False,
                 )
                 embed_dim = sam.prompt_encoder.embed_dim
                 embed_size = sam.prompt_encoder.image_embedding_size
                 mask_input_size = [4 * x for x in embed_size]
                 dummy_inputs = {
-                    "image_embeddings": torch.randn(1, embed_dim, *embed_size, dtype=torch.float),
-                    "point_coords": torch.randint(low=0, high=1024, size=(1, 5, 2), dtype=torch.float),
-                    "point_labels": torch.randint(low=0, high=4, size=(1, 5), dtype=torch.float),
-                    "mask_input": torch.randn(1, 1, *mask_input_size, dtype=torch.float),
+                    "image_embeddings": torch.randn(
+                        1, embed_dim, *embed_size, dtype=torch.float
+                    ),
+                    "point_coords": torch.randint(
+                        low=0, high=1024, size=(1, 5, 2), dtype=torch.float
+                    ),
+                    "point_labels": torch.randint(
+                        low=0, high=4, size=(1, 5), dtype=torch.float
+                    ),
+                    "mask_input": torch.randn(
+                        1, 1, *mask_input_size, dtype=torch.float
+                    ),
                     "has_mask_input": torch.tensor([1], dtype=torch.float),
                     "orig_im_size": torch.tensor([1024, 1024], dtype=torch.float),
                 }
@@ -421,19 +460,29 @@ class RuntimeApp:
                     warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
                     warnings.filterwarnings("ignore", category=UserWarning)
                     torch.onnx.export(
-                        onnx_model, tuple(dummy_inputs.values()), str(onnx_path),
-                        export_params=True, verbose=False, opset_version=17,
-                        do_constant_folding=True, input_names=list(dummy_inputs.keys()),
+                        onnx_model,
+                        tuple(dummy_inputs.values()),
+                        str(onnx_path),
+                        export_params=True,
+                        verbose=False,
+                        opset_version=17,
+                        do_constant_folding=True,
+                        input_names=list(dummy_inputs.keys()),
                         output_names=["masks", "iou_predictions", "low_res_masks"],
                         dynamic_axes=dynamic_axes,
                     )
                 ort_inputs = {k: v.cpu().numpy() for k, v in dummy_inputs.items()}
-                InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"]).run(None, ort_inputs)
+                InferenceSession(
+                    str(onnx_path), providers=["CPUExecutionProvider"]
+                ).run(None, ort_inputs)
                 if quantize:
                     q_path = onnx_path.with_stem(onnx_path.stem + "_quantized")
                     quantize_dynamic(
-                        model_input=str(onnx_path), model_output=str(q_path),
-                        per_channel=False, reduce_range=False, weight_type=QuantType.QUInt8,
+                        model_input=str(onnx_path),
+                        model_output=str(q_path),
+                        per_channel=False,
+                        reduce_range=False,
+                        weight_type=QuantType.QUInt8,
                     )
                     onnx_path = q_path
                 return onnx_path.read_bytes()
@@ -443,7 +492,9 @@ class RuntimeApp:
     # === composition endpoints (called by EntryApp via the runtime handle) ===
 
     async def auto_segment(
-        self, images: List[np.ndarray], model_type: str = "vit_l_lm",
+        self,
+        images: List[np.ndarray],
+        model_type: str = "vit_l_lm",
         generate_kwargs: Optional[Dict[str, Any]] = None,
         checkpoint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
@@ -459,8 +510,11 @@ class RuntimeApp:
         return results
 
     async def auto_segment_from_embedding(
-        self, embeddings: List[Dict[str, Any]], model_type: str = "vit_l_lm",
-        generate_kwargs: Optional[Dict[str, Any]] = None, checkpoint: Optional[str] = None,
+        self,
+        embeddings: List[Dict[str, Any]],
+        model_type: str = "vit_l_lm",
+        generate_kwargs: Optional[Dict[str, Any]] = None,
+        checkpoint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """AIS masks for a batch of precomputed embeddings (each a dict with
         ``features``/``input_size``/``original_size``) → wire-dict list.
@@ -470,15 +524,21 @@ class RuntimeApp:
         async with self._gpu_lock:
             for emb in embeddings:
                 labels = await asyncio.to_thread(
-                    self._auto_segment_from_embedding, model_type,
-                    emb["features"], emb["input_size"], emb["original_size"],
-                    generate_kwargs, checkpoint,
+                    self._auto_segment_from_embedding,
+                    model_type,
+                    emb["features"],
+                    emb["input_size"],
+                    emb["original_size"],
+                    generate_kwargs,
+                    checkpoint,
                 )
                 results.append({"output": self._nd(labels)})
         return results
 
     async def encode(
-        self, image: np.ndarray, model_type: str = "vit_l_lm",
+        self,
+        image: np.ndarray,
+        model_type: str = "vit_l_lm",
         checkpoint: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Encoder embedding. ``features`` comes back as a wire-dict (the entry
@@ -487,26 +547,33 @@ class RuntimeApp:
         running AIS on it later via ``infer(embeddings=...)``.
         """
         async with self._gpu_lock:
-            payload = await asyncio.to_thread(self._encode, model_type, image, checkpoint)
+            payload = await asyncio.to_thread(
+                self._encode, model_type, image, checkpoint
+            )
         payload["features"] = self._nd(payload["features"])
         return payload
 
     async def export_onnx(
-        self, model_type: str = "vit_l_lm", quantize: bool = True,
+        self,
+        model_type: str = "vit_l_lm",
+        quantize: bool = True,
     ) -> bytes:
         cache_key = f"{model_type}:{quantize}"
         if cache_key in self._onnx_cache:
             return self._onnx_cache[cache_key]
         logger.info(f"📦 Exporting ONNX prompt decoder for '{model_type}'...")
         async with self._gpu_lock:
-            onnx_bytes = await asyncio.to_thread(self._export_onnx, model_type, quantize)
+            onnx_bytes = await asyncio.to_thread(
+                self._export_onnx, model_type, quantize
+            )
         self._onnx_cache[cache_key] = onnx_bytes
         return onnx_bytes
 
     def _subprocess_env(self) -> Dict[str, str]:
         """Inherit the replica env (incl. Ray's CUDA_VISIBLE_DEVICES) minus secrets."""
         return {
-            k: v for k, v in os.environ.items()
+            k: v
+            for k, v in os.environ.items()
             if "TOKEN" not in k.upper() and "SECRET" not in k.upper()
         }
 
@@ -515,8 +582,10 @@ class RuntimeApp:
 
         worker = str(Path(__file__).parent / "train_worker.py")
         return training.run_cancellable_subprocess(
-            [sys.executable, worker, session_id], session_id,
-            cwd=str(Path(__file__).parent), env=self._subprocess_env(),
+            [sys.executable, worker, session_id],
+            session_id,
+            cwd=str(Path(__file__).parent),
+            env=self._subprocess_env(),
         )
 
     def _run_export_subprocess(self, session_id: str, export_dir: str):
@@ -526,10 +595,14 @@ class RuntimeApp:
         return subprocess.run(
             [sys.executable, worker, session_id, export_dir],
             cwd=str(Path(__file__).parent),
-            capture_output=True, text=True, env=env,
+            capture_output=True,
+            text=True,
+            env=env,
         )
 
-    async def export_bioimageio(self, session_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    async def export_bioimageio(
+        self, session_id: str, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Build a standard combined SAM+decoder BioImage.IO package (interactive
         prompt head + AIS decoder in one checkpoint) from a trained session in a
         CPU subprocess (no GPU lock), via ``micro_sam.bioimageio.export_sam_model``.
@@ -545,7 +618,9 @@ class RuntimeApp:
         export_dir.mkdir(parents=True, exist_ok=True)
         (export_dir / "request.json").write_text(json.dumps(request))
 
-        proc = await asyncio.to_thread(self._run_export_subprocess, session_id, str(export_dir))
+        proc = await asyncio.to_thread(
+            self._run_export_subprocess, session_id, str(export_dir)
+        )
         res_path = export_dir / "export_result.json"
         if proc.returncode != 0 or not res_path.exists():
             raise RuntimeError(
@@ -553,37 +628,49 @@ class RuntimeApp:
             )
         return json.loads(res_path.read_text())
 
-    async def train(self, session_id: str, model_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def train(
+        self, session_id: str, model_type: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Fine-tune in a subprocess under the shared GPU lock (long-running).
 
         Evicts the resident inference model first so the subprocess owns the GPU;
         the subprocess (``train_worker.py``) writes COMPLETED/FAILED to the
         session status. Held for the run's duration, so concurrent inference
-        queues behind it on this replica — at the effective target of 2 (#0091) a
-        training plus one inference asks for one replica, not two (#0097).
+        queues behind it on this replica — at the effective target of 2 a
+        training plus one inference asks for one replica, not two.
         """
         import training
 
         async with self._gpu_lock:
             await asyncio.to_thread(self._release_model)
             training.write_status(
-                session_id, status="TRAINING", start_time=time.time(),
-                n_epochs=params.get("n_epochs"), device=self._device(),
+                session_id,
+                status="TRAINING",
+                start_time=time.time(),
+                n_epochs=params.get("n_epochs"),
+                device=self._device(),
             )
-            rc, tail, stopped = await asyncio.to_thread(self._run_train_subprocess, session_id)
+            rc, tail, stopped = await asyncio.to_thread(
+                self._run_train_subprocess, session_id
+            )
 
         if stopped:
             training.write_status(
-                session_id, status="STOPPED", message="stopped by user",
-                end_time=time.time(), terminated_by="user_stop",
+                session_id,
+                status="STOPPED",
+                message="stopped by user",
+                end_time=time.time(),
+                terminated_by="user_stop",
             )
         else:
             # Fallback: if the child died without writing a terminal status, record it.
             st = training.read_status(session_id)
             if st.get("status") not in ("COMPLETED", "FAILED", "STOPPED"):
                 training.write_status(
-                    session_id, status="FAILED",
+                    session_id,
+                    status="FAILED",
                     message=f"training subprocess exited rc={rc}: {tail}",
-                    end_time=time.time(), terminated_by="supervisor",
+                    end_time=time.time(),
+                    terminated_by="supervisor",
                 )
         return {"session_id": session_id, "returncode": rc}

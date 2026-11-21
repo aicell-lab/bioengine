@@ -27,6 +27,13 @@ from ray.util.state.common import (
 from ray.util.state.exception import RayStateApiException
 
 logger = logging.getLogger("ray")
+
+#: How many DEAD actors one death-cause query may return. The query is filtered
+#: to dead actors and the result is intersected with this deployment's own
+#: replicas, so this is a safety bound on the response size rather than a tuning
+#: knob: 94 dead replicas were measured on a single live worker, so the ceiling
+#: is set well above the largest number actually seen.
+_DEAD_ACTOR_QUERY_LIMIT = 10_000
 date_format = "%Y-%m-%d %H:%M:%S %Z"
 
 
@@ -90,10 +97,12 @@ def _touch_on_call(method: Callable) -> Callable:
     wrapped — they are reached only via calls that already touched the
     timer at the public-method boundary.
     """
+
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         self._last_called_at = time.time()
         return method(self, *args, **kwargs)
+
     return wrapper
 
 
@@ -221,7 +230,19 @@ class BioEngineProxyActor:
         #                      "ttl_seconds": float}}
         self._pending_tokens: Dict[str, Dict[str, Any]] = {}
 
-        self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
+        # Deploy-time secret env vars, held here so they never have to travel
+        # in a replica's runtime_env — Ray writes a runtime_env verbatim into
+        # every node's runtime_env_agent.log, which outlives the replica.
+        # Unlike _pending_tokens this is read without consuming, because every
+        # replica of the app needs it and a restarting replica needs it again;
+        # get_app_secret_env_vars is the only reader and no status getter
+        # touches it.
+        # Structure: {app_id: {"HYPHA_TOKEN": str, ...}}
+        self._app_secret_env_vars: Dict[str, Dict[str, str]] = {}
+
+        self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = (
+            None
+        )
 
         # Last successful per-node GPU read (memory and device names) from the
         # Ray dashboard. The dashboard sits behind a KubeRay auth proxy where a
@@ -821,18 +842,14 @@ class BioEngineProxyActor:
             from ray import serve
 
             client = serve.context._get_global_client()
-            details = ray.get(
-                client._controller.get_serve_instance_details.remote()
-            )
+            details = ray.get(client._controller.get_serve_instance_details.remote())
             if hasattr(details, "model_dump"):
                 return details.model_dump()
             if isinstance(details, dict):
                 return details
             return {}
         except Exception as e:
-            logger.error(
-                f"Failed to fetch Serve instance details: {e}", exc_info=True
-            )
+            logger.error(f"Failed to fetch Serve instance details: {e}", exc_info=True)
             return {}
 
     @_touch_on_call
@@ -935,6 +952,7 @@ class BioEngineProxyActor:
         self.service_registrations.pop(application_id, None)
         # An undeployed app has nobody left to collect its token.
         self._pending_tokens.pop(application_id, None)
+        self._app_secret_env_vars.pop(application_id, None)
         logger.info(
             f"Cleared all registered replicas for application '{application_id}'."
         )
@@ -1104,6 +1122,41 @@ class BioEngineProxyActor:
         return self._pending_tokens.pop(application_id, None)
 
     @_touch_on_call
+    def set_app_secret_env_vars(
+        self, application_id: str, secret_env_vars: Dict[str, str]
+    ) -> None:
+        """Hold an app's deploy-time secrets for its replicas to fetch at startup.
+
+        The worker calls this instead of putting them in the replicas'
+        ``runtime_env``: Ray's runtime_env_agent writes every runtime_env it
+        materialises into a plaintext log on each node, so a credential
+        delivered that way is readable by anything that can read the log and
+        outlives the replica that used it.
+
+        Overwrites, so a redeploy's secrets replace the previous ones; the
+        replicas holding the old values are being replaced along with them.
+        """
+        self._app_secret_env_vars[application_id] = dict(secret_env_vars)
+        # Names only. These logs are readable through get_app_status.
+        logger.info(
+            f"Stored {len(secret_env_vars)} secret env var(s) for application "
+            f"'{application_id}', awaiting collection by its replicas: "
+            f"{sorted(secret_env_vars)}."
+        )
+
+    @_touch_on_call
+    def get_app_secret_env_vars(self, application_id: str) -> Dict[str, str]:
+        """Hand an app's secrets to one of its starting replicas.
+
+        Read without consuming, unlike ``take_pending_token``: every replica
+        of the app needs these at ``__init__``, and one that restarts needs
+        them again. An empty dict means the worker deployed the app without
+        secrets — the caller decides whether that is a failure, since only it
+        knows what it was told to expect.
+        """
+        return dict(self._app_secret_env_vars.get(application_id) or {})
+
+    @_touch_on_call
     def get_replica_identities(
         self, application_id: str
     ) -> Dict[str, Dict[str, Dict[str, Optional[str]]]]:
@@ -1145,7 +1198,81 @@ class BioEngineProxyActor:
 
         if not actors:
             return None
-        death_cause = getattr(actors[0], "death_cause", None)
+        return self._parse_death_cause(getattr(actors[0], "death_cause", None))
+
+    def _get_actor_death_causes(
+        self, actor_ids: List[str]
+    ) -> Dict[str, Optional[Dict[str, str]]]:
+        """Death causes for MANY actors in ONE GCS call.
+
+        This exists because picking a single dead replica is not a thing that
+        can be done correctly. Ray's ``ActorState`` carries **no death
+        timestamp** — measured against ray 2.55, the dataclass has no
+        end-time field at all — so "the most recently dead replica" is not
+        derivable from this data source, and the registration order that was
+        used instead let a deliberate scale-down mask a crash that happened
+        first.
+
+        Fetching every dead actor in one call removes the choice without the
+        per-replica cost that motivated making one: the expense was one GCS
+        lookup PER dead replica (94 dead replicas measured on one live
+        worker), and this is a single query however many there are.
+        """
+        wanted = set(actor_ids)
+        if not wanted:
+            return {}
+        all_causes = self._all_dead_actor_causes()
+        if all_causes is None:
+            return None
+        return {aid: cause for aid, cause in all_causes.items() if aid in wanted}
+
+    @_touch_on_call
+    def get_all_death_causes(self) -> Optional[Dict[str, Optional[Dict[str, str]]]]:
+        """Every dead actor's cause, in ONE cluster-wide query. None if the query failed.
+
+        Public so ``AppsManager`` can fetch it once per ``get_app_status`` and hand the
+        same map to every deployment. The query does not take a deployment filter -- it
+        lists all DEAD actors regardless -- so calling it per deployment did identical
+        work N times for an application with N deployments.
+        """
+        return self._all_dead_actor_causes()
+
+    def _all_dead_actor_causes(self) -> Optional[Dict[str, Optional[Dict[str, str]]]]:
+        """The raw cluster-wide query. None on failure, never an empty dict for it."""
+        try:
+            actors = self.state_api_client.list(
+                resource=StateResource.ACTORS,
+                options=ListApiOptions(
+                    limit=_DEAD_ACTOR_QUERY_LIMIT,
+                    timeout=DEFAULT_RPC_TIMEOUT,
+                    filters=[("state", "=", "DEAD")],
+                    detail=True,
+                    explain=False,
+                ),
+                raise_on_missing_output=False,
+            )
+        except Exception as e:
+            # None, not {}. An empty dict is indistinguishable from "the query ran and
+            # none of these actors has a recorded cause", and the caller turns that into
+            # one unexplained-death entry PER dead replica -- so a single failed lookup
+            # would invent N incidents out of nothing. The caller must be able to tell
+            # "we do not know" from "nothing died unexpectedly".
+            logger.warning(f"Failed to fetch death causes: {e}")
+            return None
+        causes = {}
+        for actor in actors or []:
+            actor_id = getattr(actor, "actor_id", None)
+            if actor_id is not None:
+                causes[actor_id] = self._parse_death_cause(
+                    getattr(actor, "death_cause", None)
+                )
+        return causes
+
+    @staticmethod
+    def _parse_death_cause(
+        death_cause: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        """Ray's nested death-cause payload, flattened to reason + message."""
         if not death_cause:
             return None
 
@@ -1248,6 +1375,8 @@ class BioEngineProxyActor:
         deployment_name: str,
         n_previous_replica: int = 0,
         tail: int = 30,
+        death_causes: Optional[Dict[str, Optional[Dict[str, str]]]] = None,
+        death_cause_query_failed: bool = False,
     ) -> Dict[str, Dict[str, List[str]]]:
         """
         Get logs for all replicas of a Ray Serve deployment.
@@ -1260,11 +1389,29 @@ class BioEngineProxyActor:
             application_id: Name of the Ray Serve application.
             deployment_name: Name of the deployment within the application.
             n_previous_replica: Number of most recent dead replicas to include.
-                               Set to 0 to only get logs from active replicas.
+                               Set to 0 to omit replica LOGS; the death cause of
+                               every abnormally-dead replica is still reported,
+                               and deliberate stops are returned as a count under
+                               ``_deliberately_stopped_replicas``.
                                Set to -1 to get logs from all dead replicas.
                                Default is 0.
             tail: Number of lines to retrieve from the end of each log.
                   Use -1 to get the entire log. Default is 30.
+            death_causes: A pre-fetched actor-id -> cause map, or None to fetch one.
+                  The underlying query is CLUSTER-WIDE -- it lists every dead actor
+                  whatever deployment it belonged to -- so running it once per
+                  deployment repeats identical work for each one of an application's
+                  deployments. ``AppsManager`` fetches it ONCE per ``get_app_status``
+                  and passes it to every deployment. ``None`` here means "no map was
+                  supplied", which is not the same as the map being EMPTY: an empty
+                  map is a successful query that matched nothing, while a failed
+                  query also yields None from ``_get_actor_death_causes`` and makes
+                  this method report no deaths at all rather than invent unexplained
+                  ones.
+            death_cause_query_failed: set by the caller when the HOISTED query failed.
+                  ``death_causes=None`` cannot express that on its own -- it already means
+                  "no map supplied" -- and treating the two alike made a failed hoist
+                  re-query once per deployment.
 
         Returns:
             Dictionary mapping replica IDs to their log dictionaries:
@@ -1278,6 +1425,20 @@ class BioEngineProxyActor:
             Error messages are included in stderr if log retrieval fails.
             Dead replicas additionally carry ``death_cause``
             (``{"reason", "message"}``, or None if Ray no longer holds one).
+            At the default ``n_previous_replica=0`` EVERY abnormally-dead replica is
+            reported -- not one chosen replica -- each with empty log lists and
+            ``logs_omitted: True``, so a caller using defaults learns that something
+            died and why without paying for its logs. Replicas that were stopped
+            DELIBERATELY (scale-down, redeploy) are not listed individually; they are
+            returned as a count under ``_deliberately_stopped_replicas``.
+
+            That count is the one key in this mapping whose value is NOT a replica
+            dict. ``AppsManager`` LIFTS it into a sibling ``deliberately_stopped_replicas``
+            field on the deployment before any consumer sees it -- rebuilding this
+            mapping rather than mutating the one returned here -- because every consumer
+            iterates it as replica-id -> stream-dict and an int in it raises
+            ``AttributeError``. A caller invoking this method DIRECTLY gets the raw
+            shape and must skip the key itself.
         """
         logs = {}
 
@@ -1314,9 +1475,6 @@ class BioEngineProxyActor:
                     "stderr": [f"Error retrieving logs: {str(e)}"],
                 }
 
-        if n_previous_replica == 0:
-            return logs
-
         # Logs of previously registered replicas
         registered_replicas = self.application_replicas.get(application_id, {}).get(
             deployment_name, {}
@@ -1326,6 +1484,78 @@ class BioEngineProxyActor:
             for replica_id in registered_replicas.keys()
             if replica_id not in active_replicas
         ]
+
+        if n_previous_replica == 0:
+            # Report THAT a replica died and why, without its logs.
+            #
+            # The default used to return here outright, so a caller using default
+            # arguments saw no dead replica and no death_cause and concluded nothing
+            # had died — the same wrong-layer diagnosis this field exists to prevent,
+            # one level up.
+            #
+            # EVERY abnormal death is reported, not one chosen replica.
+            #
+            # This used to describe only `dead_replica_ids[-1]`, to hold the cost
+            # to a single GCS lookup. That is registration order, not death
+            # order, and review measured what it costs: A registers and later
+            # dies of OOM, B is added by autoscaling and then deliberately
+            # scaled down, and the default reports B's RAY_KILL while A's OOM
+            # never appears. The operator reads "deliberate stop" and concludes
+            # nothing crashed — the wrong-layer diagnosis this field exists to
+            # prevent, reintroduced one level up.
+            #
+            # Ordering cannot be repaired: ray's ActorState carries no death
+            # timestamp, so "most recent" is not knowable here. So the choice is
+            # removed instead, and the cost objection is answered by fetching
+            # every dead actor in ONE query rather than one per replica.
+            #
+            # A deliberate RAY_KILL is still summarised rather than listed: it is
+            # the routine case, it is what floods a long-lived deployment, and
+            # it is never the thing an operator is hunting. A crash is never
+            # dropped to make room for one.
+            #
+            # No log lines are fetched, which is the expensive half: asking "did
+            # something die, and why" is one query, and asking "show me its
+            # output" stays behind n_previous_replica > 0.
+            if dead_replica_ids:
+                actor_ids = {
+                    replica_id: registered_replicas[replica_id][0]
+                    for replica_id in dead_replica_ids
+                }
+                if death_cause_query_failed:
+                    # The HOISTED query already failed. `death_causes=None` cannot carry that:
+                    # it is overloaded with "no map was supplied", so falling through here
+                    # re-ran the cluster-wide query ONCE PER DEPLOYMENT -- five lookups for one
+                    # get_app_status, each able to block for the full RPC timeout, in exactly
+                    # the case where the query is slow. A separate flag is the whole fix.
+                    return logs
+                causes = (
+                    death_causes
+                    if death_causes is not None
+                    else self._get_actor_death_causes(list(actor_ids.values()))
+                )
+                if causes is None:
+                    # The lookup FAILED. Reporting every dead replica as an unexplained
+                    # death would turn one failed GCS call into N fabricated incidents,
+                    # and an operator cannot tell those from real ones. Say nothing about
+                    # deaths rather than saying something false; the warning is already
+                    # in the worker log.
+                    return logs
+                deliberate = 0
+                for replica_id, actor_id in actor_ids.items():
+                    cause = causes.get(actor_id)
+                    if cause and cause.get("reason") == "RAY_KILL":
+                        deliberate += 1
+                        continue
+                    logs[replica_id] = {
+                        "stdout": [],
+                        "stderr": [],
+                        "death_cause": cause,
+                        "logs_omitted": True,
+                    }
+                if deliberate:
+                    logs["_deliberately_stopped_replicas"] = deliberate
+            return logs
         # Add logs of the n most recent dead replicas (or all if n_previous_replica is -1)
         dead_replicas_to_fetch = (
             dead_replica_ids[::-1]

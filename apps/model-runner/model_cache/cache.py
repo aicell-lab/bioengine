@@ -19,7 +19,6 @@ Everything else on the class is private orchestration the entry code
 doesn't talk to directly.
 """
 
-
 import asyncio
 import json
 import logging

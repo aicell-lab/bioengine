@@ -1,4 +1,4 @@
-"""``deploy_app`` must actually CALL the scaling validator (#0212).
+"""``deploy_app`` must actually CALL the scaling validator.
 
 ``_validate_scaling_map`` is thoroughly unit-tested — ``tests/test_scaling_validation.py``
 names it eleven times — but those cases import the helper directly, and none of them drives
@@ -50,7 +50,9 @@ def _make_manager(class_names=("Entry", "Runtime")) -> AppsManager:
     manager.admin_users = [USER_EMAIL]
 
     manager._check_initialized = lambda: None
-    manager._get_full_artifact_id = lambda aid: aid if "/" in aid else f"bioimage-io/{aid}"
+    manager._get_full_artifact_id = lambda aid: (
+        aid if "/" in aid else f"bioimage-io/{aid}"
+    )
 
     server = MagicMock()
     server.config.workspace = "bioimage-io"
@@ -64,9 +66,7 @@ def _make_manager(class_names=("Entry", "Runtime")) -> AppsManager:
     # so the names here are the whole input to the decision under test.
     app = SimpleNamespace(
         spec={
-            "classes": {
-                name: {"qualname": f"module.{name}"} for name in class_names
-            }
+            "classes": {name: {"qualname": f"module.{name}"} for name in class_names}
         },
         metadata={
             "version": "1.0.0",
@@ -108,9 +108,9 @@ async def test_an_unknown_deployment_name_is_refused_by_deploy_app():
         await _deploy(manager, {"NoSuchClass": {"num_replicas": 1}})
 
     message = str(caught.value)
-    assert PAST_THE_VALIDATOR not in message, (
-        "the deploy got past the scaling validator — the call site is missing"
-    )
+    assert (
+        PAST_THE_VALIDATOR not in message
+    ), "the deploy got past the scaling validator — the call site is missing"
     assert "NoSuchClass" in message, message
 
 
@@ -124,9 +124,9 @@ async def test_a_zero_replica_entry_is_refused_by_deploy_app():
         await _deploy(manager, {"Entry": {"num_replicas": 0}})
 
     message = str(caught.value)
-    assert PAST_THE_VALIDATOR not in message, (
-        "the deploy got past the scaling validator — the call site is missing"
-    )
+    assert (
+        PAST_THE_VALIDATOR not in message
+    ), "the deploy got past the scaling validator — the call site is missing"
     assert "Entry" in message, message
 
 

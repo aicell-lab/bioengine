@@ -9,7 +9,10 @@ on:
   pull_request:
     branches:
       - main
-    types: [opened, synchronize, reopened, ready_for_review]
+    # converted_to_draft is here for the draft-bump job below: a PR taken BACK
+    # to draft while carrying a bump is the rung-hoarding case this row is about,
+    # and without this event nothing re-evaluates it.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 jobs:
   check-version:
@@ -19,13 +22,13 @@ jobs:
     steps:
     - name: Checkout code (pull_request)
       if: github.event_name == 'pull_request'
-      uses: actions/checkout@v3
+      uses: actions/checkout@v5
       with:
         fetch-depth: 0  # Fetch full history for accurate origin/main reference
 
     - name: Checkout code (workflow_dispatch)
       if: github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v3
+      uses: actions/checkout@v5
       with:
         ref: ${{ inputs.pr_branch }}
         fetch-depth: 0  # Fetch full history for accurate origin/main reference
@@ -179,4 +182,66 @@ jobs:
       if: env.RELEVANT_CHANGE == 'false'
       run: echo "✅ No relevant files changed. Skipping version check."
 
+  # ---------------------------------------------------------------------------
+  # ADVISORY, and deliberately NOT a required check.
+  #
+  # The rule is bump LAST: a draft that already carries a version bump has
+  # reserved a rung nobody else can use, so every other open PR conflicts the
+  # moment one of them merges. check-version above cannot see this at all --
+  # it skips drafts by design, which is why the reservation was invisible.
+  #
+  # Why advisory rather than required, which is a real trade-off and not
+  # timidity: bump-last means the bump commit IS the commit that gets readied
+  # and merged. A required job failing on that commit while it was still a
+  # draft would leave a red run on the merge head and block the very sequence
+  # the rule prescribes. Making this required would need a settings change as
+  # well, which the decision on this row explicitly excludes.
+  #
+  # So this exists to make a reserved rung LOUD while the PR is still a draft,
+  # at the one moment when moving it is free.
+  #
+  # It flags a rung that has SAT and that is ABOVE main, not one that merely exists.
+  # Two limitations are stated in the script's header rather than implied here: the
+  # age is the bump commit's committer time, which a rebase resets, so a draft kept
+  # current by rebasing is not caught; and this only judges when a pull_request event
+  # fires, so a draft that bumps and then sits is judged once, at age ~0.
+  #
+  # The logic and its paired demonstration are .github/scripts/check_draft_bump.sh
+  # and test_check_draft_bump.sh.
+  # ---------------------------------------------------------------------------
+  draft-bump-check:
+    # No draft filter here ON PURPOSE. An `if:` that skips reports completed/skipped
+    # on the head that merges -- green-looking, ran nothing -- and that head is
+    # exactly where ready_for_review and a synchronize-while-not-draft land. The
+    # draft/non-draft decision is made by the script, which says which branch it took.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
 
+    - name: Flag a version rung that has SAT on this draft
+      # Through env rather than interpolated into the script: a branch name is
+      # attacker-shaped input even when only writers can trigger the dispatch.
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BRANCH: ${{ github.event.inputs.pr_branch }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_IS_DRAFT: ${{ github.event.pull_request.draft }}
+      run: |
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # Demonstration path: grade an arbitrary branch against main as if it were a
+          # draft, so the check can be SEEN to go red without waiting for a real one.
+          git fetch --quiet origin "$PR_BRANCH" main
+          .github/scripts/check_draft_bump.sh \
+            "$(git rev-parse origin/main)" \
+            "$(git rev-parse FETCH_HEAD)" \
+            true
+        else
+          .github/scripts/check_draft_bump.sh \
+            "$PR_BASE_SHA" \
+            "$PR_HEAD_SHA" \
+            "$PR_IS_DRAFT"
+        fi

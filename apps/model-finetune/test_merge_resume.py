@@ -1,4 +1,4 @@
-"""Tests for aggregate()'s resume journal — the clause-2 half of #0068.
+"""Tests for aggregate()'s resume journal.
 
 A merge is ``2 * len(batch) + 3`` scoring passes and each pass is minutes of
 exclusive GPU. The run that prompted this was killed at pass 11 of 35 and returned
@@ -29,12 +29,15 @@ DIAM = 30.0
 
 # ── the key: a soup is a SET of members ──────────────────────────────────────
 
+
 def test_score_key_is_order_independent():
     """A soup is a uniform mean, so [a, b] and [b, a] are the same checkpoint and
     must not be paid for twice. This is also what lets the greedy admission pass
     reuse the ordering pass's score for whichever candidate it takes first."""
     gate = pool.split_identity(GATE)
-    assert pool.score_key(gate, ["a.pt", "b.pt"]) == pool.score_key(gate, ["b.pt", "a.pt"])
+    assert pool.score_key(gate, ["a.pt", "b.pt"]) == pool.score_key(
+        gate, ["b.pt", "a.pt"]
+    )
 
 
 def test_score_key_separates_different_member_sets():
@@ -55,21 +58,26 @@ def test_score_key_separates_the_two_splits():
     """Selection reads split A and the reported curve is split B. A key that did
     not separate them would serve a gate score as a witness score — the exact
     circularity the two-split design exists to prevent."""
-    assert pool.score_key(pool.split_identity(GATE), ["a.pt"]) != \
-        pool.score_key(pool.split_identity(WITNESS), ["a.pt"])
+    assert pool.score_key(pool.split_identity(GATE), ["a.pt"]) != pool.score_key(
+        pool.split_identity(WITNESS), ["a.pt"]
+    )
 
 
 # ── invalidation: a score is only true for the inputs it was measured with ───
 
-@pytest.mark.parametrize("field,value", [
-    ("schema_version", "0.0.1-other"),
-    ("gate_split", "bioimage-io/splits@" + "c" * 64),
-    ("witness_split", "bioimage-io/splits@" + "d" * 64),
-    ("diam_mean", 17.0),
-])
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("schema_version", "0.0.1-other"),
+        ("gate_split", "bioimage-io/splits@" + "c" * 64),
+        ("witness_split", "bioimage-io/splits@" + "d" * 64),
+        ("diam_mean", 17.0),
+    ],
+)
 def test_each_stamp_invalidates_the_journal(field, value):
     saved = pool.new_merge_journal(GATE, WITNESS, DIAM)
-    pool.record_score(saved, "k", 0.5)
+    pool.record_score(saved, "k", 0.5, per_image=[0.4, 0.6])
     saved[field] = value
 
     fresh = pool.usable_merge_journal(saved, GATE, WITNESS, DIAM)
@@ -80,7 +88,7 @@ def test_matching_stamps_keep_the_journal():
     """Positive control for the four above: if nothing kept a journal, they would
     all pass for a function that always returned empty."""
     saved = pool.new_merge_journal(GATE, WITNESS, DIAM)
-    pool.record_score(saved, "k", 0.5)
+    pool.record_score(saved, "k", 0.5, per_image=[0.4, 0.6])
 
     kept = pool.usable_merge_journal(saved, GATE, WITNESS, DIAM)
     assert kept["scores"] == {"k": 0.5}
@@ -95,12 +103,13 @@ def test_unusable_journals_degrade_to_empty(junk):
 def test_record_score_evicts_oldest_first_at_the_cap():
     journal = pool.new_merge_journal(GATE, WITNESS, DIAM)
     for i in range(10):
-        pool.record_score(journal, f"k{i}", i / 10, cap=4)
+        pool.record_score(journal, f"k{i}", i / 10, per_image=[i / 10], cap=4)
 
     assert list(journal["scores"]) == ["k6", "k7", "k8", "k9"]
 
 
-# ── the behaviour the clause is about ────────────────────────────────────────
+# ── the behaviour under test ────────────────────────────────────────
+
 
 def _merge(members, journal, killed_at=None):
     """Replay aggregate()'s scoring sequence against a journal.
@@ -123,7 +132,9 @@ def _merge(members, journal, killed_at=None):
         # A real score; deterministic here so resume and restart are comparable.
         value = round(0.5 + len(paths) / 100, 6)
         paid.append(key)
-        pool.record_score(journal, key, value)
+        # The vector a real pass would carry: two images whose mean IS the scalar,
+        # so the journal's own pairing check is exercised on every replayed pass.
+        pool.record_score(journal, key, value, per_image=[value - 0.01, value + 0.01])
         return value
 
     score([], gate)
@@ -140,7 +151,7 @@ def _merge(members, journal, killed_at=None):
 
 
 def test_resume_after_a_kill_pays_only_for_the_passes_it_lost():
-    """The clause: a kill mid-merge leaves a resumable checkpoint rather than
+    """The contract: a kill mid-merge leaves a resumable checkpoint rather than
     returning nothing."""
     members = [f"m{i}.pt" for i in range(16)]
 
@@ -158,7 +169,9 @@ def test_resume_after_a_kill_pays_only_for_the_passes_it_lost():
 
     assert head == head_cold, "resuming must not change the result"
     assert len(paid_on_resume) == len(paid_cold) - 11
-    assert paid_on_resume == paid_cold[11:], "it must resume where it died, not elsewhere"
+    assert (
+        paid_on_resume == paid_cold[11:]
+    ), "it must resume where it died, not elsewhere"
 
 
 def test_without_a_journal_a_kill_costs_everything():
@@ -188,6 +201,7 @@ def test_the_ordering_pass_prepays_the_greedy_pass():
 
 # ── the wiring, pinned at source level ───────────────────────────────────────
 
+
 def test_no_scoring_call_bypasses_the_journal():
     """``_score`` is the journal. A second call site reaching ``score_soup``
     directly would silently reintroduce an unresumable pass, and no unit test of
@@ -199,20 +213,26 @@ def test_no_scoring_call_bypasses_the_journal():
         f"expected exactly one runtime.score_soup call (inside _score, which "
         f"journals it); found {len(calls)}"
     )
-    inside_score = source.split("async def _score(")[1].split("\n            async def ")[0]
+    inside_score = source.split("async def _score(")[1].split(
+        "\n            async def "
+    )[0]
     assert "runtime.score_soup(" in inside_score
     assert "pool.record_score(" in inside_score
     assert "_write_merge_journal(" in inside_score
 
 
-# ── up-front admission (clause 1's second disjunct) ──────────────────────────
+# ── up-front admission ──────────────────────────
 
-GIB = 1024 ** 3
+GIB = 1024**3
 
 
 def test_a_merge_that_fits_is_admitted():
-    assert pool.soup_admission([2 * GIB, 1 * GIB], budget_bytes=12 * GIB,
-                               base_bytes=3 * GIB) is None
+    assert (
+        pool.soup_admission(
+            [2 * GIB, 1 * GIB], budget_bytes=12 * GIB, base_bytes=3 * GIB
+        )
+        is None
+    )
 
 
 def test_a_merge_that_cannot_fit_is_refused_with_the_numbers():
@@ -226,9 +246,15 @@ def test_refusal_sizes_the_largest_member_not_the_count():
     """Peak no longer depends on member count — the combine streams and the member
     cache is bounded — so sixteen small members must still be admitted where one
     large one is refused. A check that summed them would invert both."""
-    many_small = [256 * 1024 ** 2] * 16
-    assert pool.soup_admission(many_small, budget_bytes=12 * GIB, base_bytes=3 * GIB) is None
-    assert pool.soup_admission([4 * GIB], budget_bytes=12 * GIB, base_bytes=3 * GIB) is not None
+    many_small = [256 * 1024**2] * 16
+    assert (
+        pool.soup_admission(many_small, budget_bytes=12 * GIB, base_bytes=3 * GIB)
+        is None
+    )
+    assert (
+        pool.soup_admission([4 * GIB], budget_bytes=12 * GIB, base_bytes=3 * GIB)
+        is not None
+    )
 
 
 def test_the_base_footprint_is_counted():
@@ -236,7 +262,10 @@ def test_the_base_footprint_is_counted():
     RSS differs. A check that ignored it would admit both."""
     members = [3 * GIB]
     assert pool.soup_admission(members, budget_bytes=12 * GIB, base_bytes=0) is None
-    assert pool.soup_admission(members, budget_bytes=12 * GIB, base_bytes=6 * GIB) is not None
+    assert (
+        pool.soup_admission(members, budget_bytes=12 * GIB, base_bytes=6 * GIB)
+        is not None
+    )
 
 
 @pytest.mark.parametrize("sizes", [[], [None], [None, None]])
@@ -248,12 +277,14 @@ def test_unknown_member_sizes_fail_open(sizes):
 
 def test_a_known_size_is_used_even_when_others_are_missing():
     """Positive control for failing open: partial metadata must not disable it."""
-    assert pool.soup_admission([None, 8 * GIB], budget_bytes=12 * GIB,
-                               base_bytes=0) is not None
+    assert (
+        pool.soup_admission([None, 8 * GIB], budget_bytes=12 * GIB, base_bytes=0)
+        is not None
+    )
 
 
 def test_the_refusal_happens_before_any_scoring_pass():
-    """"Rejected up front" is the clause. A check that ran after the baseline passes
+    """Rejection happens up front. A check that ran after the baseline passes
     would already have spent GPU time, so the ORDER is the property — pinned at
     source because no unit test of pool can see it."""
     source = (pathlib.Path(__file__).parent / "entry.py").read_text()
@@ -280,19 +311,24 @@ def test_missing_sha256_would_route_gate_scores_to_witness_images():
     """
     gate_id = pool.split_identity(NO_SHA_GATE)
     wit_id = pool.split_identity(NO_SHA_WITNESS)
-    assert gate_id == wit_id, "this test documents the collision; if it stops colliding, delete the guard"
+    assert (
+        gate_id == wit_id
+    ), "this test documents the collision; if it stops colliding, delete the guard"
 
     splits = {gate_id: "gate_images", wit_id: "witness_images"}
     assert len(splits) == 1
     assert splits[gate_id] == "witness_images"
 
 
-@pytest.mark.parametrize("gate,witness,needle", [
-    (NO_SHA_GATE, WITNESS, "gate_split"),
-    (GATE, NO_SHA_WITNESS, "witness_split"),
-    ({"sha256": "a" * 64}, WITNESS, "artifact_id"),
-    ({"artifact_id": "x", "sha256": ""}, WITNESS, "sha256"),
-])
+@pytest.mark.parametrize(
+    "gate,witness,needle",
+    [
+        (NO_SHA_GATE, WITNESS, "gate_split"),
+        (GATE, NO_SHA_WITNESS, "witness_split"),
+        ({"sha256": "a" * 64}, WITNESS, "artifact_id"),
+        ({"artifact_id": "x", "sha256": ""}, WITNESS, "sha256"),
+    ],
+)
 def test_incomplete_split_provenance_is_refused(gate, witness, needle):
     reason = pool.split_provenance_error(gate, witness)
     assert reason is not None, "incomplete provenance must be refused"
@@ -317,4 +353,6 @@ def test_aggregate_validates_the_splits_before_using_them():
     usable_merge_journal() stamps the very identities being validated."""
     source = (pathlib.Path(__file__).parent / "entry.py").read_text()
     assert "pool.split_provenance_error(" in source
-    assert source.index("pool.split_provenance_error(") < source.index("pool.usable_merge_journal(")
+    assert source.index("pool.split_provenance_error(") < source.index(
+        "pool.usable_merge_journal("
+    )

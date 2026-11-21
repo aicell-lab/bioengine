@@ -1,7 +1,7 @@
 name: Test Suite
 
 # No workflow ran a test before this one, so the only gate on a merge was a
-# version comparison and a PR that broke the suite merged green (backlog #0223).
+# version comparison and a PR that broke the suite merged green.
 # The breakage that prompted it existed only in the COMBINATION of two
 # individually sound PRs, which is what a suite run on the merge result catches
 # and what a version check cannot see.
@@ -42,7 +42,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install test dependencies
         # requirements-test.txt brings pytest, pytest-asyncio and pytest-xdist,
@@ -55,7 +55,15 @@ jobs:
         # deliberately declares no imaging deps ("Hypha/S3 transport only"). It is
         # a test-only dependency, so it is installed here rather than added to the
         # bundle, which would change what the published artifact ships.
-        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow
+        # aiofiles is the opposite case: model-runner's bundle DOES declare it
+        # (requirements-entry.txt), but the worker image this job runs in does
+        # not ship it, and `_execute_test` imports it inside the function body —
+        # so the module imports fine and the failure only appears once a test
+        # actually calls it. Installing the one name keeps this step honest about
+        # what it is for; installing the whole entry requirements file would drag
+        # in bioimageio.core==0.11.0 and numpy==1.26.4 and re-resolve the image's
+        # own pins underneath the rest of the suite.
+        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow aiofiles
 
       - name: Run the suite
         # tests/end_to_end needs a live Hypha workspace and a real cluster.
@@ -115,7 +123,7 @@ jobs:
         # which this runner does not have. It is declared in
         # .github/app-bundle-suites.json and checked against the tree here, so a
         # NEW app shipping in-bundle tests fails this job instead of having them
-        # collected by nobody while every step reports success (backlog #0423).
+        # collected by nobody while every step reports success.
         run: python3 .github/scripts/app_bundle_suites.py reconcile
 
       - name: Run the app bundle suites

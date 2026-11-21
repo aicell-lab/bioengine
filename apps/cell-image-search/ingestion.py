@@ -19,6 +19,7 @@ Pipeline (per worker GPU):
 Ray Data enables automatic load balancing across N GPU workers.
 Status is written to {workspace_dir}/sessions/{session_id}/status.json.
 """
+
 from __future__ import annotations
 
 import json
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Status helpers (mirrors cellpose-finetuning pattern)
 # ---------------------------------------------------------------------------
+
 
 class IngestionStatus(str, Enum):
     WAITING = "waiting"
@@ -133,6 +135,7 @@ def request_stop(workspace_dir: str, session_id: str) -> None:
 JUMP_S3_BUCKET = "cellpainting-gallery"
 JUMP_S3_PREFIX = "cpg0016-jump"
 
+
 def list_jump_image_paths(
     n_plates: int = 10,
     channels: list[int] | None = None,
@@ -154,7 +157,9 @@ def list_jump_image_paths(
         Prefix=f"{JUMP_S3_PREFIX}/",
         Delimiter="/",
     )
-    sources = [p["Prefix"].split("/")[1] for p in sources_resp.get("CommonPrefixes", [])]
+    sources = [
+        p["Prefix"].split("/")[1] for p in sources_resp.get("CommonPrefixes", [])
+    ]
     if not sources:
         raise RuntimeError("No sources found in JUMP CP dataset")
 
@@ -169,7 +174,9 @@ def list_jump_image_paths(
             Prefix=f"{JUMP_S3_PREFIX}/{source}/",
             Delimiter="/",
         )
-        batches = [p["Prefix"].split("/")[-2] for p in batches_resp.get("CommonPrefixes", [])]
+        batches = [
+            p["Prefix"].split("/")[-2] for p in batches_resp.get("CommonPrefixes", [])
+        ]
 
         for batch in batches[:2]:
             if plates_found >= n_plates:
@@ -179,9 +186,11 @@ def list_jump_image_paths(
                 Prefix=f"{JUMP_S3_PREFIX}/{source}/{batch}/images/",
                 Delimiter="/",
             )
-            plate_prefixes = [p["Prefix"] for p in plates_resp.get("CommonPrefixes", [])]
+            plate_prefixes = [
+                p["Prefix"] for p in plates_resp.get("CommonPrefixes", [])
+            ]
 
-            for plate_prefix in plate_prefixes[:n_plates - plates_found]:
+            for plate_prefix in plate_prefixes[: n_plates - plates_found]:
                 plate = plate_prefix.rstrip("/").split("/")[-1]
                 # List image files in this plate
                 img_resp = s3.list_objects_v2(
@@ -205,17 +214,19 @@ def list_jump_image_paths(
                     if channels and ch not in channels:
                         continue
                     well = f"r{row:02d}c{col:02d}"
-                    records.append({
-                        "s3_key": key,
-                        "bucket": JUMP_S3_BUCKET,
-                        "plate": plate,
-                        "well": well,
-                        "site": site,
-                        "channel": ch,
-                        "source": source,
-                        "batch": batch,
-                        "image_path": f"s3://{JUMP_S3_BUCKET}/{key}",
-                    })
+                    records.append(
+                        {
+                            "s3_key": key,
+                            "bucket": JUMP_S3_BUCKET,
+                            "plate": plate,
+                            "well": well,
+                            "site": site,
+                            "channel": ch,
+                            "source": source,
+                            "batch": batch,
+                            "image_path": f"s3://{JUMP_S3_BUCKET}/{key}",
+                        }
+                    )
                 plates_found += 1
                 if plates_found >= n_plates:
                     break
@@ -227,6 +238,7 @@ def list_jump_image_paths(
 # ---------------------------------------------------------------------------
 # Zarr dataset helpers (OpenOrganelle / CellMap)
 # ---------------------------------------------------------------------------
+
 
 def list_zarr_paths(
     s3_url: str,
@@ -255,24 +267,27 @@ def list_zarr_paths(
                 n_z = arr.shape[0] if arr.ndim == 3 else arr.shape[1]
                 step = max(1, n_z // slices_per_volume)
                 for z in range(0, n_z, step):
-                    records.append({
-                        "zarr_url": s3_url,
-                        "array_key": key,
-                        "z_slice": int(z),
-                        "source": "zarr",
-                        "image_path": f"{s3_url}/{key}[{z}]",
-                        "compound": "unknown",
-                        "moa_class": "organelle",
-                    })
+                    records.append(
+                        {
+                            "zarr_url": s3_url,
+                            "array_key": key,
+                            "z_slice": int(z),
+                            "source": "zarr",
+                            "image_path": f"{s3_url}/{key}[{z}]",
+                            "compound": "unknown",
+                            "moa_class": "organelle",
+                        }
+                    )
         except Exception as e:
             logger.warning("Skipping %s: %s", key, e)
 
-    return records[:n_volumes * slices_per_volume]
+    return records[: n_volumes * slices_per_volume]
 
 
 # ---------------------------------------------------------------------------
 # Image loading helpers
 # ---------------------------------------------------------------------------
+
 
 def load_jump_image_multichannel(
     records_for_well: list[dict],
@@ -289,6 +304,7 @@ def load_jump_image_multichannel(
         import boto3
         from botocore import UNSIGNED
         from botocore.config import Config
+
         s3_client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
     # Sort by channel
@@ -391,6 +407,7 @@ def extract_cell_crops(
 # Main ingestion runner (called as asyncio task from main.py)
 # ---------------------------------------------------------------------------
 
+
 async def run_ingestion(
     workspace_dir: str,
     session_id: str,
@@ -415,11 +432,17 @@ async def run_ingestion(
     t0 = time.time()
 
     def _update(status, msg, n_emb=0, n_tot=0, throughput=0.0, log_lines=None):
-        write_status(workspace_dir, session_id, status, msg,
-                     n_embedded=n_emb, n_total=n_tot,
-                     throughput_per_sec=throughput,
-                     elapsed_seconds=time.time() - t0,
-                     log_lines=log_lines or [f"[{time.strftime('%H:%M:%S')}] {msg}"])
+        write_status(
+            workspace_dir,
+            session_id,
+            status,
+            msg,
+            n_embedded=n_emb,
+            n_total=n_tot,
+            throughput_per_sec=throughput,
+            elapsed_seconds=time.time() - t0,
+            log_lines=log_lines or [f"[{time.strftime('%H:%M:%S')}] {msg}"],
+        )
 
     try:
         _update(IngestionStatus.PREPARING, "Listing dataset images...")
@@ -435,6 +458,7 @@ async def run_ingestion(
         # Group CP records by (plate, well, site) for multi-channel loading
         if dataset == "jump-cp":
             from itertools import groupby
+
             key_fn = lambda r: (r["plate"], r["well"], r["site"])
             sorted_records = sorted(records, key=key_fn)
             grouped = {k: list(v) for k, v in groupby(sorted_records, key=key_fn)}
@@ -444,14 +468,20 @@ async def run_ingestion(
 
         n_total_images = len(image_groups)
         n_total_expected = n_total_images * n_crops_per_image
-        _update(IngestionStatus.PREPARING, f"Found {n_total_images} images ({n_total_expected:,} cells expected). Starting embedding...",
-                n_tot=n_total_expected)
+        _update(
+            IngestionStatus.PREPARING,
+            f"Found {n_total_images} images ({n_total_expected:,} cells expected). Starting embedding...",
+            n_tot=n_total_expected,
+        )
 
         # Step 2: Distributed embedding with Ray
         @ray.remote(num_gpus=1, num_cpus=2)
-        def embed_image_group(image_group_records: list[dict], n_crops: int) -> list[dict] | None:
+        def embed_image_group(
+            image_group_records: list[dict], n_crops: int
+        ) -> list[dict] | None:
             """Ray remote task: load → crop → embed one image group."""
             import sys, os
+
             # Ensure local modules are importable inside the Ray task
             app_dir = os.path.dirname(__file__)
             if app_dir not in sys.path:
@@ -470,6 +500,7 @@ async def run_ingestion(
                 rec = image_group_records[0]
                 try:
                     import zarr, s3fs
+
                     fs = s3fs.S3FileSystem(anon=True)
                     store = zarr.open(s3fs.S3Map(rec["zarr_url"], s3=fs), mode="r")
                     arr = store[rec["array_key"]]
@@ -482,7 +513,11 @@ async def run_ingestion(
                 if not crops:
                     crops = [img]
                 rgb_crops = [to_rgb_uint8(c) for c in crops]
-                meta_base = {k: v for k, v in rec.items() if k not in ("zarr_url", "array_key", "z_slice")}
+                meta_base = {
+                    k: v
+                    for k, v in rec.items()
+                    if k not in ("zarr_url", "array_key", "z_slice")
+                }
             else:
                 mc_img, meta_base = load_jump_image_multichannel(image_group_records)
                 if mc_img is None:
@@ -498,17 +533,20 @@ async def run_ingestion(
             for i, (emb, crop_rgb) in enumerate(zip(embeddings, rgb_crops)):
                 from PIL import Image
                 import base64, io
+
                 thumb = Image.fromarray(crop_rgb).resize((96, 96))
                 buf = io.BytesIO()
                 thumb.save(buf, format="PNG")
                 thumb_b64 = base64.b64encode(buf.getvalue()).decode()
 
-                results.append({
-                    **meta_base,
-                    "crop_idx": i,
-                    "embedding": emb.tolist(),
-                    "thumbnail_b64": thumb_b64,
-                })
+                results.append(
+                    {
+                        **meta_base,
+                        "crop_idx": i,
+                        "embedding": emb.tolist(),
+                        "thumbnail_b64": thumb_b64,
+                    }
+                )
             return results
 
         # Launch Ray tasks in batches to control memory
@@ -518,8 +556,12 @@ async def run_ingestion(
 
         for i, group in enumerate(image_groups):
             if is_stop_requested(workspace_dir, session_id):
-                _update(IngestionStatus.STOPPED, "Stopped by user.",
-                        n_emb=len(all_results), n_tot=n_total_expected)
+                _update(
+                    IngestionStatus.STOPPED,
+                    "Stopped by user.",
+                    n_emb=len(all_results),
+                    n_tot=n_total_expected,
+                )
                 return
 
             futures.append(embed_image_group.remote(group, n_crops_per_image))
@@ -544,24 +586,34 @@ async def run_ingestion(
                     f"{throughput:.0f} cells/s · "
                     f"ETA {int(eta//60)}m{int(eta%60):02d}s"
                 )
-                _update(IngestionStatus.RUNNING,
-                        f"Embedded {len(all_results):,} cells from {i+1}/{n_total_images} images",
-                        n_emb=len(all_results), n_tot=n_total_expected,
-                        throughput=throughput,
-                        log_lines=[log_line])
+                _update(
+                    IngestionStatus.RUNNING,
+                    f"Embedded {len(all_results):,} cells from {i+1}/{n_total_images} images",
+                    n_emb=len(all_results),
+                    n_tot=n_total_expected,
+                    throughput=throughput,
+                    log_lines=[log_line],
+                )
 
         if not all_results:
             _update(IngestionStatus.FAILED, "No cells successfully embedded.")
             return
 
         # Step 3: Build FAISS index
-        _update(IngestionStatus.BUILDING_INDEX,
-                f"Building FAISS index for {len(all_results):,} cells...",
-                n_emb=len(all_results), n_tot=len(all_results))
+        _update(
+            IngestionStatus.BUILDING_INDEX,
+            f"Building FAISS index for {len(all_results):,} cells...",
+            n_emb=len(all_results),
+            n_tot=len(all_results),
+        )
 
-        embeddings_arr = np.array([r["embedding"] for r in all_results], dtype=np.float32)
-        metadata_rows = [{k: v for k, v in r.items() if k not in ("embedding", "thumbnail_b64")}
-                         for r in all_results]
+        embeddings_arr = np.array(
+            [r["embedding"] for r in all_results], dtype=np.float32
+        )
+        metadata_rows = [
+            {k: v for k, v in r.items() if k not in ("embedding", "thumbnail_b64")}
+            for r in all_results
+        ]
         # Store thumbnails separately (large)
         thumbnails = [r.get("thumbnail_b64", "") for r in all_results]
 
@@ -578,12 +630,15 @@ async def run_ingestion(
         )
 
         elapsed = time.time() - t0
-        _update(IngestionStatus.COMPLETED,
-                f"Done! {len(all_results):,} cells indexed in {elapsed/60:.1f} min. "
-                f"Index: {stats['index_type']}, {stats['index_size_mb']:.0f} MB",
-                n_emb=len(all_results), n_tot=len(all_results),
-                throughput=len(all_results) / elapsed,
-                index_stats=stats)
+        _update(
+            IngestionStatus.COMPLETED,
+            f"Done! {len(all_results):,} cells indexed in {elapsed/60:.1f} min. "
+            f"Index: {stats['index_type']}, {stats['index_size_mb']:.0f} MB",
+            n_emb=len(all_results),
+            n_tot=len(all_results),
+            throughput=len(all_results) / elapsed,
+            index_stats=stats,
+        )
 
     except Exception as e:
         logger.exception("Ingestion failed: %s", e)

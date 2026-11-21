@@ -30,6 +30,17 @@ class ProxyDouble(PROXY_CLS):
     _token_ttl_seconds = 0
     _token_issued_at = 0.0
 
+    def _start_background_workers(self) -> None:
+        """Drop the Serve-only background startup.
+
+        The production constructor starts the maintenance task here, and that
+        task drives the sibling gate, which calls ``serve.status()``. In a test
+        process that initialises Ray for real: measured 2026-11-14, it took
+        ``tests/apps/test_service_id_registration_gate.py`` from 0.29 s to
+        8.5 s and left the interpreter exiting non-zero on a run where all 28
+        cases passed. Tests that want the loop drive the steps directly.
+        """
+
     def __del__(self) -> None:
         """Drop the inherited ``async def __del__``.
 

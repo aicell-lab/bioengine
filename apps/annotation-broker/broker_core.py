@@ -70,7 +70,11 @@ def _user_matches(
     entry_email = entry.get("email")
     if user_id and entry_id and str(entry_id) == str(user_id):
         return True
-    if user_email and entry_email and str(entry_email).lower() == str(user_email).lower():
+    if (
+        user_email
+        and entry_email
+        and str(entry_email).lower() == str(user_email).lower()
+    ):
         return True
     return False
 
@@ -115,14 +119,18 @@ def resolve_role(
     return "none"
 
 
-def set_user_role(metadata: Dict[str, Any], user: Dict[str, Any], role: str) -> Dict[str, Any]:
+def set_user_role(
+    metadata: Dict[str, Any], user: Dict[str, Any], role: str
+) -> Dict[str, Any]:
     """Add/move *user* into the ``managers``/``annotators`` list for *role*.
 
     A user has at most one non-owner role at a time, so they're removed from
     both lists first. Mutates and returns *metadata*.
     """
     if role not in ROLE_LIST_KEYS:
-        raise ValueError(f"Invalid role {role!r}; expected one of {sorted(ROLE_LIST_KEYS)}")
+        raise ValueError(
+            f"Invalid role {role!r}; expected one of {sorted(ROLE_LIST_KEYS)}"
+        )
     remove_user_role(metadata, user)
     metadata.setdefault(ROLE_LIST_KEYS[role], []).append(dict(user))
     return metadata
@@ -137,7 +145,9 @@ def remove_user_role(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str
     user_email = user.get("email")
     for key in ROLE_LIST_KEYS.values():
         metadata[key] = [
-            u for u in metadata.get(key, []) or [] if not _user_matches(u, user_id, user_email)
+            u
+            for u in metadata.get(key, []) or []
+            if not _user_matches(u, user_id, user_email)
         ]
     return metadata
 
@@ -148,7 +158,10 @@ def remove_user_role(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str
 
 
 def add_access_request(
-    metadata: Dict[str, Any], user: Dict[str, Any], requested_role: str, requested_at: str
+    metadata: Dict[str, Any],
+    user: Dict[str, Any],
+    requested_role: str,
+    requested_at: str,
 ) -> Dict[str, Any]:
     """Record that *user* asked for *requested_role* on this dataset.
 
@@ -174,7 +187,9 @@ def add_access_request(
     return metadata
 
 
-def remove_access_request(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+def remove_access_request(
+    metadata: Dict[str, Any], user: Dict[str, Any]
+) -> Dict[str, Any]:
     """Drop *user*'s pending access request, if any. Mutates and returns
     *metadata*."""
     user_id = user.get("id")
@@ -334,8 +349,12 @@ def parse_image_manifest(doc: Any) -> Dict[str, Dict[str, Any]]:
     return {
         stem: dict(entry)
         for stem, entry in images.items()
-        if stem and isinstance(entry, dict) and entry.get("state") in (
-            IMAGE_STATE_LOCAL, IMAGE_STATE_REMOTE,
+        if stem
+        and isinstance(entry, dict)
+        and entry.get("state")
+        in (
+            IMAGE_STATE_LOCAL,
+            IMAGE_STATE_REMOTE,
         )
     }
 
@@ -356,7 +375,9 @@ def image_names_from_listing(entries: List[Any]) -> List[str]:
         name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
         if not name or name == _IMAGE_MANIFEST_NAME:
             continue
-        if isinstance(entry, dict) and (entry.get("type") == "directory" or entry.get("is_dir")):
+        if isinstance(entry, dict) and (
+            entry.get("type") == "directory" or entry.get("is_dir")
+        ):
             continue
         names.append(name)
     return names
@@ -462,9 +483,18 @@ NGFF_NUMERIC_DTYPES = frozenset(
 # v3 spells a dtype out where v2 abbreviates it. Everything downstream works
 # in the v2 vocabulary, so this is the one translation table.
 NGFF_V3_TO_V2_DTYPE = {
-    "bool": "b1", "int8": "i1", "uint8": "u1", "int16": "i2",
-    "uint16": "u2", "int32": "i4", "uint32": "u4", "int64": "i8",
-    "uint64": "u8", "float16": "f2", "float32": "f4", "float64": "f8",
+    "bool": "b1",
+    "int8": "i1",
+    "uint8": "u1",
+    "int16": "i2",
+    "uint16": "u2",
+    "int32": "i4",
+    "uint32": "u4",
+    "int64": "i8",
+    "uint64": "u8",
+    "float16": "f2",
+    "float32": "f4",
+    "float64": "f8",
 }
 
 # Axis order implied by OME-NGFF before v0.4, which made `axes` optional.
@@ -490,9 +520,7 @@ def normalise_store_root(url: Any) -> str:
         raise NgffSourceError("Store root is required.")
     root = url.strip()
     if not root.lower().startswith(("http://", "https://")):
-        raise NgffSourceError(
-            f"Store root must be an http(s) URL, got {root!r}."
-        )
+        raise NgffSourceError(f"Store root must be an http(s) URL, got {root!r}.")
     if "?" in root or "#" in root:
         raise NgffSourceError(
             "Store root must not contain a query string or fragment: a Zarr "
@@ -522,7 +550,7 @@ def split_store_credential(root: str) -> tuple:
     match = _TOKEN_SEGMENT.search(root)
     if not match:
         return root, None
-    untokened = root[: match.start()] + "/" + root[match.end():]
+    untokened = root[: match.start()] + "/" + root[match.end() :]
     return untokened, match.group(1)
 
 
@@ -570,9 +598,7 @@ def parse_ngff_multiscales(
                 chosen = entry
                 break
         if chosen is None:
-            names = [
-                str(e.get("name")) for e in multiscales if isinstance(e, dict)
-            ]
+            names = [str(e.get("name")) for e in multiscales if isinstance(e, dict)]
             raise NgffSourceError(
                 f"No multiscale named {multiscale_path!r}; this store has: "
                 + (", ".join(n for n in names if n and n != "None") or "(unnamed)")
@@ -743,7 +769,11 @@ def ngff_channel_names(zattrs: Any) -> Optional[List[str]]:
     attrs = zattrs if isinstance(zattrs, dict) else {}
     if isinstance(attrs.get("ome"), dict):
         attrs = {**attrs, **attrs["ome"]}
-    channels = (attrs.get("omero") or {}).get("channels") if isinstance(attrs.get("omero"), dict) else None
+    channels = (
+        (attrs.get("omero") or {}).get("channels")
+        if isinstance(attrs.get("omero"), dict)
+        else None
+    )
     if not isinstance(channels, list) or not channels:
         return None
     names = [
@@ -825,7 +855,9 @@ def normalise_region(
         raise ValueError(f"Region is empty: {width}x{height} pixels.")
     if x < 0 or y < 0:
         raise ValueError(f"Region starts outside the image at ({x}, {y}).")
-    if (store_width > 0 and x >= store_width) or (store_height > 0 and y >= store_height):
+    if (store_width > 0 and x >= store_width) or (
+        store_height > 0 and y >= store_height
+    ):
         raise ValueError(
             f"Region starts at ({x}, {y}), outside the "
             f"{store_width}x{store_height} image."
@@ -895,15 +927,10 @@ def image_entry_is_local(entry: Optional[Dict[str, Any]]) -> bool:
     return entry.get("state") == IMAGE_STATE_LOCAL and bool(entry.get("path"))
 
 
-def non_local_stems(
-    entries: Dict[str, Dict[str, Any]], stems: List[str]
-) -> List[str]:
+def non_local_stems(entries: Dict[str, Dict[str, Any]], stems: List[str]) -> List[str]:
     """Sorted stems in *stems* that are known but not materialised."""
     return sorted(
-        {
-            s for s in stems
-            if s in entries and not image_entry_is_local(entries.get(s))
-        }
+        {s for s in stems if s in entries and not image_entry_is_local(entries.get(s))}
     )
 
 
@@ -919,10 +946,18 @@ def non_local_stems(
 
 # Bytes per sample, keyed by the normalised v2 dtype.
 _DTYPE_ITEMSIZE = {
-    "b1": 1, "i1": 1, "u1": 1,
-    "i2": 2, "u2": 2, "f2": 2,
-    "i4": 4, "u4": 4, "f4": 4,
-    "i8": 8, "u8": 8, "f8": 8,
+    "b1": 1,
+    "i1": 1,
+    "u1": 1,
+    "i2": 2,
+    "u2": 2,
+    "f2": 2,
+    "i4": 4,
+    "u4": 4,
+    "f4": 4,
+    "i8": 8,
+    "u8": 8,
+    "f8": 8,
 }
 
 # What one level-0 read is allowed to cost the annotator's browser, in bytes
@@ -986,8 +1021,7 @@ def check_materialisable(
         raise FileNotFoundError(f"'{stem}' is not an image of this dataset.")
     if entry.get("state") != IMAGE_STATE_REMOTE:
         raise ValueError(
-            f"'{stem}' is not a remote image, so there is nothing to "
-            f"materialise."
+            f"'{stem}' is not a remote image, so there is nothing to " f"materialise."
         )
     channels = entry.get("channels")
     count = len(channels) if isinstance(channels, list) else 0
@@ -1024,7 +1058,11 @@ def parse_png_dims(header: bytes) -> Optional[List[int]]:
     so 24 bytes are enough. Returns ``None`` for anything that is not a
     plausible PNG header (the caller treats that as "dimensions unknown",
     never an error)."""
-    if len(header) < 24 or not header.startswith(PNG_SIGNATURE) or header[12:16] != b"IHDR":
+    if (
+        len(header) < 24
+        or not header.startswith(PNG_SIGNATURE)
+        or header[12:16] != b"IHDR"
+    ):
         return None
     width = int.from_bytes(header[16:20], "big")
     height = int.from_bytes(header[20:24], "big")
@@ -1148,7 +1186,9 @@ def latest_pairs_by_stem(filenames: List[str]) -> Dict[str, Dict[str, str]]:
 
     result: Dict[str, Dict[str, str]] = {}
     for stem, ts_map in by_stem_ts.items():
-        complete = [ts for ts, files in ts_map.items() if "png" in files and "geojson" in files]
+        complete = [
+            ts for ts, files in ts_map.items() if "png" in files and "geojson" in files
+        ]
         if not complete:
             continue
         latest = max(complete)
@@ -1224,7 +1264,9 @@ def _clean_stems(stems: Any) -> List[str]:
     return out
 
 
-def _require_annotated(stems: List[str], annotation_counts: Dict[str, int], what: str) -> None:
+def _require_annotated(
+    stems: List[str], annotation_counts: Dict[str, int], what: str
+) -> None:
     missing = [s for s in stems if annotation_counts.get(s, 0) < 1]
     if missing:
         raise ValueError(
@@ -1253,7 +1295,9 @@ def new_split(
         raise ValueError("A split needs at least one training image.")
     overlap = set(train) & set(test)
     if overlap:
-        raise ValueError(f"Stems cannot be in both train and test: {', '.join(sorted(overlap))}")
+        raise ValueError(
+            f"Stems cannot be in both train and test: {', '.join(sorted(overlap))}"
+        )
     _require_annotated(train, annotation_counts, "train")
     _require_annotated(test, annotation_counts, "test")
     members = set(train) | set(test)
@@ -1313,7 +1357,9 @@ def extend_split(
         )
     both = set(add_train) & set(add_test)
     if both:
-        raise ValueError(f"Stems cannot be in both train and test: {', '.join(sorted(both))}")
+        raise ValueError(
+            f"Stems cannot be in both train and test: {', '.join(sorted(both))}"
+        )
     _require_annotated(add_train, annotation_counts, "train")
     _require_annotated(add_test, annotation_counts, "test")
 
@@ -1323,7 +1369,9 @@ def extend_split(
     # Refresh the snapshot for every member so the frontend's "+N new
     # annotations" indicator resets after each extension. A member that lost
     # its files entirely keeps count 0 rather than erroring.
-    split["annotation_counts"] = {s: int(annotation_counts.get(s, 0)) for s in sorted(members)}
+    split["annotation_counts"] = {
+        s: int(annotation_counts.get(s, 0)) for s in sorted(members)
+    }
     ts = now_iso()
     split["updated_at"] = ts
     split["updated_by"] = updated_by
@@ -1402,7 +1450,9 @@ def collect_embeddings(filenames: List[str]) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
     for stem, models in by_stem.items():
         model_types = sorted(models)
-        preferred = DEFAULT_MODEL_TYPE if DEFAULT_MODEL_TYPE in models else model_types[0]
+        preferred = (
+            DEFAULT_MODEL_TYPE if DEFAULT_MODEL_TYPE in models else model_types[0]
+        )
         result[stem] = {"model_type": preferred, "model_types": model_types}
     return result
 
@@ -1453,14 +1503,18 @@ def new_metadata(artifact_id: str, owner: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def read_metadata(artifact_id: str, root: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def read_metadata(
+    artifact_id: str, root: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
     p = metadata_path(artifact_id, root)
     if not p.exists():
         return None
     return json.loads(p.read_text())
 
 
-def write_metadata(metadata: Dict[str, Any], root: Optional[Path] = None) -> Dict[str, Any]:
+def write_metadata(
+    metadata: Dict[str, Any], root: Optional[Path] = None
+) -> Dict[str, Any]:
     """Atomically write *metadata* (write to a ``.tmp`` file, then
     ``os.replace``) — same pattern as ``training.write_status`` in the
     micro-sam app. Stamps ``updated_at`` and returns the written dict."""
@@ -1500,7 +1554,9 @@ def list_dataset_ids(root: Optional[Path] = None) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def add_label(metadata: Dict[str, Any], name: str, description: str = "") -> Dict[str, Any]:
+def add_label(
+    metadata: Dict[str, Any], name: str, description: str = ""
+) -> Dict[str, Any]:
     if not is_valid_label_name(name):
         raise ValueError(f"Invalid label name {name!r}: must match ^[a-z0-9._-]+$")
     labels = metadata.setdefault("labels", [])
@@ -1623,7 +1679,9 @@ async def ensure_staged(
 # ---------------------------------------------------------------------------
 
 
-def is_cache_fresh(cached_at: float, ttl_s: float = 60.0, now: Optional[float] = None) -> bool:
+def is_cache_fresh(
+    cached_at: float, ttl_s: float = 60.0, now: Optional[float] = None
+) -> bool:
     now = time.time() if now is None else now
     return (now - cached_at) < ttl_s
 

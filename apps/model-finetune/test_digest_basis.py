@@ -1,4 +1,4 @@
-"""#0417 — a stored head digest must say WHICH digest it is, or say it cannot.
+"""a stored head digest must say WHICH digest it is, or say it cannot.
 
 ``global_sha256`` (and its ``current_community.sha256`` and manifest
 ``weights_sha256`` copies — one value, three places) digested the file
@@ -50,9 +50,9 @@ import pool
 # harness has another; a constant imported from the module under test cannot
 # detect that module silently moving it.
 # `git show -s --format=%ct d3040c4f8165`, not a hand-converted date.
-CUTOFF = 1793004206.0                       # 2026-10-26T08:43:26Z, commit d3040c4f8165
-OLDEST_REAL_MERGE = 1790589154.005547       # 2026-09-28T09:52:34Z, cpsam-soup-demo-pool v1
-AFTER_CUTOFF = 1793500000.0                 # 2026-11-01T02:26:40Z
+CUTOFF = 1793004206.0  # 2026-10-26T08:43:26Z, commit d3040c4f8165
+OLDEST_REAL_MERGE = 1790589154.005547  # 2026-09-28T09:52:34Z, cpsam-soup-demo-pool v1
+AFTER_CUTOFF = 1793500000.0  # 2026-11-01T02:26:40Z
 
 SHA = "a" * 64
 OTHER_SHA = "b" * 64
@@ -77,13 +77,23 @@ def _merge(
     rec: Dict[str, Any] = {
         "published_version": version,
         "baseline_version": "stock-cpsam",
-        "members": [{"contribution_id": "c-1", "marginal_score": 0.5,
-                     "gate_score": 0.6, "included": True}],
+        "members": [
+            {
+                "contribution_id": "c-1",
+                "marginal_score": 0.5,
+                "gate_score": 0.6,
+                "included": True,
+            }
+        ],
         "selection_metric": {"role": "selection", "aggregate": 0.6},
         "witness_metric": {"role": "witness", "aggregate": 0.55},
         "global_sha256": sha,
-        "transport": {"bytes_in": 1, "bytes_out": 2, "n_transfers": 1,
-                      "sources_complete": True},
+        "transport": {
+            "bytes_in": 1,
+            "bytes_out": 2,
+            "n_transfers": 1,
+            "sources_complete": True,
+        },
         "deferred": [],
         "created_at": created_at,
     }
@@ -92,7 +102,9 @@ def _merge(
     return rec
 
 
-def _index(merges: List[Dict[str, Any]], *, current: Any = "<derive>") -> Dict[str, Any]:
+def _index(
+    merges: List[Dict[str, Any]], *, current: Any = "<derive>"
+) -> Dict[str, Any]:
     """A pool index around ``merges``. ``current='<derive>'`` points at the last
     published merge the way ``set_current_community`` would have, WITHOUT a basis
     stamp — i.e. as every pool on the live service looks today."""
@@ -113,10 +125,17 @@ def _index(merges: List[Dict[str, Any]], *, current: Any = "<derive>") -> Dict[s
         "model_type": "cpsam",
         "architecture_signature": "sig",
         "current_community": current,
-        "contributions": [{"contribution_id": "c-1", "weights_path": "p",
-                           "metadata_path": "m", "weights_sha256": "c" * 64,
-                           "architecture_signature": "sig", "samples_seen": 10,
-                           "uploaded_at": OLDEST_REAL_MERGE}],
+        "contributions": [
+            {
+                "contribution_id": "c-1",
+                "weights_path": "p",
+                "metadata_path": "m",
+                "weights_sha256": "c" * 64,
+                "architecture_signature": "sig",
+                "samples_seen": 10,
+                "uploaded_at": OLDEST_REAL_MERGE,
+            }
+        ],
         "decided_contribution_ids": ["c-1"],
         "baseline": {"witness_metric": {"role": "witness", "aggregate": 0.5}},
         "merges": merges,
@@ -125,10 +144,13 @@ def _index(merges: List[Dict[str, Any]], *, current: Any = "<derive>") -> Dict[s
 
 # ── the resolver ─────────────────────────────────────────────────────────────
 
+
 class TestResolver:
     def test_a_pre_cutoff_record_is_the_file_digest(self):
         """The only direction a date can prove: state_dict_digest did not exist."""
-        assert pool.digest_basis(_merge(created_at=CUTOFF - 1)) == pool.DIGEST_BASIS_FILE
+        assert (
+            pool.digest_basis(_merge(created_at=CUTOFF - 1)) == pool.DIGEST_BASIS_FILE
+        )
 
     def test_every_real_stored_merge_resolves_to_the_file_digest(self):
         """The eight live values, by their measured timestamps."""
@@ -136,7 +158,7 @@ class TestResolver:
             assert pool.digest_basis(_merge(created_at=ts)) == pool.DIGEST_BASIS_FILE
 
     def test_a_post_cutoff_record_without_a_stamp_is_undetermined(self):
-        """The row's fourth clause. A worker can still be running the old build a
+        """A worker can still be running the old build a
         week after the commit, so the late side is evidence of nothing."""
         out = pool.digest_basis(_merge(created_at=AFTER_CUTOFF))
         assert out == pool.DIGEST_BASIS_UNDETERMINED
@@ -144,29 +166,47 @@ class TestResolver:
 
     def test_the_cutoff_instant_itself_is_undetermined(self):
         """Strictly-before, so the boundary falls on the honest side."""
-        assert pool.digest_basis(_merge(created_at=CUTOFF)) == pool.DIGEST_BASIS_UNDETERMINED
+        assert (
+            pool.digest_basis(_merge(created_at=CUTOFF))
+            == pool.DIGEST_BASIS_UNDETERMINED
+        )
 
     def test_timestamps_alone_never_yield_the_tensor_meaning(self):
         """The asymmetry, swept rather than sampled: across the whole timeline there
         is NO unstamped input for which a date resolves to the new meaning. Guessing
         it would reinstate the silent default one version later."""
-        probes = [0.0, 1.0, OLDEST_REAL_MERGE, CUTOFF - 1e-6, CUTOFF,
-                  CUTOFF + 1e-6, AFTER_CUTOFF, 4_000_000_000.0]
+        probes = [
+            0.0,
+            1.0,
+            OLDEST_REAL_MERGE,
+            CUTOFF - 1e-6,
+            CUTOFF,
+            CUTOFF + 1e-6,
+            AFTER_CUTOFF,
+            4_000_000_000.0,
+        ]
         seen = {pool.digest_basis(_merge(created_at=t)) for t in probes}
         assert pool.DIGEST_BASIS_TENSORS not in seen
         # ...and the sweep is a real one: both honest answers DO occur, so an
         # assertion of absence is not passing because nothing was evaluated.
         assert seen == {pool.DIGEST_BASIS_FILE, pool.DIGEST_BASIS_UNDETERMINED}
 
-    @pytest.mark.parametrize("stamp,expected", [
-        (pool.DIGEST_BASIS_TENSORS, pool.DIGEST_BASIS_TENSORS),
-        (pool.DIGEST_BASIS_FILE, pool.DIGEST_BASIS_FILE),
-    ])
-    def test_an_explicit_stamp_beats_the_timestamp_in_both_directions(self, stamp, expected):
+    @pytest.mark.parametrize(
+        "stamp,expected",
+        [
+            (pool.DIGEST_BASIS_TENSORS, pool.DIGEST_BASIS_TENSORS),
+            (pool.DIGEST_BASIS_FILE, pool.DIGEST_BASIS_FILE),
+        ],
+    )
+    def test_an_explicit_stamp_beats_the_timestamp_in_both_directions(
+        self, stamp, expected
+    ):
         """Including the combination a date would get wrong: a file digest written
         after the cutoff (an old build still deployed) and a tensor digest dated
         before it (a clock that is wrong, or a record copied forward)."""
-        assert pool.digest_basis(_merge(created_at=AFTER_CUTOFF, basis=stamp)) == expected
+        assert (
+            pool.digest_basis(_merge(created_at=AFTER_CUTOFF, basis=stamp)) == expected
+        )
         assert pool.digest_basis(_merge(created_at=CUTOFF - 1, basis=stamp)) == expected
 
     def test_an_unrecognised_stamp_is_undetermined_not_defaulted(self):
@@ -186,14 +226,26 @@ class TestResolver:
         rec = _merge(version=None, sha=None, basis=pool.DIGEST_BASIS_TENSORS)
         assert pool.digest_basis(rec) == pool.DIGEST_BASIS_ABSENT
 
-    @pytest.mark.parametrize("ts", [
-        None, "", "2026-09-28T09:52:34Z", "not-a-number", [], {},
-        float("nan"), float("inf"), float("-inf"),
-    ])
+    @pytest.mark.parametrize(
+        "ts",
+        [
+            None,
+            "",
+            "2026-09-28T09:52:34Z",
+            "not-a-number",
+            [],
+            {},
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        ],
+    )
     def test_an_unusable_created_at_is_undetermined(self, ts):
         """-inf is in here on purpose: it is arithmetically 'before the cutoff' and a
         bare ``<`` would confidently return the file meaning for a nonsense value."""
-        assert pool.digest_basis(_merge(created_at=ts)) == pool.DIGEST_BASIS_UNDETERMINED
+        assert (
+            pool.digest_basis(_merge(created_at=ts)) == pool.DIGEST_BASIS_UNDETERMINED
+        )
 
     @pytest.mark.parametrize("record", [None, "", 0, [], "a" * 64])
     def test_a_non_record_is_undetermined(self, record):
@@ -202,51 +254,66 @@ class TestResolver:
     def test_the_keys_are_parameterisable_for_the_other_two_surfaces(self):
         """The same value is stored under three names; one resolver reads all three."""
         manifest = {"weights_sha256": SHA, "created_at": CUTOFF - 1}
-        assert pool.digest_basis(manifest, digest_key="weights_sha256") == pool.DIGEST_BASIS_FILE
+        assert (
+            pool.digest_basis(manifest, digest_key="weights_sha256")
+            == pool.DIGEST_BASIS_FILE
+        )
         pointer = {"sha256": SHA, "sha256_basis": pool.DIGEST_BASIS_TENSORS}
-        assert pool.digest_basis(pointer, digest_key="sha256") == pool.DIGEST_BASIS_TENSORS
+        assert (
+            pool.digest_basis(pointer, digest_key="sha256") == pool.DIGEST_BASIS_TENSORS
+        )
 
 
-# Measured 2026-11-13 from the six live bioimage-io pools (the snapshot the row's
+# Measured 2026-11-13 from the six live bioimage-io pools (the snapshot this file's
 # figures were re-checked against). Eight merges carry a digest; these are their
 # created_at values. Written out rather than derived so this file does not need the
 # snapshot to run, and so a change to the snapshot cannot quietly change the test.
 REAL_MERGE_TIMES: List[float] = [
-    1790589154.005547,   # cpsam-soup-demo-pool       v1  2026-09-28T09:52:34Z
+    1790589154.005547,  # cpsam-soup-demo-pool       v1  2026-09-28T09:52:34Z
     1790590608.3255925,  # cpsam-soup-demo-pool-v2    v1  2026-09-28T10:16:48Z
     1790591145.4142523,  # cpsam-soup-demo-pool-v2    v2  2026-09-28T10:25:45Z
-    1790591632.632655,   # cpsam-soup-demo-pool-v2    v3  2026-09-28T10:33:52Z
-    1790596196.454121,   # cpsam-soup-concurrent-v2   v1  2026-09-28T11:49:56Z
+    1790591632.632655,  # cpsam-soup-demo-pool-v2    v3  2026-09-28T10:33:52Z
+    1790596196.454121,  # cpsam-soup-concurrent-v2   v1  2026-09-28T11:49:56Z
     1790615628.9399433,  # cpsam-soup-overnight-gen2  v1  2026-09-28T17:13:48Z
-    1790617463.887484,   # cpsam-soup-overnight-gen2  v2  2026-09-28T17:44:23Z
+    1790617463.887484,  # cpsam-soup-overnight-gen2  v2  2026-09-28T17:44:23Z
     1790619791.5862625,  # cpsam-soup-overnight-gen2  v3  2026-09-28T18:23:11Z
 ]
 
 
 def test_the_measured_live_timestamps_are_all_before_the_cutoff():
-    """The row's claim, as a fixture-level assertion: if a pool is later written by
+    """The claim, as a fixture-level assertion: if a pool is later written by
     a newer app and this list is refreshed, a value on the other side of the cutoff
     fails HERE, naming the reason, instead of silently changing what the suite above
     is testing."""
     assert len(REAL_MERGE_TIMES) == 8
     assert max(REAL_MERGE_TIMES) < CUTOFF
-    assert CUTOFF - max(REAL_MERGE_TIMES) > 20 * 24 * 3600   # ~28 days of margin
+    assert CUTOFF - max(REAL_MERGE_TIMES) > 20 * 24 * 3600  # ~28 days of margin
 
 
 # ── the published form ───────────────────────────────────────────────────────
 
+
 class TestProvenance:
-    @pytest.mark.parametrize("basis", [
-        pool.DIGEST_BASIS_TENSORS, pool.DIGEST_BASIS_FILE,
-        pool.DIGEST_BASIS_UNDETERMINED, pool.DIGEST_BASIS_ABSENT,
-    ])
+    @pytest.mark.parametrize(
+        "basis",
+        [
+            pool.DIGEST_BASIS_TENSORS,
+            pool.DIGEST_BASIS_FILE,
+            pool.DIGEST_BASIS_UNDETERMINED,
+            pool.DIGEST_BASIS_ABSENT,
+        ],
+    )
     def test_every_basis_has_a_note(self, basis):
         assert basis in pool.DIGEST_BASIS_NOTES
         assert len(pool.DIGEST_BASIS_NOTES[basis]) > 80
 
     def test_the_four_bases_are_distinct(self):
-        bases = {pool.DIGEST_BASIS_TENSORS, pool.DIGEST_BASIS_FILE,
-                 pool.DIGEST_BASIS_UNDETERMINED, pool.DIGEST_BASIS_ABSENT}
+        bases = {
+            pool.DIGEST_BASIS_TENSORS,
+            pool.DIGEST_BASIS_FILE,
+            pool.DIGEST_BASIS_UNDETERMINED,
+            pool.DIGEST_BASIS_ABSENT,
+        }
         assert len(bases) == 4
 
     def test_undetermined_reproducibility_is_none_not_false(self):
@@ -259,7 +326,7 @@ class TestProvenance:
         out = pool.digest_provenance(_merge(created_at=CUTOFF - 1))
         assert out["basis"] == pool.DIGEST_BASIS_FILE
         assert out["reproducible_by_re_merge"] is False
-        # The clause: the reader is TOLD WHY, not left to infer corruption.
+        # The contract: the reader is TOLD WHY, not left to infer corruption.
         note = out["note"]
         assert "filename" in note
         assert "not evidence about the weights" in note
@@ -280,7 +347,7 @@ class TestProvenance:
 # CURRENT_DIGEST_BASIS names what state_dict_digest computes. Nothing in the
 # language ties them together, so a change to the function that forgets the
 # constant would start stamping new records with a basis that is no longer true —
-# the same defect as #0417, with a stamp on it. The golden vector below is the tie.
+# the same defect as the digest-basis rule, with a stamp on it. The golden vector below is the tie.
 
 
 class _StubTensor:
@@ -298,7 +365,9 @@ class _StubTensor:
         def __str__(self) -> str:
             return self._name
 
-    def __init__(self, values, dtype_name: str = "torch.float32", np_dtype="<f4") -> None:
+    def __init__(
+        self, values, dtype_name: str = "torch.float32", np_dtype="<f4"
+    ) -> None:
         self._a = np.asarray(values, dtype=np.dtype(np_dtype))
         self.dtype = self._DType(dtype_name)
 
@@ -348,15 +417,19 @@ class TestDigestFramingIsPinned:
         stopped being hashed, the golden vector above would still pass for the wrong
         reason, because the raw bytes are unchanged."""
         same_bytes_other_dtype = {
-            "encoder.weight": _StubTensor([[1.0, 2.0], [3.0, 4.0]], dtype_name="torch.float16"),
+            "encoder.weight": _StubTensor(
+                [[1.0, 2.0], [3.0, 4.0]], dtype_name="torch.float16"
+            ),
             "decoder.bias": _StubTensor([0.5, -0.5]),
             "diam_labels": _StubTensor([30.0]),
         }
         assert pool.state_dict_digest(same_bytes_other_dtype) != GOLDEN
 
     def test_the_key_names_are_inside_the_hash(self):
-        renamed = {("x." + k if k != "diam_labels" else k): v
-                   for k, v in _golden_state_dict().items()}
+        renamed = {
+            ("x." + k if k != "diam_labels" else k): v
+            for k, v in _golden_state_dict().items()
+        }
         assert pool.state_dict_digest(renamed) != GOLDEN
 
     def test_the_current_stamp_names_the_tensor_meaning(self):
@@ -365,41 +438,398 @@ class TestDigestFramingIsPinned:
 
 # ── writers ──────────────────────────────────────────────────────────────────
 
+
 class TestWritersStampTheBasis:
     def test_a_new_community_manifest_carries_the_basis(self):
         man = pool.build_community_manifest(
-            community_version="v1", combine="uniform", selected_contribution_ids=["c-1"],
-            gate_split={"sha256": "ab"}, witness_split={"sha256": "cd"},
-            selection_metric={"role": "selection"}, witness_metric={"role": "witness"},
-            members=[], architecture_signature="sig", weights_sha256=SHA,
+            community_version="v1",
+            combine="uniform",
+            selected_contribution_ids=["c-1"],
+            gate_split={"sha256": "ab"},
+            witness_split={"sha256": "cd"},
+            selection_metric={"role": "selection"},
+            witness_metric={"role": "witness"},
+            members=[],
+            quarantined=[],
+            architecture_signature="sig",
+            weights_sha256=SHA,
             created_at=AFTER_CUTOFF,
         )
         assert man["weights_sha256_basis"] == pool.CURRENT_DIGEST_BASIS
-        assert pool.digest_basis(man, digest_key="weights_sha256") == pool.DIGEST_BASIS_TENSORS
+        assert (
+            pool.digest_basis(man, digest_key="weights_sha256")
+            == pool.DIGEST_BASIS_TENSORS
+        )
 
     def test_a_stamped_manifest_resolves_with_no_timestamp_at_all(self):
         """The whole point of the stamp: attribution without date-reasoning."""
         man = pool.build_community_manifest(
-            community_version="v1", combine="uniform", selected_contribution_ids=[],
-            gate_split={}, witness_split={}, selection_metric={}, witness_metric={},
-            members=[], architecture_signature="sig", weights_sha256=SHA,
+            community_version="v1",
+            combine="uniform",
+            selected_contribution_ids=[],
+            gate_split={},
+            witness_split={},
+            selection_metric={},
+            witness_metric={},
+            members=[],
+            quarantined=[],
+            architecture_signature="sig",
+            weights_sha256=SHA,
             created_at=AFTER_CUTOFF,
         )
         del man["created_at"]
-        assert pool.digest_basis(man, digest_key="weights_sha256") == pool.DIGEST_BASIS_TENSORS
+        assert (
+            pool.digest_basis(man, digest_key="weights_sha256")
+            == pool.DIGEST_BASIS_TENSORS
+        )
 
     def test_the_index_pointer_carries_the_basis(self):
         """The pointer has no created_at of its own, so without this stamp it is the
         one surface of the three that cannot be attributed from itself."""
         index = {"current_community": None}
         pool.set_current_community(
-            index, community_version="v1", weights_path="community/v1/weights.pt",
-            sha256=SHA, selection_metric={}, witness_metric={},
+            index,
+            community_version="v1",
+            weights_path="community/v1/weights.pt",
+            sha256=SHA,
+            selection_metric={},
+            witness_metric={},
         )
         cur = index["current_community"]
         assert "created_at" not in cur
         assert cur["sha256_basis"] == pool.CURRENT_DIGEST_BASIS
         assert pool.digest_basis(cur, digest_key="sha256") == pool.DIGEST_BASIS_TENSORS
+
+
+# ── the stored-basis stamp: the contribution surface ──────────────────────────────────────────
+#
+# The third writer. ``append_contribution`` stamped nothing, so a contribution's
+# ``weights_sha256`` was the one published digest with no attribution at all — a
+# client re-hashes its own uploaded file, gets a different value from the one the
+# pool publishes, and has no way to tell "the pool digested something else" from
+# "my upload is corrupt".
+#
+# The basis here is the FILE one, and that is NOT CURRENT_DIGEST_BASIS. Measured
+# 2026-11-14 over runtime_cellpose.py: the contribution digest is sha256_file at
+# :634 and has been at every commit that ever touched the line (6eec9581, app
+# 0.20.0, which introduced it), while the cut-over d3040c4f moved only the SOUP
+# digest at :586. The two surfaces were never under one basis, so stamping the
+# community constant here would assert a tensor digest over a hashed file — and be
+# worse than the absence, because digest_basis honours an explicit basis above
+# every other signal. These cases pin the constant that is correct AND that the
+# wrong one is not used.
+#
+# Deliberately NOT asserted through the writer's own return value or its argument
+# dict: what must be stamped is the STORED entry read back out of the index, because a
+# stamp applied to the caller's dict and then dropped on the way in would satisfy
+# any assertion made on the dict.
+
+CONTRIB_SHA = "d" * 64
+CONTRIB_OTHER_SHA = "e" * 64
+# Two DISTINCT instants that STRADDLE the cut-over. The contribution path's digest
+# function never changed, so both must resolve the same way — which is how these
+# cases show the answer comes from the code path rather than from the clock. A
+# resolver that date-reasoned here would split them.
+UPLOADED_OLD = OLDEST_REAL_MERGE
+UPLOADED_NEW = AFTER_CUTOFF
+
+
+def _contribution(
+    cid: str, digest: str, uploaded_at: Any, basis: Any = "<omit>"
+) -> Dict[str, Any]:
+    """A contribution stub in the stored shape. ``basis='<omit>'`` writes no basis
+    key at all — what every record written before the stored-basis stamp looks like, and distinct
+    from a key present and null."""
+    rec: Dict[str, Any] = {
+        "contribution_id": cid,
+        "weights_path": f"contributions/{cid}/weights.pt",
+        "metadata_path": f"contributions/{cid}/metadata.json",
+        "weights_sha256": digest,
+        "architecture_signature": "sig",
+        "samples_seen": 10,
+        "n_train_images": 5,
+        "n_bytes": 1218617275,
+        "uploaded_at": uploaded_at,
+    }
+    if basis != "<omit>":
+        rec["weights_sha256_basis"] = basis
+    return rec
+
+
+class TestContributionsStampTheBasis:
+    def test_a_new_contribution_carries_the_basis_on_the_stored_entry(self):
+        """Read back out of the index rather than off the writer."""
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = index["contributions"][-1]
+        assert stored["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
+        assert pool.contribution_digest_basis(stored) == pool.DIGEST_BASIS_FILE
+
+    def test_the_stamp_is_the_file_basis_and_NOT_the_community_head_constant(self):
+        """The regression test for the obvious wrong fix.
+
+        ``CURRENT_DIGEST_BASIS`` is right at the community builder and wrong here:
+        a contribution's digest comes from ``sha256_file``, so stamping the tensor
+        meaning would assert "sha256 over keys, shapes, dtypes and raw weight
+        bytes" over a hashed file — and it would be BELIEVED, because an explicit
+        basis outranks every other signal in ``digest_basis``. That makes the wrong
+        stamp strictly worse than the absence it replaces, which is why this is
+        pinned rather than left to the constant's name.
+
+        The inequality of the two constants is asserted first: without it, every
+        ``!=`` below would pass vacuously the day they happened to coincide.
+        """
+        assert pool.CONTRIBUTION_DIGEST_BASIS == pool.DIGEST_BASIS_FILE
+        assert pool.CURRENT_DIGEST_BASIS == pool.DIGEST_BASIS_TENSORS
+        assert pool.CONTRIBUTION_DIGEST_BASIS != pool.CURRENT_DIGEST_BASIS
+
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = index["contributions"][-1]
+        assert stored["weights_sha256_basis"] != pool.CURRENT_DIGEST_BASIS
+        assert pool.contribution_digest_basis(stored) != pool.DIGEST_BASIS_TENSORS
+
+    def test_a_stamped_contribution_resolves_with_no_timestamp_at_all(self):
+        """The point of the stamp: attribution without date-reasoning."""
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = dict(index["contributions"][-1])
+        del stored["uploaded_at"]
+        assert pool.contribution_digest_basis(stored) == pool.DIGEST_BASIS_FILE
+
+    def test_two_contributions_under_different_bases_are_distinguishable(self):
+        """THE discrimination this file is for, and the test with teeth.
+
+        One record explicitly stamped with the TENSOR meaning — what a future build
+        whose ``prepare_contribution`` switched digest functions would write — and
+        one appended by today's writer, which is the FILE meaning. Both dates are
+        POST-cutoff and the two differ, so:
+
+          * a resolver hardcoding either meaning reads one of the two wrong;
+          * a resolver leaking a sibling's basis gives both the SAME answer;
+          * a resolver that ignored the stamps and dated the records would call
+            BOTH "undetermined", since neither date is evidence of anything.
+
+        Only reading each record's own stamp first passes.
+        """
+        index: Dict[str, Any] = {
+            "contributions": [
+                _contribution(
+                    "c-tensors",
+                    CONTRIB_OTHER_SHA,
+                    UPLOADED_OLD,
+                    basis=pool.DIGEST_BASIS_TENSORS,
+                )
+            ]
+        }
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        tensors, new = index["contributions"]
+
+        assert tensors["contribution_id"] == "c-tensors"
+        assert new["contribution_id"] == "c-new"
+        assert tensors["weights_sha256"] != new["weights_sha256"]
+        assert tensors["uploaded_at"] != new["uploaded_at"]
+
+        assert pool.contribution_digest_basis(tensors) == pool.DIGEST_BASIS_TENSORS
+        assert pool.contribution_digest_basis(new) == pool.DIGEST_BASIS_FILE
+        assert pool.contribution_digest_basis(
+            tensors
+        ) != pool.contribution_digest_basis(new)
+
+    def test_an_unstamped_contribution_is_the_file_basis_on_BOTH_sides_of_the_cutoff(
+        self,
+    ):
+        """The decision, as behaviour rather than prose: an absent basis
+        means the FILE basis here, and it means it as a PROOF rather than as a
+        dated inference — ``prepare_contribution`` has never computed this value
+        any other way.
+
+        The two records straddle the cut-over instant, which is the discrimination:
+        a resolver that reached this answer by date would call the late one
+        "undetermined", and a reader would then be told a record cannot be
+        attributed when its own code path attributes it with certainty. The
+        cut-over applies to the community head, not to this surface, and these two
+        assertions are what say so in code.
+        """
+        early = _contribution("c-early", CONTRIB_SHA, OLDEST_REAL_MERGE)
+        late = _contribution("c-late", CONTRIB_OTHER_SHA, AFTER_CUTOFF)
+        assert "weights_sha256_basis" not in early
+        assert "weights_sha256_basis" not in late
+        assert early["uploaded_at"] < CUTOFF <= late["uploaded_at"]
+
+        assert pool.contribution_digest_basis(early) == pool.DIGEST_BASIS_FILE
+        assert pool.contribution_digest_basis(late) == pool.DIGEST_BASIS_FILE
+        assert pool.contribution_digest_basis(late) != pool.DIGEST_BASIS_UNDETERMINED
+        assert pool.contribution_digest_basis(late) != pool.DIGEST_BASIS_TENSORS
+
+    def test_the_community_head_still_date_reasons_and_is_untouched(self):
+        """Over-reach control for the new ``absent_basis`` keyword. It is opt-in, so
+        the community surface — whose digest function DID change — must still refuse
+        a post-cutoff record rather than inheriting a default from this change."""
+        late = {"global_sha256": SHA, "created_at": AFTER_CUTOFF}
+        early = {"global_sha256": SHA, "created_at": OLDEST_REAL_MERGE}
+        assert pool.digest_basis(late) == pool.DIGEST_BASIS_UNDETERMINED
+        assert pool.digest_basis(early) == pool.DIGEST_BASIS_FILE
+
+    def test_an_unrecognised_absent_basis_raises_rather_than_degrading(self):
+        """A typo'd constant must not resolve to "undetermined", which is exactly
+        what this module's honest refusal looks like — it would read as working."""
+        rec = _contribution("c-x", CONTRIB_SHA, UPLOADED_NEW)
+        with pytest.raises(ValueError):
+            pool.digest_basis(
+                rec, digest_key="weights_sha256", absent_basis="torch_save_fil"
+            )
+        # Control: the two recognised values do NOT raise on the same call shape.
+        for good in (pool.DIGEST_BASIS_FILE, pool.DIGEST_BASIS_TENSORS):
+            assert (
+                pool.digest_basis(rec, digest_key="weights_sha256", absent_basis=good)
+                == good
+            )
+
+    def test_a_stored_basis_outranks_absent_basis(self):
+        """``absent_basis`` says what a MISSING field means and must not be able to
+        contradict a record that states one — otherwise it would become a way for a
+        caller to overwrite stored data on read."""
+        rec = _contribution(
+            "c-stamped", CONTRIB_SHA, UPLOADED_NEW, basis=pool.DIGEST_BASIS_TENSORS
+        )
+        assert (
+            pool.digest_basis(
+                rec,
+                digest_key="weights_sha256",
+                absent_basis=pool.DIGEST_BASIS_FILE,
+            )
+            == pool.DIGEST_BASIS_TENSORS
+        )
+
+    def test_the_metadata_record_carries_the_same_basis_as_the_index_entry(self):
+        """Both stored records hold the same digest, so both say what it is of. If
+        only one did, the absence on the other would newly mean "written by a build
+        that does not stamp" — the ambiguity this check exists to remove, moved one
+        file sideways."""
+        meta = pool.build_contribution_metadata(
+            contribution_id="c-new",
+            model_type="cpsam",
+            app_version="0.30.6",
+            cellpose_version="4.0.1",
+            architecture_signature="sig",
+            base_checkpoint_id="stock-cpsam",
+            base_checkpoint_sha256=None,
+            samples_seen=10,
+            training_params={},
+            l2_from_base=None,
+            dataset_fingerprint=None,
+            solo_val_metric=None,
+            weights_sha256=CONTRIB_SHA,
+            uploaded_at=UPLOADED_NEW,
+        )
+        assert meta["weights_sha256_basis"] == pool.CONTRIBUTION_DIGEST_BASIS
+        assert pool.contribution_digest_basis(meta) == pool.DIGEST_BASIS_FILE
+
+        index: Dict[str, Any] = {}
+        pool.append_contribution(
+            index, _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        stored = index["contributions"][-1]
+        assert meta["weights_sha256_basis"] == stored["weights_sha256_basis"]
+        # Additive: the field the schema version would have to cover is new, and no
+        # existing one moved.
+        assert meta["schema_version"] == pool.SCHEMA_VERSION
+
+    def test_an_unrecognised_stamp_is_undetermined_not_passed_through(self):
+        """A record written by a NEWER app than this one. Shaped like a real basis,
+        so a check loose enough to accept any string would accept it."""
+        rec = _contribution(
+            "c-future", CONTRIB_SHA, UPLOADED_NEW, basis=NEVER_WRITTEN_BASIS
+        )
+        assert pool.contribution_digest_basis(rec) == pool.DIGEST_BASIS_UNDETERMINED
+
+    def test_a_contribution_with_no_digest_says_so_rather_than_undetermined(self):
+        """``no_digest`` and ``undetermined`` are different answers — "nothing to
+        attribute" vs "cannot attribute" — and collapsing them hides the second.
+
+        The writer also leaves such an entry unstamped: a basis on a record with no
+        digest asserts something about a value that is not there, and the resolver
+        answers ``no_digest`` before it ever reads the field, so it buys nothing."""
+        rec = _contribution("c-empty", "", UPLOADED_NEW)
+        assert pool.contribution_digest_basis(rec) == pool.DIGEST_BASIS_ABSENT
+
+        index: Dict[str, Any] = {}
+        pool.append_contribution(index, rec)
+        stored = index["contributions"][-1]
+        assert "weights_sha256_basis" not in stored
+        # Paired control, so "the writer stamps nothing at all" cannot pass here:
+        # the same writer DOES stamp an entry that carries a digest.
+        pool.append_contribution(
+            index, _contribution("c-full", CONTRIB_SHA, UPLOADED_NEW)
+        )
+        assert (
+            index["contributions"][-1]["weights_sha256_basis"]
+            == pool.CONTRIBUTION_DIGEST_BASIS
+        )
+
+    def test_the_default_keys_misattribute_a_contribution_two_different_ways(self):
+        """Why ``contribution_digest_basis`` exists rather than keyword arguments
+        spelled out at each call site. A contribution's digest key differs from the
+        default AND its absence means something the default does not know, so there
+        are two wrong answers available and neither raises.
+
+        The second is the dangerous one: "undetermined" for a record whose own code
+        path proves the file meaning is indistinguishable from the honest refusal
+        this module exists to give, so it reads as the fix working."""
+        legacy = _contribution("c-legacy", CONTRIB_OTHER_SHA, UPLOADED_OLD)
+
+        assert pool.digest_basis(legacy) == pool.DIGEST_BASIS_ABSENT
+        assert (
+            pool.digest_basis(legacy, digest_key="weights_sha256")
+            == pool.DIGEST_BASIS_UNDETERMINED
+        )
+        # The named resolver is the only one of the three that is right.
+        assert pool.contribution_digest_basis(legacy) == pool.DIGEST_BASIS_FILE
+
+    def test_appending_back_fills_nothing_and_does_not_mutate_the_caller(self):
+        """Existing stored records keep having no basis — they resolve to
+        the file meaning from the code path on every read, where the inference stays
+        visible as one — and the dict the caller passed in is left alone, so nothing
+        it might also be holding is rewritten."""
+        legacy = _contribution("c-legacy", CONTRIB_OTHER_SHA, UPLOADED_OLD)
+        index: Dict[str, Any] = {"contributions": [legacy]}
+        before = dict(legacy)
+
+        fresh = _contribution("c-new", CONTRIB_SHA, UPLOADED_NEW)
+        pool.append_contribution(index, fresh)
+
+        assert index["contributions"][0] is legacy, "the stored record was replaced"
+        assert legacy == before, "the stored record was rewritten"
+        assert "weights_sha256_basis" not in index["contributions"][0]
+        assert "weights_sha256_basis" not in fresh, "the caller's dict was mutated"
+        # Paired with the above so "nothing was written" cannot pass: the new entry
+        # DID get the stamp, which is the whole change.
+        assert (
+            index["contributions"][1]["weights_sha256_basis"]
+            == pool.CONTRIBUTION_DIGEST_BASIS
+        )
+
+    def test_the_refused_duplicate_append_stamps_nothing(self):
+        """The dedupe backstop still fires, and the stamp does not reach the
+        index on the path that raises."""
+        index: Dict[str, Any] = {
+            "contributions": [_contribution("c-first", CONTRIB_SHA, UPLOADED_OLD)]
+        }
+        with pytest.raises(ValueError):
+            pool.append_contribution(
+                index, _contribution("c-retry", CONTRIB_SHA, UPLOADED_NEW)
+            )
+        assert len(index["contributions"]) == 1
+        assert "weights_sha256_basis" not in index["contributions"][0]
 
 
 # ── the wire projection ──────────────────────────────────────────────────────
@@ -408,12 +838,23 @@ class TestWritersStampTheBasis:
 # its own; a copy imported from there could not detect that file being edited to
 # accept a widened contract, which is the thing this controls for.
 PINNED_SOUP_KEYS_0_13_0_DRAFT = {
-    "soup_id", "index", "merged_at", "assessed", "contributions",
-    "selection_metric", "witness_metric", "global_sha256", "weights",
-    "transport", "community_model",
+    "soup_id",
+    "index",
+    "merged_at",
+    "assessed",
+    "contributions",
+    "selection_metric",
+    "witness_metric",
+    "global_sha256",
+    "weights",
+    "transport",
+    "community_model",
 }
 PINNED_EMPTY_MERGE_KEYS_0_13_0_DRAFT = {
-    "merged_at", "assessed", "selection_metric", "transport",
+    "merged_at",
+    "assessed",
+    "selection_metric",
+    "transport",
 }
 
 
@@ -433,8 +874,9 @@ class TestWireProjection:
     def test_a_legacy_pool_attributes_every_published_head_to_the_file_digest(self):
         """A pool as the live ones are: pre-cutoff, no stamp anywhere."""
         wire = pool.pool_wire_state(
-            _index([_merge(version="v1", sha=SHA),
-                    _merge(version="v2", sha=OTHER_SHA)]),
+            _index(
+                [_merge(version="v1", sha=SHA), _merge(version="v2", sha=OTHER_SHA)]
+            ),
             pool_artifact_id=POOL_ID,
         )
         prov = wire["digest_provenance"]["soups"]
@@ -459,8 +901,14 @@ class TestWireProjection:
             _index([_merge(version="v1", created_at=OLDEST_REAL_MERGE)]),
             pool_artifact_id=POOL_ID,
         )
-        assert wire["digest_provenance"]["current_community"]["basis"] == pool.DIGEST_BASIS_FILE
-        assert wire["current_community"]["sha256_provenance"]["basis"] == pool.DIGEST_BASIS_FILE
+        assert (
+            wire["digest_provenance"]["current_community"]["basis"]
+            == pool.DIGEST_BASIS_FILE
+        )
+        assert (
+            wire["current_community"]["sha256_provenance"]["basis"]
+            == pool.DIGEST_BASIS_FILE
+        )
 
     def test_the_pointer_is_undetermined_when_no_merge_publishes_its_version(self):
         """An index whose pointer names a version the timeline does not contain — an
@@ -469,7 +917,10 @@ class TestWireProjection:
         index = _index([_merge(version="v1")])
         index["current_community"]["version"] = "v9"
         wire = pool.pool_wire_state(index, pool_artifact_id=POOL_ID)
-        assert wire["digest_provenance"]["current_community"]["basis"] == pool.DIGEST_BASIS_UNDETERMINED
+        assert (
+            wire["digest_provenance"]["current_community"]["basis"]
+            == pool.DIGEST_BASIS_UNDETERMINED
+        )
 
     def test_a_post_cutoff_unstamped_pool_reports_undetermined(self):
         """The negative control at projection level: a pool written in the window
@@ -485,11 +936,23 @@ class TestWireProjection:
     def test_a_pool_written_by_this_app_resolves_to_tensors_end_to_end(self):
         """Index built the way the entry now builds one: stamp on the merge record
         and on the pointer. No date reasoning is involved in either answer."""
-        index = _index([_merge(version="v1", created_at=AFTER_CUTOFF,
-                               basis=pool.CURRENT_DIGEST_BASIS)], current=None)
+        index = _index(
+            [
+                _merge(
+                    version="v1",
+                    created_at=AFTER_CUTOFF,
+                    basis=pool.CURRENT_DIGEST_BASIS,
+                )
+            ],
+            current=None,
+        )
         pool.set_current_community(
-            index, community_version="v1", weights_path="community/v1/weights.pt",
-            sha256=SHA, selection_metric={}, witness_metric={},
+            index,
+            community_version="v1",
+            weights_path="community/v1/weights.pt",
+            sha256=SHA,
+            selection_metric={},
+            witness_metric={},
         )
         wire = pool.pool_wire_state(index, pool_artifact_id=POOL_ID)
         prov = wire["digest_provenance"]
@@ -499,7 +962,8 @@ class TestWireProjection:
 
     def test_a_pool_with_no_published_head_has_no_pointer_provenance(self):
         wire = pool.pool_wire_state(
-            _index([_merge(version=None, sha=None)]), pool_artifact_id=POOL_ID)
+            _index([_merge(version=None, sha=None)]), pool_artifact_id=POOL_ID
+        )
         assert wire["current_community"] is None
         assert wire["digest_provenance"]["current_community"] is None
         assert wire["digest_provenance"]["soups"] == {}
@@ -546,13 +1010,15 @@ def _read_manifest_of(instance):
 
 @pytest.mark.asyncio
 async def test_a_legacy_manifest_is_attributed_on_read_back():
-    stub = _Entry({
-        "community_version": "v1",
-        "weights_sha256": SHA,
-        "created_at": OLDEST_REAL_MERGE,
-        "selection_metric": {"role": "selection"},
-        "witness_metric": {"role": "witness"},
-    })
+    stub = _Entry(
+        {
+            "community_version": "v1",
+            "weights_sha256": SHA,
+            "created_at": OLDEST_REAL_MERGE,
+            "selection_metric": {"role": "selection"},
+            "witness_metric": {"role": "witness"},
+        }
+    )
     out = await _read_manifest_of(stub)(_AM(), POOL_ID, "v1")
 
     assert out["sha256"] == SHA
@@ -563,14 +1029,16 @@ async def test_a_legacy_manifest_is_attributed_on_read_back():
 
 @pytest.mark.asyncio
 async def test_a_stamped_manifest_is_attributed_without_its_date():
-    stub = _Entry({
-        "community_version": "v4",
-        "weights_sha256": SHA,
-        "weights_sha256_basis": pool.DIGEST_BASIS_TENSORS,
-        "created_at": AFTER_CUTOFF,
-        "selection_metric": {},
-        "witness_metric": {},
-    })
+    stub = _Entry(
+        {
+            "community_version": "v4",
+            "weights_sha256": SHA,
+            "weights_sha256_basis": pool.DIGEST_BASIS_TENSORS,
+            "created_at": AFTER_CUTOFF,
+            "selection_metric": {},
+            "witness_metric": {},
+        }
+    )
     out = await _read_manifest_of(stub)(_AM(), POOL_ID, "v4")
     assert out["sha256_provenance"]["basis"] == pool.DIGEST_BASIS_TENSORS
     assert out["sha256_provenance"]["reproducible_by_re_merge"] is True
@@ -579,13 +1047,15 @@ async def test_a_stamped_manifest_is_attributed_without_its_date():
 @pytest.mark.asyncio
 async def test_a_manifest_written_in_the_unstamped_window_is_undetermined():
     """Neither a stamp nor a usable date — the state the fix must not paper over."""
-    stub = _Entry({
-        "community_version": "v4",
-        "weights_sha256": SHA,
-        "created_at": AFTER_CUTOFF,
-        "selection_metric": {},
-        "witness_metric": {},
-    })
+    stub = _Entry(
+        {
+            "community_version": "v4",
+            "weights_sha256": SHA,
+            "created_at": AFTER_CUTOFF,
+            "selection_metric": {},
+            "witness_metric": {},
+        }
+    )
     out = await _read_manifest_of(stub)(_AM(), POOL_ID, "v4")
     assert out["sha256_provenance"]["basis"] == pool.DIGEST_BASIS_UNDETERMINED
     assert out["sha256_provenance"]["reproducible_by_re_merge"] is None
@@ -615,7 +1085,7 @@ HEAD_SHA = "e" * 64
 
 # Large enough that pool.soup_admission never refuses: this harness is about the
 # attribution of a digest, and a refusal would exit before one exists.
-_BUDGET = {"declared_bytes": 64 * 1024 ** 3, "rss_bytes": 1024 ** 3}
+_BUDGET = {"declared_bytes": 64 * 1024**3, "rss_bytes": 1024**3}
 
 
 class _AggResp(_Resp):
@@ -646,12 +1116,47 @@ class _Runtime:
     async def soup_memory_budget(self) -> Dict[str, Any]:
         return dict(_BUDGET)
 
-    async def score_soup(self, specs, imgs, gts, diam_mean) -> Dict[str, Any]:
-        return {"f1": self._f1, "replica": "r0", "soup_dl_bytes": 0}
+    async def verify_members(self, specs) -> Dict[str, Any]:
+        """Every member hashes to what the pool recorded for it.
 
-    async def materialize_soup(self, specs, url) -> Dict[str, Any]:
-        return {"sha256": self._sha, "n_bytes": 2048,
-                "replica": "r0", "soup_dl_bytes": 0}
+        This harness is about how a digest is ATTRIBUTED once it exists, so it
+        deliberately presents a pool with nothing to quarantine; the quarantine
+        behaviour itself is driven end to end in ``test_merge_quarantine.py``,
+        where the runtime is allowed to disagree with the index.
+        """
+        return {
+            "digests": {s["key"]: s["sha256"] for s in specs},
+            "replica": "r0",
+            "soup_dl_bytes": 0,
+        }
+
+    async def score_soup(
+        self, specs, imgs, gts, diam_mean, base_commitment=None
+    ) -> Dict[str, Any]:
+        # One per-image score per image of the split, as the real runtime returns.
+        # Uniform, so the mean is exactly the ``f1`` the caller chose —
+        # aggregate() refuses a record whose aggregate is not the mean of the
+        # vector beside it, so a stub returning an arbitrary vector would make
+        # every branch below fail for a reason that is not under test here.
+        # ``base_commitment`` is accepted and ignored: the base-commitment rules made it part of the
+        # call, and a stub that rejected it would fail on the signature rather
+        # than on anything this file is about.
+        return {
+            "f1": self._f1,
+            "per_image": [self._f1] * max(len(gts), 1),
+            "replica": "r0",
+            "soup_dl_bytes": 0,
+        }
+
+    async def materialize_soup(
+        self, specs, url, base_commitment=None
+    ) -> Dict[str, Any]:
+        return {
+            "sha256": self._sha,
+            "n_bytes": 2048,
+            "replica": "r0",
+            "soup_dl_bytes": 0,
+        }
 
 
 class _Merging:
@@ -729,13 +1234,15 @@ def _pool_index() -> Dict[str, Any]:
             "witness_metric": {"role": "witness", "aggregate": 0.40},
             "created_at": OLDEST_REAL_MERGE,
         },
-        "contributions": [{
-            "contribution_id": "c-1",
-            "weights_path": "contributions/c-1/weights.pt",
-            "n_bytes": 4096,
-            "uploaded_at": OLDEST_REAL_MERGE,
-            "weights_sha256": OTHER_SHA,
-        }],
+        "contributions": [
+            {
+                "contribution_id": "c-1",
+                "weights_path": "contributions/c-1/weights.pt",
+                "n_bytes": 4096,
+                "uploaded_at": OLDEST_REAL_MERGE,
+                "weights_sha256": OTHER_SHA,
+            }
+        ],
     }
 
 
@@ -750,9 +1257,12 @@ async def _run_merge(f1: float):
     result = await _aggregate_of(stub)(
         pool_artifact_id=POOL_ID,
         pool_token="t",
-        gate_val_images=[], gate_val_labels=[],
-        witness_val_images=[], witness_val_labels=[],
-        gate_split=dict(GATE_SPLIT), witness_split=dict(WITNESS_SPLIT),
+        gate_val_images=[],
+        gate_val_labels=[],
+        witness_val_images=[],
+        witness_val_labels=[],
+        gate_split=dict(GATE_SPLIT),
+        witness_split=dict(WITNESS_SPLIT),
     )
     return result, index
 
@@ -799,7 +1309,7 @@ async def test_a_merge_that_admitted_nothing_stamps_a_null_basis_not_an_absent_o
 
 @pytest.mark.asyncio
 async def test_aggregate_returns_the_attribution_of_the_digest_it_just_published():
-    """The moment the #0417 false alarm actually happens: a caller re-merges an
+    """The moment the false alarm the digest-basis rule removes actually happens: a caller re-merges an
     identical member set, gets a number, and compares it against a stored one. Both
     numbers are in their hands HERE, so the attribution has to travel with the
     return value and not only on a page they would have to go and read."""

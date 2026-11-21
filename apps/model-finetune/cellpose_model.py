@@ -13,6 +13,7 @@ The exported ``pytorch_state_dict`` is the bare ``net`` state dict (what
 ``net.save_model`` writes during training), loaded via ``load_state_dict`` below.
 Kept in sync with ``apps/cellpose-finetuning/model_template.py``.
 """
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -75,8 +76,21 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
             self.net = CPSAM(dtype=dtype).to(self.device)
             self.backbone = "sam_vitl"
 
-        self.net.diam_labels = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
-        self.net.diam_mean = nn.Parameter(torch.tensor([diam_mean]), requires_grad=False)
+        # Registered by iterating pool.NON_WEIGHT_PARAMS rather than by naming the
+        # two fields, so the set the federated merge EXCLUDES and the set this
+        # wrapper CREATES are one list, declared once. Adding a non-learned
+        # Parameter here without declaring it there is now impossible: there is
+        # nowhere else to add it. requires_grad=False is the declaration that these
+        # are not learned; it is not serialised into a state_dict, which is why the
+        # merge has to be told the names at all.
+        import pool
+
+        for _name in sorted(pool.NON_WEIGHT_PARAMS):
+            setattr(
+                self.net,
+                _name,
+                nn.Parameter(torch.tensor([diam_mean]), requires_grad=False),
+            )
 
         self.nclasses = 3
         self.channel_axis = None
@@ -84,7 +98,9 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
     def load_state_dict(self, state_dict, strict=True, assign=False):
         from collections import namedtuple
 
-        Incompatible = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
+        Incompatible = namedtuple(
+            "IncompatibleKeys", ["missing_keys", "unexpected_keys"]
+        )
 
         result = self.net.load_state_dict(state_dict, strict=strict)
 
@@ -113,7 +129,9 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
             if img_np.shape[2] == 1:
                 img_np = np.concatenate([img_np, img_np, img_np], axis=2)
             elif img_np.shape[2] == 2:
-                img_np = np.concatenate([img_np, np.zeros_like(img_np[:, :, 0:1])], axis=2)
+                img_np = np.concatenate(
+                    [img_np, np.zeros_like(img_np[:, :, 0:1])], axis=2
+                )
             elif img_np.shape[2] > 3:
                 img_np = img_np[:, :, :3]
             image_list.append(img_np)
@@ -131,7 +149,9 @@ class CellposeSAMWrapper(nn.Module, cpmodels.CellposeModel):
         )
 
         if isinstance(masks_list, list):
-            masks = torch.stack([torch.from_numpy(np.array(m, dtype=np.float32)) for m in masks_list])
+            masks = torch.stack(
+                [torch.from_numpy(np.array(m, dtype=np.float32)) for m in masks_list]
+            )
         else:
             masks = torch.from_numpy(np.array(masks_list, dtype=np.float32))
 

@@ -1,0 +1,71 @@
+name: Lint
+
+# A gate, not advice. The directive behind this is that a rule which CAN be
+# mechanised should be a check that fails rather than a sentence a reviewer has
+# to remember. `black` is the only formatter this repo configures
+# (`[tool.black]` in pyproject.toml, line-length 88, target py311), so it is
+# the only thing asserted here — this deliberately does not introduce isort,
+# ruff or flake8, which would each be a new opinion rather than enforcement of
+# an existing one.
+#
+# The version is PINNED to the one in requirements-test.txt. An unpinned black
+# reformats differently between releases, so a floating version turns this from
+# a gate into an intermittent failure that nobody can reproduce locally — and
+# the first symptom is a red check on a PR that changed nothing relevant.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  black:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install black at the pinned version
+        run: |
+          set -euo pipefail
+          # Read the pin from requirements-test.txt rather than repeating it
+          # here, so the two cannot drift apart silently.
+          pin=$(grep -E '^black==' requirements-test.txt)
+          echo "installing: $pin"
+          python -m pip install --quiet "$pin"
+          python -m black --version
+
+      - name: Prove the check can FAIL before trusting that it passed
+        run: |
+          set -euo pipefail
+          # A formatter that is misconfigured, or pointed at no files, reports
+          # success and says nothing. This runs black against a file that is
+          # definitely misformatted and asserts it is rejected, so a green
+          # result below means "the code is formatted" rather than "the check
+          # did not run".
+          tmp=$(mktemp -d)
+          printf 'x = {  1:2,   3:4 }\ndef  f( a ):\n  return a\n' > "$tmp/ugly.py"
+          if python -m black --check "$tmp/ugly.py"; then
+            echo "::error::black accepted a deliberately misformatted file - this gate is vacuous"
+            exit 1
+          fi
+          echo "control OK: black rejected the misformatted file"
+
+      - name: black --check
+        run: |
+          set -euo pipefail
+          # Named paths rather than `.` so a new top-level directory is a
+          # deliberate addition here instead of silently joining the gate.
+          # --check alone would pass on an empty file list, so the count is
+          # asserted too.
+          paths="bioengine tests apps scripts .github"
+          n=$(find $paths -name '*.py' | wc -l)
+          echo "python files in scope: $n"
+          if [ "$n" -lt 100 ]; then
+            echo "::error::only $n python files in scope - the path list is wrong, not the repo"
+            exit 1
+          fi
+          python -m black --check --diff $paths

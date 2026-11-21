@@ -47,6 +47,7 @@ def _make_manager(delete_raises: bool) -> AppsManager:
     manager._missing_from_status = {APP_ID: 2}
     manager._deleted_pending_redeploy = {APP_ID}
     manager._identity_warned = {APP_ID}
+    manager._last_controller_recovery = 0.0
     manager._deployed_applications = {
         APP_ID: {
             "is_deployed": is_deployed,
@@ -66,8 +67,7 @@ def _make_manager(delete_raises: bool) -> AppsManager:
     if delete_raises:
         ray_cluster.call_with_reconnect = AsyncMock(
             side_effect=RuntimeError(
-                "Some of these applications weren't deleted after 60s: "
-                f"['{APP_ID}']"
+                "Some of these applications weren't deleted after 60s: " f"['{APP_ID}']"
             )
         )
     else:

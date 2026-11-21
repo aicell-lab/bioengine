@@ -236,7 +236,9 @@ async def test_proxy_counts_an_answered_call(tmp_path: Path, monkeypatch) -> Non
     assert stats["by_method"]["infer"][EXTERNAL]["answered"] == 1
 
 
-async def test_proxy_counts_a_raising_call_as_failed(tmp_path: Path, monkeypatch) -> None:
+async def test_proxy_counts_a_raising_call_as_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
     async def boom(*args, **kwargs):
         raise RuntimeError("CUDA error")
 
@@ -247,9 +249,7 @@ async def test_proxy_counts_a_raising_call_as_failed(tmp_path: Path, monkeypatch
         await call(context=_user_context())
     await proxy._flush_usage()
 
-    assert read_usage(tmp_path / "ledger")["totals"] == _totals(
-        attempted=1, failed=1
-    )
+    assert read_usage(tmp_path / "ledger")["totals"] == _totals(attempted=1, failed=1)
 
 
 async def test_a_call_that_never_returns_counts_as_attempted_only(
@@ -597,7 +597,9 @@ def test_a_caller_with_no_key_to_the_hosting_workspace_is_external() -> None:
     context = _user_context(scope={"workspaces": {"ws-user-u-1": "a"}})
     assert classify_caller(context, "host-ws") == EXTERNAL
 
-    assert classify_caller(_user_context(scope={"workspaces": {}}), "host-ws") == EXTERNAL
+    assert (
+        classify_caller(_user_context(scope={"workspaces": {}}), "host-ws") == EXTERNAL
+    )
     assert classify_caller(_user_context(), "host-ws") == EXTERNAL
 
 
@@ -608,16 +610,12 @@ def test_a_grant_on_some_other_workspace_is_external() -> None:
 
 def test_a_named_authorized_user_is_internal() -> None:
     context = _user_context()
-    assert (
-        classify_caller(context, "host-ws", {"*": ["u@example.org"]}) == INTERNAL
-    )
+    assert classify_caller(context, "host-ws", {"*": ["u@example.org"]}) == INTERNAL
 
 
 def test_a_token_account_is_matched_through_its_parent() -> None:
     context = {"user": {"id": "blossom-account-1", "parent": "real-account"}}
-    assert (
-        classify_caller(context, "host-ws", {"*": ["real-account"]}) == INTERNAL
-    )
+    assert classify_caller(context, "host-ws", {"*": ["real-account"]}) == INTERNAL
 
 
 def test_public_authorization_does_not_make_every_caller_internal() -> None:
@@ -927,7 +925,9 @@ async def test_a_hypha_client_can_call_usage_stats_on_the_registered_service(
     assert set(stats["totals"]) == set(EVENTS)
 
 
-def test_an_app_without_durable_storage_still_deploys(tmp_path: Path, monkeypatch) -> None:
+def test_an_app_without_durable_storage_still_deploys(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.delenv("BIOENGINE_APP_DIR", raising=False)
     inst = object.__new__(ProxyDouble)
     inst.application_id = "counted-app"

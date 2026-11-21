@@ -3,13 +3,13 @@
 
 Each app under ``apps/`` ships its tests inside the bundle published to Hypha,
 and ``pytest.ini`` sets ``testpaths = tests``, so ``pytest tests/`` never
-collects them (backlog #0247). The apps CI runs cannot simply be ``apps/*``:
+collects them. The apps CI runs cannot simply be ``apps/*``:
 some apps' suites need that app's own image, which the CI runner does not have.
 
 So the set is declared in ``.github/app-bundle-suites.json`` and RECONCILED
 against what is on disk. An app that ships ``test_*.py`` and is named in
 neither table fails the job, rather than having its tests collected by nobody
-while every step reports success (backlog #0423). The registry is one file, so
+while every step reports success. The registry is one file, so
 the list CI iterates and the floors it asserts cannot drift apart.
 
   reconcile   refuse unless the registry and the tree agree
@@ -55,7 +55,9 @@ def load_registry(root: str) -> tuple[dict[str, int], dict[str, str]]:
         raise Refusal(f"{REGISTRY} must hold two objects, 'run' and 'skip'")
     for app, floor in run.items():
         if not isinstance(floor, int) or floor < 1:
-            raise Refusal(f"{REGISTRY}: run['{app}'] must be a floor >= 1, got {floor!r}")
+            raise Refusal(
+                f"{REGISTRY}: run['{app}'] must be a floor >= 1, got {floor!r}"
+            )
     for app, reason in skip.items():
         if not isinstance(reason, str) or not reason.strip():
             raise Refusal(f"{REGISTRY}: skip['{app}'] must say WHY CI cannot run it")
@@ -94,7 +96,7 @@ def reconcile(root: str) -> list[str]:
             f"{', '.join(undeclared)} ship(s) in-bundle {TEST_GLOB} that no CI step "
             f"runs. Add each to {REGISTRY}: to 'run' with a floor on the number of "
             "tests that must execute (measure it), or to 'skip' with the reason CI "
-            "cannot run it. This refusal is the point of backlog #0423 — without it "
+            "cannot run it. This refusal is the point of this gate — without it "
             "those tests are collected by nobody and the job still reports success."
         )
 
@@ -129,12 +131,16 @@ def assert_ran(root: str, reports_dir: str) -> None:
         try:
             root_el = ET.parse(path).getroot()
         except (OSError, ET.ParseError) as e:
-            bad.append(f"{app}: no readable JUnit report, so nothing attests a run: {e}")
+            bad.append(
+                f"{app}: no readable JUnit report, so nothing attests a run: {e}"
+            )
             continue
         suites = root_el.findall("testsuite") or [root_el]
         total = sum(int(s.get("tests", 0)) for s in suites)
         skipped = sum(int(s.get("skipped", 0)) for s in suites)
-        failed = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+        failed = sum(
+            int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites
+        )
         ran = total - skipped
         print(
             f"{app}: collected={total} skipped={skipped} ran={ran} "
@@ -154,9 +160,7 @@ def assert_ran(root: str, reports_dir: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "command", choices=("reconcile", "list", "assert-ran")
-    )
+    parser.add_argument("command", choices=("reconcile", "list", "assert-ran"))
     parser.add_argument(
         "--root",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."),

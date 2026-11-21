@@ -10,7 +10,7 @@ because Ray builds runtime_env venvs with ``--system-site-packages``:
   A pin here would install a venv-local copy shadowing the inherited one.
 * ``httpx`` is NOT (nor is ``httpcore``), while ``hypha-rpc`` declares a *bare*
   ``httpx``. So the hypha-rpc pin alone already pip-installs httpx into every
-  replica venv at whatever version PyPI serves that minute — #0020's drift
+  replica venv at whatever version PyPI serves that minute — the drift
   mechanism, one package over. Naming httpx here changes which version lands,
   not whether it lands.
 
@@ -67,7 +67,7 @@ def test_no_replica_entry_is_left_unpinned() -> None:
 def test_each_pin_is_read_from_the_installed_distribution(
     monkeypatch, package: str
 ) -> None:
-    """#0020's mutation, applied to this list. A hardcoded ``0.28.1`` passes
+    """The mutation, applied to this list. A hardcoded ``0.28.1`` passes
     every assertion above for as long as it happens to match what the image
     resolved. Move the installed version out from under the worker and the
     emitted pin has to move with it."""

@@ -804,9 +804,9 @@ class SlurmWorkers:
         # carry a `required_resources` field, so probe each candidate).
         required_resources = None
         for resource_type in ("actors", "tasks", "jobs"):
-            pending_items = self.ray_cluster.status["cluster"][
-                "pending_resources"
-            ].get(resource_type, [])
+            pending_items = self.ray_cluster.status["cluster"]["pending_resources"].get(
+                resource_type, []
+            )
             for item in reversed(pending_items):
                 candidate = item.get("required_resources") if item else None
                 if candidate:
@@ -1201,10 +1201,13 @@ class SlurmWorkers:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "squeue",
-                "-u", os.environ["USER"],
-                "-n", self.job_name,
+                "-u",
+                os.environ["USER"],
+                "-n",
+                self.job_name,
                 "-h",
-                "-o", "%i|%T|%V|%S|%l|%M|%R|%N",
+                "-o",
+                "%i|%T|%V|%S|%l|%M|%R|%N",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1227,7 +1230,9 @@ class SlurmWorkers:
             parts = line.split("|")
             if len(parts) < 8:
                 continue
-            job_id, state, submit_s, start_s, time_limit_s, elapsed_s, reason, node = parts
+            job_id, state, submit_s, start_s, time_limit_s, elapsed_s, reason, node = (
+                parts
+            )
             submit_t = self._parse_slurm_timestamp(submit_s)
             start_t = self._parse_slurm_timestamp(start_s)
             time_limit = self._parse_slurm_duration(time_limit_s)
@@ -1239,15 +1244,17 @@ class SlurmWorkers:
                     remaining = max(0, time_limit - elapsed)
                 else:
                     remaining = None
-                running.append({
-                    "job_id": job_id,
-                    "state": state,
-                    "node": node or None,
-                    "start_time": start_t,
-                    "time_limit_seconds": time_limit,
-                    "elapsed_seconds": elapsed,
-                    "remaining_seconds": remaining,
-                })
+                running.append(
+                    {
+                        "job_id": job_id,
+                        "state": state,
+                        "node": node or None,
+                        "start_time": start_t,
+                        "time_limit_seconds": time_limit,
+                        "elapsed_seconds": elapsed,
+                        "remaining_seconds": remaining,
+                    }
+                )
             elif state in ("PENDING", "CONFIGURING"):
                 # Only states that have not yet started the user payload.
                 # Terminal states (COMPLETING, COMPLETED, CANCELLED, FAILED,
@@ -1259,13 +1266,15 @@ class SlurmWorkers:
                     pending_secs = max(0, int(now - submit_t))
                 else:
                     pending_secs = None
-                queued.append({
-                    "job_id": job_id,
-                    "state": state,
-                    "submit_time": submit_t,
-                    "pending_seconds": pending_secs,
-                    "reason": reason,
-                })
+                queued.append(
+                    {
+                        "job_id": job_id,
+                        "state": state,
+                        "submit_time": submit_t,
+                        "pending_seconds": pending_secs,
+                        "reason": reason,
+                    }
+                )
             # else: terminal state — skip
         return {"queued": queued, "running": running}
 

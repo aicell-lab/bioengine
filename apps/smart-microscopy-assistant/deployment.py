@@ -225,7 +225,11 @@ def _assert_same_origin_url(url: str) -> str:
     parsed = urlparse(url)
     # `netloc` keeps any userinfo, so `https://<expected>@evil.example/`
     # would pass a naive comparison while resolving to `evil.example`.
-    if parsed.scheme != "https" or "@" in parsed.netloc or parsed.netloc.lower() != expected:
+    if (
+        parsed.scheme != "https"
+        or "@" in parsed.netloc
+        or parsed.netloc.lower() != expected
+    ):
         raise ValueError(
             f"Refusing to fetch {url.split('?', 1)[0]!r}: only https URLs on "
             f"{expected} are accepted. Pass a Hypha artifact reference "
@@ -331,6 +335,7 @@ class SmartMicroscopyAssistant:
     @bioengine.async_init
     async def _async_init(self) -> None:
         import os as _os
+
         for d in ("/tmp/triton-cache", "/tmp/hf-home", "/tmp/xdg-cache"):
             _os.makedirs(d, exist_ok=True)
         self._tests_dir = _resolve_tests_dir()
@@ -338,7 +343,9 @@ class SmartMicroscopyAssistant:
         existing = self._list_all_test_records()
         logger.info(
             "Visual-test library at %s (%d test%s)",
-            self._tests_dir, len(existing), "" if len(existing) == 1 else "s",
+            self._tests_dir,
+            len(existing),
+            "" if len(existing) == 1 else "s",
         )
 
         import transformers
@@ -355,7 +362,9 @@ class SmartMicroscopyAssistant:
         dtype = getattr(torch, _BACKEND["compute_dtype"])
         logger.info(
             "Loading %s weights on cuda:0 (%s, %s compute, booked %d MB)...",
-            _MODEL_NAME, _BACKEND["quantization"], _BACKEND["compute_dtype"],
+            _MODEL_NAME,
+            _BACKEND["quantization"],
+            _BACKEND["compute_dtype"],
             _BACKEND["gpu_memory_mb"],
         )
         # The vision tower stays unquantised: it is a small share of the
@@ -542,7 +551,9 @@ class SmartMicroscopyAssistant:
         # Redirects are followed by hand so every hop is re-checked. Letting
         # httpx follow them would check only the caller's URL, and a
         # same-origin URL is free to redirect anywhere.
-        async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT_S, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=_DOWNLOAD_TIMEOUT_S, follow_redirects=False
+        ) as client:
             for _ in range(_MAX_REDIRECTS + 1):
                 try:
                     async with client.stream("GET", url) as resp:
@@ -568,10 +579,14 @@ class SmartMicroscopyAssistant:
                 except httpx.HTTPError as e:
                     # The httpx traceback carries the replica's venv path, so
                     # the caller gets the reason and nothing about the host.
-                    raise ValueError(f"Could not fetch the image: {type(e).__name__}.") from None
+                    raise ValueError(
+                        f"Could not fetch the image: {type(e).__name__}."
+                    ) from None
                 break
             else:
-                raise ValueError(f"Image URL redirected more than {_MAX_REDIRECTS} times.")
+                raise ValueError(
+                    f"Image URL redirected more than {_MAX_REDIRECTS} times."
+                )
 
         try:
             img = Image.open(io.BytesIO(bytes(buf)))
@@ -594,7 +609,7 @@ class SmartMicroscopyAssistant:
         needs_resize = (w * h > max_pixels) or (long_side > max_long_side)
         if needs_resize:
             t_resize = time.time()
-            scale_pix  = (max_pixels / (w * h)) ** 0.5 if w * h > max_pixels else 1.0
+            scale_pix = (max_pixels / (w * h)) ** 0.5 if w * h > max_pixels else 1.0
             scale_side = max_long_side / long_side if long_side > max_long_side else 1.0
             scale = min(scale_pix, scale_side)
             new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
@@ -602,7 +617,11 @@ class SmartMicroscopyAssistant:
             original_size = (w, h)
             logger.info(
                 "Downscaled %sx%s -> %sx%s (ratio %.3f, %.1f ms)",
-                w, h, new_size[0], new_size[1], scale,
+                w,
+                h,
+                new_size[0],
+                new_size[1],
+                scale,
                 (time.time() - t_resize) * 1000,
             )
         return img, original_size
@@ -682,7 +701,7 @@ class SmartMicroscopyAssistant:
     async def _save_example_images(
         self,
         test_dir: Path,
-        side: str,                 # "positive" or "negative"
+        side: str,  # "positive" or "negative"
         image_refs: List[str],
         token: Optional[str] = None,
     ) -> list[str]:
@@ -723,11 +742,17 @@ class SmartMicroscopyAssistant:
         self, image: "Image.Image", instruction: str, max_new_tokens: int
     ) -> tuple[str, int]:
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT_DESCRIBE}]},
-            {"role": "user", "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": instruction},
-            ]},
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": self._SYSTEM_PROMPT_DESCRIBE}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": instruction},
+                ],
+            },
         ]
         return await self._generate_with_images(messages, [image], max_new_tokens)
 
@@ -744,40 +769,57 @@ class SmartMicroscopyAssistant:
         fail_text = (visual_test.get("fail_criterion") or "").strip()
 
         user_content: List[Dict[str, Any]] = [
-            {"type": "text", "text":
-                f"Visual test: {visual_test['name']}\n"
+            {
+                "type": "text",
+                "text": f"Visual test: {visual_test['name']}\n"
                 f"PASS condition: {pass_text or '(none specified)'}\n"
-                f"FAIL condition: {fail_text or '(none specified)'}"},
+                f"FAIL condition: {fail_text or '(none specified)'}",
+            },
         ]
         if positive_images:
-            user_content.append({"type": "text", "text":
-                "Reference images that PASS this criterion:"})
+            user_content.append(
+                {"type": "text", "text": "Reference images that PASS this criterion:"}
+            )
             for img in positive_images:
                 user_content.append({"type": "image", "image": img})
         if negative_images:
-            user_content.append({"type": "text", "text":
-                "Reference images that FAIL this criterion:"})
+            user_content.append(
+                {"type": "text", "text": "Reference images that FAIL this criterion:"}
+            )
             for img in negative_images:
                 user_content.append({"type": "image", "image": img})
-        user_content.append({"type": "text", "text":
-            "Now evaluate this new image. Decide whether it PASSED, FAILED, "
-            "or is UNSURE based on the conditions above (and the references "
-            "if provided):"})
+        user_content.append(
+            {
+                "type": "text",
+                "text": "Now evaluate this new image. Decide whether it PASSED, FAILED, "
+                "or is UNSURE based on the conditions above (and the references "
+                "if provided):",
+            }
+        )
         user_content.append({"type": "image", "image": new_image})
-        user_content.append({"type": "text", "text":
-            "Reply on the first line with exactly `VERDICT: passed`, "
-            "`VERDICT: failed`, or `VERDICT: unsure`. Use `unsure` only when "
-            "the visible evidence is genuinely ambiguous or insufficient. "
-            "Then on a second line write `REASON: ` followed by ONE short "
-            "sentence grounded in the new image's visible content (not in "
-            "the references)."})
+        user_content.append(
+            {
+                "type": "text",
+                "text": "Reply on the first line with exactly `VERDICT: passed`, "
+                "`VERDICT: failed`, or `VERDICT: unsure`. Use `unsure` only when "
+                "the visible evidence is genuinely ambiguous or insufficient. "
+                "Then on a second line write `REASON: ` followed by ONE short "
+                "sentence grounded in the new image's visible content (not in "
+                "the references).",
+            }
+        )
 
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": self._SYSTEM_PROMPT_VERDICT}]},
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": self._SYSTEM_PROMPT_VERDICT}],
+            },
             {"role": "user", "content": user_content},
         ]
         ordered_images = list(positive_images) + list(negative_images) + [new_image]
-        return await self._generate_with_images(messages, ordered_images, max_new_tokens)
+        return await self._generate_with_images(
+            messages, ordered_images, max_new_tokens
+        )
 
     async def _generate_with_images(
         self,
@@ -830,8 +872,12 @@ class SmartMicroscopyAssistant:
         separately as ``description``, so ``reason`` stays a single short
         sentence or empty.
         """
-        m = re.search(r"VERDICT\s*:\s*(passed|failed|unsure)\b", text, flags=re.IGNORECASE)
-        m2 = re.search(r"REASON\s*:\s*(.+?)(?:\n|$)", text, flags=re.IGNORECASE | re.DOTALL)
+        m = re.search(
+            r"VERDICT\s*:\s*(passed|failed|unsure)\b", text, flags=re.IGNORECASE
+        )
+        m2 = re.search(
+            r"REASON\s*:\s*(.+?)(?:\n|$)", text, flags=re.IGNORECASE | re.DOTALL
+        )
         reason = m2.group(1).strip() if m2 else ""
         if not m:
             return "unsure", reason, False
@@ -845,7 +891,8 @@ class SmartMicroscopyAssistant:
         """
         now = time.time()
         for run_id in [
-            rid for rid, j in self._inspect_jobs.items()
+            rid
+            for rid, j in self._inspect_jobs.items()
             if j["completed_at"] is not None
             and (now - j["completed_at"]) > _INSPECT_JOBS_TTL_SEC
         ]:
@@ -1087,7 +1134,10 @@ class SmartMicroscopyAssistant:
             raise ValueError(
                 f"visual-test name must match {_TEST_NAME_RE.pattern} (got: {name!r})"
             )
-        for label, value in (("pass_criterion", pass_criterion), ("fail_criterion", fail_criterion)):
+        for label, value in (
+            ("pass_criterion", pass_criterion),
+            ("fail_criterion", fail_criterion),
+        ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{label} must be a non-empty string.")
             if len(value) > _MAX_TEST_DESC_CHARS:
@@ -1108,6 +1158,7 @@ class SmartMicroscopyAssistant:
                 )
 
         import shutil
+
         # Re-using your own name overwrites — including a copy of it still
         # filed under an older ownership key, so the library converges on the
         # current scheme instead of showing the same name twice.
@@ -1125,10 +1176,16 @@ class SmartMicroscopyAssistant:
         test_dir.mkdir(parents=True, exist_ok=True)
         try:
             pos_paths = await self._save_example_images(
-                test_dir, "positive", positive_image_refs, token,
+                test_dir,
+                "positive",
+                positive_image_refs,
+                token,
             )
             neg_paths = await self._save_example_images(
-                test_dir, "negative", negative_image_refs, token,
+                test_dir,
+                "negative",
+                negative_image_refs,
+                token,
             )
         except Exception:
             shutil.rmtree(test_dir, ignore_errors=True)
@@ -1156,7 +1213,11 @@ class SmartMicroscopyAssistant:
             json.dump(record, f, indent=2)
         logger.info(
             "Saved visual test %r (owner=%s, public=%s): %d pos / %d neg",
-            name, owner, record["is_public"], record["n_positive"], record["n_negative"],
+            name,
+            owner,
+            record["is_public"],
+            record["n_positive"],
+            record["n_negative"],
         )
         return record
 
@@ -1200,6 +1261,7 @@ class SmartMicroscopyAssistant:
     ) -> dict:
         """Delete one of YOUR visual tests. Refuses to delete another user's."""
         import shutil
+
         caller_keys = _owner_keys(context)
         if not _TEST_NAME_RE.match(name):
             raise ValueError(
@@ -1231,6 +1293,7 @@ class SmartMicroscopyAssistant:
             shutil.rmtree(test_dir)
         logger.info("Deleted visual test %r (owner=%s)", name, caller_keys[0])
         return {"name": name, "deleted": True}
+
     # ------------------------------------------------------------ inspect path
 
     @staticmethod
@@ -1248,7 +1311,9 @@ class SmartMicroscopyAssistant:
         visual_test_name = _arg(visual_test_name, None)
         max_new_tokens = _arg(max_new_tokens, 512)
 
-        if not visual_test_name and not (isinstance(instruction, str) and instruction.strip()):
+        if not visual_test_name and not (
+            isinstance(instruction, str) and instruction.strip()
+        ):
             raise ValueError(
                 "Either `visual_test_name` or `instruction` must be provided."
             )
@@ -1284,12 +1349,17 @@ class SmartMicroscopyAssistant:
 
             if visual_test is not None:
                 from PIL import Image
+
                 owner = visual_test.get("created_by", _ANON_OWNER)
                 test_dir = self._test_dir(owner, visual_test["name"])
-                pos_imgs = [Image.open(test_dir / p).convert("RGB")
-                            for p in visual_test.get("positive_images", [])]
-                neg_imgs = [Image.open(test_dir / p).convert("RGB")
-                            for p in visual_test.get("negative_images", [])]
+                pos_imgs = [
+                    Image.open(test_dir / p).convert("RGB")
+                    for p in visual_test.get("positive_images", [])
+                ]
+                neg_imgs = [
+                    Image.open(test_dir / p).convert("RGB")
+                    for p in visual_test.get("negative_images", [])
+                ]
 
             job["state"] = "running"
             job["running_ts"] = time.time()
@@ -1305,7 +1375,9 @@ class SmartMicroscopyAssistant:
                         max_new_tokens=max_new_tokens,
                     )
                 else:
-                    raw, n_tokens = await self._run_vlm(image, instruction, max_new_tokens)
+                    raw, n_tokens = await self._run_vlm(
+                        image, instruction, max_new_tokens
+                    )
                 gen_dt = time.time() - t_gen0
 
             if visual_test is not None:
@@ -1325,18 +1397,22 @@ class SmartMicroscopyAssistant:
             else:
                 result = {"mode": "describe", "description": raw}
 
-            result.update({
-                "image_size": list(image.size),
-                # The caller's own ref, not the resolved URL: for an artifact
-                # ref that resolves to a presigned URL, i.e. a credential.
-                "image_ref": image_ref,
-                "model": _MODEL_ID,
-                "tokens_generated": n_tokens,
-                "generation_time_s": round(gen_dt, 2),
-                "tokens_per_second": round(n_tokens / gen_dt, 2) if gen_dt > 0 else None,
-                "processing_time_s": round(time.time() - t0, 2),
-                "run_id": job["job_id"],
-            })
+            result.update(
+                {
+                    "image_size": list(image.size),
+                    # The caller's own ref, not the resolved URL: for an artifact
+                    # ref that resolves to a presigned URL, i.e. a credential.
+                    "image_ref": image_ref,
+                    "model": _MODEL_ID,
+                    "tokens_generated": n_tokens,
+                    "generation_time_s": round(gen_dt, 2),
+                    "tokens_per_second": (
+                        round(n_tokens / gen_dt, 2) if gen_dt > 0 else None
+                    ),
+                    "processing_time_s": round(time.time() - t0, 2),
+                    "run_id": job["job_id"],
+                }
+            )
             if original_size is not None:
                 result["downscaled_from"] = list(original_size)
                 result["downscale_note"] = (
@@ -1373,12 +1449,18 @@ class SmartMicroscopyAssistant:
         caller_id = _owner_from_context(context)
         visual_test = (
             self._find_test_for_caller(visual_test_name, _owner_keys(context))
-            if visual_test_name else None
+            if visual_test_name
+            else None
         )
         job = self._new_job(caller_id)
         job["task"] = asyncio.create_task(
             self._execute_inspect(
-                job, image_ref, instruction, visual_test, max_new_tokens, token,
+                job,
+                image_ref,
+                instruction,
+                visual_test,
+                max_new_tokens,
+                token,
             )
         )
         return job
@@ -1413,7 +1495,8 @@ class SmartMicroscopyAssistant:
         max_new_tokens: int = Field(
             512,
             description="Maximum response tokens (1-1024).",
-            ge=1, le=1024,
+            ge=1,
+            le=1024,
         ),
         token: Optional[str] = Field(
             None,
@@ -1449,14 +1532,20 @@ class SmartMicroscopyAssistant:
         for the whole run — it submits and awaits with the same arguments.
         """
         return self._submit_inspect(
-            image_ref, instruction, visual_test_name, max_new_tokens,
-            context, _arg(token, None),
+            image_ref,
+            instruction,
+            visual_test_name,
+            max_new_tokens,
+            context,
+            _arg(token, None),
         )["job_id"]
 
     @bioengine.method(context=True)
     async def get_inspect_status(
         self,
-        run_id: str = Field(..., description="Id returned by `submit_inspect` ('ij-…')."),
+        run_id: str = Field(
+            ..., description="Id returned by `submit_inspect` ('ij-…')."
+        ),
         context=None,
     ) -> dict:
         """
@@ -1523,7 +1612,8 @@ class SmartMicroscopyAssistant:
         max_new_tokens: int = Field(
             512,
             description="Maximum response tokens (1-1024).",
-            ge=1, le=1024,
+            ge=1,
+            le=1024,
         ),
         token: Optional[str] = Field(
             None,
@@ -1545,8 +1635,12 @@ class SmartMicroscopyAssistant:
         position, and for callers that would otherwise time out.
         """
         job = self._submit_inspect(
-            image_ref, instruction, visual_test_name, max_new_tokens,
-            context, _arg(token, None),
+            image_ref,
+            instruction,
+            visual_test_name,
+            max_new_tokens,
+            context,
+            _arg(token, None),
         )
         await job["task"]
         if job.get("exception") is not None:

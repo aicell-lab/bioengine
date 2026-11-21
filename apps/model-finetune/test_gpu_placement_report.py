@@ -1,4 +1,4 @@
-"""Regression tests for #0370 — a GPU shortfall must be visible from the running app.
+"""Regression tests for the GPU shortfall report — a GPU shortfall must be visible from the running app.
 
 Both GPU runtimes declare ``gpu_memory_mb=-1`` (``runtime.py:65``,
 ``runtime_cellpose.py:79``), which ``bioengine/apps/builder.py:514-516`` resolves to
@@ -41,8 +41,8 @@ def _with_cluster_gpus(monkeypatch, total, free=_SAME):
     The two views are SEPARATE arguments on purpose: ``cluster_resources()`` is the
     total and ``available_resources()`` is what is free, and the report keys its
     verdict to the first while reporting the second. A harness that set only a total
-    could not express the shape the row was filed about — deNBI, 4 GPUs, 0 free —
-    which is the gap the re-review found (#0370). ``free`` defaults to ``total``,
+    could not express the shape this check is about — deNBI, 4 GPUs, 0 free —
+    which is the gap the re-review found. ``free`` defaults to ``total``,
     i.e. an idle cluster, so a case that is not about the distinction stays short.
 
     ``entry`` does not import ray at module scope — the report imports it lazily so a
@@ -52,8 +52,12 @@ def _with_cluster_gpus(monkeypatch, total, free=_SAME):
     if free is _SAME:
         free = total
     fake = types.ModuleType("ray")
-    fake.cluster_resources = lambda: ({"CPU": 8.0} if total is None else {"CPU": 8.0, "GPU": total})
-    fake.available_resources = lambda: ({"CPU": 8.0} if free is None else {"CPU": 8.0, "GPU": free})
+    fake.cluster_resources = lambda: (
+        {"CPU": 8.0} if total is None else {"CPU": 8.0, "GPU": total}
+    )
+    fake.available_resources = lambda: (
+        {"CPU": 8.0} if free is None else {"CPU": 8.0, "GPU": free}
+    )
     monkeypatch.setitem(sys.modules, "ray", fake)
 
 
@@ -97,7 +101,7 @@ def _ray_unimportable(monkeypatch):
 
 
 def test_each_enabled_gpu_backend_costs_one_whole_gpu(monkeypatch) -> None:
-    """The arithmetic the whole row is about: N backends on → N whole GPUs needed."""
+    """The arithmetic this file is about: N backends on → N whole GPUs needed."""
     _with_cluster_gpus(monkeypatch, 8.0)
     assert entry._gpu_placement_report({"microsam", "cellpose"})["gpus_required"] == 2
     assert entry._gpu_placement_report({"cellpose"})["gpus_required"] == 1
@@ -178,7 +182,9 @@ def test_a_cluster_advertising_no_gpu_key_is_unknown_too(monkeypatch) -> None:
     assert report["gpus_in_cluster"] == 0.0
 
 
-def test_a_cluster_that_owns_enough_but_has_none_free_names_the_free_count(monkeypatch) -> None:
+def test_a_cluster_that_owns_enough_but_has_none_free_names_the_free_count(
+    monkeypatch,
+) -> None:
     """deNBI's measured shape, and the case the first version of this report got wrong.
 
     4 GPUs owned, 0 free (read from that worker's own ``get_status()`` → the
@@ -205,7 +211,7 @@ def test_a_cluster_that_owns_enough_but_has_none_free_names_the_free_count(monke
     assert "pend" in report["detail"]
 
     # DELIBERATELY unchanged, and this is the half that is easy to get wrong in the
-    # other direction (#0370 re-review): a free shortfall is NOT a shortfall. The
+    # other direction: a free shortfall is NOT a shortfall. The
     # cluster owns enough, this app's own replicas are part of what books the
     # devices, and an elastic cluster is momentarily 0-free between jobs. Escalating
     # it would make the diagnostic fire at itself.
@@ -213,7 +219,9 @@ def test_a_cluster_that_owns_enough_but_has_none_free_names_the_free_count(monke
     assert report["advice"] == ""
 
 
-def test_a_real_shortfall_and_a_merely_busy_cluster_do_not_read_alike(monkeypatch) -> None:
+def test_a_real_shortfall_and_a_merely_busy_cluster_do_not_read_alike(
+    monkeypatch,
+) -> None:
     """DISCRIMINATOR for the test above. Reporting the free count is only worth
     anything if the two situations still come apart: owning too few is a configuration
     mistake with a remedy, owning enough but being busy is neither."""
@@ -228,7 +236,9 @@ def test_a_real_shortfall_and_a_merely_busy_cluster_do_not_read_alike(monkeypatc
     assert short["detail"] != busy["detail"]
 
 
-def test_the_free_count_is_reported_on_a_cluster_with_room_to_spare(monkeypatch) -> None:
+def test_the_free_count_is_reported_on_a_cluster_with_room_to_spare(
+    monkeypatch,
+) -> None:
     """The other arm of the same key: ``gpus_free`` is populated whenever the view was
     readable, not only when it is short. A field present only on the bad path cannot be
     read by anything that polls."""
@@ -302,7 +312,7 @@ def _async_init_source() -> str:
 
 
 def test_the_placement_log_is_actually_called_at_startup() -> None:
-    """The warning is worth writing only if something writes it (#0370, re-review).
+    """The warning is worth writing only if something writes it.
 
     Replacing ``self._log_gpu_placement()`` in ``_connect`` with ``pass`` left the
     whole suite green at 139 passed, while a comment-only control arm was also green
@@ -312,7 +322,7 @@ def test_the_placement_log_is_actually_called_at_startup() -> None:
     the method with ``__get__(inst)`` and so exercises the helper, never the wiring.
     A grep for the call site existed, but outside the repo, where CI never runs it — and
     a report nothing calls is indistinguishable from no report at all, which is this
-    row's whole subject.
+    the whole subject here.
 
     Asserted against the startup coroutine specifically, not the file: the call
     surviving somewhere else in ``entry.py`` is not the thing that makes it run.
@@ -323,9 +333,9 @@ def test_the_placement_log_is_actually_called_at_startup() -> None:
     # a slice that silently became the empty string, or the whole file, would make the
     # assertion below either vacuously red or vacuously green.
     assert "connect_to_server" in body, "CONTROL: the slice is not _connect's body"
-    assert "def get_training_capabilities" not in body, (
-        "CONTROL: the slice ran past the end of _connect and covers the whole class"
-    )
+    assert (
+        "def get_training_capabilities" not in body
+    ), "CONTROL: the slice ran past the end of _connect and covers the whole class"
 
     assert "self._log_gpu_placement()" in body, (
         "nothing calls _log_gpu_placement from the entry's startup path, so the "
@@ -372,7 +382,9 @@ def test_the_entry_logs_a_warning_only_on_a_real_shortfall(monkeypatch) -> None:
     assert len(log.info_calls) == 1
 
 
-def test_get_training_capabilities_explains_the_unavailable_it_reports(monkeypatch) -> None:
+def test_get_training_capabilities_explains_the_unavailable_it_reports(
+    monkeypatch,
+) -> None:
     """The queryable half, reproducing the whole reported symptom in one call.
 
     This is the exact state of an over-subscribed cluster: the GPU runtimes never
@@ -424,26 +436,48 @@ def test_the_entry_starts_one_replica_so_it_can_speak_while_the_app_hangs() -> N
     it into ``deployments.<entry>.logs``, which ``get_app_status`` returns throughout
     ``DEPLOYING``.
 
-    ``min_replicas`` must stay 0: #0045's brief is that an idle entry holds nothing on
+    ``min_replicas`` must stay 0: the scale-to-zero requirement is that an idle entry holds nothing on
     an HPC login node. Both halves are asserted, because satisfying one by breaking the
     other is the easy mistake.
     """
     cfg = entry.EntryApp._deployment_config.autoscaling_config
-    assert cfg.min_replicas == 0, "#0045: an idle entry must still scale to zero"
-    assert cfg.initial_replicas == 1, (
-        "#0370: with 0 the placement warning is never written on the cluster it is for"
+    assert cfg.min_replicas == 0, "an idle entry must still scale to zero"
+    assert (
+        cfg.initial_replicas == 1
+    ), "with 0 the placement warning is never written on the cluster it is for"
+    # CONTROL that the two contracts above are read off the LIVE resolved config rather
+    # than a default-shaped object. For that to mean anything it has to assert a field
+    # whose decorator value DIFFERS from Ray Serve's own default — otherwise it passes
+    # against exactly the object it claims to exclude.
+    #
+    # ⚠ The previous control asserted `max_replicas == 1` and `downscale_delay_s == 600.0`
+    # under a comment stating that neither is a Ray Serve default. BOTH WERE. Measured in
+    # the CI image on ray 2.55.1, AutoscalingConfig() defaults are:
+    #
+    #   min_replicas=1  initial_replicas=None  max_replicas=1
+    #   downscale_delay_s=600.0  upscale_delay_s=30.0
+    #   metrics_interval_s=10.0  look_back_period_s=30.0
+    #
+    # So the old control would have gone on passing if the decorator had stopped setting
+    # either field, which is the one thing it existed to catch. `upscale_delay_s` is 0.0
+    # here against a default of 30.0, so this assertion can actually fail. The two
+    # contracts above are self-witnessing for the same reason — `min_replicas` is 0
+    # against a default of 1, and `initial_replicas` is 1 against a default of None.
+    #
+    # `downscale_delay_s` is deliberately NOT asserted here any more. Its value is the
+    # subject of a separate, held product decision, and pinning it in this file would
+    # make an unrelated test the thing that fails when that decision lands.
+    assert cfg.upscale_delay_s == 0.0, (
+        "control: 0.0 differs from Ray's 30.0 default, so reaching this line proves the "
+        "decorator's config was resolved rather than a default object read"
     )
-    # CONTROL: this is the live resolved config, not a default-shaped object — these
-    # two values are set in the decorator and are not Ray Serve defaults.
-    assert cfg.max_replicas == 1
-    assert cfg.downscale_delay_s == 600.0
 
 
 def test_the_declaration_this_row_is_about_is_unchanged() -> None:
     """The recorded decision, pinned. Changing either runtime to a positive
     ``gpu_memory_mb`` opts it into VRAM packing (builder.py:518-536) with a figure
     fixed at author time while the real need is per-model and per-caller — so it
-    must be re-argued on the row, not slipped in.
+    must be re-argued explicitly, not slipped in.
 
     Read off disk rather than by importing, so this holds in an environment where
     neither ML stack is installed (which is every environment this suite runs in).

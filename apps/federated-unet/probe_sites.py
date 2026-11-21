@@ -13,9 +13,14 @@ from hypha_rpc import connect_to_server
 from workers import resolve_worker
 
 SITES = {
-    "ws-user-github|49943582/bioengine-worker-europa": (
+    os.environ.get("FEDUNET_SITE_A_WORKER", "<workspace>/bioengine-worker"): (
         "HYPHA_TOKEN",
-        ["fedunet-bbbc038-fluo", "fedunet-bbbc039", "fedunet-nuinsseg", "fedunet-pooled"],
+        [
+            "fedunet-bbbc038-fluo",
+            "fedunet-bbbc039",
+            "fedunet-nuinsseg",
+            "fedunet-pooled",
+        ],
     ),
     "bioimage-io/bioengine-worker-denbi": (
         "BIOIMAGE_IO_TOKEN",

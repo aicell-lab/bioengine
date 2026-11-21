@@ -20,6 +20,7 @@ ray-gated test asserts that those kwargs resolve to a pinned deployment
 config, which is what makes the fake's premise true. Run with ``-rs``: ray is
 not installed on every host, and a silently skipped gate reads as a pass.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -59,7 +60,7 @@ def test_fixed_count_clears_the_decorators_autoscaling_config() -> None:
 
 def test_autoscaling_config_entry_is_passed_through_alone() -> None:
     """The sibling branch must not grow a ``num_replicas`` kwarg: Ray rejects
-    the two together, and this branch is how #0088 expresses a pin today."""
+    the two together, and this branch is how a pin is expressed today."""
     cls = _FakeDeployment()
     config = {"min_replicas": 1, "max_replicas": 1}
     _apply_scaling(cls, {"autoscaling_config": config})
@@ -98,9 +99,7 @@ def test_resolved_deployment_config_is_pinned() -> None:
         "upscale_delay_s": 0.0,
     }
 
-    @serve.deployment(
-        autoscaling_config=decorator_autoscaling, max_ongoing_requests=10
-    )
+    @serve.deployment(autoscaling_config=decorator_autoscaling, max_ongoing_requests=10)
     class _Runtime:
         def __call__(self) -> int:
             return 1

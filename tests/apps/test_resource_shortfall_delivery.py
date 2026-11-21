@@ -1,4 +1,4 @@
-"""A computed shortfall must reach the caller: compute → store → publish (#0384).
+"""A computed shortfall must reach the caller: compute → store → publish.
 
 ``tests/test_external_cluster_shortfall.py`` pins what ``_check_resources``
 *returns*, and that ``"resource_shortfall"`` is in ``PUBLIC_APP_STATUS_FIELDS``.
@@ -124,6 +124,11 @@ async def _manager_that_deployed(shortfall: dict | None) -> AppsManager:
     ray_cluster.check_connection = AsyncMock()
     ray_cluster.call_with_reconnect = AsyncMock()
     proxy = ray_cluster.proxy_actor_handle
+    # get_app_status now fetches the cluster-wide dead-actor map ONCE per call and
+    # hands it to every deployment, instead of each deployment querying for itself.
+    # A MagicMock attribute is not awaitable, so a handle that does not mock this
+    # fails with `object MagicMock can't be used in 'await' expression`.
+    proxy.get_all_death_causes.remote = AsyncMock(return_value={})
     proxy.get_serve_instance_details.remote = AsyncMock(
         return_value=_instance_details()
     )

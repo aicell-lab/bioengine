@@ -5,7 +5,7 @@ version already running (``manager.py``, the ``is_update`` branch). That rule is
 deliberate and documented, but nothing ever flagged it as a *mistake*: a caller
 who had just uploaded newer code got a deploy that reported success while
 redeploying the code it had replaced, and every status field agreed. Reported
-twice independently — over the API (svamp #0023) and from the CLI
+twice independently — over the API and from the CLI
 (aicell-lab/bioengine#157).
 
 Two pins here:
@@ -70,9 +70,9 @@ async def test_a_stale_inherited_version_warns_and_names_both(caplog) -> None:
     # Both numbers must be present — one of them alone is not actionable.
     assert "'1.0.0'" in warnings[0]
     assert "'1.0.1'" in warnings[0]
-    assert "version='1.0.1'" in warnings[0], (
-        "The warning has to name the way out, or it just restates the symptom."
-    )
+    assert (
+        "version='1.0.1'" in warnings[0]
+    ), "The warning has to name the way out, or it just restates the symptom."
 
 
 @pytest.mark.asyncio
@@ -225,6 +225,7 @@ async def test_deploy_app_stays_quiet_when_the_caller_named_the_version(
 
 
 # ── CLI: `bioengine apps deploy` must deploy what it just uploaded ────────────
+
 
 def _manifest(version: str | None) -> str:
     # `version` is an optional manifest field, so a version-less manifest is a

@@ -1,7 +1,7 @@
 """Re-depositing a checkpoint the pool already holds must not append a second
 member — and must not wedge the pool artifact on the way out.
 
-The defect (#0376): ``contribute`` appended unconditionally. A client whose
+The defect: ``contribute`` appended unconditionally. A client whose
 response was eaten by a gateway timeout retries, which is the correct thing for
 it to do — 4 of 92 deposits on the r2 corpus needed it, with the 504 threshold
 bracketed at 94.4–100.8 s — and the pool then held the same bytes twice. The
@@ -14,7 +14,7 @@ checkpoint into two deposits; it can only hide the double weight. Comparing a
 caller-supplied field as well (``dataset_fingerprint``) would let a retry defeat
 de-duplication by accident.
 
-Two things are asserted that the row's own clause does not ask for, because
+Two things are asserted beyond what is strictly required, because
 "one member remains" is satisfied by a run that left the artifact unusable:
 
 * the stage was DISCARDED, and
@@ -90,11 +90,19 @@ def test_finds_the_member_holding_the_digest() -> None:
 
 
 def test_absent_digest_is_none() -> None:
-    assert pool.find_contribution_by_digest(_index(_member(_FIRST_ID, _DIGEST)), _OTHER_DIGEST) is None
+    assert (
+        pool.find_contribution_by_digest(
+            _index(_member(_FIRST_ID, _DIGEST)), _OTHER_DIGEST
+        )
+        is None
+    )
 
 
 def test_empty_index_is_none() -> None:
-    assert pool.find_contribution_by_digest(pool.empty_index("cpsam", _SIG), _DIGEST) is None
+    assert (
+        pool.find_contribution_by_digest(pool.empty_index("cpsam", _SIG), _DIGEST)
+        is None
+    )
     assert pool.find_contribution_by_digest({}, _DIGEST) is None
 
 
@@ -117,7 +125,13 @@ def test_the_predicate_ignores_metadata_it_is_not_given() -> None:
     passing ``samples_seen=10, n_train_images=5`` — ``_member``'s own defaults —
     so its "differences" differed from nothing and it could not fail for the
     reason it gave."""
-    first = _member(_FIRST_ID, _DIGEST, samples_seen=777, n_train_images=99, dataset_fingerprint="dataset-A")
+    first = _member(
+        _FIRST_ID,
+        _DIGEST,
+        samples_seen=777,
+        n_train_images=99,
+        dataset_fingerprint="dataset-A",
+    )
     assert pool.find_contribution_by_digest(_index(first), _DIGEST) is first
 
 
@@ -150,8 +164,12 @@ def test_append_refuses_a_duplicate_digest() -> None:
     with pytest.raises(ValueError) as err:
         pool.append_contribution(idx, _member("retry-id", _DIGEST))
     msg = str(err.value)
-    assert _FIRST_ID in msg, "the refusal must name the member already holding the digest"
-    assert len(idx["contributions"]) == 1, "the refused append must not have mutated the index"
+    assert (
+        _FIRST_ID in msg
+    ), "the refusal must name the member already holding the digest"
+    assert (
+        len(idx["contributions"]) == 1
+    ), "the refused append must not have mutated the index"
     assert idx["contributions"][0]["contribution_id"] == _FIRST_ID
 
 
@@ -161,7 +179,10 @@ def test_append_still_accepts_a_different_checkpoint() -> None:
     assertion in this file on its own."""
     idx = _index(_member(_FIRST_ID, _DIGEST))
     pool.append_contribution(idx, _member("second-deposit-id", _OTHER_DIGEST))
-    assert [c["contribution_id"] for c in idx["contributions"]] == [_FIRST_ID, "second-deposit-id"]
+    assert [c["contribution_id"] for c in idx["contributions"]] == [
+        _FIRST_ID,
+        "second-deposit-id",
+    ]
 
 
 def test_append_bootstraps_a_pool_with_no_contributions_key() -> None:
@@ -193,11 +214,16 @@ def fake_training(monkeypatch: pytest.MonkeyPatch) -> None:
     about what the pool index ends up holding, not about reading a real session."""
     mod = types.ModuleType("training")
     mod.get_status = lambda sid: {
-        "status": "COMPLETED", "model_type": "cpsam",
-        "n_epochs_completed": 2, "n_train_inputs": 5,
+        "status": "COMPLETED",
+        "model_type": "cpsam",
+        "n_epochs_completed": 2,
+        "n_train_inputs": 5,
     }
     mod.session_backend = lambda sid: "cellpose"
-    mod.read_training_params = lambda sid: {"model_type": "cpsam", "init_checkpoint": "stock"}
+    mod.read_training_params = lambda sid: {
+        "model_type": "cpsam",
+        "init_checkpoint": "stock",
+    }
     monkeypatch.setitem(sys.modules, "training", mod)
 
 
@@ -208,7 +234,9 @@ class _Runtime:
     def __init__(self, digest: str) -> None:
         self._digest = digest
 
-    async def prepare_contribution(self, session_id: str, weights_put_url: str) -> Dict[str, Any]:
+    async def prepare_contribution(
+        self, session_id: str, weights_put_url: str, model_type: str = "cpsam"
+    ) -> Dict[str, Any]:
         return {
             "architecture_signature": _SIG,
             "base_checkpoint_sha256": "b" * 64,
@@ -216,6 +244,14 @@ class _Runtime:
             "l2_from_base": 0.5,
             "weights_sha256": self._digest,
             "n_bytes": 1218617275,
+            # The base-commitment rules: the bootstrap writes this into a fresh pool_index.json. Present here
+            # so the dedupe fixtures exercise the same shape production now takes.
+            "base_commitment": {
+                "non_learned": {"diam_labels": 30.0, "diam_mean": 30.0},
+                "key_set_sha256": "c" * 64,
+                "key_count": 350,
+                "source": "session_init_checkpoint:" + "b" * 64,
+            },
         }
 
 
@@ -311,7 +347,7 @@ def _index_puts(stub: _Stub) -> List[bytes]:
 
 @pytest.mark.asyncio
 async def test_a_redeposit_leaves_exactly_one_member(fake_training: None) -> None:
-    """The row's clause 2, first half."""
+    """Exactly one member for a repeated digest: first half."""
     idx = _index(_member(_FIRST_ID, _DIGEST))
     stub = _Stub(idx, _DIGEST)
     await _deposit(stub)
@@ -323,7 +359,7 @@ async def test_a_redeposit_leaves_exactly_one_member(fake_training: None) -> Non
 
 @pytest.mark.asyncio
 async def test_a_redeposit_leaves_the_first_member_intact(fake_training: None) -> None:
-    """Clause 2's other half, paired with the count: a dedup that DELETED the
+    """The other half, paired with the count: a dedup that DELETED the
     member would also leave 'exactly one' false-green on an empty pool, and would
     satisfy the count assertion above on a pool of two."""
     first = _member(_FIRST_ID, _DIGEST)
@@ -332,9 +368,9 @@ async def test_a_redeposit_leaves_the_first_member_intact(fake_training: None) -
     held = {c["contribution_id"]: c for c in idx["contributions"]}
     assert set(held) == {_FIRST_ID, "unrelated"}
     assert held[_FIRST_ID]["weights_sha256"] == _DIGEST
-    assert held[_FIRST_ID]["uploaded_at"] == first["uploaded_at"], (
-        "the first deposit's record is immutable; a retry must not restamp it"
-    )
+    assert (
+        held[_FIRST_ID]["uploaded_at"] == first["uploaded_at"]
+    ), "the first deposit's record is immutable; a retry must not restamp it"
 
 
 @pytest.mark.asyncio
@@ -365,7 +401,9 @@ async def test_a_retry_reporting_different_metadata_is_still_one_deposit(
     report anything at all. Folding it into identity is the bypass this file's
     header warns about — a retry would defeat de-duplication by accident and the
     uniform soup would weight that site 2:1."""
-    stored = _member(_FIRST_ID, _DIGEST, samples_seen=777, dataset_fingerprint="dataset-A")
+    stored = _member(
+        _FIRST_ID, _DIGEST, samples_seen=777, dataset_fingerprint="dataset-A"
+    )
     idx = _index(stored)
     stub = _Stub(idx, _DIGEST)
 
@@ -376,9 +414,9 @@ async def test_a_retry_reporting_different_metadata_is_still_one_deposit(
         f"checkpoint: {[c['contribution_id'] for c in idx['contributions']]}"
     )
     assert returned["deduplicated"] is True
-    assert returned["contribution_id"] == _FIRST_ID, (
-        "the retry must get the FIRST deposit's id back, not a fresh one"
-    )
+    assert (
+        returned["contribution_id"] == _FIRST_ID
+    ), "the retry must get the FIRST deposit's id back, not a fresh one"
     assert returned["samples_seen"] == 777, (
         f"samples_seen must be read back off the stored member ({stored['samples_seen']}), "
         f"not recomputed from this call ({returned['samples_seen']}) — the stored member is "
@@ -401,14 +439,16 @@ async def test_two_real_deposits_of_one_checkpoint_leave_one_member(
     the predicate reads. This one can."""
     idx = _index()
     first = await _deposit(_Stub(idx, _DIGEST), dataset_fingerprint="dataset-A")
-    assert first["deduplicated"] is False, "the first deposit into an empty pool is fresh"
+    assert (
+        first["deduplicated"] is False
+    ), "the first deposit into an empty pool is fresh"
 
     stub = _Stub(idx, _DIGEST)
     retry = await _deposit(stub, dataset_fingerprint="dataset-B")
 
-    assert len(idx["contributions"]) == 1, (
-        f"two deposits of one checkpoint left {len(idx['contributions'])} members"
-    )
+    assert (
+        len(idx["contributions"]) == 1
+    ), f"two deposits of one checkpoint left {len(idx['contributions'])} members"
     assert retry["deduplicated"] is True
     assert retry["contribution_id"] == first["contribution_id"]
     assert retry["samples_seen"] == first["samples_seen"]
@@ -421,12 +461,12 @@ async def test_a_fresh_deposit_says_deduplicated_false_rather_than_omitting_it(
 ) -> None:
     """A key present only when true cannot be dated: a client holding a response
     without it cannot tell 'fresh deposit' from 'a release that predates
-    de-duplication'. That is the defect ``app_version`` exists to avoid (#0116,
-    #0140 — five of 92 saved responses were undatable)."""
+    de-duplication'. That is the defect ``app_version`` exists to avoid (the undatable-response defect,
+    the undatable-response report — five of 92 saved responses were undatable)."""
     returned = await _deposit(_Stub(_index(_member(_FIRST_ID, _OTHER_DIGEST)), _DIGEST))
-    assert "deduplicated" in returned, (
-        "contribute's return value is the only record the depositing site keeps"
-    )
+    assert (
+        "deduplicated" in returned
+    ), "contribute's return value is the only record the depositing site keeps"
     assert returned["deduplicated"] is False
 
 
@@ -436,15 +476,19 @@ async def test_both_return_paths_have_the_same_shape(fake_training: None) -> Non
     deposit it is retrying."""
     fresh = await _deposit(_Stub(_index(_member(_FIRST_ID, _OTHER_DIGEST)), _DIGEST))
     dup = await _deposit(_Stub(_index(_member(_FIRST_ID, _DIGEST)), _DIGEST))
-    assert set(fresh) == set(dup), f"fresh-only={set(fresh) - set(dup)} dup-only={set(dup) - set(fresh)}"
+    assert set(fresh) == set(
+        dup
+    ), f"fresh-only={set(fresh) - set(dup)} dup-only={set(dup) - set(fresh)}"
 
 
 @pytest.mark.asyncio
-async def test_a_redeposit_discards_the_stage_and_writes_nothing(fake_training: None) -> None:
-    """The failure mode the row does not name, and the one that would be worse than
-    the bug: ``put_file`` minted the duplicate's weights row inside the stage
-    before the digest could be known, so leaving the block without discarding
-    makes every later commit on this pool fail for ~62 s and then raise."""
+async def test_a_redeposit_discards_the_stage_and_writes_nothing(
+    fake_training: None,
+) -> None:
+    """Not the bug itself, and worse than it: ``put_file`` minted the duplicate's
+    weights row inside the stage before the digest could be known, so leaving the
+    block without discarding makes every later commit on this pool fail for ~62 s
+    and then raise."""
     stub = _Stub(_index(_member(_FIRST_ID, _DIGEST)), _DIGEST)
     await _deposit(stub)
     assert stub.discards == ["bioimage-io/cpsam-community-pool"], (
@@ -452,13 +496,19 @@ async def test_a_redeposit_discards_the_stage_and_writes_nothing(fake_training: 
         f"with no object behind it leaves the pool permanently uncommittable"
     )
     assert stub.commits == [], "a recognised re-deposit must not commit a new version"
-    assert _index_puts(stub) == [], "the index must not be rewritten at all on a re-deposit"
-    assert [u for u, _ in stub.puts] == [], f"unexpected writes: {[u for u, _ in stub.puts]}"
+    assert (
+        _index_puts(stub) == []
+    ), "the index must not be rewritten at all on a re-deposit"
+    assert [
+        u for u, _ in stub.puts
+    ] == [], f"unexpected writes: {[u for u, _ in stub.puts]}"
 
 
 @pytest.mark.asyncio
-async def test_a_different_checkpoint_still_appends_and_commits(fake_training: None) -> None:
-    """Clause 3's pair for the whole path: the dedup cannot pass by refusing every
+async def test_a_different_checkpoint_still_appends_and_commits(
+    fake_training: None,
+) -> None:
+    """The pair for the whole path: the dedup cannot pass by refusing every
     deposit. Read off the index bytes actually PUT, not off the in-memory dict."""
     idx = _index(_member(_FIRST_ID, _OTHER_DIGEST))
     stub = _Stub(idx, _DIGEST)
@@ -475,7 +525,9 @@ async def test_a_different_checkpoint_still_appends_and_commits(fake_training: N
 
 
 @pytest.mark.asyncio
-async def test_the_first_deposit_into_an_uninitialised_pool_still_works(fake_training: None) -> None:
+async def test_the_first_deposit_into_an_uninitialised_pool_still_works(
+    fake_training: None,
+) -> None:
     """The bootstrap branch has no index to look in; the check must not break it."""
     stub = _Stub(None, _DIGEST)
     returned = await _deposit(stub)
@@ -485,18 +537,22 @@ async def test_the_first_deposit_into_an_uninitialised_pool_still_works(fake_tra
 
 
 @pytest.mark.asyncio
-async def test_a_redeposit_counts_bytes_but_not_a_contribution(fake_training: None) -> None:
+async def test_a_redeposit_counts_bytes_but_not_a_contribution(
+    fake_training: None,
+) -> None:
     """The bytes did cross the wire, so bytes_up counts them — pretending otherwise
     would understate the cost of exactly these retries. ``contributions`` is the
     number quoted as deposits, and the pool gained no member."""
     stub = _Stub(_index(_member(_FIRST_ID, _DIGEST)), _DIGEST)
     await _deposit(stub)
-    assert len(stub.transport) == 1, f"expected one transport bump, got {stub.transport}"
+    assert (
+        len(stub.transport) == 1
+    ), f"expected one transport bump, got {stub.transport}"
     bumped = stub.transport[0]
     assert bumped.get("bytes_up") == 1218617275
-    assert "contributions" not in bumped or bumped["contributions"] == 0, (
-        f"a re-deposit must not increment the deposit count: {bumped}"
-    )
+    assert (
+        "contributions" not in bumped or bumped["contributions"] == 0
+    ), f"a re-deposit must not increment the deposit count: {bumped}"
 
 
 @pytest.mark.asyncio
@@ -513,7 +569,7 @@ async def test_a_fresh_deposit_counts_a_contribution(fake_training: None) -> Non
 async def test_an_already_merged_checkpoint_is_recognised_on_the_whole_path(
     fake_training: None,
 ) -> None:
-    """Clause 3 end to end: a re-deposit of a checkpoint already inside a published
+    """The dedup end to end: a re-deposit of a checkpoint already inside a published
     community soup is returned, never appended."""
     idx = _index(_member(_FIRST_ID, _DIGEST))
     idx["decided_contribution_ids"] = [_FIRST_ID]

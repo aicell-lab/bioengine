@@ -12,7 +12,7 @@ a multiple of one member's size so the number is independent of member size. Run
 
 Exits non-zero if the current combine's peak grows with member count, so it is a
 regression gate and not just a report. ``--mode before`` reproduces the pre-fix
-algorithm for contrast; it is the discrimination control for the flat row, and it
+algorithm for contrast; it is the discrimination control for the flatness property, and it
 is expected to FAIL the flatness check.
 """
 
@@ -86,7 +86,19 @@ def _run_point(member_file: str, n_members: int, mode: str) -> None:
     if mode == "before":
         merged = _old_uniform_soup([load() for _ in range(n_members)])
     else:
-        merged = pool.uniform_soup([load] * n_members)
+        # The benchmark measures peak RSS of the accumulation, so the base is one of
+        # the same synthetic members: uniform_soup reads only its key set and its
+        # non-learned values, and these members carry none, so the carried set is
+        # empty and the arithmetic matches what "before" measures. A differently
+        # shaped base would change the key set and be refused, which is the point.
+        # No pool record here, so the commitment is built from the same synthetic
+        # member: uniform_soup reads only its non-learned values and its key-set
+        # commitment, and these members carry no non-learned keys, so the carried
+        # set is empty and the arithmetic matches what "before" measures.
+        merged = pool.uniform_soup(
+            [load] * n_members,
+            base=pool.base_commitment(load(), source="bench:synthetic"),
+        )
 
     peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(json.dumps({"peak_bytes": peak_kb * 1024, "checksum": _checksum(merged)}))
@@ -110,20 +122,34 @@ def main() -> int:
         _write_member(member, args.member_mb, 2.0)
         member_bytes = member.stat().st_size
 
-        print(f"mode={args.mode}  member={member_bytes / 1024 ** 2:.0f} MiB  "
-              f"peak RSS as a multiple of one member")
+        print(
+            f"mode={args.mode}  member={member_bytes / 1024 ** 2:.0f} MiB  "
+            f"peak RSS as a multiple of one member"
+        )
         rows, checksums = [], set()
         for n in args.members:
             out = subprocess.run(
-                [sys.executable, __file__, "--mode", args.mode,
-                 "--_point", str(n), "--_file", str(member)],
-                capture_output=True, text=True, check=True,
+                [
+                    sys.executable,
+                    __file__,
+                    "--mode",
+                    args.mode,
+                    "--_point",
+                    str(n),
+                    "--_file",
+                    str(member),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
             )
             point = json.loads(out.stdout.strip().splitlines()[-1])
             ratio = point["peak_bytes"] / member_bytes
             rows.append((n, ratio))
             checksums.add(point["checksum"])
-            print(f"  members={n:<3} peak={point['peak_bytes'] / 1024 ** 3:6.2f} GiB  {ratio:5.2f}x")
+            print(
+                f"  members={n:<3} peak={point['peak_bytes'] / 1024 ** 3:6.2f} GiB  {ratio:5.2f}x"
+            )
 
         # A merge is a mean, so the result must not depend on member count. If this
         # ever splits, the memory numbers are measuring two different computations.
@@ -134,13 +160,19 @@ def main() -> int:
 
         worst = max(ratio for _, ratio in rows)
         growth = rows[-1][1] - rows[0][1]
-        print(f"  worst={worst:.2f}x  growth {rows[0][0]}->{rows[-1][0]} members = {growth:+.2f}x")
+        print(
+            f"  worst={worst:.2f}x  growth {rows[0][0]}->{rows[-1][0]} members = {growth:+.2f}x"
+        )
         if growth > MAX_GROWTH:
-            print(f"FAIL: peak grew {growth:+.2f}x from {rows[0][0]} to {rows[-1][0]} members, "
-                  f"budget {MAX_GROWTH}x — peak memory still scales with member count")
+            print(
+                f"FAIL: peak grew {growth:+.2f}x from {rows[0][0]} to {rows[-1][0]} members, "
+                f"budget {MAX_GROWTH}x — peak memory still scales with member count"
+            )
             return 1
-        print(f"OK: peak grew {growth:+.2f}x from {rows[0][0]} to {rows[-1][0]} members "
-              f"(budget {MAX_GROWTH}x) — flat in member count")
+        print(
+            f"OK: peak grew {growth:+.2f}x from {rows[0][0]} to {rows[-1][0]} members "
+            f"(budget {MAX_GROWTH}x) — flat in member count"
+        )
         return 0
 
 

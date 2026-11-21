@@ -123,6 +123,7 @@ def _manager(
     manager._missing_from_status = {}
     manager._deleted_pending_redeploy = set()
     manager._identity_warned = set()
+    manager._last_controller_recovery = 0.0
     manager._deploy_application = AsyncMock()
     manager._deployed_applications = {
         APP_ID: {
@@ -160,7 +161,9 @@ def _manager(
 
 
 def _deposits(manager: AppsManager) -> list:
-    return manager.ray_cluster.proxy_actor_handle.set_pending_token.remote.await_args_list
+    return (
+        manager.ray_cluster.proxy_actor_handle.set_pending_token.remote.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -310,9 +313,9 @@ async def test_the_monitor_renews_an_app_that_opted_out_of_auto_redeploy() -> No
     """
     manager = _manager(age_days=25, auto_redeploy=False)
     await manager.monitor_applications()
-    assert len(_deposits(manager)) == 1, (
-        "monitor_applications skipped renewal for an app with auto_redeploy off"
-    )
+    assert (
+        len(_deposits(manager)) == 1
+    ), "monitor_applications skipped renewal for an app with auto_redeploy off"
 
 
 @pytest.mark.asyncio
@@ -381,9 +384,9 @@ async def test_collection_forces_a_client_rebuild() -> None:
     """
     inst = _proxy(pending=_deposit())
     await inst._collect_renewed_token()
-    assert inst._connection_lost is True, (
-        "collected without forcing a rebuild, so the stale token stays in use"
-    )
+    assert (
+        inst._connection_lost is True
+    ), "collected without forcing a rebuild, so the stale token stays in use"
 
 
 @pytest.mark.asyncio
@@ -401,7 +404,9 @@ async def test_an_unreachable_actor_keeps_the_working_token() -> None:
     inst = _proxy(fail=RuntimeError("actor gone"))
     await inst._collect_renewed_token()
     assert inst.proxy_service_token == ORIGINAL
-    assert inst._connection_lost is False, "a failed collection must not force a rebuild"
+    assert (
+        inst._connection_lost is False
+    ), "a failed collection must not force a rebuild"
 
 
 @pytest.mark.asyncio
@@ -430,9 +435,9 @@ async def test_the_maintenance_tick_collects() -> None:
     inst._is_permanent_registration_error = lambda e: False
 
     await inst._maintenance_tick()
-    assert inst.proxy_service_token == RENEWED, (
-        "_maintenance_tick did not collect; the token would expire untouched"
-    )
+    assert (
+        inst.proxy_service_token == RENEWED
+    ), "_maintenance_tick did not collect; the token would expire untouched"
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@
 Hypha maps an artifact version to its stored files by POSITION in the version
 list, so deleting version i re-points every later version's payload down one
 slot: version i+1 starts serving version i's bytes under its own label, with a
-200 and a version list that still reads correctly (myco #0019, re-measured on
+200 and a version list that still reads correctly (re-measured on
 live Hypha 2026-10-24).
 
 ``delete_app_version`` used to call ``artifact_manager.delete`` unconditionally
@@ -68,9 +68,9 @@ async def test_deleting_a_version_with_a_release_after_it_is_refused() -> None:
 
     message = str(excinfo.value)
     assert "2.11.1" in message, "The versions at risk have to be named."
-    assert "newest-first" in message, (
-        "The error has to name the way out, or it just restates the symptom."
-    )
+    assert (
+        "newest-first" in message
+    ), "The error has to name the way out, or it just restates the symptom."
     manager.artifact_manager.delete.assert_not_awaited()
 
 

@@ -84,9 +84,11 @@ def _resolve(argv, monkeypatch, env_url):
     if env_url is not None:
         monkeypatch.setenv("BIOENGINE_SERVER_URL", env_url)
     monkeypatch.setattr(sys, "argv", ["bioengine.worker", *argv])
-    return resolve_server_url(get_args_by_group(create_parser())).get(
-        "Hypha Options", {}
-    ).get("server_url")
+    return (
+        resolve_server_url(get_args_by_group(create_parser()))
+        .get("Hypha Options", {})
+        .get("server_url")
+    )
 
 
 # ===== the defect =====
@@ -142,7 +144,9 @@ def test_resolution_is_idempotent(monkeypatch) -> None:
     monkeypatch.delenv("BIOENGINE_SERVER_URL", raising=False)
     monkeypatch.setenv("BIOENGINE_SERVER_URL", ENV_URL)
     monkeypatch.setattr(
-        sys, "argv", ["bioengine.worker", "--mode", "single-machine", "--server-url", FLAG_URL]
+        sys,
+        "argv",
+        ["bioengine.worker", "--mode", "single-machine", "--server-url", FLAG_URL],
     )
     configs = get_args_by_group(create_parser())
     once = resolve_server_url(configs)
@@ -192,7 +196,9 @@ def _server_url_at_the_boundary(argv, env_url):
     captured = [
         line for line in result.stdout.splitlines() if line.startswith("CAPTURED ")
     ]
-    assert captured, f"entrypoint never reached BioEngineWorker:\n{result.stdout}\n{result.stderr}"
+    assert (
+        captured
+    ), f"entrypoint never reached BioEngineWorker:\n{result.stdout}\n{result.stderr}"
     return json.loads(captured[-1][len("CAPTURED ") :])["server_url"]
 
 
@@ -219,7 +225,9 @@ def _server_url_at_the_boundary(argv, env_url):
         "padded-flag-is-stripped",
     ],
 )
-def test_the_entrypoint_hands_the_worker_the_right_server(argv, env_url, expected) -> None:
+def test_the_entrypoint_hands_the_worker_the_right_server(
+    argv, env_url, expected
+) -> None:
     """The wiring, asserted at the boundary rather than by reading source.
 
     The original bug was a declared option nothing read, and a resolver that is

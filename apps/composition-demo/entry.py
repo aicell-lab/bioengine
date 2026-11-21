@@ -86,7 +86,9 @@ class EntryDeployment:
     async def run_all(
         self,
         text: str = Field("hello bioengine", description="Text input for RuntimeA"),
-        values: list = Field(None, description="Numbers for RuntimeB (defaults to [1..5])"),
+        values: list = Field(
+            None, description="Numbers for RuntimeB (defaults to [1..5])"
+        ),
         count: int = Field(3, description="Count for RuntimeC"),
     ) -> dict:
         """Fan out to all three runtimes in parallel and combine the results."""

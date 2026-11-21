@@ -1,4 +1,5 @@
-"""``error_exit`` must not bury the cause under a remote traceback (myco #0446)."""
+"""``error_exit`` must not bury the cause under a remote traceback."""
+
 import traceback
 
 import pytest
@@ -71,5 +72,7 @@ def test_the_full_traceback_is_still_reachable(capsys, monkeypatch):
 
 def test_a_callers_own_hint_is_not_replaced(capsys):
     with pytest.raises(SystemExit):
-        error_exit(f"Upload failed: {_wire_payload()}", hint="run `bioengine apps list`")
+        error_exit(
+            f"Upload failed: {_wire_payload()}", hint="run `bioengine apps list`"
+        )
     assert "Hint:  run `bioengine apps list`" in capsys.readouterr().err
