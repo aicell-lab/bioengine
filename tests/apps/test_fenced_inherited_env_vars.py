@@ -28,12 +28,17 @@ controls here are for:
 
 from __future__ import annotations
 
+import ast
+import inspect
 import logging
 import os
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+import tests.apps.test_adopted_app_env_var_loss as adoption_rig
 from bioengine.apps.builder import AppBuilder
 
 FENCE_KEY = "BIOENGINE_FENCED_ENV_KEYS"
@@ -288,62 +293,188 @@ def test_the_builders_flattening_still_matches_what_the_helper_copies():
 
 
 # --------------------------------------------------------------------------
-# adoption must not silently drop the fence
+# adoption must not silently drop the fence — DRIVEN, not grepped
 # --------------------------------------------------------------------------
+#
+# WHY THESE ARMS ARE DRIVEN RATHER THAN ASSERTED OVER SOURCE TEXT. A substring
+# assertion over ``build``, ``deploy_app`` or ``AppsManager`` answers "is this
+# text present", which is not the question the fence needs answered. At least
+# two defect shapes keep every such string in place while inverting the
+# behaviour:
+#
+#   - the update gate written as ``hypha_token is None and not
+#     existing_app.get("hypha_token_fenced")`` UNFENCES fenced apps and fences
+#     unfenced ones. The key is still read, and ``hypha_token = ""`` is still
+#     there a line below it, so a text check cannot tell the two apart.
+#   - recovery reading ``app_data.get("hypha_token_fence")``, one letter short,
+#     makes the flag always False, so adoption silently drops the fence. A
+#     check anchored on the WRITE site never looks at this.
+#
+# So the arms below drive the real ``recover_deployed_applications`` and then
+# the real ``deploy_app``, and assert the ``hypha_token`` value the builder was
+# actually handed. Both shapes above make them fail. The adoption rig they
+# build on is ``tests/apps/test_adopted_app_env_var_loss.py``.
+#
+# The WRITE side has no value to observe, so it stays a source check — but it
+# parses the ``app_data`` dict literal with ``ast`` and asserts the value
+# EXPRESSION rather than matching text, following the precedent of
+# ``test_the_builder_writes_the_redacted_key_names_into_the_recovery_blob``.
+
+def _recover_with_fence_flag(monkeypatch, flag):
+    """Make the blob a running proxy hands back carry ``hypha_token_fenced``.
+
+    ``flag=None`` means the key is ABSENT — which is what an app deployed by a
+    worker older than this change recovers as, and the case that must not be
+    read as "fenced".
+    """
+    original = adoption_rig._app_data
+
+    def with_flag(raw_env_vars):
+        blob = original(raw_env_vars)
+        if flag is not None:
+            blob["hypha_token_fenced"] = flag
+        return blob
+
+    monkeypatch.setattr(adoption_rig, "_app_data", with_flag)
 
 
-def test_the_fence_INTENT_survives_adoption_even_though_the_token_cannot():
-    """Found by review. ``app_data`` deliberately holds no secret, so a worker
-    adopting an app recovers it with ``hypha_token: None`` — and an update that
-    omits the argument inherits that None, which emits NO fence. On a
-    single-machine worker the new replicas then hold the worker's own credential
-    again: a plain restart plus a routine update is enough, which is the shape
-    of the incident the fence exists to prevent.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_flag,expected_token",
+    [
+        (True, ""),  # adopted AND fenced -> the fence is re-applied
+        (False, None),  # adopted, never fenced -> left alone
+        (None, None),  # key absent (older worker) -> left alone
+    ],
+    ids=["fenced", "not-fenced", "flag-absent"],
+)
+async def test_an_update_that_omits_the_token_RE_FENCES_an_adopted_fenced_app(
+    monkeypatch, stored_flag, expected_token
+):
+    """THE DEFECT, driven end to end.
+
+    ``app_data`` deliberately holds no secret, so a worker adopting an app
+    recovers it with ``hypha_token: None`` — and an update that omits the
+    argument inherits that None, which emits NO fence. On a single-machine
+    worker the new replicas then hold the worker's own credential again: a
+    plain restart plus a routine update is enough, which is the shape of the
+    incident the fence exists to prevent.
 
     The token cannot survive in the blob. The INTENT can, and is not secret.
     """
-    from bioengine.apps import builder as builder_mod
-    import inspect
-
-    build_src = inspect.getsource(builder_mod.AppBuilder.build)
-    assert '"hypha_token_fenced": hypha_token == ""' in build_src, (
-        "the builder does not record the fence intent in app_data, so adoption "
-        "has nothing to carry"
+    _recover_with_fence_flag(monkeypatch, stored_flag)
+    manager = await adoption_rig._adopted_manager(
+        monkeypatch, adoption_rig.PLAIN_ONLY_ENV_VARS
+    )
+    assert manager._deployed_applications[adoption_rig.APP_ID][
+        "hypha_token_fenced"
+    ] is bool(stored_flag), (
+        "recovery did not carry the stored fence intent onto the tracked app, "
+        "so the update path has nothing to gate on"
     )
 
-
-def test_an_update_that_omits_the_token_RE_FENCES_an_adopted_fenced_app():
-    """The behavioural half: inheriting None over a FENCED app must mean "",
-    not "no fence"."""
-    from bioengine.apps import manager as manager_mod
-    import inspect
-
-    src = inspect.getsource(manager_mod.AppsManager.deploy_app)
-    assert 'existing_app.get("hypha_token_fenced")' in src, (
-        "the update path cannot tell an adopted-and-fenced app from one deployed "
-        "without a fence"
+    await manager.deploy_app(
+        artifact_id=adoption_rig.ARTIFACT_ID,
+        application_id=adoption_rig.APP_ID,
+        version=adoption_rig.NEXT_VERSION,
+        context=adoption_rig.CONTEXT,
     )
-    # ...and the inherited None must be turned into the explicit empty string,
-    # because that is the only value _build_env_vars emits a fence for.
-    i = src.index('existing_app.get("hypha_token_fenced")')
-    assert 'hypha_token = ""' in src[i : i + 400], (
-        "the fenced branch does not set hypha_token to the empty string, so "
-        "_build_env_vars still emits no fence"
+    await adoption_rig._settle(manager)
+
+    handed = manager.app_builder.build.await_args.kwargs["hypha_token"]
+    # `is type(...)` and not `==`, because "" == None is False but a sloppy
+    # falsy comparison would let one stand in for the other, and only "" emits
+    # a fence while only None means "inherit".
+    assert handed == expected_token and type(handed) is type(expected_token), (
+        f"an adopted app whose stored fence intent was {stored_flag!r} handed "
+        f"the builder {handed!r}; expected {expected_token!r}. "
+        '"" emits the fence, None emits nothing.'
+    )
+    assert manager._deployed_applications[adoption_rig.APP_ID][
+        "hypha_token_fenced"
+    ] is (expected_token == ""), "the record did not carry the intent forward"
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_fenced_app_handed_a_REAL_token_is_UNFENCED(monkeypatch):
+    """CONTROL on over-reach: the fence must not be sticky.
+
+    Without this, a gate that fenced an adopted app unconditionally — ignoring
+    the caller entirely — would pass the arm above for the ``fenced`` case. An
+    operator who supplies a credential on the update must get it.
+    """
+    _recover_with_fence_flag(monkeypatch, True)
+    manager = await adoption_rig._adopted_manager(
+        monkeypatch, adoption_rig.PLAIN_ONLY_ENV_VARS
     )
 
+    await manager.deploy_app(
+        artifact_id=adoption_rig.ARTIFACT_ID,
+        application_id=adoption_rig.APP_ID,
+        version=adoption_rig.NEXT_VERSION,
+        hypha_token="real-credential",
+        context=adoption_rig.CONTEXT,
+    )
+    await adoption_rig._settle(manager)
 
-def test_a_NON_fenced_adopted_app_is_not_given_a_fence_it_never_had():
-    """CONTROL on the new branch. The flag must gate it: an app deployed WITH a
-    token, then adopted, must not come back fenced — that would strip a
-    credential the operator supplied."""
+    assert (
+        manager.app_builder.build.await_args.kwargs["hypha_token"]
+        == "real-credential"
+    ), "an explicit token on the update was swallowed by the fence"
+    assert (
+        manager._deployed_applications[adoption_rig.APP_ID]["hypha_token_fenced"]
+        is False
+    ), "the app is still recorded as fenced after being handed a real token"
+
+
+def test_a_NON_fenced_app_gets_no_fence_from_the_builder_either():
+    """CONTROL at the env-var layer, which the driven arms do not reach."""
     env = _env(None)
     assert FENCE_KEY not in env
-    # and the recovery blob's flag is a bool, so a missing key reads False
-    from bioengine.apps import manager as manager_mod
-    import inspect
 
-    rec = inspect.getsource(manager_mod.AppsManager)
-    assert '"hypha_token_fenced": bool(' in rec, (
-        "the recovery blob does not coerce the flag, so a missing key could read "
-        "truthy from a stale payload"
+
+def test_the_builder_RECORDS_the_fence_intent_in_the_recovery_blob():
+    """The WRITE side, where there is no value to observe.
+
+    Driven arms monkeypatch the blob, so they would still pass against a
+    builder that never writes the flag — adoption would then always read it
+    absent. Parsed with ``ast`` rather than grepped, and the VALUE expression is
+    asserted too: a constant ``False``, or a comparison against something other
+    than the empty string, is the same defect as the key being missing.
+    """
+    from bioengine.apps import builder as builder_mod
+
+    source = textwrap.dedent(inspect.getsource(builder_mod.AppBuilder.build))
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Dict)
+            and any(getattr(t, "id", None) == "app_data" for t in node.targets)
+        ):
+            entries = {
+                k.value: v
+                for k, v in zip(node.value.keys, node.value.values)
+                if isinstance(k, ast.Constant)
+            }
+            break
+    else:
+        raise AssertionError("no `app_data = {...}` literal in AppBuilder.build")
+
+    assert "hypha_token_fenced" in entries, (
+        "the builder does not record the fence intent in app_data, so adoption "
+        "has nothing to carry and the fence dies at the next worker restart"
+    )
+    value = entries["hypha_token_fenced"]
+    assert isinstance(value, ast.Compare) and isinstance(
+        value.ops[0], ast.Eq
+    ), f"expected `hypha_token == \"\"`, got {ast.dump(value)[:120]}"
+    assert (
+        isinstance(value.left, ast.Name) and value.left.id == "hypha_token"
+    ), "the flag is computed from something other than hypha_token"
+    assert (
+        isinstance(value.comparators[0], ast.Constant)
+        and value.comparators[0].value == ""
+    ), (
+        "the flag is not a comparison against the empty string, which is the "
+        "only value that means FENCED"
     )
