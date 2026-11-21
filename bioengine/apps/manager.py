@@ -314,6 +314,33 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
+# How many consecutive failed redeploys an app gets before the worker stops
+# trying. The backoff above caps the RATE; it never capped the COUNT, so an app
+# that can never come back — a deleted artifact, a GPU that is gone, a manifest
+# the current worker refuses — was redeployed at the 10-minute floor for as long
+# as the worker lived. Each attempt is a real ``serve.run``: it builds a
+# runtime_env, schedules replicas, and on a GPU app holds the reservation while
+# it fails, so "bounded rate, unbounded count" still burns the cluster
+# indefinitely and buries every other line in the log an operator reads.
+#
+# 10 attempts with the schedule above is 2430 s — 40 minutes — of trying before
+# the monitor gives up: the 9 waits between the 10 fires are
+# 10+20+40+80+160+320+600+600+600. ``_retry_startup_applications`` sleeps BEFORE
+# each attempt rather than between them, so its 10 attempts span 3030 s, 50
+# minutes. Both comfortably outlast a Hypha restart, a node drain or an image
+# pull, and are past the point where the difference between "recovering" and
+# "never coming back" has stopped being interesting.
+#
+# Those two figures are computed by ``test_the_cap_is_finite_...`` rather than
+# trusted: an earlier version of this comment said "~85 minutes", which is about
+# double the real number and was arrived at by not adding the terms up.
+#
+# Giving up is NOT silent: it logs once at error level and is
+# reported as ``auto_redeploy_exhausted_at`` on the app's status, because an app
+# that quietly stops being retried is the same invisible failure as an app that
+# was never retried at all.
+_REDEPLOY_MAX_ATTEMPTS = 10
+
 # Grace and backoff for the artifact-manager resolution done at BOOT, which is
 # the only caller that opts into this wait. Every *later* call on a resolved
 # proxy is covered by _ReconnectingArtifactManager, which re-resolves on demand;
@@ -1797,6 +1824,15 @@ class AppsManager:
             "last_updated_at": application_info["last_updated_at"],
             "last_updated_by": application_info["last_updated_by"],
             "auto_redeploy": application_info["auto_redeploy"],
+            # None while the app is healthy or still being retried; a timestamp
+            # once the worker has STOPPED retrying it after
+            # _REDEPLOY_MAX_ATTEMPTS consecutive failures. A caller cannot infer
+            # this from `status` alone: DEPLOY_FAILED reads the same whether a
+            # redeploy is due in nine minutes or will never come again, and that
+            # ambiguity is what let a dead app sit unnoticed for 19 hours.
+            "auto_redeploy_exhausted_at": application_info.get(
+                "auto_redeploy_exhausted_at"
+            ),
             "deployed_by_worker_client_id": application_info.get(
                 "deployed_by_worker_client_id"
             ),
@@ -2260,9 +2296,11 @@ class AppsManager:
         """
         pending = list(app_configs)
         delay = _REDEPLOY_BACKOFF_INITIAL_SECONDS
-        while pending:
+        attempts = 0
+        while pending and attempts < _REDEPLOY_MAX_ATTEMPTS:
             await asyncio.sleep(delay)
             delay = min(delay * 2, _REDEPLOY_BACKOFF_MAX_SECONDS)
+            attempts += 1
 
             still_pending = []
             for app_config in pending:
@@ -2278,6 +2316,17 @@ class AppsManager:
                     )
                     still_pending.append(app_config)
             pending = still_pending
+
+        if pending:
+            # Same rule as monitor_applications: bounded attempts, and the
+            # give-up is announced. Without this the loop retried a startup
+            # application that can never deploy for the worker's whole life.
+            self.logger.error(
+                f"Giving up on {len(pending)} startup application(s) after "
+                f"{_REDEPLOY_MAX_ATTEMPTS} failed attempts: "
+                f"{', '.join(c['artifact_id'] for c in pending)}. They will NOT be "
+                f"retried again; deploy them explicitly once the cause is fixed."
+            )
 
     def cancel_startup_retry(self) -> None:
         """Stop retrying startup applications that failed to deploy."""
@@ -2368,8 +2417,15 @@ class AppsManager:
           unless the current time has passed the per-app deadline; when it has,
           fire the redeploy and double the backoff (capped at
           ``_REDEPLOY_BACKOFF_MAX_SECONDS``).
+        - After ``_REDEPLOY_MAX_ATTEMPTS`` consecutive failures the app is given
+          up on: no further redeploy is fired, one error-level line says so, and
+          ``auto_redeploy_exhausted_at`` appears on its status. The backoff caps
+          how OFTEN a redeploy fires and never capped HOW MANY, so without this
+          an app that can never come back was redeployed for the worker's whole
+          life.
         - The moment the app is observed healthy again, the per-app backoff
-          state is dropped — the next failure restarts from the initial delay.
+          state is dropped — the next failure restarts from the initial delay,
+          and a given-up app is eligible again if something else revives it.
 
         A worker with no opted-in app does not take that path, but still probes
         for a lost Serve controller and reports one; detection is what every
@@ -2502,6 +2558,11 @@ class AppsManager:
                         f"Application '{application_id}' recovered; "
                         f"auto-redeploy backoff cleared."
                     )
+                # Clear the give-up too. Without this an app that was abandoned
+                # and later revived by any other route keeps reporting
+                # auto_redeploy_exhausted_at forever, i.e. a healthy app reads
+                # as permanently dead.
+                application_info.pop("auto_redeploy_exhausted_at", None)
                 # RUNNING is not proof the new code is live: Ray Serve can reuse
                 # a replica of ANY deployment (not just the entry) after a
                 # version bump, serving stale in-memory code. If any live replica
@@ -2604,15 +2665,76 @@ class AppsManager:
                 # transition to settle before deciding to retry.
                 continue
 
+            # A retry budget belongs to ONE deploy. `deploy_app` bumps
+            # `last_updated_at` every time it (re)deploys an application_id, so a
+            # budget recorded against an older value is from a deploy that is no
+            # longer running and must not be charged to this one. Keying on the
+            # deploy rather than relying on `deploy_app` to remember to clear the
+            # dict is what makes this hold for every route that replaces a
+            # tracking entry — explicit redeploy, startup retry, adoption after a
+            # worker restart — rather than only the one that was remembered.
+            if backoff_state is not None and backoff_state.get("for_deploy") != (
+                application_info.get("last_updated_at")
+            ):
+                self._redeploy_backoff.pop(application_id, None)
+                backoff_state = None
+
             if backoff_state is None:
                 # First failure observation — fire immediately, seed backoff.
-                self._fire_redeploy(
+                fired = self._fire_redeploy(
                     application_id, application_info, attempt=1, reason=reason
                 )
                 self._redeploy_backoff[application_id] = {
                     "consecutive_failures": 1,
+                    # How many of the counted attempts never actually ran. An
+                    # app recovered from a previous worker carries no built
+                    # application, so its "attempt" is a skip — and a give-up
+                    # that called 10 skips "10 auto-redeploys all failed" was
+                    # saying something untrue of that case.
+                    "skipped": 0 if fired else 1,
                     "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
+                    # Which deploy this budget belongs to. See the staleness
+                    # check immediately above.
+                    "for_deploy": application_info.get("last_updated_at"),
                 }
+                continue
+
+            # Give up after a bounded number of attempts. The deadline check
+            # below would otherwise let this app be redeployed forever: the
+            # backoff caps how OFTEN, never HOW MANY TIMES.
+            if backoff_state["consecutive_failures"] >= _REDEPLOY_MAX_ATTEMPTS:
+                if application_info.get("auto_redeploy_exhausted_at") is None:
+                    # Recorded on the app's own state, not on the backoff dict,
+                    # so _get_app_status reads only what it already reads. The
+                    # first version of this put it on _redeploy_backoff and the
+                    # status builder reached across for it, which broke 49 tests
+                    # that build an AppsManager with just the attributes the code
+                    # under test needs — a status surface should not depend on
+                    # the monitor's private bookkeeping existing.
+                    application_info["auto_redeploy_exhausted_at"] = now
+                    skipped = backoff_state.get("skipped", 0)
+                    if skipped >= _REDEPLOY_MAX_ATTEMPTS:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive attempts could "
+                            f"not run at all — this application was recovered from "
+                            f"a previous worker and carries no built application"
+                        )
+                    elif skipped:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive attempts failed "
+                            f"({skipped} of them could not run)"
+                        )
+                    else:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive auto-redeploys "
+                            f"all failed"
+                        )
+                    self.logger.error(
+                        f"Giving up on application '{application_id}': {what} "
+                        f"({reason}). It will NOT be retried again and is left in "
+                        f"its failed state; redeploy it explicitly once the cause "
+                        f"is fixed."
+                    )
                 continue
 
             # Subsequent failure — honour the per-app deadline.
@@ -2620,9 +2742,11 @@ class AppsManager:
                 continue
 
             attempt = backoff_state["consecutive_failures"] + 1
-            self._fire_redeploy(
+            fired = self._fire_redeploy(
                 application_id, application_info, attempt=attempt, reason=reason
             )
+            if not fired:
+                backoff_state["skipped"] = backoff_state.get("skipped", 0) + 1
             delay = min(
                 _REDEPLOY_BACKOFF_MAX_SECONDS,
                 _REDEPLOY_BACKOFF_INITIAL_SECONDS * (2 ** (attempt - 1)),
@@ -2680,8 +2804,15 @@ class AppsManager:
         application_info: Dict[str, Any],
         attempt: int,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Schedule a redeploy task, logging what triggered it.
+
+        Returns True when a redeploy was actually started, False when the attempt
+        was counted against the cap but nothing ran — an application recovered
+        from a previous worker carries no built application, so there is nothing
+        to resubmit. The caller tallies the Falses so the give-up line can say
+        that attempts "could not run" rather than that redeploys "failed".
+
 
         ``reason`` is what makes an incident readable afterwards: an explicit
         UNHEALTHY verdict and a missing status entry are different failures and
@@ -2699,7 +2830,9 @@ class AppsManager:
                 f"application; skipping auto-redeploy (attempt #{attempt}). "
                 f"Redeploy it explicitly to bring it back under this worker."
             )
-            return
+            # False: the attempt was COUNTED against the cap but nothing ran, so
+            # the give-up line must not claim that redeploys "failed".
+            return False
         self.logger.warning(
             f"Application '{application_id}' for artifact "
             f"'{application_info['artifact_id']}' is unhealthy ({reason}); "
@@ -2710,6 +2843,7 @@ class AppsManager:
             name=f"Deploy_{application_id}",
         )
         application_info["deployment_task"] = deployment_task
+        return True
 
     @schema_method
     async def upload_app(
