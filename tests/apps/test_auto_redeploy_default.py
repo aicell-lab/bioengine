@@ -355,3 +355,82 @@ def test_the_deployed_record_STORES_THE_VARIABLE_not_a_constant():
         f"the record stores auto_redeploy as {bad} rather than the resolved variable; "
         "a constant there makes the monitor read something the caller never asked for"
     )
+
+
+def test_the_RECORD_is_written_ONLY_by_the_dict_literal_and_nothing_else():
+    """Allow-list over the STRING, because an allow-list over write SHAPES keeps losing.
+
+    Enumerating the ways a value can be bound to the NAME ``auto_redeploy`` catches an
+    assignment, a tuple target, an annotation, an augmented assignment and a walrus -- and
+    still misses a write that never touches the name at all:
+
+        self._deployed_applications[application_id]["auto_redeploy"] = True
+
+    That is a Subscript target, not a Name, so no amount of Name-write enumeration sees it,
+    and it overrides the recorded value after the dict literal has honoured the caller. It was
+    measured surviving the whole file. ``.update({"auto_redeploy": True})``,
+    ``setdefault`` and ``setattr`` are the same defect one step further along, and adding each
+    to a list of shapes is the mistake that produced this test.
+
+    So invert it: count the string constants equal to ``"auto_redeploy"`` inside ``deploy_app``
+    and require each to be one of the two legitimate uses. Any route that writes the key --
+    subscript, update, setdefault -- must mention the string to do it, so it shows up here
+    whatever syntax it uses.
+
+    The two legitimate uses:
+      1. the key of the record dict literal, whose value must be the resolved NAME
+      2. a READ of the previous value on the update path (``existing_app["auto_redeploy"]``)
+    """
+    fn = _deploy_app_fn()
+    occurrences = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Constant) and n.value == "auto_redeploy"
+    ]
+    assert occurrences, (
+        "deploy_app never mentions the string 'auto_redeploy' -- this arm would be vacuous "
+        "and the record it is written for has moved"
+    )
+
+    # Classify each occurrence by the role it plays.
+    dict_keys, subscript_reads, other = [], [], []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value == "auto_redeploy":
+                    dict_keys.append((k, v))
+        elif isinstance(node, ast.Subscript):
+            s = node.slice
+            if isinstance(s, ast.Constant) and s.value == "auto_redeploy":
+                # A LOAD is a read; a STORE is a write to the record and is never legitimate.
+                (subscript_reads if isinstance(node.ctx, ast.Load) else other).append(node)
+
+    accounted = len(dict_keys) + len(subscript_reads) + len(other)
+    assert accounted == len(occurrences), (
+        f"{len(occurrences) - accounted} occurrence(s) of the string 'auto_redeploy' in "
+        f"deploy_app are in neither a dict literal nor a subscript -- an unclassified "
+        f"mention is exactly what this arm exists to refuse, so it fails rather than "
+        f"ignoring them (lines "
+        f"{sorted(n.lineno for n in occurrences) })"
+    )
+
+    assert not other, (
+        f"deploy_app WRITES the record key by subscript at line(s) "
+        f"{sorted(n.lineno for n in other)}; that overrides the value the dict literal "
+        f"recorded for the caller, so an application that opted out is redeployed anyway"
+    )
+
+    assert len(dict_keys) == 1, (
+        f"expected exactly ONE record entry for auto_redeploy, found {len(dict_keys)} at "
+        f"lines {sorted(k.lineno for k, _ in dict_keys)}"
+    )
+    key, value = dict_keys[0]
+    assert isinstance(value, ast.Name) and value.id == "auto_redeploy", (
+        f"the record entry at line {key.lineno} stores "
+        f"{type(value).__name__} rather than the resolved variable"
+    )
+
+    assert len(subscript_reads) <= 1, (
+        f"more than one subscript READ of the key at lines "
+        f"{sorted(n.lineno for n in subscript_reads)}; only the update path's read of the "
+        f"previous value is expected"
+    )
