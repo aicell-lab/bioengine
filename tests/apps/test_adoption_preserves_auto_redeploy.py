@@ -35,6 +35,7 @@ import pytest
 
 import bioengine.apps.builder as builder_mod
 import bioengine.apps.manager as manager_mod
+from bioengine.apps.builder import AppBuilder
 from bioengine.apps.manager import AppsManager
 
 APP_ID = "adopted-app"
@@ -161,10 +162,16 @@ async def test_the_two_directions_DIFFER_so_the_value_is_carried_not_constant():
 
 @pytest.mark.asyncio
 async def test_adoption_REFUSES_an_app_data_blob_that_omits_the_setting():
-    """A missing key must refuse, not default. Recovery lists `auto_redeploy` in its required
-    keys; if it were ever dropped from that set, a blob without it would adopt and the record
-    would carry whatever `.get` returned — and `None` is falsy, so the app would silently stop
-    being redeployed rather than loudly failing to adopt."""
+    """A blob missing the setting must not be adopted, BY ANY MECHANISM.
+
+    What this pins is the outcome, not the route to it: an application whose blob omits
+    `auto_redeploy` must not end up in the tracking table, because a record carrying a default
+    would silently stop redeploying (`None` is falsy) instead of loudly failing to adopt.
+
+    It deliberately does NOT claim to pin `auto_redeploy` being in recovery's `required_keys`.
+    Measured: removing it from that set still refuses the adoption — the record construction
+    raises `KeyError` instead — so this arm stays green against that mutation and the
+    required-keys membership is asserted by the writer/reader agreement arm below."""
     blob = _app_data(True)
     del blob[KEY]
     m = _manager(blob)
@@ -274,4 +281,144 @@ def test_the_WRITER_and_the_READER_agree_on_the_key_and_it_is_REQUIRED():
     assert KEY in names, (
         f"{KEY!r} is not in recovery's required_keys, so a blob omitting it would adopt and the "
         f"record would carry a default instead of the deployed value"
+    )
+
+
+# ── THE ROUND TRIP: the blob comes from the REAL builder ─────────────────────
+#
+# The static arm below pins how builder.py is SPELLED. That is not the same as pinning
+# the value that reaches the blob, and two one-line mutations prove it: assigning
+# `auto_redeploy = True` on the line before the dict literal, or
+# `app_data.update(auto_redeploy=True)` after it, both leave the dict entry reading
+# `"auto_redeploy": auto_redeploy` and both ship a constant. The second is invisible to
+# any search for the string, because a keyword argument's name is an identifier and not
+# a string constant.
+#
+# So take the blob from the builder itself: drive the real AppBuilder.build with its
+# collaborators stubbed, read proxy_args["app_data"] out of what it returns, and feed
+# THAT to the real recover_deployed_applications.
+
+
+async def _blob_from_the_real_builder(auto_redeploy):
+    """Run the real AppBuilder.build and return the app_data blob it produced."""
+    b = object.__new__(AppBuilder)
+    b.logger = MagicMock()
+    b.server_url = "https://example.invalid"
+    b.proxy_actor_name = "bioengine-proxy"
+    b.server = SimpleNamespace(
+        generate_token=AsyncMock(return_value="download-token"),
+        config=SimpleNamespace(
+            workspace=WORKSPACE, client_id="worker-1", public_base_url="https://example.invalid",
+            user={"id": "tester"},
+        ),
+    )
+    b._load_manifest = AsyncMock(return_value=(
+        {
+            "entry": "entry:EntryApp",
+            "name": "Adopted App",
+            "description": "an app",
+            "id": "adopted",
+            "type": "ray-serve",
+            "format_version": "0.6.0",
+        },
+        "1.0.0",
+    ))
+    b._introspect_via_ray_task = AsyncMock(return_value={
+        # build() reads introspect_result["spec"] and checks its format_version against
+        # the module's own SPEC_FORMAT_VERSION, so take that constant from the module
+        # rather than hard-coding a string that would rot independently of it.
+        "spec": {
+            "entry_id": "entry:EntryApp",
+            # The class shape a real introspect returns: validate_kwargs_against_spec
+            # reads init_params, and the resource helpers read resources.
+            "classes": {
+                "entry:EntryApp": {
+                    "methods": {"ping": {}},
+                    "resources": {},
+                    "init_params": [],
+                    # a LIST of dicts, each with a "name" - build() does [m["name"] for m in ...]
+                    "method_schemas": [{"name": "ping"}],
+                    "lifecycle_methods": {"smoke_test": None, "health_check": None},
+                }
+            },
+            "format_version": builder_mod.SPEC_FORMAT_VERSION,
+        },
+        "source_signature": "sig-1",
+    })
+    b._build_env_vars = MagicMock(return_value={})
+    b._build_submit_runtime_env = MagicMock(return_value={"env_vars": {}})
+    b._resolve_authorized_users = MagicMock(return_value=["*"])
+    b._translate_kwargs_keys = MagicMock(side_effect=lambda kwargs, *a, **k: dict(kwargs or {}))
+    b._sum_resources = MagicMock(return_value={"num_cpus": 1, "num_gpus": 0, "memory": 1 << 30})
+    b._apply_gpu_memory = MagicMock(side_effect=lambda res, *a, **k: res)
+    b._get_cluster_gpu_sizing = AsyncMock(return_value={})
+    # returns a PAIR: (recovery_env_vars, redacted_env_var_keys)
+    b._sanitize_recovery_env_vars = MagicMock(side_effect=lambda ev, *a, **k: (dict(ev or {}), {}))
+    b._bioengine_gcs_uri = MagicMock(return_value="gcs://_ray_pkg_test.zip")
+
+    built = await b.build(
+        application_id=APP_ID,
+        artifact_id="bioimage-io/adopted",
+        version="1.0.0",
+        application_kwargs=None,
+        application_env_vars=None,
+        hypha_token=None,
+        disable_gpu=False,
+        max_ongoing_requests=10,
+        proxy_memory_in_gb=0.5,
+        debug=False,
+        started_at=1.0,
+        last_updated_at=2.0,
+        last_updated_by="someone",
+        auto_redeploy=auto_redeploy,
+        ice_servers=None,
+        authorized_users=["*"],
+        deploying_user=("tester", "tester@example.org"),
+        admin_users=[],
+        scaling=None,
+    )
+    blob = built.proxy_args["app_data"]
+    assert isinstance(blob, dict), f"app_data is {type(blob).__name__}, not a dict"
+    return blob
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deployed_with", [False, True])
+async def test_the_REAL_builders_blob_round_trips_through_REAL_adoption(deployed_with):
+    """The clause, end to end in-process: builder -> app_data -> recovery -> record.
+
+    Both halves are production code. Only the builder's collaborators are stubbed, and
+    none of them touches auto_redeploy -- it goes in as an argument to build() and comes
+    out of the record, so anything that alters it in between is caught here by VALUE
+    rather than by spelling.
+    """
+    blob = await _blob_from_the_real_builder(deployed_with)
+    assert blob.get(KEY, "<ABSENT>") is deployed_with, (
+        f"the REAL builder stamped {blob.get(KEY, '<ABSENT>')!r} into app_data for an "
+        f"application deployed with {KEY}={deployed_with!r}; every application adopted after a "
+        f"worker restart would come back with that value"
+    )
+
+    # ...and the same blob through the real adoption path.
+    m = _manager(blob)
+    await m.recover_deployed_applications()
+    assert _recovered(m) is deployed_with, (
+        f"the round trip lost the value: deployed {deployed_with!r}, adopted "
+        f"{_recovered(m)!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_round_trip_CARRIES_the_value_rather_than_a_constant():
+    """Instrument control over the arm above: the two parametrised runs must disagree, or a
+    constant anywhere in the chain satisfies one of them and looks half-working."""
+    seen = []
+    for want in (False, True):
+        blob = await _blob_from_the_real_builder(want)
+        m = _manager(blob)
+        await m.recover_deployed_applications()
+        seen.append(_recovered(m))
+    assert seen == [False, True], (
+        f"the builder-to-adoption round trip produced {seen!r} for [False, True]; the value is "
+        f"not being carried through the chain"
     )
