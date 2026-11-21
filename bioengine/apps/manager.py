@@ -2571,11 +2571,17 @@ class AppsManager:
 
             if backoff_state is None:
                 # First failure observation — fire immediately, seed backoff.
-                self._fire_redeploy(
+                fired = self._fire_redeploy(
                     application_id, application_info, attempt=1, reason=reason
                 )
                 self._redeploy_backoff[application_id] = {
                     "consecutive_failures": 1,
+                    # How many of the counted attempts never actually ran. An
+                    # app recovered from a previous worker carries no built
+                    # application, so its "attempt" is a skip — and a give-up
+                    # that called 10 skips "10 auto-redeploys all failed" was
+                    # saying something untrue of that case.
+                    "skipped": 0 if fired else 1,
                     "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
                     # Which deploy this budget belongs to. See the staleness
                     # check immediately above.
@@ -2596,12 +2602,28 @@ class AppsManager:
                     # under test needs — a status surface should not depend on
                     # the monitor's private bookkeeping existing.
                     application_info["auto_redeploy_exhausted_at"] = now
+                    skipped = backoff_state.get("skipped", 0)
+                    if skipped >= _REDEPLOY_MAX_ATTEMPTS:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive attempts could "
+                            f"not run at all — this application was recovered from "
+                            f"a previous worker and carries no built application"
+                        )
+                    elif skipped:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive attempts failed "
+                            f"({skipped} of them could not run)"
+                        )
+                    else:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive auto-redeploys "
+                            f"all failed"
+                        )
                     self.logger.error(
-                        f"Giving up on application '{application_id}': "
-                        f"{_REDEPLOY_MAX_ATTEMPTS} consecutive auto-redeploys all "
-                        f"failed ({reason}). It will NOT be retried again and is "
-                        f"left in its failed state; redeploy it explicitly once "
-                        f"the cause is fixed."
+                        f"Giving up on application '{application_id}': {what} "
+                        f"({reason}). It will NOT be retried again and is left in "
+                        f"its failed state; redeploy it explicitly once the cause "
+                        f"is fixed."
                     )
                 continue
 
@@ -2610,9 +2632,11 @@ class AppsManager:
                 continue
 
             attempt = backoff_state["consecutive_failures"] + 1
-            self._fire_redeploy(
+            fired = self._fire_redeploy(
                 application_id, application_info, attempt=attempt, reason=reason
             )
+            if not fired:
+                backoff_state["skipped"] = backoff_state.get("skipped", 0) + 1
             delay = min(
                 _REDEPLOY_BACKOFF_MAX_SECONDS,
                 _REDEPLOY_BACKOFF_INITIAL_SECONDS * (2 ** (attempt - 1)),
@@ -2689,7 +2713,9 @@ class AppsManager:
                 f"application; skipping auto-redeploy (attempt #{attempt}). "
                 f"Redeploy it explicitly to bring it back under this worker."
             )
-            return
+            # False: the attempt was COUNTED against the cap but nothing ran, so
+            # the give-up line must not claim that redeploys "failed".
+            return False
         self.logger.warning(
             f"Application '{application_id}' for artifact "
             f"'{application_info['artifact_id']}' is unhealthy ({reason}); "
@@ -2700,6 +2726,7 @@ class AppsManager:
             name=f"Deploy_{application_id}",
         )
         application_info["deployment_task"] = deployment_task
+        return True
 
     @schema_method
     async def upload_app(
