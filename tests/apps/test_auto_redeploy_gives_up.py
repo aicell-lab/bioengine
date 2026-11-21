@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import bioengine.apps.manager as _manager_module
 from bioengine.apps.manager import (
     _REDEPLOY_BACKOFF_INITIAL_SECONDS,
     _REDEPLOY_BACKOFF_MAX_SECONDS,
@@ -49,6 +50,17 @@ ENTRY = "ModelRunner"
 VERSION = "2.8.0"
 
 
+class _LoopIsUnbounded(BaseException):
+    """Escapes the retry loop's `except Exception`, which an AssertionError does not.
+
+    The loop catches `Exception` around each `deploy_app` call and logs a warning,
+    so a ceiling that raises `AssertionError` is swallowed and the unbounded
+    mutant keeps spinning. Measured: with an AssertionError ceiling the mutant
+    still ran past a 180 s wall-clock timeout with no output at all. Deriving
+    from `BaseException` is what makes the ceiling reach the test runner.
+    """
+
+
 def _serve_status(state: str, *, also: dict | None = None):
     apps = {APP_ID: SimpleNamespace(status=SimpleNamespace(value=state))}
     for app_id, app_state in (also or {}).items():
@@ -56,11 +68,14 @@ def _serve_status(state: str, *, also: dict | None = None):
     return SimpleNamespace(applications=apps)
 
 
-def _app_entry(entry: str = ENTRY) -> dict:
+def _app_entry(entry: str = ENTRY, last_updated_at: float = 1.0) -> dict:
     is_deployed = asyncio.Event()
     is_deployed.set()
     return {
         "is_deployed": is_deployed,
+        # What the retry budget is keyed on: deploy_app bumps this on every
+        # (re)deploy of an application_id.
+        "last_updated_at": last_updated_at,
         "artifact_id": "bioimage-io/model-runner",
         "version": VERSION,
         "auto_redeploy": True,
@@ -164,16 +179,38 @@ def test_the_cap_is_finite_and_leaves_room_for_a_real_outage() -> None:
     """
     assert 1 < _REDEPLOY_MAX_ATTEMPTS < 1000
 
-    total = sum(
+    # The monitor fires on the first unhealthy observation and then waits
+    # between fires, so N attempts span N-1 waits.
+    monitor_total = sum(
         min(
             _REDEPLOY_BACKOFF_MAX_SECONDS,
             _REDEPLOY_BACKOFF_INITIAL_SECONDS * (2 ** (n - 1)),
         )
         for n in range(1, _REDEPLOY_MAX_ATTEMPTS)
     )
-    assert total >= 1800, (
-        f"the cap allows only {total:.0f}s of retrying, which is shorter than a "
-        f"node drain or an image pull — a recoverable app would be abandoned"
+    # The startup retry loop sleeps BEFORE each attempt, so N attempts span N
+    # waits — a different figure from the same constants, and conflating the two
+    # is how the comment on _REDEPLOY_MAX_ATTEMPTS came to claim a span about
+    # double the real one.
+    delay, startup_total = _REDEPLOY_BACKOFF_INITIAL_SECONDS, 0.0
+    for _ in range(_REDEPLOY_MAX_ATTEMPTS):
+        startup_total += delay
+        delay = min(delay * 2, _REDEPLOY_BACKOFF_MAX_SECONDS)
+
+    for label, total in (("monitor", monitor_total), ("startup", startup_total)):
+        assert total >= 1800, (
+            f"the {label} cap allows only {total:.0f}s of retrying, which is "
+            f"shorter than a node drain or an image pull — a recoverable app "
+            f"would be abandoned"
+        )
+
+    # The exact figures, so the comment documenting them cannot drift unnoticed.
+    # Asserted rather than described: the previous comment's "~85 minutes" was
+    # wrong by about a factor of two and nothing caught it.
+    assert (monitor_total, startup_total) == (2430.0, 3030.0), (
+        f"the schedule changed: monitor={monitor_total:.0f}s "
+        f"startup={startup_total:.0f}s. Update the comment on "
+        f"_REDEPLOY_MAX_ATTEMPTS to match before changing this assertion."
     )
 
 
@@ -310,3 +347,151 @@ async def test_the_give_up_is_reported_on_the_apps_status(clock) -> None:
     )
     # Scoped to that one method: a module-wide grep would pass against a version
     # that mentions the key anywhere else and never reports it.
+
+
+# ── the startup retry loop's bound ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_startup_retry_loop_is_bounded_too(monkeypatch) -> None:
+    """`_retry_startup_applications` loops on its own schedule, not the monitor's.
+
+    It retries apps that failed inside `deploy_app` and therefore have no entry
+    in `_deployed_applications`, so `monitor_applications` cannot see them and
+    none of the arms above touch this path. Its loop was `while pending:` with no
+    attempt limit — the same unbounded defect in a second place, and reverting
+    the bound left every other test in the tree green.
+
+    Two details are load-bearing, and both were arrived at the hard way:
+
+    * The SCHEDULE is shrunk rather than the clock stubbed. Monkeypatching
+      `asyncio.sleep` globally replaces machinery pytest-asyncio's own event loop
+      uses, and it turns the unbounded mutant into an infinite BUSY loop — a
+      container running that mutant escaped a stopped harness and spun for four
+      hours. These two constants are read from module globals on every call, so
+      patching them is a data change with no effect on the loop.
+    * The ceiling raises a `BaseException` subclass. The loop wraps each
+      `deploy_app` call in `except Exception`, so an `AssertionError` ceiling is
+      swallowed and changes nothing.
+    """
+    manager = object.__new__(AppsManager)
+    manager.logger = logging.getLogger("test.giveup")
+
+    attempts = {"n": 0}
+    # Just above the cap: "it made more attempts than the cap allows" is the
+    # whole claim, and a larger ceiling only makes the mutant slower to refuse.
+    CEILING = _REDEPLOY_MAX_ATTEMPTS + 5
+
+    async def _always_fails(**_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] > CEILING:
+            raise _LoopIsUnbounded(
+                f"still retrying after {CEILING} attempts, so the loop is not "
+                f"bounded by _REDEPLOY_MAX_ATTEMPTS={_REDEPLOY_MAX_ATTEMPTS}"
+            )
+        raise RuntimeError("artifact is gone")
+
+    manager.deploy_app = _always_fails
+    monkeypatch.setattr(_manager_module, "_REDEPLOY_BACKOFF_INITIAL_SECONDS", 0.001)
+    monkeypatch.setattr(_manager_module, "_REDEPLOY_BACKOFF_MAX_SECONDS", 0.001)
+
+    await manager._retry_startup_applications(
+        [{"artifact_id": "bioimage-io/never-coming-back"}]
+    )
+
+    assert attempts["n"] == _REDEPLOY_MAX_ATTEMPTS, (
+        f"made {attempts['n']} attempts against a cap of {_REDEPLOY_MAX_ATTEMPTS}"
+    )
+    # CONTROL: the loop must have RUN. Returning immediately also satisfies
+    # "<= cap", and a startup app never retried once is the opposite defect.
+    assert attempts["n"] > 1, "nothing was retried, so this proves nothing about a cap"
+
+
+@pytest.mark.asyncio
+async def test_the_startup_give_up_is_announced(monkeypatch, caplog) -> None:
+    """A startup app that never deployed has no status row, so the log is all there is.
+
+    `get_app_status` reads `_deployed_applications`, and an app that failed inside
+    `deploy_app` has no entry there. `auto_redeploy_exhausted_at` therefore cannot
+    carry this give-up, which makes the error line the only surface — and an
+    unannounced give-up is the same invisible failure as an unbounded retry.
+    """
+    manager = object.__new__(AppsManager)
+    manager.logger = logging.getLogger("test.giveup")
+
+    seen = {"n": 0}
+
+    async def _always_fails(**_kwargs):
+        seen["n"] += 1
+        if seen["n"] > _REDEPLOY_MAX_ATTEMPTS + 5:
+            raise _LoopIsUnbounded("the retry loop is not bounded")
+        raise RuntimeError("artifact is gone")
+
+    manager.deploy_app = _always_fails
+    monkeypatch.setattr(_manager_module, "_REDEPLOY_BACKOFF_INITIAL_SECONDS", 0.001)
+    monkeypatch.setattr(_manager_module, "_REDEPLOY_BACKOFF_MAX_SECONDS", 0.001)
+
+    with caplog.at_level(logging.ERROR, logger="test.giveup"):
+        await manager._retry_startup_applications(
+            [{"artifact_id": "bioimage-io/never-coming-back"}]
+        )
+
+    errors = _errors(caplog)
+    assert len(errors) == 1, f"expected one give-up line, got {len(errors)}"
+    assert "Giving up" in errors[0]
+    assert "never-coming-back" in errors[0], (
+        "the line does not name the application, so an operator cannot act on it"
+    )
+
+
+# ── an explicit redeploy after a give-up gets its retries back ──────────────
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_redeploy_after_a_give_up_is_retried_again(clock) -> None:
+    """The regression the attempt cap introduced, and the worst possible one.
+
+    The give-up message tells the operator to "redeploy it explicitly once the
+    cause is fixed". `deploy_app` replaces the app's tracking entry, which clears
+    `auto_redeploy_exhausted_at` — but the monitor's `_redeploy_backoff` entry is
+    popped only on undeploy and on RUNNING, so `consecutive_failures` stayed at
+    the cap. The first unhealthy observation after that redeploy then went
+    straight to the give-up branch: **zero** automatic retries, plus a second
+    "10 consecutive auto-redeploys all failed" line that is false for the new
+    deploy.
+
+    Before the cap existed a stale counter only cost a longer delay. With it, it
+    means never — so the fix made the documented recovery path strictly worse
+    than the defect it was fixing, for anyone who followed the instruction.
+    """
+    manager = _make_manager()
+
+    for _ in range(_REDEPLOY_MAX_ATTEMPTS * 2):
+        await _tick(manager, "DEPLOY_FAILED")
+        clock.advance_past_the_backoff()
+
+    assert _status_field(manager) is not None, "the arm needs a give-up to have happened"
+    manager._deploy_application.reset_mock()
+
+    # Replace the tracking entry the way deploy_app does — a NEW
+    # `last_updated_at`, everything else the same — and do NOT touch
+    # `_redeploy_backoff`. Clearing it here would make this arm a tautology: it
+    # would pass against a worker that never resets the budget, which is the
+    # defect. The exhausted entry is deliberately left in place so the monitor
+    # has to notice for itself that it belongs to a previous deploy.
+    stale = dict(manager._redeploy_backoff.get(APP_ID) or {})
+    assert stale.get("consecutive_failures") == _REDEPLOY_MAX_ATTEMPTS, (
+        f"the arm needs an exhausted budget to still be present, got {stale}"
+    )
+    manager._deployed_applications[APP_ID] = _app_entry(last_updated_at=2.0)
+
+    await _tick(manager, "DEPLOY_FAILED")
+
+    assert manager._deploy_application.await_count > 0, (
+        "the redeploy the give-up message asks for got no automatic retries at "
+        "all — the stale attempt counter sent the first failure straight to the "
+        "give-up branch"
+    )
+    assert _status_field(manager) is None, (
+        "the fresh deploy is already marked exhausted"
+    )

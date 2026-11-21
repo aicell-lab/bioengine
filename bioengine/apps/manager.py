@@ -323,11 +323,19 @@ _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 # it fails, so "bounded rate, unbounded count" still burns the cluster
 # indefinitely and buries every other line in the log an operator reads.
 #
-# 10 attempts with the schedule above is ~85 minutes of trying (10+20+40+80+160+
-# 320+600+600+600 s) before giving up, which comfortably outlasts a Hypha
-# restart, a node drain or an image pull, and is the point past which the
-# difference between "recovering" and "never coming back" has stopped being
-# interesting. Giving up is NOT silent: it logs once at error level and is
+# 10 attempts with the schedule above is 2430 s — 40 minutes — of trying before
+# the monitor gives up: the 9 waits between the 10 fires are
+# 10+20+40+80+160+320+600+600+600. ``_retry_startup_applications`` sleeps BEFORE
+# each attempt rather than between them, so its 10 attempts span 3030 s, 50
+# minutes. Both comfortably outlast a Hypha restart, a node drain or an image
+# pull, and are past the point where the difference between "recovering" and
+# "never coming back" has stopped being interesting.
+#
+# Those two figures are computed by ``test_the_cap_is_finite_...`` rather than
+# trusted: an earlier version of this comment said "~85 minutes", which is about
+# double the real number and was arrived at by not adding the terms up.
+#
+# Giving up is NOT silent: it logs once at error level and is
 # reported as ``auto_redeploy_exhausted_at`` on the app's status, because an app
 # that quietly stops being retried is the same invisible failure as an app that
 # was never retried at all.
@@ -2547,6 +2555,20 @@ class AppsManager:
                 # transition to settle before deciding to retry.
                 continue
 
+            # A retry budget belongs to ONE deploy. `deploy_app` bumps
+            # `last_updated_at` every time it (re)deploys an application_id, so a
+            # budget recorded against an older value is from a deploy that is no
+            # longer running and must not be charged to this one. Keying on the
+            # deploy rather than relying on `deploy_app` to remember to clear the
+            # dict is what makes this hold for every route that replaces a
+            # tracking entry — explicit redeploy, startup retry, adoption after a
+            # worker restart — rather than only the one that was remembered.
+            if backoff_state is not None and backoff_state.get("for_deploy") != (
+                application_info.get("last_updated_at")
+            ):
+                self._redeploy_backoff.pop(application_id, None)
+                backoff_state = None
+
             if backoff_state is None:
                 # First failure observation — fire immediately, seed backoff.
                 self._fire_redeploy(
@@ -2555,6 +2577,9 @@ class AppsManager:
                 self._redeploy_backoff[application_id] = {
                     "consecutive_failures": 1,
                     "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
+                    # Which deploy this budget belongs to. See the staleness
+                    # check immediately above.
+                    "for_deploy": application_info.get("last_updated_at"),
                 }
                 continue
 
