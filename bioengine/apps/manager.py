@@ -4339,13 +4339,24 @@ class AppsManager:
                     "death_cause": ..., "logs_omitted": True,
                 }                                         # no timezone, no timestamp
                 logs["error"] = "<message>"               # retrieval failed: a STRING value
-                logs["_deliberately_stopped_replicas"] = <int>   # a COUNT, not a replica
 
-            So a loop over ``logs.items()`` must not assume the value is a record, and a
-            record must not be assumed to carry ``timezone``: it is added only when the
-            replica's zone is known, which excludes the error entry and every abnormally
-            dead replica on default arguments. Treating an absent ``timezone`` as UTC is a
-            guess, not a default.
+            So a loop over ``logs.items()`` must not assume the value is a record — the
+            ``error`` entry's value is a string — and a record must not be assumed to carry
+            ``timezone``: it is added only when the replica's zone is known, which excludes
+            the error entry and every abnormally dead replica on default arguments. Treating
+            an absent ``timezone`` as UTC is a guess, not a default.
+
+            Two counts live BESIDE ``logs`` rather than inside it, and both are easy to miss:
+
+                deployments[<class_name>].deliberately_stopped_replicas = <int>
+                deployments[<class_name>].death_causes_unavailable = True   # when present
+
+            The first is lifted out of the logs map before this method returns, precisely so a
+            caller iterating ``logs`` never meets an int where it expects a record — the proxy's
+            own ``get_deployment_logs`` does still carry it under
+            ``_deliberately_stopped_replicas``, so a caller of THAT must handle it. The second
+            exists so "no deaths shown" cannot be read as "nothing died": an empty answer and an
+            unanswered question are different, and only this key distinguishes them.
 
             When ``timezone`` IS present it names the zone of the timestamps INSIDE the
             ``stdout``/``stderr`` text — the replica's local zone, not necessarily UTC.
@@ -4384,9 +4395,13 @@ class AppsManager:
                 ...                                   # retrieval failed; no replicas here
             for replica_id, rec in logs.items():
                 if not isinstance(rec, dict):
-                    continue                          # e.g. _deliberately_stopped_replicas
+                    continue                          # the "error" entry's value is a string
                 lines = rec.get("stdout", []) + rec.get("stderr", [])
                 zone = rec.get("timezone")            # may be absent; do NOT assume UTC
+
+            # the counts are SIBLINGS of logs, not entries in it
+            dep = app["deployments"]["MyApp"]
+            dep.get("deliberately_stopped_replicas"), dep.get("death_causes_unavailable")
         """
         _validate_deployment_logs_map(deployment_logs)
 

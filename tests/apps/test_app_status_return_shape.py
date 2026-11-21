@@ -227,9 +227,14 @@ def test_the_docstring_documents_the_NON_RECORD_entries_in_the_logs_map():
     # "satisfied by the wrong occurrence" failure that an earlier arm here had.
     for needed in (
         'logs["error"] = "<message>"',
-        'logs["_deliberately_stopped_replicas"] = <int>',
         '"death_cause"',
         '"logs_omitted": True',
+        # The counts are SIBLINGS of logs, not entries in it: manager.py lifts
+        # _deliberately_stopped_replicas out of the map before returning, exactly so a caller
+        # iterating logs never meets an int. Documenting it as a logs entry was wrong, and was
+        # corrected by the consumer that reads this surface.
+        "deployments[<class_name>].deliberately_stopped_replicas",
+        "deployments[<class_name>].death_causes_unavailable",
     ):
         assert " ".join(needed.split()) in normalised, (
             f"the docstring's shape enumeration no longer gives {needed!r}, so a caller writing "
@@ -270,3 +275,23 @@ def test_the_documented_EXAMPLE_survives_every_shape_the_docstring_names():
             "the error entry is a string value; a caller that indexes it as a record raises "
             "TypeError, which is why the docstring has to name this shape"
         )
+
+
+def test_the_docstring_does_NOT_put_the_COUNTS_inside_the_logs_map():
+    """The counts are siblings of `logs`, and saying otherwise sends a caller hunting an int
+    inside a map that cannot contain one.
+
+    manager.py rebuilds the logs map WITHOUT `_deliberately_stopped_replicas` and re-exposes it
+    as `deployments[<name>].deliberately_stopped_replicas`, specifically so a consumer iterating
+    `logs` never meets an int where a record belongs. The proxy's own `get_deployment_logs` does
+    still carry the prefixed key, so the distinction is between the two surfaces rather than
+    between present and absent.
+    """
+    normalised = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    assert 'logs["_deliberately_stopped_replicas"]' not in normalised, (
+        "the docstring places the count INSIDE the logs map; get_app_status lifts it out before "
+        "returning, so a caller told this looks for an int that is never there"
+    )
+    assert "deliberately_stopped_replicas" in normalised, (
+        "the count is not documented at all, so a caller cannot find it on either surface"
+    )
