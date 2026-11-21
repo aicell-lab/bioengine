@@ -382,10 +382,11 @@ def _status_manager(app_id: str, info: dict) -> AppsManager:
 async def test_the_give_up_IS_IN_the_status_payload_a_caller_receives() -> None:
     """The published field, read off the RETURNED dict rather than off the source.
 
-    The first version of this arm asserted `"auto_redeploy_exhausted_at" in
-    inspect.getsource(_get_app_status)`. That survives a version which mentions
-    the key and always reports None — a source-text guard tests the spelling you
-    pictured, not the behaviour, and review caught exactly that.
+    Asserting `"auto_redeploy_exhausted_at" in inspect.getsource(_get_app_status)`
+    instead is strictly weaker and not equivalent: it holds for an implementation
+    that mentions the key and always reports None. A source-text guard constrains
+    the spelling, not the value a caller receives, so the assertion has to be made
+    against the returned payload.
     """
     app_id = "flaky-status"
     manager = _status_manager(app_id, _status_app_info(exhausted_at=1795221171.0))
