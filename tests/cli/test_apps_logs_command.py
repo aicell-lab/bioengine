@@ -155,9 +155,7 @@ def invoke(monkeypatch):
     def _invoke(command: list, status: dict):
         worker = MagicMock()
         worker.get_app_status = AsyncMock(return_value={APP_ID: status})
-        monkeypatch.setattr(
-            apps_cli, "connect_worker", AsyncMock(return_value=worker)
-        )
+        monkeypatch.setattr(apps_cli, "connect_worker", AsyncMock(return_value=worker))
         result = CliRunner().invoke(
             apps_cli.apps_group,
             [*command, "--worker", WORKER, "--token", TOKEN],
@@ -410,7 +408,10 @@ PROXY_LOGS_WITH_STOPPED_COUNT = {
     "CellposeApp#deadOOM": {
         "stdout": [],
         "stderr": [],
-        "death_cause": {"reason": "OOM", "message": "Task was killed due to the node running low on memory."},
+        "death_cause": {
+            "reason": "OOM",
+            "message": "Task was killed due to the node running low on memory.",
+        },
         "logs_omitted": True,
     },
     "_deliberately_stopped_replicas": 3,
@@ -466,7 +467,7 @@ PROXY_LOGS_WITH_CAUSELESS_DEAD = {
     "CellposeApp#goneCause": {
         "stdout": [],
         "stderr": [],
-        "death_cause": None,     # the query ran; Ray simply no longer has the cause
+        "death_cause": None,  # the query ran; Ray simply no longer has the cause
         "logs_omitted": True,
     },
 }
@@ -499,7 +500,9 @@ def _deployments_counting(proxy_logs: dict, replicas: list, n_deployments: int):
     manager.ray_cluster = ray_cluster
     details = _serve_details(replicas)
     one = details["deployments"][DEPLOYMENT]
-    details["deployments"] = {f"{DEPLOYMENT}{i}": dict(one) for i in range(n_deployments)}
+    details["deployments"] = {
+        f"{DEPLOYMENT}{i}": dict(one) for i in range(n_deployments)
+    }
     shared = {"actor-1": {"reason": "OOM", "message": "boom"}}
     asyncio.run(
         manager._get_deployment_status(

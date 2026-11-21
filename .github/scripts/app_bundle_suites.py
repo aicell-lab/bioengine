@@ -55,7 +55,9 @@ def load_registry(root: str) -> tuple[dict[str, int], dict[str, str]]:
         raise Refusal(f"{REGISTRY} must hold two objects, 'run' and 'skip'")
     for app, floor in run.items():
         if not isinstance(floor, int) or floor < 1:
-            raise Refusal(f"{REGISTRY}: run['{app}'] must be a floor >= 1, got {floor!r}")
+            raise Refusal(
+                f"{REGISTRY}: run['{app}'] must be a floor >= 1, got {floor!r}"
+            )
     for app, reason in skip.items():
         if not isinstance(reason, str) or not reason.strip():
             raise Refusal(f"{REGISTRY}: skip['{app}'] must say WHY CI cannot run it")
@@ -129,12 +131,16 @@ def assert_ran(root: str, reports_dir: str) -> None:
         try:
             root_el = ET.parse(path).getroot()
         except (OSError, ET.ParseError) as e:
-            bad.append(f"{app}: no readable JUnit report, so nothing attests a run: {e}")
+            bad.append(
+                f"{app}: no readable JUnit report, so nothing attests a run: {e}"
+            )
             continue
         suites = root_el.findall("testsuite") or [root_el]
         total = sum(int(s.get("tests", 0)) for s in suites)
         skipped = sum(int(s.get("skipped", 0)) for s in suites)
-        failed = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+        failed = sum(
+            int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites
+        )
         ran = total - skipped
         print(
             f"{app}: collected={total} skipped={skipped} ran={ran} "
@@ -154,9 +160,7 @@ def assert_ran(root: str, reports_dir: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "command", choices=("reconcile", "list", "assert-ran")
-    )
+    parser.add_argument("command", choices=("reconcile", "list", "assert-ran"))
     parser.add_argument(
         "--root",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."),

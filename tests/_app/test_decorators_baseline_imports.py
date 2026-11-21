@@ -14,6 +14,7 @@ This was the root cause of the 0.11.4 deploy_app regression — a top-level
 runtime_env was ever materialised. These tests pin the fix so the
 regression doesn't sneak back in.
 """
+
 from __future__ import annotations
 
 import builtins

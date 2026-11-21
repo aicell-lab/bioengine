@@ -8,6 +8,7 @@ Handles:
 - 5-channel Cell Painting → RGB (AGP, ER, DNA)
 - Shot-noise-robust percentile clipping
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -15,8 +16,8 @@ import numpy as np
 
 # JUMP Cell Painting channel order (1-indexed, standard acquisition)
 # ch1=DNA(DAPI), ch2=ER, ch3=RNA(SYTO), ch4=AGP, ch5=Mito
-JUMP_CH_DNA = 0   # index into 0-based array
-JUMP_CH_ER  = 1
+JUMP_CH_DNA = 0  # index into 0-based array
+JUMP_CH_ER = 1
 JUMP_CH_RNA = 2
 JUMP_CH_AGP = 3
 JUMP_CH_MITO = 4
@@ -26,7 +27,7 @@ JUMP_RGB_CHANNELS = [JUMP_CH_AGP, JUMP_CH_ER, JUMP_CH_DNA]
 
 # ImageNet mean/std for DINOv2 input normalisation (applied after uint8 → float [0,1])
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def percentile_stretch(
@@ -119,12 +120,22 @@ def to_rgb_uint8(
         return np.stack([ch, ch, ch], axis=-1)
     elif n_ch == 2:
         # Two-channel: use ch0, ch1, and mean as B
-        selected = np.stack([img[..., 0], img[..., 1], (img[..., 0].astype(np.float32) + img[..., 1]) / 2], axis=-1)
+        selected = np.stack(
+            [
+                img[..., 0],
+                img[..., 1],
+                (img[..., 0].astype(np.float32) + img[..., 1]) / 2,
+            ],
+            axis=-1,
+        )
     elif n_ch == 3:
         selected = img
     elif n_ch >= 5:
         # Cell Painting: R=AGP(3), G=ER(1), B=DNA(0)
-        selected = np.stack([img[..., JUMP_CH_AGP], img[..., JUMP_CH_ER], img[..., JUMP_CH_DNA]], axis=-1)
+        selected = np.stack(
+            [img[..., JUMP_CH_AGP], img[..., JUMP_CH_ER], img[..., JUMP_CH_DNA]],
+            axis=-1,
+        )
     else:
         # 4-channel: use first 3
         selected = img[..., :3]
@@ -147,10 +158,10 @@ def to_dinov2_tensor(img_rgb_uint8: np.ndarray, size: int = 224):
 
     pil = Image.fromarray(img_rgb_uint8, mode="RGB")
     pil = pil.resize((size, size), Image.BICUBIC)
-    arr = np.array(pil, dtype=np.float32) / 255.0          # [0, 1]
-    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD              # ImageNet normalise
-    tensor = torch.from_numpy(arr).permute(2, 0, 1)        # (3, H, W)
-    return tensor.unsqueeze(0)                              # (1, 3, H, W)
+    arr = np.array(pil, dtype=np.float32) / 255.0  # [0, 1]
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD  # ImageNet normalise
+    tensor = torch.from_numpy(arr).permute(2, 0, 1)  # (3, H, W)
+    return tensor.unsqueeze(0)  # (1, 3, H, W)
 
 
 def decode_image_bytes(data: bytes) -> np.ndarray:
@@ -159,12 +170,15 @@ def decode_image_bytes(data: bytes) -> np.ndarray:
     Tries tifffile first (for microscopy TIFFs), falls back to PIL.
     """
     import io
+
     try:
         import tifffile
+
         img = tifffile.imread(io.BytesIO(data))
         return img
     except Exception:
         pass
     from PIL import Image
+
     img = Image.open(io.BytesIO(data))
     return np.array(img)

@@ -129,9 +129,11 @@ def evaluate(
         per_image.append(
             {
                 "index": index,
-                "dice": float(2.0 * intersection / (prediction.sum() + truth.sum()))
-                if (prediction.sum() + truth.sum()) > 0
-                else 1.0,
+                "dice": (
+                    float(2.0 * intersection / (prediction.sum() + truth.sum()))
+                    if (prediction.sum() + truth.sum()) > 0
+                    else 1.0
+                ),
                 "iou": float(intersection / union) if union > 0 else 1.0,
                 "pred_foreground_fraction": float(prediction.mean()),
                 "true_foreground_fraction": float(truth.mean()),

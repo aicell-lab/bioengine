@@ -95,8 +95,10 @@ def _install_runtime_stubs() -> dict:
     a fake ``bioengine`` behind for any other suite.
     """
     saved = {}
-    for name, factory in (("bioengine", _make_bioengine_stub),
-                          ("hypha_rpc", _make_hypha_rpc_stub)):
+    for name, factory in (
+        ("bioengine", _make_bioengine_stub),
+        ("hypha_rpc", _make_hypha_rpc_stub),
+    ):
         saved[name] = sys.modules.get(name, _ABSENT)
         sys.modules[name] = factory()
     return saved
@@ -207,7 +209,9 @@ def _store(
     for i, shape in enumerate(shapes):
         chunks = [1] * (len(shape) - 2) + [256, 256]
         objects[f"{ROOT}{i}/.zarray"] = (
-            200, _zarray(shape, chunks, dtype, compressor), {},
+            200,
+            _zarray(shape, chunks, dtype, compressor),
+            {},
         )
         key = ".".join(["0"] * len(shape))
         objects[f"{ROOT}{i}/{key}"] = (chunk_status, b"\x00\x00", chunk_headers)
@@ -247,7 +251,8 @@ class TestProbeNgffSource:
         broker = _broker(_store(shapes=((3, 4096, 4096), (3, 512, 512), (3, 64, 64))))
         await broker._probe_ngff_source(ROOT, None, ORIGIN)
         chunks = [
-            u for u in broker._http.requested
+            u
+            for u in broker._http.requested
             if "/.z" not in u and not u.endswith("zarr.json")
         ]
         assert chunks == [f"{ROOT}2/0.0.0"]
@@ -257,7 +262,8 @@ class TestProbeNgffSource:
         broker = _broker(_store(shapes=((3, 64, 64), (3, 4096, 4096))))
         await broker._probe_ngff_source(ROOT, None, ORIGIN)
         chunks = [
-            u for u in broker._http.requested
+            u
+            for u in broker._http.requested
             if "/.z" not in u and not u.endswith("zarr.json")
         ]
         assert chunks == [f"{ROOT}0/0.0.0"]
@@ -266,7 +272,9 @@ class TestProbeNgffSource:
         assert probe["width"] == 64
 
     async def test_reads_omero_channel_names(self):
-        broker = _broker(_store(omero={"channels": [{"label": "DAPI"}, {"label": "GFP"}]}))
+        broker = _broker(
+            _store(omero={"channels": [{"label": "DAPI"}, {"label": "GFP"}]})
+        )
         probe = await broker._probe_ngff_source(ROOT, None, ORIGIN)
         assert probe["channels"] == ["DAPI", "GFP"]
 
@@ -311,7 +319,9 @@ class TestProbeNgffSource:
     async def test_rejects_an_undecodable_filter(self):
         objects = _store()
         objects[f"{ROOT}0/.zarray"] = (
-            200, _zarray((3, 600, 800), (1, 256, 256), filters=[{"id": "delta"}]), {},
+            200,
+            _zarray((3, 600, 800), (1, 256, 256), filters=[{"id": "delta"}]),
+            {},
         )
         with pytest.raises(bc.NgffSourceError, match="delta"):
             await _broker(objects)._probe_ngff_source(ROOT, None, ORIGIN)
@@ -328,11 +338,17 @@ class TestProbeNgffSource:
 
     async def test_rejects_a_chunk_that_does_not_allow_our_origin(self):
         broker = _broker(_store(chunk_headers={}))
-        with pytest.raises(bc.NgffSourceError, match="Access-Control-Allow-Origin: absent"):
+        with pytest.raises(
+            bc.NgffSourceError, match="Access-Control-Allow-Origin: absent"
+        ):
             await broker._probe_ngff_source(ROOT, None, ORIGIN)
 
     async def test_rejects_a_chunk_that_allows_only_another_origin(self):
-        broker = _broker(_store(chunk_headers={"Access-Control-Allow-Origin": "https://evil.example"}))
+        broker = _broker(
+            _store(
+                chunk_headers={"Access-Control-Allow-Origin": "https://evil.example"}
+            )
+        )
         with pytest.raises(bc.NgffSourceError, match="cross-origin"):
             await broker._probe_ngff_source(ROOT, None, ORIGIN)
 
@@ -384,8 +400,14 @@ class TestProbeV3Store:
             "node_type": "array",
             "shape": [600, 800],
             "data_type": "uint16",
-            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [256, 256]}},
-            "chunk_key_encoding": {"name": "default", "configuration": {"separator": separator}},
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": {"chunk_shape": [256, 256]},
+            },
+            "chunk_key_encoding": {
+                "name": "default",
+                "configuration": {"separator": separator},
+            },
             "codecs": [{"name": "bytes"}, {"name": "blosc"}],
             "fill_value": 0,
         }
@@ -407,7 +429,11 @@ class TestProbeV3Store:
 
     async def test_zarr_json_wins_over_a_stale_zattrs(self):
         objects = self._objects()
-        objects[ROOT + ".zattrs"] = (200, {"multiscales": [{"datasets": [{"path": "old"}]}]}, {})
+        objects[ROOT + ".zattrs"] = (
+            200,
+            {"multiscales": [{"datasets": [{"path": "old"}]}]},
+            {},
+        )
         probe = await _broker(objects)._probe_ngff_source(ROOT, None, ORIGIN)
         assert probe["levels"] == 1
 
@@ -495,7 +521,9 @@ class TestImportNgffImage:
         assert out["stem"] == "my-sample"
 
     async def test_an_explicit_stem_wins(self, importer):
-        out = await importer.import_ngff_image("ws/ds", ROOT, stem="chosen", context=None)
+        out = await importer.import_ngff_image(
+            "ws/ds", ROOT, stem="chosen", context=None
+        )
         assert out["stem"] == "chosen"
 
     async def test_rejects_a_stem_that_could_be_a_path(self, importer):
@@ -511,9 +539,14 @@ class TestImportNgffImage:
     async def test_a_second_import_keeps_the_first(self, importer):
         await importer.import_ngff_image("ws/ds", ROOT, stem="one", context=None)
         await importer.import_ngff_image("ws/ds", ROOT, stem="two", context=None)
-        assert set(bc.parse_image_manifest(importer._state["manifest"])) == {"one", "two"}
+        assert set(bc.parse_image_manifest(importer._state["manifest"])) == {
+            "one",
+            "two",
+        }
 
-    async def test_a_query_string_credential_is_refused_before_any_fetch(self, importer):
+    async def test_a_query_string_credential_is_refused_before_any_fetch(
+        self, importer
+    ):
         with pytest.raises(bc.NgffSourceError, match="query string"):
             await importer.import_ngff_image("ws/ds", ROOT + "?token=abc", context=None)
         assert importer._http.requested == []
@@ -547,14 +580,19 @@ class TestImportARegion:
 
     async def test_a_whole_store_region_is_indistinguishable_from_none(self, importer):
         whole = await importer.import_ngff_image(
-            "ws/ds", ROOT, stem="a",
-            region={"x": 0, "y": 0, "width": 800, "height": 600}, context=None,
+            "ws/ds",
+            ROOT,
+            stem="a",
+            region={"x": 0, "y": 0, "width": 800, "height": 600},
+            context=None,
         )
         assert whole["source"]["region"] is None
 
     async def test_the_far_edge_is_clamped_to_the_store(self, importer):
         out = await importer.import_ngff_image(
-            "ws/ds", ROOT, region={"x": 700, "y": 500, "width": 400, "height": 400},
+            "ws/ds",
+            ROOT,
+            region={"x": 700, "y": 500, "width": 400, "height": 400},
             context=None,
         )
         assert (out["width"], out["height"]) == (100, 100)
@@ -562,7 +600,9 @@ class TestImportARegion:
     async def test_a_region_outside_the_store_writes_nothing(self, importer):
         with pytest.raises(ValueError, match="outside"):
             await importer.import_ngff_image(
-                "ws/ds", ROOT, region={"x": 900, "y": 0, "width": 8, "height": 8},
+                "ws/ds",
+                ROOT,
+                region={"x": 900, "y": 0, "width": 8, "height": 8},
                 context=None,
             )
         assert importer._state["manifest"] is None
@@ -600,7 +640,9 @@ class TestProbeNgffSourceRpc:
 
     async def test_the_credential_is_used_but_not_returned(self, prober):
         tokened = "https://ov.example/t/secret-123/zarr/ds1/"
-        prober._http.objects = {k.replace(ROOT, tokened): v for k, v in _store().items()}
+        prober._http.objects = {
+            k.replace(ROOT, tokened): v for k, v in _store().items()
+        }
         out = await prober.probe_ngff_source(tokened, context=None)
         assert out["store_root"] == "https://ov.example/zarr/ds1/"
         assert all(u.startswith(tokened) for u in prober._http.requested)
@@ -628,7 +670,9 @@ class TestImportKeepsTheCredentialOutOfTheArtifact:
         return importer
 
     async def test_the_token_is_used_to_fetch_but_not_stored(self, tokened):
-        out = await tokened.import_ngff_image("ws/ds", self.TOKENED, stem="s", context=None)
+        out = await tokened.import_ngff_image(
+            "ws/ds", self.TOKENED, stem="s", context=None
+        )
 
         assert all(u.startswith(self.TOKENED) for u in tokened._http.requested)
         blob = json.dumps(tokened._state["manifest"])
@@ -738,9 +782,13 @@ class TestSplitsExcludeRemoteImages:
 
     async def test_a_remote_stem_is_refused_by_name(self, guard):
         with pytest.raises(ValueError, match="Not materialised.*remote-a"):
-            await guard._validate_split_stems_are_images("ws/ds", ["local-a", "remote-a"])
+            await guard._validate_split_stems_are_images(
+                "ws/ds", ["local-a", "remote-a"]
+            )
 
-    async def test_an_unknown_stem_still_reports_unknown_not_unmaterialised(self, guard):
+    async def test_an_unknown_stem_still_reports_unknown_not_unmaterialised(
+        self, guard
+    ):
         with pytest.raises(ValueError, match="Not images of this dataset: ghost"):
             await guard._validate_split_stems_are_images("ws/ds", ["ghost"])
 
@@ -780,7 +828,9 @@ class TestForgetRemoteImage:
         with pytest.raises(FileNotFoundError, match="not an image"):
             await importer.forget_remote_image("ws/ds", "ghost", context=None)
 
-    async def test_a_local_file_absent_from_the_manifest_is_not_swept_in(self, importer):
+    async def test_a_local_file_absent_from_the_manifest_is_not_swept_in(
+        self, importer
+    ):
         # The write-back is stored-minus-one, never a merge, so a file the
         # manifest has not caught up with must not gain an entry here.
         await importer.import_ngff_image("ws/ds", ROOT, stem="remote-one", context=None)

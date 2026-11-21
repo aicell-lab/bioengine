@@ -23,6 +23,7 @@ is the correct idle state, so the replica count alone cannot separate a crash
 from a deliberate scale-down — Serve's status can, and the tests below pin both
 directions.
 """
+
 from __future__ import annotations
 
 import asyncio

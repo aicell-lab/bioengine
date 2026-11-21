@@ -24,6 +24,7 @@ The retry rule is the delicate part, and it is not "retry transport errors":
   would risk double-running a ``create`` or ``commit``. Those re-raise, and only
   the handle is refreshed — one visible failure instead of an endless outage.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -513,7 +514,9 @@ async def test_a_call_issued_during_a_re_resolve_waits_for_the_new_handle():
 
     commit = asyncio.create_task(am.commit("ws/my-app"))
     await asyncio.sleep(0)
-    assert dead.calls == [("read", "ws/my-app")], "the commit must not reach the dead proxy"
+    assert dead.calls == [
+        ("read", "ws/my-app")
+    ], "the commit must not reach the dead proxy"
 
     release.set()
     assert (await read)["served_by"] == "fresh"
@@ -539,9 +542,9 @@ async def test_a_failed_re_resolve_surfaces_rather_than_being_swallowed():
 
     fresh = _Proxy("fresh")
     am._server = _Server(fresh)
-    assert (await am.read("ws/my-app"))["served_by"] == "fresh", (
-        "a failed re-resolve must not leave callers blocked forever"
-    )
+    assert (await am.read("ws/my-app"))[
+        "served_by"
+    ] == "fresh", "a failed re-resolve must not leave callers blocked forever"
 
 
 # ===== attribute delegation =====
@@ -687,7 +690,9 @@ def fast_grace(monkeypatch):
 async def test_a_transient_resolution_failure_at_boot_is_survived(fast_grace):
     """THE DEFECT: before the fix, one failure here killed the worker."""
     server = _FlakyServer(fail_times=3)
-    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(
+        grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S
+    )
 
     assert proxy.name == "after-retry"
     assert server.attempts == 4, "should have retried exactly until it succeeded"
@@ -713,7 +718,9 @@ async def test_a_healthy_boot_is_not_delayed(monkeypatch):
 
     server = _FlakyServer(fail_times=0)
     started = _time.monotonic()
-    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+    proxy = await _manager_with(server)._resolve_artifact_manager_proxy(
+        grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S
+    )
     elapsed = _time.monotonic() - started
 
     assert proxy.name == "after-retry"
@@ -739,7 +746,9 @@ async def test_a_service_that_never_returns_still_RAISES_rather_than_hanging(
 
     started = _time.monotonic()
     with pytest.raises(KeyError) as raised:
-        await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+        await _manager_with(server)._resolve_artifact_manager_proxy(
+            grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S
+        )
     elapsed = _time.monotonic() - started
 
     assert raised.value is sentinel, "the operator must see the real error"
@@ -767,14 +776,14 @@ async def test_the_wait_never_overshoots_the_grace(monkeypatch):
     monkeypatch.setattr(
         _manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S", 5.0
     )
-    monkeypatch.setattr(
-        _manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S", 5.0
-    )
+    monkeypatch.setattr(_manager_module, "_ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S", 5.0)
 
     server = _FlakyServer(fail_times=10**9)
     started = _time.monotonic()
     with pytest.raises(KeyError):
-        await _manager_with(server)._resolve_artifact_manager_proxy(grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S)
+        await _manager_with(server)._resolve_artifact_manager_proxy(
+            grace_s=_manager_module._ARTIFACT_MANAGER_RESOLVE_GRACE_S
+        )
     elapsed = _time.monotonic() - started
 
     assert server.attempts >= 1
@@ -843,15 +852,19 @@ async def test_the_repair_path_fails_fast_instead_of_waiting_the_boot_grace():
     """
     from bioengine.utils.network import RECONNECT_BUDGET_S
 
-    server = _FlakyServer(fail_times=10_000)   # never succeeds
+    server = _FlakyServer(fail_times=10_000)  # never succeeds
     started = asyncio.get_event_loop().time()
     with pytest.raises(Exception):
-        await _manager_with(server)._resolve_artifact_manager_proxy()   # default grace = 0
+        await _manager_with(
+            server
+        )._resolve_artifact_manager_proxy()  # default grace = 0
     elapsed = asyncio.get_event_loop().time() - started
 
-    assert elapsed < RECONNECT_BUDGET_S, (
-        "the repair path took %.2fs, which does not fit inside its own %.0fs budget"
-        % (elapsed, RECONNECT_BUDGET_S)
+    assert (
+        elapsed < RECONNECT_BUDGET_S
+    ), "the repair path took %.2fs, which does not fit inside its own %.0fs budget" % (
+        elapsed,
+        RECONNECT_BUDGET_S,
     )
     assert server.attempts == 1, (
         "expected ONE attempt on the fail-fast path, got %d" % server.attempts
@@ -903,7 +916,10 @@ def test_the_default_grace_is_FAIL_FAST_at_both_layers():
 
     checked = {}
     for label, fn in (
-        ("AppsManager._resolve_artifact_manager_proxy", AppsManager._resolve_artifact_manager_proxy),
+        (
+            "AppsManager._resolve_artifact_manager_proxy",
+            AppsManager._resolve_artifact_manager_proxy,
+        ),
         ("AppsManager.complete_initialization", AppsManager.complete_initialization),
         ("BioEngineWorker._connect_to_server", BioEngineWorker._connect_to_server),
     ):
@@ -937,7 +953,9 @@ def test_the_BOOT_call_site_opts_IN_and_the_REPAIR_call_site_does_NOT():
     # CONTROL: both methods must actually call _connect_to_server, or the two
     # assertions below are vacuous -- an empty haystack satisfies "not in".
     assert "_connect_to_server" in boot, "boot path no longer calls _connect_to_server"
-    assert "_connect_to_server" in repair, "repair path no longer calls _connect_to_server"
+    assert (
+        "_connect_to_server" in repair
+    ), "repair path no longer calls _connect_to_server"
 
     assert "artifact_manager_grace_s" in boot, (
         "the boot path no longer opts into the grace, so a Hypha gap at boot "

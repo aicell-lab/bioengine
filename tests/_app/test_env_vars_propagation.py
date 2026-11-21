@@ -16,6 +16,7 @@ These tests pin the merge semantics: every framework key must show up on
 the replica, and a key the author put in ``@bioengine.app(env_vars=…)``
 must NOT be silently overridden.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict

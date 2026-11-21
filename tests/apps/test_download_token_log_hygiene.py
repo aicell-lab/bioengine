@@ -13,6 +13,7 @@ Now: permission-mismatch is logged at INFO with a one-line message.
 Genuine failures (network, unexpected server errors) stay at WARNING so
 they don't get lost in the noise.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -23,14 +24,14 @@ from bioengine.apps import builder as builder_module
 def test_permission_branch_logs_at_info() -> None:
     src = inspect.getsource(builder_module.AppBuilder.build)
     # Match on the substring the fix uses to detect the expected case.
-    assert 'any permission for workspace' in src, (
+    assert "any permission for workspace" in src, (
         "expected the fix to detect the Hypha PermissionError message "
         "and downgrade its log level."
     )
     # The permission-mismatch branch must be INFO, not WARNING.
-    idx = src.find('any permission for workspace')
-    branch = src[idx:idx + 500]
-    assert 'logger.info' in branch, (
+    idx = src.find("any permission for workspace")
+    branch = src[idx : idx + 500]
+    assert "logger.info" in branch, (
         "expected the permission-mismatch branch to log at INFO — "
         "it's the expected outcome for public cross-workspace artifacts, "
         "not a warning."
@@ -38,8 +39,8 @@ def test_permission_branch_logs_at_info() -> None:
     # The message must NOT re-include the full exception (which would drag
     # the stacktrace back in). Presence of "exc}" inside the info branch
     # would defeat the purpose.
-    info_line = branch.split('logger.info')[1].split(')')[0]
-    assert '{exc' not in info_line, (
+    info_line = branch.split("logger.info")[1].split(")")[0]
+    assert "{exc" not in info_line, (
         "the INFO branch must not interpolate the full exception (that "
         "brings back the stacktrace the operator wanted removed)."
     )
@@ -50,13 +51,13 @@ def test_non_permission_failures_still_warn() -> None:
     WARNING with the exception attached so they don't get lost in the noise."""
     src = inspect.getsource(builder_module.AppBuilder.build)
     # There must still be a logger.warning branch that includes the exc.
-    assert 'logger.warning' in src
+    assert "logger.warning" in src
     # The warning branch must still interpolate the exception — the
     # remaining failure modes are unexpected and the operator needs the
     # detail to diagnose.
-    warn_idx = src.find('logger.warning')
-    warn_line = src[warn_idx:warn_idx + 500]
-    assert '{exc' in warn_line, (
+    warn_idx = src.find("logger.warning")
+    warn_line = src[warn_idx : warn_idx + 500]
+    assert "{exc" in warn_line, (
         "the WARNING branch must keep interpolating exc so genuine "
         "failures still show enough detail to diagnose."
     )

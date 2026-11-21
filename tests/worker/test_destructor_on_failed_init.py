@@ -10,6 +10,7 @@ the silence test alone, so `test_warning_still_fires...` is the control that kee
 honest: it asserts the warning STILL happens for an object that really is being collected
 half-initialised, which is the thing __del__ exists to say.
 """
+
 import logging
 
 from bioengine.worker.worker import BioEngineWorker
@@ -24,14 +25,18 @@ def _del_output(obj):
     """
     try:
         obj.__del__()
-    except BaseException as exc:  # noqa: BLE001 - the defect IS an exception escaping here
+    except (
+        BaseException
+    ) as exc:  # noqa: BLE001 - the defect IS an exception escaping here
         return exc
     return None
 
 
 def test_del_is_silent_when_init_failed_before_start_time():
     """A worker whose __init__ died early must not raise out of __del__."""
-    worker = BioEngineWorker.__new__(BioEngineWorker)  # never ran __init__, so no attributes
+    worker = BioEngineWorker.__new__(
+        BioEngineWorker
+    )  # never ran __init__, so no attributes
     assert not hasattr(worker, "start_time")
     assert _del_output(worker) is None
 
@@ -58,6 +63,7 @@ def test_warning_still_fires_for_a_half_initialised_worker(caplog):
         assert _del_output(worker) is None
 
     assert any(
-        "garbage collected with partially/completely initialized components" in r.message
+        "garbage collected with partially/completely initialized components"
+        in r.message
         for r in caplog.records
     ), "the destructor's warning disappeared -- the guard skipped real work"

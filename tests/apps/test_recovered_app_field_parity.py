@@ -381,16 +381,14 @@ async def test_an_adopted_app_keeps_its_static_site_link(monkeypatch) -> None:
         await recovered.get_app_status(application_ids=[APP_ID], context=CONTEXT)
     )[APP_ID]
 
-    assert status["static_site_url"], (
-        "An adopted app with a frontend must still advertise its static site."
-    )
+    assert status[
+        "static_site_url"
+    ], "An adopted app with a frontend must still advertise its static site."
     assert APP_ID in status["static_site_url"]
 
 
 @pytest.mark.asyncio
-async def test_adoption_refuses_a_blob_without_an_entry_id(
-    monkeypatch, caplog
-) -> None:
+async def test_adoption_refuses_a_blob_without_an_entry_id(monkeypatch, caplog) -> None:
     # The entry id is what names the Serve deployment whose replica reports the
     # running version. A blob without it cannot be adopted into a complete
     # record, so it must be refused — and say which key was missing, rather
@@ -403,8 +401,7 @@ async def test_adoption_refuses_a_blob_without_an_entry_id(
 
     assert APP_ID not in recovered._deployed_applications
     assert any(
-        "Missing required app_data keys" in r.getMessage()
-        and "entry" in r.getMessage()
+        "Missing required app_data keys" in r.getMessage() and "entry" in r.getMessage()
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
 
@@ -421,9 +418,7 @@ def _app_data_keys_written_by_the_builder() -> set[str]:
             and any(getattr(t, "id", None) == "app_data" for t in node.targets)
         ):
             return {
-                key.value
-                for key in node.value.keys
-                if isinstance(key, ast.Constant)
+                key.value for key in node.value.keys if isinstance(key, ast.Constant)
             }
     raise AssertionError("no `app_data = {...}` literal in AppBuilder.build")
 

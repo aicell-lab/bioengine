@@ -71,17 +71,21 @@ def _center_crop(chw: np.ndarray, size: int = 256) -> np.ndarray:
     _, h, w = chw.shape
     ch, cw = min(size, h), min(size, w)
     top, left = (h - ch) // 2, (w - cw) // 2
-    return chw[:, top:top + ch, left:left + cw]
+    return chw[:, top : top + ch, left : left + cw]
 
 
 def _cite():
     return [
-        {"text": "Stringer, C., Wang, T., Michaelos, M. et al. Cellpose: a generalist "
-                 "algorithm for cellular segmentation. Nat Methods 18, 100–106 (2021).",
-         "doi": "10.1038/s41592-020-01018-x"},
-        {"text": "Pachitariu, M., Stringer, C. Cellpose 2.0: how to train your own "
-                 "model. Nat Methods 19, 1634–1641 (2022).",
-         "doi": "10.1038/s41592-022-01663-4"},
+        {
+            "text": "Stringer, C., Wang, T., Michaelos, M. et al. Cellpose: a generalist "
+            "algorithm for cellular segmentation. Nat Methods 18, 100–106 (2021).",
+            "doi": "10.1038/s41592-020-01018-x",
+        },
+        {
+            "text": "Pachitariu, M., Stringer, C. Cellpose 2.0: how to train your own "
+            "model. Nat Methods 19, 1634–1641 (2022).",
+            "doi": "10.1038/s41592-022-01663-4",
+        },
     ]
 
 
@@ -95,13 +99,28 @@ def _authors(raw):
     return out or [{"name": "BioEngine user"}]
 
 
-def _build_rdf(name, description, authors, license_id, diam_mean, provenance,
-               input_shape, output_shape, model_type="cpsam", cell_diameters=None):
+def _build_rdf(
+    name,
+    description,
+    authors,
+    license_id,
+    diam_mean,
+    provenance,
+    input_shape,
+    output_shape,
+    model_type="cpsam",
+    cell_diameters=None,
+):
     import torch
 
-    family = "Cellpose-DINO" if model_type in ("cpdino", "cpdino-vitb") else "Cellpose-SAM"
-    desc = (f"Fine-tuned {family} model. {description}".strip()
-            if description else f"Fine-tuned {family} model.")
+    family = (
+        "Cellpose-DINO" if model_type in ("cpdino", "cpdino-vitb") else "Cellpose-SAM"
+    )
+    desc = (
+        f"Fine-tuned {family} model. {description}".strip()
+        if description
+        else f"Fine-tuned {family} model."
+    )
     rdf = {
         "name": name,
         "description": desc,
@@ -114,25 +133,29 @@ def _build_rdf(name, description, authors, license_id, diam_mean, provenance,
         "type": "model",
         "id_emoji": "🔬",
         "documentation": "documentation.md",
-        "inputs": [{
-            "id": "input",
-            "axes": [
-                {"type": "batch"},
-                {"type": "channel", "channel_names": ["r", "g", "b"]},
-                {"size": int(input_shape[1]), "id": "y", "type": "space"},
-                {"size": int(input_shape[2]), "id": "x", "type": "space"},
-            ],
-            "test_tensor": {"source": "input_sample.npy"},
-        }],
-        "outputs": [{
-            "id": "masks",
-            "axes": [
-                {"type": "batch"},
-                {"size": int(output_shape[0]), "id": "y", "type": "space"},
-                {"size": int(output_shape[1]), "id": "x", "type": "space"},
-            ],
-            "test_tensor": {"source": "output_sample.npy"},
-        }],
+        "inputs": [
+            {
+                "id": "input",
+                "axes": [
+                    {"type": "batch"},
+                    {"type": "channel", "channel_names": ["r", "g", "b"]},
+                    {"size": int(input_shape[1]), "id": "y", "type": "space"},
+                    {"size": int(input_shape[2]), "id": "x", "type": "space"},
+                ],
+                "test_tensor": {"source": "input_sample.npy"},
+            }
+        ],
+        "outputs": [
+            {
+                "id": "masks",
+                "axes": [
+                    {"type": "batch"},
+                    {"size": int(output_shape[0]), "id": "y", "type": "space"},
+                    {"size": int(output_shape[1]), "id": "x", "type": "space"},
+                ],
+                "test_tensor": {"source": "output_sample.npy"},
+            }
+        ],
         "weights": {
             "pytorch_state_dict": {
                 "source": "model_weights.pth",
@@ -162,8 +185,11 @@ def _build_rdf(name, description, authors, license_id, diam_mean, provenance,
         "config": {
             "bioimageio": {
                 "reproducibility_tolerance": [
-                    {"relative_tolerance": 0.01, "absolute_tolerance": 0.001,
-                     "mismatched_elements_per_million": 20},
+                    {
+                        "relative_tolerance": 0.01,
+                        "absolute_tolerance": 0.001,
+                        "mismatched_elements_per_million": 20,
+                    },
                 ]
             }
         },
@@ -209,14 +235,19 @@ BSD-3-Clause (Cellpose license).
 
 def _cover(pkg_dir: Path, input_chw: np.ndarray, mask_hw: np.ndarray) -> None:
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     disp = np.transpose(input_chw, (1, 2, 0))
     disp = (disp - disp.min()) / (disp.ptp() or 1.0)
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 5))
-    a1.imshow(disp); a1.set_title("input"); a1.axis("off")
-    a2.imshow(mask_hw, cmap="tab20"); a2.set_title(f"{len(np.unique(mask_hw)) - 1} objects"); a2.axis("off")
+    a1.imshow(disp)
+    a1.set_title("input")
+    a1.axis("off")
+    a2.imshow(mask_hw, cmap="tab20")
+    a2.set_title(f"{len(np.unique(mask_hw)) - 1} objects")
+    a2.axis("off")
     plt.tight_layout()
     plt.savefig(pkg_dir / "cover.png", dpi=120, bbox_inches="tight")
     plt.close()
@@ -238,7 +269,9 @@ def main(session_id: str, export_dir: str) -> None:
     model_type = params.get("model_type", "cpsam")
     ckpt = training.checkpoint_path(session_id)
     if not ckpt.exists():
-        raise FileNotFoundError(f"No cellpose checkpoint for session '{session_id}' at {ckpt}.")
+        raise FileNotFoundError(
+            f"No cellpose checkpoint for session '{session_id}' at {ckpt}."
+        )
     diam_mean = float(params.get("diam_mean", 30.0))
 
     pkg_dir = export_path / "package"
@@ -256,9 +289,18 @@ def main(session_id: str, export_dir: str) -> None:
     from cellpose_model import CellposeSAMWrapper
 
     wrapper = CellposeSAMWrapper(
-        model_type=model_type, diam_mean=diam_mean, cp_batch_size=8, channels=[0, 0],
-        flow_threshold=0.4, cellprob_threshold=0.0, stitch_threshold=0.0,
-        estimate_diam=False, normalize=True, do_3D=False, gpu=False, use_bfloat16=False,
+        model_type=model_type,
+        diam_mean=diam_mean,
+        cp_batch_size=8,
+        channels=[0, 0],
+        flow_threshold=0.4,
+        cellprob_threshold=0.0,
+        stitch_threshold=0.0,
+        estimate_diam=False,
+        normalize=True,
+        do_3D=False,
+        gpu=False,
+        use_bfloat16=False,
     )
     wrapper.load_state_dict(torch.load(str(ckpt), map_location="cpu"))
     wrapper.eval()
@@ -271,9 +313,16 @@ def main(session_id: str, export_dir: str) -> None:
 
     cell_diameters = (training.read_status(session_id) or {}).get("cell_diameters")
     rdf = _build_rdf(
-        name, request.get("description", ""), request.get("authors"), license_id,
-        diam_mean, provenance, input_sample.shape[1:], output_sample.shape[1:],
-        model_type=model_type, cell_diameters=cell_diameters,
+        name,
+        request.get("description", ""),
+        request.get("authors"),
+        license_id,
+        diam_mean,
+        provenance,
+        input_sample.shape[1:],
+        output_sample.shape[1:],
+        model_type=model_type,
+        cell_diameters=cell_diameters,
     )
     (pkg_dir / "rdf.yaml").write_text(yaml.safe_dump(rdf, sort_keys=False))
     (pkg_dir / "documentation.md").write_text(_doc(name, session_id, diam_mean))
@@ -292,9 +341,13 @@ def main(session_id: str, export_dir: str) -> None:
             detail = summary.format()
         except Exception:
             detail = str(status)
-        raise RuntimeError(f"bioimageio test_model did not pass (status={status}):\n{detail[-3000:]}")
+        raise RuntimeError(
+            f"bioimageio test_model did not pass (status={status}):\n{detail[-3000:]}"
+        )
 
-    zip_path = export_path / f"{name.strip().lower().replace(' ', '-') or 'cellpose-sam'}.zip"
+    zip_path = (
+        export_path / f"{name.strip().lower().replace(' ', '-') or 'cellpose-sam'}.zip"
+    )
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -304,7 +357,8 @@ def main(session_id: str, export_dir: str) -> None:
 
     files = [
         {"name": f.relative_to(pkg_dir).as_posix(), "size": f.stat().st_size}
-        for f in sorted(pkg_dir.rglob("*")) if f.is_file()
+        for f in sorted(pkg_dir.rglob("*"))
+        if f.is_file()
     ]
     result = {
         "package_dir": str(pkg_dir),

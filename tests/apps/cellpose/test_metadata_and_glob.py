@@ -105,26 +105,24 @@ class _FakeArtifact:
 
 
 class _FakeArtifactNestedMetadata:
-        async def ls(self, folder_path: str, detail: bool = False):
-                await asyncio.sleep(0)
-                folder = folder_path.rstrip("/") + "/"
-                if folder == "metadata/":
-                        entries = [{"path": "metadata/records.json", "type": "file"}]
-                else:
-                        entries = []
-                return entries if detail else [
-                        e["path"].rsplit("/", 1)[-1] for e in entries
-                ]
+    async def ls(self, folder_path: str, detail: bool = False):
+        await asyncio.sleep(0)
+        folder = folder_path.rstrip("/") + "/"
+        if folder == "metadata/":
+            entries = [{"path": "metadata/records.json", "type": "file"}]
+        else:
+            entries = []
+        return entries if detail else [e["path"].rsplit("/", 1)[-1] for e in entries]
 
-        async def get(self, remote_paths, local_paths, on_error="ignore"):
-                await asyncio.sleep(0)
-                for remote, local in zip(remote_paths, local_paths):
-                        local_path = Path(local)
-                        local_path.parent.mkdir(parents=True, exist_ok=True)
+    async def get(self, remote_paths, local_paths, on_error="ignore"):
+        await asyncio.sleep(0)
+        for remote, local in zip(remote_paths, local_paths):
+            local_path = Path(local)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
 
-                        if str(remote).endswith("metadata/records.json"):
-                                local_path.write_text(
-                                        """
+            if str(remote).endswith("metadata/records.json"):
+                local_path.write_text(
+                    """
 {
     "payload": {
         "items": [
@@ -142,10 +140,10 @@ class _FakeArtifactNestedMetadata:
     }
 }
                                         """.strip(),
-                                        encoding="utf-8",
-                                )
-                        else:
-                                local_path.write_bytes(b"dummy")
+                    encoding="utf-8",
+                )
+            else:
+                local_path.write_bytes(b"dummy")
 
 
 def test_make_training_pairs_from_metadata(tmp_path: Path) -> None:
@@ -190,6 +188,14 @@ def test_make_training_pairs_from_nested_metadata_formats(tmp_path: Path) -> Non
     assert len(train_pairs) == 1
     assert len(test_pairs) == 1
     assert train_pairs[0]["image"].as_posix().endswith("images/train/t0010.tif")
-    assert train_pairs[0]["annotation"].as_posix().endswith("annotations/train/t0010_mask.ome.tif")
+    assert (
+        train_pairs[0]["annotation"]
+        .as_posix()
+        .endswith("annotations/train/t0010_mask.ome.tif")
+    )
     assert test_pairs[0]["image"].as_posix().endswith("images/test/t0011.tif")
-    assert test_pairs[0]["annotation"].as_posix().endswith("annotations/test/t0011_mask.ome.tif")
+    assert (
+        test_pairs[0]["annotation"]
+        .as_posix()
+        .endswith("annotations/test/t0011_mask.ome.tif")
+    )

@@ -67,7 +67,7 @@ _WEIGHTS_PUT_BACKOFF_S = 2.0
 
 # Disk budget for cached soup members; see _evict_members. Override with
 # BIOENGINE_SOUP_CACHE_MAX_BYTES.
-_SOUP_CACHE_MAX_BYTES = 24 * 1024 ** 3
+_SOUP_CACHE_MAX_BYTES = 24 * 1024**3
 
 # What this deployment promises Ray. Named rather than inlined in the decorator so
 # soup_memory_budget() reports the figure actually in force: aggregate() rejects a
@@ -224,7 +224,7 @@ class CellposeRuntime:
         if rss is not None and not in_flight:
             self._soup_idle_rss = rss
         return {
-            "declared_bytes": _RUNTIME_MEMORY_MB * 1024 ** 2,
+            "declared_bytes": _RUNTIME_MEMORY_MB * 1024**2,
             "rss_bytes": self._soup_idle_rss if in_flight else rss,
             "soup_in_flight": in_flight,
         }
@@ -322,9 +322,15 @@ class CellposeRuntime:
         model = self._ensure_model(checkpoint, model_type)
         img = self._to_hwc3(image)
         eval_kwargs = dict(
-            channels=[0, 0], channel_axis=None, diameter=_SERVE_DIAMETER,
-            flow_threshold=0.4, cellprob_threshold=0.0, stitch_threshold=0.0,
-            batch_size=8, normalize=True, do_3D=False,
+            channels=[0, 0],
+            channel_axis=None,
+            diameter=_SERVE_DIAMETER,
+            flow_threshold=0.4,
+            cellprob_threshold=0.0,
+            stitch_threshold=0.0,
+            batch_size=8,
+            normalize=True,
+            do_3D=False,
         )
         if generate_kwargs.get("min_size") is not None:
             eval_kwargs["min_size"] = generate_kwargs["min_size"]
@@ -341,7 +347,9 @@ class CellposeRuntime:
     # === composition endpoints (called by EntryApp via the runtime handle) ===
 
     async def auto_segment(
-        self, images: List[np.ndarray], model_type: str = "cpsam",
+        self,
+        images: List[np.ndarray],
+        model_type: str = "cpsam",
         generate_kwargs: Optional[Dict[str, Any]] = None,
         checkpoint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
@@ -390,9 +398,11 @@ class CellposeRuntime:
         import pool
 
         pool.evict_lru_to_cap(
-            self._soup_dir(), "member-*.pt",
-            cap_bytes=int(os.environ.get(
-                "BIOENGINE_SOUP_CACHE_MAX_BYTES", _SOUP_CACHE_MAX_BYTES)),
+            self._soup_dir(),
+            "member-*.pt",
+            cap_bytes=int(
+                os.environ.get("BIOENGINE_SOUP_CACHE_MAX_BYTES", _SOUP_CACHE_MAX_BYTES)
+            ),
             incoming_bytes=incoming_bytes,
         )
 
@@ -466,7 +476,9 @@ class CellposeRuntime:
         for attempt in range(_WEIGHTS_PUT_ATTEMPTS):
             try:
                 data = path.read_bytes()
-                with urlopen(Request(url, data=data, method="PUT"), timeout=timeout) as r:
+                with urlopen(
+                    Request(url, data=data, method="PUT"), timeout=timeout
+                ) as r:
                     r.read()
                 return
             except HTTPError as e:
@@ -487,9 +499,13 @@ class CellposeRuntime:
 
     def _member_cache_path(self, key: str) -> Path:
         """Where this replica caches the member at pool path ``key``."""
-        return self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+        return (
+            self._soup_dir() / f"member-{hashlib.sha256(key.encode()).hexdigest()}.pt"
+        )
 
-    def _ensure_member(self, key: str, url: str, expected_sha256: Optional[str]) -> Path:
+    def _ensure_member(
+        self, key: str, url: str, expected_sha256: Optional[str]
+    ) -> Path:
         """The member's file on local disk, downloading it on first use.
 
         The download is cached as a file, not as tensors: one download per member
@@ -542,7 +558,10 @@ class CellposeRuntime:
         return cached
 
     def _fetch_member(
-        self, key: str, url: str, expected_sha256: Optional[str] = None,
+        self,
+        key: str,
+        url: str,
+        expected_sha256: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Load a member state_dict, downloading on first use."""
         import torch
@@ -582,7 +601,8 @@ class CellposeRuntime:
                 if key in digests:
                     continue
                 path = await asyncio.to_thread(
-                    self._ensure_member, key, m["url"], m.get("sha256"))
+                    self._ensure_member, key, m["url"], m.get("sha256")
+                )
                 digests[key] = await asyncio.to_thread(pool.sha256_file, path)
         return {
             "digests": digests,
@@ -590,9 +610,12 @@ class CellposeRuntime:
             "soup_dl_bytes": self._soup_dl_bytes - dl_before,
         }
 
-    def _build_soup(self, members: List[Dict[str, str]],
-                    base_commitment: Optional[Dict[str, Any]] = None,
-                    member_non_learned: Optional[List[Dict[str, float]]] = None):
+    def _build_soup(
+        self,
+        members: List[Dict[str, str]],
+        base_commitment: Optional[Dict[str, Any]] = None,
+        member_non_learned: Optional[List[Dict[str, float]]] = None,
+    ):
         """Uniform mean of member state_dicts; None when empty (= stock base).
 
         Learned tensors are averaged; non-learned ones (``diam_labels``) are carried
@@ -603,15 +626,20 @@ class CellposeRuntime:
         if not members:
             return None
         return pool.uniform_soup(
-            [partial(self._fetch_member, m["key"], m["url"], m.get("sha256"))
-             for m in members],
+            [
+                partial(self._fetch_member, m["key"], m["url"], m.get("sha256"))
+                for m in members
+            ],
             base=base_commitment,
             member_non_learned=member_non_learned,
         )
 
     async def score_soup(
-        self, members: List[Dict[str, str]], images: List[np.ndarray],
-        labels: List[np.ndarray], diam_mean: float = 30.0,
+        self,
+        members: List[Dict[str, str]],
+        images: List[np.ndarray],
+        labels: List[np.ndarray],
+        diam_mean: float = 30.0,
         base_commitment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Mean instance F1 (IoU>=0.5) of the uniform soup of ``members`` on a split,
@@ -637,7 +665,8 @@ class CellposeRuntime:
             # dead weight, and the lock wait below can be minutes.
             async with self._soup_sem:
                 soup = await asyncio.to_thread(
-                    partial(self._build_soup, members, base_commitment))
+                    partial(self._build_soup, members, base_commitment)
+                )
                 if soup is not None:
                     import torch
 
@@ -649,15 +678,24 @@ class CellposeRuntime:
                 gk = {"diameter": diam_mean}
                 masks = []
                 for image in images:
-                    masks.append(await asyncio.to_thread(
-                        self._segment, image, gk, str(ckpt) if ckpt else None, "cpsam"))
+                    masks.append(
+                        await asyncio.to_thread(
+                            self._segment,
+                            image,
+                            gk,
+                            str(ckpt) if ckpt else None,
+                            "cpsam",
+                        )
+                    )
         finally:
             if ckpt and ckpt.exists():
                 ckpt.unlink()
         # Score once, reduce once. The caller publishes both halves and the pool
         # refuses a record whose aggregate is not the mean of its vector, so these
         # must be one measurement rather than two calls that agree today.
-        per_image = pool.per_image_instance_f1(masks, [np.asarray(lbl) for lbl in labels])
+        per_image = pool.per_image_instance_f1(
+            masks, [np.asarray(lbl) for lbl in labels]
+        )
         return {
             "f1": pool.mean_of_per_image(per_image),
             "per_image": per_image,
@@ -666,7 +704,9 @@ class CellposeRuntime:
         }
 
     async def materialize_soup(
-        self, members: List[Dict[str, str]], put_url: str,
+        self,
+        members: List[Dict[str, str]],
+        put_url: str,
         base_commitment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build the uniform soup of ``members``, PUT it to the pool's presigned URL,
@@ -698,12 +738,18 @@ class CellposeRuntime:
         # are both released before the next merge starts allocating.
         async with self._soup_sem:
             soup = await asyncio.to_thread(
-                partial(self._build_soup, members, base_commitment,
-                        member_non_learned=collected))
+                partial(
+                    self._build_soup,
+                    members,
+                    base_commitment,
+                    member_non_learned=collected,
+                )
+            )
             # Read the non-learned values off the published soup while it is resident.
             inherited = {
                 key: float(soup[key].detach().reshape(-1)[0])
-                for key in sorted(soup) if pool.is_non_weight_param(key)
+                for key in sorted(soup)
+                if pool.is_non_weight_param(key)
             }
             if len(collected) != len(members):
                 raise RuntimeError(
@@ -711,8 +757,7 @@ class CellposeRuntime:
                     f"{len(members)} members, so a diameter cannot be attributed"
                 )
             per_member = [
-                {"key": spec["key"], **vals}
-                for spec, vals in zip(members, collected)
+                {"key": spec["key"], **vals} for spec, vals in zip(members, collected)
             ]
             # Digest the tensors, not the saved file: the random stem below lands in
             # every torch zip record name, so a file digest would differ on every
@@ -727,7 +772,8 @@ class CellposeRuntime:
             finally:
                 path.unlink()
             return {
-                "sha256": sha, "n_bytes": n_bytes,
+                "sha256": sha,
+                "n_bytes": n_bytes,
                 "replica": self._replica_id(),
                 "soup_dl_bytes": self._soup_dl_bytes - dl_before,
                 "non_learned_inherited": inherited,
@@ -735,8 +781,9 @@ class CellposeRuntime:
                 "member_non_learned": per_member,
             }
 
-    async def prepare_contribution(self, session_id: str, weights_put_url: str,
-                                   model_type: str = "cpsam") -> Dict[str, Any]:
+    async def prepare_contribution(
+        self, session_id: str, weights_put_url: str, model_type: str = "cpsam"
+    ) -> Dict[str, Any]:
         """Inspect a finished session's local cpsam checkpoint (architecture
         signature + L2 drift from the base it started from), PUT its weights to the
         pool's presigned URL, and return the signature, drift, sha256s, byte size,
@@ -762,12 +809,16 @@ class CellposeRuntime:
 
         ckpt = str(training.checkpoint_path(session_id))
         if not Path(ckpt).exists():
-            raise FileNotFoundError(f"no servable checkpoint for session '{session_id}' at {ckpt}.")
+            raise FileNotFoundError(
+                f"no servable checkpoint for session '{session_id}' at {ckpt}."
+            )
         base_path = training.session_dir(session_id) / "init_checkpoint.pt"
 
         def _inspect() -> Dict[str, Any]:
             def _state(path):
-                return self._unwrap_sd(torch.load(path, map_location="cpu", weights_only=False))
+                return self._unwrap_sd(
+                    torch.load(path, map_location="cpu", weights_only=False)
+                )
 
             sd = _state(ckpt)
             out: Dict[str, Any] = {
@@ -882,7 +933,8 @@ class CellposeRuntime:
 
     def _subprocess_env(self) -> Dict[str, str]:
         return {
-            k: v for k, v in os.environ.items()
+            k: v
+            for k, v in os.environ.items()
             if "TOKEN" not in k.upper() and "SECRET" not in k.upper()
         }
 
@@ -891,21 +943,29 @@ class CellposeRuntime:
 
         worker = str(Path(__file__).parent / "train_worker_cellpose.py")
         return training.run_cancellable_subprocess(
-            [sys.executable, worker, session_id], session_id,
-            cwd=str(Path(__file__).parent), env=self._subprocess_env(),
+            [sys.executable, worker, session_id],
+            session_id,
+            cwd=str(Path(__file__).parent),
+            env=self._subprocess_env(),
         )
 
     def _run_export_subprocess(self, session_id: str, export_dir: str):
         worker = str(Path(__file__).parent / "export_worker_cellpose.py")
         env = self._subprocess_env()
-        env["CUDA_VISIBLE_DEVICES"] = ""  # CPU-only export → deterministic + no GPU contention
+        env["CUDA_VISIBLE_DEVICES"] = (
+            ""  # CPU-only export → deterministic + no GPU contention
+        )
         return subprocess.run(
             [sys.executable, worker, session_id, export_dir],
             cwd=str(Path(__file__).parent),
-            capture_output=True, text=True, env=env,
+            capture_output=True,
+            text=True,
+            env=env,
         )
 
-    async def export_bioimageio(self, session_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    async def export_bioimageio(
+        self, session_id: str, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Build a draft cpsam BioImage.IO package (pytorch_state_dict + bundled
         CellposeSAMWrapper, self-tested with bioimageio.core.test_model) from a
         trained session in a CPU subprocess. Publishes nothing — returns the export
@@ -918,7 +978,9 @@ class CellposeRuntime:
         export_dir.mkdir(parents=True, exist_ok=True)
         (export_dir / "request.json").write_text(json.dumps(request))
 
-        proc = await asyncio.to_thread(self._run_export_subprocess, session_id, str(export_dir))
+        proc = await asyncio.to_thread(
+            self._run_export_subprocess, session_id, str(export_dir)
+        )
         res_path = export_dir / "export_result.json"
         if proc.returncode != 0 or not res_path.exists():
             raise RuntimeError(
@@ -926,7 +988,9 @@ class CellposeRuntime:
             )
         return json.loads(res_path.read_text())
 
-    async def train(self, session_id: str, model_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def train(
+        self, session_id: str, model_type: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Fine-tune cpsam in a subprocess under the shared GPU lock. Evicts the
         resident inference model first so the subprocess owns the GPU; the
         subprocess (``train_worker_cellpose.py``) writes COMPLETED/FAILED."""
@@ -935,22 +999,32 @@ class CellposeRuntime:
         async with self._gpu_lock:
             await asyncio.to_thread(self._release_model)
             training.write_status(
-                session_id, status="TRAINING", start_time=time.time(),
-                n_epochs=params.get("n_epochs"), device=self._device(),
+                session_id,
+                status="TRAINING",
+                start_time=time.time(),
+                n_epochs=params.get("n_epochs"),
+                device=self._device(),
             )
-            rc, tail, stopped = await asyncio.to_thread(self._run_train_subprocess, session_id)
+            rc, tail, stopped = await asyncio.to_thread(
+                self._run_train_subprocess, session_id
+            )
 
         if stopped:
             training.write_status(
-                session_id, status="STOPPED", message="stopped by user",
-                end_time=time.time(), terminated_by="user_stop",
+                session_id,
+                status="STOPPED",
+                message="stopped by user",
+                end_time=time.time(),
+                terminated_by="user_stop",
             )
         else:
             st = training.read_status(session_id)
             if st.get("status") not in ("COMPLETED", "FAILED", "STOPPED"):
                 training.write_status(
-                    session_id, status="FAILED",
+                    session_id,
+                    status="FAILED",
                     message=f"training subprocess exited rc={rc}: {tail}",
-                    end_time=time.time(), terminated_by="supervisor",
+                    end_time=time.time(),
+                    terminated_by="supervisor",
                 )
         return {"session_id": session_id, "returncode": rc}

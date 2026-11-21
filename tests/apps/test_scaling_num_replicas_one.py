@@ -20,6 +20,7 @@ ray-gated test asserts that those kwargs resolve to a pinned deployment
 config, which is what makes the fake's premise true. Run with ``-rs``: ray is
 not installed on every host, and a silently skipped gate reads as a pass.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -98,9 +99,7 @@ def test_resolved_deployment_config_is_pinned() -> None:
         "upscale_delay_s": 0.0,
     }
 
-    @serve.deployment(
-        autoscaling_config=decorator_autoscaling, max_ongoing_requests=10
-    )
+    @serve.deployment(autoscaling_config=decorator_autoscaling, max_ongoing_requests=10)
     class _Runtime:
         def __call__(self) -> int:
             return 1

@@ -5,7 +5,7 @@ pages reach a BioEngine replica, which only receives Python modules.
 """
 
 PAGES = {
-    'index.html': r'''<!doctype html>
+    "index.html": r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -488,8 +488,8 @@ function card(d) {
 </script>
 </body>
 </html>
-''',
-    'annotate.html': r'''<!doctype html>
+""",
+    "annotate.html": r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -718,7 +718,7 @@ function say(msg, cls = "") {
 </script>
 </body>
 </html>
-''',
+""",
 }
 
-SOURCE_HASHES = {'index.html': '4e7606ad90ed87fb', 'annotate.html': 'efc7143cad9c9317'}
+SOURCE_HASHES = {"index.html": "4e7606ad90ed87fb", "annotate.html": "efc7143cad9c9317"}

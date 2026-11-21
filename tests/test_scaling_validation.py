@@ -84,7 +84,11 @@ def test_both_keys_are_rejected():
 
 def test_autoscaling_config_alone_is_accepted():
     _validate_scaling_map(
-        {"CellposeRuntime": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 3}}},
+        {
+            "CellposeRuntime": {
+                "autoscaling_config": {"min_replicas": 1, "max_replicas": 3}
+            }
+        },
         DEPLOYMENTS,
         "my-app",
     )
@@ -113,7 +117,9 @@ def test_a_key_ray_adds_later_is_accepted_without_touching_this_file(monkeypatch
     here: ``model_fields`` is a plain dict, so a synthetic key can be injected and the
     future simulated. Measured in the shipped image at Ray 2.55.1 / pydantic 2.12.0.
     """
-    monkeypatch.setitem(AutoscalingConfig.model_fields, "zz_future_knob", _a_field_info())
+    monkeypatch.setitem(
+        AutoscalingConfig.model_fields, "zz_future_knob", _a_field_info()
+    )
 
     _validate_scaling_map(
         {"CellposeRuntime": {"autoscaling_config": {"zz_future_knob": 7}}},
@@ -137,7 +143,11 @@ def test_a_key_ray_removes_stops_being_accepted(monkeypatch):
 
     with pytest.raises(ValueError) as excinfo:
         _validate_scaling_map(
-            {"CellposeRuntime": {"autoscaling_config": {"aggregation_function": "mean"}}},
+            {
+                "CellposeRuntime": {
+                    "autoscaling_config": {"aggregation_function": "mean"}
+                }
+            },
             DEPLOYMENTS,
             "my-app",
         )

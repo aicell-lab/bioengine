@@ -5,6 +5,7 @@ hand-written list silently stops covering an option the moment somebody adds one
 would keep passing. `test_the_parsers_dir_option_set_has_not_changed` is what turns that
 derivation into a tripwire.
 """
+
 import argparse
 
 import pytest
@@ -40,7 +41,9 @@ def test_the_parsers_dir_option_set_has_not_changed():
 
 def test_uncreatable_workspace_dir_names_the_option():
     with pytest.raises(ValueError) as exc:
-        create_option_dirs({"Core Options": {"workspace_dir": "/proc/cannot-create-here/x"}})
+        create_option_dirs(
+            {"Core Options": {"workspace_dir": "/proc/cannot-create-here/x"}}
+        )
     msg = str(exc.value)
     assert "--workspace-dir" in msg, f"the message does not name the option: {msg!r}"
     # The OS reason must survive too -- naming the option is an ADDITION, not a replacement.

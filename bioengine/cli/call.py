@@ -10,6 +10,7 @@ Examples:
   bioengine call bioimage-io/my-app process --arg text=hello --arg max_length=100
   bioengine call bioimage-io/my-app --list-methods
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -54,7 +55,7 @@ def _parse_value(s: str):
     default=None,
     metavar="JSON",
     help=(
-        "Method arguments as a JSON object, e.g. '{\"key\": \"value\", \"n\": 10}'. "
+        'Method arguments as a JSON object, e.g. \'{"key": "value", "n": 10}\'. '
         "Merged with any --arg flags (--arg takes precedence)."
     ),
 )
@@ -91,7 +92,9 @@ def _parse_value(s: str):
     help="Hypha auth token. Can also be set via HYPHA_TOKEN env var.",
 )
 @click.option("--server-url", envvar="BIOENGINE_SERVER_URL", default=None, hidden=True)
-def call_command(service_id, method, args_json, arg_pairs, list_methods, as_json, token, server_url):
+def call_command(
+    service_id, method, args_json, arg_pairs, list_methods, as_json, token, server_url
+):
     """
     Call any method on any deployed BioEngine service.
 
@@ -121,8 +124,10 @@ def call_command(service_id, method, args_json, arg_pairs, list_methods, as_json
         try:
             svc = await connect_service(server_url, service_id, token)
         except Exception as exc:
-            error_exit(f"Could not connect to service '{service_id}': {exc}",
-                       "Check the service ID and make sure the service is running.")
+            error_exit(
+                f"Could not connect to service '{service_id}': {exc}",
+                "Check the service ID and make sure the service is running.",
+            )
 
         if list_methods:
             # Discover available methods from service info
@@ -152,8 +157,10 @@ def call_command(service_id, method, args_json, arg_pairs, list_methods, as_json
             try:
                 kwargs = json.loads(args_json)
             except json.JSONDecodeError as e:
-                error_exit(f"Invalid JSON in --args: {e}",
-                           "Wrap the JSON in single quotes and use double quotes inside.")
+                error_exit(
+                    f"Invalid JSON in --args: {e}",
+                    "Wrap the JSON in single quotes and use double quotes inside.",
+                )
 
         for kv in arg_pairs:
             if "=" not in kv:

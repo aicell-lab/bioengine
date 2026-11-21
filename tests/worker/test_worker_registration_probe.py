@@ -733,9 +733,9 @@ async def test_the_repair_passes_NO_artifact_manager_grace_by_any_route():
     assert calls, "the repair path never called _connect_to_server"
     args, kwargs = calls[-1]
 
-    assert "artifact_manager_grace_s" not in kwargs, (
-        f"the repair passed the boot grace as a keyword: {kwargs}"
-    )
+    assert (
+        "artifact_manager_grace_s" not in kwargs
+    ), f"the repair passed the boot grace as a keyword: {kwargs}"
     assert args == (), (
         f"the repair passed {len(args)} positional argument(s) {args}; the second "
         f"positional slot of _connect_to_server was the artifact-manager grace, "

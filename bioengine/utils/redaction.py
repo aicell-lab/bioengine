@@ -102,12 +102,18 @@ def is_secret_env_var(key: str, value: Any) -> bool:
 def _render_pairs(pairs: Any) -> str:
     """One deployment's ``key=value`` pairs, masking anything secret-shaped."""
     return " ".join(
-        f'{key}="{SECRET_MASK}"' if is_secret_env_var(key, value) else f"{key}={value!r}"
+        (
+            f'{key}="{SECRET_MASK}"'
+            if is_secret_env_var(key, value)
+            else f"{key}={value!r}"
+        )
         for key, value in pairs.items()
     )
 
 
-def describe_deploy_arguments(application_kwargs: Any, application_env_vars: Any) -> tuple:
+def describe_deploy_arguments(
+    application_kwargs: Any, application_env_vars: Any
+) -> tuple:
     """The ``kwargs:``/``env_vars:`` text of the deploy log line, already masked.
 
     Pulled out of ``AppsManager.deploy_app`` so it can be tested on its OUTPUT. The test
@@ -126,10 +132,16 @@ def describe_deploy_arguments(application_kwargs: Any, application_env_vars: Any
     """
     kwargs_str = (
         ", ".join(
-            f"{deployment_class}(" + ", ".join(
-                f'{key}="{SECRET_MASK}"' if is_secret_env_var(key, value) else f"{key}={value!r}"
+            f"{deployment_class}("
+            + ", ".join(
+                (
+                    f'{key}="{SECRET_MASK}"'
+                    if is_secret_env_var(key, value)
+                    else f"{key}={value!r}"
+                )
                 for key, value in deployment_kwargs.items()
-            ) + ")"
+            )
+            + ")"
             for deployment_class, deployment_kwargs in application_kwargs.items()
         )
         if application_kwargs

@@ -25,7 +25,9 @@ class TransportLog:
     def __init__(self) -> None:
         self._entries: List[Dict[str, Any]] = []
 
-    def record(self, direction: str, kind: str, path: str, payload: bytes, note: str = "") -> Dict[str, Any]:
+    def record(
+        self, direction: str, kind: str, path: str, payload: bytes, note: str = ""
+    ) -> Dict[str, Any]:
         entry = {
             "seq": len(self._entries),
             "timestamp": time.time(),
@@ -46,11 +48,15 @@ class TransportLog:
             "entries": list(self._entries),
             "n_transfers": len(self._entries),
             "bytes_out": sum(e["bytes"] for e in outbound),
-            "bytes_in": sum(e["bytes"] for e in self._entries if e["direction"] == "in"),
+            "bytes_in": sum(
+                e["bytes"] for e in self._entries if e["direction"] == "in"
+            ),
             "kinds_transferred": kinds,
             # The assertion the experiment rests on, stated as a check over the
             # log rather than as a claim: nothing but model weights left here.
-            "only_weights_left_site": all(e["kind"] == "model_weights" for e in outbound),
+            "only_weights_left_site": all(
+                e["kind"] == "model_weights" for e in outbound
+            ),
         }
 
 
@@ -93,7 +99,9 @@ class CheckpointStore:
                 )
                 await asyncio.sleep(delay)
 
-    async def put(self, path: str, payload: bytes, kind: str = "model_weights", note: str = "") -> Dict[str, Any]:
+    async def put(
+        self, path: str, payload: bytes, kind: str = "model_weights", note: str = ""
+    ) -> Dict[str, Any]:
         async def _transfer() -> None:
             url = await self.artifact_manager.put_file(self.artifact_id, file_path=path)
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -103,9 +111,13 @@ class CheckpointStore:
         await self._retry(f"put {path}", _transfer)
         return self.log.record("out", kind, f"{self.artifact_id}/{path}", payload, note)
 
-    async def get(self, path: str, kind: str = "model_weights", note: str = "") -> bytes:
+    async def get(
+        self, path: str, kind: str = "model_weights", note: str = ""
+    ) -> bytes:
         async def _transfer() -> bytes:
-            url = await self.artifact_manager.get_file(self.artifact_id, path, version="stage")
+            url = await self.artifact_manager.get_file(
+                self.artifact_id, path, version="stage"
+            )
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(url)
                 response.raise_for_status()
@@ -129,7 +141,8 @@ async def ensure_run_artifact(
         created = await artifact_manager.create(
             type="generic",
             alias=alias,
-            manifest=manifest or {"name": alias, "description": "federated-unet run checkpoints"},
+            manifest=manifest
+            or {"name": alias, "description": "federated-unet run checkpoints"},
             stage=True,
         )
         return created["id"]

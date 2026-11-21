@@ -49,7 +49,11 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
     """
     while not stop.wait(interval):
         n = _epochs_completed(session_id)
-        extra = {"n_epochs_completed": n, "n_epochs_completed_basis": "measured"} if n is not None else {}
+        extra = (
+            {"n_epochs_completed": n, "n_epochs_completed_basis": "measured"}
+            if n is not None
+            else {}
+        )
         training.write_status(session_id, **extra)
 
 
@@ -65,30 +69,47 @@ def main(session_id: str) -> None:
 
     training.write_status(session_id, status="TRAINING", message="training started")
     stop = threading.Event()
-    heartbeat = threading.Thread(target=_heartbeat, args=(session_id, stop), daemon=True)
+    heartbeat = threading.Thread(
+        target=_heartbeat, args=(session_id, stop), daemon=True
+    )
     heartbeat.start()
 
     common = dict(
-        raw_key=None, label_key=None, patch_shape=patch,
-        with_segmentation_decoder=True, batch_size=p["batch_size"],
+        raw_key=None,
+        label_key=None,
+        patch_shape=patch,
+        with_segmentation_decoder=True,
+        batch_size=p["batch_size"],
         sampler=MinInstanceSampler(min_num_instances=1),
         num_workers=p.get("num_workers", 0),
     )
     try:
         train_loader = default_sam_loader(
-            raw_paths=p["train_images"], label_paths=p["train_labels"],
-            is_train=True, shuffle=True, n_samples=p.get("n_samples"), **common,
+            raw_paths=p["train_images"],
+            label_paths=p["train_labels"],
+            is_train=True,
+            shuffle=True,
+            n_samples=p.get("n_samples"),
+            **common,
         )
         val_loader = default_sam_loader(
-            raw_paths=p["val_images"], label_paths=p["val_labels"],
-            is_train=False, shuffle=False, **common,
+            raw_paths=p["val_images"],
+            label_paths=p["val_labels"],
+            is_train=False,
+            shuffle=False,
+            **common,
         )
         train_sam(
-            name=session_id, model_type=p["model_type"],
-            train_loader=train_loader, val_loader=val_loader,
-            n_epochs=p["n_epochs"], n_objects_per_batch=p.get("n_objects_per_batch", 8),
-            with_segmentation_decoder=True, save_root=str(sdir),
-            device=device, lr=p["learning_rate"],
+            name=session_id,
+            model_type=p["model_type"],
+            train_loader=train_loader,
+            val_loader=val_loader,
+            n_epochs=p["n_epochs"],
+            n_objects_per_batch=p.get("n_objects_per_batch", 8),
+            with_segmentation_decoder=True,
+            save_root=str(sdir),
+            device=device,
+            lr=p["learning_rate"],
             checkpoint_path=p.get("checkpoint_path"),
         )
         stop.set()
@@ -96,16 +117,24 @@ def main(session_id: str) -> None:
         training.write_status(
             session_id,
             status="COMPLETED" if ok else "FAILED",
-            message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
-            end_time=time.time(), terminated_by="child",
+            message=(
+                "checkpoint saved"
+                if ok
+                else "training finished but no checkpoint was produced"
+            ),
+            end_time=time.time(),
+            terminated_by="child",
             n_epochs_completed=_epochs_completed(session_id),
             n_epochs_completed_basis="measured",
         )
     except Exception as e:
         stop.set()
         training.write_status(
-            session_id, status="FAILED", message=str(e)[:800],
-            traceback=traceback.format_exc()[-2500:], end_time=time.time(),
+            session_id,
+            status="FAILED",
+            message=str(e)[:800],
+            traceback=traceback.format_exc()[-2500:],
+            end_time=time.time(),
             terminated_by="child",
         )
         raise

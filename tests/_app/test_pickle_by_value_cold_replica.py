@@ -16,6 +16,7 @@ user modules. This test reproduces the exact failure and the fix at the
 ``ray.cloudpickle`` layer, loading in a CLEAN subprocess that mimics the cold
 replica (source dir absent from ``sys.path``).
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -72,9 +73,7 @@ def _dump(code: str, blob):
 
 
 def _load(code: str, cwd: str):
-    return subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, cwd=cwd
-    )
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, cwd=cwd)
 
 
 def test_by_reference_pickle_fails_cold_but_by_value_loads(tmp_path):

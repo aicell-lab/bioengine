@@ -6,6 +6,7 @@ silently turned every proxy into a 1-CPU reservation despite the worker
 code intending 0. The decorator now sets ``num_cpus=0`` explicitly; this
 test pins that invariant so the regression can't reappear unnoticed.
 """
+
 from __future__ import annotations
 
 from bioengine.apps.proxy_deployment import ProxyDeployment

@@ -5,6 +5,7 @@ viewer or a Python client actually experiences — not an in-process shortcut.
 Cold and warm are distinguished by the server's own ``X-View-Cache`` header
 rather than assumed from ordering.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,8 +38,18 @@ def _stats(values: List[float]) -> Dict[str, Any]:
 def _provenance(base: str) -> Dict[str, Any]:
     try:
         commit = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parents[3]), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=10).stdout.strip()
+            [
+                "git",
+                "-C",
+                str(Path(__file__).resolve().parents[3]),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
     except Exception:
         commit = "unknown"
     return {
@@ -47,8 +58,8 @@ def _provenance(base: str) -> Dict[str, Any]:
         "bioengine_commit": commit,
         "measured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "note": "client and server are the same host; the endpoint is "
-                "reached through its public tunnel, so each request pays a "
-                "tunnel round trip that a co-located client would not.",
+        "reached through its public tunnel, so each request pays a "
+        "tunnel round trip that a co-located client would not.",
     }
 
 
@@ -145,7 +156,9 @@ def main() -> int:
         try:
             results["datasets"].append(measure(args.base, ds, args.n, args.timeout))
         except Exception as e:
-            results["datasets"].append({"dataset": ds, "error": f"{type(e).__name__}: {e}"})
+            results["datasets"].append(
+                {"dataset": ds, "error": f"{type(e).__name__}: {e}"}
+            )
     with open(args.out, "w") as fh:
         json.dump(results, fh, indent=1)
     print(json.dumps(results, indent=1))

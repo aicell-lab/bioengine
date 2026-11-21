@@ -131,9 +131,9 @@ async def test_the_renamed_target_field_is_rejected_not_dropped() -> None:
         "The error has to name the offending key: the whole failure mode is "
         "that the author cannot tell which value went missing."
     )
-    assert APP_ID not in manager._deployed_applications, (
-        "A rejected scaling map must not leave a half-registered application."
-    )
+    assert (
+        APP_ID not in manager._deployed_applications
+    ), "A rejected scaling map must not leave a half-registered application."
 
 
 @pytest.mark.asyncio
@@ -149,7 +149,9 @@ async def test_the_live_target_field_with_the_same_value_is_accepted() -> None:
 
     assert result["application_id"] == APP_ID
     assert manager._deployed_applications[APP_ID]["scaling"] == {
-        DEPLOYMENT: {"autoscaling_config": {"min_replicas": 1, "max_replicas": 3, LIVE_KEY: 1.0}}
+        DEPLOYMENT: {
+            "autoscaling_config": {"min_replicas": 1, "max_replicas": 3, LIVE_KEY: 1.0}
+        }
     }
 
 
@@ -175,6 +177,6 @@ async def test_every_unknown_key_is_listed_so_one_fix_round_is_enough() -> None:
 
     message = str(excinfo.value)
     assert DEAD_KEY in message and "min_replicass" in message
-    assert "max_replicas'" not in message.split("key(s)")[1].split(";")[0], (
-        "The valid sibling key must not be reported as unknown."
-    )
+    assert (
+        "max_replicas'" not in message.split("key(s)")[1].split(";")[0]
+    ), "The valid sibling key must not be reported as unknown."

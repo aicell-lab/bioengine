@@ -66,8 +66,12 @@ def download(url: str, dest: Path) -> None:
                 done += len(chunk)
                 if total:
                     pct = 100 * done / total
-                    print(f"\r  {dest.name}: {pct:5.1f}%  "
-                          f"{done/1e6:.0f}/{total/1e6:.0f} MB", end="", flush=True)
+                    print(
+                        f"\r  {dest.name}: {pct:5.1f}%  "
+                        f"{done/1e6:.0f}/{total/1e6:.0f} MB",
+                        end="",
+                        flush=True,
+                    )
     print()
     tmp.rename(dest)
 
@@ -82,19 +86,23 @@ def md5(path: Path) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dest",
-                    default="../../.dev/omezarr-view-data",
-                    help="where to put demo files; kept OUTSIDE the app directory "
-                         "because upload_app ships the whole directory")
-    ap.add_argument("--skip-large", action="store_true",
-                    help="skip files over ~1 GB")
+    ap.add_argument(
+        "--dest",
+        default="../../.dev/omezarr-view-data",
+        help="where to put demo files; kept OUTSIDE the app directory "
+        "because upload_app ships the whole directory",
+    )
+    ap.add_argument("--skip-large", action="store_true", help="skip files over ~1 GB")
     args = ap.parse_args()
 
     dest_dir = Path(args.dest)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    lines = ["# Local demo data — licences verified from the source repository API",
-             "",
-             "| file | licence | attribution |", "|---|---|---|"]
+    lines = [
+        "# Local demo data — licences verified from the source repository API",
+        "",
+        "| file | licence | attribution |",
+        "|---|---|---|",
+    ]
 
     for name, url, licence, attribution, size, expect_md5, large in FILES:
         if large and args.skip_large:

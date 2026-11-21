@@ -24,6 +24,7 @@ The contract now:
   successor that claims the record and then never registers withholds a
   working address for as long as the predecessor keeps serving it.
 """
+
 from __future__ import annotations
 
 import asyncio
