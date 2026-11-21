@@ -380,10 +380,11 @@ def test_the_RECORD_is_written_ONLY_by_the_dict_literal_and_nothing_else():
 
     LIMIT, because this arm must not be read as more than it is: a key the code COMPUTES rather
     than names is invisible to any string match. ``record["auto_" + "redeploy"] = True`` passes
-    this arm and every other arm in this file. That one is caught behaviourally instead, by
-    reading ``auto_redeploy`` back off a live worker for an explicitly opted-out deploy, where
-    it reports True for a caller that asked for False. CI does not run that arm, so this file
-    does not close that route and does not claim to.
+    this arm and every other arm in this file. Closing that route needs an assertion on the
+    VALUE rather than on the code, which is
+    ``tests/apps/test_deploy_app_stores_auto_redeploy.py``: it drives ``deploy_app`` against
+    stubs and reads the stored record back, and a computed-key write fails four of its five
+    arms. So the route is covered, in CI, by that file and not by this one.
 
     The two legitimate uses:
       1. the key of the record dict literal, whose value must be the resolved NAME
