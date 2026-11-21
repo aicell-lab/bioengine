@@ -16,7 +16,7 @@ from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 
 from bioengine import __version__
-from bioengine.apps.manager import AppsManager
+from bioengine.apps.manager import AppsManager, _ARTIFACT_MANAGER_RESOLVE_GRACE_S
 from bioengine.datasets import BioEngineDatasets
 from bioengine.heartbeat import (
     DEFAULT_HEARTBEAT_PATH,
@@ -908,7 +908,10 @@ class BioEngineWorker:
             await self._ping_data_server()
 
     async def _connect_to_server(
-        self, retry_budget_seconds: float = RECONNECT_BUDGET_S
+        self,
+        retry_budget_seconds: float = RECONNECT_BUDGET_S,
+        *,
+        artifact_manager_grace_s: float = 0.0,
     ) -> None:
         """
         Establish connection to Hypha server and configure admin user permissions.
@@ -1006,6 +1009,9 @@ class BioEngineWorker:
             server=self.server,
             admin_users=self.admin_users,
             worker_service_id=self.full_service_id,
+            # 0 on the REPAIR path: this runs inside one monitoring pass with a 15 s
+            # budget, and a 300 s wait here stalls the whole tick.
+            artifact_manager_grace_s=artifact_manager_grace_s,
         )
         await self.code_executor.initialize(admin_users=self.admin_users)
 
@@ -1632,7 +1638,12 @@ class BioEngineWorker:
 
             # Connect the BioEngine worker to the Hypha server
             # Completes initialization of AppsManager and CodeExecutor
-            await self._connect_to_server(STARTUP_CONNECT_BUDGET_S)
+            # BOOT is the only caller that opts into the grace: there is no request to
+            # fail and nothing to replay, so waiting beats crash-looping.
+            await self._connect_to_server(
+                STARTUP_CONNECT_BUDGET_S,
+                artifact_manager_grace_s=_ARTIFACT_MANAGER_RESOLVE_GRACE_S,
+            )
 
             # Check for running data server
             await self._discover_data_server()
