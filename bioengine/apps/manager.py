@@ -2456,14 +2456,22 @@ class AppsManager:
             if app_info["auto_redeploy"]
         ]
         if not apps_to_redeploy:
-            # Noticing is not redeploying. auto_redeploy defaults to False, so
-            # a worker tracking only opted-out apps used to return here and
-            # never read Serve's state at all, which made controller loss
-            # undetectable for it rather than merely unactioned. The actor
-            # lookup is the question being asked and costs a fraction of the
-            # serve.status RPC the path below makes, so detection is reported
+            # Noticing is not redeploying. A worker tracking only opted-out apps
+            # used to return here and never read Serve's state at all, which made
+            # controller loss undetectable for it rather than merely unactioned.
+            # The actor lookup is the question being asked and costs a fraction of
+            # the serve.status RPC the path below makes, so detection is reported
             # on it alone. No recovery sweep follows — an app that asked not to
             # be redeployed still is not.
+            #
+            # Since auto_redeploy became True for a new application, reaching here
+            # means every tracked app opted out EXPLICITLY, or was deployed before
+            # that default changed, or was adopted carrying False. It is now the
+            # rare path rather than the common one — but not a dead one, which is
+            # why the detection stays. Adoption is unaffected either way: it
+            # requires `auto_redeploy` in app_data (see the required_keys check in
+            # the recovery path), so an adopted app carries whatever it was
+            # deployed with and never picks up this default.
             #
             # The cooldown gates the probe, not just the line: the lookup runs
             # in a thread that outlives its own timeout, so asking once per

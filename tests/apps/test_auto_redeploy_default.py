@@ -20,12 +20,17 @@ the next redeploy. Both are pinned below.
 from __future__ import annotations
 
 import ast
+import textwrap
 import inspect
 import re
 
 from bioengine.apps import manager as manager_mod
 from bioengine.apps.manager import AppsManager
 
+
+# Read from the module that is actually IMPORTED, not from a guessed path: a path read can
+# silently answer for a different checkout than the one under test.
+_MANAGER_SRC = inspect.getsource(manager_mod)
 
 def _deploy_app_source() -> str:
     return inspect.getsource(AppsManager.deploy_app)
@@ -149,3 +154,130 @@ def test_startup_applications_inherit_the_default_rather_than_setting_their_own(
         "inherits the new default"
     )
     assert "deploy_app(**deploy_app_kwargs)" in src.replace("await ", "")
+
+# ─────────────────── behavioural: the decision is EXECUTED ───────────────────
+#
+# Review round 1 showed every arm above to be a source-text or AST assertion, and defeated them
+# with two one-line mutants that both passed 8/8:
+#   M1  an unconditional `auto_redeploy = True` after the guard, so an explicit False is overridden
+#   M2  storing `"auto_redeploy": False` in the deployed-app record whatever the argument said
+# The arms below run the real decision and pin its assignment sites, so both go red.
+
+
+def _deploy_app_fn() -> ast.AST:
+    tree = ast.parse(_MANAGER_SRC)
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "deploy_app"),
+        None,
+    )
+    assert fn is not None, "manager.py has no `deploy_app` -- the anchor moved, not the fix"
+    return fn
+
+
+def _auto_redeploy_guards(fn):
+    """Every `if auto_redeploy is None:` whose body assigns auto_redeploy, with its source."""
+    out = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        t = node.test
+        if not (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name)
+                and t.left.id == "auto_redeploy"
+                and len(t.ops) == 1 and isinstance(t.ops[0], ast.Is)
+                and isinstance(t.comparators[0], ast.Constant)
+                and t.comparators[0].value is None):
+            continue
+        assigns = [n for n in ast.walk(node) if isinstance(n, ast.Assign)
+                   and any(isinstance(x, ast.Name) and x.id == "auto_redeploy" for x in n.targets)]
+        if assigns:
+            out.append((node, ast.get_source_segment(_MANAGER_SRC, node)))
+    return out
+
+
+def _run_guard(src: str, *, auto_redeploy, existing_app=None):
+    """Execute one real guard block with controlled inputs and return the resulting value."""
+    ns = {"auto_redeploy": auto_redeploy, "existing_app": existing_app or {}}
+    exec(textwrap.dedent(src), {}, ns)   # the production source, not a copy of it
+    return ns["auto_redeploy"]
+
+
+def test_the_NEW_path_assigns_True_and_an_explicit_value_SURVIVES_it():
+    """Executes the real new-application guard with each of the three inputs."""
+    guards = _auto_redeploy_guards(_deploy_app_fn())
+    new = [src for _, src in guards if "existing_app" not in src]
+    assert len(new) == 1, f"expected one new-application guard, found {len(new)}"
+    src = new[0]
+    assert _run_guard(src, auto_redeploy=None) is True, (
+        "a fresh deploy with the argument omitted does not come out True"
+    )
+    assert _run_guard(src, auto_redeploy=False) is False, (
+        "an explicit auto_redeploy=False does NOT survive the new-application guard"
+    )
+    assert _run_guard(src, auto_redeploy=True) is True
+
+
+def test_the_UPDATE_path_INHERITS_and_an_explicit_value_SURVIVES_it():
+    """Executes the real update guard: omitted inherits, explicit wins."""
+    guards = _auto_redeploy_guards(_deploy_app_fn())
+    upd = [src for _, src in guards if "existing_app" in src]
+    assert len(upd) == 1, f"expected one update guard, found {len(upd)}"
+    src = upd[0]
+    assert _run_guard(src, auto_redeploy=None, existing_app={"auto_redeploy": True}) is True
+    assert _run_guard(src, auto_redeploy=None, existing_app={"auto_redeploy": False}) is False, (
+        "an UPDATE that omits the argument does not preserve a running False"
+    )
+    assert _run_guard(src, auto_redeploy=False, existing_app={"auto_redeploy": True}) is False, (
+        "an explicit False does NOT survive the update guard"
+    )
+
+
+def test_EVERY_assignment_to_auto_redeploy_in_deploy_app_is_BEHIND_a_None_guard():
+    """Allow-list, not a blacklist. This is what kills the override mutant.
+
+    An unconditional `auto_redeploy = True` anywhere in deploy_app overrides an explicit False, and
+    no execution of the guarded blocks can see it. So: enumerate every assignment to the name and
+    require each to sit inside an `if auto_redeploy is None:` block.
+    """
+    fn = _deploy_app_fn()
+    guarded = set()
+    for node, _ in _auto_redeploy_guards(fn):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Assign) and any(
+                isinstance(x, ast.Name) and x.id == "auto_redeploy" for x in n.targets
+            ):
+                guarded.add(n.lineno)
+    all_assigns = [
+        n.lineno for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(x, ast.Name) and x.id == "auto_redeploy" for x in n.targets)
+    ]
+    assert all_assigns, "deploy_app assigns auto_redeploy nowhere -- this arm would be vacuous"
+    unguarded = sorted(set(all_assigns) - guarded)
+    assert not unguarded, (
+        f"deploy_app assigns auto_redeploy outside an `is None` guard at line(s) {unguarded}; "
+        "such an assignment overrides an explicit auto_redeploy=False"
+    )
+
+
+def test_the_deployed_record_STORES_THE_VARIABLE_not_a_constant():
+    """What the monitor later reads. This is what kills the record mutant.
+
+    `"auto_redeploy": False` in the record passes every guard test above while telling the monitor
+    the opposite of what the caller asked for. So require the value to be the NAME.
+    """
+    fn = _deploy_app_fn()
+    entries = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Dict):
+            continue
+        for k, v in zip(node.keys, node.values):
+            if isinstance(k, ast.Constant) and k.value == "auto_redeploy":
+                entries.append((getattr(k, "lineno", -1), v))
+    assert entries, "deploy_app builds no record entry for auto_redeploy -- arm would be vacuous"
+    bad = [(ln, type(v).__name__) for ln, v in entries
+           if not (isinstance(v, ast.Name) and v.id == "auto_redeploy")]
+    assert not bad, (
+        f"the record stores auto_redeploy as {bad} rather than the resolved variable; "
+        "a constant there makes the monitor read something the caller never asked for"
+    )
