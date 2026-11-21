@@ -150,3 +150,22 @@ def test_both_bootstrap_tasks_apply_the_fence_after_their_env_loop():
             f"{fn_name} fences BEFORE it applies env_vars, so the apply would "
             "put the inherited value straight back"
         )
+        # BOTH bounds, because one is not an ordering. Round 2 of review moved the
+        # call to just AFTER the user import and this arm still passed (18/18):
+        # the docstring promised "before the app class is loaded" while the
+        # assertion only checked "after the env loop", so the window the fence
+        # has to sit inside was open at the top.
+        import_at = min(
+            (src.index(m) for m in ("_ensure_source(", "_load_app_class(", "introspect_app(")
+             if m in src),
+            default=None,
+        )
+        assert import_at is not None, (
+            f"{fn_name} no longer calls any of the source-loading helpers this arm "
+            "anchors on; re-anchor it rather than deleting the bound"
+        )
+        assert fence_at < import_at, (
+            f"{fn_name} fences AFTER it reaches user code (fence at {fence_at}, "
+            f"load at {import_at}), so a module-level read already captured the "
+            "inherited credential"
+        )

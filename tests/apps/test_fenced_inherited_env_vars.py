@@ -285,3 +285,65 @@ def test_the_builders_flattening_still_matches_what_the_helper_copies():
         "helper in this file is testing a path that no longer exists"
     )
     assert 'k[1:]: v for k, v in flat_env_vars.items() if k.startswith("_")' in source
+
+
+# --------------------------------------------------------------------------
+# adoption must not silently drop the fence
+# --------------------------------------------------------------------------
+
+
+def test_the_fence_INTENT_survives_adoption_even_though_the_token_cannot():
+    """Found by review. ``app_data`` deliberately holds no secret, so a worker
+    adopting an app recovers it with ``hypha_token: None`` — and an update that
+    omits the argument inherits that None, which emits NO fence. On a
+    single-machine worker the new replicas then hold the worker's own credential
+    again: a plain restart plus a routine update is enough, which is the shape
+    of the incident the fence exists to prevent.
+
+    The token cannot survive in the blob. The INTENT can, and is not secret.
+    """
+    from bioengine.apps import builder as builder_mod
+    import inspect
+
+    build_src = inspect.getsource(builder_mod.AppBuilder.build)
+    assert '"hypha_token_fenced": hypha_token == ""' in build_src, (
+        "the builder does not record the fence intent in app_data, so adoption "
+        "has nothing to carry"
+    )
+
+
+def test_an_update_that_omits_the_token_RE_FENCES_an_adopted_fenced_app():
+    """The behavioural half: inheriting None over a FENCED app must mean "",
+    not "no fence"."""
+    from bioengine.apps import manager as manager_mod
+    import inspect
+
+    src = inspect.getsource(manager_mod.AppsManager.deploy_app)
+    assert 'existing_app.get("hypha_token_fenced")' in src, (
+        "the update path cannot tell an adopted-and-fenced app from one deployed "
+        "without a fence"
+    )
+    # ...and the inherited None must be turned into the explicit empty string,
+    # because that is the only value _build_env_vars emits a fence for.
+    i = src.index('existing_app.get("hypha_token_fenced")')
+    assert 'hypha_token = ""' in src[i : i + 400], (
+        "the fenced branch does not set hypha_token to the empty string, so "
+        "_build_env_vars still emits no fence"
+    )
+
+
+def test_a_NON_fenced_adopted_app_is_not_given_a_fence_it_never_had():
+    """CONTROL on the new branch. The flag must gate it: an app deployed WITH a
+    token, then adopted, must not come back fenced — that would strip a
+    credential the operator supplied."""
+    env = _env(None)
+    assert FENCE_KEY not in env
+    # and the recovery blob's flag is a bool, so a missing key reads False
+    from bioengine.apps import manager as manager_mod
+    import inspect
+
+    rec = inspect.getsource(manager_mod.AppsManager)
+    assert '"hypha_token_fenced": bool(' in rec, (
+        "the recovery blob does not coerce the flag, so a missing key could read "
+        "truthy from a stale payload"
+    )

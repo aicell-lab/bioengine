@@ -900,6 +900,14 @@ class AppBuilder:
             "application_kwargs": application_kwargs,
             "application_env_vars": recovery_env_vars,
             "redacted_env_var_keys": redacted_env_var_keys,
+            # The fence INTENT, not the token. app_data deliberately holds no
+            # secret, so a recovered app came back with hypha_token None and an
+            # update that omitted the argument inherited that None -- which emits
+            # NO fence, so a single-machine replica silently held the worker's own
+            # credential again after a plain restart plus a routine update. The
+            # flag is not secret, so it survives in the blob and the update path
+            # re-emits the fence from it.
+            "hypha_token_fenced": hypha_token == "",
             "disable_gpu": disable_gpu,
             "max_ongoing_requests": max_ongoing_requests,
             "proxy_memory_in_gb": proxy_memory_in_gb,
