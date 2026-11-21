@@ -142,10 +142,10 @@ def test_resolved_live_targets_is_empty_without_a_credential() -> None:
 def test_resolved_live_targets_names_every_credential_in_scope() -> None:
     assert resolved_live_targets(
         {
-            "HYPHA_TOKEN": _fake_jwt("ws-user-test|1"),
+            "HYPHA_TOKEN": _fake_jwt("test-workspace"),
             "BIOIMAGE_IO_TOKEN": _fake_jwt("bioimage-io"),
         }
-    ) == [("HYPHA_TOKEN", "ws-user-test|1"), ("BIOIMAGE_IO_TOKEN", "bioimage-io")]
+    ) == [("HYPHA_TOKEN", "test-workspace"), ("BIOIMAGE_IO_TOKEN", "bioimage-io")]
 
 
 def test_banner_names_the_server_the_workspace_and_the_count() -> None:
@@ -165,14 +165,14 @@ def test_every_resolved_credential_is_announced_before_the_first_test() -> None:
     stdout = _collect(
         [],
         {
-            "HYPHA_TOKEN": _fake_jwt("ws-user-test|1"),
+            "HYPHA_TOKEN": _fake_jwt("test-workspace"),
             # The model-runner gate prefers this one, so a run can reach
             # production even with HYPHA_TOKEN scoped somewhere harmless.
             "BIOIMAGE_IO_TOKEN": _fake_jwt("bioimage-io"),
         },
     )
     assert "live cluster credentials resolved" in stdout
-    assert "HYPHA_TOKEN -> workspace ws-user-test|1" in stdout
+    assert "HYPHA_TOKEN -> workspace test-workspace" in stdout
     assert "BIOIMAGE_IO_TOKEN -> workspace bioimage-io" in stdout
     assert HYPHA_SERVER_URL in stdout
     assert "25 collected test(s) can reach" in stdout
