@@ -4247,7 +4247,7 @@ class AppsManager:
         self,
         application_ids: Optional[List[str]] = Field(
             None,
-            description="List of application IDs to retrieve status for. If not provided, status for all deployed applications will be returned. If a list with only one application ID is provided, only that application's status is returned directly (not nested in a dictionary).",
+            description="List of application IDs to retrieve status for. If not provided, status for all deployed applications will be returned. The result is always a dictionary keyed by application id, including when exactly one id is requested, so a caller never has to branch on how many it asked for.",
         ),
         logs_tail: int = Field(
             30,
@@ -4304,15 +4304,112 @@ class AppsManager:
         Args:
             application_ids: Optional list of specific application IDs to query.
                            If None, returns status for all tracked applications.
-                           If a list with exactly one application ID, returns only
-                           that application's status directly (not wrapped in a dictionary).
 
         Returns:
-            - If application_ids is None or contains multiple IDs: Dictionary mapping
-              application IDs to their detailed status information.
-            - If application_ids contains exactly one ID: The status information for
-              that single application (not nested in a dictionary).
-            - Empty dictionary if no applications match the criteria (when application_ids is None).
+            Always a dictionary KEYED BY application id, whatever the query — including a
+            query naming exactly one application. Empty when application_ids is None and
+            nothing is deployed.
+
+            The shape does not special-case a single id, so a caller never has to branch on
+            how many it asked for:
+
+                status = await get_app_status(application_ids=["app1"])
+                app = status["app1"]
+
+            Each value has the fields built by ``_get_app_status``. Two of them are nested
+            deeper than the rest and are easy to mis-read:
+
+            ``deployments`` maps the user's ``@bioengine.app`` class name to that
+            deployment's state. Its ``logs`` key is keyed again, mostly by replica id — but
+            NOT every entry is a replica record, and the records do not all carry the same
+            keys. Handle four shapes:
+
+                logs[<replica_id>] = {                    # a live replica
+                    "stdout": list[str], "stderr": list[str],
+                    "creation_timestamp": <epoch float>,  # ONLY when known
+                    "timezone": <tz name, e.g. "CET">,    # ONLY when known
+                }
+                logs[<replica_id>] = {                    # abnormally dead; the DEFAULT
+                    "stdout": [], "stderr": [],           # n_previous_replica=0 shape
+                    "death_cause": ..., "logs_omitted": True,
+                }                                         # no timezone, no timestamp
+                logs["error"] = "<message>"               # retrieval failed: a STRING value
+
+            So a loop over ``logs.items()`` must not assume the value is a record — the
+            ``error`` entry's value is a string — and a record must not be assumed to carry
+            ``timezone``: it is added only when the replica's zone is known, which excludes
+            the error entry and every abnormally dead replica on default arguments. Treating
+            an absent ``timezone`` as UTC is a guess, not a default.
+
+            Two fields live BESIDE ``logs`` rather than inside it, and both are easy to miss.
+            **Both are present only sometimes**, so read them with ``.get`` — indexing either
+            raises on a perfectly healthy deployment. And for the count, **absent never simply
+            means "none"**:
+
+            ``deliberately_stopped_replicas`` is a SUMMARY produced only on the default
+            ``n_previous_replica=0`` path, and only when the death-cause lookup succeeded. So it
+            is absent — while replicas really were stopped deliberately — whenever
+
+              * ``n_previous_replica != 0`` (including a per-deployment override in
+                ``deployment_logs``, which this method's own example uses). On that path the
+                stopped replicas appear as ``logs`` entries carrying ``death_cause`` with
+                reason ``RAY_KILL``, and no count is emitted at all — **but the page is the
+                ``n_previous_replica`` most recently REGISTERED dead replicas, of ANY cause**,
+                and all of them only at ``-1``. Two things follow. Counting ``RAY_KILL``
+                entries does NOT recover the number stopped: a deployment scaled down thirty
+                times, queried with ``n_previous_replica=3``, shows three such entries and no
+                count — the bound is a page size, not a total. And abnormal deaths take up
+                room in that same page, so with ``n_previous_replica=3`` and two recent
+                crashes a single ``RAY_KILL`` entry can be all that is left of thirty stops.
+                "Most recently registered" is also not "most recently dead": Ray's
+                ``ActorState`` carries no death timestamp, so death order is not knowable
+                here at all; or
+              * the death-cause lookup failed, which ``death_causes_unavailable`` marks.
+
+            So read an absent count as **"none, or not counted on this query"**. A caller that
+            reads it as "none stopped" will report a deployment that was scaled down thirty times
+            as having been scaled down never — which is the same mistake as reading an absent
+            ``timezone`` as UTC.
+
+            The two fields themselves, for reference — ``deliberately_stopped_replicas`` as
+            described above, and ``death_causes_unavailable`` set only when the cause lookup
+            FAILED:
+
+                deployments[<class_name>].deliberately_stopped_replicas = <int>
+                deployments[<class_name>].death_causes_unavailable = True
+
+            The first is lifted out of the logs map before this method returns, precisely so a
+            caller iterating ``logs`` never meets an int where it expects a record — the proxy's
+            own ``get_deployment_logs`` does still carry it under
+            ``_deliberately_stopped_replicas``, so a caller of THAT must handle it. The second
+            exists so "no deaths shown" cannot be read as "nothing died": an empty answer and an
+            unanswered question are different, and only this key distinguishes them.
+
+            Be precise about WHAT is missing when it is set, because the plausible reading is the
+            wrong one. On the default path the lookup failure returns **before** anything is
+            counted or listed, so the dead replicas are **absent from** ``logs`` **altogether** —
+            they are not present-but-unexplained. A reader who takes the flag to mean "shown
+            without a reason" goes looking for entries that were never emitted, and concludes the
+            deployment had no dead replicas.
+
+            **AND NONE OF THE THREE REACHES AN UNAUTHORIZED CALLER AT ALL.** For a caller outside
+            the application's roster, ``public_app_status`` keeps only
+            ``PUBLIC_DEPLOYMENT_FIELDS`` — ``status``, ``message``, ``replica_states``,
+            ``replicas``, ``max_ongoing_requests`` — so ``logs``,
+            ``deliberately_stopped_replicas`` and ``death_causes_unavailable`` are **absent**.
+            There their absence means WITHHELD: not "zero", not "no deaths", not "nothing to
+            show". A client that cannot tell those apart reports a healthy application as having
+            no logs and no stopped replicas when it simply was not entitled to see them. Check
+            whether you are an admin or named in ``authorized_users`` before reading an absence
+            as a value.
+
+            When ``timezone`` IS present it names the zone of the timestamps INSIDE the
+            ``stdout``/``stderr`` text — the replica's local zone, not necessarily UTC.
+            Comparing those against a UTC clock without applying it shifts every line by the
+            offset; which way depends on the offset's sign, and for a zone ahead of UTC the
+            lines land in the future, so an "age" computed from them can come out negative.
+            ``creation_timestamp``, when present, is a plain epoch value and is the field to
+            prefer for arithmetic.
 
         Raises:
             RuntimeError: If Ray cluster connection is unavailable
@@ -4331,9 +4428,25 @@ class AppsManager:
             apps = await get_app_status(application_ids=["app1", "app2"])
             # Returns: {"app1": {...}, "app2": {...}}
 
-            # Get single application (returns status directly)
-            app = await get_app_status(application_ids=["app1"])
-            # Returns: {...} (single app status, not {"app1": {...}})
+            # Get a single application — STILL keyed by its id, not unwrapped
+            status = await get_app_status(application_ids=["app1"])
+            # Returns: {"app1": {...}}
+            app = status["app1"]
+
+            # Replica logs are two levels below the deployment. Not every entry is a
+            # record, and a record need not carry a zone — so check both.
+            logs = app["deployments"]["MyApp"]["logs"]
+            if isinstance(logs.get("error"), str):
+                ...                                   # retrieval failed; no replicas here
+            for replica_id, rec in logs.items():
+                if not isinstance(rec, dict):
+                    continue                          # the "error" entry's value is a string
+                lines = rec.get("stdout", []) + rec.get("stderr", [])
+                zone = rec.get("timezone")            # may be absent; do NOT assume UTC
+
+            # the counts are SIBLINGS of logs, not entries in it
+            dep = app["deployments"]["MyApp"]
+            dep.get("deliberately_stopped_replicas"), dep.get("death_causes_unavailable")
         """
         _validate_deployment_logs_map(deployment_logs)
 
