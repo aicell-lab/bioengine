@@ -495,3 +495,67 @@ async def test_an_explicit_redeploy_after_a_give_up_is_retried_again(clock) -> N
     assert _status_field(manager) is None, (
         "the fresh deploy is already marked exhausted"
     )
+
+
+# ── the give-up message must describe what actually happened ────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_give_up_on_SKIPPED_attempts_does_not_claim_redeploys_failed(
+    clock, caplog
+) -> None:
+    """An app recovered from a previous worker carries no built application.
+
+    `_fire_redeploy` then logs "skipping auto-redeploy" and starts nothing — but
+    the attempt is still counted against the cap. The give-up line therefore used
+    to announce "10 consecutive auto-redeploys all failed" for a case where none
+    ran, which is a false statement about the one record an operator reads. It
+    matters more now that the default is on, because every recovered app reaches
+    this path.
+    """
+    manager = _make_manager()
+    # What a recovered app looks like to the monitor: no built_app.
+    manager._deployed_applications[APP_ID]["built_app"] = None
+
+    with caplog.at_level(logging.INFO, logger="test.giveup"):
+        for _ in range(_REDEPLOY_MAX_ATTEMPTS * 2):
+            await _tick(manager, "DEPLOY_FAILED")
+            clock.advance_past_the_backoff()
+
+    # CONTROL: nothing may actually have been deployed, or the arm is testing
+    # the wrong path entirely.
+    manager._deploy_application.assert_not_awaited()
+    assert any("skipping auto-redeploy" in r.getMessage() for r in caplog.records), (
+        "the skip path was never taken, so this arm says nothing about it"
+    )
+
+    errors = _errors(caplog)
+    assert len(errors) == 1, f"expected one give-up line, got {len(errors)}"
+    assert "could not run at all" in errors[0], errors[0]
+    assert "auto-redeploys all failed" not in errors[0], (
+        "the give-up still claims redeploys failed when none ever ran: " + errors[0]
+    )
+    assert "recovered from a previous worker" in errors[0], (
+        "the line does not say WHY nothing ran, so an operator cannot act on it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_give_up_on_REAL_failures_still_says_they_failed(clock, caplog) -> None:
+    """The control for the arm above.
+
+    Without it, a message that said "could not run" for every give-up would pass
+    — and that is the opposite error, hiding genuine deploy failures behind a
+    wording meant for a different case.
+    """
+    manager = _make_manager()
+
+    with caplog.at_level(logging.ERROR, logger="test.giveup"):
+        for _ in range(_REDEPLOY_MAX_ATTEMPTS * 2):
+            await _tick(manager, "DEPLOY_FAILED")
+            clock.advance_past_the_backoff()
+
+    errors = _errors(caplog)
+    assert len(errors) == 1
+    assert "auto-redeploys all failed" in errors[0], errors[0]
+    assert "could not run" not in errors[0], errors[0]
