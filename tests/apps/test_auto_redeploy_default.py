@@ -2,8 +2,8 @@
 
 A sub-minute Hypha outage permanently kills a replica that is still STARTING,
 while one already RUNNING rides it out. So the app that dies is the one nobody
-is watching yet, and it stays dead until a human notices — the row this came
-This was observed in production as a 19-hour outage of that exact shape.
+is watching yet, and it stays dead until a human notices. This was observed in
+production as a 19-hour outage of that exact shape.
 
 Defaulting it on used to be a trade: a dead app for indefinite retries. It is
 not any more, because attempts are bounded and the worker reports
@@ -123,10 +123,9 @@ def test_an_app_whose_UNDEPLOY_FAILED_is_still_forced_OFF():
 
 
 def test_the_bound_this_default_depends_on_EXISTS():
-    """THE PRECONDITION. This default is only safe together with, or after,
-    after the retry bound. Without the bound, defaulting on means every broken
-    app retries forever — which is the objection the decision rested on being
-    answered."""
+    """THE PRECONDITION. This default is only safe together with, or after, the
+    retry bound. Without the bound, defaulting on means every broken app
+    retries forever, which is the one real objection to turning it on."""
     src = inspect.getsource(manager_mod)
     assert "_REDEPLOY_MAX_ATTEMPTS" in src, "the attempt bound is absent"
     assert "auto_redeploy_exhausted_at" in src, "the give-up marker is absent"
@@ -232,31 +231,106 @@ def test_the_UPDATE_path_INHERITS_and_an_explicit_value_SURVIVES_it():
     )
 
 
-def test_EVERY_assignment_to_auto_redeploy_in_deploy_app_is_BEHIND_a_None_guard():
-    """Allow-list, not a blacklist. This is what kills the override mutant.
+def _auto_redeploy_stores(scope):
+    """Every node that WRITES the name ``auto_redeploy`` anywhere in ``scope``.
 
-    An unconditional `auto_redeploy = True` anywhere in deploy_app overrides an explicit False, and
-    no execution of the guarded blocks can see it. So: enumerate every assignment to the name and
-    require each to sit inside an `if auto_redeploy is None:` block.
+    Keyed on the Name node's context being a Store, NOT on the statement's type. That choice is
+    what makes this an allow-list rather than a list of shapes somebody thought of: one predicate
+    covers plain assignment, a tuple or list target (``auto_redeploy, _ = True, None``), an
+    annotated assignment (``auto_redeploy: bool = True``), an augmented assignment, a walrus
+    (``(auto_redeploy := True)``), a ``for`` target, a ``with ... as`` target and a comprehension
+    target, because every one of them puts a Store-context Name in the tree.
+
+    An earlier version of this helper matched ``ast.Assign`` with ``ast.Name`` targets. Two
+    one-line mutants beat it while every test stayed green: a tuple target, because the target is
+    then a Tuple and not a Name, and an annotated assignment, because that is an AnnAssign and
+    never an Assign at all. Both override an explicit ``auto_redeploy=False``.
+
+    ``except ... as auto_redeploy`` is covered separately: it carries the name as a plain string
+    on the handler, with no Name node to find.
+    """
+    stores = [
+        n for n in ast.walk(scope)
+        if isinstance(n, ast.Name) and n.id == "auto_redeploy"
+        and isinstance(n.ctx, ast.Store)
+    ]
+    stores += [
+        n for n in ast.walk(scope)
+        if isinstance(n, ast.ExceptHandler) and n.name == "auto_redeploy"
+    ]
+    return stores
+
+
+def test_EVERY_write_of_auto_redeploy_in_deploy_app_is_BEHIND_a_None_guard():
+    """Allow-list, not a blacklist. This is what kills the override mutants.
+
+    An unconditional write to ``auto_redeploy`` anywhere in deploy_app overrides an explicit
+    False, and no execution of the guarded blocks can see it. So: enumerate every WRITE of the
+    name, in any syntactic form, and require each to sit inside an ``if auto_redeploy is None:``
+    block. Identity, not line number — two writes can share a line.
     """
     fn = _deploy_app_fn()
-    guarded = set()
-    for node, _ in _auto_redeploy_guards(fn):
-        for n in ast.walk(node):
-            if isinstance(n, ast.Assign) and any(
-                isinstance(x, ast.Name) and x.id == "auto_redeploy" for x in n.targets
-            ):
-                guarded.add(n.lineno)
-    all_assigns = [
-        n.lineno for n in ast.walk(fn)
-        if isinstance(n, ast.Assign)
-        and any(isinstance(x, ast.Name) and x.id == "auto_redeploy" for x in n.targets)
-    ]
-    assert all_assigns, "deploy_app assigns auto_redeploy nowhere -- this arm would be vacuous"
-    unguarded = sorted(set(all_assigns) - guarded)
+    guarded = {id(n) for node, _ in _auto_redeploy_guards(fn)
+               for n in _auto_redeploy_stores(node)}
+    all_stores = _auto_redeploy_stores(fn)
+    assert all_stores, "deploy_app writes auto_redeploy nowhere -- this arm would be vacuous"
+    unguarded = sorted(n.lineno for n in all_stores if id(n) not in guarded)
     assert not unguarded, (
-        f"deploy_app assigns auto_redeploy outside an `is None` guard at line(s) {unguarded}; "
-        "such an assignment overrides an explicit auto_redeploy=False"
+        f"deploy_app writes auto_redeploy outside an `is None` guard at line(s) {unguarded}; "
+        "such a write overrides an explicit auto_redeploy=False"
+    )
+
+
+def test_the_guard_finder_SEES_every_write_form_a_mutant_could_use():
+    """Guards the guard. If `_auto_redeploy_stores` stopped seeing a form, the arm above would
+    pass for a mutant using it -- the failure that produced this test. So assert the finder
+    counts a write in each form, on synthetic source rather than on production code."""
+    forms = {
+        "plain": "auto_redeploy = True",
+        "tuple": "auto_redeploy, _ = True, None",
+        "list": "[auto_redeploy, _] = [True, None]",
+        "annotated": "auto_redeploy: bool = True",
+        "augmented": "auto_redeploy += 1",
+        "walrus": "x = (auto_redeploy := True)",
+        "for-target": "for auto_redeploy in [True]:\n    pass",
+        "with-target": "with open('/dev/null') as auto_redeploy:\n    pass",
+        "comprehension": "y = [auto_redeploy for auto_redeploy in [True]]",
+        "except-as": "try:\n    pass\nexcept ValueError as auto_redeploy:\n    pass",
+    }
+    missed = [name for name, src in forms.items()
+              if not _auto_redeploy_stores(ast.parse(textwrap.dedent(src)))]
+    assert not missed, (
+        f"_auto_redeploy_stores does not see these write forms: {missed}; a mutant using one "
+        "would pass the allow-list above"
+    )
+    # Negative control: a READ must not be counted, or every guard test becomes vacuous.
+    assert not _auto_redeploy_stores(ast.parse("if auto_redeploy is None:\n    pass")), (
+        "a READ of auto_redeploy is being counted as a write"
+    )
+
+
+def test_EVERY_auto_redeploy_ARGUMENT_deploy_app_passes_ON_is_the_resolved_VARIABLE():
+    """The builder call, which is what an adopted app is rebuilt from after a worker restart.
+
+    The resolved value has to reach the built application, not just the status record. A constant
+    at that call site passes every test above: the record keeps the caller's False while the built
+    app carries True, so an opted-out app comes back redeploying after a restart. Require every
+    `auto_redeploy=` keyword in every call inside deploy_app to pass the NAME.
+    """
+    fn = _deploy_app_fn()
+    kwargs = [
+        (kw, call) for call in ast.walk(fn) if isinstance(call, ast.Call)
+        for kw in call.keywords if kw.arg == "auto_redeploy"
+    ]
+    assert kwargs, (
+        "deploy_app passes auto_redeploy on to nothing -- this arm would be vacuous, and the "
+        "builder call it is written for has moved"
+    )
+    bad = [(kw.value.lineno, type(kw.value).__name__) for kw, _ in kwargs
+           if not (isinstance(kw.value, ast.Name) and kw.value.id == "auto_redeploy")]
+    assert not bad, (
+        f"deploy_app passes auto_redeploy on as {bad} rather than the resolved variable; "
+        "a constant there survives a restart and redeploys an app that opted out"
     )
 
 
