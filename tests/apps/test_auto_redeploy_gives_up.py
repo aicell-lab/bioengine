@@ -322,31 +322,151 @@ async def test_a_flapping_app_never_accumulates_its_way_to_a_give_up(clock) -> N
 # ── the give-up is readable from the status surface, not only the log ────────
 
 
-@pytest.mark.asyncio
-async def test_the_give_up_is_reported_on_the_apps_status(clock) -> None:
-    """A log line is not an API. A watcher reads status, not stdout.
+def _status_app_info(*, exhausted_at=None) -> dict:
+    """A reference-dict entry with every key `_get_app_status` reads.
 
-    `auto_redeploy_exhausted_at` is the only thing that distinguishes "failed,
-    retry due in nine minutes" from "failed, nothing will ever retry this
-    again" — and conflating those is exactly what hid a dead app for 19 hours.
+    Shaped after the fixture the sibling status tests use, so this arm CALLS the
+    status builder instead of reading its source.
+    """
+    ev = asyncio.Event()
+    ev.set()
+    info = {
+        "is_deployed": ev,
+        "display_name": "Flaky",
+        "description": "throwaway",
+        "artifact_id": "bioimage-io/flaky",
+        "version": VERSION,
+        "recovered_app": False,
+        "application_kwargs": {},
+        "application_env_vars": {},
+        "disable_gpu": False,
+        "application_resources": {},
+        "authorized_users": ["*"],
+        "available_methods": ["ping"],
+        "max_ongoing_requests": 1,
+        "scaling": {},
+        "static_site_url": None,
+        "started_at": 1_700_000_000.0,
+        "last_updated_at": 1_700_000_000.0,
+        "last_updated_by": "user@example.com",
+        "auto_redeploy": True,
+        "deployed_by_worker_client_id": "worker-abc",
+        "proxy_service_token_issued_at": None,
+        "proxy_service_token_ttl_seconds": None,
+    }
+    if exhausted_at is not None:
+        info["auto_redeploy_exhausted_at"] = exhausted_at
+    return info
+
+
+def _status_manager(app_id: str, info: dict) -> AppsManager:
+    manager = object.__new__(AppsManager)
+    manager.logger = logging.getLogger("test.giveup")
+    manager._deployed_applications = {app_id: info}
+    manager.startup_applications = []
+    rc = MagicMock()
+    rc.proxy_actor_handle.get_deployment_replicas.remote = AsyncMock(return_value={})
+    manager.ray_cluster = rc
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_the_give_up_IS_IN_the_status_payload_a_caller_receives() -> None:
+    """The published field, read off the RETURNED dict rather than off the source.
+
+    The first version of this arm asserted `"auto_redeploy_exhausted_at" in
+    inspect.getsource(_get_app_status)`. That survives a version which mentions
+    the key and always reports None — a source-text guard tests the spelling you
+    pictured, not the behaviour, and review caught exactly that.
+    """
+    app_id = "flaky-status"
+    manager = _status_manager(app_id, _status_app_info(exhausted_at=1795221171.0))
+
+    status = await manager._get_app_status(
+        application_id=app_id,
+        instance_details={"applications": {}},
+        n_previous_replica=0,
+        logs_tail=30,
+    )
+
+    assert "auto_redeploy_exhausted_at" in status, (
+        "the key is absent from the payload, so no caller can see the give-up"
+    )
+    assert status["auto_redeploy_exhausted_at"] == 1795221171.0, (
+        f"the payload reports {status['auto_redeploy_exhausted_at']!r} instead of the "
+        f"recorded give-up time — a version that always reports None passes a "
+        f"presence check and tells every caller the app is still being retried"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_app_that_never_gave_up_reports_None_rather_than_absent() -> None:
+    """The control for the arm above, and a statement about the contract.
+
+    Without it, a payload that hard-coded the give-up time would pass. And the
+    distinction matters to a consumer: an ABSENT key means "this worker cannot
+    say", a None means "this app has not been abandoned", and `.get()` cannot
+    tell them apart.
+    """
+    app_id = "flaky-status-ok"
+    manager = _status_manager(app_id, _status_app_info(exhausted_at=None))
+
+    status = await manager._get_app_status(
+        application_id=app_id,
+        instance_details={"applications": {}},
+        n_previous_replica=0,
+        logs_tail=30,
+    )
+
+    assert status.get("auto_redeploy_exhausted_at", "<ABSENT>") is None, (
+        f"expected an explicit None, got "
+        f"{status.get('auto_redeploy_exhausted_at', '<ABSENT>')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_app_can_be_given_up_on_AGAIN(clock) -> None:
+    """give up -> recover -> give up again, which nothing covered.
+
+    The RUNNING branch pops `auto_redeploy_exhausted_at`. Removing that pop left
+    11/11 green: every arm either gave up once or recovered once, so no arm ever
+    observed a marker that should have been cleared. A stale marker means a
+    healthy app reports as permanently abandoned, and an app revived by any route
+    can never be given up on a second time with a truthful count.
     """
     manager = _make_manager()
+
+    # 1 — give up.
     for _ in range(_REDEPLOY_MAX_ATTEMPTS * 2):
         await _tick(manager, "DEPLOY_FAILED")
         clock.advance_past_the_backoff()
+    first = _status_field(manager)
+    assert first is not None, "the arm needs a give-up to have happened"
 
-    gave_up_at = _status_field(manager)
-    assert gave_up_at is not None
-
-    import inspect
-
-    src = inspect.getsource(AppsManager._get_app_status)
-    assert "auto_redeploy_exhausted_at" in src, (
-        "the give-up timestamp exists internally but _get_app_status does not "
-        "publish it, so no caller can see it"
+    # 2 — recover. This is where the pop lives.
+    await _tick(manager, "RUNNING")
+    assert _status_field(manager) is None, (
+        "recovery left the give-up marker in place, so this app now reports as "
+        "abandoned while it is RUNNING"
     )
-    # Scoped to that one method: a module-wide grep would pass against a version
-    # that mentions the key anywhere else and never reports it.
+    assert APP_ID not in manager._redeploy_backoff
+
+    # 3 — and it must be able to give up AGAIN, with a fresh budget.
+    manager._deploy_application.reset_mock()
+    clock.advance_past_the_backoff()
+    for _ in range(_REDEPLOY_MAX_ATTEMPTS * 2):
+        await _tick(manager, "DEPLOY_FAILED")
+        clock.advance_past_the_backoff()
+    second = _status_field(manager)
+    assert second is not None, "the recovered app could not be given up on again"
+    assert second != first, (
+        "the second give-up reports the FIRST give-up's timestamp, so the marker "
+        "was never actually cleared"
+    )
+    assert manager._deploy_application.await_count == _REDEPLOY_MAX_ATTEMPTS, (
+        f"the second round fired {manager._deploy_application.await_count} "
+        f"redeploys, not a fresh budget of {_REDEPLOY_MAX_ATTEMPTS}"
+    )
 
 
 # ── the startup retry loop's bound ──────────────────────────────────────────
