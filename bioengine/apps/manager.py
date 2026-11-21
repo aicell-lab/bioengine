@@ -3834,9 +3834,10 @@ class AppsManager:
                     # TRUE by default. A sub-minute Hypha outage permanently kills
                     # a replica that is still STARTING, while one already RUNNING
                     # rides it out — so the app that dies is the one nobody is
-                    # watching yet, and it stays dead until a human notices. The
-                    # row this came from was filed on a 19-hour outage of exactly
-                    # that shape.
+                    # watching yet, and it stays dead until a human notices.
+                    # Observed in production as a 19-hour outage of exactly that
+                    # shape: a replica died during a brief platform gap and
+                    # nothing brought it back.
                     #
                     # Defaulting this on used to mean trading a dead app for
                     # indefinite retries. It no longer does: attempts are bounded

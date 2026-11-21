@@ -3,7 +3,7 @@
 A sub-minute Hypha outage permanently kills a replica that is still STARTING,
 while one already RUNNING rides it out. So the app that dies is the one nobody
 is watching yet, and it stays dead until a human notices — the row this came
-from was filed on a 19-hour outage of that exact shape.
+This was observed in production as a 19-hour outage of that exact shape.
 
 Defaulting it on used to be a trade: a dead app for indefinite retries. It is
 not any more, because attempts are bounded and the worker reports
@@ -123,7 +123,7 @@ def test_an_app_whose_UNDEPLOY_FAILED_is_still_forced_OFF():
 
 
 def test_the_bound_this_default_depends_on_EXISTS():
-    """THE PRECONDITION. The ruling allows this default only together with or
+    """THE PRECONDITION. This default is only safe together with, or after,
     after the retry bound. Without the bound, defaulting on means every broken
     app retries forever — which is the objection the decision rested on being
     answered."""
@@ -144,10 +144,10 @@ def test_the_schema_a_caller_reads_says_TRUE():
 
 
 def test_startup_applications_inherit_the_default_rather_than_setting_their_own():
-    """The ruling covers --startup-applications entries explicitly. They are
+    """--startup-applications entries are covered deliberately. They are
     covered BY the fresh-deploy default: the startup path forwards its config
     to deploy_app without naming auto_redeploy. If that ever changes, this
-    default stops reaching them and the ruling is only half implemented."""
+    default stops reaching them and only half of this change is in effect."""
     src = inspect.getsource(AppsManager.deploy_startup_applications)
     assert "auto_redeploy" not in src, (
         "the startup path now sets auto_redeploy itself, so it no longer "
@@ -157,7 +157,7 @@ def test_startup_applications_inherit_the_default_rather_than_setting_their_own(
 
 # ─────────────────── behavioural: the decision is EXECUTED ───────────────────
 #
-# Review round 1 showed every arm above to be a source-text or AST assertion, and defeated them
+# Every arm above is a source-text or AST assertion, and two one-line mutants defeat them
 # with two one-line mutants that both passed 8/8:
 #   M1  an unconditional `auto_redeploy = True` after the guard, so an explicit False is overridden
 #   M2  storing `"auto_redeploy": False` in the deployed-app record whatever the argument said
