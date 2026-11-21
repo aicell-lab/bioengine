@@ -4384,6 +4384,13 @@ class AppsManager:
             exists so "no deaths shown" cannot be read as "nothing died": an empty answer and an
             unanswered question are different, and only this key distinguishes them.
 
+            Be precise about WHAT is missing when it is set, because the plausible reading is the
+            wrong one. On the default path the lookup failure returns **before** anything is
+            counted or listed, so the dead replicas are **absent from** ``logs`` **altogether** —
+            they are not present-but-unexplained. A reader who takes the flag to mean "shown
+            without a reason" goes looking for entries that were never emitted, and concludes the
+            deployment had no dead replicas.
+
             **AND NONE OF THE THREE REACHES AN UNAUTHORIZED CALLER AT ALL.** For a caller outside
             the application's roster, ``public_app_status`` keeps only
             ``PUBLIC_DEPLOYMENT_FIELDS`` — ``status``, ``message``, ``replica_states``,

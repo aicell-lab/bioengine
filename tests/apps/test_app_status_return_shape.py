@@ -621,3 +621,52 @@ def test_the_docstring_says_the_listing_is_BOUNDED_not_a_total():
     assert "most recent" in doc, (
         "the docstring does not say WHICH of the stopped replicas are listed"
     )
+
+
+def test_a_failed_cause_lookup_OMITS_the_dead_replicas_rather_than_listing_them_unexplained():
+    """`death_causes_unavailable` means the dead replicas are MISSING, not unexplained.
+
+    The plausible reading — "shown without a reason" — sends a consumer looking for entries that
+    were never emitted, and it then concludes the deployment had no dead replicas. The failure
+    returns before anything is counted or listed, so on the default path the dead replica is
+    absent from `logs` altogether.
+
+    Driven through the real ProxyActor, with a successful lookup on the same input as the
+    control: without it, "absent" could just mean the fixture had no dead replica.
+    """
+    from tests.test_replica_death_cause import _RAY_KILL, _deployment_actor
+
+    registered = {"stopped1": ("a_stopped1", 2.0, "UTC"), "live1": ("a_live", 1.0, "UTC")}
+    causes = {"a_stopped1": _RAY_KILL}
+
+    failed = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(
+        application_id="soup", deployment_name="CellposeRuntime", death_cause_query_failed=True
+    )
+    assert "stopped1" not in failed, (
+        f"the dead replica was listed despite the cause lookup having failed, so 'absent from "
+        f"logs altogether' is wrong: {sorted(failed)}"
+    )
+    assert "_deliberately_stopped_replicas" not in failed, (
+        "a count was produced despite the failed lookup"
+    )
+
+    # CONTROL: the same input with a WORKING lookup must say something about that replica,
+    # otherwise the absence above is a property of the fixture rather than of the failure.
+    ok = _deployment_actor(
+        death_causes=causes, alive={"live1": "a_live"}, registered=registered
+    ).get_deployment_logs(application_id="soup", deployment_name="CellposeRuntime")
+    assert ok.get("_deliberately_stopped_replicas") == 1, (
+        f"the control run produced no count, so this arm cannot attribute the absence to the "
+        f"lookup failure: {sorted(ok)}"
+    )
+
+
+def test_the_docstring_says_WHAT_is_missing_when_the_lookup_failed():
+    doc = " ".join((manager_mod.AppsManager.get_app_status.__doc__ or "").split())
+    assert "absent from" in doc and "altogether" in doc, (
+        "the docstring does not say the dead replicas are absent from logs when the cause lookup "
+        "failed, so a reader assumes they are listed without a reason and hunts for cards that "
+        "were never emitted"
+    )
