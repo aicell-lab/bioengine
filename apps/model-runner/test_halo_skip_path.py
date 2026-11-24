@@ -598,3 +598,128 @@ def test_a_fixed_non_cellpose_model_that_does_not_fit_goes_to_BLOCKING() -> None
         "the fixed-extent branch still calls the padding path. Branch body:\n%s"
         % link[:500]
     )
+
+
+# --- round 3 finding D: pin the chain's CONDITIONS, not just its bodies ------
+#
+# Rounds 1, 2 and 3 each refused a version of the same gap: the tests pinned
+# where code sat rather than what it decides. Finding D is that gap one level
+# over -- the new fixed-extent branch was located by its BODY (the
+# _fixed_extent_too_small call) and its TEST was never read, so all three of
+#     elif False:
+#     elif not _all_space_axes_fixed(...):
+#     elif cellpose and _all_space_axes_fixed(...):
+# were GREEN 25/25 while a 512x512 input to a fixed-256 model fell to the final
+# else, got padded to 576 and was refused -- the outcome body DONE WHEN 2
+# forbids.
+#
+# So stop asserting shapes. Evaluate the chain's real conditions against
+# synthetic states and assert WHICH BRANCH each state reaches.
+
+
+def _dispatch_chain():
+    """The (condition_source, branch_label) pairs of the real dispatch chain."""
+    target = None
+    for node in ast.walk(ast.parse(SCRIPT)):
+        if isinstance(node, ast.If):
+            src = ast.get_source_segment(SCRIPT, node) or ""
+            if "default_blocksize_parameter" in src and "predict_sample" in src:
+                target = node
+                break
+    assert target is not None, "could not find the dispatch chain"
+
+    def label(stmts) -> str:
+        body = "\n".join((ast.get_source_segment(SCRIPT, s) or "") for s in stmts)
+        if "skip_input_padding" in body:
+            return "skip-padding"
+        if "_block_size_ns" in body:
+            return "cellpose-blocking"
+        if "_fixed_extent_too_small" in body:
+            return "fixed-blocking"
+        if "predict_sample_with_blocking" in body:
+            return "blocksize-blocking"
+        if "predict_sample_without_blocking" in body:
+            return "final-else"
+        return "unknown"
+
+    links: List[Any] = []
+    node = target
+    while True:
+        links.append((ast.get_source_segment(SCRIPT, node.test) or "", label(node.body)))
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+            node = node.orelse[0]
+            continue
+        if node.orelse:
+            links.append((None, label(node.orelse)))
+        break
+    return links
+
+
+def _selected_branch(cellpose: bool, fits: bool, all_fixed: bool,
+                     blocksize: Any = None) -> str:
+    """Evaluate the REAL conditions in order; return the branch that fires."""
+    env: Dict[str, Any] = {
+        "cellpose": cellpose,
+        "default_blocksize_parameter": blocksize,
+        "_fits_whole": lambda *a, **k: fits,
+        "_all_space_axes_fixed": lambda *a, **k: all_fixed,
+        "pipeline": type("P", (), {"model_description": object()})(),
+        "sample": object(),
+    }
+    for cond, branch in _dispatch_chain():
+        if cond is None:          # the final else
+            return branch
+        if eval(cond, dict(env)):  # noqa: S307 - the condition is our own source
+            return branch
+    return "none"
+
+
+def test_the_dispatch_chain_is_the_shape_we_think() -> None:
+    """Control: without this, a chain that lost a branch would still 'pass' the
+    table below by routing everything somewhere plausible."""
+    labels = [b for _, b in _dispatch_chain()]
+    assert labels[0] == "blocksize-blocking", labels
+    assert "skip-padding" in labels, labels
+    assert "cellpose-blocking" in labels, labels
+    assert "fixed-blocking" in labels, labels
+    assert labels[-1] == "final-else", labels
+    assert "unknown" not in labels, labels
+
+
+def test_a_fixed_non_cellpose_model_at_512_reaches_BLOCKING() -> None:
+    """Body DONE WHEN 2, as a routing requirement.
+
+    RED under all three of finding D's mutations: `elif False`,
+    `elif not _all_space_axes_fixed(...)` and
+    `elif cellpose and _all_space_axes_fixed(...)` each send this state to the
+    final else, where it is padded to 576 and refused.
+    """
+    assert _selected_branch(cellpose=False, fits=False, all_fixed=True) == "fixed-blocking"
+
+
+def test_a_parameterized_non_cellpose_model_at_512_keeps_the_PADDING_path() -> None:
+    """Round 1 finding 2, as a routing requirement: this state must NOT be
+    pulled into the fixed branch. RED under `elif not _all_space_axes_fixed(...)`."""
+    assert _selected_branch(cellpose=False, fits=False, all_fixed=False) == "final-else"
+
+
+def test_a_fixed_CELLPOSE_model_at_512_still_tiles_on_the_cellpose_branch() -> None:
+    """Round 2 finding A: Cellpose-SAM at 512 must reach `elif cellpose:`."""
+    assert _selected_branch(cellpose=True, fits=False, all_fixed=True) == "cellpose-blocking"
+
+
+def test_an_exact_fit_skips_padding_for_both_fixed_and_cellpose() -> None:
+    """The original fix, as a routing requirement."""
+    assert _selected_branch(cellpose=False, fits=True, all_fixed=True) == "skip-padding"
+    assert _selected_branch(cellpose=True, fits=True, all_fixed=False) == "skip-padding"
+
+
+def test_a_parameterized_model_that_fits_does_NOT_skip_padding() -> None:
+    """Round 1 finding 2's core: fits-whole alone must not reach the skip."""
+    assert _selected_branch(cellpose=False, fits=True, all_fixed=False) == "final-else"
+
+
+def test_an_explicit_blocksize_wins_over_everything() -> None:
+    """The first link must still short-circuit, whatever the other flags say."""
+    assert _selected_branch(cellpose=True, fits=True, all_fixed=True,
+                            blocksize=16) == "blocksize-blocking"
