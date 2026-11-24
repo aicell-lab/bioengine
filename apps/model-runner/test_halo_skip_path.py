@@ -409,15 +409,11 @@ def test_a_non_space_axis_is_ignored_by_the_predicate() -> None:
     assert fits_whole(with_channel, _sample(256, 256)) is True
 
 
-# --- review round 1, findings 1 and 2: the two cases the broad fix got wrong --
+# --- the two cases the broad fix got wrong, and the one round 2 refused ------
 
 
 def _load_fn(name: str, dino_block_size: int = 384):
-    """Exec one named top-level def out of the REAL shipped source, with stubs.
-
-    Same contract as ``_load_fits_whole``: never a copy of the function, so the
-    test cannot keep passing after the shipped code changes underneath it.
-    """
+    """Exec one named top-level def out of the REAL shipped source, with stubs."""
     tree = ast.parse(SCRIPT)
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
@@ -445,7 +441,7 @@ def _param_descr(min_: int = 64, step: int = 16) -> _Descr:
     ])])
 
 
-# finding 2 — the predicate that narrows the guard
+# round 1 finding 2 — the predicate that narrows the skip guard
 
 
 def test_all_space_axes_fixed_is_true_for_a_fixed_extent_model() -> None:
@@ -453,14 +449,12 @@ def test_all_space_axes_fixed_is_true_for_a_fixed_extent_model() -> None:
 
 
 def test_all_space_axes_fixed_is_FALSE_for_a_parameterized_model() -> None:
-    """The whole point of finding 2: a parameterized model must keep the padding
-    path, because there the halo is context the model is meant to see and is
-    cropped back off the output."""
+    """A parameterized model must keep the padding path: there the halo is
+    context the model is meant to see and is cropped back off the output."""
     assert _load_fn("_all_space_axes_fixed")(_param_descr()) is False
 
 
 def test_all_space_axes_fixed_ignores_non_space_axes() -> None:
-    """A batch or channel axis is not an int extent and must not veto the skip."""
     descr = _Descr([_Input("input0", [
         _Axis("batch", None, axis_type="batch"),
         _Axis("channel", None, axis_type="channel"),
@@ -470,57 +464,137 @@ def test_all_space_axes_fixed_ignores_non_space_axes() -> None:
 
 
 def test_a_mixed_model_with_one_parameterized_axis_is_not_all_fixed() -> None:
-    """Negative control: one non-int axis is enough to keep the padding path."""
     descr = _Descr([_Input("input0", [
         _Axis("y", 256), _Axis("x", _FakeParameterizedSize(64, 16)),
     ])])
     assert _load_fn("_all_space_axes_fixed")(descr) is False
 
 
-# finding 1 — body DONE WHEN 2: a wrong size on a fixed model must be REFUSED
+# round 2 findings A and B — LARGER tiles, only SMALLER is refused
 
 
-def test_a_512_input_to_a_fixed_256_model_is_refused_with_an_actionable_message() -> None:
-    """Body DONE WHEN 2. Before this, a 512 input fell to the padding path and
-    failed as "Input height (576) doesn't match model (256)" — a figure the
-    caller never supplied. The refusal must name the required size, the size
-    that arrived, and why tiling is not the remedy."""
-    msg = _load_fn("_fixed_extent_mismatch")(_fixed_descr(256), _sample(512, 512))
-    assert msg, "a 512x512 input to a fixed-256 model was not refused"
-    assert "256" in msg and "512" in msg, msg
-    assert "tiled" in msg or "tile" in msg, (
-        "the message must say why tiling is not the alternative: every tile "
-        "would be padded by the halo and refused at the same axis. Got: %s" % msg
-    )
-    assert "576" not in msg, (
-        "the message must name what the CALLER supplied, not the padded figure"
-    )
+def test_an_input_LARGER_than_a_fixed_extent_is_NOT_refused() -> None:
+    """Round 2 finding A, the regression that mattered most.
 
-
-def test_an_exactly_sized_input_to_a_fixed_model_is_NOT_refused() -> None:
-    """The control that stops the refusal swallowing the case the fix exists
-    for. Without it, returning a message unconditionally would pass the test
-    above and break every working fixed-extent request."""
-    assert _load_fn("_fixed_extent_mismatch")(_fixed_descr(256), _sample(256, 256)) is None
-
-
-def test_a_parameterized_model_is_never_refused_by_the_fixed_extent_check() -> None:
-    """The check must say nothing about models whose axes are not int extents —
-    those are the blocking path's business, not a refusal."""
-    fn = _load_fn("_fixed_extent_mismatch")
-    assert fn(_param_descr(), _sample(512, 512)) is None
-    assert fn(_param_descr(), _sample(80, 80)) is None
-
-
-def test_the_refusal_runs_BEFORE_the_dispatch_in_the_shipped_source() -> None:
-    """Position is the claim: core must never get the chance to pad.
-
-    A refusal computed after the dispatch would be dead code, and a whole-file
-    grep for the helper name cannot tell the two apart.
+    Refusing any mismatch made Cellpose-SAM — fixed y=256, x=256 — reject every
+    image over 256 px, because the refusal ran before the blocking branch that
+    had always tiled it. And finding B showed the stated reason was false:
+    bioimageio.core carves the halo OUT of the block (block_meta.py:
+    inner_size = block_shape - sum(halo)), so a fixed-256 model is fed 256-px
+    tiles. Larger inputs tile; they must never be refused.
     """
-    call_at = SCRIPT.index("_fixed_extent_mismatch(pipeline.model_description")
-    dispatch_at = SCRIPT.index("if default_blocksize_parameter:")
-    assert call_at < dispatch_at, (
-        "the fixed-extent refusal is evaluated at %d, after the dispatch at %d"
-        % (call_at, dispatch_at)
+    fn = _load_fn("_fixed_extent_too_small")
+    assert fn(_fixed_descr(256), _sample(512, 512)) is None
+    assert fn(_fixed_descr(256), _sample(1024, 1024)) is None
+
+
+def test_an_input_SMALLER_than_a_fixed_extent_IS_refused_with_the_remedy() -> None:
+    """The one direction that genuinely cannot be rescued: nothing to tile up to."""
+    msg = _load_fn("_fixed_extent_too_small")(_fixed_descr(256), _sample(128, 128))
+    assert msg, "a 128x128 input to a fixed-256 model was not refused"
+    assert "256" in msg and "128" in msg, msg
+    assert "576" not in msg, "name what the CALLER supplied, not a padded figure"
+
+
+def test_the_refusal_message_no_longer_claims_a_fixed_model_cannot_be_tiled() -> None:
+    """Round 2 finding B: that sentence was untrue, and acting on it caused A."""
+    msg = _load_fn("_fixed_extent_too_small")(_fixed_descr(256), _sample(128, 128))
+    assert "cannot be tiled" not in msg, msg
+    assert "tiled automatically" in msg or "larger input is tiled" in msg, (
+        "the message should say a larger input IS tiled, so the caller learns "
+        "the real rule rather than a false one. Got: %s" % msg
+    )
+
+
+def test_an_exactly_sized_input_is_NOT_refused() -> None:
+    assert _load_fn("_fixed_extent_too_small")(_fixed_descr(256), _sample(256, 256)) is None
+
+
+def test_a_parameterized_model_is_never_refused_by_the_too_small_check() -> None:
+    fn = _load_fn("_fixed_extent_too_small")
+    assert fn(_param_descr(), _sample(512, 512)) is None
+    assert fn(_param_descr(), _sample(16, 16)) is None
+
+
+# round 2 finding C — the refusal must RAISE, and must sit AFTER the cellpose branch
+
+
+def test_the_refusal_is_reached_only_AFTER_the_cellpose_branch() -> None:
+    """Round 2 finding A, pinned structurally.
+
+    The refusal must NOT run before the dispatch: a Cellpose fixed-extent model
+    with a large input has to reach ``elif cellpose:`` and tile. Goes RED on the
+    round-2 code, where the raise sat above ``if default_blocksize_parameter:``.
+    """
+    # The CALL, not the def. An earlier version of this test used the bare name
+    # and matched `def _fixed_extent_too_small(...)` itself, which of course
+    # sits above the dispatch — a pattern matching the shape I pictured rather
+    # than the thing I meant.
+    CALL = "_fixed_extent_too_small(pipeline.model_description"
+    chain_src = SCRIPT[SCRIPT.index("if default_blocksize_parameter:"):]
+    assert CALL in chain_src, "the too-small check is never called in the dispatch"
+    refusal_at = chain_src.index(CALL)
+    cellpose_at = chain_src.index("elif cellpose:")
+    assert refusal_at > cellpose_at, (
+        "the too-small refusal is evaluated before `elif cellpose:`, so a "
+        "fixed-extent Cellpose model with a large input would be refused "
+        "instead of tiled"
+    )
+    # and nothing may refuse before the dispatch at all
+    before = SCRIPT[: SCRIPT.index("if default_blocksize_parameter:")]
+    assert CALL not in before, (
+        "a refusal before the dispatch bypasses every tiling branch"
+    )
+
+
+def test_the_refusal_actually_RAISES() -> None:
+    """Round 2 finding C, mutation 1: keeping the call and deleting the `raise`
+    passed 21/21, because the old test only checked where the call sat. Pin the
+    raise itself, in the same branch as the call."""
+    tree = ast.parse(SCRIPT)
+    raises: List[ast.Raise] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        src = ast.get_source_segment(SCRIPT, node) or ""
+        if "_fixed_extent_too_small(" in src:
+            raises += [n for n in ast.walk(node) if isinstance(n, ast.Raise)]
+    assert raises, (
+        "no `raise` anywhere in the branch that computes the too-small message: "
+        "the refusal is computed and discarded"
+    )
+
+
+def test_a_fixed_non_cellpose_model_that_does_not_fit_goes_to_BLOCKING() -> None:
+    """Finding A's positive half: larger-than-declared must TILE, not pad.
+
+    Without this branch the input fell to the final `else`, which pads and lets
+    the model refuse the padded size — the original 576 defect, one size up.
+    """
+    # Scope to the ONE chain link whose body holds the refusal, and read only
+    # that link's BODY. An earlier version of this test walked every ast.If and
+    # matched the first whose SOURCE contained the call -- but the outermost If
+    # of an if/elif chain spans the whole chain, so it saw
+    # `predict_sample_with_blocking` from the blocksize and cellpose branches
+    # and passed even when this branch stopped tiling. The mutation that
+    # swapped this branch to predict_sample_without_blocking was GREEN 25/25
+    # against it.
+    link = None
+    for node in ast.walk(ast.parse(SCRIPT)):
+        if not isinstance(node, ast.If):
+            continue
+        body_src = "\n".join(
+            (ast.get_source_segment(SCRIPT, stmt) or "") for stmt in node.body
+        )
+        if "_fixed_extent_too_small(" in body_src:
+            link = body_src
+            break
+    assert link is not None, "no chain link's BODY computes _fixed_extent_too_small"
+    assert "predict_sample_with_blocking" in link, (
+        "the fixed-extent branch does not tile; it must, or a larger input is "
+        "padded and the model refuses the padded size. Branch body:\n%s" % link[:500]
+    )
+    assert "predict_sample_without_blocking" not in link, (
+        "the fixed-extent branch still calls the padding path. Branch body:\n%s"
+        % link[:500]
     )

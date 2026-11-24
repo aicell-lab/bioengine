@@ -233,20 +233,27 @@ def _all_space_axes_fixed(descr):
     return True
 
 
-def _fixed_extent_mismatch(descr, sample):
-    # A sentence naming the remedy when a FIXED-extent model is handed the
-    # wrong size, or None.
+def _fixed_extent_too_small(descr, sample):
+    # A sentence naming the remedy when a FIXED-extent model is handed an input
+    # SMALLER than it declares, or None.
     #
     # NB comments, not a docstring: this whole function lives inside the
     # ``_WARM_CHILD_SCRIPT`` raw string, and a triple-quoted docstring would
     # terminate that string and break runtime.py's own syntax.
     #
-    # Without this the request reaches core, which pads by the declared halo
-    # and lets the model assert on the padded figure -- so a 512x512 input to a
-    # fixed-256 model fails as "Input height (576) doesn't match model (256)",
-    # naming a number the caller never supplied. Tiling is not the alternative:
-    # each 256 block would still be padded to 320 and fail the same way, so a
-    # fixed-extent model that does not match is a refusal, not a blocked run.
+    # ONLY smaller, and the direction is the whole point. An input LARGER than a
+    # fixed extent tiles correctly: bioimageio.core carves the halo OUT of the
+    # block rather than adding it to it (``block_meta.py``: inner_size =
+    # block_shape - sum(halo)), and ``get_io_sample_block_metas`` uses the
+    # model's own fixed axis sizes as the block shape. So a fixed-256 model gets
+    # 256-px tiles, which is exactly how the Cellpose path has always worked.
+    # An earlier version of this helper refused on ANY mismatch and told the
+    # caller a fixed model "cannot be tiled" -- that was false, and acting on it
+    # made Cellpose-SAM refuse every image over 256 px.
+    #
+    # Smaller cannot be rescued the same way: there is no way to tile up to a
+    # size the input does not have, and padding would make the tensor the wrong
+    # size for the model. That case is a refusal.
     for ipt in descr.inputs:
         member = sample.members.get(ipt.id)
         if member is None:
@@ -255,13 +262,13 @@ def _fixed_extent_mismatch(descr, sample):
             if getattr(axis, "type", None) != "space" or not isinstance(axis.size, int):
                 continue
             extent = member.sizes.get(axis.id)
-            if extent is not None and extent != axis.size:
+            if extent is not None and extent < axis.size:
                 return (
                     "this model requires a fixed {axis}={need} and the input has "
-                    "{axis}={got}. It cannot be tiled: every tile would be padded "
-                    "by the declared halo and refused at the same axis. Resize the "
-                    "input to exactly {need} on {axis}, or pick a model whose "
-                    "{axis} axis is parameterized."
+                    "only {axis}={got}. A larger input is tiled automatically, but "
+                    "a smaller one cannot be: there is nothing to tile up to. "
+                    "Resize or pad the input to at least {need} on {axis}, or pick "
+                    "a model whose {axis} axis is parameterized."
                 ).format(axis=axis.id, need=axis.size, got=extent)
     return None
 
@@ -325,9 +332,6 @@ for line in sys.stdin:
             "skip_preprocessing": skip_pre,
             "skip_postprocessing": skip_post,
         }
-        mismatch = _fixed_extent_mismatch(pipeline.model_description, sample)
-        if mismatch:
-            raise ValueError(mismatch)
         if default_blocksize_parameter:
             result = pipeline.predict_sample_with_blocking(sample, **skips)
         elif _fits_whole(pipeline.model_description, sample) and (
@@ -360,11 +364,30 @@ for line in sys.stdin:
                 **skips,
             )
         elif cellpose:
+            # Untouched on purpose. A Cellpose model that does not fit whole has
+            # always tiled here, and that includes a FIXED-extent one such as
+            # Cellpose-SAM: core carves the halo out of the block, so a fixed-256
+            # model is fed 256-px tiles. An earlier version of this change
+            # refused before reaching this branch and so refused every
+            # Cellpose-SAM image over 256 px. A too-small input on this path
+            # still fails inside core rather than with an actionable message;
+            # that is pre-existing and belongs to the small-image row, not here.
             result = pipeline.predict_sample_with_blocking(
                 sample,
                 ns=_block_size_ns(pipeline.model_description, sample),
                 **skips,
             )
+        elif _all_space_axes_fixed(pipeline.model_description):
+            # A non-Cellpose FIXED-extent model whose input does not fit whole.
+            # The two directions are not symmetric:
+            #   - LARGER tiles correctly, for the same reason the Cellpose path
+            #     above does, so send it to blocking instead of letting the
+            #     default path pad it and have the model refuse the padded size.
+            #   - SMALLER cannot be tiled up to a size the input does not have.
+            too_small = _fixed_extent_too_small(pipeline.model_description, sample)
+            if too_small:
+                raise ValueError(too_small)
+            result = pipeline.predict_sample_with_blocking(sample, **skips)
         else:
             result = pipeline.predict_sample_without_blocking(sample, **skips)
         members = {
