@@ -211,6 +211,61 @@ def _fits_whole(descr, sample):
     return True
 
 
+def _all_space_axes_fixed(descr):
+    # True when every space axis of every input declares an INT extent.
+    #
+    # This is the half of ``_fits_whole`` for which skipping the padding is
+    # right. ``_fits_whole`` also accepts a ``ParameterizedSize`` axis that is
+    # on-grid and no larger than ``DINO_BLOCK_SIZE``, and for such a model the
+    # padding is the SPEC'S behaviour and not a defect: core pads by the
+    # declared halo, the model sees that context, and the halo is cropped back
+    # off the output. Skipping both for a parameterized model would hand back
+    # uncropped border pixels the spec marks invalid, changing results for
+    # models that already worked. A fixed extent cannot absorb a halo at all --
+    # the padded tensor is simply the wrong size and the model refuses -- which
+    # is why the two kinds are treated differently.
+    for ipt in descr.inputs:
+        for axis in getattr(ipt, "axes", None) or []:
+            if getattr(axis, "type", None) != "space":
+                continue
+            if not isinstance(axis.size, int):
+                return False
+    return True
+
+
+def _fixed_extent_mismatch(descr, sample):
+    # A sentence naming the remedy when a FIXED-extent model is handed the
+    # wrong size, or None.
+    #
+    # NB comments, not a docstring: this whole function lives inside the
+    # ``_WARM_CHILD_SCRIPT`` raw string, and a triple-quoted docstring would
+    # terminate that string and break runtime.py's own syntax.
+    #
+    # Without this the request reaches core, which pads by the declared halo
+    # and lets the model assert on the padded figure -- so a 512x512 input to a
+    # fixed-256 model fails as "Input height (576) doesn't match model (256)",
+    # naming a number the caller never supplied. Tiling is not the alternative:
+    # each 256 block would still be padded to 320 and fail the same way, so a
+    # fixed-extent model that does not match is a refusal, not a blocked run.
+    for ipt in descr.inputs:
+        member = sample.members.get(ipt.id)
+        if member is None:
+            continue
+        for axis in getattr(ipt, "axes", None) or []:
+            if getattr(axis, "type", None) != "space" or not isinstance(axis.size, int):
+                continue
+            extent = member.sizes.get(axis.id)
+            if extent is not None and extent != axis.size:
+                return (
+                    "this model requires a fixed {axis}={need} and the input has "
+                    "{axis}={got}. It cannot be tiled: every tile would be padded "
+                    "by the declared halo and refused at the same axis. Resize the "
+                    "input to exactly {need} on {axis}, or pick a model whose "
+                    "{axis} axis is parameterized."
+                ).format(axis=axis.id, need=axis.size, got=extent)
+    return None
+
+
 loaded_description = load_model_description(rdf_path)
 # Cellpose models are tile-based with a halo, so a sample that needs tiling
 # must run blocked: a plain unblocked call pads the whole sample by the halo
@@ -270,25 +325,34 @@ for line in sys.stdin:
             "skip_preprocessing": skip_pre,
             "skip_postprocessing": skip_post,
         }
+        mismatch = _fixed_extent_mismatch(pipeline.model_description, sample)
+        if mismatch:
+            raise ValueError(mismatch)
         if default_blocksize_parameter:
             result = pipeline.predict_sample_with_blocking(sample, **skips)
-        elif _fits_whole(pipeline.model_description, sample):
+        elif _fits_whole(pipeline.model_description, sample) and (
+            cellpose or _all_space_axes_fixed(pipeline.model_description)
+        ):
             # Nothing to tile, and the default path would still pad the outer
             # boundary by the declared halo. The skip flags are a matched pair:
             # cropping fires unconditionally and would remove a halo never added.
             #
-            # NOT gated on ``cellpose``, deliberately. ``_fits_whole`` is a
-            # general predicate over the model's declared axes, and the harm is
-            # general too, in two different ways:
+            # The guard is deliberately NARROWER than ``_fits_whole`` alone. It
+            # covers exactly the two cases where padding a sample that already
+            # fits does harm:
             #   - Cellpose segments the padded border into extra cells.
-            #   - A model with FIXED space extents is handed a tensor of the
-            #     wrong size and refuses outright, so the request fails rather
-            #     than degrading. A 256x256 input to a fixed-256 model becomes
-            #     320x320 under a halo of 32 and the model rejects it, which is
-            #     what made such models unreachable from every client.
-            # Gating the skip on Cellpose sent every other fits-whole model down
-            # the ``else`` branch below, which calls predict_sample_without_blocking
-            # WITHOUT these flags and therefore still pads.
+            #   - A FIXED space extent cannot absorb a halo: the padded tensor is
+            #     the wrong size and the model refuses outright, so a 256x256
+            #     input to a fixed-256 model became 320x320 and was rejected,
+            #     which is what made such models unreachable from every client.
+            # It must NOT cover a parameterized non-Cellpose model, even though
+            # ``_fits_whole`` accepts one that is on-grid and <= DINO_BLOCK_SIZE:
+            # there the padding is the spec's own behaviour, the model gets the
+            # halo as context and the halo is cropped back off. Skipping both for
+            # such a model would return uncropped border pixels the spec marks
+            # invalid and would silently change results for models that already
+            # worked. The 384 cut-off inside ``_fits_whole`` is a Cellpose-DINO
+            # block constant and carries no meaning for those models at all.
             result = pipeline.predict_sample_without_blocking(
                 sample,
                 skip_input_padding=True,

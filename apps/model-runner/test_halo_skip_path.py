@@ -47,13 +47,35 @@ Plain pytest: no Ray, no network, no GPU, no bioimageio.
 from __future__ import annotations
 
 import ast
+import pathlib
 from typing import Any, Dict, List, Optional
 
 import pytest
 
-import runtime
 
-SCRIPT: str = runtime._WARM_CHILD_SCRIPT
+def _warm_child_script() -> str:
+    """``runtime._WARM_CHILD_SCRIPT`` read as TEXT, without importing runtime.
+
+    This module's contract above is "no Ray, no network, no GPU, no bioimageio".
+    ``import runtime`` broke that: runtime.py imports bioengine, ray and
+    bioimageio at module scope, so collecting this file ERRORED wherever those
+    are absent — which is every plain checkout, and which reads as the subject
+    failing rather than the harness being short. Parsing the assignment out of
+    the source keeps the stated contract true and keeps the string the SHIPPED
+    one rather than a copy.
+    """
+    source = (pathlib.Path(__file__).resolve().parent / "runtime.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign) and any(
+            getattr(t, "id", "") == "_WARM_CHILD_SCRIPT" for t in node.targets
+        ):
+            value = node.value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                return value.value
+    raise AssertionError("_WARM_CHILD_SCRIPT is not a top-level string assignment")
+
+
+SCRIPT: str = _warm_child_script()
 
 
 # --- locating the one dispatch site -------------------------------------------
@@ -119,19 +141,70 @@ def test_exactly_one_dispatch_site_tests_fits_whole() -> None:
     assert isinstance(_fits_whole_branch(SCRIPT), ast.If)
 
 
-def test_the_fits_whole_guard_is_not_conjoined_with_cellpose() -> None:
-    """The regression itself: the guard must be the predicate alone."""
+def test_a_fixed_extent_model_is_not_gated_behind_cellpose() -> None:
+    """The regression itself — stated as a REQUIREMENT, not as a syntax shape.
+
+    The pre-fix guard was ``cellpose and _fits_whole(...)``, which sent every
+    non-Cellpose model that already fitted down a padding path. What must be
+    true is that a model with FIXED space extents reaches the skip pair without
+    being Cellpose.
+
+    An earlier version of this test asserted ``not isinstance(branch.test,
+    ast.BoolOp)`` — i.e. no conjunct at all. That was wrong twice over: it
+    pinned the syntax rather than the behaviour, and it would have gone RED on
+    the CORRECT narrower guard, which must exclude parameterized non-Cellpose
+    models and therefore needs a conjunct. Review round 1 refused on exactly
+    that. So: assert what the guard must ADMIT and what it must EXCLUDE, and let
+    its shape be whatever expresses that.
+    """
     branch = _fits_whole_branch(SCRIPT)
-    assert not isinstance(branch.test, ast.BoolOp), (
-        "the _fits_whole guard is a boolean combination (%s), so some other "
-        "condition can still send a fits-whole input down a padding path"
-        % (ast.get_source_segment(SCRIPT, branch.test),)
+    src = ast.get_source_segment(SCRIPT, branch.test) or ""
+
+    # It must still consult _fits_whole ...
+    assert "_fits_whole" in src, src
+    # ... and must NOT be reachable only for Cellpose. A bare `cellpose and`
+    # conjunction over the whole test is the defect; `cellpose or <fixed>` is
+    # the admitted narrowing.
+    if isinstance(branch.test, ast.BoolOp):
+        assert isinstance(branch.test.op, ast.And), src
+        # Every conjunct that mentions cellpose must itself be a disjunction,
+        # so cellpose can only ever WIDEN the guard, never be required.
+        for part in branch.test.values:
+            if "cellpose" in _names_in(part):
+                assert isinstance(part, ast.BoolOp) and isinstance(part.op, ast.Or), (
+                    "`cellpose` appears as a required conjunct (%s), which is the "
+                    "pre-fix defect: a non-Cellpose model that already fits would "
+                    "be padded anyway"
+                    % (ast.get_source_segment(SCRIPT, part),)
+                )
+    else:
+        assert "cellpose" not in _names_in(branch.test), src
+
+
+def test_the_guard_excludes_parameterized_non_cellpose_models() -> None:
+    """Review round 1, finding 2: the narrowing is REQUIRED, not optional.
+
+    ``_fits_whole`` also returns True for a ParameterizedSize axis that is
+    on-grid and <= DINO_BLOCK_SIZE. For such a model the padding is the spec's
+    own behaviour — core pads by the halo, the model sees that context, and the
+    halo is cropped back off the output. Skipping both flags there returns
+    uncropped border pixels the spec marks invalid, silently changing results
+    for models that already worked.
+
+    So the guard must consult something beyond ``_fits_whole`` that is false for
+    a parameterized model. Goes RED on the over-broad `elif _fits_whole(...)`
+    alone, which is what round 1 refused.
+    """
+    branch = _fits_whole_branch(SCRIPT)
+    src = ast.get_source_segment(SCRIPT, branch.test) or ""
+    assert "_all_space_axes_fixed" in src or "cellpose" in src, (
+        "the guard is `%s`: nothing in it can distinguish a FIXED extent from a "
+        "parameterized one, so a parameterized non-Cellpose model that fits "
+        "whole would lose its halo context and return invalid border pixels"
+        % src
     )
-    assert isinstance(branch.test, ast.Call)
-    assert "cellpose" not in _names_in(branch.test), (
-        "the _fits_whole guard references `cellpose`, which is the pre-fix "
-        "defect: non-Cellpose models that already fit get padded anyway"
-    )
+    # And the helper it leans on must actually reject a non-int extent.
+    assert "def _all_space_axes_fixed" in SCRIPT, "helper is missing from the script"
 
 
 def test_the_fits_whole_branch_is_reached_before_the_cellpose_branch() -> None:
@@ -334,3 +407,120 @@ def test_a_non_space_axis_is_ignored_by_the_predicate() -> None:
         ]
     )
     assert fits_whole(with_channel, _sample(256, 256)) is True
+
+
+# --- review round 1, findings 1 and 2: the two cases the broad fix got wrong --
+
+
+def _load_fn(name: str, dino_block_size: int = 384):
+    """Exec one named top-level def out of the REAL shipped source, with stubs.
+
+    Same contract as ``_load_fits_whole``: never a copy of the function, so the
+    test cannot keep passing after the shipped code changes underneath it.
+    """
+    tree = ast.parse(SCRIPT)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            source = ast.get_source_segment(SCRIPT, node)
+            break
+    else:
+        raise AssertionError("%s is not a top-level def in the child script" % name)
+    namespace: Dict[str, Any] = {
+        "ParameterizedSize": _FakeParameterizedSize,
+        "DINO_BLOCK_SIZE": dino_block_size,
+        "Optional": Any,
+    }
+    exec(compile(source, "<_WARM_CHILD_SCRIPT>", "exec"), namespace)
+    return namespace[name]
+
+
+def _fixed_descr(size: int = 256) -> _Descr:
+    return _Descr([_Input("input0", [_Axis("y", size), _Axis("x", size)])])
+
+
+def _param_descr(min_: int = 64, step: int = 16) -> _Descr:
+    return _Descr([_Input("input0", [
+        _Axis("y", _FakeParameterizedSize(min_, step)),
+        _Axis("x", _FakeParameterizedSize(min_, step)),
+    ])])
+
+
+# finding 2 — the predicate that narrows the guard
+
+
+def test_all_space_axes_fixed_is_true_for_a_fixed_extent_model() -> None:
+    assert _load_fn("_all_space_axes_fixed")(_fixed_descr(256)) is True
+
+
+def test_all_space_axes_fixed_is_FALSE_for_a_parameterized_model() -> None:
+    """The whole point of finding 2: a parameterized model must keep the padding
+    path, because there the halo is context the model is meant to see and is
+    cropped back off the output."""
+    assert _load_fn("_all_space_axes_fixed")(_param_descr()) is False
+
+
+def test_all_space_axes_fixed_ignores_non_space_axes() -> None:
+    """A batch or channel axis is not an int extent and must not veto the skip."""
+    descr = _Descr([_Input("input0", [
+        _Axis("batch", None, axis_type="batch"),
+        _Axis("channel", None, axis_type="channel"),
+        _Axis("y", 256), _Axis("x", 256),
+    ])])
+    assert _load_fn("_all_space_axes_fixed")(descr) is True
+
+
+def test_a_mixed_model_with_one_parameterized_axis_is_not_all_fixed() -> None:
+    """Negative control: one non-int axis is enough to keep the padding path."""
+    descr = _Descr([_Input("input0", [
+        _Axis("y", 256), _Axis("x", _FakeParameterizedSize(64, 16)),
+    ])])
+    assert _load_fn("_all_space_axes_fixed")(descr) is False
+
+
+# finding 1 — body DONE WHEN 2: a wrong size on a fixed model must be REFUSED
+
+
+def test_a_512_input_to_a_fixed_256_model_is_refused_with_an_actionable_message() -> None:
+    """Body DONE WHEN 2. Before this, a 512 input fell to the padding path and
+    failed as "Input height (576) doesn't match model (256)" — a figure the
+    caller never supplied. The refusal must name the required size, the size
+    that arrived, and why tiling is not the remedy."""
+    msg = _load_fn("_fixed_extent_mismatch")(_fixed_descr(256), _sample(512, 512))
+    assert msg, "a 512x512 input to a fixed-256 model was not refused"
+    assert "256" in msg and "512" in msg, msg
+    assert "tiled" in msg or "tile" in msg, (
+        "the message must say why tiling is not the alternative: every tile "
+        "would be padded by the halo and refused at the same axis. Got: %s" % msg
+    )
+    assert "576" not in msg, (
+        "the message must name what the CALLER supplied, not the padded figure"
+    )
+
+
+def test_an_exactly_sized_input_to_a_fixed_model_is_NOT_refused() -> None:
+    """The control that stops the refusal swallowing the case the fix exists
+    for. Without it, returning a message unconditionally would pass the test
+    above and break every working fixed-extent request."""
+    assert _load_fn("_fixed_extent_mismatch")(_fixed_descr(256), _sample(256, 256)) is None
+
+
+def test_a_parameterized_model_is_never_refused_by_the_fixed_extent_check() -> None:
+    """The check must say nothing about models whose axes are not int extents —
+    those are the blocking path's business, not a refusal."""
+    fn = _load_fn("_fixed_extent_mismatch")
+    assert fn(_param_descr(), _sample(512, 512)) is None
+    assert fn(_param_descr(), _sample(80, 80)) is None
+
+
+def test_the_refusal_runs_BEFORE_the_dispatch_in_the_shipped_source() -> None:
+    """Position is the claim: core must never get the chance to pad.
+
+    A refusal computed after the dispatch would be dead code, and a whole-file
+    grep for the helper name cannot tell the two apart.
+    """
+    call_at = SCRIPT.index("_fixed_extent_mismatch(pipeline.model_description")
+    dispatch_at = SCRIPT.index("if default_blocksize_parameter:")
+    assert call_at < dispatch_at, (
+        "the fixed-extent refusal is evaluated at %d, after the dispatch at %d"
+        % (call_at, dispatch_at)
+    )
