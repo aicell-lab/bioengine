@@ -174,8 +174,7 @@ def test_a_fixed_extent_model_is_not_gated_behind_cellpose() -> None:
                 assert isinstance(part, ast.BoolOp) and isinstance(part.op, ast.Or), (
                     "`cellpose` appears as a required conjunct (%s), which is the "
                     "pre-fix defect: a non-Cellpose model that already fits would "
-                    "be padded anyway"
-                    % (ast.get_source_segment(SCRIPT, part),)
+                    "be padded anyway" % (ast.get_source_segment(SCRIPT, part),)
                 )
     else:
         assert "cellpose" not in _names_in(branch.test), src
@@ -200,8 +199,7 @@ def test_the_guard_excludes_parameterized_non_cellpose_models() -> None:
     assert "_all_space_axes_fixed" in src or "cellpose" in src, (
         "the guard is `%s`: nothing in it can distinguish a FIXED extent from a "
         "parameterized one, so a parameterized non-Cellpose model that fits "
-        "whole would lose its halo context and return invalid border pixels"
-        % src
+        "whole would lose its halo context and return invalid border pixels" % src
     )
     # And the helper it leans on must actually reject a non-int extent.
     assert "def _all_space_axes_fixed" in SCRIPT, "helper is missing from the script"
@@ -372,8 +370,9 @@ def test_a_missing_member_or_unknown_axis_size_keeps_the_blocked_path() -> None:
     assert fits_whole(_fixed_256_model(), no_extent) is False
 
 
-def test_a_parameterized_axis_fits_only_on_the_declared_grid_and_under_the_block(
-) -> None:
+def test_a_parameterized_axis_fits_only_on_the_declared_grid_and_under_the_block() -> (
+    None
+):
     fits_whole = _load_fits_whole(dino_block_size=384)
     param = _Descr(
         [
@@ -435,10 +434,17 @@ def _fixed_descr(size: int = 256) -> _Descr:
 
 
 def _param_descr(min_: int = 64, step: int = 16) -> _Descr:
-    return _Descr([_Input("input0", [
-        _Axis("y", _FakeParameterizedSize(min_, step)),
-        _Axis("x", _FakeParameterizedSize(min_, step)),
-    ])])
+    return _Descr(
+        [
+            _Input(
+                "input0",
+                [
+                    _Axis("y", _FakeParameterizedSize(min_, step)),
+                    _Axis("x", _FakeParameterizedSize(min_, step)),
+                ],
+            )
+        ]
+    )
 
 
 # round 1 finding 2 — the predicate that narrows the skip guard
@@ -455,18 +461,34 @@ def test_all_space_axes_fixed_is_FALSE_for_a_parameterized_model() -> None:
 
 
 def test_all_space_axes_fixed_ignores_non_space_axes() -> None:
-    descr = _Descr([_Input("input0", [
-        _Axis("batch", None, axis_type="batch"),
-        _Axis("channel", None, axis_type="channel"),
-        _Axis("y", 256), _Axis("x", 256),
-    ])])
+    descr = _Descr(
+        [
+            _Input(
+                "input0",
+                [
+                    _Axis("batch", None, axis_type="batch"),
+                    _Axis("channel", None, axis_type="channel"),
+                    _Axis("y", 256),
+                    _Axis("x", 256),
+                ],
+            )
+        ]
+    )
     assert _load_fn("_all_space_axes_fixed")(descr) is True
 
 
 def test_a_mixed_model_with_one_parameterized_axis_is_not_all_fixed() -> None:
-    descr = _Descr([_Input("input0", [
-        _Axis("y", 256), _Axis("x", _FakeParameterizedSize(64, 16)),
-    ])])
+    descr = _Descr(
+        [
+            _Input(
+                "input0",
+                [
+                    _Axis("y", 256),
+                    _Axis("x", _FakeParameterizedSize(64, 16)),
+                ],
+            )
+        ]
+    )
     assert _load_fn("_all_space_axes_fixed")(descr) is False
 
 
@@ -507,7 +529,10 @@ def test_the_refusal_message_no_longer_claims_a_fixed_model_cannot_be_tiled() ->
 
 
 def test_an_exactly_sized_input_is_NOT_refused() -> None:
-    assert _load_fn("_fixed_extent_too_small")(_fixed_descr(256), _sample(256, 256)) is None
+    assert (
+        _load_fn("_fixed_extent_too_small")(_fixed_descr(256), _sample(256, 256))
+        is None
+    )
 
 
 def test_a_parameterized_model_is_never_refused_by_the_too_small_check() -> None:
@@ -531,7 +556,7 @@ def test_the_refusal_is_reached_only_AFTER_the_cellpose_branch() -> None:
     # sits above the dispatch — a pattern matching the shape I pictured rather
     # than the thing I meant.
     CALL = "_fixed_extent_too_small(pipeline.model_description"
-    chain_src = SCRIPT[SCRIPT.index("if default_blocksize_parameter:"):]
+    chain_src = SCRIPT[SCRIPT.index("if default_blocksize_parameter:") :]
     assert CALL in chain_src, "the too-small check is never called in the dispatch"
     refusal_at = chain_src.index(CALL)
     cellpose_at = chain_src.index("elif cellpose:")
@@ -542,9 +567,9 @@ def test_the_refusal_is_reached_only_AFTER_the_cellpose_branch() -> None:
     )
     # and nothing may refuse before the dispatch at all
     before = SCRIPT[: SCRIPT.index("if default_blocksize_parameter:")]
-    assert CALL not in before, (
-        "a refusal before the dispatch bypasses every tiling branch"
-    )
+    assert (
+        CALL not in before
+    ), "a refusal before the dispatch bypasses every tiling branch"
 
 
 def test_the_refusal_actually_RAISES() -> None:
@@ -645,7 +670,9 @@ def _dispatch_chain():
     links: List[Any] = []
     node = target
     while True:
-        links.append((ast.get_source_segment(SCRIPT, node.test) or "", label(node.body)))
+        links.append(
+            (ast.get_source_segment(SCRIPT, node.test) or "", label(node.body))
+        )
         if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
             node = node.orelse[0]
             continue
@@ -655,8 +682,9 @@ def _dispatch_chain():
     return links
 
 
-def _selected_branch(cellpose: bool, fits: bool, all_fixed: bool,
-                     blocksize: Any = None) -> str:
+def _selected_branch(
+    cellpose: bool, fits: bool, all_fixed: bool, blocksize: Any = None
+) -> str:
     """Evaluate the REAL conditions in order; return the branch that fires."""
     env: Dict[str, Any] = {
         "cellpose": cellpose,
@@ -667,7 +695,7 @@ def _selected_branch(cellpose: bool, fits: bool, all_fixed: bool,
         "sample": object(),
     }
     for cond, branch in _dispatch_chain():
-        if cond is None:          # the final else
+        if cond is None:  # the final else
             return branch
         if eval(cond, dict(env)):  # noqa: S307 - the condition is our own source
             return branch
@@ -694,7 +722,9 @@ def test_a_fixed_non_cellpose_model_at_512_reaches_BLOCKING() -> None:
     `elif cellpose and _all_space_axes_fixed(...)` each send this state to the
     final else, where it is padded to 576 and refused.
     """
-    assert _selected_branch(cellpose=False, fits=False, all_fixed=True) == "fixed-blocking"
+    assert (
+        _selected_branch(cellpose=False, fits=False, all_fixed=True) == "fixed-blocking"
+    )
 
 
 def test_a_parameterized_non_cellpose_model_at_512_keeps_the_PADDING_path() -> None:
@@ -705,7 +735,10 @@ def test_a_parameterized_non_cellpose_model_at_512_keeps_the_PADDING_path() -> N
 
 def test_a_fixed_CELLPOSE_model_at_512_still_tiles_on_the_cellpose_branch() -> None:
     """Round 2 finding A: Cellpose-SAM at 512 must reach `elif cellpose:`."""
-    assert _selected_branch(cellpose=True, fits=False, all_fixed=True) == "cellpose-blocking"
+    assert (
+        _selected_branch(cellpose=True, fits=False, all_fixed=True)
+        == "cellpose-blocking"
+    )
 
 
 def test_an_exact_fit_skips_padding_for_both_fixed_and_cellpose() -> None:
@@ -721,5 +754,7 @@ def test_a_parameterized_model_that_fits_does_NOT_skip_padding() -> None:
 
 def test_an_explicit_blocksize_wins_over_everything() -> None:
     """The first link must still short-circuit, whatever the other flags say."""
-    assert _selected_branch(cellpose=True, fits=True, all_fixed=True,
-                            blocksize=16) == "blocksize-blocking"
+    assert (
+        _selected_branch(cellpose=True, fits=True, all_fixed=True, blocksize=16)
+        == "blocksize-blocking"
+    )
