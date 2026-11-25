@@ -848,10 +848,12 @@ class AnnotationBroker:
         ),
         context=None,
     ) -> Dict[str, Any]:
-        """Training inputs for micro-sam fine-tuning: for the LATEST pair per
-        (user, stem) under the label, presigned image + geojson URLs. ONLY
-        stems that are members of the split are included, partitioned by its
-        train/test lists."""
+        """Training inputs for fine-tuning: for the LATEST pair per (user, stem)
+        under the label, a presigned geojson URL plus EITHER a presigned
+        ``image_url`` for a materialised image OR an ``image_source`` region
+        reference for a remote OME-Zarr one, which the trainer reads crop-wise
+        without downloading the image. ONLY stems that are members of the split
+        are included, partitioned by its train/test lists."""
         artifact_id = self._canonical_id(artifact_id)
         self._require_role(context, artifact_id, "manager")
         split = await self._read_split_or_raise(artifact_id, label, split_name)
@@ -886,24 +888,35 @@ class AnnotationBroker:
                     }
                 )
 
-        # model-finetune fetches each image URL whole and hands the buffer to
-        # imageio.imread, so a not-yet-materialised image has nothing that can
-        # be passed. Name the offenders here rather than minting a URL that
-        # fails downstream with an opaque unsupported-extension error.
-        # A stem whose image was deleted outright is caught by the same check:
-        # `non_local_stems` only names stems it knows, so the unknown ones are
-        # added here rather than left to KeyError at minting time.
+        # A stem with no file in the artifact used to be refused outright, because
+        # the only thing that could be handed over was a URL to fetch whole. A
+        # remote OME-Zarr stem is now served as a REGION REFERENCE instead: the
+        # trainer reads the crop's chunks from the source, so there is nothing to
+        # materialise and nothing to download whole.
+        #
+        # Still refused: a stem with no manifest entry at all (deleted outright),
+        # a non-NGFF remote source, and an NGFF source imported before the layout
+        # was recorded. `ngff_region_source` returns None for each, which is why
+        # the refusal is driven by its answer rather than by a second rule here
+        # that could disagree with it.
         manifest = await self._image_manifest(artifact_id)
         stems = [p["stem"] for p in pairs]
-        unmaterialised = sorted(
-            set(core.non_local_stems(manifest, stems))
+        region_sources = {
+            s: core.ngff_region_source(manifest.get(s))
+            for s in stems
+            if s in manifest and not core.image_entry_is_local(manifest.get(s))
+        }
+        unreadable = sorted(
+            {s for s, src in region_sources.items() if src is None}
             | {s for s in stems if s not in manifest}
         )
-        if unmaterialised:
+        if unreadable:
             raise ValueError(
-                f"Split '{split_name}' contains {len(unmaterialised)} image(s) with no "
-                f"file in the artifact: {', '.join(unmaterialised)}. Open each one in "
-                f"the annotator once to materialise it, then retry."
+                f"Split '{split_name}' contains {len(unreadable)} image(s) that can "
+                f"neither be read as a region nor fetched as a file: "
+                f"{', '.join(unreadable)}. A remote OME-Zarr image is trainable as "
+                f"imported; anything else has to be opened in the annotator once to "
+                f"materialise it."
             )
 
         sem = asyncio.Semaphore(16)
@@ -914,19 +927,32 @@ class AnnotationBroker:
                     artifact_id=artifact_id, file_path=file_path, stage=True
                 )
 
-        image_urls, geojson_urls = await asyncio.gather(
-            asyncio.gather(*[_mint(manifest[p["stem"]]["path"]) for p in pairs]),
-            asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs]),
+        # Only the materialised stems get a presigned image URL; a region stem has
+        # no file to mint one for. The geojson is minted for every pair either way.
+        file_pairs = [p for p in pairs if p["stem"] not in region_sources]
+        image_urls = await asyncio.gather(
+            *[_mint(manifest[p["stem"]]["path"]) for p in file_pairs]
         )
-        train_out: List[Dict[str, str]] = []
-        test_out: List[Dict[str, str]] = []
-        for p, img_url, geo_url in zip(pairs, image_urls, geojson_urls):
-            row = {
+        by_stem_url = {p["stem"]: u for p, u in zip(file_pairs, image_urls)}
+        geojson_urls = await asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs])
+
+        train_out: List[Dict[str, Any]] = []
+        test_out: List[Dict[str, Any]] = []
+        for p, geo_url in zip(pairs, geojson_urls):
+            row: Dict[str, Any] = {
                 "stem": p["stem"],
                 "user": p["user"],
-                "image_url": img_url,
                 "geojson_url": geo_url,
             }
+            src = region_sources.get(p["stem"])
+            if src is not None:
+                # The trainer branches on this mapping's shape, so the key is
+                # distinct from image_url rather than overloading it: a caller
+                # that only knows the old field fails loudly instead of trying
+                # to GET a mapping.
+                row["image_source"] = src
+            else:
+                row["image_url"] = by_stem_url[p["stem"]]
             (test_out if p["stem"] in test_stems else train_out).append(row)
         return {
             "train": train_out,
@@ -1570,6 +1596,11 @@ class AnnotationBroker:
             levels=probe["levels"],
             content_hint=probe["content_hint"],
             region=region,
+            layout={
+                "dataset_paths": probe["dataset_paths"],
+                "axis_roles": probe["axis_roles"],
+                "level0_shape": probe["level0_shape"],
+            },
         )
 
         async with self._image_manifest_lock(artifact_id):

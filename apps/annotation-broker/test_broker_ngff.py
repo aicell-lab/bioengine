@@ -879,3 +879,141 @@ class TestForgetRemoteImage:
         await importer.forget_remote_image("ws/ds", "remote-one", context=None)
 
         assert bc.parse_image_manifest(importer._state["manifest"]) == {}
+
+
+class TestGetTrainingUrlsServesRegions:
+    """``get_training_urls`` hands a remote OME-Zarr stem over as a region.
+
+    These are the first tests this function has. It had none before: a grep for
+    ``get_training_urls`` across this app's suite matched nothing, and nothing
+    asserted the refusal it used to raise — so the 347 passing tests said
+    nothing whatever about the path that feeds every training run.
+    """
+
+    LAYOUT = {
+        "dataset_paths": ["0", "1"],
+        "axis_roles": {"y": 1, "x": 2, "c": 0},
+        "level0_shape": [3, 600, 800],
+    }
+    REGION = {"x": 16, "y": 32, "width": 64, "height": 48}
+
+    def _remote(self, with_layout=True):
+        return bc.remote_image_entry(
+            ROOT,
+            None,
+            self.REGION["width"],
+            self.REGION["height"],
+            dtype="|u1",
+            region=dict(self.REGION),
+            layout=dict(self.LAYOUT) if with_layout else None,
+        )
+
+    @pytest.fixture
+    def trainer(self, importer, monkeypatch):
+        """The broker with a split, a manifest and minting stubbed.
+
+        Only what this method reads is faked; the region decision itself runs
+        for real, which is the point.
+        """
+        state = {"manifest": {}, "minted": []}
+
+        async def _read_split_or_raise(_a, _l, _s):
+            return {"train": ["remote-stem", "local-stem"], "test": []}
+
+        async def _image_manifest(_a):
+            return state["manifest"]
+
+        async def _list_files_safe(_a, dir_path):
+            if dir_path.endswith("user-u1"):
+                # A pair needs BOTH a png and a geojson at the same timestamp,
+                # and the timestamp format is \d{8}-\d{6}; anything else parses
+                # to None and the stem is silently not annotated.
+                return [
+                    {"name": "remote-stem-20261125-080000.png"},
+                    {"name": "remote-stem-20261125-080000.geojson"},
+                    {"name": "local-stem-20261125-080000.png"},
+                    {"name": "local-stem-20261125-080000.geojson"},
+                ]
+            return [{"name": "user-u1", "type": "directory"}]
+
+        class _Am:
+            async def get_file(self, artifact_id=None, file_path=None, stage=None):
+                state["minted"].append(file_path)
+                return f"https://signed.invalid/{file_path}"
+
+        monkeypatch.setattr(importer, "_read_split_or_raise", _read_split_or_raise)
+        monkeypatch.setattr(importer, "_image_manifest", _image_manifest)
+        monkeypatch.setattr(importer, "_list_files_safe", _list_files_safe)
+        monkeypatch.setattr(importer, "_am", _Am())
+        importer._tstate = state
+        return importer
+
+    async def test_a_remote_region_stem_comes_back_as_a_region_reference(self, trainer):
+        """THE case this change exists for, and the one that used to raise.
+
+        The reference is exactly what the trainer consumes: store root, region
+        and the layout, in one mapping.
+        """
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        rows = {r["stem"]: r for r in out["train"]}
+
+        src = rows["remote-stem"]["image_source"]
+        assert src["kind"] == bc.NGFF_SOURCE_KIND
+        assert src["region"] == self.REGION
+        assert src["dataset_paths"] == ["0", "1"]
+        assert src["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+        assert src["level0_shape"] == [3, 600, 800]
+        # No file exists for it, so no image URL was minted for it.
+        assert "image_url" not in rows["remote-stem"]
+        assert not any("remote-stem.tif" in m for m in trainer._tstate["minted"])
+
+    async def test_a_materialised_stem_still_gets_a_presigned_url(self, trainer):
+        """The regression guard. Every existing caller reads ``image_url``, and a
+        region stem must not change what a file stem returns."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        rows = {r["stem"]: r for r in out["train"]}
+        assert rows["local-stem"]["image_url"].endswith("images/local-stem.tif")
+        assert "image_source" not in rows["local-stem"]
+        # And both pairs got their geojson, region stem included.
+        assert all("geojson_url" in r for r in out["train"])
+
+    async def test_a_remote_stem_imported_before_the_layout_is_still_REFUSED(
+        self, trainer
+    ):
+        """An NGFF source with no recorded layout cannot be read: nothing says
+        which level is full resolution. Refused by name rather than guessed at —
+        guessing "0" is wrong for the stores that call it "s0"."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(with_layout=False),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        with pytest.raises(ValueError, match="neither be read as a region"):
+            await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+
+    async def test_a_stem_with_no_manifest_entry_is_still_refused(self, trainer):
+        """Deleted outright, so there is neither a file nor a source."""
+        trainer._tstate["manifest"] = {
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        with pytest.raises(ValueError, match="remote-stem"):
+            await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
