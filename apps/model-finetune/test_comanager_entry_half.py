@@ -466,3 +466,120 @@ def test_the_RESUME_PATH_calls_that_resolution_rather_than_defaulting(runs_root)
         "the resume branch now swallows an exception; a missing checkpoint "
         "could fall through to training from the base model"
     )
+
+
+# ── behavioural: what a resume actually hands the trainer ────────────────────
+
+
+class _Recorder:
+    """Captures the params a resume would hand the worker, and whether the
+    runtime was reached at all."""
+
+    def __init__(self):
+        self.written = None
+        self.trained = False
+
+    async def train(self, **kw):
+        self.trained = True
+
+
+async def _drive_resume(monkeypatch, runs_root, *, resume_id, rec):
+    """Run `_run_training` far enough to resolve the checkpoint, no further."""
+    import asyncio as _asyncio
+
+    import entry as _entry
+
+    cls, inst = _app(FakeArtifactManager({}))
+    inst._training_sem = _asyncio.Semaphore(1)
+    inst._runtime_for = lambda model_type: rec
+    inst._bump_transport = lambda **kw: None
+    inst._training_tasks = {}
+
+    async def _no_heartbeat(session_id, interval=60.0):
+        return
+
+    async def _prepared(session_id, ti, tl, vi, vl, params):
+        return {
+            "patch_shape": (32, 32),
+            "train_images": ["a"],
+            "train_labels": ["b"],
+            "val_images": [],
+            "val_labels": [],
+        }
+
+    # On the INSTANCE, not the class: a class attribute is bound and would be
+    # handed `self`, which is how the first version of this failed.
+    inst._preparing_heartbeat = _no_heartbeat
+    inst._prepare_training_data = _prepared
+    monkeypatch.setattr(
+        training, "session_backend", lambda sid, status=None: "cellpose"
+    )
+
+    def _capture(session_id, params):
+        rec.written = dict(params)
+
+    monkeypatch.setattr(training, "write_training_params", _capture)
+    monkeypatch.setattr(
+        training, "read_training_params", lambda sid: {"model_type": "cpsam"}
+    )
+
+    await cls._run_training(
+        inst,
+        session_id="2026-11-25-120000-newrun01",
+        model_type="cpsam",
+        train_images=["a"],
+        train_labels=["b"],
+        val_images=None,
+        val_labels=None,
+        params={"resume_session_id": resume_id, "n_epochs": 1},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_resume_HANDS_THE_TRAINER_the_prior_runs_checkpoint(
+    monkeypatch, runs_root
+):
+    """Behavioural, not textual.
+
+    The earlier guard read the source for the name of the resolver and for the
+    absence of `except`. Review showed that is evadable: wrapping the
+    resolution in `if checkpoint_path(...).exists():` is the silent
+    base-model fallback this row is named for, contains no `except`, and left
+    the suite green. So assert what the trainer is actually handed.
+    """
+    _run_with(runs_root, "prior-run", checkpoint=True)
+    rec = _Recorder()
+    await _drive_resume(monkeypatch, runs_root, resume_id="prior-run", rec=rec)
+
+    assert rec.written is not None, "the run never reached the params write"
+    ckpt = rec.written.get("checkpoint_path")
+    assert ckpt, f"no checkpoint_path was handed to the trainer: {rec.written}"
+    assert "prior-run" in str(ckpt), f"the trainer got {ckpt!r}, not the prior run's"
+    assert rec.trained is True, "the run should have proceeded to the runtime"
+
+
+@pytest.mark.asyncio
+async def test_a_resume_with_NO_checkpoint_NEVER_REACHES_THE_TRAINER(
+    monkeypatch, runs_root
+):
+    """THE ONE THAT KILLS THE SILENT FALLBACK.
+
+    If a missing checkpoint were tolerated, the run would proceed with no
+    `checkpoint_path` and train a fresh model while reporting success -- the
+    exact failure this row's title names. The run must not reach the runtime
+    at all.
+    """
+    _run_with(runs_root, "unfinished-run", checkpoint=False)
+    rec = _Recorder()
+    await _drive_resume(monkeypatch, runs_root, resume_id="unfinished-run", rec=rec)
+
+    assert rec.trained is False, (
+        "the runtime was reached for a resume whose checkpoint does not exist, "
+        "so the run is training from the base model while claiming to continue"
+    )
+    if rec.written is not None:
+        assert (
+            "checkpoint_path" not in rec.written
+        ), f"params carry a checkpoint_path that cannot exist: {rec.written}"
+    st = training.read_status("2026-11-25-120000-newrun01")
+    assert st.get("status") == "FAILED", f"the run should have failed: {st}"
