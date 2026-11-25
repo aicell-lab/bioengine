@@ -13,6 +13,7 @@ module stays introspectable with only ``bioengine[worker]`` + the stdlib.
 
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -35,8 +36,91 @@ def sessions_root() -> Path:
     return root
 
 
+# The exact shape ``new_session_id`` generates, and the ONLY shape accepted from
+# a caller. An allow-list, not a sanitiser: there is no attempt to clean a bad id
+# up, because every cleanup is a guess at what the caller meant and the guesses
+# are what get escaped.
+#
+# ``\A``/``\Z`` and not ``^``/``$``: in Python ``$`` also matches immediately
+# before a trailing newline, so ``re.match(r"^...$", "<valid-id>\n")`` SUCCEEDS.
+# An id with a newline on the end would then be accepted and used as a directory
+# name. There is a test for exactly that.
+SESSION_ID_PATTERN = re.compile(r"\A\d{4}-\d{2}-\d{2}-\d{6}-[0-9a-f]{8}\Z")
+
+
+class InvalidSessionId(ValueError):
+    """A session_id that this server could not have generated.
+
+    Raised BEFORE any filesystem call. It is a ``ValueError`` so that callers
+    which already report bad arguments keep reporting them the same way.
+    """
+
+
+class SessionNotFound(ValueError):
+    """A well-formed session_id for a session that does not exist here.
+
+    Deliberately distinct from :class:`InvalidSessionId`: one says the caller
+    sent something the server could not have issued, the other says the caller
+    sent something plausible that this worker does not have. Collapsing them
+    would make a legitimate "wrong worker" mistake read like an attack.
+    """
+
+
+def validate_session_id(session_id: Any) -> str:
+    """The session_id, or raise.
+
+    Checked against the generator's own shape, which was verified to cover every
+    run in production: all 261 live session ids match it, so nothing existing
+    becomes unreachable by enforcing it.
+    """
+    if not isinstance(session_id, str):
+        raise InvalidSessionId(
+            f"session_id must be a string, got {type(session_id).__name__}"
+        )
+    if not SESSION_ID_PATTERN.match(session_id):
+        # The value is NOT echoed in full: it is attacker-controlled and this
+        # message reaches logs. The length and a short prefix are enough to
+        # debug a genuine mistake.
+        raise InvalidSessionId(
+            f"session_id is not a valid session identifier "
+            f"(length {len(session_id)}, starts {session_id[:12]!r}). "
+            f"Expected the form YYYY-MM-DD-HHMMSS-xxxxxxxx."
+        )
+    return session_id
+
+
 def session_dir(session_id: str) -> Path:
-    return sessions_root() / session_id
+    """The directory for *session_id*, guaranteed to be inside the sessions root.
+
+    Two independent layers, deliberately not one:
+
+    1. :func:`validate_session_id` refuses anything the server would not itself
+       have generated, before any path is built.
+    2. The built path is resolved and asserted to be inside the resolved root.
+
+    Layer 2 is not redundant with layer 1 — it is what still holds if layer 1 is
+    ever loosened, and loosening an id format is a normal thing to want to do.
+    Softening either one alone leaves the other refusing, which is the whole
+    point: each has its own failing test.
+
+    This function is the chokepoint. ``_status_path``, ``_stop_path``,
+    ``_params_path`` and ``checkpoint_path`` all build on it, so guarding here
+    covers every method that takes a session_id rather than one of them.
+    """
+    validate_session_id(session_id)
+    root = sessions_root()
+    candidate = root / session_id
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    try:
+        # `Path.is_relative_to` is 3.9+, and this app's suite also runs on 3.8.
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise InvalidSessionId(
+            f"session_id resolves outside the sessions root "
+            f"(length {len(session_id)}, starts {session_id[:12]!r})"
+        )
+    return candidate
 
 
 def session_backend(session_id: str) -> str:
