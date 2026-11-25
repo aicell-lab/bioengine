@@ -776,10 +776,31 @@ GATED_BY_RUN_ID = {
     "contribute",  # publishes its checkpoint into the shared pool
     "start_training",  # only when resume_session_id is supplied; see the tests above
 }
-# Deliberate exceptions, each for a stated reason. `get_training_status` is the
-# documented position that a run id grants READ access to that run; infer and
-# compute_embedding take a session id to locate a MODEL, not to act on a run.
-READ_ONLY_BY_RUN_ID = {"get_training_status", "infer", "compute_embedding"}
+# Deliberate exception, on the lead's ruling: a run id grants READ access to that
+# run's status. That is the documented position, stated in the README and the
+# tutorial.
+READ_ONLY_BY_RUN_ID = {"get_training_status"}
+
+# NOT CLASSIFIED, AND DELIBERATELY SO. An earlier version of this file listed
+# these two as read-only exceptions with the reason "they take a session id to
+# locate a MODEL, not to act on a run". That reason was mine, and it is in
+# tension with the ruling that governs here, which says anything that USES OR
+# CONTINUES a run's weights is owner-or-admin and that only reads of a run's
+# status, progress and logs stay open.
+#
+# `infer` and `compute_embedding` both load `_session_checkpoint(session_id)` and
+# serve THAT RUN'S fine-tuned weights, so on the ruling's own words they are not
+# reads. Gating them is a user-visible change on a surface another lane owns --
+# in a shared notebook, several people trying one run's model is a normal thing
+# to want -- so it may well be the right product call to treat serving weights
+# as a read. Either way it is not a call this lane gets to make by writing a set
+# literal, and a test that accounts for them silently is a test that enforces a
+# decision nobody made.
+#
+# So they sit here, named, until the ruling arrives. The listing below is
+# accounted for, so the suite is green; what is NOT green is anyone's ability to
+# pretend the question is settled.
+UNDECIDED_PENDING_RULING = {"infer", "compute_embedding"}
 
 
 def _published_methods_taking_a_run_id(path):
@@ -812,7 +833,12 @@ def _published_methods_taking_a_run_id(path):
             names.append(a.vararg.arg)
         if a.kwarg:
             names.append(a.kwarg.arg)
-        if any("session_id" in n for n in names):
+        # Matches the names actually in use for a run id. KNOWN LIMIT: a run id
+        # passed under some other name would escape this, so the match list has
+        # to grow with the code. Stated rather than papered over -- a structural
+        # guard whose reach is narrower than its docstring claims is the defect
+        # this function already had once, in another form.
+        if any(("session_id" in n) or ("run_id" in n) for n in names):
             out.append(node.name)
     return sorted(out)
 
@@ -827,12 +853,29 @@ def test_no_OTHER_entry_method_takes_a_run_id_without_a_decision():
         "start_training takes resume_session_id and must be found; if it is not, "
         "the parser has regressed to a line-window scan"
     )
-    unaccounted = sorted(set(taking) - GATED_BY_RUN_ID - READ_ONLY_BY_RUN_ID)
-    assert not unaccounted, (
-        f"method(s) taking a run id that are neither gated nor a listed "
-        f"exception: {unaccounted}. Decide which, then add it to one of the two "
-        f"sets above. Found: {taking}"
+    unaccounted = sorted(
+        set(taking) - GATED_BY_RUN_ID - READ_ONLY_BY_RUN_ID - UNDECIDED_PENDING_RULING
     )
+    assert not unaccounted, (
+        f"method(s) taking a run id that are in none of the three sets: "
+        f"{unaccounted}. Decide which, then add it deliberately. Found: {taking}"
+    )
+
+
+def test_the_UNDECIDED_set_is_exactly_what_is_awaiting_a_ruling():
+    """Pins the open question so it cannot be quietly widened or forgotten.
+
+    Adding a method here is how an unclassified surface would be made to pass,
+    so the contents are asserted rather than merely used. When the ruling lands,
+    this set empties and the methods move to one of the other two.
+    """
+    assert UNDECIDED_PENDING_RULING == {"infer", "compute_embedding"}, (
+        "the set of methods awaiting a ruling changed; that is a decision, not a "
+        "refactor, and it needs the ruling rather than an edit here"
+    )
+    assert not (
+        UNDECIDED_PENDING_RULING & (GATED_BY_RUN_ID | READ_ONLY_BY_RUN_ID)
+    ), "a method cannot be both decided and undecided"
 
 
 def test_that_structural_guard_CAN_fail(tmp_path):
