@@ -7,3 +7,9 @@ tifffile
 Pillow
 httpx
 pyyaml
+# Reading one REGION of a remote OME-Zarr source for training, through
+# bioengine.datasets.http_zarr_store (which requires zarr>=3.0.8 and refuses to
+# import below it). Only the chunks a region overlaps are fetched, so a
+# whole-slide source costs what the patch costs. The worker image already
+# carries h2, which the store's HTTP/2 client needs.
+zarr>=3.0.8

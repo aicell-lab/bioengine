@@ -156,8 +156,23 @@ launch instead of OOMing mid-train.
 - **`start_training(train_images, train_labels, val_images=None, val_labels=None, model_type="vit_l_lm", n_epochs=5, n_objects_per_batch=8, patch_size=512, diam_mean=30.0, batch_size=1, learning_rate=1e-5, val_fraction=0.2, n_samples=None, resume_session_id=None, init_checkpoint=None, metrics=None, label="")`**
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
-  paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
-  `.geojson` FeatureCollection of polygons (rasterized to instances).
+  paths, **or an OME-Zarr region source** `{store_root, array_path, axes, region:
+  {x, y, width, height}, token?}` as the annotation broker's `get_training_urls`
+  returns for an image imported as a PATCH of a remote slide — such an image has
+  no file in the artifact to fetch, so the crop is read out of the store over
+  HTTP range requests and only the chunks the region overlaps are fetched. That
+  is what makes a whole-slide image trainable: its cost follows the region, not
+  the slide, and materialising one is not an option (it means reading level 0
+  whole in a browser). The read plan (`array_path`, `axes`) comes from the
+  broker rather than being inferred here, so the multiscale parsing stays in one
+  place; a source without it is refused by name. One region read is capped at
+  `ngff_region.MAX_REGION_BYTES` (128 MiB decoded, comfortably above the 64 MiB
+  the annotator can materialise), because this runs in an entry actor declared
+  with 4 GiB — the cap bounds the REGION and never the source.
+  `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
+  `.geojson` FeatureCollection of polygons (rasterized to instances); for a
+  region the polygons are in the patch's own pixels, which is what the
+  annotator drew them in.
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
   diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
   trains at a time across both backends (`QUEUED` while another holds the slot).

@@ -879,9 +879,29 @@ class EntryApp:
 
         return await asyncio.to_thread(iio.imread, buffer)
 
-    async def _resolve_image(self, source: Union[np.ndarray, str]) -> np.ndarray:
+    async def _load_ngff_region(self, source: Dict[str, Any]) -> np.ndarray:
+        """One region of a remote OME-Zarr source, fetched as chunks rather than
+        as a file.
+
+        This is what makes a whole-slide source trainable at all: it has no file
+        in the artifact to presign — materialising one means reading level 0
+        whole in the browser, which a gigapixel slide cannot survive — so the
+        crop is read out of the store here, over range requests, at a cost that
+        follows the region and not the slide.
+        """
+        import ngff_region
+        import training
+
+        array = await asyncio.to_thread(ngff_region.read_region, source)
+        return training._to_hwc_or_hw(np.asarray(array))
+
+    async def _resolve_image(
+        self, source: Union[np.ndarray, str, Dict[str, Any]]
+    ) -> np.ndarray:
         if isinstance(source, str):
             return await self._load_image_from_source(source)
+        if isinstance(source, dict):
+            return await self._load_ngff_region(source)
         if isinstance(source, np.ndarray):
             return source
         return np.asarray(source)
@@ -1731,9 +1751,17 @@ class EntryApp:
     @bioengine.method
     async def start_training(
         self,
-        train_images: List[Union[np.ndarray, str]] = Field(
+        train_images: List[Union[np.ndarray, str, Dict[str, Any]]] = Field(
             ...,
-            description="Training images: arrays, http(s) URLs, or get_upload_url paths.",
+            description="Training images: arrays, http(s) URLs, get_upload_url paths, "
+            "or an OME-Zarr region source "
+            "`{store_root, array_path, axes, region: {x, y, width, height}, token?}` "
+            "as the annotation broker's get_training_urls returns for an image that "
+            "was imported as a PATCH of a remote slide. A region source is read as "
+            "chunks over range requests, so its cost follows the region and not the "
+            "source: that is what makes a whole-slide image trainable, since it has "
+            "no file in the artifact to fetch and could never be materialised into "
+            "one.",
         ),
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
@@ -1741,8 +1769,9 @@ class EntryApp:
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
             "needs DENSE labels — annotate all objects per image.",
         ),
-        val_images: Optional[List[Union[np.ndarray, str]]] = Field(
-            None, description="Optional validation images."
+        val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
+            None,
+            description="Optional validation images, in any form train_images takes.",
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
             None, description="Validation labels."
