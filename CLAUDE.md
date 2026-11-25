@@ -47,15 +47,15 @@ before opening a PR — sync first:
 
 This repository is public, and so is everything pushed to it: files, commit messages, branch names, pull-request descriptions, issues and comments. None of them may contain anything about the environment the agent works in: agent session ids or names, workspace ids, the agent's own backlog or issue numbers, the names and commands of the agent tooling, machine names, or absolute paths on a developer's machine. Write for a contributor who has only this repository. Tooling that only makes sense inside the agent environment (backlog filing, sweeps that feed an agent's tracker, watchers, routing to named sessions) does not belong here at all. Before every push, read the diff and the commit messages you are about to publish for those identifiers and stop if one is there: a closed pull request and a deleted branch still leave their commits reachable on GitHub. **The rule is forward-looking: history published before 2026-11-18 is accepted as it is.** Do not rewrite history, force-push, or delete branches or pull requests just to comply. Only stop adding new instances.
 
-**Open a pull request only where the table below requires one, or where other people are involved.** Every other change is worked on a local branch and, once approved, squash-merged into an up-to-date `main` and pushed once. Before starting, check whether an open pull request already covers the work, and finish that one instead of opening a second.
+**Every change reaches `main` through a pull request.** The repository's `Require PR` ruleset allows its only bypass, the `admin` team, for pull requests alone, so a direct push to `main` is refused for every path with `GH013: Repository rule violations`. The table below still decides which pull requests need a version bump and the draft-then-ready workflow. A row marked *PR, no version bump* or *PR, no worker version bump* is merged as soon as it is reviewed and its required checks pass. Before starting, check whether an open pull request already covers the work, and finish that one instead of opening a second.
 
-## When PRs are required vs direct-push to main
+## Which pull requests need a version bump
 
-**This table is enforceable as a check.** `.github/hooks/pre-push` refuses a push to `main` that touches any PR-only path below. Read `.github/hooks/README.md` first; the hook is shared by every worktree of a clone, so arming it in a clone other sessions are working in affects them too. The repository's own `Require PR` ruleset cannot express this policy — it is scoped by ref with no path component, so it forbids direct pushes to `main` for *every* path, and it carries an `admin`-role bypass, which is why direct pushes succeed and only a `remote: Bypassed rule violations` line reports them.
+**The ruleset is the enforcement; the hook is a local backstop.** `.github/hooks/pre-push` refuses, before anything leaves the clone, a push to `main` that touches any PR-only path below. Read `.github/hooks/README.md` first; the hook is shared by every worktree of a clone, so arming it in a clone other sessions are working in affects them too. The repository's `Require PR` ruleset is scoped by ref with no path component, so it refuses a direct push to `main` for *every* path, and its only bypass is the `admin` team for pull requests.
 
 ⚠ **Do NOT arm it with `git config core.hooksPath .github/hooks`, which is what that README says.** `core.hooksPath` holds exactly ONE value, and on a machine whose agent tooling installs its own `pre-commit` and `commit-msg` guards in `.git/hooks`, it is already pinned there. Repointing it at `.github/hooks`, which has neither of those hooks, arms this guard by **disarming that one**. Install a shim at `.git/hooks/pre-push` that delegates to `.github/hooks/pre-push` instead: the two guards want different hook *names*, so delegating arms both and trades nothing. `.git/hooks` is local machine state and is not version controlled, so a shim has to be re-created if the directory is ever rewritten.
 
-**Which surface enforces versions.** `version-check.yml` and `app-version-check.yml` are both `pull_request`-triggered, so neither one sees a commit that reaches `main` without a PR. `push-version-check.yml` covers that path: it is `push`-triggered on `main` and runs the same two gates over `github.event.before..github.event.after` — `.github/scripts/check_worker_version.py` for `pyproject.toml` plus `bioengine/_version.py`, and the *same* `.github/scripts/check_app_artifact_version.py` the PR gate calls, so the published-artifact membership leg is identical on both paths. It is a **backstop, not a gate**: by the time it runs the commit is already on `main`, so it can only make a bad version loud.
+**Which surface enforces versions.** `version-check.yml` and `app-version-check.yml` are both `pull_request`-triggered, so neither one would see a commit that reached `main` without a PR, which the ruleset now prevents. `push-version-check.yml` covers that path: it is `push`-triggered on `main` and runs the same two gates over `github.event.before..github.event.after` — `.github/scripts/check_worker_version.py` for `pyproject.toml` plus `bioengine/_version.py`, and the *same* `.github/scripts/check_app_artifact_version.py` the PR gate calls, so the published-artifact membership leg is identical on both paths. It is a **backstop, not a gate**: by the time it runs the commit is already on `main`, so it can only make a bad version loud.
 
 **What refuses a bad version BEFORE it lands** is `.github/hooks/pre-push`, which runs those same two scripts over `<remote_sha>..<local_sha>` — the range the push would add — and refuses with a `VERSION GATE` banner distinct from its PR-only-path banner. The two checks are deliberately independent: softening the path rule stops the path check refusing, and the version check has to keep refusing on its own. It **fails closed** — a missing script or no `python3` refuses and says "NO version was checked", rather than passing a check that never ran. `git push --no-verify` bypasses it; that is accepted, since this guards against misreading the rule, not against a determined push. The app leg needs network (an unauthenticated read of the published artifact) but no credential.
 
@@ -69,13 +69,13 @@ This repository is public, and so is everything pushed to it: files, commit mess
 |---|---|
 | `bioengine/**`, `requirements*.txt`, `pyproject.toml`, `docker/**`, `.dockerignore` | **PR required.** Never push directly to `main`. If the user asks you to, refuse and create a PR instead. This is the *routing* rule only — both `version-check.yml` and `docker-publish-worker.yml` gate strictly narrower path sets than this list, so a PR here does not necessarily need a version bump. See "Whether you need a bump at all" above before bumping. A commit that reaches `main` without a PR is still version-checked, after the fact, by `push-version-check.yml`. |
 | `apps/model-runner/**`, `apps/model-finetune/**` | **PR required**. These two apps are published as Hypha artifacts and are gated by `app-version-check.yml`: on a non-draft PR, `version` in that app's `manifest.yaml` must be greater (PEP 440) than `origin/main`'s **and** must already exist in the published artifact's version list. So upload before you mark ready: open a draft PR, iterate on the live worker with `X.Y.Z-devN` pre-releases, upload the real `X.Y.Z`, then `gh pr ready`. Both legs, membership included, also run on the push path via `push-version-check.yml`. |
-| `apps/**` (every other app) | **Push direct to `main`** — no PR. Then re-upload via the running worker so the Hypha artifact tracks main. An active GitHub ruleset actually forbids this and our PAT bypasses it silently. |
-| `scripts/**` | **PR required.** No version bump: `version-check.yml`'s path filter does not match `scripts/`, and neither does `pr-only-paths.txt`, so nothing refuses a direct push here — the rule is the only thing stopping one. These are executable tools that other agents run, so a change gets a reviewer even though no gate demands it. |
-| `docs/**`, `.github/**` (CI workflows), `.claude/skills/**`, `CLAUDE.md`, `README.md` | **Push direct to `main`** — no PR. |
+| `apps/**` (every other app) | **PR, no worker version bump.** Bump `version` in the app's `manifest.yaml` (see "App version bumps"); no CI check gates it. Then re-upload via the running worker so the Hypha artifact tracks main. |
+| `scripts/**` | **PR required.** No version bump: `version-check.yml`'s path filter does not match `scripts/`. These are executable tools that other agents run, so a change gets a reviewer even though no version gate applies. |
+| `docs/**`, `.github/**` (CI workflows), `.claude/skills/**`, `CLAUDE.md`, `README.md` | **PR, no version bump.** |
 
-## PR workflow (for paths above that require one)
+## PR workflow (draft, then ready, for pull requests that need a version bump)
 
-**A PR stays a DRAFT until the issue is cleared to land.** Ready does not mean "the code is finished"; it means "this goes to production now". A ready PR has to carry a version bump to pass `check-version`, so every ready PR reserves a rung and forces a merge order on all the others. Keep the number of ready PRs at one, or near it.
+**A PR stays a DRAFT until the issue is cleared to land.** Ready does not mean "the code is finished"; it means "this goes to production now". A ready PR that touches a path `version-check.yml` gates has to carry a version bump to pass `check-version`, so every ready PR reserves a rung and forces a merge order on all the others. Keep the number of ready PRs at one, or near it.
 
 1. Push the feature branch with the substantive changes only (NO version edit).
 2. `gh pr create --draft …` — **open as DRAFT**, and leave it there for the whole of the work.
@@ -114,12 +114,14 @@ app_id = deployed['application_id']
 svc = await client.get_service(f'bioimage-io/{app_id}')
 ```
 
-Once an app is verified working, commit the source to git so the deployed version is reproducible:
+Once an app is verified working, commit the source on a branch and open a pull request so the deployed version is reproducible:
 
 ```bash
+git switch -c feat/my-app-change
 git add apps/my-app/
 git commit -m "feat(my-app): describe change, bump version to X.Y.Z"
-git push
+git push -u origin feat/my-app-change
+gh pr create
 ```
 
 The version in `manifest.yaml` must be bumped whenever app code changes.
