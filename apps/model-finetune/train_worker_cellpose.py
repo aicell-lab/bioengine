@@ -186,6 +186,29 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
 EPOCH_REPORT_CADENCE = "every epoch"
 
 
+def terminal_epoch_fields(ok, loss_basis, live_curve, n_epochs):
+    """``(n_epochs_completed, n_epochs_completed_basis)`` for the TERMINAL write.
+
+    A function rather than an inline conditional because it encodes a decision,
+    and a decision that cannot be tested gets reverted by accident. It used to be
+    inline and it was wrong: the terminal write overwrote the live count with the
+    REQUESTED total under the basis ``floor_if_completed``, so a run the page had
+    been showing real progress for lost that claim at the moment it succeeded —
+    the page makes no claim for any basis but ``measured``.
+
+    The rule: a counted curve that RECONCILES against train_seg's own returned
+    curve is observed and checked, so it is reported as ``measured`` with the
+    count actually observed — which is also the truer number if cellpose ended
+    early. Anything short of reconciled falls back to the floor, and why stays
+    visible in ``epoch_loss_basis`` instead of being smuggled into this field.
+    """
+    if not ok:
+        return None, None
+    if loss_basis == epoch_progress.BASIS_MEASURED and live_curve:
+        return len(live_curve), "measured"
+    return n_epochs, "floor_if_completed"
+
+
 def _publish_epoch(session_id: str, has_val: bool):
     """A tracker callback that writes the growing curve into status.json.
 
@@ -207,6 +230,19 @@ def _publish_epoch(session_id: str, has_val: bool):
                 ],
                 last_reported_epoch=n_completed - 1,
                 n_epochs_completed=n_completed,
+                # WITHOUT THIS THE UI SHOWS NOTHING. The page refuses to claim
+                # any progress unless the basis is exactly "measured" —
+                # `epochProgressOf` in the Colab page's trainingProgress.ts
+                # returns {kind: 'none'} for a missing basis, which is what an
+                # earlier version of this writer produced: a count the page was
+                # right to ignore, because an unlabelled number could have been
+                # inferred from anything.
+                #
+                # "measured" is the honest label here and not a convenience: the
+                # count is epochs the hook watched CLOSE, one callback per epoch
+                # boundary, not a fraction of elapsed time and not the requested
+                # total assumed to have happened.
+                n_epochs_completed_basis="measured",
             )
         except Exception:
             # Progress reporting must never be able to fail a training run.
@@ -251,6 +287,14 @@ def main(session_id: str) -> None:
     # (cellpose/train.py:408 at 4.2.1.1) and this call passes none, so it is the
     # training-image count. Getting it wrong would move every epoch boundary — and
     # would be caught at the end by the reconciliation rather than published.
+    #
+    # THIS IS THE COUNT BEFORE cellpose's `min_train_masks` FILTER, which re-sets
+    # nimg after dropping images with too few masks (train.py:264-281). It is
+    # correct today only because three things hold together: materialise_pairs
+    # already drops empty-label pairs, this call passes min_train_masks=1, and no
+    # caller can raise that. Add a min_train_masks parameter and every live epoch
+    # boundary moves, with only the end-of-run reconciliation to notice — so if
+    # that parameter ever appears, this count has to come from the filtered set.
     tracker = epoch_progress.EpochLossTracker(
         nimg_per_epoch=max(1, len(p.get("train_images") or [])),
         on_epoch=(
@@ -367,6 +411,12 @@ def main(session_id: str) -> None:
         # unchecked curve as measured is the failure this avoids.
         live_curve = list(tracker.epoch_losses)
         loss_basis = epoch_progress.agreement(live_curve, train_losses)
+        # Placed after ALL THREE inputs exist: `ok` (did a checkpoint appear),
+        # `live_curve` and `loss_basis`. An earlier edit of mine put this call
+        # above `live_curve` and it would have raised NameError on every run.
+        _terminal_completed, _terminal_basis = terminal_epoch_fields(
+            ok, loss_basis, live_curve, p["n_epochs"]
+        )
         final_epochs = [
             {
                 "epoch": i,
@@ -390,8 +440,19 @@ def main(session_id: str) -> None:
             # Only when there IS a final curve: write_status merges, so an empty list
             # here would erase the live one a reader may already have seen.
             **({"epochs": final_epochs} if final_epochs else {}),
-            n_epochs_completed=p["n_epochs"] if ok else None,
-            n_epochs_completed_basis="floor_if_completed" if ok else None,
+            # THE TERMINAL WRITE MUST NOT DOWNGRADE A MEASURED COUNT. It used to
+            # overwrite the live count with the REQUESTED total under the basis
+            # "floor_if_completed", so a run that the page had been showing real
+            # progress for lost that claim at the moment it succeeded.
+            #
+            # The rule: a counted curve that reconciles against train_seg's own
+            # returned curve is both observed AND checked, so it is reported as
+            # `measured` with the count that was actually observed — which is the
+            # truer number anyway if cellpose ended early. Anything less than
+            # reconciled falls back to the floor, and the reason stays visible in
+            # `epoch_loss_basis` rather than being smuggled into this field.
+            n_epochs_completed=_terminal_completed,
+            n_epochs_completed_basis=_terminal_basis,
             cell_diameters=cell_diameters,
             metrics_requested=metrics_requested,
             train_losses=train_losses,
