@@ -723,6 +723,40 @@ def run_names_on_disk() -> "tuple[List[str], List[str]]":
     return names, skipped
 
 
+def non_terminal_runs() -> Dict[str, Dict[str, Any]]:
+    """Every run on this worker that has NOT finished, keyed by session id.
+
+    The OPERATOR question -- "what is this worker currently working on" -- which
+    the per-caller listing deliberately cannot answer. A run is returned to its
+    owner, to a manager of its dataset, or (ownerless only) to an administrator;
+    so a run started by a token-less caller whose connection has since closed is
+    visible to nobody, while still occupying the worker. This reports those by
+    LIFECYCLE rather than by ownership.
+
+    **Owners are redacted**, and that is the whole point of it being a separate
+    function rather than a widened listing. An operator needs to know that
+    something is running and which id to stop; they do not need to know whose it
+    is. Widening `list_sessions` instead would hand every owned run to every
+    administrator and undo a privacy rule that has a test pinning it.
+
+    Read from the DISK, not from any in-memory task registry. A replica's
+    `_training_tasks` dict is empty after a restart, which would miss precisely
+    the run that outlived its process -- the case most worth catching.
+
+    Uses the one existing walk of the sessions root, so it adds no new way to
+    enumerate runs and no new I/O pattern.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for name in run_names_on_disk()[0]:
+        try:
+            status = get_status(name, include_private=True)
+        except InvalidSessionId:
+            continue
+        if status.get("status") not in _TERMINAL:
+            out[name] = redact_private(status)
+    return out
+
+
 def dataset_ids_on_disk() -> List[str]:
     """Every distinct ``dataset_artifact_id`` recorded across the runs on disk.
 

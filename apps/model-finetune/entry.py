@@ -2057,6 +2057,36 @@ class EntryApp:
         return frozenset(managed)
 
     @bioengine.method(context=True)
+    async def list_active_training_runs(self, context=None) -> Dict[str, Any]:
+        """Every UNFINISHED run on this worker, for an operator. Administrators only.
+
+        Answers the question the per-caller run listing deliberately cannot:
+        what is this worker currently working on. `list_training_sessions`
+        returns a run to its owner, to a manager of its dataset, or -- when it
+        has no owner -- to a `bioimage-io` administrator. A run started by a
+        caller who was not signed in therefore becomes invisible to everybody
+        once their connection closes, because Hypha mints that identity per
+        connection: the owner no longer exists to look, and the run is owned so
+        no administrator may list it. It keeps occupying the worker regardless.
+
+        **Owners are redacted here too.** An operator needs to know that
+        something is running and which id to stop it by; they do not need to
+        know whose it is. That is why this is a separate call rather than a
+        loosened `list_training_sessions`: widening the administrator leg of
+        that one would hand every owned run to every administrator and undo a
+        privacy decision made on purpose, which a test pins.
+
+        Returns `{}` for anyone who is not a `bioimage-io` administrator --
+        refusing rather than raising, because an operator surface should not
+        become a way to probe whether anything is running at all.
+        """
+        import training
+
+        if not training.caller_is_workspace_admin(context):
+            return {}
+        return training.non_terminal_runs()
+
+    @bioengine.method(context=True)
     async def stop_training(
         self,
         session_id: str = Field(..., description="Session id to stop."),
