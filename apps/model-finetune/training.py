@@ -259,6 +259,10 @@ def get_status(session_id: str) -> Dict[str, Any]:
         }
     st["session_id"] = session_id
     st["checkpoint_available"] = checkpoint_path(session_id).exists()
+    # The config a run used, so a history listing can say WHAT was trained and not
+    # merely that something was. It was already persisted per run and reachable only
+    # from inside this app; `{}` for a run that died before the file was written.
+    st["config"] = run_config(session_id)
     if st.get("start_time"):
         end = st.get("end_time") or time.time()
         st["elapsed_s"] = round(end - st["start_time"], 1)
@@ -594,3 +598,47 @@ def write_training_params(session_id: str, params: Dict[str, Any]) -> None:
 
 def read_training_params(session_id: str) -> Dict[str, Any]:
     return json.loads(_params_path(session_id).read_text())
+
+
+# What a client may see of a run's configuration, as an ALLOW-LIST rather than a
+# redaction list. ``training_params.json`` is written by spreading ``**params`` plus a
+# ``**resolved`` block, so its contents are whatever those carry at the time: an
+# allow-list stays safe when a field is added there later, while a blocklist would have
+# to anticipate the new name. Today nothing in it is a credential — ``pool_token`` is
+# consumed during checkpoint resolution and never stored — but a read surface should not
+# depend on that staying true.
+#
+# Deliberately NOT included: ``train_images`` / ``train_labels`` / ``val_images`` /
+# ``val_labels``, which are local materialisation paths — useless to a client and
+# needless detail about the worker's filesystem — and ``init_checkpoint``, which is a
+# path; ``resume_session_id`` and ``pool_provenance`` carry the same meaning as ids.
+RUN_CONFIG_FIELDS = (
+    "model_type",
+    "n_epochs",
+    "batch_size",
+    "learning_rate",
+    "diam_mean",
+    "val_fraction",
+    "n_samples",
+    "train_tile_size",
+    "patch_shape",
+    "metrics",
+    "resume_session_id",
+    "pool_provenance",
+)
+
+
+def run_config(session_id: str) -> Dict[str, Any]:
+    """The run's configuration for display, restricted to :data:`RUN_CONFIG_FIELDS`.
+
+    Returns ``{}`` rather than raising when the params file is absent or unreadable: a
+    run that failed during preparation can terminate before the file is written, and
+    those are exactly the sessions a history page still has to list. ``get_status`` is
+    on every read path, so it must not acquire a new way to throw."""
+    try:
+        params = read_training_params(session_id)
+    except Exception:
+        return {}
+    if not isinstance(params, dict):
+        return {}
+    return {k: params[k] for k in RUN_CONFIG_FIELDS if k in params}
