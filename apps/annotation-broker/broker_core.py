@@ -20,6 +20,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -818,6 +819,160 @@ def default_stem_from_store_root(root: str) -> str:
         if candidate and not candidate.isdigit() and is_valid_image_stem(candidate):
             return candidate
     return ""
+
+
+def normalise_planes(
+    planes: Any,
+    axes: Optional[List[str]],
+    level0_shape: Optional[List[int]],
+    axis_roles: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, int]]:
+    """A validated ``{axis_name: index}``, or ``None`` when none was given.
+
+    Recorded at import because the annotator knows which slice the region was
+    drawn on and nothing downstream can recover it. A reader refuses an axis of
+    size greater than one with no plane recorded -- deliberately, since picking
+    index 0 pairs the polygons with a different slice's pixels, leaves the mask
+    non-empty and the run reporting success. See ``ngff_region._plane_index``.
+
+    **Checked HERE as well as at read time, and that is not redundant.** The
+    reader's refusal protects the pixels; this one protects the RECORD. A plane
+    naming an axis the store does not have, or an index past its end, would
+    otherwise be written into the manifest and fail only when someone trained
+    on it -- long after the annotation was saved, and reported as a training
+    failure rather than as the bad import it was.
+
+    ``None`` rather than ``{}`` for an empty mapping, so an absent plane and an
+    empty one cannot mean two things to a consumer.
+
+    **Only NON-SPATIAL axes may carry a plane, and that is enforced here rather
+    than left to the reader.** Measured: the reader keeps y and x whole (they are
+    the crop) and keeps the CHANNEL axis whole on purpose, so a recorded
+    ``{"c": 2}`` is silently ignored -- ``region_index`` with
+    ``planes={"z": 4, "c": 2, "y": 5}`` returns
+    ``(0, slice(None), 4, slice(0, 10), slice(0, 10))``. The record would then
+    say "channel 2" while training reads all three channels, with nothing
+    reporting the difference. That is precisely the "record that says something
+    training will not do" this validator exists to keep out of the manifest, so
+    a plane on y, x or c is REFUSED.
+
+    This matters concretely because the annotator sends the viewer's current
+    selection, and that selection can include a channel. Refusing it tells the
+    frontend to drop c from what it sends; accepting it would have the record
+    and the pixels disagree forever.
+    """
+    # Only `None` and an EMPTY MAPPING mean "no plane". `0`, `""`, `False` and
+    # `[]` are all falsy and used to be swallowed as "none given", so a caller
+    # sending one got a silent no-op instead of being told its argument was not
+    # a mapping -- the quiet shape of wrongness this validator exists to refuse.
+    if planes is None:
+        return None
+    if not isinstance(planes, dict):
+        raise ValueError(
+            f"planes must be an object of axis name to index, not "
+            f"{type(planes).__name__}."
+        )
+    if not planes:
+        return None
+    names = [str(a) for a in (axes or [])]
+    shape = [int(n) for n in (level0_shape or [])]
+    if not names or not shape:
+        raise ValueError(
+            "planes was given but this source records no axis names or shape, so "
+            "an index cannot be checked against an axis; re-import the source."
+        )
+    if len(names) != len(shape):
+        raise ValueError(
+            f"this source records {len(names)} axis name(s) {names!r} and a shape "
+            f"of {len(shape)} dimension(s) {shape!r}; planes cannot be resolved "
+            f"against a layout that does not describe itself."
+        )
+    # Axis roles map a role to an axis INDEX, so the forbidden NAMES are the
+    # names sitting at those indices. Absent roles forbid nothing: a source that
+    # does not say which axis is y cannot have a plane refused for being y.
+    forbidden: Dict[str, str] = {}
+    for role, idx in (axis_roles or {}).items():
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            continue
+        if 0 <= idx < len(names):
+            forbidden[names[idx]] = str(role)
+
+    out: Dict[str, int] = {}
+    for key, value in planes.items():
+        name = str(key)
+        if name in forbidden:
+            role = forbidden[name]
+            raise ValueError(
+                f"planes names axis {name!r}, which is this source's "
+                f"{role!r} axis. A plane selects one slice of a NON-SPATIAL "
+                f"axis such as z or t; y and x are the crop, and the channel "
+                f"axis is read whole, so a plane on {name!r} would be recorded "
+                f"and then ignored -- the record would say one thing and "
+                f"training would do another."
+            )
+        if name not in names:
+            raise ValueError(
+                f"planes names axis {name!r}, which this source does not have. "
+                f"Its axes are {names!r}."
+            )
+        # STRICT on purpose: `int()` would turn 1.5 into slice 1 and True into
+        # slice 1, silently, which is the wrong-slice bug this field exists to
+        # prevent wearing a different hat. A plane must arrive as a whole
+        # number, and a caller sending anything else is told so rather than
+        # rounded into a plausible-looking answer.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a number. An index "
+                f"must be a whole number, not a string or a flag."
+            )
+        if not math.isfinite(float(value)):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a finite number. "
+                f"`inf` raises OverflowError and `nan` a message naming neither "
+                f"the axis nor the problem, so both are refused here instead."
+            )
+        if float(value) != int(value):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a whole number. "
+                f"There is no slice between two slices, and rounding one into "
+                f"the other would pick the wrong pixels silently."
+            )
+        index = int(value)
+        size = shape[names.index(name)]
+        if not 0 <= index < size:
+            raise ValueError(
+                f"planes[{name!r}]={index} is outside axis {name!r}, which has "
+                f"{size} element(s) (0..{size - 1})."
+            )
+        out[name] = index
+
+    # N4: a PARTIAL mapping used to be accepted -- {"t": 0} on a store whose z is
+    # 9 was recorded, and the reader then refused it at TRAINING time, which is
+    # exactly the "fails only when somebody trained on it" this validator claims
+    # to prevent. So once a caller names any plane, it must name them all: every
+    # axis that is neither spatial nor channel and has more than one element.
+    # An empty mapping is still fine -- that is "no plane recorded", which the
+    # reader refuses immediately and legibly.
+    # Only when the ROLES are known. Without them nothing is forbidden, so y, x
+    # and c would count as non-spatial and the rule would demand a plane for the
+    # crop axes themselves -- it broke six existing cases that way. The check is
+    # only as good as the layout, which is the same reason absent roles forbid
+    # nothing above.
+    if out and forbidden:
+        missing = [
+            n
+            for i, n in enumerate(names)
+            if n not in forbidden and n not in out and shape[i] > 1
+        ]
+        if missing:
+            raise ValueError(
+                f"planes names {sorted(out)} but leaves {missing!r} unset, and "
+                f"{'those axes have' if len(missing) > 1 else 'that axis has'} "
+                f"more than one element. A partial record is refused here rather "
+                f"than at training time: give every non-spatial axis a plane, or "
+                f"none at all."
+            )
+    return out or None
 
 
 def normalise_region(
