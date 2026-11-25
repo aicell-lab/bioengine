@@ -187,10 +187,20 @@ def level0_path(dataset_paths: Sequence[str]) -> str:
     return str(dataset_paths[0]).strip("/")
 
 
+# A whole-level read that nobody asked for is the exact thing this module exists
+# to avoid, and ``region`` is optional, so omitting it reaches a full download
+# through the region-aware path. 64 megapixels is ~8000x8000, which is a large
+# microscope field and a small fraction of a slide; the broker caps its own
+# materialisation path at 64 MiB for a comparable reason. A caller that really
+# wants a whole big level says so with ``allow_whole_level=True``.
+MAX_WHOLE_LEVEL_PIXELS = 64 * 1024 * 1024
+
+
 def read_region(
     source: Any,
     probe: Dict[str, Any],
     opener: Any = None,
+    allow_whole_level: bool = False,
 ) -> Any:
     """Read *source*'s region out of its store and return HxW or HxWxC.
 
@@ -211,6 +221,18 @@ def read_region(
                 f"result from a broker that returns the store layout."
             )
     shape = list(probe["level0_shape"])
+    roles = probe["axis_roles"]
+    if ref["region"] is None and not allow_whole_level:
+        # Refused BEFORE the open, so nothing is fetched to discover the size.
+        px = int(shape[int(roles["y"])]) * int(shape[int(roles["x"])])
+        if px > MAX_WHOLE_LEVEL_PIXELS:
+            raise RegionSourceError(
+                f"no region given and level 0 is "
+                f"{shape[int(roles['x'])]}x{shape[int(roles['y'])]} "
+                f"({px} pixels), above the {MAX_WHOLE_LEVEL_PIXELS}-pixel cap for "
+                f"a whole-level read. Pass a region, or allow_whole_level=True if "
+                f"the whole level really is wanted."
+            )
     index = region_index(probe["axis_roles"], len(shape), shape, ref["region"])
 
     if opener is None:

@@ -10,6 +10,19 @@ httpx
 # image (ngff_region.py). ENTRY ONLY, on purpose: the two GPU runtimes pin numpy
 # irreconcilably (cellpose 1.26.4 vs micro-sam's python-elf >=2), and the crop is
 # read where image references are already resolved, so neither runtime needs it.
-# Measured with pip --dry-run against this file: adds donfig + numcodecs + zarr.
+#
+# fsspec + aiohttp + requests are NOT optional here, and `pip install zarr` does
+# not bring them. zarr reaches an http(s) store through fsspec's HTTPFileSystem,
+# which imports requests and aiohttp at construction; without them every region
+# read dies at its first open with ModuleNotFoundError: fsspec, and then with
+# ImportError: HTTPFileSystem requires "requests" and "aiohttp". Measured in a
+# clean py3.11 venv holding only numpy+zarr, which is exactly what an earlier
+# version of this file described.
+#
+# The lesson in one line: `pip install --dry-run zarr` answers what RESOLVES, not
+# what WORKS. Opening a remote store is a capability, and it has to be exercised.
 zarr
+fsspec
+aiohttp
+requests
 pyyaml
