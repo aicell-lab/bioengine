@@ -706,7 +706,9 @@ class EntryApp:
     # stage state, and never retries indefinitely.
     _HTTP_RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0)
 
-    async def _http_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
+    async def _http_retry(
+        self, method: str, url: str, absent_is_final: bool = False, **kwargs
+    ) -> httpx.Response:
         """Issue a request on a presigned URL, retrying transient failures.
 
         Retries on 403/404/408/429/5xx and httpx transport errors with the
@@ -714,11 +716,18 @@ class EntryApp:
         status — callers keep their own handling (e.g. 404 -> FileNotFoundError,
         raise_for_status on a PUT). An exhausted retry loop must surface loudly.
 
+        ``absent_is_final`` drops 404 from the retried set, for a caller where a
+        missing object is an ANSWER rather than a symptom. Reading a chunked store
+        is the case: Zarr omits any chunk that is entirely the fill value, so a
+        sparse region — the normal shape for an annotation on a slide — would
+        otherwise spend the whole backoff, 30 seconds, per hole, to arrive at the
+        answer the first request already gave.
+
         If ``content`` is callable it is invoked fresh on every attempt to yield
         a new body — required for streamed uploads, whose async iterators are
         single-use and would be spent after a retry.
         """
-        retry_status = {403, 404, 408, 429}
+        retry_status = {403, 408, 429} if absent_is_final else {403, 404, 408, 429}
         body_factory = (
             kwargs.pop("content", None) if callable(kwargs.get("content")) else None
         )
@@ -811,7 +820,75 @@ class EntryApp:
 
         return await asyncio.to_thread(iio.imread, buffer)
 
-    async def _resolve_image(self, source: Union[np.ndarray, str]) -> np.ndarray:
+    # A region read is bounded by BYTES rather than by a chunk count, because the
+    # chunk count means nothing without the chunk size: 4 chunks of a 4096-square
+    # store is a 64 MB read, and 400 chunks of a 64-square one is under 2 MB. The
+    # limit refuses rather than clamping — a clamp would train on a different area
+    # than was annotated, silently.
+    _NGFF_REGION_BUDGET_BYTES = 512 * 1024 * 1024
+
+    async def _resolve_ngff_region(self, source: Dict[str, Any]) -> np.ndarray:
+        """Read the annotated region out of a remote OME-Zarr store.
+
+        The alternative this replaces is fetching the whole image, which bounds a
+        training run by what fits in memory and is the second most common cause of
+        training failures in production, because a materialised temporary object
+        expires between annotation and training. Here nothing is materialised: the
+        chunks the region covers are read straight from the source.
+        """
+        import ngff_store
+
+        kind = source.get("kind")
+        if kind != "ngff":
+            raise ValueError(
+                f"a dict image source must be an OME-Zarr source with kind 'ngff', "
+                f"got kind={kind!r}"
+            )
+        root = source.get("store_root") or ""
+        if not root:
+            raise ValueError("an OME-Zarr source needs a store_root to read from")
+        region = source.get("region")
+        if not region:
+            # A whole remote image is deliberately not supported on this path: it
+            # would be the full download this exists to avoid, arriving by a new
+            # route. Importing the image as a region is the supported way.
+            raise ValueError(
+                "an OME-Zarr source must carry the region to train on; reading a "
+                "whole remote image here would be the full download this path "
+                "exists to avoid"
+            )
+
+        async def get(url: str):
+            # absent_is_final: an omitted chunk is the fill value, not a symptom.
+            resp = await self._http_retry("GET", url, absent_is_final=True)
+            return resp.status_code, resp.content
+
+        opened = await ngff_store.open_level(
+            get, root, level=0, multiscale_path=source.get("multiscale_path")
+        )
+        max_chunks = ngff_store.max_chunks_for_budget(
+            opened["spec"], self._NGFF_REGION_BUDGET_BYTES
+        )
+        # Every non-spatial axis is pinned to 0: a training pair is one 2D plane,
+        # and ngff_region refuses rather than defaulting, so this is the one place
+        # that choice is made and it is made visibly.
+        index = {a: 0 for a in opened["axes"] if a not in ("y", "x")}
+        array, stats = await ngff_store.read_region(
+            get, opened, region, index=index, max_chunks=max_chunks
+        )
+        logger.info(
+            f"read a {region.get('width')}x{region.get('height')} region from "
+            f"{opened['array_url'].split('?')[0]}: {stats['chunks_fetched']} chunk(s) "
+            f"fetched, {stats['chunks_absent']} absent of {stats['chunks_planned']} "
+            f"planned"
+        )
+        return array
+
+    async def _resolve_image(
+        self, source: Union[np.ndarray, str, Dict[str, Any]]
+    ) -> np.ndarray:
+        if isinstance(source, dict):
+            return await self._resolve_ngff_region(source)
         if isinstance(source, str):
             return await self._load_image_from_source(source)
         if isinstance(source, np.ndarray):
@@ -1466,9 +1543,14 @@ class EntryApp:
     @bioengine.method
     async def start_training(
         self,
-        train_images: List[Union[np.ndarray, str]] = Field(
+        train_images: List[Union[np.ndarray, str, Dict[str, Any]]] = Field(
             ...,
-            description="Training images: arrays, http(s) URLs, or get_upload_url paths.",
+            description="Training images: arrays, http(s) URLs, get_upload_url paths, "
+            "or a remote OME-Zarr region as "
+            "{'kind': 'ngff', 'store_root': ..., 'multiscale_path': ..., "
+            "'region': {'x','y','width','height'}}. A region source reads only the "
+            "chunks that region covers, so a whole-slide image works and nothing is "
+            "downloaded whole; the region is required, in level-0 pixels.",
         ),
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
@@ -1476,7 +1558,7 @@ class EntryApp:
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
             "needs DENSE labels — annotate all objects per image.",
         ),
-        val_images: Optional[List[Union[np.ndarray, str]]] = Field(
+        val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
             None, description="Optional validation images."
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(

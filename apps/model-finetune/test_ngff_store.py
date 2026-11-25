@@ -232,3 +232,28 @@ def test_the_dimension_separator_from_the_metadata_is_the_one_used():
     out, stats = asyncio.run(main())
     assert stats["chunks_absent"] == 0, "every chunk 404'd: the separator was wrong"
     assert np.array_equal(out, expect[10:110, 10:110])
+
+
+def test_a_byte_budget_becomes_a_chunk_count_that_respects_the_chunk_size():
+    """A limit in chunks is meaningless without the chunk size: four chunks of a
+    4096-square store is a 64 MB read, four hundred of a 64-square one is under 2 MB.
+    So the caller states bytes and this converts."""
+    budget = 512 * 1024 * 1024
+    big = {"chunks": [4096, 4096], "dtype": "|u1"}      # 16 MiB per chunk
+    small = {"chunks": [64, 64], "dtype": "|u1"}        # 4 KiB per chunk
+    assert ns.max_chunks_for_budget(big, budget) == 32
+    assert ns.max_chunks_for_budget(small, budget) == budget // 4096
+    # A wider dtype costs proportionally more chunks' worth of budget.
+    assert ns.max_chunks_for_budget({"chunks": [4096, 4096], "dtype": "<u2"}, budget) == 16
+
+
+def test_a_budget_below_one_chunk_still_allows_one():
+    """One chunk is the least a region can cost, so a bound below it would turn the
+    limit into a hard failure for small budgets instead of a cap on large reads."""
+    assert ns.max_chunks_for_budget({"chunks": [4096, 4096], "dtype": "|u1"}, 1) == 1
+
+
+def test_a_nonsense_budget_or_chunk_is_refused():
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            ns.max_chunks_for_budget({"chunks": [8, 8], "dtype": "|u1"}, bad)

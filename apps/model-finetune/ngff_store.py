@@ -143,6 +143,28 @@ async def open_level(
     }
 
 
+def max_chunks_for_budget(spec: Dict[str, Any], budget_bytes: int) -> int:
+    """How many chunks fit in a byte budget, for this array's chunk size.
+
+    A limit expressed in chunks is meaningless without the chunk size — four chunks
+    of a 4096-square store is a 64 MB read, and four hundred of a 64-square one is
+    under 2 MB — so a caller should state a byte budget and convert it here.
+
+    Never returns 0: a budget smaller than a single chunk still allows one, because
+    refusing every possible read would make the limit a hard failure for small
+    budgets rather than a bound on large ones. One chunk is the minimum a region
+    can cost, so it is not a bound anyone can usefully go below.
+    """
+    import numpy as np
+
+    if int(budget_bytes) <= 0:
+        raise ValueError(f"the budget must be positive, got {budget_bytes!r}")
+    per_chunk = int(np.prod(spec["chunks"])) * np.dtype(spec["dtype"]).itemsize
+    if per_chunk <= 0:
+        raise ValueError(f"this array's chunk has no size: chunks={spec['chunks']!r}")
+    return max(1, int(budget_bytes) // per_chunk)
+
+
 async def read_region(
     get: Getter,
     opened: Dict[str, Any],
