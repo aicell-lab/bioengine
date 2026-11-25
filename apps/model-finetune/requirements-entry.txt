@@ -1,6 +1,21 @@
 # CPU entry: Hypha/S3 transport + training data materialization only.
-# numpy stays 2.x (matches the runtime for entry->runtime array passing);
-# no torch / micro-sam here.
+# No torch / micro-sam here.
+#
+# numpy MUST stay on whatever the worker image ships, and the entry env must not
+# install a numpy of its own. Measured on a deployed worker image (ray 2.55.1,
+# python 3.11.11): numpy 1.26.4, pandas 1.5.3, and a scipy and cupy compiled
+# against numpy 1.x headers. Anything that drags numpy 2.x into this overlay
+# shadows the image's numpy, and every one of those compiled modules then raises
+#
+#   ValueError: numpy.dtype size changed, may indicate binary incompatibility.
+#   Expected 96 from C header, got 88 from PyObject
+#
+# (96 is numpy 1.x's dtype basicsize, 88 is numpy 2.x's; built-against-1.x then
+# run-on-2.x is the unsupported direction.) ray.serve._private.utils imports
+# pandas unconditionally, so the replica cannot even be constructed: the
+# deployment goes DEPLOY_FAILED after three attempts with NO replica logs at all,
+# because it dies before logging starts. requirements-runtime.txt records the same
+# fact from the other side — the worker's ProxyDeployment runs numpy 1.x.
 numpy
 imageio>=2.37.0
 tifffile
@@ -10,6 +25,18 @@ httpx
 # image (ngff_region.py). ENTRY ONLY, on purpose: the two GPU runtimes pin numpy
 # irreconcilably (cellpose 1.26.4 vs micro-sam's python-elf >=2), and the crop is
 # read where image references are already resolved, so neither runtime needs it.
+#
+# `zarr<3` is load-bearing twice over, and a bare `zarr` is what broke it:
+#
+#  1. zarr 3.x declares `numpy>=2.0`, so it pulls numpy 2.x into this overlay and
+#     triggers the ABI break described above. Measured: a bare `zarr` resolved to
+#     zarr 3.1.6 + numpy 2.4.6 and the entry deployment went DEPLOY_FAILED; in
+#     that env even `import zarr` fails, through the image's cupy -> scipy. The
+#     same requirement list with `zarr<3` resolves to zarr 2.18.7 + numcodecs
+#     0.15.2 and installs NO numpy at all.
+#  2. the store wrapper in ngff_region.py is a MutableMapping, which is the zarr 2
+#     store interface. zarr 3 replaced it, so zarr 3 would need a different
+#     wrapper than the one the tests exercise.
 #
 # fsspec + aiohttp + requests are NOT optional here, and `pip install zarr` does
 # not bring them. zarr reaches an http(s) store through fsspec's HTTPFileSystem,
@@ -21,7 +48,7 @@ httpx
 #
 # The lesson in one line: `pip install --dry-run zarr` answers what RESOLVES, not
 # what WORKS. Opening a remote store is a capability, and it has to be exercised.
-zarr
+zarr<3
 fsspec
 aiohttp
 requests
