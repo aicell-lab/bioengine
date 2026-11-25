@@ -937,6 +937,57 @@ def require_caller_may_mutate(session_id: str, context: Any) -> None:
         )
 
 
+def caller_may_use_export(export_id: str, context: Any) -> bool:
+    """True iff *context* identifies the export's creator, or a ``bioimage-io``
+    admin.
+
+    An export id is a handle to a run's WEIGHTS: the READY record carries a
+    presigned `download_url` with six hours of life in it, plus the name of the
+    resumable checkpoint inside the package, and `push_export` streams the whole
+    package to any presigned URL a caller supplies. `export_model` is already
+    owner-or-admin, so this closes the gap between "who may start an export" and
+    "who may use its handle" -- which were not the same question.
+
+    Deliberately the SAME shape as :func:`caller_may_mutate`, including the two
+    properties that one learned the hard way:
+
+    * the admin test is reached for an OWNED export too, not only an ownerless
+      one, so an administrator is not refused their own stated authority;
+    * an export with no usable creator is admin-only. That covers an export
+      minted before this field existed, which cannot be attributed to anybody.
+      Those expire within hours, so the window in which a non-admin is refused
+      their own in-flight export is bounded and known rather than permanent.
+
+    Reads what is on disk through :func:`read_export` and CREATES NOTHING -- not
+    :func:`get_export`, which sweeps a stale record and WRITES. Asking about an
+    export that does not exist is therefore safe and answers False for a
+    non-admin, which is what lets the refusal be identical for "not yours" and
+    "no such export".
+    """
+    owner = read_export(export_id).get("_owner")
+    if isinstance(owner, str) and owner:
+        caller = caller_identity(context).get("owner")
+        if caller is not None and caller == owner:
+            return True
+        return caller_is_workspace_admin(context)
+    return caller_is_workspace_admin(context)
+
+
+def require_caller_may_use_export(export_id: str, context: Any) -> None:
+    """:func:`caller_may_use_export`, or raise :class:`NotTheOwner`.
+
+    The message says nothing about whether the export exists, who created it,
+    or whether the caller merely lacks admin. That is the point: an id is a
+    bearer capability, and a refusal that distinguished "not yours" from "no
+    such export" would turn this check into an oracle for guessing ids.
+    """
+    if not caller_may_use_export(export_id, context):
+        raise NotTheOwner(
+            "this export belongs to another caller; only the identity that "
+            "created it or a workspace administrator can use it"
+        )
+
+
 def redact_private(status: Dict[str, Any]) -> Dict[str, Any]:
     """Drop every private field, in place, and return the same dict.
 
