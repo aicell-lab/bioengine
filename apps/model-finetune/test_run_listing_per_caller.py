@@ -767,36 +767,97 @@ def test_EVERY_mutating_method_keyed_by_session_id_is_gated(method):
     assert flags and any(flags), f"{method} is not flagged as wanting the context"
 
 
-def test_no_OTHER_entry_method_takes_a_session_id_without_the_gate():
-    """Structural: every @bioengine.method whose signature has `session_id` is
-    either gated or listed here as a deliberate read-only exception. A new one
-    fails this until someone decides which it is."""
-    import pathlib
-    import re
+# Every published method whose signature takes a run id, and which rule applies.
+# A method absent from BOTH sets fails the structural test below, so adding one
+# forces a decision rather than inheriting whichever behaviour is default.
+GATED_BY_RUN_ID = {
+    "stop_training",  # cancels the run
+    "export_model",  # builds a publishable package from its checkpoint
+    "contribute",  # publishes its checkpoint into the shared pool
+    "start_training",  # only when resume_session_id is supplied; see the tests above
+}
+# Deliberate exceptions, each for a stated reason. `get_training_status` is the
+# documented position that a run id grants READ access to that run; infer and
+# compute_embedding take a session id to locate a MODEL, not to act on a run.
+READ_ONLY_BY_RUN_ID = {"get_training_status", "infer", "compute_embedding"}
 
+
+def _published_methods_taking_a_run_id(path):
+    """Names of `@bioengine.method`s whose signature takes a run id.
+
+    PARSED, not read through a line window. The previous version of this helper
+    looked at the first 30 lines after `async def` -- and `start_training`'s
+    signature runs 114 lines, with `resume_session_id` far past the window. So it
+    was missed entirely: absent from both sets and the test still green. A guard
+    that claims to cover every method must not have a shorter reach than the
+    methods it inspects.
+    """
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(path).read_text())
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        decorated = any(
+            "bioengine" in ast.dump(d) and "method" in ast.dump(d)
+            for d in node.decorator_list
+        )
+        if not decorated:
+            continue
+        a = node.args
+        names = [x.arg for x in (a.posonlyargs + a.args + a.kwonlyargs)]
+        if a.vararg:
+            names.append(a.vararg.arg)
+        if a.kwarg:
+            names.append(a.kwarg.arg)
+        if any("session_id" in n for n in names):
+            out.append(node.name)
+    return sorted(out)
+
+
+def test_no_OTHER_entry_method_takes_a_run_id_without_a_decision():
+    """Every published method taking a run id is gated or a listed exception."""
     import entry
 
-    src = pathlib.Path(entry.__file__).read_text()
-    lines = src.splitlines()
-    taking = []
-    for i, line in enumerate(lines):
-        m = re.match(r"\s+async def (\w+)\(", line)
-        if not m:
-            continue
-        block = "\n".join(lines[i : i + 30])
-        sig = block.split(") ->")[0] if ") ->" in block else block
-        if "session_id" in sig and "@bioengine.method" in lines[i - 1] + lines[i - 2]:
-            taking.append(m.group(1))
-    gated = {"stop_training", "export_model", "contribute"}
-    # Deliberate read-only exceptions. `get_training_status` is tracked as its
-    # own question (is a run id a bearer capability?); infer/compute_embedding
-    # read a model, not a run's ownership.
-    read_only = {"get_training_status", "infer", "compute_embedding"}
-    unaccounted = sorted(set(taking) - gated - read_only)
-    assert not unaccounted, (
-        f"method(s) taking a session_id that are neither gated nor a listed "
-        f"read-only exception: {unaccounted}. Decide which, then add it here."
+    taking = _published_methods_taking_a_run_id(entry.__file__)
+    assert taking, "the parser found no methods at all -- it is reading the wrong file"
+    assert "start_training" in taking, (
+        "start_training takes resume_session_id and must be found; if it is not, "
+        "the parser has regressed to a line-window scan"
     )
+    unaccounted = sorted(set(taking) - GATED_BY_RUN_ID - READ_ONLY_BY_RUN_ID)
+    assert not unaccounted, (
+        f"method(s) taking a run id that are neither gated nor a listed "
+        f"exception: {unaccounted}. Decide which, then add it to one of the two "
+        f"sets above. Found: {taking}"
+    )
+
+
+def test_that_structural_guard_CAN_fail(tmp_path):
+    """THE CONTROL. It reads a file, so it can silently measure the wrong thing.
+    Point it at a module with a long-signature method that is in neither set and
+    it must be found -- which is exactly the case the old 30-line window missed.
+    """
+    fake = tmp_path / "fake_entry.py"
+    padding = "\n".join(f"        arg{i}: int = 0," for i in range(60))
+    fake.write_text(
+        "class EntryApp:\n"
+        "    @bioengine.method\n"
+        "    async def a_new_method(\n"
+        "        self,\n" + padding + "\n"
+        "        session_id: str = '',\n"
+        "    ) -> dict:\n"
+        "        pass\n"
+    )
+    found = _published_methods_taking_a_run_id(str(fake))
+    assert found == [
+        "a_new_method"
+    ], f"the parser missed a method whose run id sits past a 60-line signature: {found}"
+    assert not (
+        set(found) & (GATED_BY_RUN_ID | READ_ONLY_BY_RUN_ID)
+    ), "the control's method must be in neither set, or it proves nothing"
 
 
 # ── resuming reads another run's CHECKPOINT, so it is gated too ─────────────
