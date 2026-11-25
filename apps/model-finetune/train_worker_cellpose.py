@@ -22,7 +22,6 @@ import threading
 import time
 import traceback
 
-import epoch_progress
 import training
 
 
