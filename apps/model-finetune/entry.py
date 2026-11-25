@@ -1274,20 +1274,34 @@ class EntryApp:
     async def _preparing_heartbeat(
         self, session_id: str, interval: float = 60.0
     ) -> None:
-        """Refresh status.json's ``updated_at`` while a run is still PREPARING.
+        """Refresh status.json's ``updated_at`` while a run is PREPARING or QUEUED.
 
         Nothing between the PREPARING write and the runtime's TRAINING write
         reports progress — input resolution, a cold runtime replica coming up,
         the GPU lock — so on a cold instance that span can exceed
         STATUS_STALE_SECONDS and get_status sweeps a healthy run to STOPPED.
-        Exits as soon as the status moves on, so a wedged TRAINING run is still
-        swept; the worker's own heartbeat covers that phase.
+
+        **QUEUED is covered too, and that is not cosmetic.** The semaphore
+        caps concurrent trainings at one by default, so a second run waits here
+        for as long as the first one trains — routinely far longer than the
+        stale window. Nothing else refreshes the record in that phase, so
+        without this the operator listing marks a perfectly healthy queued run
+        as stale, i.e. "probably dead", and the obvious response to that is to
+        stop somebody's valid job. Covering QUEUED is what makes a stale QUEUED
+        record mean what it claims: the replica that was waiting is gone.
+
+        Exits as soon as the status moves beyond those two, so a wedged
+        TRAINING run is still swept; the worker's own heartbeat covers that
+        phase.
         """
         import training
 
         while True:
             await asyncio.sleep(interval)
-            if training.read_status(session_id).get("status") != "PREPARING":
+            if training.read_status(session_id).get("status") not in (
+                "PREPARING",
+                "QUEUED",
+            ):
                 return
             training.write_status(session_id)
 
@@ -1360,7 +1374,10 @@ class EntryApp:
             # one replica, not two.
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
-            # so a session waiting here is not false-flagged STOPPED.
+            # so a session waiting here is not false-flagged STOPPED -- but the
+            # record still has to be refreshed while it waits, or the operator
+            # listing reports a healthy queued run as stale. That is what
+            # `_preparing_heartbeat` covers; it runs through this phase.
             if self._training_sem.locked():
                 training.write_status(
                     session_id,

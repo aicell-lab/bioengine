@@ -319,3 +319,98 @@ def test_an_UNREADABLE_record_is_reported_but_marked(operator_root):
     rec = out.get("2026-11-25-100000-ffffffff")
     assert rec is not None, "an unreadable record vanished from the operator view"
     assert rec["stale"] is True, f"an unreadable record is not marked stale: {rec}"
+
+
+# ── a queued run is not a dead one ───────────────────────────────────────────
+
+
+def test_a_run_QUEUED_longer_than_the_stale_window_is_NOT_marked_stale(operator_root):
+    """The defect the staleness mark introduced, and the reason it mattered.
+
+    The semaphore caps concurrent trainings at one by default, so a second run
+    waits in QUEUED for as long as the first one trains -- routinely far longer
+    than the ten-minute stale window. Marking it stale told the operator that a
+    perfectly healthy queued job was "probably dead", and the obvious response
+    to that is to stop somebody's valid run. That is a worse failure than the
+    blindness this listing was built to fix, because it invites an action.
+
+    The record is refreshed while a run is QUEUED, so a fresh timestamp on a
+    queued run is the normal case and must read as live.
+    """
+    _write_run(
+        operator_root,
+        "2026-11-25-100000-00000001",
+        status="QUEUED",
+        updated_at=time.time(),  # the heartbeat has been refreshing it
+    )
+    rec = training.non_terminal_runs()["2026-11-25-100000-00000001"]
+    assert rec["status"] == "QUEUED"
+    assert (
+        rec["stale"] is False
+    ), f"a queued run whose record is being refreshed is reported dead: {rec}"
+
+
+def test_the_HEARTBEAT_KEEPS_RUNNING_while_a_run_is_QUEUED():
+    """What makes the test above true of the running system, not just of a fixture.
+
+    A fresh timestamp on a queued run is only the normal case if something
+    refreshes it. Nothing else does: the PREPARING write happens once, the
+    QUEUED write happens once, and the runtime does not write again until
+    TRAINING. So the heartbeat has to span both phases, and this reads that
+    from the source rather than trusting the comment.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).with_name("entry.py").read_text()
+    tree = ast.parse(src)
+    fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "_preparing_heartbeat":
+                fn = node
+                break
+    assert fn is not None, "_preparing_heartbeat not found"
+    body = ast.get_source_segment(src, fn) or ""
+    assert '"QUEUED"' in body or "'QUEUED'" in body, (
+        "the heartbeat no longer covers the QUEUED phase, so a run waiting for "
+        "the GPU stops being refreshed and the operator listing will report it "
+        "as stale while it is perfectly healthy"
+    )
+
+
+def test_an_UNUSABLE_timestamp_does_not_break_the_whole_listing(operator_root):
+    """One bad record must not take the operator view down with it.
+
+    The arithmetic on `updated_at` was unguarded, so a non-numeric value raised
+    a TypeError out of the whole listing -- which is the opposite of what this
+    view is for, and contradicts what the junk-directory test already promises.
+    """
+    _write_run(operator_root, "2026-11-25-100000-00000002", status="TRAINING")
+    # TRAINING with an unusable timestamp: the existing stale sweep treats it
+    # as maximally quiet and moves it to STOPPED, so it is terminal and
+    # correctly absent from an ACTIVE listing.
+    d = operator_root / "2026-11-25-100000-00000003"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "status.json").write_text(
+        json.dumps({"status": "TRAINING", "updated_at": "not a number"})
+    )
+    # QUEUED is exempt from that sweep, so this one reaches the projection and
+    # exercises the guard there rather than the one in `get_status`.
+    d2 = operator_root / "2026-11-25-100000-00000004"
+    d2.mkdir(parents=True, exist_ok=True)
+    (d2 / "status.json").write_text(
+        json.dumps({"status": "QUEUED", "updated_at": [1, 2, 3]})
+    )
+
+    out = training.non_terminal_runs()  # must not raise
+
+    assert "2026-11-25-100000-00000002" in out, "the healthy run vanished"
+    assert "2026-11-25-100000-00000003" not in out, (
+        "a TRAINING record with no usable timestamp should be swept to STOPPED "
+        "and so absent from an ACTIVE listing"
+    )
+    bad = out.get("2026-11-25-100000-00000004")
+    assert bad is not None, "the queued record with the bad timestamp vanished"
+    assert bad["stale"] is True, f"an unusable timestamp should read as stale: {bad}"
+    assert bad["stale_for_s"] is None, bad

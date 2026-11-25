@@ -753,6 +753,27 @@ OPERATOR_FIELDS = (
 )
 
 
+def quiet_seconds(record: Dict[str, Any]) -> float:
+    """How long since *record* was last written, by its own ``updated_at``.
+
+    Returns infinity when there is no usable timestamp, so a record with none
+    reads as maximally stale -- the safe direction for every caller here, all
+    of which use this to decide whether something has gone quiet.
+
+    It exists because the arithmetic was written inline in three places as
+    ``time.time() - record.get("updated_at", 0)``, which raises TypeError on a
+    non-numeric value and takes the whole read down with it. `get_status` is on
+    every run-reading path, so one malformed record would have made the run
+    listing, the status call and the operator view all raise rather than
+    skipping the bad record. Booleans are rejected explicitly: `True` is an
+    `int` to `isinstance` and would otherwise be read as a timestamp of 1.
+    """
+    stamped = record.get("updated_at")
+    if isinstance(stamped, bool) or not isinstance(stamped, (int, float)):
+        return float("inf")
+    return time.time() - stamped
+
+
 def operator_view(status: Dict[str, Any]) -> Dict[str, Any]:
     """Project a run record down to what an operator may see, plus staleness.
 
@@ -772,12 +793,17 @@ def operator_view(status: Dict[str, Any]) -> Dict[str, Any]:
     """
     out = {k: status[k] for k in OPERATOR_FIELDS if k in status}
     state = status.get("status")
-    quiet_for = time.time() - status.get("updated_at", 0)
+    # A non-numeric `updated_at` must not take the whole operator listing down
+    # with a TypeError. This view exists to stay readable when things are
+    # wrong, and the listing it sits in already promises that a junk directory
+    # does not break it. An unusable timestamp is treated as no timestamp,
+    # which reads as stale -- the safe direction for an operator.
+    quiet_for = quiet_seconds(status)
     out["stale"] = bool(
         state is None or state == "UNKNOWN" or quiet_for > STATUS_STALE_SECONDS
     )
     if out["stale"]:
-        out["stale_for_s"] = round(quiet_for, 1) if status.get("updated_at") else None
+        out["stale_for_s"] = None if quiet_for == float("inf") else round(quiet_for, 1)
     return out
 
 
@@ -898,7 +924,7 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
     # A run with no live thread that hasn't updated in a while is stale → stopped.
     if (
         st.get("status") in ("PREPARING", "TRAINING")
-        and time.time() - st.get("updated_at", 0) > STATUS_STALE_SECONDS
+        and quiet_seconds(st) > STATUS_STALE_SECONDS
     ):
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
@@ -1040,7 +1066,7 @@ def get_export(export_id: str) -> Dict[str, Any]:
     if (
         rec
         and rec.get("status") in ("PENDING", "BUILDING")
-        and time.time() - rec.get("updated_at", 0) > STATUS_STALE_SECONDS
+        and quiet_seconds(rec) > STATUS_STALE_SECONDS
     ):
         rec["status"] = "FAILED"
         rec["message"] = "failed"
