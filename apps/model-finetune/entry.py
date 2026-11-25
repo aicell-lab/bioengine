@@ -859,9 +859,30 @@ class EntryApp:
             )
 
         async def get(url: str):
+            from http.client import IncompleteRead
+
             # absent_is_final: an omitted chunk is the fill value, not a symptom.
             resp = await self._http_retry("GET", url, absent_is_final=True)
-            return resp.status_code, resp.content
+            content = resp.content
+            # A SHORT READ HAS TO BE CAUGHT HERE, because the decoder cannot catch
+            # it. Measured against real numcodecs: a blosc chunk truncated to half
+            # its length decodes to the FULL declared size with WRONG bytes and
+            # raises nothing — [0, 114, 105, 116, 101, …] where [0, 1, 2, 3, 4, …]
+            # was written — so the decoder's size check passes and corrupt pixels
+            # become training data. Content-Length is the last place the truncation
+            # is still visible.
+            #
+            # Deliberately not _get_verified, which is the same check plus
+            # raise_for_status: here a 404 is DATA (an omitted chunk is the fill
+            # value) and must reach the caller as a status, not an exception.
+            declared = resp.headers.get("Content-Length")
+            if (
+                200 <= resp.status_code < 300
+                and declared is not None
+                and len(content) != int(declared)
+            ):
+                raise IncompleteRead(content, int(declared) - len(content))
+            return resp.status_code, content
 
         opened = await ngff_store.open_level(
             get, root, level=0, multiscale_path=source.get("multiscale_path")

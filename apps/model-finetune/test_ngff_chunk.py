@@ -183,3 +183,63 @@ def test_end_to_end_a_region_read_from_a_chunked_store_matches_a_direct_slice():
     assert len(fetched) == plan["chunks_touched"]
     assert len(fetched) < ny * nx, "the region read every chunk in the store"
     assert hole in fetched, "the sparse chunk was not even attempted"
+
+
+def test_a_real_blosc_chunk_decodes_through_numcodecs():
+    """The decode path against the ACTUAL library, not a fake.
+
+    Every other codec test here injects a recording stand-in, which proves the
+    plumbing calls the right ids in the right order and nothing about whether a
+    real compressed chunk comes back correct. Skipped rather than failed where
+    numcodecs is absent — this app installs it in the entry environment, but a bare
+    checkout need not have it, and a test that cannot run must say so rather than
+    pass quietly.
+    """
+    numcodecs = pytest.importorskip("numcodecs", reason="numcodecs is not installed")
+    spec = nc.parse_zarray(dict(BASE, compressor={"id": "blosc"}))
+    block = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    raw = numcodecs.get_codec({"id": "blosc"}).encode(block.tobytes())
+    assert raw != block.tobytes(), "the fixture is not actually compressed"
+    out = nc.decode_chunk(raw, spec)
+    assert np.array_equal(out, block)
+
+
+def test_a_truncated_blosc_chunk_is_NOT_detectable_here_which_is_why_the_fetch_checks():
+    """A LIMITATION, pinned deliberately — and it is the reason the transport has to
+    verify the body length.
+
+    Measured against real numcodecs 0.12.1: a blosc chunk truncated to half its
+    length decodes WITHOUT RAISING and to the full declared size, with wrong
+    content — [0, 114, 105, 116, 101, 0, 0, 0] where [0, 1, 2, 3, 4, 5, 6, 7] was
+    written. So the size check in decode_chunk passes, and nothing downstream can
+    tell those pixels from real ones.
+
+    The defence therefore cannot live here: it is in the chunk fetch, which compares
+    the body against Content-Length, the last point at which the truncation is still
+    visible. This test exists so that if a later numcodecs DOES start raising, it
+    fails and tells us the defence could move closer to the data.
+    """
+    numcodecs = pytest.importorskip("numcodecs", reason="numcodecs is not installed")
+    spec = nc.parse_zarray(dict(BASE, compressor={"id": "blosc"}))
+    block = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    raw = numcodecs.get_codec({"id": "blosc"}).encode(block.tobytes())
+    out = nc.decode_chunk(raw[: len(raw) // 2], spec)
+    assert out.shape == (4, 4), "a truncated chunk no longer yields a full chunk"
+    assert not np.array_equal(out, block), (
+        "numcodecs now appears to reconstruct a truncated chunk exactly; if it "
+        "instead started RAISING, this test fails and the defence can move"
+    )
+
+
+def test_a_real_gzip_filter_chain_undoes_in_the_right_order():
+    """Filters plus a compressor, for real: written compressor-last, undone
+    compressor-first."""
+    numcodecs = pytest.importorskip("numcodecs", reason="numcodecs is not installed")
+    spec = nc.parse_zarray(
+        dict(BASE, compressor={"id": "blosc"}, filters=[{"id": "zlib"}])
+    )
+    block = (np.arange(16, dtype=np.uint8) * 3).reshape(4, 4)
+    staged = numcodecs.get_codec({"id": "zlib"}).encode(block.tobytes())
+    raw = numcodecs.get_codec({"id": "blosc"}).encode(staged)
+    out = nc.decode_chunk(raw, spec)
+    assert np.array_equal(out, block)
