@@ -442,7 +442,9 @@ def _store_age(reference: Path, target: os.stat_result) -> float:
     return reference.stat().st_mtime - target.st_mtime
 
 
-def _reap_stale_mutex(run_dir: Path, mutex: Path, unique: Path, judged_ino: int) -> bool:
+def _reap_stale_mutex(
+    run_dir: Path, mutex: Path, unique: Path, judged_ino: int
+) -> bool:
     """Replace a stale mutex with THIS writer's lock. True if we now hold it.
 
     Reaping by removing the stale file cannot be made safe. Two designs tried

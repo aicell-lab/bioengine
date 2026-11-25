@@ -507,12 +507,14 @@ def test_the_RELEASE_does_not_delete_a_SUCCESSORS_mutex(run_dir, monkeypatch):
         "the overrunning holder's release deleted the SUCCESSOR's mutex, which "
         "lets a third writer into the successor's critical section"
     )
-    assert mutex.stat().st_ino == successor_ino, (
-        "the mutex at the path is no longer the successor's file"
-    )
+    assert (
+        mutex.stat().st_ino == successor_ino
+    ), "the mutex at the path is no longer the successor's file"
 
 
-def test_an_ABANDONED_lock_is_reaped_when_the_FILE_CLOCK_RUNS_AHEAD(run_dir, monkeypatch):
+def test_an_ABANDONED_lock_is_reaped_when_the_FILE_CLOCK_RUNS_AHEAD(
+    run_dir, monkeypatch
+):
     """The store's clock is not this process's clock, and the lock must not care.
 
     On an NFS share, mtime is set by the SERVER. Measured on the de.NBI export
