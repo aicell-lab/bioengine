@@ -74,9 +74,9 @@ def test_anonymity_is_NOT_inferred_from_the_shape_of_the_id():
     day it changes, so only the flag counts."""
     got = training.caller_identity({"user": {"id": "ws-user-anonymouz-9f3a"}})
     assert got["owner"] == "ws-user-anonymouz-9f3a"
-    assert got["owner_anonymous"] is None, (
-        "anonymity was inferred from the id rather than read from the flag"
-    )
+    assert (
+        got["owner_anonymous"] is None
+    ), "anonymity was inferred from the id rather than read from the flag"
     # and the converse: a real-looking id with the flag set IS anonymous
     got2 = training.caller_identity(
         {"user": {"id": "github|49943582", "is_anonymous": True}}
@@ -152,9 +152,9 @@ def test_THE_PUBLIC_READ_PATH_DOES_NOT_RETURN_THE_OWNER(sessions):
     assert "owner_anonymous" not in public
     listed = training.list_sessions()
     assert "s3" in listed, "the run vanished from the listing entirely"
-    assert "owner" not in listed["s3"], (
-        f"list_sessions publishes the owner: {listed['s3']}"
-    )
+    assert (
+        "owner" not in listed["s3"]
+    ), f"list_sessions publishes the owner: {listed['s3']}"
 
 
 def test_a_caller_THAT_ASKS_can_still_read_the_owner(sessions):
@@ -213,6 +213,7 @@ def _capture_preparing_write(monkeypatch):
     cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
     inst = object.__new__(cls)
     inst._enabled_backends = {"microsam", "cellpose"}
+
     async def _async_none(*a, **k):
         return None
 
@@ -224,6 +225,7 @@ def _capture_preparing_write(monkeypatch):
     # harness fault that looks nothing like the thing under test.
     inst._check_runtime_available = _async_none
     inst._resolve_pool_init = _async_pool
+
     async def _async_gpu(*a, **k):
         # `available: False` so the VRAM floor check is skipped -- this harness
         # is about attribution, not about placement.
@@ -241,9 +243,9 @@ async def test_entry_passes_the_INJECTED_caller_to_the_write(monkeypatch):
     with pytest.raises(_Stop):
         await fn(inst, train_images=["a.tif"], train_labels=["b.tif"], context=ctx)
     assert seen.get("status") == "PREPARING", seen
-    assert seen.get("owner") == "github|49943582", (
-        f"start_training did not pass the injected caller to the write: {seen}"
-    )
+    assert (
+        seen.get("owner") == "github|49943582"
+    ), f"start_training did not pass the injected caller to the write: {seen}"
     assert seen.get("owner_anonymous") is False
 
 
@@ -257,21 +259,33 @@ async def test_entry_passes_NOTHING_when_there_is_no_caller(monkeypatch):
     assert seen.get("owner") is None, seen
 
 
-# ── the decorator itself: context must be INJECTED, never client-supplied ─────
+# ── the decorator: without it, every run records NO owner, silently ───────────
 #
-# This replaces a test I deleted, and deleting it was the worse mistake of the
-# two. The old one grepped entry.py for `@bioengine.method(context=True)`; I
-# removed it as "another substring grep" and put nothing in its place, so
-# reverting the decorator passed the whole file. The behavioural tests cannot
-# see it either, because they pass `context=` straight to the function and so
-# cannot tell an injected context from a client-supplied one.
+# This replaces a test that was deleted and not replaced. The old one grepped
+# entry.py for `@bioengine.method(context=True)`; it was removed as "another
+# substring grep", which left nothing asserting the decorator at all, so
+# reverting it passed the whole file. The behavioural tests above cannot cover
+# it either: they pass `context=` straight to the function, so they cannot tell
+# an injected context from a client-supplied one.
 #
-# The consequence is not merely that no owner is recorded. With `context=True`,
-# the framework strips `context` from the schema Hypha publishes, so a client
-# CANNOT send it. Without it, the parameter is published and anyone could pass
-# context={"user": {"id": "<somebody else>"}} and file a run under that name --
-# which the per-caller filter would then show to the victim. So this asserts the
-# effect on the published schema, not the presence of the decorator's text.
+# What reverting the decorator actually does, traced through the transport
+# rather than inferred from the schema: the proxy forwards a context to the
+# method only `if wants_context` (bioengine/apps/proxy_deployment.py), which the
+# decorator sets. Without it the method's `context` parameter keeps its default
+# of None, and EVERY run is recorded with no owner -- so a per-caller listing
+# degrades to showing nothing rather than to showing the wrong thing. It is
+# silent: nothing raises, and the runs still train.
+#
+# It is NOT an impersonation vector, though the published schema makes it look
+# like one. Reverting the decorator does leave `context` in the schema Hypha
+# publishes, so a client can send one; but the proxy service is registered with
+# `require_context: True`, and hypha_rpc assigns `kwargs["context"] = data["ctx"]`
+# after parsing the client's kwargs and before dispatch, overwriting whatever the
+# client sent. A client cannot forge an owner by this route. Stated here because
+# the schema is one hop and the slot the value lands in is another, and reading
+# only the first gives the wrong answer with full confidence.
+#
+# So these assert the effect, not the decorator's text.
 
 
 def _start_training_attr():
@@ -284,8 +298,10 @@ def _start_training_attr():
 
 
 def test_context_is_NOT_in_the_schema_hypha_publishes_to_clients():
-    """The whole protection: a parameter absent from the published schema is one
-    a client cannot set, which is what makes the recorded owner trustworthy."""
+    """`context` absent from the published schema is the visible signature of the
+    decorator being in place. It is not itself the protection -- the transport
+    overwrites a client-sent context either way -- but it is the cheapest thing
+    to assert that cannot be true unless the method was declared correctly."""
     fn = _start_training_attr()
     schema = getattr(fn, "__schema__", None)
     assert schema, "start_training carries no __schema__ to check"
@@ -296,9 +312,11 @@ def test_context_is_NOT_in_the_schema_hypha_publishes_to_clients():
         f"{sorted(props)[:8]}"
     )
     assert "context" not in props, (
-        "`context` is published to clients, so a caller can supply its own "
-        "identity and record a run as somebody else. start_training must be "
-        "declared @bioengine.method(context=True), which strips it."
+        "`context` is in the published schema, which means start_training was "
+        "NOT declared @bioengine.method(context=True). The proxy forwards a "
+        "context only when that flag is set, so every run would be recorded "
+        "with owner=None and a per-caller listing would show nobody anything. "
+        "Nothing raises when this is wrong."
     )
 
 
