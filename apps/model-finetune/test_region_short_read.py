@@ -326,38 +326,3 @@ def test_the_store_is_read_only():
         asyncio.run(store.set("x", b"y"))
     with pytest.raises(ngff_region.RegionSourceError):
         asyncio.run(store.delete("x"))
-
-
-# ── the byte-range slicing, which is new code and can return WRONG bytes ─────
-
-
-@pytest.mark.parametrize(
-    "make, expected",
-    [
-        (lambda m: None, b"0123456789"),
-        (lambda m: m.RangeByteRequest(2, 5), b"234"),
-        (lambda m: m.OffsetByteRequest(7), b"789"),
-        (lambda m: m.SuffixByteRequest(3), b"789"),
-    ],
-)
-def test_every_byte_range_variant_slices_correctly(make, expected):
-    """Each variant explicitly, because a wrong slice returns plausible bytes
-    rather than an error."""
-    import zarr.abc.store as zs
-
-    cls = ngff_region._length_checked_store_class()
-    assert cls._slice(b"0123456789", make(zs)) == expected
-
-
-def test_an_unknown_byte_range_request_is_REFUSED_not_ignored():
-    """The tempting fallback is to ignore an unrecognised request and return the
-    whole object. That hands a caller that asked for a slice the wrong bytes,
-    silently, which is this module's whole subject."""
-    cls = ngff_region._length_checked_store_class()
-
-    class _Future:  # a variant this code has never seen
-        pass
-
-    with pytest.raises(ngff_region.RegionSourceError) as e:
-        cls._slice(b"0123456789", _Future())
-    assert "_Future" in str(e.value)

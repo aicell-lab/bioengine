@@ -455,12 +455,7 @@ def _length_checked_store_class() -> Any:
 
     import asyncio
 
-    from zarr.abc.store import (
-        OffsetByteRequest,
-        RangeByteRequest,
-        Store,
-        SuffixByteRequest,
-    )
+    from zarr.abc.store import Store
 
     class _LengthCheckedStore(Store):  # type: ignore[misc]
         """A read-only Zarr store that supplies bytes and refuses a bad length.
@@ -511,15 +506,31 @@ def _length_checked_store_class() -> Any:
             return f"LengthCheckedStore({redact_store_credential(self._root)!r})"
 
         # ── the one method that does the work ─────────────────────────────
-        def _get_whole(self, key: str) -> Optional[bytes]:
-            """The whole object's bytes, or ``None`` when it is absent.
+        def _get_bytes(
+            self, key: str, range_header: Optional[str] = None
+        ) -> Optional[bytes]:
+            """The object's bytes, or the requested RANGE of them, or ``None``.
 
             ``None`` rather than an error because zarr omits a chunk that is
             entirely the fill value, so absence is DATA. A store that raised here
             would turn every sparse source into a failed read.
+
+            **Why the range goes to the server instead of being applied here.**
+            Sharding is the normal layout for OME-NGFF v0.5 whole-slide data:
+            many small inner chunks packed into one large shard object with an
+            index at its end. zarr reads such an array by asking for a suffix
+            range (the index) and then a range per inner chunk. Fetching the
+            whole object and slicing locally returns the RIGHT pixels, so nothing
+            fails — while pulling the entire shard down once per inner chunk.
+            Measured on exactly that mistake: a 1 MB+ single-shard store answered
+            a 128x128 crop with the whole shard fetched TWICE and not one Range
+            header sent. A multi-gigabyte shard makes that ruinous, and it is
+            precisely what this module exists not to do.
             """
             try:
-                status, body, declared, wire = self._fetch(self._root + str(key))
+                status, body, declared, wire = self._fetch(
+                    self._root + str(key), range_header
+                )
             except ShortStoreRead as exc:
                 # The transport caught it first — the common case and the
                 # stronger one, since a connection that went away mid-body is
@@ -544,6 +555,23 @@ def _length_checked_store_class() -> Any:
                 raise RegionSourceError(
                     redact_store_credential(
                         f"store key {key!r} returned HTTP {status}"
+                    )
+                )
+            if range_header is not None and int(status) != 206:
+                # The server ignored the Range and sent the WHOLE object. Slicing
+                # it here would be CORRECT and would cost a full download per
+                # inner chunk, silently — the sharding cost described above, just
+                # moved. Refuse instead and say so, rather than succeed
+                # expensively: a store this reader cannot read economically is a
+                # fact the caller needs, and a multi-gigabyte shard fetched per
+                # chunk is not a smaller problem than a failed read.
+                raise RegionSourceError(
+                    redact_store_credential(
+                        f"store key {key!r}: asked for range {range_header!r} and "
+                        f"the server answered HTTP {status} with the whole "
+                        f"object instead of 206. This store cannot be read one "
+                        f"region at a time, because every inner chunk of a "
+                        f"sharded array would cost a full download of its shard."
                     )
                 )
             want: Optional[int]
@@ -572,36 +600,17 @@ def _length_checked_store_class() -> Any:
                 )
             return body
 
-        @staticmethod
-        def _slice(body: bytes, byte_range: Any) -> bytes:
-            """Apply zarr's byte-range request to an object already fetched.
-
-            Every variant is handled explicitly and an unknown one REFUSES. The
-            tempting fallback — ignore it and hand back the whole object — would
-            return the wrong bytes to a caller that asked for a slice, silently,
-            which is the exact failure class this module exists to prevent.
-            """
-            if byte_range is None:
-                return body
-            if isinstance(byte_range, RangeByteRequest):
-                return body[byte_range.start : byte_range.end]
-            if isinstance(byte_range, OffsetByteRequest):
-                return body[byte_range.offset :]
-            if isinstance(byte_range, SuffixByteRequest):
-                return body[-byte_range.suffix :]
-            raise RegionSourceError(
-                f"unsupported byte range request "
-                f"{type(byte_range).__name__}: refusing, rather than returning "
-                f"the whole object, which would be the wrong bytes."
-            )
-
         async def get(
             self, key: str, prototype: Any, byte_range: Any = None
         ) -> Any:
-            body = await asyncio.to_thread(self._get_whole, key)
+            # The range is asked of the SERVER, never applied locally. See
+            # _range_header and the sharding note in _get_bytes.
+            body = await asyncio.to_thread(
+                self._get_bytes, key, _range_header(byte_range)
+            )
             if body is None:
                 return None
-            return prototype.buffer.from_bytes(self._slice(body, byte_range))
+            return prototype.buffer.from_bytes(body)
 
         async def get_partial_values(
             self, prototype: Any, key_ranges: Any
@@ -612,7 +621,7 @@ def _length_checked_store_class() -> Any:
             return out
 
         async def exists(self, key: str) -> bool:
-            return (await asyncio.to_thread(self._get_whole, key)) is not None
+            return (await asyncio.to_thread(self._get_bytes, key, None)) is not None
 
         # ── what this store deliberately does NOT do ──────────────────────
         @property
@@ -670,7 +679,43 @@ def LengthCheckedStore(root: str, fetch: Optional[Any] = None) -> Any:
 
 
 
-def _http_fetch(url: str):
+def _range_header(byte_range: Any) -> Optional[str]:
+    """zarr's byte-range request as an HTTP ``Range`` header value, or ``None``.
+
+    Every variant is handled explicitly and an unknown one REFUSES. Both of the
+    tempting fallbacks are wrong in their own way, which is why neither is taken:
+    sending no Range fetches the whole object, and for a sharded array that is a
+    full shard download per inner chunk; guessing a range reads the WRONG bytes,
+    which decode without complaint.
+
+    ``RangeByteRequest`` is end-EXCLUSIVE and HTTP ranges are end-INCLUSIVE, so
+    the ``- 1`` is load-bearing: without it every ranged read is one byte long and
+    lands one byte past where it should end.
+    """
+    if byte_range is None:
+        return None
+
+    from zarr.abc.store import (
+        OffsetByteRequest,
+        RangeByteRequest,
+        SuffixByteRequest,
+    )
+
+    if isinstance(byte_range, RangeByteRequest):
+        return f"bytes={byte_range.start}-{byte_range.end - 1}"
+    if isinstance(byte_range, OffsetByteRequest):
+        return f"bytes={byte_range.offset}-"
+    if isinstance(byte_range, SuffixByteRequest):
+        return f"bytes=-{byte_range.suffix}"
+    raise RegionSourceError(
+        f"unsupported byte range request {type(byte_range).__name__}: refusing. "
+        f"Sending no range would fetch the whole object, and for a sharded array "
+        f"that is a full shard per inner chunk; guessing one would read the wrong "
+        f"bytes."
+    )
+
+
+def _http_fetch(url: str, range_header: Optional[str] = None):
     """GET a store key, returning ``(status, body, declared_length, wire_length)``.
 
     httpx is lazy here for the same reason zarr is: this module is imported by a
@@ -697,14 +742,17 @@ def _http_fetch(url: str):
     """
     import httpx
 
+    # Ask for no transfer encoding, so the body we measure and the body zarr
+    # decodes are the same bytes. See the docstring.
+    headers = {"Accept-Encoding": "identity"}
+    if range_header is not None:
+        headers["Range"] = range_header
     try:
         resp = httpx.get(
             url,
             timeout=60.0,
             follow_redirects=True,
-            # Ask for no transfer encoding, so the body we measure and the body
-            # zarr decodes are the same bytes. See the docstring.
-            headers={"Accept-Encoding": "identity"},
+            headers=headers,
         )
     except httpx.RemoteProtocolError as exc:
         # "peer closed connection without sending complete message body
