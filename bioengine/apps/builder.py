@@ -45,6 +45,7 @@ from bioengine._app.bootstrap import (
     _ensure_jsonable,
     build_and_run_application,
     introspect_app_in_ray_task,
+    stage_app_source_in_ray_task,
     validate_kwargs_against_spec,
 )
 from bioengine._app.errors import BioEngineUserError
@@ -103,6 +104,16 @@ _DOWNLOAD_TOKEN_TTL_SECONDS = 3600 * 24 * 30
 #: actor like the other secrets do.
 _ARTIFACT_DOWNLOAD_TOKEN_KEY = "BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN"
 
+#: Tells a replica that this deploy's source is already on disk, so its setup hook may materialise
+#: without a credential (``bioengine._app.replica_init._SOURCE_STAGED_KEY``, where the reasoning
+#: lives). Set only AFTER :meth:`AppBuilder._stage_source_on_nodes` has succeeded on every alive
+#: node, and deliberately not given to the staging task itself — a process that can sync must keep
+#: syncing, or a re-staged version would be served stale.
+#:
+#: Spelled out here as well as there, like ``_SECRET_ENV_VAR_PREFIX``: the replica receives
+#: bioengine as raw source and must not import a worker module to learn one string.
+_SOURCE_STAGED_KEY = "BIOENGINE_SOURCE_STAGED"
+
 #: Prefix marking an env var as a deploy-time secret. Values under it are kept
 #: out of every ``runtime_env`` the worker composes and are delivered to
 #: replicas through the proxy actor instead; ``bioengine._app.mixin`` strips the
@@ -129,13 +140,27 @@ def split_secret_env_vars(
     replica whose fetch comes back short can say which key it was missing
     rather than letting the user's ``__init__`` run without it.
 
-    One function because this is the single invariant the fix rests on: every
-    dict reaching a ``runtime_env`` comes out of here.
+    ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` is dropped here too, and for the same
+    reason as the secrets even though it is not secret-prefixed: it is a 30-day
+    workspace-**read** credential, and this dict is merged into *every*
+    deployment's ``runtime_env`` at bind time, so leaving it in writes it into
+    ``runtime_env_agent.log`` on every node a replica lands on. It cannot be
+    delivered through the proxy actor instead — the replica's setup hook needs
+    it before ``__init__``, which is when the proxy fetch happens — so the
+    replica is given no credential at all and materialises from source the
+    worker's staging task has already written
+    (:meth:`AppBuilder._stage_source_on_nodes`).
+
+    Dropping it HERE rather than at the call site is deliberate: this function
+    is the single invariant the fix rests on — every dict reaching a
+    ``runtime_env`` comes out of here — so a future caller cannot reintroduce
+    the leak by composing its own replica env.
     """
     replica_env_vars = {
         key: value
         for key, value in env_vars.items()
         if not key.startswith(_SECRET_ENV_VAR_PREFIX)
+        and key != _ARTIFACT_DOWNLOAD_TOKEN_KEY
     }
     secret_env_vars = {
         key[len(_SECRET_ENV_VAR_PREFIX) :]: value
@@ -355,11 +380,13 @@ class AppBuilder:
         Ray's per-field inheritance of the worker's job-level py_modules
         (set by :meth:`bioengine.cluster.ray_cluster.RayCluster.connect`).
         It materialises the user app source itself via
-        :func:`bioengine._app.replica_init._ensure_source` — same flow as Ray
-        Serve replicas. It reads the ``BIOENGINE_*`` keys from its own
-        ``os.environ``, which it populates from the env mapping it is handed as
-        a task *argument*; most of those keys are also in the dict below, but
-        the download token deliberately is not (next paragraph).
+        :func:`bioengine._app.replica_init._ensure_source`, reading the
+        ``BIOENGINE_*`` keys from its own ``os.environ``, which it populates
+        from the env mapping it is handed as a task *argument*. Most of those
+        keys are also in the dict below, but the download token deliberately is
+        not (next paragraph) — so this is **no longer** the same flow as a Ray
+        Serve replica, which now gets no download credential at all and
+        materialises from the already-staged directory.
 
         Task-level ``py_modules`` would need a ``gcs://`` URI Ray could
         accept; producing one requires ``upload_package_if_needed``, which
@@ -367,30 +394,32 @@ class AppBuilder:
         to the ray-client gRPC bridge. Hypha downloads sidestep that.
 
         ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` is deliberately **excluded** from
-        this dict. Of the ``runtime_env``\\ s the token used to ride in, this is
-        the one no consumer depends on. Both tasks composed from this dict receive their
-        env mapping as a plain task **argument** and apply it onto their own
-        ``os.environ`` *before* calling ``_ensure_source``:
-        ``introspect_app_in_ray_task`` gets ``task_env_vars`` (derived in
-        :meth:`_introspect_via_ray_task` from the full ``env_vars``, not from
-        here) and ``build_and_run_application`` gets
-        ``BuiltApp.replica_env_vars``. A task argument travels through the
-        object store; only ``runtime_env`` is materialised by Ray's
-        ``runtime_env_agent``, which writes what it materialises into a
-        plaintext per-node log. So dropping the key here removes a 30-day
-        workspace-read credential from that log without removing it from any
-        process that reads it.
+        this dict, and no consumer of it depends on the key being here. Every
+        task composed from this dict receives its env mapping as a plain task
+        **argument** and applies it onto its own ``os.environ`` *before* calling
+        ``_ensure_source``: ``introspect_app_in_ray_task`` gets
+        ``task_env_vars`` (derived in :meth:`_introspect_via_ray_task` from the
+        full ``env_vars``, not from here), ``stage_app_source_in_ray_task`` gets
+        the equivalent dict from :meth:`_stage_source_on_nodes`, and
+        ``build_and_run_application`` gets ``BuiltApp.replica_env_vars``. A task
+        argument travels through the object store; only ``runtime_env`` is
+        materialised by Ray's ``runtime_env_agent``, which writes what it
+        materialises into a plaintext per-node log. So dropping the key here
+        removes a 30-day workspace-read credential from that log without
+        removing it from any process that reads it.
 
-        This rests on the apply-before-``_ensure_source`` ordering in both
+        This rests on the apply-before-``_ensure_source`` ordering in those
         tasks. ``tests/apps/test_submit_runtime_env_excludes_download_token.py``
         asserts that ordering alongside the exclusion, so a refactor that drops
         an apply loop fails there rather than silently breaking source sync.
 
-        The per-replica deployments are a different surface and still carry the
-        token (via ``BuiltApp.replica_env_vars`` at bind time) — a Serve replica
-        has no argument channel, its setup hook reads ``os.environ``. Removing
-        it there needs a credential-free way to materialise the source and is
-        not part of this change.
+        The per-replica deployments were the surface this did *not* cover: a
+        Serve replica has no argument channel, its setup hook reads
+        ``os.environ``, so the token used to reach them through
+        ``BuiltApp.replica_env_vars`` at bind time. That is closed too — see
+        :func:`split_secret_env_vars`, which now drops the key, and
+        :meth:`_stage_source_on_nodes`, which is the credential-free way to
+        materialise the source that closing it required.
 
         ``pip`` is the BioEngine baseline only — every module containing
         ``@bioengine.app`` (and anything they transitively import at top
@@ -465,6 +494,113 @@ class AppBuilder:
         except ray.exceptions.RayTaskError as exc:
             cause = exc.cause if isinstance(exc.cause, Exception) else exc
             raise BioEngineUserError(str(cause)) from exc
+
+    async def _stage_source_on_nodes(
+        self,
+        env_vars: Dict[str, str],
+        submit_runtime_env: Dict[str, Any],
+        application_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Materialise the app source on every alive Ray node, before replicas start.
+
+        This is what lets ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` leave the
+        per-replica ``runtime_env``. The token is handed to
+        :func:`stage_app_source_in_ray_task` as a task **argument** — the object
+        store, not ``runtime_env`` — and the task writes
+        ``<app_dir>/source`` plus the ``.version`` marker. Replicas then find it
+        already staged and materialise with no credential of their own.
+
+        **One task per alive node, with hard node affinity, and every one is
+        waited on.** This is deliberately not conditional on filesystem
+        topology:
+
+        * On a shared volume (KTH is one ``ReadWriteMany`` volume; de.NBI is NFS
+          across all pods) the tasks converge on one path. The per-node
+          ``fcntl`` lock in ``_ensure_source`` serialises them, and because the
+          Hypha sync is incremental every task after the first downloads 0
+          files. So the redundancy costs a lock wait, not N downloads.
+        * On a ``per_node`` filesystem each node needs its own copy anyway.
+
+        Not calling ``AppsManager._detect_fs_topology`` is the point. Its
+        contract is that the probe fires lazily from a dashboard call and
+        "never at worker startup or anywhere else"; calling it from the deploy
+        path would falsify that and write probe markers across the cluster on
+        every first deploy. Staging everywhere is correct under either topology
+        and only ever costs extra tasks — which is the direction the one safe
+        default points, since guessing "shared" wrongly gives a replica that
+        cannot find its source.
+
+        ``soft=False`` so a node that cannot take the task fails loudly instead
+        of being silently staged somewhere else, which would leave the node it
+        was meant for without source.
+
+        **KNOWN GAP, deliberately not papered over.** The nodes staged are the
+        ones alive *now*. A node that joins later — autoscale — has no staged
+        source and, by design, no credential. On a shared filesystem it sees the
+        staged copy and is fine; on a ``per_node`` filesystem its replica fails,
+        with the diagnosis in ``_ensure_source``'s error rather than a bare
+        HTTP 401. Both real sites are shared. A replica cannot self-heal this:
+        the setup hook runs before ``__init__``, which is exactly why this token
+        is not delivered through the proxy actor.
+
+        Returns one result dict per node, each ``{"node_id", "source", "files"}``.
+        """
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        node_ids = [
+            node["NodeID"]
+            for node in ray.nodes()
+            if node.get("Alive") and node.get("NodeID")
+        ]
+        if not node_ids:
+            # Not "nothing to do": a cluster with no alive node cannot run the
+            # replicas either, and silently staging nowhere would turn into a
+            # confusing replica-side failure later.
+            raise RuntimeError(
+                f"Cannot stage source for '{application_id}': ray.nodes() "
+                "reported no alive node."
+            )
+
+        # The token rides in this ARGUMENT. The secret-prefixed keys do not go
+        # near a task; they are delivered through the proxy actor.
+        task_env_vars = {
+            key: value
+            for key, value in env_vars.items()
+            if not key.startswith(_SECRET_ENV_VAR_PREFIX)
+        }
+
+        try:
+            refs = [
+                ray.remote(num_cpus=0, max_calls=1, runtime_env=submit_runtime_env)(
+                    stage_app_source_in_ray_task
+                )
+                .options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=node_id, soft=False
+                    )
+                )
+                .remote(task_env_vars)
+                for node_id in node_ids
+            ]
+            results = await asyncio.to_thread(ray.get, refs)
+        except ray.exceptions.RayTaskError as exc:
+            cause = exc.cause if isinstance(exc.cause, Exception) else exc
+            raise BioEngineUserError(str(cause)) from exc
+
+        # A task that returned without raising is not the same claim as source
+        # being on disk. Refuse an empty tree here rather than letting every
+        # replica discover it one by one.
+        empty = [r for r in results if not r.get("files")]
+        if empty:
+            raise RuntimeError(
+                f"Staging source for '{application_id}' produced an empty tree "
+                f"on {len(empty)} of {len(results)} node(s): {empty}"
+            )
+        self.logger.info(
+            f"Staged source for '{application_id}' on {len(results)} Ray node(s) "
+            f"({results[0]['files']} files at {results[0]['source']})"
+        )
+        return results
 
     # ───────────────────────── kwargs translation ────────────────────────
 
@@ -772,11 +908,18 @@ class AppBuilder:
         application_kwargs = dict(application_kwargs or {})
         application_env_vars = dict(application_env_vars or {})
 
-        # 1. Mint a read-only token for the introspect task AND every replica's
-        # per-file Hypha source sync (it rides in replica_env_vars). 30-day TTL
-        # so replicas starting later (autoscale, crash-restart) can still pull;
-        # refreshed on each redeploy. On a public artifact the mint raises a
-        # permission error and we fall through to anonymous read (below).
+        # 1. Mint a read-only token for the worker's own Ray tasks — introspect
+        # and staging — which receive it as a task ARGUMENT. It no longer
+        # reaches the replicas: they materialise from the staged directory and
+        # hold no credential (see split_secret_env_vars). Refreshed on each
+        # redeploy. On a public artifact the mint raises a permission error and
+        # we fall through to anonymous read (below).
+        #
+        # The 30-day TTL is now longer than anything needs — the tasks it is
+        # handed to run within one deploy. It is left as-is deliberately rather
+        # than shortened in the same change that removes its other consumer:
+        # the TTL is also what a *re*-deploy relies on, and narrowing it belongs
+        # with its own measurement rather than riding along here.
         download_token: Optional[str] = None
         artifact_workspace = artifact_id.split("/", 1)[0]
         try:
@@ -831,9 +974,9 @@ class AppBuilder:
         runtime_env = self._build_submit_runtime_env(env_vars)
 
         # 3. Introspect the user package via a Ray task — the task syncs the
-        # source from Hypha and walks the @bioengine.app composition. Returns
-        # the spec plus a content hash of the synced source; replicas sync their
-        # own source per file from Hypha.
+        # source from Hypha (token as a task argument) and walks the
+        # @bioengine.app composition. Returns the spec plus a content hash of
+        # the synced source.
         introspect_result = await self._introspect_via_ray_task(
             entry_id, env_vars, runtime_env
         )
@@ -848,6 +991,21 @@ class AppBuilder:
                 f"{spec.get('format_version')!r}, worker expects "
                 f"{SPEC_FORMAT_VERSION!r}."
             )
+
+        # 3b. Stage the source on every alive node while the download token is
+        # still in scope HERE, in the worker, rather than handing the token to
+        # the replicas. Done in build() and not in submit() on purpose: submit()
+        # is reached with ``BuiltApp`` only, and BuiltApp deliberately carries no
+        # download credential, so there is nothing to leak into it.
+        #
+        # The introspect task above has already materialised source on whichever
+        # single node it happened to run on; this covers the rest.
+        await self._stage_source_on_nodes(env_vars, runtime_env, application_id)
+        # Only now, and only for what follows: the staging tasks above were given env_vars WITHOUT
+        # this flag, so each of them re-synced from Hypha as before. Everything composed from
+        # env_vars after this line — including every replica's runtime_env — is told the source is
+        # on disk and may read it with no credential.
+        env_vars[_SOURCE_STAGED_KEY] = "1"
 
         # 4. Translate user-friendly kwargs keys and validate against spec.
         translated_kwargs = self._translate_kwargs_keys(spec, application_kwargs)
@@ -1030,14 +1188,17 @@ class AppBuilder:
     async def submit(self, built_app: "BuiltApp", application_id: str) -> None:
         """Fire the ``build_and_run_application`` Ray task.
 
-        ``build()`` returns metadata only (after the introspect Ray task);
-        the manager runs ``_check_resources`` against that metadata and
+        ``build()`` returns metadata only (after the introspect and staging Ray
+        tasks); the manager runs ``_check_resources`` against that metadata and
         then calls this to actually claim the cluster resources. Splitting
         the steps means the resource check happens *before* ``serve.run``,
         not after — and preserves the SLURM-scaling fallback.
 
-        No worker-side cleanup needed: the worker never wrote anything to
-        its own filesystem. Replicas sync source per file from Hypha.
+        No worker-side cleanup needed: the worker never wrote anything to its
+        own filesystem. Source is materialised Ray-side — by ``build()``'s
+        staging tasks, under ``apps_workdir`` — and the replicas started here
+        read it from there with no credential of their own, which is why
+        ``built_app.replica_env_vars`` can be, and is, token-free.
         """
         # Before serve.run, because that is what starts the replicas that
         # fetch them.

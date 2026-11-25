@@ -16,8 +16,9 @@ WHAT THIS GUARDS, in three legs that only make sense together:
   2. The token must still reach each task by its other channel: the env mapping passed as a task
      **argument**. For introspect that is ``task_env_vars``, which must be derived from the full
      ``env_vars`` and *not* from ``submit_runtime_env["env_vars"]``; for the build task it is
-     ``BuiltApp.replica_env_vars``, which ``split_secret_env_vars`` must keep the key in **and**
-     which ``submit`` must be the thing actually handed to ``.remote()``.
+     ``BuiltApp.replica_env_vars``, which ``submit`` must be the thing actually handed to
+     ``.remote()``. (``replica_env_vars`` itself no longer carries the token — see the note under
+     "SUPERSEDED IN PART" below.)
   3. Both tasks must keep applying that mapping onto ``os.environ`` *before* calling
      ``_ensure_source``.
 
@@ -35,10 +36,10 @@ here as a permanent red-maker:
   * ``task_env_vars = dict(submit_runtime_env["env_vars"])`` — reinstates the excluded key by
     copying the dict the exclusion just built, and breaks every private-artifact introspect.
   * ``split_secret_env_vars(runtime_env["env_vars"])`` in ``build()`` — a correct helper called
-    with the wrong dict. Asserting that ``split_secret_env_vars`` keeps the key says nothing about
+    with the wrong dict. Asserting what ``split_secret_env_vars`` does to a key says nothing about
     whether any caller passes it the right mapping, or passes its result on.
   * handing ``built_app.runtime_env["env_vars"]`` instead of ``built_app.replica_env_vars`` at
-    ``submit``'s ``.remote()`` — removes the token from the build task's only channel.
+    ``submit``'s ``.remote()`` — gives the build task the wrong env mapping entirely.
 
 The lesson generalises: guard the CONSUMER, not the producer, and walk every hop between them.
 
@@ -50,11 +51,24 @@ sibling file says the same of it): the argument it passes to ``split_secret_env_
 structurally instead, by AST, which is enough to fail the mutant above. Leg 3 is structural for the
 same reason — the two task functions only run inside a Ray worker.
 
+SUPERSEDED IN PART. This file used to end by naming the per-replica surface as out of scope: every
+Serve deployment's ``runtime_env`` still carried the token via ``BuiltApp.replica_env_vars``,
+because a replica has no argument channel, and removing it needed a credential-free way to
+materialise source. That path now exists — ``AppBuilder._stage_source_on_nodes`` stages on every
+alive node with the token as a task argument — so ``split_secret_env_vars`` drops the key and
+``replica_env_vars`` is token-free. Two consequences for this file, both already applied:
+
+  * ``test_split_secret_env_vars_DROPS_the_token_now_that_source_is_staged`` is the INVERSE of the
+    assertion that lived here before, and says so.
+  * the ``submit`` call-site arm can no longer identify ``replica_env_vars`` by the token it
+    carries — both candidate dicts now lack it, so asserting absence would pass for the mutant.
+    It uses a neutral marker key instead.
+
+The per-replica guard proper lives in
+``tests/apps/test_replica_runtime_env_excludes_download_token.py``.
+
 WHAT THIS DOES NOT CATCH, stated so nobody reads it as wider than it is:
 
-  * The per-replica surface. Every Serve deployment's ``runtime_env`` still carries the token via
-    ``BuiltApp.replica_env_vars``; a replica has no argument channel. Removing it there needs a
-    credential-free source-materialisation path and is tracked separately.
   * Whether the token is *correct* or scoped as intended — only where it is placed.
   * ``/proc/<pid>/environ``. A value applied to ``os.environ`` is visible there; this is about
     Ray's log, not about hiding a credential from the process using it.
@@ -235,21 +249,33 @@ def test_the_token_is_NOT_in_the_runtime_env_the_task_is_submitted_with(monkeypa
     assert fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY] not in repr(submitted)
 
 
-def test_split_secret_env_vars_KEEPS_the_token_for_the_build_task():
-    """Leg 2, build side, HELPER only. Not sufficient on its own — see the two tests below.
+def test_split_secret_env_vars_DROPS_the_token_now_that_source_is_staged():
+    """``replica_env_vars`` must NOT carry the download token.
 
-    This says the helper keeps the key. It says nothing about whether anyone calls it with the
-    right dict, or passes its result to the task. Round 2 found both of those unguarded.
+    That dict is merged into every Serve deployment's ``runtime_env`` at bind time, so a key left
+    in it reaches ``runtime_env_agent.log`` on every node a replica lands on, with a lifetime far
+    longer than the replica's.
+
+    Dropping it is safe only because the build task no longer needs it: ``build()`` stages source
+    on every alive node first (``_stage_source_on_nodes``, token delivered as a task *argument*),
+    and the build task and the replicas then take ``_ensure_source``'s credential-free staged
+    branch.
+
+    The consumer-side guard — that the staging task's ARGUMENT does carry the token — is in
+    ``tests/apps/test_replica_runtime_env_excludes_download_token.py``. Both are required: this one
+    alone would be satisfied by a change that starves every private-artifact deploy.
     """
     from bioengine.apps.builder import split_secret_env_vars
 
     fixture = _env_vars_fixture()
     replica_env_vars, secret_env_vars = split_secret_env_vars(fixture)
-    assert replica_env_vars.get(_ARTIFACT_DOWNLOAD_TOKEN_KEY) == (
-        fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY]
-    ), "the build task would sync source anonymously and fail on a private artifact"
+    assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in replica_env_vars, (
+        "a bind-time runtime_env would carry the credential into runtime_env_agent.log on "
+        "every node a replica lands on"
+    )
+    assert fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY] not in replica_env_vars.values()
     assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in secret_env_vars, (
-        "routing it through the proxy actor would not work: the setup hook reads "
+        "routing it through the proxy actor would not work either: the setup hook reads "
         "os.environ before __init__"
     )
 
@@ -306,39 +332,47 @@ def _drive_submit(monkeypatch, built_app):
     return calls[0]
 
 
-def test_submit_hands_the_task_the_dict_that_CARRIES_the_token(monkeypatch):
+def test_submit_hands_the_task_replica_env_vars_and_not_the_runtime_env(monkeypatch):
     """Leg 2, build side, CALL SITE. The mutant round 2 found lives here.
 
-    The ``runtime_env`` given to the BuiltApp deliberately LACKS the token, exactly as
-    ``_build_submit_runtime_env`` now produces it. So handing ``built_app.runtime_env["env_vars"]``
-    to ``.remote()`` instead of ``built_app.replica_env_vars`` fails here — and that swap is
-    otherwise silent, because a token-less sync falls back to anonymous read.
+    Handing ``built_app.runtime_env["env_vars"]`` to ``.remote()`` instead of
+    ``built_app.replica_env_vars`` is the swap, and it is otherwise silent.
 
-    The token is located by VALUE across every positional argument rather than by index: an index
-    would break on any reordering of a 11-argument call and would then be fixed by renumbering
-    rather than by noticing.
+    **This arm used to identify the right dict by the download token it carried.** It no longer
+    can: ``replica_env_vars`` is deliberately token-free now that source is staged before submit
+    (see ``test_split_secret_env_vars_DROPS_the_token_now_that_source_is_staged``). Re-pointing it
+    at the token's *absence* would be worse than useless — both candidate dicts lack it, so the
+    assertion would pass for the mutant too.
+
+    So the two dicts are told apart by a marker only ``replica_env_vars`` has. That keeps this hop
+    guarded without asserting anything false about where credentials live. The marker is located by
+    VALUE across every positional argument rather than by index: an index would break on any
+    reordering of an 11-argument call and would then get "fixed" by renumbering rather than by
+    someone noticing.
     """
     fixture = _env_vars_fixture()
-    token = fixture[_ARTIFACT_DOWNLOAD_TOKEN_KEY]
     runtime_env = _submit_runtime_env(fixture)
-    assert _ARTIFACT_DOWNLOAD_TOKEN_KEY not in runtime_env["env_vars"], (
-        "control: the runtime_env must already lack the token, or this arm cannot tell the "
+    marker_key = "BIOENGINE_APPLICATION_ID"
+    marker_value = "distinguishes-replica-env-vars"
+    assert marker_key not in runtime_env["env_vars"], (
+        "control: the marker must be absent from the runtime_env, or this arm cannot tell the "
         "two candidate dicts apart"
     )
     replica_env_vars = {
         k: v for k, v in fixture.items() if not k.startswith(_SECRET_ENV_VAR_PREFIX)
     }
+    replica_env_vars[marker_key] = marker_value
 
     call = _drive_submit(monkeypatch, _built_app(replica_env_vars, runtime_env))
 
     carriers = [
         a
         for a in call["args"]
-        if isinstance(a, dict) and a.get(_ARTIFACT_DOWNLOAD_TOKEN_KEY) == token
+        if isinstance(a, dict) and a.get(marker_key) == marker_value
     ]
     assert carriers, (
-        "no argument handed to the build task carries the download token; the task would sync "
-        "source anonymously and every private-artifact deploy would fail"
+        "no argument handed to the build task is replica_env_vars; the task received the "
+        "runtime_env's env_vars instead, which is the round-2 mutant"
     )
 
 
@@ -461,6 +495,16 @@ def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
                 a is node for a in parent.args
             ):
                 return "introspect"
+            # The staging tasks are the third consumer, added when the per-replica copy of the
+            # token was removed: they are submitted with the SAME helper runtime_env as the
+            # introspect task, and their own env mapping is derived from the full ``env_vars``
+            # inside ``_stage_source_on_nodes`` — never from this dict. Allowed by the same rule
+            # as introspect, i.e. only as a direct positional argument, so the dict still cannot
+            # be mutated or re-read into an env on the way.
+            if fname == "_stage_source_on_nodes" and any(
+                a is node for a in parent.args
+            ):
+                return "staging"
         if isinstance(parent, ast.keyword) and parent.arg == "runtime_env":
             grand = parents.get(id(parent))
             if isinstance(grand, ast.Call) and (
@@ -479,12 +523,17 @@ def test_build_passes_the_HELPERS_runtime_env_through_UNTOUCHED():
             seen.setdefault(kind, []).append(node.lineno)
 
     assert not illegal, (
-        f"{name!r} is loaded somewhere other than its two consumers, at "
+        f"{name!r} is loaded somewhere other than its three consumers, at "
         f"{[f'line {ln} under {p}' for ln, p in illegal]}. Every use must be a direct argument of "
-        "_introspect_via_ray_task(...) or the runtime_env= keyword of BuiltApp(...); anything else "
-        "can reach the dict and undo the exclusion"
+        "_introspect_via_ray_task(...) or _stage_source_on_nodes(...), or the runtime_env= keyword "
+        "of BuiltApp(...); anything else can reach the dict and undo the exclusion"
     )
     assert "introspect" in seen, f"the introspect task is never submitted with {name!r}"
+    assert "staging" in seen, (
+        f"the staging tasks are never submitted with {name!r} -- without them the replicas have "
+        "no source to read and removing their copy of the token starves every private-artifact "
+        "deploy"
+    )
     assert "builtapp" in seen, f"BuiltApp is never constructed with runtime_env={name}"
     # Control: if the allow-list matched nothing at all the assertions above would be vacuous.
     assert loads, f"{name!r} is never loaded -- the helper's result goes nowhere"

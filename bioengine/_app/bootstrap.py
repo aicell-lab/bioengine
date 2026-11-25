@@ -206,6 +206,64 @@ def introspect_app_in_ray_task(
     return {"spec": spec, "source_signature": hash_source_tree(source)}
 
 
+def stage_app_source_in_ray_task(
+    env_vars: Dict[str, str],
+) -> Dict[str, Any]:
+    """Materialise the app source on **this** Ray node, for replicas to read.
+
+    This is the producer half of taking
+    ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` out of every Serve replica's
+    ``runtime_env``. A Serve replica has no argument channel — its setup hook
+    reads ``os.environ`` — so before this existed the only way to let a replica
+    fetch source was to put a 30-day workspace-read credential into the
+    ``runtime_env``, which Ray's ``runtime_env_agent`` writes verbatim into a
+    plaintext per-node log.
+
+    A Ray **task** does have an argument channel. ``env_vars`` arrives as a task
+    argument, travelling through the object store rather than through
+    ``runtime_env``, and is applied onto this process's ``os.environ`` before
+    :func:`~bioengine._app.replica_init._ensure_source` reads it. The source
+    lands in ``<app_dir>/source`` with a ``.version`` marker written last, and
+    the replica's own ``_ensure_source`` then finds it already staged and
+    returns it **without any credential**.
+
+    Returns ``{"node_id", "source", "files"}``. ``files`` is counted so the
+    caller can refuse a stage that produced an empty tree: "the task did not
+    raise" and "source is present" are different claims, and only the second is
+    the one replicas depend on.
+    """
+    import logging
+    import os
+    from pathlib import Path
+
+    import ray
+
+    from bioengine._app.replica_init import _ensure_source
+
+    # Overwrite rather than setdefault, for the same reason as the introspect
+    # task: this deploy's version and URL must win over anything a reused Ray
+    # worker process happens to be carrying from a previous build.
+    for key, value in env_vars.items():
+        os.environ[key] = value
+
+    app_dir = Path(env_vars["BIOENGINE_APP_DIR"])
+    version = env_vars.get("BIOENGINE_ARTIFACT_VERSION", "")
+    if not version:
+        raise BioEngineUserError(
+            "BIOENGINE_ARTIFACT_VERSION not in task env_vars; the worker is "
+            "expected to populate it before submitting the staging task."
+        )
+
+    logger = logging.getLogger("ray.serve")
+    source = _ensure_source(app_dir, version, logger)
+    n_files = sum(1 for path in source.rglob("*") if path.is_file())
+    try:
+        node_id = ray.get_runtime_context().get_node_id()
+    except Exception:
+        node_id = ""
+    return {"node_id": node_id, "source": str(source), "files": n_files}
+
+
 def _walk(
     cid: str,
     user_cls: type,
