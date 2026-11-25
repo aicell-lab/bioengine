@@ -200,6 +200,73 @@ def region_index(
         )
     want = dict(planes or {})
 
+    # DECISION (#0908 clause 3): a plane named for a SPATIAL or CHANNEL axis, or
+    # for an axis this layout does not have, is REFUSED -- not ignored.
+    #
+    # Those axes never reach `_plane_index`: y and x get the crop's slices and a
+    # channel axis is kept whole, so until now `planes={"c": 2}` was accepted and
+    # discarded, and `planes={"bogus": 1}` likewise. The caller asked for one
+    # thing and got another with no complaint, which is the same class of silence
+    # this module refuses elsewhere.
+    #
+    # Refusing is also what makes the two ends agree: the annotation broker's
+    # import validator already refuses a plane for a spatial or channel axis and
+    # an unknown axis name, so nothing written through the supported path can
+    # carry these shapes. A record written before that validator, or by another
+    # path, now fails loudly here instead of training on something the caller did
+    # not ask for.
+    #
+    # WITHOUT AXIS NAMES, A NON-EMPTY `planes` IS REFUSED OUTRIGHT.
+    #
+    # With no names a key cannot be resolved to an axis, which makes honouring it
+    # and range-checking it equally impossible -- so the only alternatives are
+    # refusing and discarding, and discarding is the silence this decision exists
+    # to rule out.
+    #
+    # This case needs its own refusal rather than falling to the checks below,
+    # which are gated on `names`, or to `_plane_index`, which reports missing
+    # names ONLY when some non-spatial axis has size > 1. For a single-element
+    # axis or a plain cyx store neither fires, so without this a plane naming
+    # nothing at all would be accepted and dropped: on `axes=[]` with shape
+    # [3, 1, 64, 64], `{"z": 7}`, `{"c": 2}` and `{"bogus": 1}` all resolve to
+    # index 0.
+    #
+    # A stem imported before axis names were recorded arrives with `axes=[]`, so
+    # this is exactly the legacy population the decision above is motivated by --
+    # which is why the gap mattered more here than anywhere else.
+    #
+    # Nothing written through the supported path has this shape: the import
+    # validator is given the probe's axes and records planes only alongside the
+    # names they refer to.
+    if want and not names:
+        raise RegionSourceError(
+            f"planes {sorted(want)!r} was given, but this array's axis names are "
+            f"not recorded, so no plane can be resolved to an axis. It is refused "
+            f"rather than ignored. Re-import the source so the layout records its "
+            f"axis names, or drop planes from the region reference."
+        )
+
+    if want and names:
+        roles: Dict[str, str] = {}
+        for role, idx in (("y", y), ("x", x), ("c", c)):
+            if isinstance(idx, int) and 0 <= idx < len(names):
+                roles[names[idx]] = role
+        for key in sorted(want):
+            if key in roles:
+                raise RegionSourceError(
+                    f"planes[{key!r}] names the {roles[key]!r} axis, which is not a "
+                    f"plane axis: y and x are the crop and a channel axis is kept "
+                    f"whole. It is refused rather than ignored, because ignoring it "
+                    f"would read something other than what was asked for. Drop "
+                    f"{key!r} from planes."
+                )
+            if key not in names:
+                raise RegionSourceError(
+                    f"planes[{key!r}] names no axis of this array, whose axes are "
+                    f"{list(names)!r}. It is refused rather than ignored: a plane "
+                    f"that selects nothing looks like a plane that was honoured."
+                )
+
     out: List[Any] = []
     for axis in range(rank):
         if axis == y:
@@ -223,16 +290,29 @@ def _plane_index(
     of 0 is wrong and silent.
     """
     name = str(names[axis]) if axis < len(names) else ""
-    if size == 1:
-        return 0
+    # A SUPPLIED plane is range-checked FIRST, before the size-1 shortcut.
+    #
+    # The shortcut used to come first, so for a single-element axis the caller's
+    # index was never looked at: planes={"z": 7} on a z of size 1 was accepted
+    # and silently read z=0. The pixels were right -- there is only one plane --
+    # but the error was lost, so a caller whose numbering is wrong got no
+    # complaint, and a stored record could claim a plane that does not exist.
+    # The same index on a 4-element axis was refused cleanly, which is how the
+    # inconsistency was found: the check existed and was simply unreachable.
     if name and name in planes:
         index = int(planes[name])
         if not (0 <= index < size):
+            where = (
+                f"which has only 1 element, so the only valid index is 0"
+                if size == 1
+                else f"which has {size} elements (0..{size - 1})"
+            )
             raise RegionSourceError(
-                f"planes[{name!r}]={index} is outside axis {name!r}, which has "
-                f"{size} elements (0..{size - 1})."
+                f"planes[{name!r}]={index} is outside axis {name!r}, {where}."
             )
         return index
+    if size == 1:
+        return 0
     label = f"{name!r}" if name else f"at position {axis}"
     known = (
         f"Its name is not in the recorded axes ({list(names)!r}), so a plane "
