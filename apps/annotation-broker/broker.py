@@ -2062,10 +2062,18 @@ class AnnotationBroker:
           presigned as before. The pre-0.10.0 shape is a subset of this one,
           so a stale frontend still renders local images.
         * ``{"stem", "kind": "ngff", "store_root", "multiscale_path",
-          "region"}`` -- a remote OME-Zarr source the browser reads directly.
-          ``region`` is null unless the image was imported as a patch of a
-          whole-slide source, in which case it is the crop, in level-0 pixels,
-          that the reader must confine itself to.
+          "region", "planes", "level0_shape"}`` -- a remote OME-Zarr source the
+          browser reads directly. ``region`` is null unless the image was
+          imported as a patch of a whole-slide source, in which case it is the
+          crop, in level-0 pixels, that the reader must confine itself to.
+          ``planes`` is which slice of each non-spatial axis the annotation
+          belongs to, by axis NAME, or null when none was recorded; and
+          ``level0_shape`` is the level-0 dataset shape the per-level plane
+          index is derived from, or null. Note it is POSITIONAL and the axis
+          names are NOT returned, so a reader must take axis order from the
+          store's own ``multiscales`` metadata. Both are needed together: a pyramid
+          that resamples z has a different index per level for the same
+          physical slice, and neither value alone lets a reader work out which.
 
         For a remote source any credential is spliced in **here**, after the
         role check, and never stored in the artifact (design §12).
@@ -2083,12 +2091,35 @@ class AnnotationBroker:
                 )
             store_root = source.get("store_root") or ""
             credential = (meta.get("ngff_credentials") or {}).get(store_root)
+            layout = source.get("layout") or {}
             return {
                 "stem": image_stem,
                 "kind": "ngff",
                 "store_root": core.apply_store_credential(store_root, credential),
                 "multiscale_path": source.get("multiscale_path"),
                 "region": source.get("region"),
+                # Both recorded at import and both needed by the viewer to pick
+                # the right slice at every pyramid level. `planes` says which
+                # slice of each non-spatial axis the annotation belongs to;
+                # `level0_shape` is what a level's own plane index is derived
+                # FROM, since a pyramid that resamples z has a different index
+                # per level for the same physical slice.
+                #
+                # Dropping them here is not cosmetic. On a z-downsampled store
+                # each level otherwise pins its own middle slice, so a region
+                # recorded at z 4 of 9 is drawn at level 1 index 2 -- which
+                # covers level-0 slices 4.5 to 6.75 and does not include 4. The
+                # annotation would be made on one slice and the record would
+                # name another, which is the mispairing the plane exists to
+                # prevent, reappearing one level down.
+                #
+                # NULL rather than absent when unrecorded: a 2-D source has no
+                # plane to report, and the viewer distinguishes "no plane, draw
+                # the only slice" from "plane unknown, refuse". An absent key
+                # and an explicit null are the same thing over this transport,
+                # but the explicit form is what the shape above documents.
+                "planes": source.get("planes") or None,
+                "level0_shape": layout.get("level0_shape") or None,
             }
 
         read_url = await self._am.get_file(

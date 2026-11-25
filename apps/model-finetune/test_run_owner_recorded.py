@@ -164,7 +164,12 @@ def test_THE_PUBLIC_READ_PATH_DOES_NOT_RETURN_THE_OWNER(sessions):
     public = training.get_status(S_PUBLIC_READ)
     assert "owner" not in public, f"the owner is in the public response: {public}"
     assert "owner_anonymous" not in public
-    listed = training.list_sessions()
+    # Listed AS ITS OWNER. The listing is per-caller, so any other context would
+    # return {} and make the redaction assertion below vacuous -- the
+    # `S_PUBLIC_READ in listed` guard on the next line is what keeps that honest.
+    listed = training.list_sessions(
+        {"user": {"id": "github|49943582", "is_anonymous": False}}
+    )
     assert S_PUBLIC_READ in listed, "the run vanished from the listing entirely"
     assert (
         "owner" not in listed[S_PUBLIC_READ]
