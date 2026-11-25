@@ -38,6 +38,44 @@ problems and route to whoever owns the cluster.
 `kuberay-operator` and the `raycluster-*` releases are **out of scope**
 too, despite the worker depending on them.
 
+## Before you conclude a worker is wedged — it is usually the listing, not the worker
+
+A worker whose management calls "stop answering" is very often a caller
+stuck inside `api.list_services()`, which hangs against a busy workspace
+while the worker is perfectly healthy. In one run on one RPC connection,
+the RPC listing **timed out after 75 s** while `get_service` +
+`get_status` by **exact id** answered in **0.7 s**, with a bogus id
+correctly refused in 0.0 s. The defect is upstream in
+`hypha-rpc`/`hypha-server`, and **it is intermittent** — ~24 minutes
+later the same listing answered in 0.05 s, and it has been seen to clear
+by itself after ~25 minutes. So an RPC listing that answers today is not
+evidence the bug is gone.
+
+So, in this order, before touching anything:
+
+1. Call the worker by its **exact** service id, never by listing. The
+   resolve-by-HTTP recipe and its three silent traps (a `307` with a
+   zero-byte body that reads as "no services"; HTTP ids not being
+   workspace-prefixed; the token being optional, where a *wrong* one
+   gives 401 on a route that answers 200 with none) are in the
+   **bioengine-maintainer** skill under *Hypha platform invariants*.
+   Keep a bogus-id control beside whatever wraps it.
+2. Read the pod's log with `kubectl`, which does not go through Hypha at
+   all and is therefore available exactly when the RPC path is not.
+3. Read Serve health from the Ray dashboard rather than from the worker.
+   Check that the site *has* Ray pods first — in at least one
+   `external-cluster` deployment `kubectl get pods -A | grep -i ray`
+   matched nothing anywhere, so Ray ran inside the worker pod and there
+   was no separate dashboard to read.
+
+**And never conclude a service is ABSENT from a listing.** The RPC and
+HTTP listings have been seen to disagree about which worker pod's
+services existed (25 entries vs 28, naming different pods) — and ~24
+minutes later to agree at 25. Only an exact-id lookup can answer an
+absence question; asserting one from the RPC listing produced a false
+"production app is unreachable" report and an unnecessary escalation, and
+agreement on a single run does not retire the problem.
+
 ## Kubernetes, both sites
 
 - **A namespace you cannot see is reported as `Forbidden`, not
