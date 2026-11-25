@@ -421,12 +421,30 @@ def _record_mutex(run_dir: Path, session_id: str):
     flock and lockf both raise ENOLCK on the share these replicas use. See the
     note above `RECORD_LOCK_NAME` for the measurement.
 
-    An abandoned mutex older than `RECORD_LOCK_STALE_S` is removed and the
+    An abandoned mutex older than `RECORD_LOCK_STALE_S` is reaped and the
     acquisition retried, because nothing releases a link-based lock when its
-    holder dies. The removal targets the mutex by inode-identity -- it re-reads
-    the age and unlinks only if it is STILL stale -- so two writers reaping the
-    same stale lock cannot have the second one remove a third writer's fresh
-    one.
+    holder dies.
+
+    TWO things about that path are load-bearing, and the first version of this
+    function got both wrong:
+
+    * **The unique file is stamped immediately before `os.link`, not when it is
+      created.** `os.link` gives the mutex the unique file's mtime, so stamping
+      at queue time meant a writer that waited N seconds acquired a mutex that
+      already looked N seconds old. After a holder dies every queued writer
+      waits about `RECORD_LOCK_STALE_S`, so the winner linked an
+      already-stale mutex and the next waiter reaped it WHILE IT WAS HELD.
+      Measured on that version: up to six writers inside the critical section
+      at once and a write lost in four trials of five -- the lock broken
+      exactly in the case the reap exists for.
+    * **Reaping is a rename, not a stat-then-unlink.** `os.rename` is atomic,
+      so of several writers that all judged the same mutex stale only one
+      succeeds; the losers see ENOENT and go round again. The winner then
+      unlinks the file IT renamed, which cannot be a fresh mutex somebody
+      linked in the meantime. An earlier docstring here claimed the removal
+      "targets the mutex by inode-identity" -- it did not, it compared nothing,
+      and the check-then-act it actually performed let writer B unlink writer
+      A's fresh mutex.
     """
     mutex = run_dir / RECORD_LOCK_NAME
     unique = run_dir / f".mutex-{os.getpid()}-{uuid.uuid4().hex}"
@@ -435,6 +453,10 @@ def _record_mutex(run_dir: Path, session_id: str):
     try:
         while True:
             try:
+                # STAMP IMMEDIATELY BEFORE LINKING. The mutex inherits this
+                # mtime, and it must say when the lock was TAKEN, not when this
+                # writer joined the queue -- see the docstring.
+                os.utime(unique, None)
                 os.link(unique, mutex)
                 break
             except FileExistsError:
@@ -443,10 +465,18 @@ def _record_mutex(run_dir: Path, session_id: str):
                 except FileNotFoundError:
                     continue  # released between the link and the stat
                 if age > RECORD_LOCK_STALE_S:
+                    # Reap by RENAME: atomic, so exactly one of several writers
+                    # that judged this mutex stale wins it, and the winner then
+                    # removes the file it renamed rather than whatever happens
+                    # to be at the mutex path by then.
+                    claimed = run_dir / f".mutex-stale-{uuid.uuid4().hex}"
                     try:
-                        if time.time() - mutex.stat().st_mtime > RECORD_LOCK_STALE_S:
-                            mutex.unlink()
+                        os.rename(mutex, claimed)
                     except (FileNotFoundError, OSError):
+                        continue  # somebody else reaped it, or it was released
+                    try:
+                        claimed.unlink()
+                    except FileNotFoundError:
                         pass
                     continue
                 if time.monotonic() > deadline:
@@ -495,9 +525,14 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
     # before another writer's replace writes its stale copy back over it, and the
     # terminal-status precedence below cannot refuse an incumbent it never saw.
     #
-    # flock and not a lockfile-by-O_EXCL: no stale-lock timeout to tune, and the
-    # kernel releases it if a writer dies. The run directory is the only place
-    # guaranteed to be on the same filesystem as the record.
+    # The run directory is the only place guaranteed to be on the same
+    # filesystem as the record, which link() requires.
+    #
+    # NOTE ON CLOCK SKEW, unmeasured: staleness compares the SERVER-set mtime of
+    # the mutex with this client's time.time(). On the NFS share those are
+    # different machines, so skew shifts the window by however far the clocks
+    # differ. A 30s window tolerates a few seconds of skew; it would not
+    # tolerate minutes. Not measured on this cluster.
     with _record_mutex(p.parent, session_id):
         return _write_status_locked(p, session_id, fields)
 

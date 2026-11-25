@@ -317,3 +317,86 @@ def test_the_mutex_does_not_disturb_the_listing(run_dir):
     # signature lands with the listing row, not here.
     seen = training.list_sessions()
     assert sorted(seen) == [SID], f"the listing returned {sorted(seen)}"
+
+
+def _one_field(idx, root_str, stale_s, errors, overlaps):
+    """Write one distinct field, holding the critical section briefly."""
+    import time as _t
+
+    import training as t
+
+    root = Path(root_str)
+    t.sessions_root = lambda: root
+    t.session_dir = lambda sid: root / sid
+    t.RECORD_LOCK_STALE_S = stale_s
+    real = t._write_status_locked
+
+    def slow(p, session_id, fields):
+        # Count how many writers are inside the critical section at once. If the
+        # mutex is doing its job this never exceeds 1.
+        with overlaps.get_lock():
+            overlaps.value += 1
+            here = overlaps.value
+        if here > 1:
+            errors.append(f"OVERLAP: {here} writers inside the critical section")
+        _t.sleep(0.05)
+        out = real(p, session_id, fields)
+        with overlaps.get_lock():
+            overlaps.value -= 1
+        return out
+
+    t._write_status_locked = slow
+    try:
+        t.write_status(SID, **{f"f{idx}": idx})
+    except Exception as exc:
+        errors.append(f"f{idx}: {type(exc).__name__}: {exc}")
+
+
+@pytest.mark.slow
+def test_a_DEAD_HOLDERS_mutex_is_reaped_WITHOUT_breaking_exclusion(run_dir):
+    """The case the reap exists for, and the one it used to break.
+
+    A holder dies leaving a FRESH mutex. Every queued writer then waits out the
+    staleness window. If the mutex inherits the waiter's QUEUE time rather than
+    its ACQUIRE time, the winner links an already-stale lock and the next waiter
+    reaps it while it is held -- so the reap destroys the exclusion it exists to
+    restore.
+
+    Measured on that version by the reviewer: up to six writers inside the
+    critical section at once, and a write lost in four trials of five.
+
+    The staleness window is scaled down so the test runs in seconds; the logic
+    is identical at 30s.
+    """
+    (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+    # A dead holder's mutex: present, fresh, and nobody is coming back for it.
+    (run_dir / training.RECORD_LOCK_NAME).write_text("dead holder")
+
+    N = 6
+    for trial in range(3):
+        mgr = mp.Manager()
+        errors = mgr.list()
+        overlaps = mp.Value("i", 0)
+        procs = [
+            mp.Process(
+                target=_one_field, args=(i, str(run_dir.parent), 1.0, errors, overlaps)
+            )
+            for i in range(N)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=120)
+
+        overlapping = [e for e in errors if e.startswith("OVERLAP")]
+        assert overlapping == [], (
+            f"trial {trial}: the mutex stopped excluding while reaping a dead "
+            f"holder's lock: {overlapping[:3]}"
+        )
+        rec = json.loads((run_dir / "status.json").read_text())
+        lost = [f"f{i}" for i in range(N) if f"f{i}" not in rec]
+        assert lost == [], f"trial {trial}: fields lost during the reap: {lost}"
+        assert rec.get("status") == "TRAINING", rec.get("status")
+        # reset for the next trial
+        (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+        (run_dir / training.RECORD_LOCK_NAME).write_text("dead holder")
