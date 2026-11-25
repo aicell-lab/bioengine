@@ -313,9 +313,11 @@ def test_the_mutex_does_not_disturb_the_listing(run_dir):
     Asserted rather than reasoned about."""
     training.write_status(SID, status="TRAINING", owner="gh|1")
     (run_dir / training.RECORD_LOCK_NAME).write_text("held")  # simulate one held
-    # NOTE: on this branch `list_sessions` takes no context -- the per-caller
-    # signature lands with the listing row, not here.
-    seen = training.list_sessions()
+    # `list_sessions` is per-caller since the listing row landed, so it needs a
+    # context and returns only what THAT caller may see. The owner above is the
+    # caller here, which keeps this a test about the mutex rather than about
+    # visibility.
+    seen = training.list_sessions({"user": {"id": "gh|1", "is_anonymous": False}})
     assert sorted(seen) == [SID], f"the listing returned {sorted(seen)}"
 
 
