@@ -244,6 +244,12 @@ async def _cancel_during_prepare(stop_requested_first: bool) -> str:
     class _Replica:
         _training_tasks: dict = {}
 
+        def _persist_run_in_background(self, *_a, **_k):
+            # `_run_training` records the run in the app's workspace storage at
+            # its start and in its `finally`. History is not what this test is
+            # about and there is no storage here, so the write is a no-op.
+            return None
+
         async def _preparing_heartbeat(self, sid, interval=60.0):
             await asyncio.sleep(3600)
 

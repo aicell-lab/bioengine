@@ -61,6 +61,12 @@ class _Stub:
     def __init__(self):
         self._training_tasks = {}
 
+    def _persist_run_in_background(self, *_a, **_k):
+        # `_run_training` records the run in the app's workspace storage at
+        # its start and in its `finally`. History is not what this test is
+        # about and there is no storage here, so the write is a no-op.
+        return None
+
     async def _preparing_heartbeat(self, *a, **k):
         # _run_training creates this as a task and cancels it in its own cleanup;
         # a no-op coroutine is enough to get past that line.

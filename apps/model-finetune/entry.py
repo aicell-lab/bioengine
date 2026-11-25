@@ -32,6 +32,31 @@ from hypha_rpc import connect_to_server
 from pydantic import Field
 
 
+def _redact_urls(value: Any) -> Any:
+    """A copy of *value* with every URL's query string dropped.
+
+    A run record is written to workspace storage and read back by anything
+    holding that workspace, so a presigned URL inside it is a credential with a
+    longer life than the one it was minted for. The path is kept because it says
+    WHAT the run started from, which is the part worth recording.
+
+    Module-level on purpose: ``EntryApp`` at module scope is the Ray Serve
+    ``Deployment`` wrapper once ``@bioengine.app`` has run, so a staticmethod
+    recursing through the class name raises AttributeError at the first nested
+    dict — and `_persist_run` is best-effort, so it would have swallowed that
+    into a warning and written no history at all.
+    """
+    if isinstance(value, str):
+        if value.startswith(("http://", "https://")) and "?" in value:
+            return value.split("?", 1)[0] + "?<redacted>"
+        return value
+    if isinstance(value, dict):
+        return {k: _redact_urls(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_urls(v) for v in value]
+    return value
+
+
 def _parse_backends(raw: Optional[str]) -> set:
     """Backends this worker deploys, from ``MODEL_FINETUNE_BACKENDS`` (comma list
     over ``microsam``/``cellpose``); unset or empty → both. A disabled backend's
@@ -73,6 +98,41 @@ SERVER_URL = "https://hypha.aicell.io"
 # as UNHEALTHY by this check rather than timing the check itself out. Matches
 # annotation-broker's `_HEALTH_CALL_TIMEOUT_S`, which guards the same shape.
 _HEALTH_CALL_TIMEOUT_S = 15.0
+
+# Where a run's record lives, in the app's own workspace storage.
+#
+# A session directory under ``~/.bioengine`` survives a replica restart only
+# while the same host mount is still there: a worker rebuild, a move to another
+# cluster, or a scale-to-zero onto a fresh node take the whole history with
+# them, and a runs page then shows a user nothing they did. The record is small
+# and immutable per run, so one object per session needs no index to stay
+# consistent with itself.
+RUNS_PREFIX = "model-finetune/runs"
+# Newest-first cap on how many records a listing reads. The names and mtimes come
+# from one `list_files` call, but each record is its own GET, so this bounds a
+# polling page rather than the stored history.
+RUNS_LIST_LIMIT = 200
+# Config a record carries, as an ALLOW-list. `params` also holds host filesystem
+# paths and a resolved `init_checkpoint` URL, and a deny-list would publish
+# whatever a later version adds to it.
+_RUN_CONFIG_KEYS = (
+    "model_type",
+    "n_epochs",
+    "n_objects_per_batch",
+    "batch_size",
+    "learning_rate",
+    "diam_mean",
+    "train_tile_size",
+    "patch_shape",
+    "val_fraction",
+    "n_samples",
+    "metrics",
+    "label",
+)
+# Status keys withheld from a record: a presigned URL and a host path tell a
+# reader of the history nothing, and the URL would outlive its own secrecy.
+_RUN_STATUS_DROP = ("init_checkpoint", "checkpoint_path")
+
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal[
@@ -544,6 +604,14 @@ class EntryApp:
         # to max_replicas=1 (see the deployment decorator) — every aggregate lands in this
         # process. Raising max_replicas voids it and needs a pool-side lease instead.
         self._pool_locks: Dict[str, asyncio.Lock] = {}
+        # Run records already read back from storage, keyed by object name and
+        # invalidated by its `last_modified`. A runs page polls, and a record is
+        # immutable once its run is terminal, so re-fetching every object on
+        # every poll would spend one GET per run per poll for bytes that cannot
+        # have changed.
+        self._run_record_cache: Dict[str, Dict[str, Any]] = {}
+        # In-flight record writes, held so the loop cannot collect one mid-write.
+        self._record_tasks: set = set()
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -1191,6 +1259,175 @@ class EntryApp:
         await self._check_runtime_available()
         return await self.runtime.export_onnx(model_type=model_type, quantize=quantize)
 
+    # === run history that outlives the session directory ===
+
+    def _run_record(
+        self, session_id: str, config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """What is kept about one fine-tuning run: its config, its per-epoch
+        metrics and its outcome. Built from the session's own status, so the
+        record cannot describe a run that did not happen.
+
+        *config* is passed in for the record written at the START of a run:
+        ``training_params.json`` is written later, inside the run, and reading it
+        then raises — which would have made the starting record the one that
+        never landed.
+        """
+        import training
+
+        status = {
+            k: v
+            for k, v in training.get_status(session_id).items()
+            if k not in _RUN_STATUS_DROP
+        }
+        if config is None:
+            try:
+                config = training.read_training_params(session_id)
+            except Exception:  # noqa: BLE001 - no params yet is not a failure
+                config = {}
+        config = {k: config[k] for k in _RUN_CONFIG_KEYS if k in config}
+        return _redact_urls(
+            {
+                # Bumped when the shape changes, so a reader that meets an older
+                # record knows which shape it is reading rather than guessing
+                # from which keys happen to be present.
+                "record_version": 1,
+                "session_id": session_id,
+                "saved_at": time.time(),
+                "status": status,
+                "config": config,
+            }
+        )
+
+    async def _persist_run(
+        self, session_id: str, config: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Write the run's record. Best-effort on purpose: history is worth less
+        than the run, so a storage failure is logged and the training outcome
+        stands. Returns whether the record landed."""
+        try:
+            record = await asyncio.to_thread(self._run_record, session_id, config)
+            url = await self._s3.put_file(
+                file_path=f"{RUNS_PREFIX}/{session_id}.json", ttl=3600
+            )
+            resp = await self._http_retry(
+                "PUT", url, content=json.dumps(record).encode()
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as exc:  # noqa: BLE001 - history must not fail a run
+            logger.warning(f"could not persist the run record for {session_id}: {exc}")
+            return False
+
+    def _persist_run_in_background(
+        self, session_id: str, config: Optional[Dict[str, Any]] = None
+    ) -> Optional[Any]:
+        """Start the record write; return its task, or ``None`` if it could not
+        even be started.
+
+        Guarded end to end because the caller is ``_run_training``'s ``finally``:
+        an exception raised from there replaces the run's own outcome with a
+        failure to write its history, which is the wrong way round — a record is
+        worth less than the run it describes. ``test_run_history`` pins that the
+        happy path really does write, so this tolerance cannot turn into silence.
+        """
+        try:
+            task = asyncio.ensure_future(self._persist_run(session_id, config))
+            tasks = self._record_tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            return task
+        except Exception as exc:  # noqa: BLE001 - never break the run
+            logger.warning(f"could not start the record write for {session_id}: {exc}")
+            return None
+
+    async def _persisted_runs(self, limit: int = RUNS_LIST_LIMIT) -> Dict[str, Any]:
+        """Run records in storage, newest first, keyed by session id.
+
+        An absent prefix is an empty history, not an error: a worker that has
+        never trained anything has no objects under it.
+        """
+        try:
+            entries = await self._s3.list_files(path=RUNS_PREFIX)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"could not list stored run records: {exc}")
+            return {}
+
+        files = [
+            e
+            for e in (entries or [])
+            if isinstance(e, dict)
+            and e.get("type") == "file"
+            and str(e.get("name", "")).endswith(".json")
+        ]
+        files.sort(key=lambda e: e.get("last_modified") or 0, reverse=True)
+        files = files[: max(0, int(limit))]
+
+        sem = asyncio.Semaphore(8)
+
+        async def _read(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            name = str(entry["name"])
+            stamp = entry.get("last_modified")
+            cached = self._run_record_cache.get(name)
+            if cached is not None and cached.get("_stamp") == stamp:
+                return cached.get("record")
+            async with sem:
+                try:
+                    url = await self._s3.get_file(
+                        file_path=f"{RUNS_PREFIX}/{name}", use_proxy=True
+                    )
+                    resp = await self._http_retry("GET", url)
+                    # `get_file` mints a URL for an object that is not there —
+                    # measured — so absence shows up here as a 404 and nowhere
+                    # earlier. Checked rather than parsed: an error body is
+                    # valid JSON often enough to become a plausible record.
+                    resp.raise_for_status()
+                    record = resp.json()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"could not read run record {name}: {exc}")
+                    return None
+            if not isinstance(record, dict):
+                return None
+            self._run_record_cache[name] = {"_stamp": stamp, "record": record}
+            return record
+
+        out: Dict[str, Any] = {}
+        for record in await asyncio.gather(*[_read(e) for e in files]):
+            if record is None:
+                continue
+            sid = record.get("session_id")
+            if isinstance(sid, str) and sid:
+                out[sid] = record
+        return out
+
+    @staticmethod
+    def _status_from_record(session_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        """A stored record as a status payload, in the shape a live session has.
+
+        ``persisted`` is what separates the two: the run happened, the record is
+        all that is left of it, and the weights went with the session directory —
+        so ``checkpoint_available`` is false regardless of what the record said
+        when it was written, and nothing can be served or exported from here.
+        """
+        status = dict(record.get("status") or {})
+        status["session_id"] = session_id
+        status["persisted"] = True
+        status["checkpoint_available"] = False
+        status["config"] = record.get("config")
+        if status.get("status") in ("PREPARING", "QUEUED", "TRAINING"):
+            # A record is written when a run starts as well as when it ends, so a
+            # non-terminal one means the run never reached an outcome here. The
+            # snapshot is frozen, and nothing is going to advance it: without
+            # this a page would show a run as TRAINING for ever. Same conclusion
+            # `training.get_status` reaches through its stale window, which a
+            # stored snapshot cannot be subject to.
+            status["status"] = "STOPPED"
+            status["message"] = (
+                "recorded while still running; the session is gone, so no outcome "
+                "was ever written"
+            )
+        return status
+
     # === fine-tuning orchestration (async-job model) ===
 
     async def _prepare_training_data(
@@ -1255,6 +1492,14 @@ class EntryApp:
         import training
 
         preparing_hb = asyncio.create_task(self._preparing_heartbeat(session_id))
+        # A record at the START as well as at the end, so a run whose replica is
+        # lost before it finishes still appears in the history instead of
+        # vanishing. Overwritten with the outcome when the run ends, and a reader
+        # of a non-terminal record is told what it is (`_status_from_record`).
+        # Not awaited: history must not delay the training it describes.
+        self._persist_run_in_background(
+            session_id, config={**params, "model_type": model_type}
+        )
         try:
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
@@ -1344,6 +1589,26 @@ class EntryApp:
         finally:
             preparing_hb.cancel()
             self._training_tasks.pop(session_id, None)
+            # In `finally`, so the record is written for a run that failed or was
+            # stopped as well as one that completed — an outcome is history too,
+            # and "the run vanished" is the one thing a runs page must not show.
+            # After the status writes above, so it carries the terminal outcome.
+            #
+            # SHIELDED because this `finally` also runs while THIS task is being
+            # cancelled (a user stop), and an await inside a cancelled task
+            # raises at once: the record for every stopped run would be the one
+            # that never got written. The shielded write survives that and
+            # finishes on its own, so the wait failing here is harmless — hence
+            # the bare passes. A reference is held until it is done, or the loop
+            # may collect the task mid-write.
+            record_task = self._persist_run_in_background(session_id)
+            if record_task is not None:
+                try:
+                    await asyncio.shield(record_task)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
 
     @bioengine.method
     async def get_training_capabilities(self) -> Dict[str, Any]:
@@ -1845,17 +2110,57 @@ class EntryApp:
     ) -> Dict[str, Any]:
         """Fine-tuning session status (PREPARING/QUEUED/TRAINING/COMPLETED/FAILED/
         STOPPED), elapsed time, and whether the checkpoint is servable. QUEUED
-        means another fine-tuning holds the single training slot."""
+        means another fine-tuning holds the single training slot.
+
+        For a run whose session directory is gone, the stored record answers
+        instead, with ``persisted: true`` and ``checkpoint_available: false``.
+        Without that fallback a page that lists history and then polls a row
+        would be told ``UNKNOWN - no such session`` about a run it had just
+        shown."""
         import training
 
-        return training.get_status(session_id)
+        status = training.get_status(session_id)
+        if status.get("status") != "UNKNOWN":
+            return status
+        record = (await self._persisted_runs()).get(session_id)
+        if record is None:
+            return status
+        return self._status_from_record(session_id, record)
 
     @bioengine.method
-    async def list_training_sessions(self) -> Dict[str, Any]:
-        """All fine-tuning sessions on this worker, keyed by session_id."""
+    async def list_training_sessions(
+        self,
+        include_persisted: bool = Field(
+            True,
+            description="Also list runs that only exist as a stored record, i.e. "
+            "whose session directory this worker no longer has. False restricts "
+            "the answer to sessions live on this worker.",
+        ),
+        limit: int = Field(
+            RUNS_LIST_LIMIT,
+            ge=1,
+            description="Newest-first cap on how many stored records are read.",
+        ),
+    ) -> Dict[str, Any]:
+        """All fine-tuning runs this worker can account for, keyed by session_id.
+
+        Sessions live on this worker, plus — unless ``include_persisted`` is
+        false — runs that survive only as a stored record, so the history is
+        still there after a restart that took the session directories with it. A
+        record-only run carries ``persisted: true``, ``checkpoint_available:
+        false`` and its ``config``; a live session's own status always wins over
+        a record for the same id, because it is the fresher of the two."""
         import training
 
-        return training.list_sessions()
+        local = training.list_sessions()
+        if not include_persisted:
+            return local
+        out: Dict[str, Any] = {}
+        for sid, record in (await self._persisted_runs(limit=limit)).items():
+            if sid not in local:
+                out[sid] = self._status_from_record(sid, record)
+        out.update(local)
+        return out
 
     @bioengine.method
     async def stop_training(
