@@ -252,6 +252,10 @@ per user box:      decode locally via onnxruntime-web using onnx + emb.features 
 auto pre-seg:      infer([img], "vit_l_lm") -> [{"output": int32 [H,W]}]          # propose-and-prune
 ```
 
+## Operator notes
+
+- **Stray `.mutex-<pid>-<uuid>` files in a run's directory are expected and harmless.** Each writer creates one to take the record lock by hard link, and removes it on the way out; a writer that dies mid-write leaves its copy behind. Nothing reads them, and the run listing only looks at directories, so they do not appear as runs. They are not cleaned up automatically: a sweep that deleted another process's lock file would be the same check-then-act race the lock itself is built to avoid. Delete them by hand if a store accumulates many, which means writers are dying.
+
 ## Deployment
 
 The app reads `HYPHA_TOKEN` at startup (Hypha connection + S3 upload/download),

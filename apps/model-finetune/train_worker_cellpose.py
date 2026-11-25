@@ -174,7 +174,7 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
     STATUS_STALE_SECONDS of no update). Carries no ``status`` so the refresh lands
     even under a sticky terminal record, keeping a live orphan visibly live."""
     while not stop.wait(interval):
-        training.write_status(session_id)
+        training.write_status_best_effort(session_id)
 
 
 # Every epoch reports, because the curve is recomputed from cellpose's own per-batch
@@ -222,7 +222,7 @@ def _publish_epoch(session_id: str, has_val: bool):
 
     def on_epoch(n_completed: int, curve):
         try:
-            training.write_status(
+            training.write_status_best_effort(
                 session_id,
                 epochs=[
                     {"epoch": i, "train_loss": float(v), "val_loss": None}
