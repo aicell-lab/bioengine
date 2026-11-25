@@ -922,6 +922,12 @@ class TestGetImageUrl:
             "store_root": "https://x/zarr/ds/",
             "multiscale_path": "0",
             "region": None,
+            # Both present and null: this source recorded neither, and the
+            # viewer distinguishes "no plane, draw the only slice" from "plane
+            # unknown". Asserted as an EXACT dict so a field added to this
+            # response without a decision shows up here.
+            "planes": None,
+            "level0_shape": None,
         }
 
     async def test_a_patch_carries_its_region_to_the_reader(self, served):
@@ -956,6 +962,101 @@ class TestGetImageUrl:
         }
         out = await served.get_image_url("ws/ds", "r", context=None)
         assert out["store_root"] == "https://ov.example/zarr/ds1/"
+
+    # ── the recorded plane has to reach the browser ──────────────────────
+
+    async def test_a_recorded_PLANE_reaches_the_reader(self, served):
+        """CLAUSE 1. The page has no other way to learn it: `get_image_url` is
+        the only call the annotate page makes to resolve an image."""
+        served._state["entries"] = {
+            "r": bc.remote_image_entry(
+                "https://x/zarr/stack/",
+                "0",
+                64,
+                64,
+                planes={"z": 4},
+                layout={
+                    "dataset_paths": ["0", "1"],
+                    "axis_roles": {"y": 1, "x": 2},
+                    "level0_shape": [9, 64, 64],
+                    "axes": ["z", "y", "x"],
+                },
+            )
+        }
+        out = await served.get_image_url("ws/ds", "r", context=None)
+        assert out["planes"] == {"z": 4}
+        assert out["level0_shape"] == [9, 64, 64]
+
+    async def test_a_source_with_NO_plane_returns_null_for_both(self, served):
+        """CLAUSE 1, the other half. A 2-D source has no plane to report, and
+        null is a different statement from a missing key -- the viewer draws the
+        only slice for one and refuses for the other."""
+        served._state["entries"] = {
+            "r": bc.remote_image_entry("https://x/zarr/flat/", "0", 64, 64)
+        }
+        out = await served.get_image_url("ws/ds", "r", context=None)
+        assert out["planes"] is None
+        assert out["level0_shape"] is None
+        assert "planes" in out and "level0_shape" in out, (
+            "the keys must be PRESENT and null, not absent: the documented "
+            "shape promises them"
+        )
+
+    async def test_a_3D_source_carries_BOTH_fields_together(self, served):
+        """Both fields travel for a source that records a plane AND a layout.
+
+        ⚠ THIS TEST DOES NOT, AND CANNOT, COVER THE Z-DOWNSAMPLING CASE. An
+        earlier version of it was named for that and claimed to, and the claim
+        was false in two ways worth recording:
+
+        * its fixture had no z-downsampled level at all. It was identical to
+          `test_a_recorded_PLANE_reaches_the_reader`'s but for the store_root;
+          the "level 1 has 5 slices" existed only in a comment, so every mutant
+          that reddened it reddened that test too and it had ZERO unique kills;
+        * its docstring said a y/x-only pyramid would let the assertion pass
+          with the fields dropped. That is not true of any pyramid:
+          `get_image_url` is a PASS-THROUGH and never sees a level's shape, so
+          dropping the fields fails identically everywhere.
+
+        The per-level index is derived by the VIEWER from `level0_shape` plus
+        the store's own level shapes. Nothing in this repo reads a level shape,
+        so the z-downsampling behaviour is not verifiable on the broker side at
+        all -- it belongs to the page, which is where the row's clause 2 puts
+        it. This test is therefore scoped to what it really checks: the two
+        fields arrive together and unmangled.
+        """
+        served._state["entries"] = {
+            "r": bc.remote_image_entry(
+                "https://x/zarr/zstack/",
+                "0",
+                64,
+                64,
+                planes={"z": 4},
+                layout={
+                    "dataset_paths": ["0", "1"],
+                    "axis_roles": {"y": 1, "x": 2},
+                    "level0_shape": [9, 64, 64],
+                    "axes": ["z", "y", "x"],
+                },
+            )
+        }
+        out = await served.get_image_url("ws/ds", "r", context=None)
+        assert out["planes"] == {"z": 4}
+        assert out["level0_shape"] == [9, 64, 64], (
+            "the level-0 extent is what the VIEWER derives a per-level index "
+            "from; this asserts it arrives, not that the derivation is right"
+        )
+
+    async def test_a_remote_image_whose_layout_is_absent_does_not_raise(self, served):
+        """An entry imported before layout was recorded must still resolve. The
+        page refuses to DRAW it, which is the safe state; the broker must not
+        turn it into an error that hides the image entirely."""
+        entry = bc.remote_image_entry("https://x/zarr/old/", "0", 8, 8, planes={"z": 1})
+        entry["source"].pop("layout", None)
+        served._state["entries"] = {"r": entry}
+        out = await served.get_image_url("ws/ds", "r", context=None)
+        assert out["planes"] == {"z": 1}
+        assert out["level0_shape"] is None
 
     async def test_an_entry_with_neither_a_file_nor_a_source_raises(self, served):
         served._state["entries"] = {"broken": {"state": "local"}}
