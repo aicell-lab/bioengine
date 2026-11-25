@@ -1244,6 +1244,68 @@ class AnnotationBroker:
         await self._apply_permissions(artifact_id, meta)
         return meta
 
+    @bioengine.method()
+    async def list_public_datasets(self) -> List[Dict[str, Any]]:
+        """The public gallery: datasets whose owner called ``set_public(True)``.
+
+        Callable by anyone, including an anonymous visitor, because that is
+        who the gallery is for. It takes no ``context`` at all -- there is no
+        identity-dependent behaviour here, and a method that cannot see who is
+        calling cannot accidentally vary by caller.
+
+        **Served from the broker's OWN flag**, the same one ``resolve_role``
+        consults when it decides whether an anonymous caller may read a
+        dataset. That is deliberate: a gallery built on any other source could
+        advertise a dataset the read path then refuses, or hide one it would
+        happily serve. It also means the gallery works regardless of the
+        parent collection's permissions -- the broker reads the artifacts with
+        the app's own credential, and an anonymous visitor never touches the
+        artifact manager directly.
+
+        **No email addresses.** The response is an allow-list of fields, and
+        every string in it is scrubbed on the way out, not just the owner --
+        a name or a description is free text somebody typed. The owner is
+        shown as an opaque id, since broker metadata holds an id and an email
+        and nothing resembling a display name; where the id is itself an
+        address there is nothing publishable and the field is null.
+
+        One artifact read per public dataset, for the name, description and
+        image count. That is proportional to the number of PUBLIC datasets
+        rather than to all of them, and a dataset whose artifact cannot be
+        read is listed with whatever is known rather than dropped -- a
+        gallery that silently shrinks is worse than one with a sparse card.
+        """
+        entries: List[Dict[str, Any]] = []
+        for meta in core.iter_public_metadata(STATE_ROOT):
+            artifact_id = meta["artifact_id"]
+            name = description = None
+            image_count = None
+            try:
+                art = await self._am.read(artifact_id=artifact_id)
+                manifest = (art or {}).get("manifest") or {}
+                name = manifest.get("name")
+                description = manifest.get("description")
+            except Exception:
+                # Deliberately not logged per dataset: the id comes from the
+                # broker's own state, but the read is a network call and a
+                # transient failure must not turn the gallery into a log
+                # amplifier. The sparse card is the whole response.
+                pass
+            try:
+                manifest_images = await self._image_manifest(artifact_id)
+                image_count = len(manifest_images)
+            except Exception:
+                pass
+            entries.append(
+                core.public_dataset_entry(
+                    meta,
+                    name=name,
+                    description=description,
+                    image_count=image_count,
+                )
+            )
+        return entries
+
     @bioengine.method(context=True)
     async def set_public(
         self,
