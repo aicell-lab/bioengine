@@ -387,18 +387,163 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
 
 # Fields recorded on a run but NOT returned by the public read path.
 #
-# `list_training_sessions` answers anonymous callers today, and it returns
-# whatever `get_status` returns. So the moment a run records who started it, that
-# identity is published to anyone who asks -- the public history would stop
-# saying only WHAT was trained and start saying WHO trained it. Recording the
-# owner and keeping it out of the response therefore have to be one change, not
-# two: "record now, filter later" publishes the identity in between.
+# `list_training_sessions` is now per-caller (see `list_sessions`), so a run is
+# only returned to the identity it was recorded under. That is NOT why these
+# fields are withheld. The owner is what the filter COMPARES, so it is read on
+# every listing; publishing it would turn a history that says WHAT was trained
+# into one that says WHO trained it, for every run the caller can see. Recording
+# the owner and keeping it out of the response therefore have to be one change,
+# not two: "record now, filter later" publishes the identity in between.
 #
 # These come back only for a caller that asks with include_private=True, which is
-# the hook the per-caller filter will use to compare a request against the run's
-# owner. When that filter lands, the listing can return owned runs to their owner
-# and this redaction becomes the default for everyone else rather than for all.
+# the hook the per-caller filter uses to compare a request against the run's owner.
+# The owner is therefore READ on every listing and PUBLISHED on none.
 PRIVATE_STATUS_FIELDS = ("owner", "owner_anonymous")
+
+# Runs that carry no owner are shown ONLY to a caller holding rw or admin on
+# this exact workspace. Three narrowings, each deliberate:
+#
+#   * "r" is EXCLUDED. Read permission is not authority over other people's run
+#     history. ``usage_ledger.classify_caller`` counts {"r", "rw", "a"} as
+#     operator grants, which is right for its own question — is this caller an
+#     insider, for a usage figure meant to be a floor — and wrong for this one.
+#     Measured: that function buckets a caller holding only "r" on this
+#     workspace as `internal`, where this one refuses it.
+#   * the workspace is NAMED, and the caller's OWN workspace does not count.
+#     Measured 2026-11-25: every token-less caller is minted a fresh identity
+#     holding "a" on its own personal workspace (`ws-user-anonymouz-...`). This
+#     function deliberately does NOT short-circuit on `is_anonymous`, because an
+#     anonymous caller is a real identity that owns its own runs — so an
+#     implementation reading "does this caller hold an operator grant anywhere"
+#     would be true for every caller alive, anonymous ones included, and hand
+#     the whole unowned history to exactly the callers it must exclude. A mutant
+#     doing that turns three tests red.
+#   * a WILDCARD grant does NOT count, even carrying rw or admin. A global
+#     operator arguably does hold authority here, so accepting "*" would be
+#     defensible — but the rule this implements names one workspace, and
+#     widening a privacy filter past its rule is not a call to make in passing.
+#     Refusing "*" costs a genuine global operator nothing but the ownerless
+#     rows; accepting it would show 261 other people's runs to an identity
+#     nobody authorised. If "*" is ever wanted, it should arrive as a decision
+#     with a name on it.
+#
+# NB `classify_caller` would NOT have leaked to anonymous callers if reused: it
+# returns `anonymous` before ever reading the grants (measured, including with
+# `*: a`). The leak above is a hazard of a naive implementation of THIS
+# function, which has no such short-circuit. Recorded because an earlier note
+# here attributed it to that function, and that was wrong.
+OWNERLESS_WORKSPACE = "bioimage-io"
+OWNERLESS_GRANTS = frozenset({"rw", "a"})
+
+
+def caller_is_workspace_admin(
+    context: Any, *, workspace: str = OWNERLESS_WORKSPACE
+) -> bool:
+    """True iff the caller holds rw or admin on *workspace* — ``bioimage-io``.
+
+    Named for what it TESTS, not for one of its uses. Two different rules ask
+    this same question: an ownerless run is visible only to such a caller, and
+    a mutating call on somebody else's run is allowed only for such a caller.
+    Naming it after the first use made the second one read like a mistake.
+
+    A run that carries no owner cannot be attributed to anybody, and there are
+    261 of them written before the field existed. They are not guessed at, not
+    made public and not deleted: they are shown only to a caller with rw or
+    admin on ``bioimage-io`` specifically.
+
+    **Not "the workspace hosting the app".** The name is the constant above, so
+    an instance of this app deployed into some other workspace — a dev worker —
+    does not treat its own hosting workspace as authoritative. That is the
+    intended reading of the rule and not an oversight; it is also why the
+    workspace is a keyword argument, so a test can state the name it means.
+
+    Decided from the INJECTED context and from nothing else: there is no
+    parameter, so a caller cannot ask to be treated as an administrator. A
+    wildcard grant does not qualify — see the note above the constant.
+
+    Never raises: an unusable context is "no authority", which is the closed
+    direction. A caller that cannot be read must not inherit the open one.
+    """
+    if not isinstance(context, dict):
+        return False
+    user = context.get("user")
+    if not isinstance(user, dict):
+        return False
+    scope = user.get("scope")
+    if not isinstance(scope, dict):
+        return False
+    grants = scope.get("workspaces")
+    if not isinstance(grants, dict):
+        return False
+    return grants.get(workspace) in OWNERLESS_GRANTS
+
+
+class NotTheOwner(PermissionError):
+    """A caller asked to change a run that is not theirs.
+
+    A ``PermissionError`` rather than a ``ValueError``: the request was
+    well-formed and the session exists, and the only thing wrong is who is
+    asking. Callers that already distinguish "bad argument" from "not allowed"
+    keep distinguishing them.
+    """
+
+
+def caller_may_mutate(session_id: str, context: Any) -> bool:
+    """True iff *context* identifies the run's owner, or a ``bioimage-io`` admin.
+
+    A run with a recorded owner is matched EXACTLY against the caller's injected
+    identity. A run with no usable owner cannot be attributed to anybody, so it
+    is admin-only — the same rule the listing applies to the 261 runs recorded
+    before the field existed, and for the same reason: guessing an owner is worse
+    than admitting there is none.
+
+    Reads nothing but the status that is already on disk and CREATES NOTHING, so
+    asking the question about a session that does not exist is safe. It answers
+    False for one, because an absent status has no owner and the ownerless rule
+    then applies — a non-admin is refused before any write can happen.
+
+    Fails closed: an unreadable context yields no identity and so no match, and
+    `caller_is_workspace_admin` is False for it too.
+    """
+    owner = read_status(session_id).get("owner")
+    if isinstance(owner, str) and owner:
+        caller = caller_identity(context).get("owner")
+        if caller is not None and caller == owner:
+            return True
+        # NOT a fall-through to "refuse". The rule is "the owner OR an admin",
+        # and an earlier version reached the admin test only for OWNERLESS runs
+        # -- so an administrator could not touch an owned run, while this
+        # function's own docstring said they could. The tests missed it because
+        # their admin fixture used the SAME id as the owner, so "the admin can"
+        # passed as "the owner can".
+        return caller_is_workspace_admin(context)
+    return caller_is_workspace_admin(context)
+
+
+def require_caller_may_mutate(session_id: str, context: Any) -> None:
+    """:func:`caller_may_mutate`, or raise :class:`NotTheOwner`.
+
+    The message deliberately does NOT say whether the run exists, who owns it,
+    or whether the caller merely lacks admin — a refusal that explains itself
+    tells an unauthorised caller which session ids are real.
+    """
+    if not caller_may_mutate(session_id, context):
+        raise NotTheOwner(
+            "this training run belongs to another caller; only its owner or a "
+            "workspace administrator can change it"
+        )
+
+
+def redact_private(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop every private field, in place, and return the same dict.
+
+    One definition, used by both the single-run read and the listing. Two copies
+    of this loop is how a field added to :data:`PRIVATE_STATUS_FIELDS` ends up
+    stripped on one path and published on the other.
+    """
+    for field in PRIVATE_STATUS_FIELDS:
+        status.pop(field, None)
+    return status
 
 
 def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, Any]:
@@ -426,32 +571,40 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
     if not include_private:
-        for field in PRIVATE_STATUS_FIELDS:
-            st.pop(field, None)
+        redact_private(st)
 
     return st
 
 
-def list_sessions() -> Dict[str, Dict[str, Any]]:
-    """Every run on this worker whose directory name is a real session id.
+def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
+    """The runs this caller may see, keyed by session id, owner redacted.
 
-    **A non-conforming directory is SKIPPED, not fatal, and that is the whole
-    point of this function having a comment.** ``get_status`` validates the id,
-    so listing a directory whose name is not a session id raises — and one such
-    directory would then make the listing raise for *every* caller, turning a
-    stray directory into a total outage of the run history.
+    *context* is REQUIRED and has no default, deliberately. There is no
+    unfiltered listing to call by mistake: the previous `list_sessions()`
+    returned every run on the worker to whoever asked, and leaving that
+    signature available with a filtered sibling beside it would make the open
+    behaviour one forgotten argument away.
 
-    That is not hypothetical. Until this fix is deployed, the running version
-    lets any unauthenticated caller create exactly such a directory, so the
-    fixed version can come up with junk already on disk beside the real runs.
-    The "all 261 live ids conform" measurement was taken *before* the rollout
-    and cannot speak for what is on disk after it.
+    A run is visible iff its recorded owner IS this caller, or it carries no
+    owner and the caller may see ownerless runs. Both legs fail closed: an
+    unreadable context yields no identity, no authority, and so an empty
+    listing. The owner is read here and redacted from everything returned, so
+    the field decides visibility and is never itself published.
 
-    So the rule is: validate what a CALLER hands us, and tolerate what we FIND.
-    A name that cannot be a session id was not produced by this server, and the
-    honest thing is to leave it out of the history rather than to refuse to show
-    the history at all. It is logged once per listing so the junk is visible.
+    **A directory that is not a session is SKIPPED, not fatal.** `get_status`
+    validates the id, so listing a directory whose name is not a session id
+    raises -- and one such directory would then make the listing raise for
+    EVERY caller, turning a stray directory into a total outage of the run
+    history. The rule is: validate what a CALLER hands us, tolerate what we
+    FIND. A name that cannot be a session id was not produced by this server,
+    so leaving it out of the history is honest; refusing to show the history at
+    all is not. Skipped names are logged with a bounded sample, since they are
+    attacker-controlled.
     """
+    identity = caller_identity(context)
+    caller = identity.get("owner")
+    see_ownerless = caller_is_workspace_admin(context)
+
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
     skipped: List[str] = []
@@ -462,23 +615,28 @@ def list_sessions() -> Dict[str, Dict[str, Any]]:
             skipped.append(d.name)
             continue
         try:
-            out[d.name] = get_status(d.name)
+            status = get_status(d.name, include_private=True)
         except InvalidSessionId:
-            # The name passed, but a deeper layer still refused it. Today that
-            # means the containment check: a directory whose NAME is a valid
-            # session id but which is a SYMLINK out of the sessions root. The
-            # name check above cannot see that, and without this the one bad
-            # link would raise and take the whole history down -- the same
-            # outage the name check was added to prevent, through the other
-            # layer. Caught here rather than by pre-checking the link, so that
-            # any future refusal inside `session_dir` is covered too.
+            # The name passed but a deeper layer refused it -- today that means
+            # a directory whose NAME is a valid session id but which is a
+            # SYMLINK out of the sessions root. Skipped like a bad name, so one
+            # bad link cannot take the whole history down.
             skipped.append(d.name)
+            continue
+        owner = status.get("owner")
+        if isinstance(owner, str) and owner:
+            # A recorded owner is matched EXACTLY, and only against a caller we
+            # could actually read. `caller is None` must never match a run.
+            visible = caller is not None and caller == owner
+        else:
+            # No owner, or one unusable as an identity. Both are unattributable.
+            visible = see_ownerless
+        if visible:
+            out[d.name] = redact_private(status)
     if skipped:
-        # Names are attacker-controlled, so log how many and a bounded sample
-        # rather than the lot.
         print(
-            f"[model-finetune] skipped {len(skipped)} session directory(ies) whose "
-            f"name is not a valid session id: {skipped[:5]}",
+            f"[model-finetune] skipped {len(skipped)} session directory(ies) that "
+            f"are not a session on this worker: {skipped[:5]}",
             flush=True,
         )
     return out
