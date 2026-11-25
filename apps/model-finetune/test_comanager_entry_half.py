@@ -23,6 +23,7 @@ thing under test is the wiring in `entry.py`: which permissions document reaches
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -212,3 +213,152 @@ async def test_the_LISTING_passes_only_the_RESOLVED_datasets_not_all_of_them(
     cls, inst = _app(am)
     await cls.list_training_sessions(inst, context=MANAGER)
     assert seen["writable"] == frozenset({"ws/mine"}), seen["writable"]
+
+
+# ── start_training's two gates: the claim, and the resume ────────────────────
+#
+# Review's mutants (a) and (d). Both live in `start_training`, which is why
+# they survived the resolver tests above: nothing drove the call.
+
+
+async def _start(inst, cls, **kwargs):
+    """Call start_training far enough to exercise its gates and no further.
+
+    The gates run before the session directory exists, by design, so a refused
+    call must raise before any filesystem work. That is also what lets this be
+    driven without a Ray runtime: anything that gets PAST the gates fails later
+    for an unrelated reason, which the tests below distinguish by exception
+    type rather than by "it raised".
+    """
+    return await cls.start_training(inst, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_dataset_the_caller_does_NOT_manage_is_REFUSED_on_start(monkeypatch):
+    """Mutant (a): disabling this check lets anyone attach a run to any dataset.
+
+    That is not privilege escalation -- the run is the caller's own -- but it
+    puts arbitrary content into a team's listing of a dataset they manage, in
+    front of people who never agreed to see it.
+    """
+    am = FakeArtifactManager({"ws/theirs": PUBLIC_BUT_UNMANAGED})
+    cls, inst = _app(am)
+    with pytest.raises(training.NotTheOwner, match="do not own or manage"):
+        await _start(
+            inst,
+            cls,
+            train_images=[],
+            train_labels=[],
+            dataset_artifact_id="ws/theirs",
+            context=STRANGER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_dataset_the_caller_DOES_manage_gets_past_that_gate(monkeypatch):
+    """THE CONTROL for the test above.
+
+    A `start_training` that refused every dataset would satisfy it and break
+    the feature. So assert this call does NOT raise NotTheOwner -- it fails
+    later, on the empty training data, which is a different exception and
+    proves the gate let it through.
+    """
+    am = FakeArtifactManager({"ws/mine": MANAGED_BY_MANAGER})
+    cls, inst = _app(am)
+    try:
+        await _start(
+            inst,
+            cls,
+            train_images=[],
+            train_labels=[],
+            dataset_artifact_id="ws/mine",
+            context=MANAGER,
+        )
+    except training.NotTheOwner as exc:  # pragma: no cover - the failure we test for
+        raise AssertionError(f"a managed dataset was refused: {exc}")
+    except Exception:
+        pass  # anything else means the gate passed, which is the claim here
+
+
+@pytest.mark.asyncio
+async def test_RESUMING_a_run_on_a_dataset_the_caller_does_not_manage_is_REFUSED(
+    monkeypatch, tmp_path
+):
+    """Mutant (d): passing the prior run's dataset as managed, unchecked.
+
+    Resuming continues from another run's CHECKPOINT, so the resulting model
+    derives from weights the caller never trained. The gate is by access --
+    owner, dataset manager, or admin -- and the mutant hands the second of
+    those to everybody by asserting the prior run's dataset is managed without
+    asking the artifact manager.
+    """
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(training, "sessions_root", lambda: root)
+    monkeypatch.setattr(training, "session_dir", lambda sid: root / sid)
+    import re as _re
+
+    monkeypatch.setattr(training, "SESSION_ID_PATTERN", _re.compile(r"\A[\w.-]+\Z"))
+    prior = root / "someone-elses-run"
+    prior.mkdir()
+    (prior / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "COMPLETED",
+                "owner": "u-manager",
+                training.DATASET_FIELD: "ws/theirs",
+            }
+        )
+    )
+
+    # The stranger manages nothing: the artifact reads back with no grant.
+    am = FakeArtifactManager({"ws/theirs": PUBLIC_BUT_UNMANAGED})
+    cls, inst = _app(am)
+    with pytest.raises(training.NotTheOwner):
+        await _start(
+            inst,
+            cls,
+            train_images=[],
+            train_labels=[],
+            resume_session_id="someone-elses-run",
+            context=STRANGER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_CO_MANAGER_may_resume_the_same_run(monkeypatch, tmp_path):
+    """THE CONTROL for the resume gate, and the feature this row exists for."""
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(training, "sessions_root", lambda: root)
+    monkeypatch.setattr(training, "session_dir", lambda sid: root / sid)
+    import re as _re
+
+    monkeypatch.setattr(training, "SESSION_ID_PATTERN", _re.compile(r"\A[\w.-]+\Z"))
+    prior = root / "a-colleagues-run"
+    prior.mkdir()
+    (prior / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "COMPLETED",
+                "owner": "u-somebody-else",
+                training.DATASET_FIELD: "ws/shared",
+            }
+        )
+    )
+
+    am = FakeArtifactManager({"ws/shared": MANAGED_BY_MANAGER})
+    cls, inst = _app(am)
+    try:
+        await _start(
+            inst,
+            cls,
+            train_images=[],
+            train_labels=[],
+            resume_session_id="a-colleagues-run",
+            context=MANAGER,
+        )
+    except training.NotTheOwner as exc:  # pragma: no cover
+        raise AssertionError(f"a dataset co-manager was refused a resume: {exc}")
+    except Exception:
+        pass
