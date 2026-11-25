@@ -532,15 +532,32 @@ class TestImportNgffImage:
         assert importer._state["manifest"] is None, "a refused import wrote a manifest"
         assert importer._state["committed"] == 0, "a refused import committed"
 
-    async def test_a_fractional_plane_is_REFUSED_BY_THE_IMPORT(self, importer):
+    async def test_a_fractional_plane_is_REFUSED_BY_THE_IMPORT(
+        self, importer, monkeypatch
+    ):
         """The one the swallowed-refusal mutant let through: int(1.5) is 1, so a
-        permissive path records a real slice the caller never asked for."""
+        permissive path records a real slice the caller never asked for.
+
+        On a z-STACK probe, not the fixture's (c, y, x) store. Sent as
+        {'c': 1.5} the channel rule refuses it first, so the test passed without
+        the whole-number check at all and its name claimed more than it showed.
+        """
+        async def _zstack_probe(_root, _mp, _origin):
+            return {
+                "store_root": ROOT, "multiscale_path": None, "stem": "sample",
+                "width": 800, "height": 600, "dtype": "|u1", "channels": None,
+                "levels": 1, "content_hint": "deadbeef", "dataset_paths": ["0"],
+                "axis_roles": {"y": 1, "x": 2}, "level0_shape": [9, 600, 800],
+                "axes": ["z", "y", "x"],
+            }
+
+        monkeypatch.setattr(importer, "_probe_ngff_source", _zstack_probe)
         with pytest.raises(ValueError) as e:
             await importer.import_ngff_image(
-                "ws/ds", ROOT, planes={"c": 1.5}, context=None
+                "ws/ds", ROOT, planes={"z": 1.5}, context=None
             )
         assert importer._state["committed"] == 0
-        assert "whole number" in str(e.value) or "channel" in str(e.value), str(e.value)
+        assert "whole number" in str(e.value), str(e.value)
 
     async def test_a_plane_on_the_CHANNEL_axis_is_refused_by_the_import(
         self, importer

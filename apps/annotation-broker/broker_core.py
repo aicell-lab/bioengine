@@ -20,6 +20,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -860,10 +861,19 @@ def normalise_planes(
     frontend to drop c from what it sends; accepting it would have the record
     and the pixels disagree forever.
     """
-    if not planes:
+    # Only `None` and an EMPTY MAPPING mean "no plane". `0`, `""`, `False` and
+    # `[]` are all falsy and used to be swallowed as "none given", so a caller
+    # sending one got a silent no-op instead of being told its argument was not
+    # a mapping -- the quiet shape of wrongness this validator exists to refuse.
+    if planes is None:
         return None
     if not isinstance(planes, dict):
-        raise ValueError("planes must be an object of axis name to index.")
+        raise ValueError(
+            f"planes must be an object of axis name to index, not "
+            f"{type(planes).__name__}."
+        )
+    if not planes:
+        return None
     names = [str(a) for a in (axes or [])]
     shape = [int(n) for n in (level0_shape or [])]
     if not names or not shape:
@@ -915,6 +925,12 @@ def normalise_planes(
                 f"planes[{name!r}] is {value!r}, which is not a number. An index "
                 f"must be a whole number, not a string or a flag."
             )
+        if not math.isfinite(float(value)):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a finite number. "
+                f"`inf` raises OverflowError and `nan` a message naming neither "
+                f"the axis nor the problem, so both are refused here instead."
+            )
         if float(value) != int(value):
             raise ValueError(
                 f"planes[{name!r}] is {value!r}, which is not a whole number. "
@@ -929,6 +945,33 @@ def normalise_planes(
                 f"{size} element(s) (0..{size - 1})."
             )
         out[name] = index
+
+    # N4: a PARTIAL mapping used to be accepted -- {"t": 0} on a store whose z is
+    # 9 was recorded, and the reader then refused it at TRAINING time, which is
+    # exactly the "fails only when somebody trained on it" this validator claims
+    # to prevent. So once a caller names any plane, it must name them all: every
+    # axis that is neither spatial nor channel and has more than one element.
+    # An empty mapping is still fine -- that is "no plane recorded", which the
+    # reader refuses immediately and legibly.
+    # Only when the ROLES are known. Without them nothing is forbidden, so y, x
+    # and c would count as non-spatial and the rule would demand a plane for the
+    # crop axes themselves -- it broke six existing cases that way. The check is
+    # only as good as the layout, which is the same reason absent roles forbid
+    # nothing above.
+    if out and forbidden:
+        missing = [
+            n
+            for i, n in enumerate(names)
+            if n not in forbidden and n not in out and shape[i] > 1
+        ]
+        if missing:
+            raise ValueError(
+                f"planes names {sorted(out)} but leaves {missing!r} unset, and "
+                f"{'those axes have' if len(missing) > 1 else 'that axis has'} "
+                f"more than one element. A partial record is refused here rather "
+                f"than at training time: give every non-spatial axis a plane, or "
+                f"none at all."
+            )
     return out or None
 
 

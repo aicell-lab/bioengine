@@ -31,8 +31,45 @@ SHAPE = [1, 3, 9, 1000, 2000]        # z has NINE slices: the case that must be 
 def test_no_planes_is_None_not_an_empty_mapping():
     """An absent plane and an empty one must not mean two different things to a
     consumer, so both normalise to None."""
-    for empty in (None, {}, 0, ""):
+    for empty in (None, {}):
         assert core.normalise_planes(empty, TCZYX, SHAPE) is None
+
+
+@pytest.mark.parametrize("falsy", [0, "", False, [], ()])
+def test_a_FALSY_NON_MAPPING_is_refused_rather_than_read_as_no_planes(falsy):
+    """`0`, `""`, `False` and `[]` are falsy but are not "no plane given" -- they
+    are a caller passing the wrong type, and swallowing them returned a silent
+    no-op instead of saying so."""
+    with pytest.raises(ValueError) as e:
+        core.normalise_planes(falsy, TCZYX, SHAPE)
+    assert "object of axis name to index" in str(e.value)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_a_NON_FINITE_index_is_refused_naming_the_axis(bad):
+    """Before this, `inf` raised OverflowError and `nan` a ValueError naming
+    neither the axis nor the problem. Nothing was written either way, but the
+    message is the whole point of refusing."""
+    with pytest.raises(ValueError) as e:
+        core.normalise_planes({"z": bad}, TCZYX, SHAPE)
+    assert "'z'" in str(e.value) and "finite" in str(e.value)
+
+
+def test_a_PARTIAL_mapping_is_refused_at_import_not_at_training_time():
+    """SHAPE has z=9 and c=3; t is singleton. Naming only z leaves nothing
+    missing, but on a store with two multi-slice non-spatial axes a partial
+    record would be accepted and then refused by the reader far away from here."""
+    two_stacks = [5, 3, 9, 1000, 2000]          # t=5 AND z=9
+    roles = {"c": 1, "y": 3, "x": 4}
+    with pytest.raises(ValueError) as e:
+        core.normalise_planes({"z": 4}, TCZYX, two_stacks, roles)
+    assert "'t'" in str(e.value) and "unset" in str(e.value)
+    # naming both is accepted
+    assert core.normalise_planes({"z": 4, "t": 1}, TCZYX, two_stacks, roles) == {
+        "z": 4, "t": 1
+    }
+    # and naming none is still fine -- the reader refuses that legibly
+    assert core.normalise_planes(None, TCZYX, two_stacks, roles) is None
 
 
 def test_a_named_plane_is_recorded_as_given():
@@ -162,9 +199,19 @@ def test_a_plane_on_a_SPATIAL_or_CHANNEL_axis_is_refused(name, role):
 
 def test_a_plane_on_a_non_spatial_axis_is_still_accepted_with_roles_given():
     """THE CONTROL for the three above. Without it, the refusal could be the
-    role check rejecting every plane rather than only the wrong ones."""
+    role check rejecting every plane rather than only the wrong ones.
+
+    SHAPE is t=1, c=3, z=9, so naming z is complete (t is singleton) while
+    naming only t is NOT -- z would be left unset. That asymmetry is the
+    completeness rule working, and this test asserted the old lenient behaviour
+    until that rule landed."""
     assert core.normalise_planes({"z": 4}, TCZYX, SHAPE, ROLES) == {"z": 4}
-    assert core.normalise_planes({"t": 0}, TCZYX, SHAPE, ROLES) == {"t": 0}
+    assert core.normalise_planes({"z": 4, "t": 0}, TCZYX, SHAPE, ROLES) == {
+        "z": 4, "t": 0
+    }
+    with pytest.raises(ValueError) as e:
+        core.normalise_planes({"t": 0}, TCZYX, SHAPE, ROLES)
+    assert "'z'" in str(e.value) and "unset" in str(e.value)
 
 
 def test_a_mixed_mapping_is_refused_whole_rather_than_partly_kept():
