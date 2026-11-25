@@ -134,10 +134,62 @@ def test_a_valid_plane_is_refused_if_an_INVALID_one_rides_along():
         idx(STACK, {"z": 2, "c": 1})
 
 
-def test_planes_are_left_alone_when_the_axis_NAMES_are_unknown():
-    """Without names an axis cannot be matched to a role, so the role check
-    cannot run. `_plane_index` then reports the missing-names case itself rather
-    than this check guessing."""
+# ── names absent: a non-empty `planes` is REFUSED, not quietly dropped ──────
+#
+# THE GAP THIS CLOSES, and it was in my own decision comment. The role check is
+# gated on the axis names being known, and a stem imported before names were
+# recorded arrives with `axes=[]` — the very legacy population the decision is
+# motivated by. So the check was skipped, `_plane_index` took the size-1
+# shortcut without looking at `planes`, and this row's own defect survived in
+# the same form. Measured on that version, axes=[], shape [3, 1, 64, 64]:
+#
+#     {"z": 7}      -> ACCEPTED, z index 0
+#     {"c": 2}      -> ACCEPTED, z index 0
+#     {"bogus": 1}  -> ACCEPTED, z index 0
+#
+# The first version of the test below used STACK only. That is the ONE shape
+# where `_plane_index` does refuse (a size-4 axis with no resolvable plane), so
+# the test passed and the gap stayed hidden. The parametrisation now covers the
+# shapes where it does not.
+
+
+@pytest.mark.parametrize(
+    "shape", [SINGLETON, STACK, [3, 64, 64]], ids=["singleton", "stack", "cyx"]
+)
+@pytest.mark.parametrize("axes", [None, []], ids=["axes-none", "axes-empty"])
+@pytest.mark.parametrize("planes", [{"z": 1}, {"z": 7}, {"c": 2}, {"bogus": 1}])
+def test_a_plane_WITHOUT_axis_names_is_refused(shape, axes, planes):
+    """Every combination, because the gap was shape-specific and a single shape
+    is what hid it."""
+    roles = ROLES if len(shape) == 4 else {"y": 1, "x": 2, "c": 0}
     with pytest.raises(nr.RegionSourceError) as exc:
-        nr.region_index(ROLES, 4, STACK, REGION, axes=None, planes={"z": 1})
-    assert "not in the recorded axes" in str(exc.value), str(exc.value)
+        nr.region_index(roles, len(shape), shape, REGION, axes=axes, planes=planes)
+    msg = str(exc.value)
+    assert "axis names are not recorded" in msg, msg
+    assert "refused rather than ignored" in msg, msg
+
+
+@pytest.mark.parametrize(
+    "shape", [SINGLETON, STACK, [3, 64, 64]], ids=["singleton", "stack", "cyx"]
+)
+def test_NO_planes_without_axis_names_is_still_handled_as_before(shape):
+    """THE CONTROL. The refusal above must be about the planes, not about the
+    names being absent — a legacy record that asks for nothing still behaves
+    exactly as it did: a singleton or cyx store resolves, and a size-4 axis is
+    refused for the pre-existing reason."""
+    roles = ROLES if len(shape) == 4 else {"y": 1, "x": 2, "c": 0}
+    if shape is STACK:
+        with pytest.raises(nr.RegionSourceError) as exc:
+            nr.region_index(roles, len(shape), shape, REGION, axes=[], planes=None)
+        assert "no plane was given" in str(exc.value)
+    else:
+        idx = nr.region_index(roles, len(shape), shape, REGION, axes=[], planes=None)
+        assert len(idx) == len(shape)
+
+
+def test_the_refusal_no_longer_claims_NO_PLANE_WAS_GIVEN_when_one_was():
+    """The minor the review also named: with names absent and a plane supplied,
+    the old path reported "no plane was given", which is the opposite of true."""
+    with pytest.raises(nr.RegionSourceError) as exc:
+        nr.region_index(ROLES, 4, STACK, REGION, axes=[], planes={"z": 1})
+    assert "no plane was given" not in str(exc.value), str(exc.value)

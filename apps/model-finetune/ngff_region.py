@@ -216,9 +216,35 @@ def region_index(
     # path, now fails loudly here instead of training on something the caller did
     # not ask for.
     #
-    # Only possible when the axis NAMES are known. Without them an axis cannot be
-    # matched to a role, so the keys are left alone and `_plane_index` reports the
-    # missing-names case itself.
+    # WITHOUT AXIS NAMES, A NON-EMPTY `planes` IS REFUSED OUTRIGHT.
+    #
+    # An earlier version of this comment claimed the refusals below applied
+    # generally and that `_plane_index` reported the names-absent case itself.
+    # Both were wrong, and wrong in the worst place: a stem imported before axis
+    # names were recorded arrives with `axes=[]` -- the exact legacy population
+    # this decision is motivated by -- and the role check below is gated on
+    # `names`, so it was skipped. `_plane_index` then took the size-1 shortcut
+    # without looking at `planes` at all. Measured on that version, axes=[],
+    # shape [3, 1, 64, 64]: `{"z": 7}`, `{"c": 2}` and `{"bogus": 1}` were ALL
+    # accepted and discarded -- this row's own defect, in the same form.
+    #
+    # `_plane_index` only reports the missing names when some non-spatial axis
+    # has size > 1. For a singleton, or a plain cyx store, it never fires, and
+    # those are precisely where the silence lived.
+    #
+    # So refuse: with no names the keys cannot be resolved to any axis, which
+    # makes honouring them and range-checking them equally impossible, and
+    # ignoring them is the silence this decision exists to rule out. Nothing
+    # written through the supported path has this shape, because the import
+    # validator records planes only alongside the names they refer to.
+    if want and not names:
+        raise RegionSourceError(
+            f"planes {sorted(want)!r} was given, but this array's axis names are "
+            f"not recorded, so no plane can be resolved to an axis. It is refused "
+            f"rather than ignored. Re-import the source so the layout records its "
+            f"axis names, or drop planes from the region reference."
+        )
+
     if want and names:
         roles: Dict[str, str] = {}
         for role, idx in (("y", y), ("x", x), ("c", c)):
