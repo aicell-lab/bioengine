@@ -123,11 +123,20 @@ def session_dir(session_id: str) -> Path:
     return candidate
 
 
-def session_backend(session_id: str) -> str:
+def session_backend(session_id: str, *, status: Optional[Dict[str, Any]] = None) -> str:
     """Fine-tuning backend a session used — 'microsam' (default) or 'cellpose'.
+
     Recorded in status.json at session start; the two backends save their
-    checkpoint in different places, so this drives ``checkpoint_path``."""
-    return read_status(session_id).get("backend", "microsam")
+    checkpoint in different places, so this drives ``checkpoint_path``.
+
+    *status* lets a caller that has ALREADY read the record answer from it
+    instead of reading it again. `get_status` does, and that one re-read was
+    half the cost of the run listing: it is called once per run, so a history
+    of N runs read 2N records where N would do.
+    """
+    if status is None:
+        status = read_status(session_id)
+    return status.get("backend", "microsam")
 
 
 # Our public cpsam/cpdino model_type strings → the cellpose ``pretrained_model``
@@ -263,13 +272,19 @@ def detect_gpu_memory() -> Dict[str, Any]:
     }
 
 
-def checkpoint_path(session_id: str) -> Path:
+def checkpoint_path(
+    session_id: str, *, status: Optional[Dict[str, Any]] = None
+) -> Path:
     """Servable checkpoint for a finished session, by backend:
     micro-sam's torch_em writes ``<dir>/checkpoints/<name>/best.pt``; cellpose's
     ``train_seg`` (save_path=<dir>, model_name='model') writes ``<dir>/models/model``.
+
+    *status* is passed straight to `session_backend`, so a caller holding the
+    record already does not pay for a second read of it. `get_status` calls
+    this on every run it reports.
     """
     sdir = session_dir(session_id)
-    if session_backend(session_id) == "cellpose":
+    if session_backend(session_id, status=status) == "cellpose":
         return sdir / "models" / "model"
     return sdir / "checkpoints" / session_id / "best.pt"
 
@@ -506,12 +521,6 @@ DATASET_FIELD = "dataset_artifact_id"
 # grants, for the same reason, and a mutant that reads the wildcard turns the
 # public-dataset test red.
 DATASET_MANAGER_PERMISSION = "*"
-
-# Annotators hold "r+" and are deliberately NOT co-managers. The ruling says a
-# run's collaborators are its dataset's MANAGERS, and the page draws the same
-# line (`role === 'owner' || role === 'manager'`). "r+" lets someone add
-# annotations to a dataset; it is not authority over models trained from it.
-DATASET_NON_MANAGER_PERMISSIONS = frozenset({"r", "r+", "rw"})
 
 
 def caller_manages_dataset(permissions: Any, context: Any) -> bool:
@@ -793,7 +802,7 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
             "message": "no such session",
         }
     st["session_id"] = session_id
-    st["checkpoint_available"] = checkpoint_path(session_id).exists()
+    st["checkpoint_available"] = checkpoint_path(session_id, status=st).exists()
     # The config a run used, so a history listing can say WHAT was trained and not
     # merely that something was. It was already persisted per run and reachable only
     # from inside this app; `{}` for a run that died before the file was written.
@@ -814,8 +823,44 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
     return st
 
 
+def scan_runs_for_listing() -> Tuple[Dict[str, Dict[str, Any]], List[str], List[str]]:
+    """ONE walk of the sessions root, for the listing that needs both halves.
+
+    Returns ``(records, dataset_ids, skipped)``: every run's full record keyed
+    by session id, the distinct ``dataset_artifact_id`` values across them in
+    first-seen order, and the names that were skipped.
+
+    Exists because the published listing needs the dataset ids BEFORE it can
+    filter -- resolving which of them the caller manages is one artifact-manager
+    round trip each, and must happen once per call rather than once per run --
+    and then needs the records themselves. Asking for those separately read
+    every record twice over, on top of the read inside `get_status`: measured
+    at 3 reads per run, so 783 of them for the 261 runs on the production
+    store. A previous commit claimed to have removed that and had not; this is
+    the combined scan that actually does, and `test_the_PUBLISHED_listing_reads_each_record_ONCE`
+    measures the path the caller really takes rather than an inner helper.
+    """
+    records: Dict[str, Dict[str, Any]] = {}
+    datasets: Dict[str, None] = {}
+    names, skipped = run_names_on_disk()
+    for name in names:
+        try:
+            status = get_status(name, include_private=True)
+        except InvalidSessionId:
+            skipped.append(name)
+            continue
+        records[name] = status
+        dataset = status.get(DATASET_FIELD)
+        if isinstance(dataset, str) and dataset:
+            datasets.setdefault(dataset, None)
+    return records, list(datasets), skipped
+
+
 def list_sessions(
-    context: Any, *, writable_datasets: Any = frozenset()
+    context: Any,
+    *,
+    writable_datasets: Any = frozenset(),
+    records: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """The runs this caller may see, keyed by session id, owner redacted.
 
@@ -852,10 +897,19 @@ def list_sessions(
     attacker-controlled.
     """
     out: Dict[str, Dict[str, Any]] = {}
-    names, skipped = run_names_on_disk()
+    if records is not None:
+        # Already read by `scan_runs_for_listing`; re-reading them here is the
+        # cost this parameter exists to avoid.
+        names, skipped = list(records), []
+    else:
+        names, skipped = run_names_on_disk()
     for name in names:
         try:
-            status = get_status(name, include_private=True)
+            status = (
+                records[name]
+                if records is not None
+                else get_status(name, include_private=True)
+            )
         except InvalidSessionId:
             # The name passed but a deeper layer refused it -- today that means
             # a directory whose NAME is a valid session id but which is a

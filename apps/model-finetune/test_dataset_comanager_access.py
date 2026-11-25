@@ -319,13 +319,16 @@ def test_the_listing_reads_each_run_record_ONCE(runs, monkeypatch):
     failed; the listing simply did three times the I/O, and on the production
     store that is 783 file reads where there were 261.
 
-    The floor is TWO reads per run, and it is not mine: `get_status` reads the
-    record, and the pre-existing `session_backend` reads it again. Measured on
-    the branch BEFORE this change, which gives the same 2N -- so the number
-    asserted here is the unchanged baseline, not a target I chose. A listing
-    that costs more than this has acquired a re-read.
+    The floor is now ONE read per run. It used to be two, because
+    `session_backend` re-read the record `get_status` had just parsed; it now
+    takes the record it is given. **This measures `training.list_sessions`,
+    which is an INNER helper** -- see
+    `test_the_PUBLISHED_listing_reads_each_record_ONCE` for the path a caller
+    actually takes. Review found that distinction the hard way: this test
+    passed at 2N while the published path was doing 3N, because the extra pass
+    was in the entry point this test never calls.
     """
-    PER_RUN = 2
+    PER_RUN = 1
     for i in range(5):
         runs(f"run-{i}", OWNER, dataset=DATASET)
 
@@ -353,7 +356,7 @@ def test_the_listing_still_reads_once_when_the_caller_is_an_admin(runs, monkeypa
     fallback after the shared legs declined. A count taken only on the owner
     path would not have noticed, because the owner leg returns before reaching
     it."""
-    PER_RUN = 2
+    PER_RUN = 1
     for i in range(4):
         runs(f"old-{i}", None)
 
@@ -372,4 +375,64 @@ def test_the_listing_still_reads_once_when_the_caller_is_an_admin(runs, monkeypa
     assert len(calls) == 4 * PER_RUN, (
         f"expected {4 * PER_RUN} record reads for 4 runs on the admin path, "
         f"got {len(calls)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_PUBLISHED_listing_reads_each_record_ONCE(runs, monkeypatch):
+    """The cost of the path a CALLER takes, not of an inner helper.
+
+    The two cost tests above measure `training.list_sessions`. Review showed
+    that is not where the cost was: `list_training_sessions` resolved the
+    dataset ids with a whole extra pass over the store before calling it, so
+    the published path did THREE reads per run while those tests sat green at
+    two. Measured: 15 reads for 5 runs, which is 783 for the 261 runs on the
+    production store -- the number a commit message had claimed was removed.
+
+    So this walks the published method, with the artifact manager faked out,
+    and asserts the total.
+    """
+
+    class _AM:
+        async def read(self, artifact_id):
+            return {"config": {"permissions": {}}}
+
+    class _Hypha:
+        async def get_service(self, name):
+            return _AM()
+
+    for i in range(5):
+        runs(f"run-{i}", OWNER, dataset=DATASET)
+
+    calls = []
+    real = training.read_status
+    monkeypatch.setattr(
+        training,
+        "read_status",
+        lambda sid, *a, **k: (calls.append(sid), real(sid, *a, **k))[1],
+    )
+
+    import entry
+
+    cls = None
+    for obj in vars(entry).values():
+        if isinstance(obj, type) and obj.__name__ == "EntryApp":
+            cls = obj
+            break
+        inner = getattr(obj, "__wrapped_class__", None) or getattr(
+            obj, "func_or_class", None
+        )
+        if isinstance(inner, type) and inner.__name__ == "EntryApp":
+            cls = inner
+            break
+    assert cls is not None, "EntryApp not found"
+    inst = cls.__new__(cls)
+    inst._hypha = _Hypha()
+
+    await cls.list_training_sessions(inst, context=ctx(OWNER, anonymous=False))
+
+    assert len(calls) == 5, (
+        f"the PUBLISHED listing read {len(calls)} records for 5 runs "
+        f"({len(calls) / 5:.1f} each). One walk of the store is enough: the "
+        "records and the dataset ids come back from the same scan."
     )

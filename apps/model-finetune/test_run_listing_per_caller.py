@@ -439,15 +439,26 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
 
     seen = {}
 
-    def spy(context, *, writable_datasets=frozenset()):
+    def spy(context, *, writable_datasets=frozenset(), records=None):
         seen["context"] = context
         seen["writable_datasets"] = writable_datasets
+        seen["records"] = records
         return {"sentinel": {}}
 
+    class _AM:
+        async def read(self, artifact_id):
+            return {"config": {"permissions": {}}}
+
+    class _Hypha:
+        async def get_service(self, name):
+            return _AM()
+
     monkeypatch.setattr(training, "list_sessions", spy)
+    monkeypatch.setattr(training, "scan_runs_for_listing", lambda: ({}, [], []))
     cls = _entry_class()
     fn = getattr(cls, "list_training_sessions")
     inst = cls.__new__(cls)
+    inst._hypha = _Hypha()
     out = await fn(inst, context=ADMIN)
     assert out == {"sentinel": {}}
     assert seen["context"] is ADMIN, seen
