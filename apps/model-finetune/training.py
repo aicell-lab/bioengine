@@ -352,9 +352,18 @@ def write_status_best_effort(session_id: str, **fields: Any) -> bool:
 
     They are wrong to raise at a HEARTBEAT. A heartbeat exists only to refresh
     `updated_at` so a long epoch does not trip the stale window; it carries no
-    outcome, and the next one is a minute away. Letting one kill the training
-    process would mean a contended lock destroys hours of GPU work to protect a
-    timestamp -- strictly worse than the stale sweep the heartbeat is dodging.
+    outcome, and the next one is a minute away.
+
+    **What an unhandled heartbeat exception actually does**, stated precisely
+    because an earlier version of this docstring overstated it: the heartbeat
+    runs on a daemon thread, so the exception ends THAT THREAD and the training
+    process carries on. It does not kill the run directly. What it does is stop
+    `updated_at` advancing, silently -- and once `STATUS_STALE_SECONDS` passes,
+    `get_status` sweeps a LIVE run from TRAINING to STOPPED. So a contended
+    lock would make a healthy run report itself dead, which is the same
+    stale-window failure the heartbeat exists to prevent, arrived at from the
+    other side.
+
     Progress writes are the same shape: an epoch curve that misses one update
     is repaired by the next, and by the reconciliation at the end.
 
@@ -411,6 +420,7 @@ def read_status(session_id: str) -> Dict[str, Any]:
 # it. It is the classic NFS-safe mutex, it held on both mounts, and it works on
 # a local filesystem too, so there is one code path rather than two.
 RECORD_LOCK_NAME = ".status.mutex"
+
 
 # ⚠ ACROSS NODES, the reap's judgement rests on a `stat` another NFS client may
 # answer from its attribute cache, and that cache can outlive this window (the

@@ -661,3 +661,52 @@ def test_the_HEARTBEAT_CALL_SITES_use_the_best_effort_helper():
         assert (
             "write_status_best_effort(" not in src
         ), f"{name} uses the best-effort helper; terminal writes must raise"
+
+
+def test_the_CHILDS_OWN_TERMINAL_WRITES_still_raise():
+    """The gap the call-site test left, and the likeliest mistake in this area.
+
+    `train_worker*.py` contain BOTH the heartbeat that was just converted and
+    the run's final COMPLETED/FAILED write, a few dozen lines apart. The
+    earlier call-site test only asserted that the heartbeat uses the helper and
+    that the two runtime files do not use it at all -- so converting the
+    child's own terminal write, in the same file, went unnoticed: the suite
+    stayed at 21 passed.
+
+    If that were done, a lock timeout at completion would be logged and
+    skipped, the record would stay TRAINING, and the stale sweep would later
+    report a finished run as STOPPED -- the exact outcome the terminal half of
+    this rule exists to prevent.
+
+    So parse the calls and check every one carrying a terminal marker.
+    """
+    import ast
+    import pathlib
+
+    here = pathlib.Path(__file__).parent
+    checked = 0
+    for name in ("train_worker.py", "train_worker_cellpose.py"):
+        src = (here / name).read_text()
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if fn not in ("write_status", "write_status_best_effort"):
+                continue
+            seg = ast.get_source_segment(src, node) or ""
+            terminal = (
+                ("terminated_by" in seg) or ("COMPLETED" in seg) or ("FAILED" in seg)
+            )
+            if not terminal:
+                continue
+            checked += 1
+            assert fn == "write_status", (
+                f"{name}:{node.lineno} writes a terminal status through "
+                f"{fn}(), which swallows a lock timeout. A terminal write must "
+                "raise: otherwise the record stays TRAINING and the stale "
+                "sweep later reports a finished run as STOPPED."
+            )
+    assert checked >= 3, (
+        f"only {checked} terminal write(s) found in the worker files; the "
+        "parse is not seeing them, so this test would pass vacuously"
+    )
