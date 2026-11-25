@@ -1965,13 +1965,28 @@ class EntryApp:
         A run with no recorded owner is administrator-only: it cannot be
         attributed to anybody, and guessing is worse than admitting that.
 
-        `context=True` is load-bearing. Without it the proxy forwards no context,
-        the check sees no identity, and it then refuses EVERYBODY — the safe
-        direction, but a silent outage, so a test asserts the decorator.
+        Refuses a session that does not exist, and creates nothing when it does
+        so. `write_status` below calls `mkdir(parents=True)`, which is how a real
+        session's directory comes into being on its first write -- so without
+        that check, stopping a run that never existed MANUFACTURES it, complete
+        with a status record that then appears in the run listing.
+
+        THE ORDER OF THE TWO IS LOAD-BEARING. The ownership gate runs FIRST, so a
+        caller who does not own the run is refused without learning whether it
+        exists; only a caller already entitled to act on it reaches the
+        existence check and can tell the two apart.
+
+        `context=True` is load-bearing too. Without it the proxy forwards no
+        context, the check sees no identity, and it then refuses EVERYBODY -- the
+        safe direction, but a silent outage, so a test asserts the decorator.
         """
         import training
 
         training.require_caller_may_mutate(session_id, context)
+        if not training.session_dir(session_id).exists():
+            raise training.SessionNotFound(
+                f"no training session {session_id!r} on this worker"
+            )
         training.request_stop(session_id)
         task = self._training_tasks.get(session_id)
         if task is not None and not task.done():

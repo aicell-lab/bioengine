@@ -510,6 +510,123 @@ class TestImportNgffImage:
         # A staged-only write disappears after a restage, so it must commit.
         assert importer._state["committed"] == 1
 
+    async def test_a_bad_plane_is_REFUSED_BY_THE_IMPORT_and_writes_nothing(
+        self, importer
+    ):
+        """Through the real import, because that is the only thing that proves
+        the refusal reaches the manifest decision.
+
+        A source-text check that the validator is called was measured GREEN
+        against a mutant wrapping the call in `try/except ValueError: pass`:
+        with the refusal swallowed, {'z': 1.5} is written and then int()-coerced
+        to slice 1, which is the wrong-slice bug. Only driving the import can
+        see that, so this asserts BOTH that it raises AND that nothing was
+        stored -- a refusal that still commits a manifest is not a refusal.
+        """
+        # the fixture store is (c, y, x), so 'z' is not one of its axes at all
+        with pytest.raises(ValueError) as e:
+            await importer.import_ngff_image(
+                "ws/ds", ROOT, planes={"z": 0}, context=None
+            )
+        assert "'z'" in str(e.value) and "does not have" in str(e.value)
+        assert importer._state["manifest"] is None, "a refused import wrote a manifest"
+        assert importer._state["committed"] == 0, "a refused import committed"
+
+    async def test_a_fractional_plane_is_REFUSED_BY_THE_IMPORT(
+        self, importer, monkeypatch
+    ):
+        """The one the swallowed-refusal mutant let through: int(1.5) is 1, so a
+        permissive path records a real slice the caller never asked for.
+
+        On a z-STACK probe, not the fixture's (c, y, x) store. Sent as
+        {'c': 1.5} the channel rule refuses it first, so the test passed without
+        the whole-number check at all and its name claimed more than it showed.
+        """
+
+        async def _zstack_probe(_root, _mp, _origin):
+            return {
+                "store_root": ROOT,
+                "multiscale_path": None,
+                "stem": "sample",
+                "width": 800,
+                "height": 600,
+                "dtype": "|u1",
+                "channels": None,
+                "levels": 1,
+                "content_hint": "deadbeef",
+                "dataset_paths": ["0"],
+                "axis_roles": {"y": 1, "x": 2},
+                "level0_shape": [9, 600, 800],
+                "axes": ["z", "y", "x"],
+            }
+
+        monkeypatch.setattr(importer, "_probe_ngff_source", _zstack_probe)
+        with pytest.raises(ValueError) as e:
+            await importer.import_ngff_image(
+                "ws/ds", ROOT, planes={"z": 1.5}, context=None
+            )
+        assert importer._state["committed"] == 0
+        assert "whole number" in str(e.value), str(e.value)
+
+    async def test_a_plane_on_the_CHANNEL_axis_is_refused_by_the_import(self, importer):
+        """The fixture's axes are (c, y, x) with c as the channel, and the reader
+        keeps the channel whole, so recording a channel plane would have the
+        manifest claim something training does not do."""
+        with pytest.raises(ValueError) as e:
+            await importer.import_ngff_image(
+                "ws/ds", ROOT, planes={"c": 0}, context=None
+            )
+        assert "channel" in str(e.value).lower()
+        assert importer._state["committed"] == 0
+
+    async def test_a_RECORDED_plane_round_trips_to_what_the_READER_consumes(
+        self, importer, monkeypatch
+    ):
+        """Not just into the entry: through `ngff_region_source`, which is the
+        one place the stored source becomes the shape a trainer reads.
+
+        Asserting on `entry["source"]["planes"]` alone was measured GREEN
+        against a mutant that made `ngff_region_source` return
+        `"planes": None` -- the plane would be stored and never delivered.
+
+        The fixture's own store is (c, y, x) and has no z, so only the PROBE is
+        replaced here, with a z-stack layout. Rebuilding the broker instead was
+        tried and is the wrong shape: it loses the fixture's artifact-I/O stubs,
+        and the test then fails on a missing artifact manager rather than on
+        anything it means to check.
+        """
+
+        async def _zstack_probe(_root, _multiscale_path, _origin):
+            return {
+                "store_root": ROOT,
+                "multiscale_path": None,
+                "stem": "sample",
+                "width": 800,
+                "height": 600,
+                "dtype": "|u1",
+                "channels": None,
+                "levels": 1,
+                "content_hint": "deadbeef",
+                "dataset_paths": ["0"],
+                "axis_roles": {"t": None, "c": None, "z": None, "y": 1, "x": 2},
+                "level0_shape": [9, 600, 800],
+                "axes": ["z", "y", "x"],
+            }
+
+        monkeypatch.setattr(importer, "_probe_ngff_source", _zstack_probe)
+        out = await importer.import_ngff_image(
+            "ws/ds", ROOT, planes={"z": 4}, context=None
+        )
+        assert out["state"] == "remote"
+        stored = bc.parse_image_manifest(importer._state["manifest"])
+        entry = stored[out["stem"]]
+        assert entry["source"]["planes"] == {"z": 4}
+        ref = bc.ngff_region_source(entry)
+        assert ref is not None, "the stored entry yields no reader reference at all"
+        assert ref["planes"] == {
+            "z": 4
+        }, f"the plane does not reach the reader's reference: {ref.get('planes')!r}"
+
     async def test_the_IMPORT_records_the_axis_names_in_the_layout(self, importer):
         """Through the real import, because that is the only thing that writes a
         layout, and a test that seeds a manifest cannot see this at all.

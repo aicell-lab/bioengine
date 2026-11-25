@@ -32,6 +32,7 @@ failure this suite is least able to notice on its own.
 """
 
 import json
+import re
 import time
 
 import pytest
@@ -75,6 +76,17 @@ def runs(tmp_path, monkeypatch):
     root.mkdir()
     monkeypatch.setattr(training, "sessions_root", lambda: root)
     monkeypatch.setattr(training, "session_dir", lambda sid: root / sid)
+
+    # These tests use readable labels ("mine", "theirs", "old") as session ids.
+    # The id ALLOW-LIST added for path containment refuses anything that is not
+    # the shape the server generates, and the listing skips what it refuses --
+    # so without this every planted run would be skipped and each assertion
+    # below would pass while measuring nothing.
+    #
+    # Relaxed deliberately and only here: this file is about WHO MAY SEE WHICH
+    # RUN. The shape rule, and the listing's tolerance of a name that breaks it,
+    # are covered by test_session_id_containment.py against the real pattern.
+    monkeypatch.setattr(training, "SESSION_ID_PATTERN", re.compile(r"\A[\w.-]+\Z"))
 
     def add(sid, owner, *, owner_anonymous=False, omit_key=False):
         """Plant one run.
@@ -776,31 +788,24 @@ GATED_BY_RUN_ID = {
     "contribute",  # publishes its checkpoint into the shared pool
     "start_training",  # only when resume_session_id is supplied; see the tests above
 }
-# Deliberate exception, on the lead's ruling: a run id grants READ access to that
-# run's status. That is the documented position, stated in the README and the
-# tutorial.
-READ_ONLY_BY_RUN_ID = {"get_training_status"}
-
-# NOT CLASSIFIED, AND DELIBERATELY SO. An earlier version of this file listed
-# these two as read-only exceptions with the reason "they take a session id to
-# locate a MODEL, not to act on a run". That reason was mine, and it is in
-# tension with the ruling that governs here, which says anything that USES OR
-# CONTINUES a run's weights is owner-or-admin and that only reads of a run's
-# status, progress and logs stay open.
+# WHICH RULE APPLIES IS DECIDED BY WHETHER THE CALL HANDS OUT OR CREATES
+# WEIGHTS -- not by whether it touches them.
 #
-# `infer` and `compute_embedding` both load `_session_checkpoint(session_id)` and
-# serve THAT RUN'S fine-tuned weights, so on the ruling's own words they are not
-# reads. Gating them is a user-visible change on a surface another lane owns --
-# in a shared notebook, several people trying one run's model is a normal thing
-# to want -- so it may well be the right product call to treat serving weights
-# as a read. Either way it is not a call this lane gets to make by writing a set
-# literal, and a test that accounts for them silently is a test that enforces a
-# decision nobody made.
+# OPEN, gated by possession of the run id alone: status, progress, logs, and
+# inference. `infer` and `compute_embedding` return OUTPUTS computed with the
+# weights; the caller never receives the checkpoint and no new model derives
+# from it. Shared notebook sessions exist for several people to try one run's
+# model, and gating inference would break that.
 #
-# So they sit here, named, until the ruling arrives. The listing below is
-# accounted for, so the suite is green; what is NOT green is anyone's ability to
-# pretend the question is settled.
-UNDECIDED_PENDING_RULING = {"infer", "compute_embedding"}
+# OWNER-OR-ADMIN: export (hands out the weights), contribute (publishes them
+# into the shared pool), resume (creates a new model derived from them), and
+# stop (acts on someone else's run).
+#
+# That line is the ruling's, not this lane's. An earlier version of this file
+# classified inference as open on the reasoning that it "locates a model rather
+# than acting on a run" -- which reached the same answer by a route that would
+# also have let export through, and which was mine to begin with.
+READ_ONLY_BY_RUN_ID = {"get_training_status", "infer", "compute_embedding"}
 
 
 def _published_methods_taking_a_run_id(path):
@@ -853,29 +858,29 @@ def test_no_OTHER_entry_method_takes_a_run_id_without_a_decision():
         "start_training takes resume_session_id and must be found; if it is not, "
         "the parser has regressed to a line-window scan"
     )
-    unaccounted = sorted(
-        set(taking) - GATED_BY_RUN_ID - READ_ONLY_BY_RUN_ID - UNDECIDED_PENDING_RULING
-    )
+    unaccounted = sorted(set(taking) - GATED_BY_RUN_ID - READ_ONLY_BY_RUN_ID)
     assert not unaccounted, (
         f"method(s) taking a run id that are in none of the three sets: "
         f"{unaccounted}. Decide which, then add it deliberately. Found: {taking}"
     )
 
 
-def test_the_UNDECIDED_set_is_exactly_what_is_awaiting_a_ruling():
-    """Pins the open question so it cannot be quietly widened or forgotten.
-
-    Adding a method here is how an unclassified surface would be made to pass,
-    so the contents are asserted rather than merely used. When the ruling lands,
-    this set empties and the methods move to one of the other two.
-    """
-    assert UNDECIDED_PENDING_RULING == {"infer", "compute_embedding"}, (
-        "the set of methods awaiting a ruling changed; that is a decision, not a "
-        "refactor, and it needs the ruling rather than an edit here"
-    )
-    assert not (
-        UNDECIDED_PENDING_RULING & (GATED_BY_RUN_ID | READ_ONLY_BY_RUN_ID)
-    ), "a method cannot be both decided and undecided"
+def test_each_set_is_exactly_what_the_ruling_says():
+    """Pins both sets, so moving a method between them is a decision rather than
+    a refactor. The ruling's line is whether the call hands out or creates
+    weights; a new surface has to be placed against that, not appended here."""
+    assert GATED_BY_RUN_ID == {
+        "stop_training",
+        "export_model",
+        "contribute",
+        "start_training",
+    }, "the owner-or-admin set changed; that needs a ruling, not an edit here"
+    assert READ_ONLY_BY_RUN_ID == {
+        "get_training_status",
+        "infer",
+        "compute_embedding",
+    }, "the open set changed; that needs a ruling, not an edit here"
+    assert not (GATED_BY_RUN_ID & READ_ONLY_BY_RUN_ID), "a method cannot be both"
 
 
 def test_that_structural_guard_CAN_fail(tmp_path):

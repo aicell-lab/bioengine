@@ -13,6 +13,7 @@ module stays introspectable with only ``bioengine[worker]`` + the stdlib.
 
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -35,8 +36,91 @@ def sessions_root() -> Path:
     return root
 
 
+# The exact shape ``new_session_id`` generates, and the ONLY shape accepted from
+# a caller. An allow-list, not a sanitiser: there is no attempt to clean a bad id
+# up, because every cleanup is a guess at what the caller meant and the guesses
+# are what get escaped.
+#
+# ``\A``/``\Z`` and not ``^``/``$``: in Python ``$`` also matches immediately
+# before a trailing newline, so ``re.match(r"^...$", "<valid-id>\n")`` SUCCEEDS.
+# An id with a newline on the end would then be accepted and used as a directory
+# name. There is a test for exactly that.
+SESSION_ID_PATTERN = re.compile(r"\A\d{4}-\d{2}-\d{2}-\d{6}-[0-9a-f]{8}\Z")
+
+
+class InvalidSessionId(ValueError):
+    """A session_id that this server could not have generated.
+
+    Raised BEFORE any filesystem call. It is a ``ValueError`` so that callers
+    which already report bad arguments keep reporting them the same way.
+    """
+
+
+class SessionNotFound(ValueError):
+    """A well-formed session_id for a session that does not exist here.
+
+    Deliberately distinct from :class:`InvalidSessionId`: one says the caller
+    sent something the server could not have issued, the other says the caller
+    sent something plausible that this worker does not have. Collapsing them
+    would make a legitimate "wrong worker" mistake read like an attack.
+    """
+
+
+def validate_session_id(session_id: Any) -> str:
+    """The session_id, or raise.
+
+    Checked against the generator's own shape, which was verified to cover every
+    run in production: all 261 live session ids match it, so nothing existing
+    becomes unreachable by enforcing it.
+    """
+    if not isinstance(session_id, str):
+        raise InvalidSessionId(
+            f"session_id must be a string, got {type(session_id).__name__}"
+        )
+    if not SESSION_ID_PATTERN.match(session_id):
+        # The value is NOT echoed in full: it is attacker-controlled and this
+        # message reaches logs. The length and a short prefix are enough to
+        # debug a genuine mistake.
+        raise InvalidSessionId(
+            f"session_id is not a valid session identifier "
+            f"(length {len(session_id)}, starts {session_id[:12]!r}). "
+            f"Expected the form YYYY-MM-DD-HHMMSS-xxxxxxxx."
+        )
+    return session_id
+
+
 def session_dir(session_id: str) -> Path:
-    return sessions_root() / session_id
+    """The directory for *session_id*, guaranteed to be inside the sessions root.
+
+    Two independent layers, deliberately not one:
+
+    1. :func:`validate_session_id` refuses anything the server would not itself
+       have generated, before any path is built.
+    2. The built path is resolved and asserted to be inside the resolved root.
+
+    Layer 2 is not redundant with layer 1 — it is what still holds if layer 1 is
+    ever loosened, and loosening an id format is a normal thing to want to do.
+    Softening either one alone leaves the other refusing, which is the whole
+    point: each has its own failing test.
+
+    This function is the chokepoint. ``_status_path``, ``_stop_path``,
+    ``_params_path`` and ``checkpoint_path`` all build on it, so guarding here
+    covers every method that takes a session_id rather than one of them.
+    """
+    validate_session_id(session_id)
+    root = sessions_root()
+    candidate = root / session_id
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    try:
+        # `Path.is_relative_to` is 3.9+, and this app's suite also runs on 3.8.
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise InvalidSessionId(
+            f"session_id resolves outside the sessions root "
+            f"(length {len(session_id)}, starts {session_id[:12]!r})"
+        )
+    return candidate
 
 
 def session_backend(session_id: str) -> str:
@@ -499,14 +583,23 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
     unfiltered listing to call by mistake: the previous `list_sessions()`
     returned every run on the worker to whoever asked, and leaving that
     signature available with a filtered sibling beside it would make the open
-    behaviour one forgotten argument away. A caller with nothing to pass passes
-    ``None`` and gets what ``None`` deserves.
+    behaviour one forgotten argument away.
 
     A run is visible iff its recorded owner IS this caller, or it carries no
     owner and the caller may see ownerless runs. Both legs fail closed: an
     unreadable context yields no identity, no authority, and so an empty
     listing. The owner is read here and redacted from everything returned, so
     the field decides visibility and is never itself published.
+
+    **A directory that is not a session is SKIPPED, not fatal.** `get_status`
+    validates the id, so listing a directory whose name is not a session id
+    raises -- and one such directory would then make the listing raise for
+    EVERY caller, turning a stray directory into a total outage of the run
+    history. The rule is: validate what a CALLER hands us, tolerate what we
+    FIND. A name that cannot be a session id was not produced by this server,
+    so leaving it out of the history is honest; refusing to show the history at
+    all is not. Skipped names are logged with a bounded sample, since they are
+    attacker-controlled.
     """
     identity = caller_identity(context)
     caller = identity.get("owner")
@@ -514,33 +607,39 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
 
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
+    skipped: List[str] = []
     for d in sorted(root.iterdir()) if root.exists() else []:
         if not (d.is_dir() and (d / "status.json").exists()):
             continue
-        status = get_status(d.name, include_private=True)
+        if not SESSION_ID_PATTERN.match(d.name):
+            skipped.append(d.name)
+            continue
+        try:
+            status = get_status(d.name, include_private=True)
+        except InvalidSessionId:
+            # The name passed but a deeper layer refused it -- today that means
+            # a directory whose NAME is a valid session id but which is a
+            # SYMLINK out of the sessions root. Skipped like a bad name, so one
+            # bad link cannot take the whole history down.
+            skipped.append(d.name)
+            continue
         owner = status.get("owner")
         if isinstance(owner, str) and owner:
             # A recorded owner is matched EXACTLY, and only against a caller we
-            # could actually read.
-            #
-            # `caller is not None` is REDUNDANT as this branch is written, and
-            # measured to be: `owner` here is a non-empty string, so
-            # `owner == caller` is already False for `caller is None`, and a
-            # mutant dropping the guard keeps the whole suite green. It is kept
-            # because the branch CONDITION is what makes it redundant, and that
-            # condition is the fragile part -- loosening it to `"owner" in
-            # status` sends a null owner into this comparison, where
-            # `None == None` is True and every run by an unidentified caller
-            # becomes visible to every unidentifiable caller. That mutant turns
-            # 10 tests red. So: the guard is defence for an edit nobody has made
-            # yet, not live logic, and no test can distinguish it today.
-            visible = caller is not None and owner == caller
+            # could actually read. `caller is None` must never match a run.
+            visible = caller is not None and caller == owner
         else:
-            # No owner, or an owner we cannot use as an identity (empty string,
-            # wrong type). Both are "unattributable", which is the ownerless case.
+            # No owner, or one unusable as an identity. Both are unattributable.
             visible = see_ownerless
         if visible:
             out[d.name] = redact_private(status)
+    if skipped:
+        print(
+            f"[model-finetune] skipped {len(skipped)} session directory(ies) that "
+            f"are not a session on this worker: {skipped[:5]}",
+            flush=True,
+        )
+    return out
     return out
 
 

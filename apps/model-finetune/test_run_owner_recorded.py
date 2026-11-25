@@ -24,6 +24,18 @@ import pytest
 
 import training
 
+# A session id must match the shape the server generates
+# (YYYY-MM-DD-HHMMSS-xxxxxxxx). `training.session_dir` refuses anything else --
+# a caller-supplied id was once used as a directory name unchecked, which let
+# `../x` and absolute paths write outside the sessions root. So the short ids
+# these tests used ("s1".."s5") can no longer name a directory; the constants
+# keep the tests readable while using ids the app accepts.
+S_EXTRA = "2026-11-25-130005-00000005"
+S_OWNED = "2026-11-25-130001-00000001"
+S_PRIVATE_READ = "2026-11-25-130004-00000004"
+S_PUBLIC_READ = "2026-11-25-130003-00000003"
+S_UNOWNED = "2026-11-25-130002-00000002"
+
 
 def test_a_known_user_is_recorded_with_anonymous_False():
     got = training.caller_identity(
@@ -129,15 +141,15 @@ def _write_owned(sid, ctx):
 
 def test_the_owner_REACHES_THE_STORED_RECORD(sessions):
     """What a grep cannot check: that the write stores the injected identity."""
-    _write_owned("s1", {"user": {"id": "github|49943582", "is_anonymous": False}})
-    on_disk = training.read_status("s1")
+    _write_owned(S_OWNED, {"user": {"id": "github|49943582", "is_anonymous": False}})
+    on_disk = training.read_status(S_OWNED)
     assert on_disk["owner"] == "github|49943582", on_disk
     assert on_disk["owner_anonymous"] is False
 
 
 def test_an_unidentified_caller_stores_no_owner(sessions):
-    _write_owned("s2", None)
-    on_disk = training.read_status("s2")
+    _write_owned(S_UNOWNED, None)
+    on_disk = training.read_status(S_UNOWNED)
     assert on_disk.get("owner") is None
     assert on_disk.get("owner_anonymous") is None
 
@@ -146,19 +158,21 @@ def test_THE_PUBLIC_READ_PATH_DOES_NOT_RETURN_THE_OWNER(sessions):
     """THE FINDING THIS COMMIT EXISTS FOR. `list_training_sessions` answers
     anonymous callers and returns whatever get_status returns, so recording an
     owner without redacting it publishes the creator's user id to anybody."""
-    _write_owned("s3", {"user": {"id": "github|49943582", "is_anonymous": False}})
-    public = training.get_status("s3")
+    _write_owned(
+        S_PUBLIC_READ, {"user": {"id": "github|49943582", "is_anonymous": False}}
+    )
+    public = training.get_status(S_PUBLIC_READ)
     assert "owner" not in public, f"the owner is in the public response: {public}"
     assert "owner_anonymous" not in public
-    # Listed AS ITS OWNER. The listing is now per-caller, so any other context
-    # would return {} and make the redaction assertion below vacuous -- the
-    # `"s3" in listed` guard on the next line is what keeps that honest.
+    # Listed AS ITS OWNER. The listing is per-caller, so any other context would
+    # return {} and make the redaction assertion below vacuous -- the
+    # `S_PUBLIC_READ in listed` guard on the next line is what keeps that honest.
     listed = training.list_sessions(
         {"user": {"id": "github|49943582", "is_anonymous": False}}
     )
-    assert "s3" in listed, "the run vanished from the listing entirely"
+    assert S_PUBLIC_READ in listed, "the run vanished from the listing entirely"
     assert (
-        "owner" not in listed["s3"]
+        "owner" not in listed[S_PUBLIC_READ]
     ), f"list_sessions publishes the owner: {listed['s3']}"
 
 
@@ -167,18 +181,18 @@ def test_a_caller_THAT_ASKS_can_still_read_the_owner(sessions):
     pass if the owner were never stored at all -- which is the bug the reviewer
     produced twice. This proves the field is present and merely withheld, and it
     is the hook the per-caller filter will use."""
-    _write_owned("s4", {"user": {"id": "github|7", "is_anonymous": False}})
-    private = training.get_status("s4", include_private=True)
+    _write_owned(S_PRIVATE_READ, {"user": {"id": "github|7", "is_anonymous": False}})
+    private = training.get_status(S_PRIVATE_READ, include_private=True)
     assert private["owner"] == "github|7"
     assert private["owner_anonymous"] is False
 
 
 def test_redaction_does_not_disturb_the_rest_of_the_record(sessions):
     """A blanket strip would be easy to write and would take the status with it."""
-    _write_owned("s5", {"user": {"id": "github|7"}})
-    public = training.get_status("s5")
+    _write_owned(S_EXTRA, {"user": {"id": "github|7"}})
+    public = training.get_status(S_EXTRA)
     assert public["status"] == "PREPARING"
-    assert public["session_id"] == "s5"
+    assert public["session_id"] == S_EXTRA
     assert public["created_at"] == 1.0
 
 

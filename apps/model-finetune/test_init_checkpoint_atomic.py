@@ -28,9 +28,21 @@ import pytest
 
 import training
 
+# A session id must match the shape the server itself generates
+# (YYYY-MM-DD-HHMMSS-xxxxxxxx). `training.session_dir` refuses anything else --
+# a caller-supplied id was previously used as a directory name unchecked, which
+# let `../x` and absolute paths write outside the sessions root. So a descriptive
+# id like "s-stale" can no longer be a directory name; these constants keep the
+# tests readable while using ids the app accepts.
+S_INIT_CKPT = "2026-11-25-120006-00000006"
+
 OLD = b"OLD-CHECKPOINT-" + b"o" * 4096
 NEW = b"NEW-CHECKPOINT-" + b"n" * 65536
-SESSION = "sess-init-ckpt-atomic"
+SESSION = S_INIT_CKPT
+# A SECOND, distinct session. It used to be built as SESSION + "-fresh", which
+# is no longer a usable id: session_dir refuses anything that is not the exact
+# shape the server generates, so a suffixed id cannot name a directory.
+SESSION_FRESH = "2026-11-25-120012-0000000c"
 
 
 @pytest.fixture(autouse=True)
@@ -181,14 +193,14 @@ async def test_the_destination_is_never_left_as_a_prefix_when_absent_beforehand(
     never published" are different guarantees, and a reader hitting a zero-length
     file is the case the fix's own docstring names.
     """
-    dest = training.session_dir(SESSION + "-fresh") / "init_checkpoint.pt"
+    dest = training.session_dir(SESSION_FRESH) / "init_checkpoint.pt"
     dest.parent.mkdir(parents=True, exist_ok=True)
     assert not dest.exists()
 
     _fail_half_way_through_writing(monkeypatch, "init_checkpoint.pt")
 
     await _method_of("_run_training", _Stub())(
-        SESSION + "-fresh",
+        SESSION_FRESH,
         "vit_b_lm",
         [],
         [],
@@ -197,7 +209,7 @@ async def test_the_destination_is_never_left_as_a_prefix_when_absent_beforehand(
         {"init_checkpoint": "https://example.invalid/init_checkpoint.pt"},
     )
 
-    status = training.read_status(SESSION + "-fresh")
+    status = training.read_status(SESSION_FRESH)
     assert status.get("status") == "FAILED", status
     assert "injected" in str(status.get("message", "")), status
 
