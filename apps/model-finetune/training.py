@@ -640,7 +640,6 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
             flush=True,
         )
     return out
-    return out
 
 
 def request_stop(session_id: str) -> None:

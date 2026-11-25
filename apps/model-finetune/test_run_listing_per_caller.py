@@ -860,7 +860,7 @@ def test_no_OTHER_entry_method_takes_a_run_id_without_a_decision():
     )
     unaccounted = sorted(set(taking) - GATED_BY_RUN_ID - READ_ONLY_BY_RUN_ID)
     assert not unaccounted, (
-        f"method(s) taking a run id that are in none of the three sets: "
+        f"method(s) taking a run id that are in neither set: "
         f"{unaccounted}. Decide which, then add it deliberately. Found: {taking}"
     )
 
