@@ -554,3 +554,110 @@ def test_an_ABANDONED_lock_is_reaped_when_the_FILE_CLOCK_RUNS_AHEAD(
         f"happened: {rec}"
     )
     assert rec.get("status") == "TRAINING", rec
+
+
+# ── a heartbeat must not kill a run; a terminal write must still raise ───────
+
+
+def _hold_the_mutex(run_dir):
+    """Leave a FRESH mutex nobody will release, so the next writer times out."""
+    mutex = run_dir / training.RECORD_LOCK_NAME
+    mutex.write_text("a holder that is not coming back")
+    os.utime(mutex, None)
+    return mutex
+
+
+def test_a_HEARTBEAT_under_a_held_lock_does_NOT_abort_the_run(run_dir, monkeypatch):
+    """The lock must not be able to destroy hours of GPU work to save a timestamp.
+
+    `RunRecordLockTimeout` is a new exception at call sites that never raised
+    before. On a heartbeat it is the wrong answer: the write carries no
+    outcome, the next one is a minute away, and killing the training process
+    over it is strictly worse than the stale sweep the heartbeat exists to
+    dodge.
+    """
+    monkeypatch.setattr(training, "RECORD_LOCK_WAIT_S", 0.3)
+    monkeypatch.setattr(training, "RECORD_LOCK_STALE_S", 600.0)  # never reaped
+    (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+    _hold_the_mutex(run_dir)
+
+    landed = training.write_status_best_effort(SID, n_epochs_completed=3)
+
+    assert landed is False, "the write should have been skipped, not reported as done"
+    rec = json.loads((run_dir / "status.json").read_text())
+    assert rec == {"status": "TRAINING"}, f"the record was touched anyway: {rec}"
+
+
+def test_a_TERMINAL_write_under_the_same_held_lock_STILL_RAISES(run_dir, monkeypatch):
+    """THE OTHER HALF, and the one that makes the first half safe.
+
+    If the catch were applied to every write, a terminal status could be
+    swallowed and a finished run would look like it was still going -- which is
+    the failure the lock was built to surface, reintroduced one layer up.
+    """
+    monkeypatch.setattr(training, "RECORD_LOCK_WAIT_S", 0.3)
+    monkeypatch.setattr(training, "RECORD_LOCK_STALE_S", 600.0)
+    (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+    _hold_the_mutex(run_dir)
+
+    with pytest.raises(training.RunRecordLockTimeout):
+        training.write_status(SID, status="COMPLETED", terminated_by="child")
+
+
+def test_an_UNREADABLE_record_is_also_survived_by_a_heartbeat(run_dir):
+    """The second new exception, same rule.
+
+    A record that will not parse is refused rather than overwritten. A
+    heartbeat must not die of it either -- and the file must still be left
+    exactly as it was, which is what makes the refusal worth having.
+    """
+    corrupt = "{ this is not json"
+    (run_dir / "status.json").write_text(corrupt)
+
+    landed = training.write_status_best_effort(SID, n_epochs_completed=1)
+
+    assert landed is False
+    assert (run_dir / "status.json").read_text() == corrupt, "the record was altered"
+
+
+def test_a_heartbeat_that_CAN_take_the_lock_still_writes(run_dir):
+    """THE CONTROL. A best-effort helper that silently never wrote would pass
+    both tests above and would stop every heartbeat in production."""
+    (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+
+    landed = training.write_status_best_effort(SID, n_epochs_completed=7)
+
+    assert landed is True
+    rec = json.loads((run_dir / "status.json").read_text())
+    assert rec["n_epochs_completed"] == 7, rec
+    assert rec["status"] == "TRAINING", rec
+
+
+def test_the_HEARTBEAT_CALL_SITES_use_the_best_effort_helper():
+    """Pins the split at the places it actually has to hold.
+
+    The helper is only worth having if the heartbeats call it, and the terminal
+    writes do not. Read from the source, so moving a call to the wrong one
+    fails here.
+    """
+    import pathlib
+
+    here = pathlib.Path(__file__).parent
+    for name, fn in (
+        ("train_worker.py", "_heartbeat"),
+        ("train_worker_cellpose.py", "_heartbeat"),
+    ):
+        src = (here / name).read_text()
+        body = src.split(f"def {fn}(", 1)[1].split("\ndef ", 1)[0]
+        assert "write_status_best_effort(" in body, f"{name}:{fn} does not use it"
+        assert (
+            "training.write_status(" not in body
+        ), f"{name}:{fn} still calls the raising write_status"
+
+    # ...and the terminal writes must NOT have been converted with them.
+    for name in ("runtime.py", "runtime_cellpose.py"):
+        src = (here / name).read_text()
+        assert 'status="FAILED"' in src or "status='FAILED'" in src
+        assert (
+            "write_status_best_effort(" not in src
+        ), f"{name} uses the best-effort helper; terminal writes must raise"

@@ -340,6 +340,44 @@ def new_session_id() -> str:
     return datetime.now().strftime("%Y-%m-%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
 
 
+def write_status_best_effort(session_id: str, **fields: Any) -> bool:
+    """`write_status` for a write the RUN MUST SURVIVE. True if it landed.
+
+    The record lock introduced two exceptions that never existed before:
+    `RunRecordLockTimeout` when the mutex cannot be taken, and
+    `RunRecordUnreadable` when the file on disk will not parse. Both are right
+    to raise at a write whose whole point is to be durable -- a terminal status,
+    a failure record -- because an unlocked merge is what silently erases a
+    record.
+
+    They are wrong to raise at a HEARTBEAT. A heartbeat exists only to refresh
+    `updated_at` so a long epoch does not trip the stale window; it carries no
+    outcome, and the next one is a minute away. Letting one kill the training
+    process would mean a contended lock destroys hours of GPU work to protect a
+    timestamp -- strictly worse than the stale sweep the heartbeat is dodging.
+    Progress writes are the same shape: an epoch curve that misses one update
+    is repaired by the next, and by the reconciliation at the end.
+
+    So this is for heartbeat and progress ONLY. Terminal writes keep calling
+    `write_status` and keep raising. The split is deliberate and is tested both
+    ways round, because a catch-all here would hide exactly the failure the
+    lock was built to surface.
+    """
+    try:
+        write_status(session_id, **fields)
+        return True
+    except (RunRecordLockTimeout, RunRecordUnreadable) as exc:
+        # Logged with the session id so a run whose timestamps go quiet can be
+        # tied to the reason. Not re-raised: see above.
+        print(
+            f"[model-finetune] run {session_id}: a non-terminal status write was "
+            f"skipped ({type(exc).__name__}: {exc}). The run continues; the next "
+            "update will carry the state.",
+            flush=True,
+        )
+        return False
+
+
 def read_status(session_id: str) -> Dict[str, Any]:
     p = _status_path(session_id)
     if not p.exists():
@@ -374,6 +412,15 @@ def read_status(session_id: str) -> Dict[str, Any]:
 # a local filesystem too, so there is one code path rather than two.
 RECORD_LOCK_NAME = ".status.mutex"
 
+# ⚠ ACROSS NODES, the reap's judgement rests on a `stat` another NFS client may
+# answer from its attribute cache, and that cache can outlive this window (the
+# usual client defaults reach 60 s, twice the 30 s below). So a reaper on one
+# node can in principle act on a stale view of a lock held on another. Measured
+# only within ONE pod, where a single client's cache is coherent; the
+# cross-client case is NOT measured. Accepted rather than fixed: it can only
+# bite after a holder has died, which is the case the reap exists for and
+# already concedes an overlap. The ordinary acquire path is unaffected --
+# `os.link`'s EEXIST is decided on the server, not from any cache.
 # How long a mutex may be held before another writer treats it as abandoned.
 # A link-based lock has no kernel to release it if the holder dies, so without
 # this one crashed writer wedges a run's record forever. Generous relative to a
