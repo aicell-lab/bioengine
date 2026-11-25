@@ -65,7 +65,10 @@ def _write_store(tmp_path, zarr_format):
     rng = np.random.default_rng(5)
     full = rng.integers(1, 255, size=SHAPE, dtype=np.uint8)
     kwargs = dict(
-        store=str(root), shape=SHAPE, chunks=CHUNKS, dtype="u1",
+        store=str(root),
+        shape=SHAPE,
+        chunks=CHUNKS,
+        dtype="u1",
         zarr_format=zarr_format,
     )
     try:
@@ -81,7 +84,8 @@ def _victim_key(root, zarr_format):
     """The relative key of the (1, 1) chunk, discovered rather than assumed."""
     want = "1.1" if zarr_format == 2 else "c/1/1"
     hits = [
-        p for p in root.rglob("*")
+        p
+        for p in root.rglob("*")
         if p.is_file() and str(p.relative_to(root)).replace("\\", "/") == want
     ]
     assert len(hits) == 1, (
@@ -311,8 +315,11 @@ def test_listing_says_so_rather_than_answering_empty():
     the silent-wrong-answer shape this class exists to prevent."""
     store = ngff_region.LengthCheckedStore("http://127.0.0.1:1/")
     assert store.supports_listing is False
-    for call in (lambda: store.list(), lambda: store.list_prefix(""),
-                 lambda: store.list_dir("")):
+    for call in (
+        lambda: store.list(),
+        lambda: store.list_prefix(""),
+        lambda: store.list_dir(""),
+    ):
         with pytest.raises(NotImplementedError):
             call()
 

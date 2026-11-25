@@ -494,10 +494,7 @@ def _length_checked_store_class() -> Any:
 
         # ── identity ──────────────────────────────────────────────────────
         def __eq__(self, other: object) -> bool:
-            return (
-                isinstance(other, _LengthCheckedStore)
-                and other._root == self._root
-            )
+            return isinstance(other, _LengthCheckedStore) and other._root == self._root
 
         def __hash__(self) -> int:
             return hash(("LengthCheckedStore", self._root))
@@ -553,9 +550,7 @@ def _length_checked_store_class() -> Any:
                 return None
             if not 200 <= int(status) < 300:
                 raise RegionSourceError(
-                    redact_store_credential(
-                        f"store key {key!r} returned HTTP {status}"
-                    )
+                    redact_store_credential(f"store key {key!r} returned HTTP {status}")
                 )
             if range_header is not None and int(status) != 206:
                 # The server ignored the Range and sent the WHOLE object. Slicing
@@ -603,9 +598,7 @@ def _length_checked_store_class() -> Any:
                 )
             return body
 
-        async def get(
-            self, key: str, prototype: Any, byte_range: Any = None
-        ) -> Any:
+        async def get(self, key: str, prototype: Any, byte_range: Any = None) -> Any:
             # The range is asked of the SERVER, never applied locally. See
             # _range_header and the sharding note in _get_bytes.
             body = await asyncio.to_thread(
@@ -615,9 +608,7 @@ def _length_checked_store_class() -> Any:
                 return None
             return prototype.buffer.from_bytes(body)
 
-        async def get_partial_values(
-            self, prototype: Any, key_ranges: Any
-        ) -> Any:
+        async def get_partial_values(self, prototype: Any, key_ranges: Any) -> Any:
             out = []
             for key, rng in key_ranges:
                 out.append(await self.get(key, prototype, rng))
@@ -681,7 +672,6 @@ def LengthCheckedStore(root: str, fetch: Optional[Any] = None) -> Any:
     return _length_checked_store_class()(root, fetch=fetch)
 
 
-
 class WrongRangeRead(RegionSourceError):
     """The server answered a range request with a DIFFERENT range.
 
@@ -692,8 +682,9 @@ class WrongRangeRead(RegionSourceError):
     """
 
 
-def _check_content_range(key: str, requested: str, content_range: Optional[str],
-                         body_len: int) -> None:
+def _check_content_range(
+    key: str, requested: str, content_range: Optional[str], body_len: int
+) -> None:
     """Refuse unless the 206 describes the range that was actually requested.
 
     **Why this is not covered by the length check.** The wire-byte check compares
@@ -879,6 +870,4 @@ def _zarr_opener(store_root: str, array_path: str) -> Any:
     import zarr
 
     root = store_root if store_root.endswith("/") else store_root + "/"
-    return zarr.open_array(
-        store=LengthCheckedStore(root + array_path), mode="r"
-    )
+    return zarr.open_array(store=LengthCheckedStore(root + array_path), mode="r")

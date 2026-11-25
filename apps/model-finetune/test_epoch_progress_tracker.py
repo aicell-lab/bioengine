@@ -39,7 +39,9 @@ def test_an_epoch_closes_at_nimg_per_epoch_and_divides_by_it():
     actually summed. The two differ whenever batch_size does not divide it, and
     matching cellpose is the whole point of recomputing rather than averaging."""
     seen = []
-    t = ep.EpochLossTracker(nimg_per_epoch=10, on_epoch=lambda n, curve: seen.append((n, list(curve))))
+    t = ep.EpochLossTracker(
+        nimg_per_epoch=10, on_epoch=lambda n, curve: seen.append((n, list(curve)))
+    )
     # Four batches of 3 = 12 samples, so the epoch closes on the fourth and the
     # divisor is 10, not 12.
     for _ in range(4):
@@ -99,8 +101,14 @@ def test_the_live_curve_equals_what_train_seg_would_have_returned():
     t = ep.EpochLossTracker(nimg)
     hook = ep.CellposeLossHook(t, grad_enabled=lambda: grad["on"])
     # Two epochs' worth: batches of 2 samples, losses chosen to be distinguishable.
-    batches = [(1.5, 2, None), (2.5, 2, None), (3.5, 2, None),
-               (0.5, 2, None), (1.0, 2, None), (1.5, 2, None)]
+    batches = [
+        (1.5, 2, None),
+        (2.5, 2, None),
+        (3.5, 2, None),
+        (0.5, 2, None),
+        (1.0, 2, None),
+        (1.5, 2, None),
+    ]
     _replay(hook, batches, grad)
     expect = [
         (1.5 * 2 + 2.5 * 2 + 3.5 * 2) / nimg,
@@ -130,12 +138,12 @@ def test_a_validation_batch_is_not_counted():
     t = ep.EpochLossTracker(4)
     hook = ep.CellposeLossHook(t, grad_enabled=lambda: grad["on"])
     seg = hook.wrap_seg(lambda lbl, y: FakeTensor(y))
-    seg(FakeBatch(2), 1.0)          # a training batch
+    seg(FakeBatch(2), 1.0)  # a training batch
     grad["on"] = False
     for _ in range(5):
-        seg(FakeBatch(2), 99.0)     # a validation pass: must be ignored entirely
+        seg(FakeBatch(2), 99.0)  # a validation pass: must be ignored entirely
     grad["on"] = True
-    seg(FakeBatch(2), 3.0)          # the training batch that closes the epoch
+    seg(FakeBatch(2), 3.0)  # the training batch that closes the epoch
     hook.close()
     assert hook.skipped_no_grad == 5
     assert t.epochs_completed == 1
@@ -160,7 +168,9 @@ def test_agreement_distinguishes_checked_from_merely_unchecked():
     live = [1.0, 2.0]
     assert ep.agreement(live, [1.0, 2.0]) == ep.BASIS_MEASURED
     assert ep.agreement(live, [1.0, 2.5]) == ep.BASIS_UNRECONCILED
-    assert ep.agreement(live, [1.0]) == ep.BASIS_UNRECONCILED, "a length mismatch is not agreement"
+    assert (
+        ep.agreement(live, [1.0]) == ep.BASIS_UNRECONCILED
+    ), "a length mismatch is not agreement"
     # Absent or empty is UNRECONCILED, not MEASURED: unchecked is not checked-and-equal.
     assert ep.agreement(live, []) == ep.BASIS_UNRECONCILED
     assert ep.agreement(live, None) == ep.BASIS_UNRECONCILED

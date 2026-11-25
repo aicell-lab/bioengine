@@ -59,7 +59,9 @@ def test_zarr_excludes_3_1_6_which_is_the_release_that_requires_numpy_2():
         for line in _requirement_lines()
         if packaging_requirements.Requirement(line).name.lower() == "zarr"
     ]
-    assert len(zarr_reqs) == 1, f"expected exactly one zarr requirement, got {zarr_reqs}"
+    assert (
+        len(zarr_reqs) == 1
+    ), f"expected exactly one zarr requirement, got {zarr_reqs}"
 
     spec = zarr_reqs[0].specifier
     assert str(spec), (
@@ -106,7 +108,9 @@ def test_numpy_is_declared_without_an_upper_bound():
         for line in _requirement_lines()
         if packaging_requirements.Requirement(line).name.lower() == "numpy"
     ]
-    assert len(numpy_reqs) == 1, f"expected exactly one numpy requirement, got {numpy_reqs}"
+    assert (
+        len(numpy_reqs) == 1
+    ), f"expected exactly one numpy requirement, got {numpy_reqs}"
     assert not str(numpy_reqs[0].specifier), (
         f"numpy is pinned to {numpy_reqs[0].specifier}. Leave it unpinned so pip "
         "keeps the worker image's own numpy and installs none."

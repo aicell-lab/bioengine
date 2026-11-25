@@ -57,10 +57,18 @@ def epoch_progress_of(session):
         return {"kind": "none"}
     total = _as_count(session.get("n_epochs"))
     if total is None or total <= 0:
-        return {"kind": "measured", "completed": completed, "total": None,
-                "fraction": None}
-    return {"kind": "measured", "completed": completed, "total": total,
-            "fraction": min(1.0, completed / total)}
+        return {
+            "kind": "measured",
+            "completed": completed,
+            "total": None,
+            "fraction": None,
+        }
+    return {
+        "kind": "measured",
+        "completed": completed,
+        "total": total,
+        "fraction": min(1.0, completed / total),
+    }
 
 
 # ── what the live writer puts on the status ───────────────────────────────────
@@ -117,8 +125,9 @@ def test_a_mid_run_status_reads_as_progress_through_the_PAGES_rule(live_writes):
 def test_the_rule_rejects_the_status_this_writer_used_to_produce(live_writes):
     """THE CONTROL on the transcription. If the rule accepted a basis-less status
     too, the test above would pass whatever the writer did."""
-    without = {k: v for k, v in live_writes[-1].items()
-               if k != "n_epochs_completed_basis"}
+    without = {
+        k: v for k, v in live_writes[-1].items() if k != "n_epochs_completed_basis"
+    }
     assert epoch_progress_of({"n_epochs": 3, **without}) == {"kind": "none"}
 
 
@@ -144,8 +153,11 @@ def test_a_missing_or_zero_total_still_reports_the_count():
     because a backend that omits n_epochs should still show progress."""
     for total in (None, 0):
         got = epoch_progress_of(
-            {"n_epochs": total, "n_epochs_completed_basis": "measured",
-             "n_epochs_completed": 4}
+            {
+                "n_epochs": total,
+                "n_epochs_completed_basis": "measured",
+                "n_epochs_completed": 4,
+            }
         )
         assert got["kind"] == "measured" and got["completed"] == 4
         assert got["total"] is None and got["fraction"] is None
@@ -155,8 +167,7 @@ def test_a_count_above_the_total_is_reported_not_hidden():
     """The page clamps the BAR but not the number, on the grounds that a count
     above the requested total is a backend fact worth seeing."""
     got = epoch_progress_of(
-        {"n_epochs": 3, "n_epochs_completed_basis": "measured",
-         "n_epochs_completed": 5}
+        {"n_epochs": 3, "n_epochs_completed_basis": "measured", "n_epochs_completed": 5}
     )
     assert got["completed"] == 5 and got["fraction"] == 1.0
 
@@ -183,23 +194,32 @@ def test_a_reconciled_curve_keeps_the_measured_basis_at_the_end():
     """It used to write `floor_if_completed` with the REQUESTED total, so a run
     the page had been showing progress for lost the claim on success."""
     live = [0.9, 0.7, 0.5]
-    assert epoch_progress.agreement(live, [0.9, 0.7, 0.5]) == \
-        epoch_progress.BASIS_MEASURED
-    status = {"n_epochs": 3, "n_epochs_completed": len(live),
-              "n_epochs_completed_basis": "measured"}
+    assert (
+        epoch_progress.agreement(live, [0.9, 0.7, 0.5]) == epoch_progress.BASIS_MEASURED
+    )
+    status = {
+        "n_epochs": 3,
+        "n_epochs_completed": len(live),
+        "n_epochs_completed_basis": "measured",
+    }
     assert epoch_progress_of(status)["kind"] == "measured"
 
 
 def test_an_unreconciled_curve_does_NOT_claim_measured():
     """The fallback has to stay a fallback: a live curve that cannot be
     reproduced from train_seg's own curve is not a measurement to advertise."""
-    assert epoch_progress.agreement([0.9, 0.7], [0.9, 0.4]) == \
-        epoch_progress.BASIS_UNRECONCILED
+    assert (
+        epoch_progress.agreement([0.9, 0.7], [0.9, 0.4])
+        == epoch_progress.BASIS_UNRECONCILED
+    )
     assert epoch_progress.agreement([], [0.9]) == epoch_progress.BASIS_UNAVAILABLE
     # and the page makes no claim for the floor basis the fallback writes
     assert epoch_progress_of(
-        {"n_epochs": 3, "n_epochs_completed": 3,
-         "n_epochs_completed_basis": "floor_if_completed"}
+        {
+            "n_epochs": 3,
+            "n_epochs_completed": 3,
+            "n_epochs_completed_basis": "floor_if_completed",
+        }
     ) == {"kind": "none"}
 
 
@@ -215,9 +235,14 @@ def _fields(ok, basis, curve, n_epochs=3):
 def test_a_reconciled_curve_is_reported_as_measured_with_the_OBSERVED_count():
     """Not the requested total: if cellpose ended early the observed count is the
     truer number, and it is the one the page will display."""
-    assert _fields(True, epoch_progress.BASIS_MEASURED, [0.9, 0.7], 3) == (2, "measured")
+    assert _fields(True, epoch_progress.BASIS_MEASURED, [0.9, 0.7], 3) == (
+        2,
+        "measured",
+    )
     assert _fields(True, epoch_progress.BASIS_MEASURED, [0.9, 0.7, 0.5], 3) == (
-        3, "measured")
+        3,
+        "measured",
+    )
 
 
 @pytest.mark.parametrize(
@@ -246,7 +271,10 @@ def test_the_terminal_fields_render_through_the_PAGES_rule():
     status, must come out as progress the page will show."""
     completed, basis = _fields(True, epoch_progress.BASIS_MEASURED, [0.9, 0.7, 0.5], 3)
     got = epoch_progress_of(
-        {"n_epochs": 3, "n_epochs_completed": completed,
-         "n_epochs_completed_basis": basis}
+        {
+            "n_epochs": 3,
+            "n_epochs_completed": completed,
+            "n_epochs_completed_basis": basis,
+        }
     )
     assert got == {"kind": "measured", "completed": 3, "total": 3, "fraction": 1.0}

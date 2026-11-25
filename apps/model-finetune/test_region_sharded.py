@@ -51,8 +51,13 @@ def _write_sharded(tmp_path):
     rng = np.random.default_rng(11)
     full = rng.integers(1, 255, size=SHAPE, dtype=np.uint8)
     z = zarr.create_array(
-        store=str(root), shape=SHAPE, chunks=INNER, shards=SHARD,
-        dtype="u1", zarr_format=3, compressors=None,
+        store=str(root),
+        shape=SHAPE,
+        chunks=INNER,
+        shards=SHARD,
+        dtype="u1",
+        zarr_format=3,
+        compressors=None,
     )
     z[:] = full
     files = [p for p in root.rglob("*") if p.is_file()]
@@ -93,10 +98,10 @@ class _RangeServer:
                     m = re.fullmatch(r"bytes=(\d*)-(\d*)", rng.strip())
                     assert m, f"unparsable Range: {rng!r}"
                     a, b = m.group(1), m.group(2)
-                    if a == "":                      # suffix: bytes=-N
+                    if a == "":  # suffix: bytes=-N
                         n = min(int(b), total)
                         start, end = total - n, total - 1
-                    elif b == "":                    # open-ended: bytes=N-
+                    elif b == "":  # open-ended: bytes=N-
                         start, end = int(a), total - 1
                     else:
                         start, end = int(a), min(int(b), total - 1)
@@ -170,7 +175,9 @@ def test_the_fixture_really_is_one_big_shard(sharded):
         f"{[p.name for p in chunk_objects]} -- the fixture is not sharded"
     )
     biggest = max(p.stat().st_size for p in chunk_objects)
-    assert biggest > 500_000, f"the shard is only {biggest} B; fixture too small to be a test"
+    assert (
+        biggest > 500_000
+    ), f"the shard is only {biggest} B; fixture too small to be a test"
 
 
 def test_a_crop_from_a_sharded_store_does_not_download_the_shard(sharded):
@@ -217,8 +224,12 @@ def test_an_unsharded_v3_store_is_unaffected(tmp_path):
     rng = np.random.default_rng(12)
     full = rng.integers(1, 255, size=(256, 256), dtype=np.uint8)
     z = zarr.create_array(
-        store=str(root), shape=(256, 256), chunks=(128, 128),
-        dtype="u1", zarr_format=3, compressors=None,
+        store=str(root),
+        shape=(256, 256),
+        chunks=(128, 128),
+        dtype="u1",
+        zarr_format=3,
+        compressors=None,
     )
     z[:] = full
     srv = _RangeServer(root)

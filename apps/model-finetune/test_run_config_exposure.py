@@ -146,6 +146,8 @@ def test_the_allow_list_is_not_empty_and_does_filter(session):
     sid, d = session
     _write_params(d, {k: 1 for k in training.RUN_CONFIG_FIELDS})
     cfg = training.run_config(sid)
-    assert len(cfg) == len(training.RUN_CONFIG_FIELDS), "an allow-listed field was dropped"
+    assert len(cfg) == len(
+        training.RUN_CONFIG_FIELDS
+    ), "an allow-listed field was dropped"
     _write_params(d, {"definitely_not_allow_listed": 1})
     assert training.run_config(sid) == {}, "the allow-list is not filtering"
