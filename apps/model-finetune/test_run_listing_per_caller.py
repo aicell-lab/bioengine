@@ -797,3 +797,98 @@ def test_no_OTHER_entry_method_takes_a_session_id_without_the_gate():
         f"method(s) taking a session_id that are neither gated nor a listed "
         f"read-only exception: {unaccounted}. Decide which, then add it here."
     )
+
+
+# ── resuming reads another run's CHECKPOINT, so it is gated too ─────────────
+#
+# Not a mutating call -- it does not change the run it resumes from -- which is
+# why the review set it aside from the mutating clause. It still takes that run's
+# trained weights and continues from them, so the resulting model derives from a
+# checkpoint the caller was never granted. The ruling is that reads of a run stay
+# open and documented, but a RESUME is gated owner-or-admin.
+
+
+async def _start(cls, inst, resume_from, who):
+    return await cls.start_training(
+        inst,
+        train_images=["a.tif"],
+        train_labels=["b.tif"],
+        resume_session_id=resume_from,
+        context=who,
+    )
+
+
+@pytest.mark.asyncio
+async def test_RESUMING_someone_elses_run_is_refused(runs):
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    for who in (ctx(OTHER, anonymous=False), ctx(ANON_A), None):
+        with pytest.raises(training.NotTheOwner):
+            await _start(cls, inst, sid, who)
+
+
+@pytest.mark.asyncio
+async def test_resuming_an_OWNERLESS_run_is_admin_only(runs):
+    sid = "2026-11-25-150730-abcdef12"
+    runs(sid, None)
+    cls, inst = _entry()
+    with pytest.raises(training.NotTheOwner):
+        await _start(cls, inst, sid, ctx(ANON_A))
+
+
+@pytest.mark.asyncio
+async def test_resuming_leaves_NO_session_behind_when_refused(runs, tmp_path):
+    """A refused resume must not create the new run either — otherwise the
+    refusal still costs a PREPARING record, which is the manufacture-by-calling
+    shape this app has already been bitten by."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    before = sorted(p.name for p in training.sessions_root().iterdir())
+    cls, inst = _entry()
+    with pytest.raises(training.NotTheOwner):
+        await _start(cls, inst, sid, ctx(OTHER, anonymous=False))
+    assert sorted(p.name for p in training.sessions_root().iterdir()) == before
+
+
+@pytest.mark.asyncio
+async def test_resuming_YOUR_OWN_run_gets_past_the_gate(runs):
+    """THE CONTROL, and it asserts the gate was CONSULTED rather than merely that
+    some other error came back — the same mistake that made an earlier control
+    pass on a missing-argument TypeError."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    seen = []
+    real = training.require_caller_may_mutate
+
+    def spy(session_id, context):
+        seen.append(session_id)
+        return real(session_id, context)
+
+    training.require_caller_may_mutate = spy
+    try:
+        with pytest.raises(Exception) as exc:
+            await _start(cls, inst, sid, ctx(ME, anonymous=False))
+    finally:
+        training.require_caller_may_mutate = real
+    assert seen == [sid], f"the gate was not consulted for the resume: {seen}"
+    assert not isinstance(exc.value, training.NotTheOwner)
+
+
+@pytest.mark.asyncio
+async def test_NOT_resuming_does_not_consult_the_gate_at_all(runs):
+    """The paired control the other way: a normal start must not be gated on
+    anything, or every caller would need an owned run to train at all."""
+    cls, inst = _entry()
+    seen = []
+    real = training.require_caller_may_mutate
+
+    def spy(session_id, context):
+        seen.append(session_id)
+        return real(session_id, context)
+
+    training.require_caller_may_mutate = spy
+    try:
+        with pytest.raises(Exception):
+            await _start(cls, inst, None, ctx(ANON_A))
+    finally:
+        training.require_caller_may_mutate = real
+    assert seen == [], f"a plain start consulted the resume gate: {seen}"

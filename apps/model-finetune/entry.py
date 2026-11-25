@@ -1657,6 +1657,21 @@ class EntryApp:
                 "they select different starting checkpoints."
             )
 
+        # Resuming reads ANOTHER RUN'S CHECKPOINT, so it is gated like the other
+        # calls keyed by a session id: the run's own caller, or a `bioimage-io`
+        # admin. It does not CHANGE the other run, which is why it is not a
+        # mutating call -- but it takes that run's trained weights and continues
+        # from them, so the resulting model derives from a checkpoint the caller
+        # was never granted. "You shared the id so you shared the history" is a
+        # far easier thing to accept than "you shared the id so you shared the
+        # weights", and only the first is the documented position.
+        #
+        # Checked BEFORE the session directory exists and before anything else,
+        # so a refused resume leaves no PREPARING session behind and reveals
+        # nothing about whether the named run exists.
+        if resume_session_id:
+            training.require_caller_may_mutate(resume_session_id, context)
+
         # Before the session dir exists, so a bad name fails the call outright
         # rather than leaving a PREPARING session behind.
         selected_metrics = training.validate_metrics(metrics)
