@@ -200,6 +200,46 @@ def region_index(
         )
     want = dict(planes or {})
 
+    # DECISION (#0908 clause 3): a plane named for a SPATIAL or CHANNEL axis, or
+    # for an axis this layout does not have, is REFUSED -- not ignored.
+    #
+    # Those axes never reach `_plane_index`: y and x get the crop's slices and a
+    # channel axis is kept whole, so until now `planes={"c": 2}` was accepted and
+    # discarded, and `planes={"bogus": 1}` likewise. The caller asked for one
+    # thing and got another with no complaint, which is the same class of silence
+    # this module refuses elsewhere.
+    #
+    # Refusing is also what makes the two ends agree: the annotation broker's
+    # import validator already refuses a plane for a spatial or channel axis and
+    # an unknown axis name, so nothing written through the supported path can
+    # carry these shapes. A record written before that validator, or by another
+    # path, now fails loudly here instead of training on something the caller did
+    # not ask for.
+    #
+    # Only possible when the axis NAMES are known. Without them an axis cannot be
+    # matched to a role, so the keys are left alone and `_plane_index` reports the
+    # missing-names case itself.
+    if want and names:
+        roles: Dict[str, str] = {}
+        for role, idx in (("y", y), ("x", x), ("c", c)):
+            if isinstance(idx, int) and 0 <= idx < len(names):
+                roles[names[idx]] = role
+        for key in sorted(want):
+            if key in roles:
+                raise RegionSourceError(
+                    f"planes[{key!r}] names the {roles[key]!r} axis, which is not a "
+                    f"plane axis: y and x are the crop and a channel axis is kept "
+                    f"whole. It is refused rather than ignored, because ignoring it "
+                    f"would read something other than what was asked for. Drop "
+                    f"{key!r} from planes."
+                )
+            if key not in names:
+                raise RegionSourceError(
+                    f"planes[{key!r}] names no axis of this array, whose axes are "
+                    f"{list(names)!r}. It is refused rather than ignored: a plane "
+                    f"that selects nothing looks like a plane that was honoured."
+                )
+
     out: List[Any] = []
     for axis in range(rank):
         if axis == y:
@@ -223,16 +263,29 @@ def _plane_index(
     of 0 is wrong and silent.
     """
     name = str(names[axis]) if axis < len(names) else ""
-    if size == 1:
-        return 0
+    # A SUPPLIED plane is range-checked FIRST, before the size-1 shortcut.
+    #
+    # The shortcut used to come first, so for a single-element axis the caller's
+    # index was never looked at: planes={"z": 7} on a z of size 1 was accepted
+    # and silently read z=0. The pixels were right -- there is only one plane --
+    # but the error was lost, so a caller whose numbering is wrong got no
+    # complaint, and a stored record could claim a plane that does not exist.
+    # The same index on a 4-element axis was refused cleanly, which is how the
+    # inconsistency was found: the check existed and was simply unreachable.
     if name and name in planes:
         index = int(planes[name])
         if not (0 <= index < size):
+            where = (
+                f"which has only 1 element, so the only valid index is 0"
+                if size == 1
+                else f"which has {size} elements (0..{size - 1})"
+            )
             raise RegionSourceError(
-                f"planes[{name!r}]={index} is outside axis {name!r}, which has "
-                f"{size} elements (0..{size - 1})."
+                f"planes[{name!r}]={index} is outside axis {name!r}, {where}."
             )
         return index
+    if size == 1:
+        return 0
     label = f"{name!r}" if name else f"at position {axis}"
     known = (
         f"Its name is not in the recorded axes ({list(names)!r}), so a plane "
