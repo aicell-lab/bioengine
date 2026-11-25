@@ -43,12 +43,27 @@ RUN_KEY_PARAMS = frozenset({"session_id", "resume_session_id", "export_id"})
 OPEN_TO_ANY_HOLDER = frozenset(
     {
         "get_training_status",  # what was trained, and how far it got
-        "get_export_status",  # progress of an export already minted
         "infer",  # an OUTPUT of the model, not the model
         "compute_embedding",  # likewise
-        "push_export",  # completes an export minted by the gated export_model
     }
 )
+
+# NOT a third opinion, a third STATE: ungated today, and nobody has ruled that
+# it should be.
+#
+# An earlier version of this file put these two in OPEN_TO_ANY_HOLDER and
+# described an export handle as safe to pass around. That was wrong on the
+# facts. `get_export_status` returns the whole export record, and a READY record
+# carries `download_url` -- a six-hour presigned link to the packaged weights --
+# plus `resume_checkpoint_file`. `push_export` streams the package to any
+# presigned URL the caller supplies. So an export handle hands over the
+# weights, which is the thing the restricted set exists to protect, and
+# freezing it as "open" asserted a decision nobody had taken.
+#
+# They stay here, matching what the code does today, until that is ruled on.
+# Gating them is a behaviour change and belongs with the gate's own row, not
+# with a documentation change.
+UNGATED_PENDING_A_RULING = frozenset({"get_export_status", "push_export"})
 
 OWNER_OR_ADMIN = frozenset(
     {
@@ -114,22 +129,29 @@ def test_EVERY_run_keyed_method_is_on_exactly_one_side():
     identifier or requires the owner. Adding one without saying which fails
     here, which is the only moment anybody is reliably forced to decide.
     """
-    declared = OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN
+    declared = OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_PENDING_A_RULING
     undeclared = set(RUN_KEYED) - declared
     assert undeclared == set(), (
         f"these methods take a run identifier and are on neither side: "
         f"{sorted(undeclared)}. Decide, then add each to OPEN_TO_ANY_HOLDER or "
         "OWNER_OR_ADMIN above."
     )
-    assert not (OPEN_TO_ANY_HOLDER & OWNER_OR_ADMIN), "a method cannot be on both sides"
+    for a, b in (
+        (OPEN_TO_ANY_HOLDER, OWNER_OR_ADMIN),
+        (OPEN_TO_ANY_HOLDER, UNGATED_PENDING_A_RULING),
+        (OWNER_OR_ADMIN, UNGATED_PENDING_A_RULING),
+    ):
+        assert not (a & b), "a method cannot be in two of the three sets"
 
 
 def test_the_declared_sets_do_not_name_methods_that_no_longer_EXIST():
     """The other direction, so a rename cannot leave a set asserting nothing."""
-    missing = (OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN) - set(METHODS)
-    assert missing == set(), (
-        f"these are declared but are not public methods of the app: {sorted(missing)}"
+    missing = (OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_PENDING_A_RULING) - set(
+        METHODS
     )
+    assert (
+        missing == set()
+    ), f"these are declared but are not public methods of the app: {sorted(missing)}"
 
 
 @pytest.mark.parametrize("name", sorted(OWNER_OR_ADMIN))
@@ -211,10 +233,95 @@ def test_the_TUTORIAL_says_it_too_where_the_id_is_first_obtained():
         for c in nb["cells"]
         if c.get("cell_type") == "markdown"
     ).lower()
-    assert "cannot be withdrawn" in text, (
-        "the tutorial does not tell the reader the grant is irrevocable"
-    )
+    assert (
+        "cannot be withdrawn" in text
+    ), "the tutorial does not tell the reader the grant is irrevocable"
     assert "run inference with its model" in text, (
         "the tutorial does not say inference is included, which is the part a "
         "reader would not guess"
     )
+
+
+@pytest.mark.parametrize("name", sorted(UNGATED_PENDING_A_RULING))
+def test_the_UNRULED_methods_are_in_fact_ungated_today(name):
+    """Records the state, not an endorsement of it.
+
+    If somebody gates these, this test fails and the fix is to move the method
+    into OWNER_OR_ADMIN and update the documentation -- not to delete the
+    assertion. That is the whole difference between this set and the open one.
+    """
+    node, _params = METHODS[name]
+    assert not _calls_the_gate(node), (
+        f"{name} is now gated. Move it to OWNER_OR_ADMIN and correct the "
+        "README, which currently tells readers it is not."
+    )
+
+
+def test_an_EXPORT_RECORD_really_does_hand_over_the_weights():
+    """Why the export handle is not a progress token, pinned to the source.
+
+    The README says an `export_id` is equivalent to the weights. That claim has
+    to be anchored to the code, or it becomes another sentence that drifts: if
+    `download_url` ever stops being part of what `get_export_status` returns,
+    the warning should be revisited rather than left standing.
+    """
+    assert "download_url" in SOURCE, "the export record no longer mentions download_url"
+    node, _params = METHODS["get_export_status"]
+    body = ast.get_source_segment(SOURCE, node) or ""
+    assert "startswith" in body and "_" in body, (
+        "get_export_status no longer returns the record filtered only by a "
+        "leading-underscore convention; re-check what it exposes"
+    )
+    assert "download_url" in (
+        ast.get_docstring(node) or ""
+    ), "get_export_status's own docstring no longer documents download_url"
+
+
+def test_the_RESUME_gate_is_applied_to_the_RESUMED_run_not_the_new_one():
+    """Nit from review, and a real hole: the gate's ARGUMENT was never checked.
+
+    `_calls_the_gate` passes when the gate is called anywhere in the body with
+    any argument, so `start_training` gating the freshly minted `session_id`,
+    or gating unconditionally, would have stayed green while the docstring
+    claimed it gates "when resume_session_id is given". Assert the argument.
+    """
+    node, _params = METHODS["start_training"]
+    args_seen = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            fn = sub.func
+            if (getattr(fn, "attr", None) or getattr(fn, "id", None)) == GATE:
+                args_seen.append(
+                    [
+                        a.id if isinstance(a, ast.Name) else type(a).__name__
+                        for a in sub.args
+                    ]
+                )
+    assert args_seen, f"{GATE} is not called in start_training at all"
+    assert any("resume_session_id" in a for a in args_seen), (
+        f"start_training calls {GATE} with {args_seen}, never with "
+        "resume_session_id. The gate must be applied to the run being resumed."
+    )
+
+
+def test_the_README_warns_that_an_EXPORT_HANDLE_is_the_weights():
+    readme = pathlib.Path(__file__).with_name("README.md").read_text().lower()
+    assert "download_url" in readme, "the README does not name download_url"
+    for phrase in ("export handle", "not yet decided"):
+        assert phrase in readme, f"the README does not say {phrase!r}"
+
+
+def test_the_TUTORIAL_warns_about_the_export_handle_too():
+    import json
+
+    nb = json.loads(
+        pathlib.Path(__file__).with_name("tutorial_model_finetune.ipynb").read_text()
+    )
+    text = "\n".join(
+        "".join(c.get("source", []))
+        for c in nb["cells"]
+        if c.get("cell_type") == "markdown"
+    ).lower()
+    assert (
+        "not a progress token" in text
+    ), "the tutorial hands the reader an export_id without saying what it grants"

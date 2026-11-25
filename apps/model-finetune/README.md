@@ -76,18 +76,22 @@ What holding an identifier lets anyone do:
 | Call | Who | |
 |---|---|---|
 | `get_training_status(session_id)` | anyone holding the identifier | what was trained, the configuration, and how far it got |
-| `get_export_status(export_id)` | anyone holding the handle | progress of an export already started |
-| `push_export(export_id)` | anyone holding the handle | completes an export that `export_model` already authorised |
+| `get_export_status(export_id)` | anyone holding the handle | ⚠ **hands over the weights** — a READY record carries `download_url`, a 6-hour presigned link to the packaged weights, and `resume_checkpoint_file` |
+| `push_export(export_id)` | anyone holding the handle | ⚠ streams the package to any presigned URL the caller supplies |
 | `infer(session_id=…)` | anyone holding the identifier | **run inference with the run's model** |
 | `compute_embedding(session_id=…)` | anyone holding the identifier | likewise |
-| `stop_training(session_id)` | the run's owner, or a workspace administrator | acts on somebody else's run |
-| `export_model(session_id=…)` | the run's owner, or a workspace administrator | hands out the weights |
-| `contribute(session_id=…)` | the run's owner, or a workspace administrator | publishes them into the shared pool |
-| `start_training(resume_session_id=…)` | the run's owner, or a workspace administrator | continues training from the checkpoint, producing a model derived from it |
+| `stop_training(session_id)` | the run's owner, or `rw`/admin on `bioimage-io` | acts on somebody else's run |
+| `export_model(session_id=…)` | the run's owner, or `rw`/admin on `bioimage-io` | hands out the weights |
+| `contribute(session_id=…)` | the run's owner, or `rw`/admin on `bioimage-io` | publishes them into the shared pool |
+| `start_training(resume_session_id=…)` | the run's owner, or `rw`/admin on `bioimage-io` | continues training from the checkpoint, producing a model derived from it |
 
-The line is not "touches the weights" — it is whether the call **hands out or creates** weights. Inference returns an *output* computed with the model; the caller never receives the checkpoint and no new model derives from it. Several people trying one run's model in a shared notebook is the intended flow, so inference is deliberately open to any holder of the identifier. Exporting, contributing and resuming each put the weights themselves in somebody's hands, so those require the owner.
+The line is not "touches the weights" — it is whether the call **hands out or creates** weights. Inference returns an *output* computed with the model; the caller never receives the checkpoint and no new model derives from it. Several people trying one run's model in a shared notebook is the intended flow, so inference is deliberately open to any holder of the run identifier. Exporting, contributing and resuming each put the weights themselves in somebody's hands, so those require the run's owner or a holder of `rw`/admin on `bioimage-io`.
 
-Note that `list_training_sessions()` returns **only your own runs**, which is a narrower rule than the one above on purpose: the list is a convenience and does not define who can read what. If you hold an identifier, you can read that run whether or not it appears in your list.
+⚠ **An export handle is not a progress token — treat it as the weights themselves.** `export_model` is restricted, but the `export_id` it returns is not: a READY export record carries `download_url`, a presigned link anyone can fetch the packaged weights from for six hours, plus `resume_checkpoint_file`. So handing somebody an `export_id` "so they can watch the progress" hands them the model. Do not share one; share the run identifier instead if you want somebody to see the run or try its model.
+
+Whether those two calls should require the owner, the way `export_model` does, is **not yet decided** — today they do not, and that is recorded here as the current behaviour rather than as a judgement that it is right.
+
+For the per-caller run listing, and what an id does and does not grant, see `list_training_sessions` under Methods below; that paragraph is the authoritative one and this section does not restate it.
 
 ## Methods
 
