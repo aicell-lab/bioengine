@@ -398,3 +398,39 @@ def test_the_listing_control_lists_what_it_SHOULD(root):
     a = _plant(root, "2026-11-25-150730-abcdef12")
     b = _plant(root, "2026-11-25-150731-abcdef13")
     assert sorted(training.list_sessions()) == sorted([a, b])
+
+
+def test_a_SYMLINKED_session_directory_is_skipped_not_fatal(root):
+    """The residual the review found: a directory whose NAME is a valid session
+    id but which points OUT of the sessions root.
+
+    The name check cannot see that — only the containment check inside
+    `session_dir` can — so without catching its refusal here, one bad link takes
+    the entire run history down. That is the same outage the name check exists to
+    prevent, arriving through the other layer.
+    """
+    real = _plant(root, VALID)
+    outside = root.parent / "outside"
+    outside.mkdir()
+    (outside / "status.json").write_text(json.dumps({"status": "COMPLETED"}))
+    (root / "2026-11-25-150731-abcdef13").symlink_to(outside, target_is_directory=True)
+
+    listed = training.list_sessions()
+    assert (
+        real in listed
+    ), f"a symlinked session directory took the whole listing down: {sorted(listed)}"
+    assert "2026-11-25-150731-abcdef13" not in listed, "the escaping link was listed"
+    assert sorted(listed) == [real]
+
+
+def test_the_symlink_skip_does_not_swallow_a_LEGITIMATE_inner_symlink(root):
+    """THE CONTROL. A link that stays INSIDE the root is not an escape and must
+    still be listed, or the test above would pass by skipping every symlink."""
+    target = root / VALID
+    _plant(root, VALID)
+    link = root / "2026-11-25-150731-abcdef13"
+    link.symlink_to(target, target_is_directory=True)
+    listed = training.list_sessions()
+    assert sorted(listed) == sorted([VALID, "2026-11-25-150731-abcdef13"]), sorted(
+        listed
+    )

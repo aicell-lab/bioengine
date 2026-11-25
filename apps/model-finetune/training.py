@@ -389,7 +389,18 @@ def list_sessions() -> Dict[str, Dict[str, Any]]:
         if not SESSION_ID_PATTERN.match(d.name):
             skipped.append(d.name)
             continue
-        out[d.name] = get_status(d.name)
+        try:
+            out[d.name] = get_status(d.name)
+        except InvalidSessionId:
+            # The name passed, but a deeper layer still refused it. Today that
+            # means the containment check: a directory whose NAME is a valid
+            # session id but which is a SYMLINK out of the sessions root. The
+            # name check above cannot see that, and without this the one bad
+            # link would raise and take the whole history down -- the same
+            # outage the name check was added to prevent, through the other
+            # layer. Caught here rather than by pre-checking the link, so that
+            # any future refusal inside `session_dir` is covered too.
+            skipped.append(d.name)
     if skipped:
         # Names are attacker-controlled, so log how many and a bounded sample
         # rather than the lot.
