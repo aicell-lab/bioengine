@@ -30,6 +30,18 @@ import pytest
 
 import training
 
+# A session id must match the shape the server itself generates
+# (YYYY-MM-DD-HHMMSS-xxxxxxxx). `training.session_dir` refuses anything else --
+# a caller-supplied id was previously used as a directory name unchecked, which
+# let `../x` and absolute paths write outside the sessions root. So a descriptive
+# id like "s-stale" can no longer be a directory name; these constants keep the
+# tests readable while using ids the app accepts.
+S_BEAT = "2026-11-25-120008-00000008"
+S_COLD = "2026-11-25-120009-00000009"
+S_PREPARING = "2026-11-25-120010-0000000a"
+S_STALE = "2026-11-25-120007-00000007"
+S_WEDGED = "2026-11-25-120011-0000000b"
+
 
 @pytest.fixture(autouse=True)
 def _sandbox_home(monkeypatch, tmp_path):
@@ -58,10 +70,10 @@ def _heartbeat_of(instance) -> "object":
 
 def test_a_stale_preparing_session_is_swept_to_stopped() -> None:
     """The reported failure, reproduced: nothing wrote status, so the run 'stopped'."""
-    training.write_status("s-stale", status="PREPARING", created_at=time.time())
-    _backdate("s-stale", training.STATUS_STALE_SECONDS + 60)
+    training.write_status(S_STALE, status="PREPARING", created_at=time.time())
+    _backdate(S_STALE, training.STATUS_STALE_SECONDS + 60)
 
-    assert training.get_status("s-stale")["status"] == "STOPPED"
+    assert training.get_status(S_STALE)["status"] == "STOPPED"
 
 
 def test_a_field_only_write_moves_updated_at_and_prevents_the_sweep() -> None:
@@ -70,19 +82,19 @@ def test_a_field_only_write_moves_updated_at_and_prevents_the_sweep() -> None:
     Pinned separately because if this stops being true the heartbeat becomes a no-op
     that still looks like it is running.
     """
-    training.write_status("s-beat", status="PREPARING", created_at=time.time())
-    _backdate("s-beat", training.STATUS_STALE_SECONDS + 60)
-    assert training.get_status("s-beat")["status"] == "STOPPED"
+    training.write_status(S_BEAT, status="PREPARING", created_at=time.time())
+    _backdate(S_BEAT, training.STATUS_STALE_SECONDS + 60)
+    assert training.get_status(S_BEAT)["status"] == "STOPPED"
 
-    training.write_status("s-beat")
+    training.write_status(S_BEAT)
 
-    assert training.get_status("s-beat")["status"] == "PREPARING"
+    assert training.get_status(S_BEAT)["status"] == "PREPARING"
 
 
 @pytest.mark.asyncio
 async def test_the_heartbeat_keeps_a_preparing_session_alive() -> None:
     """It refreshes a PREPARING session that would otherwise go stale."""
-    session_id = "s-preparing"
+    session_id = S_PREPARING
     training.write_status(session_id, status="PREPARING", created_at=time.time())
     _backdate(session_id, training.STATUS_STALE_SECONDS + 60)
 
@@ -102,7 +114,7 @@ async def test_the_heartbeat_stops_once_the_status_leaves_preparing() -> None:
     window exists to catch, so this asserts both that the coroutine *returns* and that
     the sweep still fires afterwards.
     """
-    session_id = "s-wedged"
+    session_id = S_WEDGED
     training.write_status(session_id, status="PREPARING", created_at=time.time())
     training.write_status(session_id, status="TRAINING", message="training started")
 
@@ -136,7 +148,7 @@ async def test_run_training_starts_and_cancels_the_heartbeat(monkeypatch) -> Non
     # test no matter how correct the fix is. Here real elapsed time makes it stale.
     monkeypatch.setattr(training, "STATUS_STALE_SECONDS", 0.15)
 
-    session_id = "s-cold"
+    session_id = S_COLD
     training.write_status(session_id, status="PREPARING", created_at=time.time())
     seen = []
 

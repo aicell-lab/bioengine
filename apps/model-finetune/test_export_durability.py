@@ -37,6 +37,14 @@ import pytest
 
 import training
 
+# A session id must match the shape the server itself generates
+# (YYYY-MM-DD-HHMMSS-xxxxxxxx). `training.session_dir` refuses anything else --
+# a caller-supplied id was previously used as a directory name unchecked, which
+# let `../x` and absolute paths write outside the sessions root. So a descriptive
+# id like "s-stale" can no longer be a directory name; these constants keep the
+# tests readable while using ids the app accepts.
+S_CANCELLED = "2026-11-25-120005-00000005"
+
 
 @pytest.fixture(autouse=True)
 def _sandbox_home(monkeypatch, tmp_path):
@@ -236,7 +244,7 @@ async def _cancel_during_prepare(stop_requested_first: bool) -> str:
     """Drive the real ``_run_training`` to its ``CancelledError`` handler."""
     import entry
 
-    session_id = "s-cancelled"
+    session_id = S_CANCELLED
     training.write_status(session_id, status="TRAINING", message="in flight")
     if stop_requested_first:
         training.request_stop(session_id)
