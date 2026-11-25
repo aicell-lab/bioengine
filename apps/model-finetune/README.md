@@ -67,6 +67,28 @@ served without an app release.
 Switching `model_type` frees the previous model's VRAM and loads the new one
 (one resident at a time, per runtime).
 
+## Who can do what with a run identifier
+
+**A run identifier grants access to that run. Sharing the identifier is how you share the run, and it cannot be withdrawn.** An identifier is a timestamp plus 32 random bits, so nobody will guess one — but anyone you give it to keeps what it grants for as long as the run exists. There is no revoke, and there is no list of who holds it.
+
+What holding an identifier lets anyone do:
+
+| Call | Who | |
+|---|---|---|
+| `get_training_status(session_id)` | anyone holding the identifier | what was trained, the configuration, and how far it got |
+| `get_export_status(export_id)` | anyone holding the handle | progress of an export already started |
+| `push_export(export_id)` | anyone holding the handle | completes an export that `export_model` already authorised |
+| `infer(session_id=…)` | anyone holding the identifier | **run inference with the run's model** |
+| `compute_embedding(session_id=…)` | anyone holding the identifier | likewise |
+| `stop_training(session_id)` | the run's owner, or a workspace administrator | acts on somebody else's run |
+| `export_model(session_id=…)` | the run's owner, or a workspace administrator | hands out the weights |
+| `contribute(session_id=…)` | the run's owner, or a workspace administrator | publishes them into the shared pool |
+| `start_training(resume_session_id=…)` | the run's owner, or a workspace administrator | continues training from the checkpoint, producing a model derived from it |
+
+The line is not "touches the weights" — it is whether the call **hands out or creates** weights. Inference returns an *output* computed with the model; the caller never receives the checkpoint and no new model derives from it. Several people trying one run's model in a shared notebook is the intended flow, so inference is deliberately open to any holder of the identifier. Exporting, contributing and resuming each put the weights themselves in somebody's hands, so those require the owner.
+
+Note that `list_training_sessions()` returns **only your own runs**, which is a narrower rule than the one above on purpose: the list is a convenience and does not define who can read what. If you hold an identifier, you can read that run whether or not it appears in your list.
+
 ## Methods
 
 - **`infer(input_arrays=None, embeddings=None, model_type="vit_l_lm", min_size=None, session_id=None)`**

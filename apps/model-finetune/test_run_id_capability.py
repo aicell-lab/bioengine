@@ -1,0 +1,220 @@
+"""Which calls a run identifier alone may make, pinned so it cannot drift.
+
+A run identifier is a timestamp plus 32 random bits. It is not guessable, but it
+IS a bearer capability: anyone it has been shared with keeps whatever it grants,
+for as long as the run exists, with no way to withdraw it. So the question
+"which calls does holding an identifier let you make" has to have one written
+answer, and this file is where that answer is enforced rather than described.
+
+The line is NOT "touches the weights". It is whether the call HANDS OUT or
+CREATES weights:
+
+* **Open, gated by the run identifier alone** -- status, progress, logs,
+  `infer` and `compute_embedding`. These return OUTPUTS computed with the
+  model. The caller never receives the checkpoint and no new model derives from
+  it. A shared notebook session is built for several people to try one run's
+  model, and gating inference would break that.
+* **Owner or administrator** -- `export_model` hands out the weights,
+  `contribute` publishes them into the shared pool, resuming creates a new
+  model derived from them, and stopping acts on somebody else's run.
+
+The tests below read `entry.py` itself rather than a list maintained by hand, so
+a method added later that takes a run identifier and decides neither way fails
+`test_EVERY_run_keyed_method_is_on_exactly_one_side`. That is the point: the
+cost of this file is that a new run-keyed method forces a decision.
+"""
+
+import ast
+import pathlib
+
+import pytest
+
+ENTRY = pathlib.Path(__file__).with_name("entry.py")
+SOURCE = ENTRY.read_text()
+TREE = ast.parse(SOURCE)
+
+GATE = "require_caller_may_mutate"
+
+# The parameter names by which a call is keyed to somebody's run. `export_id` is
+# included because an export handle is minted by `export_model`, which is itself
+# owner-or-admin, so holding the handle is already a granted capability.
+RUN_KEY_PARAMS = frozenset({"session_id", "resume_session_id", "export_id"})
+
+OPEN_TO_ANY_HOLDER = frozenset(
+    {
+        "get_training_status",  # what was trained, and how far it got
+        "get_export_status",  # progress of an export already minted
+        "infer",  # an OUTPUT of the model, not the model
+        "compute_embedding",  # likewise
+        "push_export",  # completes an export minted by the gated export_model
+    }
+)
+
+OWNER_OR_ADMIN = frozenset(
+    {
+        "start_training",  # only when resume_session_id is given: derives a model
+        "stop_training",  # acts on somebody else's run
+        "export_model",  # hands out the weights
+        "contribute",  # publishes them into the shared pool
+    }
+)
+
+
+def _public_methods():
+    """Every public async method of the app class, with its params and body."""
+    out = {}
+    for node in ast.walk(TREE):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        if node.name.startswith("_"):
+            continue
+        params = {a.arg for a in node.args.args} | {a.arg for a in node.args.kwonlyargs}
+        out[node.name] = (node, params)
+    return out
+
+
+def _calls_the_gate(node) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            fn = sub.func
+            name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+            if name == GATE:
+                return True
+    return False
+
+
+METHODS = _public_methods()
+RUN_KEYED = {
+    name: (node, params)
+    for name, (node, params) in METHODS.items()
+    if params & RUN_KEY_PARAMS
+}
+
+
+def test_the_PARSE_FOUND_SOMETHING_to_begin_with():
+    """THE CONTROL FOR THE FILE.
+
+    Every assertion below is of the form "this set equals that set". A parse
+    that silently found nothing makes all of them pass against empty sets --
+    the same way a scan that never executed prints the same zero as a clean
+    one. So assert the raw counts first.
+    """
+    assert len(METHODS) > 10, f"only {len(METHODS)} public methods parsed; parse broke"
+    assert len(RUN_KEYED) >= 8, (
+        f"only {len(RUN_KEYED)} run-keyed methods found: {sorted(RUN_KEYED)}. "
+        "Either the signatures changed or RUN_KEY_PARAMS is wrong."
+    )
+    assert GATE in SOURCE, f"{GATE} is not in entry.py at all; the gate was renamed"
+
+
+def test_EVERY_run_keyed_method_is_on_exactly_one_side():
+    """The reason this file exists: no third, undecided category.
+
+    A method that takes a run identifier either is open to any holder of that
+    identifier or requires the owner. Adding one without saying which fails
+    here, which is the only moment anybody is reliably forced to decide.
+    """
+    declared = OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN
+    undeclared = set(RUN_KEYED) - declared
+    assert undeclared == set(), (
+        f"these methods take a run identifier and are on neither side: "
+        f"{sorted(undeclared)}. Decide, then add each to OPEN_TO_ANY_HOLDER or "
+        "OWNER_OR_ADMIN above."
+    )
+    assert not (OPEN_TO_ANY_HOLDER & OWNER_OR_ADMIN), "a method cannot be on both sides"
+
+
+def test_the_declared_sets_do_not_name_methods_that_no_longer_EXIST():
+    """The other direction, so a rename cannot leave a set asserting nothing."""
+    missing = (OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN) - set(METHODS)
+    assert missing == set(), (
+        f"these are declared but are not public methods of the app: {sorted(missing)}"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(OWNER_OR_ADMIN))
+def test_an_OWNER_OR_ADMIN_method_actually_carries_the_gate(name):
+    node, _params = METHODS[name]
+    assert _calls_the_gate(node), (
+        f"{name} is declared owner-or-admin but never calls {GATE}. Either the "
+        "gate was dropped or this method belongs in OPEN_TO_ANY_HOLDER."
+    )
+
+
+@pytest.mark.parametrize("name", sorted(OPEN_TO_ANY_HOLDER))
+def test_an_OPEN_method_does_NOT_carry_the_gate(name):
+    """The inverse, and the half that catches an accidental tightening.
+
+    Gating inference is a user-visible break of the shared-notebook flow, and it
+    would otherwise be an easy thing to add while fixing something else.
+    """
+    node, _params = METHODS[name]
+    assert not _calls_the_gate(node), (
+        f"{name} is open to any holder of the run identifier, but it now calls "
+        f"{GATE}. Several people are meant to be able to try one run's model."
+    )
+
+
+def test_INFERENCE_is_open_which_is_the_decision_that_was_actually_taken():
+    """Named separately because it is the part a reader will doubt.
+
+    `infer` and `compute_embedding` run the trained model. They are open anyway,
+    because what comes back is an output and not the checkpoint, and because
+    several people trying one run's model is the shared-notebook flow working as
+    intended rather than a leak.
+    """
+    assert {"infer", "compute_embedding"} <= OPEN_TO_ANY_HOLDER
+    for name in ("infer", "compute_embedding"):
+        node, _params = METHODS[name]
+        assert not _calls_the_gate(node), f"{name} must not require the owner"
+
+
+def test_the_WEIGHT_HANDING_methods_are_the_gated_ones():
+    """The complement of the above, stated as the rule rather than per method."""
+    assert {"export_model", "contribute"} <= OWNER_OR_ADMIN
+    node, _params = METHODS["start_training"]
+    assert _calls_the_gate(node), (
+        "resuming derives a new model from somebody else's checkpoint, so "
+        "start_training must gate when resume_session_id is given"
+    )
+
+
+def test_the_README_tells_a_reader_that_sharing_the_id_shares_the_run():
+    """DONE WHEN 2. The decision is only recorded if a reader can find it.
+
+    Checked as text because that is what the clause asks for -- a reader
+    learning, from the app's own documentation, that an identifier grants this
+    and cannot be taken back.
+    """
+    readme = pathlib.Path(__file__).with_name("README.md").read_text().lower()
+    for phrase, why in (
+        ("cannot be withdrawn", "that the grant is irrevocable"),
+        ("run inference", "that inference is included, not just reading"),
+    ):
+        assert phrase in readme, f"the README does not say {why} ({phrase!r})"
+
+
+def test_the_TUTORIAL_says_it_too_where_the_id_is_first_obtained():
+    """DONE WHEN 2, the other half.
+
+    The README is where somebody looks for a rule; the notebook is where
+    somebody first holds an identifier and is about to paste it to a colleague.
+    The note belongs at that moment, not only in the reference.
+    """
+    import json
+
+    nb = json.loads(
+        pathlib.Path(__file__).with_name("tutorial_model_finetune.ipynb").read_text()
+    )
+    text = "\n".join(
+        "".join(c.get("source", []))
+        for c in nb["cells"]
+        if c.get("cell_type") == "markdown"
+    ).lower()
+    assert "cannot be withdrawn" in text, (
+        "the tutorial does not tell the reader the grant is irrevocable"
+    )
+    assert "run inference with its model" in text, (
+        "the tutorial does not say inference is included, which is the part a "
+        "reader would not guess"
+    )
