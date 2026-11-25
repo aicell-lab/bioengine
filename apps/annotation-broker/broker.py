@@ -848,12 +848,14 @@ class AnnotationBroker:
         ),
         context=None,
     ) -> Dict[str, Any]:
-        """Training inputs for micro-sam fine-tuning: for the LATEST pair per
-        (user, stem) under the label, presigned image + geojson URLs. ONLY
-        stems that are members of the split are included, partitioned by its
-        train/test lists."""
+        """Training inputs for fine-tuning: for the LATEST pair per (user, stem)
+        under the label, a presigned geojson URL plus EITHER a presigned
+        ``image_url`` for a materialised image OR an ``image_source`` region
+        reference for a remote OME-Zarr one, which the trainer reads crop-wise
+        without downloading the image. ONLY stems that are members of the split
+        are included, partitioned by its train/test lists."""
         artifact_id = self._canonical_id(artifact_id)
-        self._require_role(context, artifact_id, "manager")
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         split = await self._read_split_or_raise(artifact_id, label, split_name)
         train_stems = set(split.get("train") or [])
         test_stems = set(split.get("test") or [])
@@ -886,25 +888,55 @@ class AnnotationBroker:
                     }
                 )
 
-        # model-finetune fetches each image URL whole and hands the buffer to
-        # imageio.imread, so a not-yet-materialised image has nothing that can
-        # be passed. Name the offenders here rather than minting a URL that
-        # fails downstream with an opaque unsupported-extension error.
-        # A stem whose image was deleted outright is caught by the same check:
-        # `non_local_stems` only names stems it knows, so the unknown ones are
-        # added here rather than left to KeyError at minting time.
+        # A stem with no file in the artifact used to be refused outright, because
+        # the only thing that could be handed over was a URL to fetch whole. A
+        # remote OME-Zarr stem is now served as a REGION REFERENCE instead: the
+        # trainer reads the crop's chunks from the source, so there is nothing to
+        # materialise and nothing to download whole.
+        #
+        # Still refused: a stem with no manifest entry at all (deleted outright),
+        # a non-NGFF remote source, and an NGFF source imported before the layout
+        # was recorded. `ngff_region_source` returns None for each, which is why
+        # the refusal is driven by its answer rather than by a second rule here
+        # that could disagree with it.
         manifest = await self._image_manifest(artifact_id)
         stems = [p["stem"] for p in pairs]
-        unmaterialised = sorted(
-            set(core.non_local_stems(manifest, stems))
+        region_sources = {
+            s: core.ngff_region_source(manifest.get(s))
+            for s in stems
+            if s in manifest and not core.image_entry_is_local(manifest.get(s))
+        }
+        unreadable = sorted(
+            {s for s, src in region_sources.items() if src is None}
             | {s for s in stems if s not in manifest}
         )
-        if unmaterialised:
+        if unreadable:
             raise ValueError(
-                f"Split '{split_name}' contains {len(unmaterialised)} image(s) with no "
-                f"file in the artifact: {', '.join(unmaterialised)}. Open each one in "
-                f"the annotator once to materialise it, then retry."
+                f"Split '{split_name}' contains {len(unreadable)} image(s) that can "
+                f"neither be read as a region nor fetched as a file: "
+                f"{', '.join(unreadable)}. A remote OME-Zarr image is trainable "
+                f"without materialising only if its store layout was recorded when "
+                f"it was imported, which an image imported by an older version of "
+                f"this service has not got: re-import those sources, or open each "
+                f"one in the annotator once to materialise it."
             )
+
+        # The credential is spliced in HERE, on the way out, exactly as the
+        # browser path does it in get_image_url -- and for the same reason: it
+        # is never stored in the artifact (design §12), so a reference built
+        # from the manifest alone cannot open a credentialed store. Without
+        # this the training path fails at its first chunk GET on precisely the
+        # stores the import flow went to the trouble of accepting a credential
+        # for.
+        credentials = meta.get("ngff_credentials") or {}
+        if credentials:
+            for src in region_sources.values():
+                if src is None:
+                    continue
+                root = src.get("store_root") or ""
+                src["store_root"] = core.apply_store_credential(
+                    root, credentials.get(root)
+                )
 
         sem = asyncio.Semaphore(16)
 
@@ -914,19 +946,32 @@ class AnnotationBroker:
                     artifact_id=artifact_id, file_path=file_path, stage=True
                 )
 
-        image_urls, geojson_urls = await asyncio.gather(
-            asyncio.gather(*[_mint(manifest[p["stem"]]["path"]) for p in pairs]),
-            asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs]),
+        # Only the materialised stems get a presigned image URL; a region stem has
+        # no file to mint one for. The geojson is minted for every pair either way.
+        file_pairs = [p for p in pairs if p["stem"] not in region_sources]
+        image_urls = await asyncio.gather(
+            *[_mint(manifest[p["stem"]]["path"]) for p in file_pairs]
         )
-        train_out: List[Dict[str, str]] = []
-        test_out: List[Dict[str, str]] = []
-        for p, img_url, geo_url in zip(pairs, image_urls, geojson_urls):
-            row = {
+        by_stem_url = {p["stem"]: u for p, u in zip(file_pairs, image_urls)}
+        geojson_urls = await asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs])
+
+        train_out: List[Dict[str, Any]] = []
+        test_out: List[Dict[str, Any]] = []
+        for p, geo_url in zip(pairs, geojson_urls):
+            row: Dict[str, Any] = {
                 "stem": p["stem"],
                 "user": p["user"],
-                "image_url": img_url,
                 "geojson_url": geo_url,
             }
+            src = region_sources.get(p["stem"])
+            if src is not None:
+                # The trainer branches on this mapping's shape, so the key is
+                # distinct from image_url rather than overloading it: a caller
+                # that only knows the old field fails loudly instead of trying
+                # to GET a mapping.
+                row["image_source"] = src
+            else:
+                row["image_url"] = by_stem_url[p["stem"]]
             (test_out if p["stem"] in test_stems else train_out).append(row)
         return {
             "train": train_out,
@@ -1406,6 +1451,32 @@ class AnnotationBroker:
             "content_hint": hashlib.sha256(
                 json.dumps(group["attrs"], sort_keys=True).encode("utf-8")
             ).hexdigest()[:16],
+            # The layout, for a caller that reads pixels itself.
+            #
+            # All four are already computed above, so returning them costs no extra
+            # request: ``dataset_paths`` and ``axes`` come from the one
+            # ``parse_ngff_multiscales`` call, ``axis_roles`` from the
+            # ``ngff_axis_roles`` call that ``dims`` needed, and ``level0_shape`` is
+            # the level-0 array metadata already parsed for the dtype and codec
+            # checks.
+            #
+            # WHY EXPOSE THEM. Slicing a crop out of a remote store needs the level-0
+            # dataset path and which axis is x and which is y. Without these a caller
+            # has to parse ``multiscales`` for itself, and this parsing is already
+            # duplicated once — ``parse_ngff_multiscales`` and ``ngff_axis_roles``
+            # both say they mirror ``ngffLayout.ts``. A third copy is how the three
+            # drift, and the one that drifts is the one nobody renders with, so it
+            # drifts silently. Returning the interpretation keeps one of them
+            # authoritative.
+            #
+            # This is metadata, not pixels. The no-pixel rule this app keeps (see
+            # ``materialise_image``: "The broker never touches a pixel, which is what
+            # keeps a 200 MB read off the worker") is about reads of image data; it is
+            # not weakened by handing back a path and two axis indices.
+            "dataset_paths": list(parsed["dataset_paths"]),
+            "axes": list(parsed["axes"]),
+            "axis_roles": dict(roles),
+            "level0_shape": [int(n) for n in full["shape"]],
         }
 
     @bioengine.method(context=True)
@@ -1544,6 +1615,12 @@ class AnnotationBroker:
             levels=probe["levels"],
             content_hint=probe["content_hint"],
             region=region,
+            layout={
+                "dataset_paths": probe["dataset_paths"],
+                "axis_roles": probe["axis_roles"],
+                "level0_shape": probe["level0_shape"],
+                "axes": probe["axes"],
+            },
         )
 
         async with self._image_manifest_lock(artifact_id):

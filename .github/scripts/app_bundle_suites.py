@@ -43,7 +43,7 @@ class Refusal(Exception):
     """A condition this gate must never resolve as pass."""
 
 
-def load_registry(root: str) -> tuple[dict[str, int], dict[str, str]]:
+def load_registry(root: str) -> tuple[dict[str, int], dict[str, str], dict[str, int]]:
     path = os.path.join(root, REGISTRY)
     try:
         with open(path) as fh:
@@ -51,8 +51,11 @@ def load_registry(root: str) -> tuple[dict[str, int], dict[str, str]]:
     except (OSError, json.JSONDecodeError) as e:
         raise Refusal(f"cannot read {REGISTRY}: {e}")
     run, skip = data.get("run", {}), data.get("skip", {})
+    ceilings = data.get("max_skipped", {})
     if not isinstance(run, dict) or not isinstance(skip, dict):
         raise Refusal(f"{REGISTRY} must hold two objects, 'run' and 'skip'")
+    if not isinstance(ceilings, dict):
+        raise Refusal(f"{REGISTRY}: 'max_skipped' must be an object")
     for app, floor in run.items():
         if not isinstance(floor, int) or floor < 1:
             raise Refusal(
@@ -61,7 +64,17 @@ def load_registry(root: str) -> tuple[dict[str, int], dict[str, str]]:
     for app, reason in skip.items():
         if not isinstance(reason, str) or not reason.strip():
             raise Refusal(f"{REGISTRY}: skip['{app}'] must say WHY CI cannot run it")
-    return run, skip
+    for app, ceiling in ceilings.items():
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+            raise Refusal(
+                f"{REGISTRY}: max_skipped['{app}'] must be >= 0, got {ceiling!r}"
+            )
+        if app not in run:
+            raise Refusal(
+                f"{REGISTRY}: max_skipped['{app}'] has no matching 'run' entry, so "
+                f"no report is read for it and the ceiling would never be checked"
+            )
+    return run, skip, ceilings
 
 
 def discover(root: str) -> set[str]:
@@ -80,7 +93,7 @@ def discover(root: str) -> set[str]:
 
 
 def reconcile(root: str) -> list[str]:
-    run, skip = load_registry(root)
+    run, skip, _ = load_registry(root)
     declared, found = set(run) | set(skip), discover(root)
 
     both = sorted(set(run) & set(skip))
@@ -118,7 +131,7 @@ def reconcile(root: str) -> list[str]:
 
 
 def assert_ran(root: str, reports_dir: str) -> None:
-    run, _ = load_registry(root)
+    run, _, ceilings = load_registry(root)
     reports = sorted(glob.glob(os.path.join(reports_dir, "junit-app-*.xml")))
     if len(reports) != len(run):
         raise Refusal(
@@ -153,6 +166,25 @@ def assert_ran(root: str, reports_dir: str) -> None:
             bad.append(f"{app}: {ran} test(s) ran, below the floor of {run[app]}")
         if failed:
             bad.append(f"{app}: {failed} test(s) failed or errored")
+        # A FLOOR ON `ran` CANNOT SEE A FILE THAT STOPS EXECUTING, which is the
+        # whole reason for a ceiling on skips. Floors sit well under the
+        # measured count so ordinary test additions do not trip them, and a
+        # module-level importorskip on a dependency the image no longer ships
+        # takes a whole file out while leaving `ran` comfortably above the
+        # floor. pytest reports such a collapse as ONE skipped entry however
+        # many cases the file held, so the drop in `ran` is smaller than the
+        # number of cases lost and can be smaller than any floor worth setting.
+        # A declared allowance makes a rise in skips something that has to be
+        # acknowledged in the registry rather than spotted in a log.
+        ceiling = ceilings.get(app)
+        if ceiling is not None and skipped > ceiling:
+            bad.append(
+                f"{app}: {skipped} test(s) skipped, above the declared "
+                f"allowance of {ceiling}. Either a dependency this suite needs "
+                f"is no longer installed (fix the install step), or the "
+                f"allowance in {REGISTRY} is out of date (raise it, and say in "
+                f"the commit which cases now skip and why)."
+            )
     if bad:
         raise Refusal("\n".join(bad))
     print(f"OK: {len(reports)} app suite(s) ran at or above their floors")
