@@ -108,7 +108,12 @@ def test_the_scratch_file_is_not_named_after_the_target(run_dir):
     test happens to get lucky on a given machine."""
     import inspect
 
-    src = inspect.getsource(training.write_status)
+    # BOTH functions: the merge moved into _write_status_locked when the lock
+    # was added, so inspecting write_status alone would look in the wrong place
+    # and pass for the wrong reason.
+    src = inspect.getsource(training.write_status) + inspect.getsource(
+        training._write_status_locked
+    )
     assert 'with_suffix(".json.tmp")' not in src, (
         "the scratch file must not be derived from the target: every concurrent "
         "writer would share it"
@@ -118,7 +123,11 @@ def test_the_scratch_file_is_not_named_after_the_target(run_dir):
 
 def test_no_scratch_file_is_left_behind(run_dir):
     training.write_status(SID, status="PREPARING")
-    leftovers = [p.name for p in run_dir.iterdir() if p.name != "status.json"]
+    leftovers = [
+        p.name
+        for p in run_dir.iterdir()
+        if p.name not in ("status.json", training.RECORD_LOCK_NAME)
+    ]
     assert leftovers == [], f"scratch files left in the run directory: {leftovers}"
 
 
@@ -132,7 +141,9 @@ def test_a_failed_write_leaves_no_scratch_file(run_dir, monkeypatch):
     monkeypatch.setattr(training.os, "replace", boom)
     with pytest.raises(OSError):
         training.write_status(SID, status="PREPARING")
-    leftovers = [p.name for p in run_dir.iterdir()]
+    leftovers = [
+        p.name for p in run_dir.iterdir() if p.name != training.RECORD_LOCK_NAME
+    ]
     assert leftovers == [], f"scratch files left after a failed write: {leftovers}"
 
 
@@ -188,11 +199,121 @@ def test_CONCURRENT_PROCESSES_do_not_lose_the_record(run_dir):
         "the status that existed before any of these writers is GONE -- a "
         f"concurrent write destroyed the record. Final keys: {sorted(rec)}"
     )
-    # Every writer must have landed at least once. Individual values may be
-    # stale -- last-writer-wins on a shared field is expected and is a different
-    # question from the record being destroyed.
-    missing = [i for i in range(writers) if f"writer_{i}" not in rec]
-    assert missing == [], f"writers that lost every write: {missing}"
+    # EVERY writer's LAST write must survive. The previous version of this test
+    # asserted only that each writer appeared at all, under a comment calling
+    # the rest "last-writer-wins on a shared field is expected". Each writer_i
+    # is a DISTINCT field, so a stale value is not last-writer-wins -- it is one
+    # writer erasing another's data, which is the defect this file is named for.
+    # That comment excused the exact failure the test existed to catch.
+    stale = {
+        f"writer_{i}": rec.get(f"writer_{i}")
+        for i in range(writers)
+        if rec.get(f"writer_{i}") != per_writer - 1
+    }
+    assert stale == {}, (
+        f"writers whose last write was lost: {stale} (each should be "
+        f"{per_writer - 1}). A distinct field per writer means this is data "
+        f"loss, not last-writer-wins."
+    )
 
-    leftovers = [p.name for p in run_dir.iterdir() if p.name != "status.json"]
+    leftovers = [
+        p.name
+        for p in run_dir.iterdir()
+        if p.name not in ("status.json", training.RECORD_LOCK_NAME)
+    ]
     assert leftovers == [], f"scratch files left behind: {leftovers}"
+
+
+def _stopper(root_str, errors):
+    """The user-stop path: one write of a terminal status, mid-run."""
+    import time as _t
+
+    import training as t
+
+    root = Path(root_str)
+    t.sessions_root = lambda: root
+    t.session_dir = lambda sid: root / sid
+    # Early, and the writers below are given enough iterations to still be
+    # running when this lands. A stop that arrives after every writer has
+    # finished cannot be erased by one, so a late stopper makes this test pass
+    # on broken code -- measured: at 0.25s with 40 iterations per writer the
+    # writers were already done and 10 trials all passed on the unlocked code.
+    _t.sleep(0.05)
+    try:
+        t.write_status(SID, status="STOPPED", terminated_by="user_stop")
+    except Exception as exc:
+        errors.append(f"stopper: {type(exc).__name__}: {exc}")
+
+
+@pytest.mark.slow
+def test_a_USER_STOP_survives_concurrent_progress_writes(run_dir):
+    """The outcome this row is named for, in its real shape.
+
+    A user clicks stop while the training child is writing progress. The stop is
+    one write; the child's are many. If the merge is an unlocked
+    read-modify-write, a child write that read before the stop landed puts the
+    record back to TRAINING -- and the terminal-status precedence logic cannot
+    refuse an incumbent it could not see.
+
+    Measured by the reviewer on the scratch-file-only fix: the stop was erased
+    in 9 of 20 trials.
+    """
+    # REPEATED, because one trial is not a discriminator. The reviewer measured
+    # the erasure in 9 of 20 trials on the scratch-file-only fix, so a single
+    # run passes on broken code better than half the time -- and a guard that
+    # misses the defect half the time is not a guard. Ten trials puts that
+    # miss probability around one in a thousand. With the lock in place every
+    # trial must pass, so this is not flaky in the other direction.
+    TRIALS = 10
+    for trial in range(TRIALS):
+        (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+        mgr = mp.Manager()
+        errors = mgr.list()
+        procs = [
+            mp.Process(target=_writer, args=(i, str(run_dir.parent), 300, errors))
+            for i in range(5)
+        ]
+        procs.append(mp.Process(target=_stopper, args=(str(run_dir.parent), errors)))
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=120)
+
+        assert list(errors) == [], f"trial {trial}: writes raised: {list(errors)[:3]}"
+        rec = json.loads((run_dir / "status.json").read_text())
+        assert rec.get("status") == "STOPPED", (
+            f"trial {trial} of {TRIALS}: the user's STOPPED was erased by a "
+            f"concurrent progress write; the record now says "
+            f"{rec.get('status')!r}, terminated_by={rec.get('terminated_by')!r}"
+        )
+        assert (
+            rec.get("terminated_by") == "user_stop"
+        ), f"trial {trial}: terminated_by={rec.get('terminated_by')!r}"
+
+
+def test_the_mutex_is_RELEASED_and_leaves_no_residue(run_dir):
+    """A link-based mutex is unlinked on release, unlike an flock sidecar which
+    persists. So after a normal write the run directory holds the record and
+    nothing else.
+
+    This assertion was originally written the other way round -- expecting a
+    persistent sidecar -- because the first implementation used flock. flock
+    turned out to raise ENOLCK on the share these replicas use, so the design
+    changed and this expectation was simply stale. Recorded because "the test
+    says the file should be there" is a bad reason to put a file back.
+    """
+    training.write_status(SID, status="TRAINING", owner="gh|1")
+    residue = [f.name for f in run_dir.iterdir() if f.name != "status.json"]
+    assert residue == [], f"the mutex or its unique file was left behind: {residue}"
+
+
+def test_the_mutex_does_not_disturb_the_listing(run_dir):
+    """The mutex lives INSIDE a run directory while held, and the listing keys
+    on directories containing status.json, so it cannot be mistaken for a run.
+    Asserted rather than reasoned about."""
+    training.write_status(SID, status="TRAINING", owner="gh|1")
+    (run_dir / training.RECORD_LOCK_NAME).write_text("held")  # simulate one held
+    # NOTE: on this branch `list_sessions` takes no context -- the per-caller
+    # signature lands with the listing row, not here.
+    seen = training.list_sessions()
+    assert sorted(seen) == [SID], f"the listing returned {sorted(seen)}"

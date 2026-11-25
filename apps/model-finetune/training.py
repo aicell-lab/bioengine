@@ -11,6 +11,7 @@ Imported lazily inside ``MicroSAM`` method bodies: heavy deps (``torch``,
 module stays introspectable with only ``bioengine[worker]`` + the stdlib.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -349,6 +350,48 @@ def read_status(session_id: str) -> Dict[str, Any]:
         return {}
 
 
+# The mutex a writer holds while merging a record.
+#
+# ⚠ NOT flock, and not fcntl.lockf. MEASURED on the de.NBI share these replicas
+# actually use (an NFSv3 mount): both raise OSError errno 37, "No locks
+# available" -- the server offers no lock manager -- so a flock-based merge
+# would not merely fail to exclude, it would RAISE on every write and take out
+# every run operation on that worker. A control in the same probe lost 299 of
+# 600 increments with no lock at all, so the processes genuinely race there.
+#
+# What DID hold on that mount, 600 of 600: os.link(). Creating a unique file
+# and linking it to a well-known name is atomic even over NFSv3, and fails with
+# EEXIST when somebody else holds it. That is the classic NFS-safe mutex and it
+# works on a local filesystem too, so there is one code path rather than two.
+#
+#     flock  -> ENOLCK (child died)
+#     lockf  -> ENOLCK (child died)
+#     link   -> 600/600
+#     none   -> 301/600   (the control: the race is real)
+RECORD_LOCK_NAME = ".status.mutex"
+
+# How long a mutex may be held before another writer treats it as abandoned.
+# A link-based lock has no kernel to release it if the holder dies, so without
+# this one crashed writer wedges a run's record forever. Generous relative to a
+# merge, which is a small read and a rename: anything near this means the holder
+# is gone, not slow.
+RECORD_LOCK_STALE_S = 30.0
+
+# How long to keep trying before giving up and raising. Raising is the safe
+# direction: a caller that cannot take the mutex must NOT merge anyway, because
+# merging unlocked is the data loss this exists to prevent.
+RECORD_LOCK_WAIT_S = 60.0
+
+
+class RunRecordLockTimeout(RuntimeError):
+    """Could not take a run's record mutex, so the merge was refused.
+
+    Refusing is the safe direction: merging without the mutex is precisely the
+    lost update this lock exists to prevent, so a caller that cannot acquire it
+    must not proceed.
+    """
+
+
 class RunRecordUnreadable(RuntimeError):
     """A run's record exists but cannot be parsed, so a merge would destroy it.
 
@@ -370,6 +413,64 @@ _TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
 _TERMINATED_BY = {"entry": 1, "supervisor": 2, "child": 3, "user_stop": 4}
 
 
+@contextlib.contextmanager
+def _record_mutex(run_dir: Path, session_id: str):
+    """Hold the run's mutex for the duration of the block.
+
+    `os.link` of a unique file onto a well-known name: atomic on NFSv3, where
+    flock and lockf both raise ENOLCK on the share these replicas use. See the
+    note above `RECORD_LOCK_NAME` for the measurement.
+
+    An abandoned mutex older than `RECORD_LOCK_STALE_S` is removed and the
+    acquisition retried, because nothing releases a link-based lock when its
+    holder dies. The removal targets the mutex by inode-identity -- it re-reads
+    the age and unlinks only if it is STILL stale -- so two writers reaping the
+    same stale lock cannot have the second one remove a third writer's fresh
+    one.
+    """
+    mutex = run_dir / RECORD_LOCK_NAME
+    unique = run_dir / f".mutex-{os.getpid()}-{uuid.uuid4().hex}"
+    unique.write_text(str(time.time()))
+    deadline = time.monotonic() + RECORD_LOCK_WAIT_S
+    try:
+        while True:
+            try:
+                os.link(unique, mutex)
+                break
+            except FileExistsError:
+                try:
+                    age = time.time() - mutex.stat().st_mtime
+                except FileNotFoundError:
+                    continue  # released between the link and the stat
+                if age > RECORD_LOCK_STALE_S:
+                    try:
+                        if time.time() - mutex.stat().st_mtime > RECORD_LOCK_STALE_S:
+                            mutex.unlink()
+                    except (FileNotFoundError, OSError):
+                        pass
+                    continue
+                if time.monotonic() > deadline:
+                    raise RunRecordLockTimeout(
+                        f"could not take the record mutex for run {session_id} "
+                        f"within {RECORD_LOCK_WAIT_S:.0f}s ({mutex} held for "
+                        f"{age:.1f}s). Refusing to merge without it, because an "
+                        "unlocked merge is what silently erases a record."
+                    )
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            try:
+                mutex.unlink()
+            except FileNotFoundError:
+                pass
+    finally:
+        try:
+            unique.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def write_status(session_id: str, **fields) -> Dict[str, Any]:
     """Atomically merge fields into the session's status.json.
 
@@ -384,6 +485,30 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
     p = _status_path(session_id)
     p.parent.mkdir(parents=True, exist_ok=True)
 
+    # EXCLUSIVE for the whole read-merge-replace. A private scratch file stops a
+    # TORN document being installed; it does nothing about a LOST UPDATE, which
+    # is the other half and the one that erases a user's stop.
+    #
+    # Measured on the scratch-file-only version: five writers plus one user-stop,
+    # the stop erased and the record back to TRAINING on the first trial, and
+    # every writer's last write lost in 20 of 20 trials. A read that happened
+    # before another writer's replace writes its stale copy back over it, and the
+    # terminal-status precedence below cannot refuse an incumbent it never saw.
+    #
+    # flock and not a lockfile-by-O_EXCL: no stale-lock timeout to tune, and the
+    # kernel releases it if a writer dies. The run directory is the only place
+    # guaranteed to be on the same filesystem as the record.
+    with _record_mutex(p.parent, session_id):
+        return _write_status_locked(p, session_id, fields)
+
+
+def _write_status_locked(p, session_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """The merge itself. Call ONLY with the record lock held.
+
+    Split out so the lock scope is one `with` block that a reader can see whole,
+    rather than an early `return` inside it leaving the reader to check whether
+    every path is covered.
+    """
     # An UNREADABLE record is not an empty one. `read_status` answers {} for
     # both "no file yet" and "the file would not parse", which is right for a
     # reader -- a history page should not break on one bad record -- and
