@@ -297,6 +297,103 @@ def test_level0_is_taken_from_the_probe_not_guessed():
     hardcoding '0' would fail on them."""
     assert nr.level0_path(["s0", "s1", "s2"]) == "s0"
     assert nr.level0_path(["/0/", "1"]) == "0"
+
+
+# ── the opened array must be the one the index was computed for ──────────────
+
+
+def _probe_2d(shape, paths=("0", "1")):
+    return {
+        "dataset_paths": list(paths),
+        "axis_roles": ROLES_2D,
+        "level0_shape": list(shape),
+        "axes": ["y", "x"],
+    }
+
+
+def test_an_array_that_is_not_the_recorded_LEVEL_0_is_REFUSED():
+    """THE case for a store whose dataset order is not finest-first.
+
+    Position 0 is read as level 0 because OME-NGFF requires that order, but the
+    frontend's pyramid code sorts levels by size and says the declared order is
+    only a convention. On a store that violates the spec the two consumers pick
+    different arrays, and a region in level-0 coordinates then crops somewhere
+    else. Numpy will not object: an over-long slice is clamped, so the result is
+    a smaller image than its labels rather than an error.
+    """
+    coarse = np.zeros((250, 500), dtype=np.uint8)  # a 4x downsample, opened by mistake
+    with pytest.raises(nr.RegionSourceError) as err:
+        nr.read_region(
+            {
+                "kind": "ngff",
+                "store_root": "https://x/y/",
+                "region": {"x": 0, "y": 0, "width": 64, "height": 64},
+            },
+            _probe_2d([1000, 2000]),
+            opener=lambda _r, _p: coarse,
+        )
+    msg = str(err.value)
+    assert "[250, 500]" in msg, f"the array's real shape is not given: {msg}"
+    assert "[1000, 2000]" in msg, f"the recorded shape is not given: {msg}"
+    assert "re-import" in msg, f"the repair is not stated: {msg}"
+
+
+def test_the_matching_array_is_read_normally():
+    """The control. A check that refused every array would pass the test above
+    while making every store unreadable."""
+    full = np.arange(1000 * 2000, dtype=np.uint32).reshape(1000, 2000)
+    out = nr.read_region(
+        {
+            "kind": "ngff",
+            "store_root": "https://x/y/",
+            "region": {"x": 10, "y": 20, "width": 64, "height": 48},
+        },
+        _probe_2d([1000, 2000]),
+        opener=lambda _r, _p: full,
+    )
+    assert out.shape == (48, 64)
+    assert np.array_equal(out, full[20:68, 10:74])
+
+
+def test_a_clamped_crop_would_otherwise_be_SMALLER_THAN_ITS_LABELS():
+    """Why the refusal is the right answer rather than a nicety.
+
+    This asserts the numpy behaviour the guard exists to prevent, so the reason
+    is pinned rather than described: slicing past the end of an array yields a
+    SHORTER result silently. The label mask is rasterised to the region's
+    declared width and height, so that crop and its labels no longer describe
+    the same pixels, and training pairs them anyway.
+    """
+    coarse = np.zeros((250, 500), dtype=np.uint8)
+    idx = nr.region_index(
+        ROLES_2D, 2, [1000, 2000], {"x": 400, "y": 200, "width": 64, "height": 64}
+    )
+    assert coarse[idx].shape == (50, 64), (
+        "numpy stopped clamping an over-long slice; if it now raises, this "
+        "guard could be relaxed"
+    )
+
+
+def test_an_opener_returning_something_without_a_shape_still_works():
+    """The check reads ``.shape`` defensively. An opener handing back an object
+    that has none must not become an AttributeError in the middle of a read --
+    the tests above pass numpy arrays, but the parameter is documented as
+    anything numpy-sliceable."""
+
+    class _NoShape:
+        def __getitem__(self, _idx):
+            return np.zeros((48, 64), dtype=np.uint8)
+
+    out = nr.read_region(
+        {
+            "kind": "ngff",
+            "store_root": "https://x/y/",
+            "region": {"x": 10, "y": 20, "width": 64, "height": 48},
+        },
+        _probe_2d([1000, 2000]),
+        opener=lambda _r, _p: _NoShape(),
+    )
+    assert out.shape == (48, 64)
     with pytest.raises(nr.RegionSourceError, match="no dataset paths"):
         nr.level0_path([])
 

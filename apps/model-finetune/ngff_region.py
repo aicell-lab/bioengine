@@ -327,6 +327,41 @@ def read_region(
     if opener is None:
         opener = _zarr_opener
     array = opener(ref["store_root"], level0_path(probe["dataset_paths"]))
+
+    # THE OPENED ARRAY MUST BE THE ONE THE INDEX WAS COMPUTED FOR.
+    #
+    # Every number above comes from the layout recorded at import; the array
+    # comes from the store now. Two ways they diverge, and both end in wrong
+    # pixels rather than an error:
+    #
+    #   The level is wrong. ``level0_path`` takes the first dataset path, which
+    #   OME-NGFF requires to be the finest level -- but the frontend's pyramid
+    #   code orders levels by size and states that the order is only a
+    #   convention, so a non-conforming store has two consumers disagreeing
+    #   about which array is level 0. Read at a downsampled level, a region in
+    #   level-0 coordinates is a crop of somewhere else entirely.
+    #
+    #   The store changed since import. A re-exported pyramid keeps its paths.
+    #
+    # Either way a numpy slice does NOT complain: an out-of-range slice is
+    # silently CLAMPED, so the crop comes back smaller than its rasterised
+    # labels -- the exact outcome region_index refuses to produce by clamping.
+    # ``.shape`` is metadata, so this costs no chunk fetches.
+    actual = getattr(array, "shape", None)
+    if actual is not None and tuple(int(n) for n in actual) != tuple(
+        int(n) for n in shape
+    ):
+        raise RegionSourceError(
+            f"the array at {level0_path(probe['dataset_paths'])!r} has shape "
+            f"{list(int(n) for n in actual)!r}, but the layout recorded at "
+            f"import says level 0 is {list(int(n) for n in shape)!r}. The region "
+            f"was computed against the recorded shape, so reading this array "
+            f"would crop somewhere other than where the annotation was drawn. "
+            f"Either the store's first dataset is not its finest level (the "
+            f"OME-NGFF order is finest-first, and a store that violates it "
+            f"cannot be read by position), or the store changed since it was "
+            f"imported: re-import the source."
+        )
     return to_hw_or_hwc(array[index], probe["axis_roles"], len(shape))
 
 
