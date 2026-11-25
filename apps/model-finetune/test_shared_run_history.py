@@ -176,6 +176,78 @@ def test_the_LOCAL_status_wins_over_a_stale_record(local):
     assert out["mine"]["status"] == "TRAINING", out["mine"]
 
 
+# ── a shared run is reported exactly as a local one ─────────────────────────
+#
+# THE RED-MAKER the first review round named, and it was right. The first
+# version returned the stored document raw while the local path went through
+# `get_status`, so the same run read both ways came back:
+#
+#   LOCAL  STOPPED  [checkpoint_available, config, elapsed_s, message,
+#                    session_id, start_time, status, updated_at]
+#   REMOTE TRAINING [start_time, status, updated_at]
+#
+# A run whose instance had died reported TRAINING forever on every other
+# instance, because the stale sweep lives in the shaping and the shared path
+# skipped it; and four fields the page reads were simply absent.
+
+
+def _record_from_local(sid):
+    """The record this run would be shared as, built the way the app builds
+    it -- from the run's own files, not hand-written."""
+    return training.run_record(sid)
+
+
+def test_a_run_LISTED_BOTH_WAYS_comes_back_IDENTICAL(local):
+    local("mine", ME, status="COMPLETED", updated_at=time.time(), start_time=1.0)
+    rec = _record_from_local("mine")
+
+    from_local = training.list_sessions(MINE)["mine"]
+    # Same run, now reachable only through the shared copy.
+    (training.sessions_root() / "mine" / "status.json").unlink()
+    from_shared = training.list_sessions(MINE, records={"mine": rec})["mine"]
+
+    assert from_shared == from_local, (
+        "a shared run is reported differently from the same run read locally; "
+        f"local-only keys {sorted(set(from_local) - set(from_shared))}, "
+        f"shared-only keys {sorted(set(from_shared) - set(from_local))}"
+    )
+
+
+def test_a_STALE_shared_run_is_SWEPT_like_a_local_one(local):
+    """The sharper half: the sweep is what stops a dead instance's run from
+    reporting TRAINING forever everywhere else."""
+    local("mine", ME, status="TRAINING", updated_at=time.time() - 86400, start_time=1.0)
+    rec = _record_from_local("mine")
+    assert rec["status"]["status"] == "TRAINING", "the stored document is unswept"
+
+    (training.sessions_root() / "mine" / "status.json").unlink()
+    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    assert out["status"] == "STOPPED", out
+    assert "stale window" in out.get("message", ""), out
+
+
+def test_a_shared_run_carries_the_FIELDS_THE_PAGE_READS(local):
+    local("mine", ME, status="COMPLETED", updated_at=time.time(), start_time=1.0)
+    rec = _record_from_local("mine")
+    (training.sessions_root() / "mine" / "status.json").unlink()
+    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    for field in ("session_id", "config", "elapsed_s", "checkpoint_available"):
+        assert field in out, f"{field} is missing from a shared run"
+    assert out["session_id"] == "mine"
+
+
+def test_a_shared_run_is_NOT_claimed_to_be_SERVABLE_here(local):
+    """`checkpoint_available` is a fact about a PLACE. The weights are on the
+    instance that trained the run, so claiming the record's value would have
+    the page offer a model no replica here holds."""
+    local("mine", ME, status="COMPLETED", updated_at=time.time())
+    rec = _record_from_local("mine")
+    rec["status"]["checkpoint_available"] = True
+    (training.sessions_root() / "mine" / "status.json").unlink()
+    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    assert out["checkpoint_available"] is False, out
+
+
 # ── a record that says nothing fails CLOSED ─────────────────────────────────
 
 

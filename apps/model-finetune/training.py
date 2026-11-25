@@ -856,8 +856,61 @@ OWNERLESS_GRANTS = frozenset({"rw", "a"})
 # not have to infer which applies.
 RUNS_ARTIFACT_ID = "bioimage-io/model-finetune-runs"
 
-# One run's entry in that artifact.
-RUN_RECORD_PATH_TEMPLATE = "runs/{session_id}.json"
+# One run's entry in that artifact, under the DEPLOYMENT it belongs to.
+#
+# The application id in that path is load-bearing and was missing from the
+# first version of this, which a review caught before it could do any damage.
+# One artifact is shared by every deployment of this app, and a worker runs
+# several at once: measured on one worker on 2026-11-25, `model-finetune`
+# (production) held 261 runs, `model-finetune-soup` 37, and the throwaways
+# `model-finetune-dev`, `model-finetune-dev-metrics`,
+# `model-finetune-dev0181` and `mf-verify` held 19, 6, 2 and 1. Sharing one
+# flat `runs/` would have merged every throwaway's test runs into the
+# production history, and the issue's own "the count before equals the count
+# after" check could then only pass by being counted on the wrong surface.
+#
+# The sharing unit is therefore the application id: replicas of ONE deployment
+# share a history, which is exactly the split that was reported, and two
+# deployments never see each other's.
+RUN_RECORD_PATH_TEMPLATE = "runs/{application_id}/{session_id}.json"
+
+#: The environment variable BioEngine sets on every app replica
+#: (`bioengine/apps/builder.py` sets it unconditionally at deploy time).
+APPLICATION_ID_ENV = "BIOENGINE_APPLICATION_ID"
+
+_APPLICATION_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def record_store_id() -> Optional[str]:
+    """Which deployment's run history this replica belongs to, or None.
+
+    None means sharing is OFF for this process, and that is deliberate rather
+    than a degraded guess: a replica that cannot tell which deployment it is
+    must not write into another deployment's history, and a fallback bucket
+    shared by every such replica is precisely that. The local listing still
+    works; the shared half is simply absent and says so.
+
+    The value is validated even though it comes from the environment and not
+    from a caller. It becomes a path component inside the artifact, and
+    "it cannot be hostile" is an argument about today's deployment path, not
+    about the next one.
+    """
+    raw = os.environ.get(APPLICATION_ID_ENV)
+    if not isinstance(raw, str) or not _APPLICATION_ID_PATTERN.match(raw):
+        return None
+    return raw
+
+
+def run_record_dir(application_id: str) -> str:
+    """The directory holding one deployment's records."""
+    if not _APPLICATION_ID_PATTERN.match(application_id or ""):
+        raise InvalidSessionId(
+            f"not a usable application id (length {len(application_id or '')})"
+        )
+    return RUN_RECORD_PATH_TEMPLATE.format(
+        application_id=application_id, session_id="x"
+    ).rsplit("/", 1)[0]
+
 
 RUN_RECORD_VERSION = 1
 
@@ -948,16 +1001,19 @@ def run_record(
     }
 
 
-def run_record_path(session_id: str) -> str:
+def run_record_path(session_id: str, application_id: str) -> str:
     """Where one run's record lives inside the runs artifact.
 
-    Validated, not formatted blindly: the session id becomes a path component,
-    so a value that is not a session id must be impossible rather than
-    unlikely. `validate_session_id` already refuses traversal and separators,
-    and is the same check every on-disk path goes through -- reused rather
-    than restated, because a second copy of the rule is how the two drift.
+    Validated, not formatted blindly: both parts become path components, so a
+    value that is not a session id must be impossible rather than unlikely.
+    `validate_session_id` already refuses traversal and separators, and is the
+    same check every on-disk path goes through -- reused rather than restated,
+    because a second copy of the rule is how the two drift.
     """
-    return RUN_RECORD_PATH_TEMPLATE.format(session_id=validate_session_id(session_id))
+    return RUN_RECORD_PATH_TEMPLATE.format(
+        application_id=run_record_dir(application_id).rsplit("/", 1)[-1],
+        session_id=validate_session_id(session_id),
+    )
 
 
 def caller_is_workspace_admin(
@@ -1070,20 +1126,41 @@ def redact_private(status: Dict[str, Any]) -> Dict[str, Any]:
     return status
 
 
-def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, Any]:
-    st = read_status(session_id)
-    if not st:
-        return {
-            "session_id": session_id,
-            "status": "UNKNOWN",
-            "message": "no such session",
-        }
+def shape_status(
+    st: Dict[str, Any],
+    session_id: str,
+    *,
+    config: Dict[str, Any],
+    checkpoint_available: bool,
+) -> Dict[str, Any]:
+    """The reported shape of one run, from its stored document.
+
+    ONE definition, because there are now two sources: this worker's own disk
+    and a record shared by another instance of the app. The first version of
+    the shared listing returned the stored document raw, and a review measured
+    what that cost -- the same run read locally and through a record came back:
+
+        LOCAL  STOPPED  [checkpoint_available, config, elapsed_s, message,
+                         session_id, start_time, status, updated_at]
+        REMOTE TRAINING [start_time, status, updated_at]
+
+    So a run whose instance died reported TRAINING forever everywhere else,
+    because the stale sweep lives here and the shared path skipped it, and the
+    page's other four fields were simply missing. Both sources go through this
+    function now, and a test lists one run both ways and requires the dicts to
+    be EQUAL.
+
+    *config* and *checkpoint_available* are arguments rather than reads because
+    they are facts about a PLACE: the params file and the checkpoint are on the
+    worker that ran the training. For a record from elsewhere the config travels
+    with it and the checkpoint is not here.
+    """
     st["session_id"] = session_id
-    st["checkpoint_available"] = checkpoint_path(session_id).exists()
+    st["checkpoint_available"] = checkpoint_available
     # The config a run used, so a history listing can say WHAT was trained and not
     # merely that something was. It was already persisted per run and reachable only
     # from inside this app; `{}` for a run that died before the file was written.
-    st["config"] = run_config(session_id)
+    st["config"] = config
     if st.get("start_time"):
         end = st.get("end_time") or time.time()
         st["elapsed_s"] = round(end - st["start_time"], 1)
@@ -1094,10 +1171,50 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
     ):
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
+    return st
+
+
+def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, Any]:
+    st = read_status(session_id)
+    if not st:
+        return {
+            "session_id": session_id,
+            "status": "UNKNOWN",
+            "message": "no such session",
+        }
+    shape_status(
+        st,
+        session_id,
+        config=run_config(session_id),
+        checkpoint_available=checkpoint_path(session_id).exists(),
+    )
     if not include_private:
         redact_private(st)
 
     return st
+
+
+def status_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One shared record as this instance reports it, or None if unusable.
+
+    `checkpoint_available` is False by construction: the weights are on the
+    instance that trained the run, and this one cannot serve them. Saying False
+    is the honest answer to "can this be served from here", and claiming the
+    record's value would make the page offer a model no replica here holds.
+    """
+    if not isinstance(record, dict):
+        return None
+    st = record.get("status")
+    session_id = record.get("session_id")
+    if not isinstance(st, dict) or not isinstance(session_id, str) or not session_id:
+        return None
+    config = record.get("config")
+    return shape_status(
+        dict(st),
+        session_id,
+        config=config if isinstance(config, dict) else {},
+        checkpoint_available=False,
+    )
 
 
 def list_sessions(
@@ -1195,21 +1312,29 @@ def list_sessions(
         if not isinstance(session_id, str) or not SESSION_ID_PATTERN.match(session_id):
             unusable += 1
             continue
-        status = (record or {}).get("status") if isinstance(record, dict) else None
-        if not isinstance(status, dict):
+        # Shaped by the SAME function the local read goes through, so a shared
+        # run is swept for staleness and carries the same fields -- see
+        # `shape_status`, and the test that lists one run both ways and
+        # requires equal dicts.
+        shaped = status_from_record(record)
+        if shaped is None:
             # A record whose status is missing or not a mapping says nothing
             # about who may see it, and the visibility rule below would read a
             # missing owner as "ownerless" and show it to an admin. Counted and
             # dropped instead: fail closed, and say how many.
             unusable += 1
             continue
-        owner = status.get("owner")
+        # The OWNER is read from the stored document, not from the shaped copy:
+        # the shaped copy is what gets redacted and handed out, and reading the
+        # decision out of the same dict that is about to be stripped is how a
+        # reordering turns the filter off.
+        owner = (record.get("status") or {}).get("owner")
         if isinstance(owner, str) and owner:
             visible = caller is not None and caller == owner
         else:
             visible = see_ownerless
         if visible:
-            out[session_id] = redact_private(dict(status))
+            out[session_id] = redact_private(shaped)
     if unusable:
         print(
             f"[model-finetune] dropped {unusable} shared run record(s) that carry "

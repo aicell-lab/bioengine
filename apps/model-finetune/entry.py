@@ -554,6 +554,14 @@ class EntryApp:
         # re-push per run and cannot lose anything.
         self._runs_pushed: Dict[str, str] = {}
         self._runs_sync_task: Optional[asyncio.Task] = None
+        # The shared history as last read. None means "never read": distinct
+        # from {} so the first listing refreshes rather than reporting an empty
+        # shared history it never asked for.
+        self._runs_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        # file name -> (size, last_modified) as the artifact last reported, so
+        # a refresh downloads only what changed.
+        self._runs_meta: Dict[str, Any] = {}
+        self._runs_cache_at: float = 0.0
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -1464,6 +1472,23 @@ class EntryApp:
     #: no-op lambda ends up calling the function it replaced, which recurses.
     RUNS_RETRY_DELAY_S = 2.0
 
+    #: How stale a cached copy of the shared history may be before a listing
+    #: refreshes it. The sync loop refreshes it unconditionally each pass, so
+    #: this only bounds the gap for a listing that arrives between passes.
+    RUNS_CACHE_TTL_S = 30.0
+
+    # Class-level fallbacks for the cache, so a published method never raises
+    # AttributeError on an instance whose __init__ did not run. That is not a
+    # hypothetical: a half-constructed instance is how the suite exercises a
+    # single method, and it is also what a future refactor of the constructor
+    # would produce. NEVER mutated in place -- `_read_run_records` copies and
+    # then assigns to the instance -- so sharing these objects between
+    # instances cannot leak one replica's history into another's.
+    _runs_cache: Optional[Dict[str, Dict[str, Any]]] = None
+    _runs_meta: Dict[str, Any] = {}
+    _runs_cache_at: float = 0.0
+    _runs_pushed: Dict[str, str] = {}
+
     async def _runs_artifact_manager(self):
         """The artifact manager on the APP's own connection.
 
@@ -1499,10 +1524,16 @@ class EntryApp:
         import json as _json
         import training
 
+        store = training.record_store_id()
+        if store is None:
+            # Sharing is OFF rather than guessed. See `record_store_id`: a
+            # replica that cannot tell which deployment it is must not write
+            # into another deployment's history.
+            return False
         for attempt in (1, 2):
             try:
                 record = training.run_record(session_id, status)
-                path = training.run_record_path(session_id)
+                path = training.run_record_path(session_id, store)
                 am = await self._runs_artifact_manager()
                 await am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True)
                 url = await am.put_file(training.RUNS_ARTIFACT_ID, file_path=path)
@@ -1534,13 +1565,33 @@ class EntryApp:
                 return False
         return False
 
-    async def _read_run_records(self) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Every shared record, keyed by session id, or None if unreadable.
+    async def _read_run_records(
+        self, *, max_age_s: Optional[float] = None
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Every shared record for THIS deployment, keyed by session id.
 
         None and `{}` are different answers and the caller treats them
         differently: `{}` is "the shared history is empty", None is "the shared
         history could not be read", and only the second one is a reason to say
         so in the log while still answering from local disk.
+
+        CACHED, AND THE CACHE IS WHY THIS IS NOT A PAGE-POLL PROBLEM. The first
+        version re-fetched every record on every `list_training_sessions`: one
+        `get_file` RPC plus one HTTP GET per run, serially, which a review put
+        at about 520 round trips per poll at the 261 runs production already
+        holds. The listing now serves a cached copy, refreshed at most once per
+        `max_age_s`, and a refresh only downloads the records whose `size` or
+        `last_modified` changed -- both of which the artifact listing returns
+        (measured on the live artifact: `{"type": "file", "name": ...,
+        "size": 41, "last_modified": 1795649029.585}`). A steady-state refresh
+        is therefore ONE `list_files` call.
+
+        The change test is size-and-mtime, which cannot see a rewrite that
+        preserved both. Every write here goes through `put_file`, which sets a
+        fresh mtime, so the case needs two writes inside one mtime tick with an
+        identical length; the next changed write repairs it, and the
+        alternative -- re-downloading everything every time -- is the cost this
+        exists to avoid.
 
         A record that will not parse is COUNTED and skipped rather than
         dropping the whole read: one bad file must not empty a run history.
@@ -1548,10 +1599,26 @@ class EntryApp:
         import json as _json
         import training
 
+        if max_age_s is None:
+            max_age_s = self.RUNS_CACHE_TTL_S
+        now = time.time()
+        if self._runs_cache is not None and (now - self._runs_cache_at) <= max_age_s:
+            return self._runs_cache
+
+        store = training.record_store_id()
+        if store is None:
+            logger.warning(
+                f"{training.APPLICATION_ID_ENV} is not set on this replica, so it "
+                "cannot tell which deployment's run history is its own; the "
+                "listing answers from this instance's own disk only"
+            )
+            return None
+
         try:
             am = await self._runs_artifact_manager()
             listing = await am.list_files(
-                artifact_id=training.RUNS_ARTIFACT_ID, dir_path="runs"
+                artifact_id=training.RUNS_ARTIFACT_ID,
+                dir_path=training.run_record_dir(store),
             )
         except Exception as exc:
             logger.warning(
@@ -1561,31 +1628,54 @@ class EntryApp:
             )
             return None
 
-        names = [
-            e.get("name") if isinstance(e, dict) else str(e) for e in (listing or [])
-        ]
-        names = [n for n in names if isinstance(n, str) and n.endswith(".json")]
-        out: Dict[str, Dict[str, Any]] = {}
-        unreadable = 0
-        for name in names:
+        entries = {}
+        for e in listing or []:
+            if not isinstance(e, dict) or e.get("type") == "directory":
+                continue
+            name = e.get("name")
+            if isinstance(name, str) and name.endswith(".json"):
+                entries[name] = (e.get("size"), e.get("last_modified"))
+
+        cached = dict(self._runs_cache or {})
+        meta = dict(self._runs_meta)
+        # A record removed from the artifact leaves the cache with it, so a
+        # deleted run does not live on in this replica's answer.
+        for gone in set(meta) - set(entries):
+            meta.pop(gone, None)
+            cached.pop(gone[: -len(".json")], None)
+
+        unreadable = fetched = 0
+        for name, stamp in entries.items():
+            session_id = name[: -len(".json")]
+            if meta.get(name) == stamp and session_id in cached:
+                continue
             try:
                 url = await am.get_file(
                     artifact_id=training.RUNS_ARTIFACT_ID,
-                    file_path=f"runs/{name}",
+                    file_path=f"{training.run_record_dir(store)}/{name}",
                 )
                 resp = await self._http.get(url)
                 resp.raise_for_status()
                 record = _json.loads(resp.text)
-                session_id = (record or {}).get("session_id") or name[: -len(".json")]
-                out[session_id] = record
+                key = (record or {}).get("session_id") or session_id
+                cached[key] = record
+                meta[name] = stamp
+                fetched += 1
             except Exception:
                 unreadable += 1
         if unreadable:
             logger.warning(
                 f"{unreadable} shared run record(s) could not be read; the rest "
-                f"({len(out)}) are listed"
+                f"({len(cached)}) are listed"
             )
-        return out
+        self._runs_cache = cached
+        self._runs_meta = meta
+        self._runs_cache_at = now
+        if fetched:
+            logger.info(
+                f"shared run history: {len(cached)} record(s), {fetched} refreshed"
+            )
+        return cached
 
     async def _sync_run_records(self) -> Dict[str, int]:
         """Push the records whose content has changed since the last push.
@@ -1632,6 +1722,10 @@ class EntryApp:
             try:
                 await asyncio.sleep(self.RUNS_SYNC_INTERVAL_S)
                 counts = await self._sync_run_records()
+                # Pull as well as push, so a run started on another replica is
+                # in this one's cache within a poll of being shared -- the
+                # clause this interval is measured against.
+                await self._read_run_records(max_age_s=0)
                 if counts["pushed"] or counts["failed"]:
                     logger.info(f"shared run records: {counts}")
             except asyncio.CancelledError:

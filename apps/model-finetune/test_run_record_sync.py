@@ -39,22 +39,33 @@ def _entry_class():
 
 
 class FakeAM:
-    """Enough artifact manager to see what the app did."""
+    """Enough artifact manager to see what the app did.
+
+    Directory-aware, because a record now lives under its DEPLOYMENT's
+    directory -- one artifact is shared by every deployment of this app, and a
+    flat `runs/` would merge a throwaway's test runs into production's history.
+
+    It also reports `size` and `last_modified` per file, as the live listing
+    does (measured: `{"type": "file", "name": ..., "size": 41,
+    "last_modified": 1795649029.585}`), because the refresh downloads only what
+    changed and a fake without those fields would make that untestable.
+    """
 
     def __init__(self, *, fail_commit_times=0, fail_list=False):
         self.calls = []
-        self.files = {}
+        self.files = {}  # full path -> bytes-as-str
+        self.stamps = {}  # full path -> (size, last_modified)
         self.versions = ["v0"]
         self._fail_commit_times = fail_commit_times
         self._fail_list = fail_list
-        self._pending = None
+        self._clock = 1000.0
 
+    # -- the calls the app makes ------------------------------------------
     async def edit(self, artifact_id=None, stage=None, **kw):
         self.calls.append(("edit", artifact_id, stage))
 
     async def put_file(self, artifact_id=None, file_path=None, **kw):
         self.calls.append(("put_file", artifact_id, file_path))
-        self._pending = file_path
         return f"https://upload.example/{file_path}"
 
     async def commit(self, artifact_id=None, **kw):
@@ -62,18 +73,38 @@ class FakeAM:
         if self._fail_commit_times > 0:
             self._fail_commit_times -= 1
             raise RuntimeError("nothing staged — another writer committed first")
-        # Measured on the live artifact: a commit does not add a version.
-        assert len(self.versions) == 1
+        assert len(self.versions) == 1  # measured: a commit adds no version
 
     async def list_files(self, artifact_id=None, dir_path=None, **kw):
         self.calls.append(("list_files", artifact_id, dir_path))
         if self._fail_list:
             raise RuntimeError("the artifact could not be listed")
-        return [{"name": n, "type": "file"} for n in sorted(self.files)]
+        prefix = f"{dir_path}/" if dir_path else ""
+        out = []
+        for path in sorted(self.files):
+            if not path.startswith(prefix):
+                continue
+            rest = path[len(prefix) :]
+            if "/" in rest:
+                continue
+            size, mtime = self.stamps[path]
+            out.append(
+                {"type": "file", "name": rest, "size": size, "last_modified": mtime}
+            )
+        return out
 
     async def get_file(self, artifact_id=None, file_path=None, **kw):
         self.calls.append(("get_file", artifact_id, file_path))
         return f"https://download.example/{file_path}"
+
+    # -- helpers for the tests --------------------------------------------
+    def store(self, path, body):
+        self._clock += 1.0
+        self.files[path] = body
+        self.stamps[path] = (len(body), self._clock)
+
+    def get_file_calls(self):
+        return [c[2] for c in self.calls if c[0] == "get_file"]
 
 
 class FakeHTTP:
@@ -94,19 +125,23 @@ class FakeHTTP:
         self.corrupt = set(corrupt)
         self.puts = []
 
+    @staticmethod
+    def _path(url):
+        return url.split("://", 1)[1].split("/", 1)[1]
+
     async def put(self, url, content=None, **kw):
-        name = url.rsplit("/", 1)[-1]
-        self.puts.append((name, content))
+        path = self._path(url)
+        self.puts.append((path, content))
         if self.put_status < 400:
             # The second write to a path replaces the first, as measured.
-            self.am.files[name] = content.decode("utf-8")
+            self.am.store(path, content.decode("utf-8"))
         return self._Resp(self.put_status)
 
     async def get(self, url, **kw):
-        name = url.rsplit("/", 1)[-1]
-        if name in self.corrupt:
+        path = self._path(url)
+        if path in self.corrupt:
             return self._Resp(200, "{not json at all")
-        return self._Resp(200, self.am.files.get(name, ""))
+        return self._Resp(200, self.am.files.get(path, ""))
 
 
 @pytest.fixture()
@@ -117,13 +152,22 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "sessions_root", lambda: root)
     monkeypatch.setattr(training, "session_dir", lambda sid: root / sid)
 
+    # Which deployment this replica belongs to. BioEngine sets this on every
+    # app replica; without it, sharing is OFF rather than guessed.
+    monkeypatch.setenv(training.APPLICATION_ID_ENV, APP)
+
     cls = _entry_class()
     inst = cls.__new__(cls)
     am = FakeAM()
     http = FakeHTTP(am)
     inst._runs_pushed = {}
-    # No real wait in the retry path.
+    inst._runs_cache = None
+    inst._runs_meta = {}
+    inst._runs_cache_at = 0.0
+    # No real wait in the retry path, and no cache between calls unless a test
+    # asks for one: a TTL would otherwise make the assertions time-dependent.
     inst.RUNS_RETRY_DELAY_S = 0
+    inst.RUNS_CACHE_TTL_S = 0
 
     async def _am():
         return am
@@ -147,6 +191,8 @@ def app(tmp_path, monkeypatch):
 
 S1 = "2026-11-25-120000-aaaaaaaa"
 S2 = "2026-11-25-130000-bbbbbbbb"
+APP = "model-finetune"
+OTHER_APP = "model-finetune-dev"
 
 
 # ── the write ───────────────────────────────────────────────────────────────
@@ -159,7 +205,7 @@ async def test_the_record_goes_to_the_APPS_OWN_artifact_under_runs(app):
     artifacts = {c[1] for c in app._am.calls if c[0] in ("edit", "put_file", "commit")}
     assert artifacts == {training.RUNS_ARTIFACT_ID}, artifacts
     paths = [c[2] for c in app._am.calls if c[0] == "put_file"]
-    assert paths == [f"runs/{S1}.json"], paths
+    assert paths == [f"runs/{APP}/{S1}.json"], paths
     # staged, uploaded, committed -- in that order, since a put_file URL is
     # only valid against a staged artifact.
     order = [c[0] for c in app._am.calls]
@@ -173,7 +219,7 @@ async def test_what_is_written_is_the_RECORD_including_the_owner(app):
     fence is the artifact's permissions, not the absence of the field."""
     app._plant(S1, owner="github|49943582")
     await app._persist_run_record(S1)
-    written = json.loads(app._am.files[f"{S1}.json"])
+    written = json.loads(app._am.files[f"runs/{APP}/{S1}.json"])
     assert written["session_id"] == S1
     assert written["record_version"] == training.RUN_RECORD_VERSION
     assert written["status"]["owner"] == "github|49943582"
@@ -239,7 +285,7 @@ async def test_a_CHANGED_record_is_pushed_again_even_without_a_status_transition
     app._plant(S1, status="TRAINING", epochs=[{"epoch": 0, "train_loss": 0.4}])
     counts = await app._sync_run_records()
     assert counts["pushed"] == 1, counts
-    written = json.loads(app._am.files[f"{S1}.json"])
+    written = json.loads(app._am.files[f"runs/{APP}/{S1}.json"])
     assert written["status"]["epochs"] == [{"epoch": 0, "train_loss": 0.4}]
 
 
@@ -250,6 +296,90 @@ async def test_a_directory_that_is_not_a_session_is_not_pushed(app):
     app._plant(S1)
     counts = await app._sync_run_records()
     assert counts == {"pushed": 1, "unchanged": 0, "failed": 0}, counts
+
+
+# ── the cache, which is why this is not a page-poll problem ────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_REFRESH_downloads_ONLY_the_records_that_changed(app):
+    """The first version re-fetched every record on every listing: one RPC
+    plus one HTTP GET per run, serially, which a review put at about 520 round
+    trips per poll at the 261 runs production already holds. A steady-state
+    refresh is now ONE list_files call."""
+    app._plant(S1)
+    app._plant(S2)
+    await app._sync_run_records()
+
+    await app._read_run_records(max_age_s=0)
+    first = len(app._am.get_file_calls())
+    assert first == 2, app._am.get_file_calls()
+
+    # Nothing changed: a refresh downloads nothing.
+    await app._read_run_records(max_age_s=0)
+    assert len(app._am.get_file_calls()) == first, "a record was re-downloaded"
+
+    # One run changes: exactly that one is downloaded.
+    app._plant(S1, status="TRAINING")
+    await app._sync_run_records()
+    before = len(app._am.get_file_calls())
+    await app._read_run_records(max_age_s=0)
+    new_calls = app._am.get_file_calls()[before:]
+    assert new_calls == [f"runs/{APP}/{S1}.json"], new_calls
+
+
+@pytest.mark.asyncio
+async def test_a_FRESH_CACHE_is_served_without_touching_the_artifact(app):
+    app._plant(S1)
+    await app._sync_run_records()
+    await app._read_run_records(max_age_s=0)
+    calls = len(app._am.calls)
+    got = await app._read_run_records(max_age_s=3600)
+    assert set(got) == {S1}
+    assert len(app._am.calls) == calls, "a fresh cache still called the artifact"
+
+
+@pytest.mark.asyncio
+async def test_a_REMOVED_record_leaves_the_cache(app):
+    """A deleted run must not live on in this replica's answer."""
+    app._plant(S1)
+    app._plant(S2)
+    await app._sync_run_records()
+    assert set(await app._read_run_records(max_age_s=0)) == {S1, S2}
+    path = f"runs/{APP}/{S1}.json"
+    app._am.files.pop(path)
+    app._am.stamps.pop(path)
+    assert set(await app._read_run_records(max_age_s=0)) == {S2}
+
+
+# ── sharing is OFF when the deployment is unknown ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_WITHOUT_a_deployment_id_nothing_is_written_or_read(app, monkeypatch):
+    """A replica that cannot tell which deployment it is must not write into
+    another deployment's history. The local listing still works; the shared
+    half is absent and says so."""
+    monkeypatch.delenv(training.APPLICATION_ID_ENV, raising=False)
+    app._plant(S1)
+    assert await app._persist_run_record(S1) is False
+    assert app._am.calls == [], app._am.calls
+    assert await app._read_run_records(max_age_s=0) is None
+
+
+@pytest.mark.asyncio
+async def test_ANOTHER_DEPLOYMENTS_records_are_NOT_read(app):
+    """One artifact, many deployments. A throwaway's test runs must not appear
+    in production's history -- measured on one worker: production 261 runs,
+    the soup 37, four throwaways 19, 6, 2 and 1."""
+    app._plant(S1)
+    await app._sync_run_records()
+    app._am.store(
+        f"runs/{OTHER_APP}/{S2}.json",
+        json.dumps({"session_id": S2, "status": {"status": "COMPLETED"}}),
+    )
+    got = await app._read_run_records(max_age_s=0)
+    assert set(got) == {S1}, got
 
 
 # ── the read ────────────────────────────────────────────────────────────────
@@ -280,7 +410,7 @@ async def test_ONE_unreadable_record_does_not_empty_the_history(app):
     app._plant(S1)
     app._plant(S2)
     await app._sync_run_records()
-    app._http.corrupt = {f"{S1}.json"}
+    app._http.corrupt = {f"runs/{APP}/{S1}.json"}
     got = await app._read_run_records()
     assert set(got) == {S2}, got
 

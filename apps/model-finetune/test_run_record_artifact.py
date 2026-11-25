@@ -163,8 +163,8 @@ def test_an_empty_status_does_not_raise(absent_sessions_root):
 
 
 def test_the_path_is_derived_from_a_VALIDATED_session_id():
-    p = training.run_record_path("2026-11-25-120000-abcdef12")
-    assert p == "runs/2026-11-25-120000-abcdef12.json", p
+    p = training.run_record_path("2026-11-25-120000-abcdef12", "model-finetune")
+    assert p == "runs/model-finetune/2026-11-25-120000-abcdef12.json", p
 
 
 @pytest.mark.parametrize(
@@ -175,7 +175,49 @@ def test_a_session_id_THAT_IS_NOT_ONE_cannot_become_a_path(bad):
     """The id becomes a path component inside the artifact, so traversal and
     separators have to be impossible rather than unlikely."""
     with pytest.raises((training.InvalidSessionId, TypeError, AttributeError)):
-        training.run_record_path(bad)
+        training.run_record_path(bad, "model-finetune")
+
+
+# ── the deployment the record belongs to ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["../escape", "a/b", "", ".", "..", "with space", "x" * 65, None, 7],
+)
+def test_an_APPLICATION_ID_THAT_IS_NOT_ONE_cannot_become_a_path(bad):
+    """The deployment id is a path component too. It comes from the
+    environment rather than a caller, which is an argument about today's
+    deployment path and not about the next one."""
+    with pytest.raises((training.InvalidSessionId, TypeError, AttributeError)):
+        training.run_record_path("2026-11-25-120000-abcdef12", bad)
+
+
+def test_record_store_id_is_OFF_rather_than_guessed(monkeypatch):
+    """A replica that cannot tell which deployment it is must not write into
+    another deployment's history, and a fallback bucket shared by every such
+    replica is exactly that."""
+    monkeypatch.delenv(training.APPLICATION_ID_ENV, raising=False)
+    assert training.record_store_id() is None
+    for bad in ("", "../escape", "a/b", "x" * 65):
+        monkeypatch.setenv(training.APPLICATION_ID_ENV, bad)
+        assert training.record_store_id() is None, bad
+    monkeypatch.setenv(training.APPLICATION_ID_ENV, "model-finetune-dev")
+    assert training.record_store_id() == "model-finetune-dev"
+
+
+def test_TWO_DEPLOYMENTS_DO_NOT_SHARE_A_DIRECTORY():
+    """The finding this closes. One artifact is shared by every deployment of
+    this app, and a worker runs several: measured on one worker, production
+    held 261 runs, the soup 37, and four throwaways 19, 6, 2 and 1. A flat
+    `runs/` would have merged every throwaway's test runs into the production
+    history -- and the issue's own "the count before equals the count after"
+    could then only pass by being counted on the wrong surface."""
+    a = training.run_record_path("2026-11-25-120000-abcdef12", "model-finetune")
+    b = training.run_record_path("2026-11-25-120000-abcdef12", "model-finetune-dev")
+    assert a != b
+    assert training.run_record_dir("model-finetune") == "runs/model-finetune"
+    assert training.run_record_dir("mf-verify") == "runs/mf-verify"
 
 
 # ── the context guard, generalised ───────────────────────────────────────────
