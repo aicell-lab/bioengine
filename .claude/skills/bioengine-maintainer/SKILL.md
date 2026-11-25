@@ -394,6 +394,69 @@ Fix shape:
 
 Apply to: services that maintain per-session disk state. Inference-only services with no per-session state are fine on default routing.
 
+### Resolve a service by HTTP, not by RPC listing — `list_services` can hang, the HTTP listing does not
+
+`api.list_services()` against a busy workspace hangs. Measured against `bioimage-io`, with each
+figure attributed to the run it came from, because these are **not** one simultaneous triple:
+
+```
+run A, 09:26:42Z, one RPC connection, both arms in the same run:
+  list_services("bioimage-io")                          TIMED OUT after 75s
+  get_service(<exact id>) + get_status + get_app_status  OK in 0.7s
+  control: get_service("<ws>/zzz-cannot-exist-0000:bioengine-worker")  REFUSED in 0.0s
+
+run B, 09:50:35Z, ~24 min later, four arms in one run on one connection:
+  control  bogus id                           REFUSED  in 0.01s
+  exact id get_service + get_status            OK       in 0.02s   version 0.16.130
+  RPC      list_services("bioimage-io")        ANSWERED in 0.05s,  25 entries
+  HTTP     GET /bioimage-io/services           HTTP 200 in 2.844s, 25 entries
+```
+
+Read those two runs together before drawing a conclusion from either:
+
+- **The hang is intermittent, and run B is what "it answered today" looks like.** It has been seen to
+  clear by itself in ~25 minutes. A run where the listing answers says nothing about the next one,
+  so it is not evidence the bug is gone.
+- **The HTTP listing is not the *faster* route, it is the route that does not hang.** In run B it was
+  57× *slower* than the RPC listing (2.844s vs 0.05s) and has also been measured at 0.127s. Do not
+  switch to it for latency; switch to it because a 75s hang has no upper bound and 2.8s does.
+
+The defect is upstream, in `hypha-rpc` or `hypha-server` — not in the data and not in our workers. A worker whose management calls "stop answering" is very often a caller stuck in a listing while the worker is perfectly healthy: check by **exact id** before concluding anything about the worker, and read the pod's log with `kubectl`, which does not go through Hypha at all.
+
+**Resolve by HTTP, then call by exact id.** Both halves matter, and both have a silent trap:
+
+```python
+import json, os, urllib.request
+
+def worker_service_id(workspace: str, match: str, server="https://hypha.aicell.io") -> str:
+    """Resolve a worker's fully-qualified service id without enumerating by RPC."""
+    # TRAP 3: send a token only if you HAVE one. A public workspace's listing answers 200
+    # anonymously, and an invalid token answers 401 -- so an absent variable
+    # works where a wrong one does not. An unconditional os.environ[...] raises KeyError.
+    headers = {}
+    token = os.environ.get("BIOIMAGE_IO_TOKEN") or os.environ.get("HYPHA_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{server}/{workspace}/services", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    if not raw:                      # TRAP 1: 307 with a zero-byte body
+        raise RuntimeError("empty body — follow redirects (curl needs -L); this is NOT 'no services'")
+    ids = [s["id"] for s in json.loads(raw)]
+    hits = [i for i in ids if i.endswith(":bioengine-worker") and match in i]
+    if len(hits) != 1:               # never pick one silently; two sites is when guessing hurts
+        raise RuntimeError(f"{len(hits)} workers match {match!r}: {hits}")
+    return f"{workspace}/{hits[0]}"   # TRAP 2: HTTP ids are NOT workspace-prefixed
+```
+
+- **Trap 1 — the URL answers `307` with a zero-byte body.** A caller that does not follow redirects sees an *empty listing*, not an error, so "no services" and "you forgot `-L`" are the same bytes. `requests` and `urllib` follow by default; `curl` does not.
+- **Trap 2 — HTTP ids are not workspace-prefixed.** The listing returns `<client-id>:<name>`; `get_service` wants `<workspace>/<client-id>:<name>`. Substituting one for the other fails with a not-found when your client is connected to a DIFFERENT workspace (from a `bioimage-io` connection the unprefixed id resolves). Always prefix.
+- **Never hard-code a pod hash.** A worker's client id contains its pod name, so an example citing one works today and dies at the next pod replacement — which is how a documented recipe rots into a false "service not found". Match on a stable substring (`bioengine-worker-kth`) and let the suffix do the rest.
+- **Trap 3 — the token is optional, and a wrong one is worse than none.** Measured 09:50:35Z against `bioimage-io`: no token at all → `HTTP 200`, 25 entries; a bogus token → `HTTP 401`; a valid workspace token → `HTTP 200`, 25 entries. So requiring a token makes the recipe unrunnable for a caller that holds none, or holds one scoped elsewhere, on a route that would have worked for them.
+- **Two listings can disagree.** Measured within one hour: the RPC listing returned 25 entries naming one worker pod's services while the HTTP listing returned 28 naming a different pod's — and ~24 minutes later both returned 25 and agreed. So a listing is not usable evidence that a service is **absent**, only an exact-id lookup is, and *agreement on one run does not retire the problem*. Asserting an absence from the RPC listing produced a false "production app is unreachable" report and an unnecessary escalation.
+
+Whatever wraps this, keep a **bogus-id control** beside it: a lookup that succeeds proves nothing unless an id that cannot exist is shown to fail. A runnable four-arm harness in exactly this shape — control, exact id, RPC listing, HTTP listing, one run, one connection — is the right thing to paste beside any claim about this bug.
+
 ## Writing issues and PR descriptions
 
 Issues and PR bodies on this repo are standalone documentation. An issue is triaged by someone who didn't follow the conversation that produced it; a PR body is read months later by a maintainer who didn't follow the review. Assume the reader knows only how BioEngine is built.
