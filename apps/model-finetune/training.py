@@ -282,6 +282,58 @@ def _stop_path(session_id: str) -> Path:
     return session_dir(session_id) / "stop.requested"
 
 
+def caller_identity(context: Any) -> Dict[str, Any]:
+    """``{"owner", "owner_anonymous"}`` from Hypha's injected caller context.
+
+    Hypha injects ``context`` at the service boundary and the ProxyDeployment
+    forwards it, so the identity here is the live caller's and a client cannot
+    set it. That is the whole reason a run can be attributed at all.
+
+    **Three states, and the third is not the second.** A known user gives an id
+    and ``owner_anonymous`` False; a known anonymous caller gives its id and
+    True; and a call that arrives with no usable context gives ``None`` for
+    both. The last is NOT "anonymous" — it is "not recorded", which is the shape
+    every run written before this field existed also has. A reader that collapses
+    the two would either hide a user's own runs or expose an anonymous one, so
+    the distinction is kept here rather than flattened for convenience.
+
+    Never raises. A malformed context must not fail a training run that is
+    otherwise valid: the run is the user's work, the attribution is bookkeeping,
+    and losing the second is not worth losing the first.
+    """
+    unknown = {"owner": None, "owner_anonymous": None}
+    try:
+        return _caller_identity(context, unknown)
+    except Exception:
+        # TOTAL on purpose, and the docstring's promise depends on it. Type
+        # checks alone are not enough: a mapping whose own `get` raises slips
+        # past every isinstance and takes the training run down with it. That is
+        # not hypothetical hardening -- the test for this caught the unguarded
+        # version returning an exception instead of "unknown".
+        return unknown
+
+
+def _caller_identity(context: Any, unknown: Dict[str, Any]) -> Dict[str, Any]:
+    """The reading itself; :func:`caller_identity` owns the never-raise promise."""
+    if not isinstance(context, dict):
+        return unknown
+    user = context.get("user")
+    if not isinstance(user, dict):
+        return unknown
+    uid = user.get("id")
+    if not isinstance(uid, str) or not uid:
+        return unknown
+    flag = user.get("is_anonymous")
+    # Read the flag; do NOT infer anonymity from the shape of the id. An
+    # anonymous workspace happens to be named recognisably today and that is a
+    # convention, not a contract -- keying on it would silently mislabel the day
+    # it changes.
+    return {
+        "owner": uid,
+        "owner_anonymous": bool(flag) if isinstance(flag, bool) else None,
+    }
+
+
 def new_session_id() -> str:
     return datetime.now().strftime("%Y-%m-%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
 
@@ -333,7 +385,23 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
     return cur
 
 
-def get_status(session_id: str) -> Dict[str, Any]:
+# Fields recorded on a run but NOT returned by the public read path.
+#
+# `list_training_sessions` answers anonymous callers today, and it returns
+# whatever `get_status` returns. So the moment a run records who started it, that
+# identity is published to anyone who asks -- the public history would stop
+# saying only WHAT was trained and start saying WHO trained it. Recording the
+# owner and keeping it out of the response therefore have to be one change, not
+# two: "record now, filter later" publishes the identity in between.
+#
+# These come back only for a caller that asks with include_private=True, which is
+# the hook the per-caller filter will use to compare a request against the run's
+# owner. When that filter lands, the listing can return owned runs to their owner
+# and this redaction becomes the default for everyone else rather than for all.
+PRIVATE_STATUS_FIELDS = ("owner", "owner_anonymous")
+
+
+def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, Any]:
     st = read_status(session_id)
     if not st:
         return {
@@ -357,6 +425,10 @@ def get_status(session_id: str) -> Dict[str, Any]:
     ):
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
+    if not include_private:
+        for field in PRIVATE_STATUS_FIELDS:
+            st.pop(field, None)
+
     return st
 
 
