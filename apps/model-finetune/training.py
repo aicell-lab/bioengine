@@ -545,35 +545,44 @@ def caller_manages_dataset(permissions: Any, context: Any) -> bool:
 
 
 def _owner_or_comanager(
-    session_id: str, context: Any, writable_datasets: Any
-) -> "tuple[bool, bool]":
-    """``(decided, allowed)`` for the two legs SHARED by seeing and resuming.
+    status: Dict[str, Any], context: Any, writable_datasets: Any
+) -> bool:
+    """The two legs SHARED by seeing and resuming: owner match, or co-manager.
 
-    Returns ``(True, True)`` when the caller owns the run or manages its
-    dataset. Returns ``(False, False)`` when neither applies, leaving the
-    caller's own administrator rule to decide -- and those rules are NOT the
-    same for the two callers, which is why this stops here rather than
-    answering.
+    Takes the run's STATUS rather than its id, so a caller that has already
+    read the record does not read it again. The listing reads every run once
+    through `get_status` and then asks this question about it; resolving the id
+    here instead meant the same file was opened three times per listed run --
+    261 runs became 783 reads on the production store. Passing the status is
+    not the same as passing the ANSWER: the rule still lives here and in one
+    place.
+
+    False means "neither leg applies", which leaves the caller's own
+    administrator rule to decide. Those rules are NOT the same for seeing and
+    resuming, which is why this stops here rather than answering.
 
     *writable_datasets* is computed SERVER-SIDE from the caller's injected
     context before this is reached; it is not a parameter a caller can supply.
     It is passed in rather than resolved here because resolving it is an async
     artifact-manager round trip while this is synchronous and runs once per run.
     """
-    status = read_status(session_id)
     owner = status.get("owner")
     if isinstance(owner, str) and owner:
         caller = caller_identity(context).get("owner")
         if caller is not None and caller == owner:
-            return True, True
+            return True
     dataset = status.get(DATASET_FIELD)
     if isinstance(dataset, str) and dataset and dataset in writable_datasets:
-        return True, True
-    return False, False
+        return True
+    return False
 
 
 def caller_may_see_run(
-    session_id: str, context: Any, *, writable_datasets: Any = frozenset()
+    session_id: str,
+    context: Any,
+    *,
+    writable_datasets: Any = frozenset(),
+    status: Any = None,
 ) -> bool:
     """True iff this run belongs in the caller's listing.
 
@@ -588,13 +597,18 @@ def caller_may_see_run(
     because somebody decided to widen a privacy boundary, not because a
     refactor unified two rules that only looked alike.
 
+    *status* lets a caller that has ALREADY read this run's record hand it over
+    instead of having it read again -- the listing does, once per run. It is the
+    record, never the verdict: the rule below is the only one, and supplying a
+    status cannot change what it decides.
+
     Fails closed: an unreadable context yields no identity and no authority, and
     *writable_datasets* defaults to empty.
     """
-    decided, allowed = _owner_or_comanager(session_id, context, writable_datasets)
-    if decided:
-        return allowed
-    owner = read_status(session_id).get("owner")
+    st = read_status(session_id) if status is None else status
+    if _owner_or_comanager(st, context, writable_datasets):
+        return True
+    owner = st.get("owner")
     if isinstance(owner, str) and owner:
         # Somebody else's, and attributable. Not an administrator's to browse.
         return False
@@ -617,9 +631,8 @@ def caller_may_resume_run(
     is the PRE-EXISTING shape, preserved on purpose: narrowing it here would be
     a second unrequested change riding along with this one.
     """
-    decided, allowed = _owner_or_comanager(session_id, context, writable_datasets)
-    if decided:
-        return allowed
+    if _owner_or_comanager(read_status(session_id), context, writable_datasets):
+        return True
     return caller_is_workspace_admin(context)
 
 
@@ -851,12 +864,22 @@ def list_sessions(
             skipped.append(name)
             continue
         # ONE test, shared with resume, rather than a second copy of the rule
-        # here. `caller_may_see_run` re-reads the status from disk, which is
-        # a second read of a file this loop has already parsed -- accepted
-        # deliberately: a listing that decides visibility by its own private
-        # copy of the rule is exactly how a caller comes to be shown a run that
-        # resume then refuses, and the drift is silent when it happens.
-        if caller_may_see_run(name, context, writable_datasets=writable_datasets):
+        # here: a listing that decides visibility by its own private copy of the
+        # rule is exactly how a caller comes to be shown a run that resume then
+        # refuses, and the drift is silent when it happens.
+        #
+        # The status just read is handed over rather than re-read. An earlier
+        # version resolved the id inside the gate, which opened the same file
+        # three times per listed run -- 261 runs became 783 reads on the
+        # production store, for a listing that used to do one each. Passing the
+        # RECORD is not passing the ANSWER: the rule is still the gate's.
+        #
+        # ORDER IS LOAD-BEARING: `redact_private` mutates this dict in place and
+        # strips `owner`, which is the field the gate compares. Redacting first
+        # would make every owned run invisible to its own owner.
+        if caller_may_see_run(
+            name, context, writable_datasets=writable_datasets, status=status
+        ):
             out[name] = redact_private(status)
     if skipped:
         print(

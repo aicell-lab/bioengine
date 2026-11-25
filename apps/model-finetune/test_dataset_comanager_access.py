@@ -305,3 +305,71 @@ def test_dataset_ids_on_disk_is_empty_when_no_run_names_one(runs):
     runs("a", OWNER)
     runs("b", COMANAGER)
     assert training.dataset_ids_on_disk() == []
+
+
+# ── the listing must not re-read what it has already read ────────────────────
+
+
+def test_the_listing_reads_each_run_record_ONCE(runs, monkeypatch):
+    """A COST assertion, pinned because the regression is silent.
+
+    The gate used to resolve the session id itself, so every listed run was
+    opened three times -- once by `get_status` in the loop, once by the shared
+    owner/co-manager helper, once more by the administrator fallback. Nothing
+    failed; the listing simply did three times the I/O, and on the production
+    store that is 783 file reads where there were 261.
+
+    The floor is TWO reads per run, and it is not mine: `get_status` reads the
+    record, and the pre-existing `session_backend` reads it again. Measured on
+    the branch BEFORE this change, which gives the same 2N -- so the number
+    asserted here is the unchanged baseline, not a target I chose. A listing
+    that costs more than this has acquired a re-read.
+    """
+    PER_RUN = 2
+    for i in range(5):
+        runs(f"run-{i}", OWNER, dataset=DATASET)
+
+    calls = []
+    real = training.read_status
+    monkeypatch.setattr(
+        training,
+        "read_status",
+        lambda sid, *a, **k: (calls.append(sid), real(sid, *a, **k))[1],
+    )
+
+    training.list_sessions(
+        ctx(OWNER, anonymous=False), writable_datasets=frozenset({DATASET})
+    )
+
+    assert len(calls) == 5 * PER_RUN, (
+        f"expected {5 * PER_RUN} record reads for 5 runs (the pre-change "
+        f"baseline of {PER_RUN} each), got {len(calls)}. The gate is re-reading "
+        f"a record the listing already parsed."
+    )
+
+
+def test_the_listing_still_reads_once_when_the_caller_is_an_admin(runs, monkeypatch):
+    """The administrator path is the one that used to read an EXTRA time, in the
+    fallback after the shared legs declined. A count taken only on the owner
+    path would not have noticed, because the owner leg returns before reaching
+    it."""
+    PER_RUN = 2
+    for i in range(4):
+        runs(f"old-{i}", None)
+
+    calls = []
+    real = training.read_status
+    monkeypatch.setattr(
+        training,
+        "read_status",
+        lambda sid, *a, **k: (calls.append(sid), real(sid, *a, **k))[1],
+    )
+
+    seen = training.list_sessions(ADMIN)
+    assert (
+        len(seen) == 4
+    ), f"the admin should see all four ownerless runs, saw {len(seen)}"
+    assert len(calls) == 4 * PER_RUN, (
+        f"expected {4 * PER_RUN} record reads for 4 runs on the admin path, "
+        f"got {len(calls)}"
+    )
