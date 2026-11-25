@@ -510,6 +510,49 @@ class TestImportNgffImage:
         # A staged-only write disappears after a restage, so it must commit.
         assert importer._state["committed"] == 1
 
+    async def test_the_IMPORT_records_the_axis_names_in_the_layout(self, importer):
+        """Through the real import, because that is the only thing that writes a
+        layout, and a test that seeds a manifest cannot see this at all.
+
+        Dropping the axis names at this call site was measured GREEN against the
+        rest of the suite for exactly that reason: every other layout test hands
+        in a manifest entry that already has them. What it costs is the region
+        reader's refusal message, which would tell the owner of a z-stack to
+        re-import a source they had just imported.
+        """
+        await importer.import_ngff_image("ws/ds", ROOT, context=None)
+        stored = bc.parse_image_manifest(importer._state["manifest"])
+        layout = stored["sample"]["source"]["layout"]
+        assert layout["axes"] == [
+            "c",
+            "y",
+            "x",
+        ], f"the axis names were not recorded at import: {layout!r}"
+        # And the rest of the layout, so this test fails on a dropped key rather
+        # than on only the one that prompted it.
+        assert layout["dataset_paths"] == ["0", "1"]
+        assert layout["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+        assert layout["level0_shape"] == [3, 600, 800]
+
+    async def test_a_region_reference_built_from_a_REAL_import_is_readable(
+        self, importer
+    ):
+        """The end of the pipe, assembled by nobody's fixture.
+
+        Each half is covered -- the import records a layout, and
+        ``ngff_region_source`` turns a layout into a reference -- and the two
+        could still disagree about a key name without either test noticing. This
+        reads the reference out of what the import actually wrote.
+        """
+        await importer.import_ngff_image("ws/ds", ROOT, context=None)
+        stored = bc.parse_image_manifest(importer._state["manifest"])
+        src = bc.ngff_region_source(stored["sample"])
+        assert src is not None, "a freshly imported remote stem is not readable"
+        assert src["axes"] == ["c", "y", "x"]
+        assert src["dataset_paths"] == ["0", "1"]
+        assert src["level0_shape"] == [3, 600, 800]
+        assert src["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+
     async def test_derives_the_stem_from_the_store_root(self, importer):
         importer._http.objects = {
             k.replace(ROOT, "https://s3.example/bucket/my-sample.zarr/"): v

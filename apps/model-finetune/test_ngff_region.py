@@ -472,3 +472,121 @@ def test_the_module_does_not_import_zarr_at_module_scope():
     )
     # CONTROL: the walk must see the imports that ARE there.
     assert "typing" in top_level, "the AST walk found no imports at all"
+
+
+# ── a store credential must not reach anything that is written down ──────────
+#
+# The credential is spliced into store_root for one call and is kept out of the
+# artifact on purpose. What brought it within reach of a reader is that zarr's
+# errors quote the store they tried: that text goes into the session status
+# document, which is served by an endpoint taking no caller context. A presigned
+# URL leaking the same way expires. A store credential does not.
+
+CRED_ROOT = "https://ov.example/t/SECRET-TOKEN-123/zarr/ds1/"
+
+
+def test_redaction_keeps_the_path_and_drops_the_credential():
+    out = nr.redact_store_credential(f"No array found in store {CRED_ROOT}0")
+    assert "SECRET-TOKEN-123" not in out
+    assert (
+        "ov.example" in out and "zarr/ds1" in out
+    ), f"the store is no longer identifiable, which makes the message useless: {out}"
+    assert nr.CREDENTIAL_PLACEHOLDER in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://ov.example/zarr/ds1/0",  # no credential: untouched
+        "nothing url-shaped at all",
+        "",
+    ],
+)
+def test_redaction_leaves_text_with_no_credential_alone(text):
+    """The control. A redaction that mangled every string would pass the test
+    above while destroying every ordinary error message."""
+    assert nr.redact_store_credential(text) == text
+
+
+def test_an_OPEN_failure_is_re_raised_without_the_credential():
+    """THE case. Any ordinary failure reaches this: a rotated credential, a
+    moved store, a wrong multiscale name."""
+
+    def _boom(root, path):
+        # Exactly what zarr does: the store it tried, URL and all.
+        raise FileNotFoundError(f"No array found in store <FsspecStore({root}{path})>")
+
+    with pytest.raises(nr.RegionSourceError) as err:
+        nr.read_region(
+            {"kind": "ngff", "store_root": CRED_ROOT, "region": BOX},
+            _probe_2d([1000, 2000]),
+            opener=_boom,
+        )
+    msg = str(err.value)
+    assert "SECRET-TOKEN-123" not in msg, f"the credential survived: {msg}"
+    assert "FileNotFoundError" in msg, "the underlying error is no longer named"
+    assert "ov.example" in msg, "the store is no longer identifiable"
+
+
+def test_the_ORIGINAL_exception_is_not_reachable_through_the_chain():
+    """`from None`, not a bare raise.
+
+    Redacting the message is not enough on its own: an exception chained as
+    __cause__ is printed in full by any traceback formatter, so the unredacted
+    original would still reach a log.
+    """
+
+    def _boom(root, path):
+        raise FileNotFoundError(f"store {root}{path}")
+
+    with pytest.raises(nr.RegionSourceError) as err:
+        nr.read_region(
+            {"kind": "ngff", "store_root": CRED_ROOT, "region": BOX},
+            _probe_2d([1000, 2000]),
+            opener=_boom,
+        )
+    assert err.value.__cause__ is None, "the unredacted original is still chained"
+    assert err.value.__context__ is None or "SECRET-TOKEN-123" not in str(
+        err.value.__context__
+    ), "the unredacted original is reachable as __context__"
+
+
+def test_a_READ_failure_is_re_raised_without_the_credential():
+    """The chunk GETs happen at the slice, not at the open, so a credentialed
+    URL reaches a reader's exception on that line too. Without this case the
+    open above would be guarded and the read would not."""
+
+    class _FailsOnSlice:
+        shape = (1000, 2000)
+
+        def __getitem__(self, _idx):
+            raise OSError(f"GET {CRED_ROOT}0/0.0 returned 403")
+
+    with pytest.raises(nr.RegionSourceError) as err:
+        nr.read_region(
+            {"kind": "ngff", "store_root": CRED_ROOT, "region": BOX},
+            _probe_2d([1000, 2000]),
+            opener=lambda _r, _p: _FailsOnSlice(),
+        )
+    msg = str(err.value)
+    assert "SECRET-TOKEN-123" not in msg, f"the credential survived: {msg}"
+    assert "403" in msg, "the underlying failure is no longer described"
+    # The same chain check as the open wrapper, because the two are separate
+    # pieces of code and only one of them was tested when this was written.
+    assert err.value.__cause__ is None
+    assert err.value.__context__ is None or "SECRET-TOKEN-123" not in str(
+        err.value.__context__
+    ), "the unredacted original is reachable as __context__ on the read path"
+
+
+def test_a_successful_read_is_unaffected_by_the_wrapping():
+    """The control for both wrappers: a try/except that swallowed the result
+    would pass every test above."""
+    full = np.arange(1000 * 2000, dtype=np.uint32).reshape(1000, 2000)
+    out = nr.read_region(
+        {"kind": "ngff", "store_root": CRED_ROOT, "region": BOX},
+        _probe_2d([1000, 2000]),
+        opener=lambda _r, _p: full,
+    )
+    assert out.shape == (13, 11)
+    assert np.array_equal(out, full[7:20, 5:16])

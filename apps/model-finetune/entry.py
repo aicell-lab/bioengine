@@ -1386,9 +1386,19 @@ class EntryApp:
                 )
             raise
         except Exception as e:
-            logger.error(f"Training session {session_id} failed: {e}")
+            # REDACTED HERE AS WELL AS AT THE RAISE SITE, and deliberately not
+            # only there. Everything this message can contain comes from some
+            # library's idea of a good error, and a store URL carries its
+            # credential as a path segment; the session status document is
+            # served by an endpoint that takes no caller context, so one of
+            # those strings reaching it publishes the credential to anyone who
+            # can list sessions. The region reader already refuses without
+            # quoting the URL. This catches the paths nobody has thought of,
+            # which is the only kind that matters for a credential.
+            safe = ngff_region.redact_store_credential(e)
+            logger.error(f"Training session {session_id} failed: {safe}")
             training.write_status(
-                session_id, status="FAILED", message=str(e)[:800], terminated_by="entry"
+                session_id, status="FAILED", message=safe[:800], terminated_by="entry"
             )
         finally:
             preparing_hb.cancel()

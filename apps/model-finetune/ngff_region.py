@@ -24,9 +24,32 @@ that once let three skipped cases pass for a guard.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 NGFF_SOURCE_KIND = "ngff"
+
+# A store credential travels as a PATH SEGMENT, ``/t/<credential>/`` -- the shape
+# the broker's split_store_credential matches. It is kept out of the artifact on
+# purpose, so the only way it reaches here is spliced into store_root for one
+# call, and the only way it leaves is in text somebody writes down.
+_CREDENTIAL_SEGMENT = re.compile(r"/t/[^/]+/")
+CREDENTIAL_PLACEHOLDER = "/t/<redacted>/"
+
+
+def redact_store_credential(text: Any) -> str:
+    """*text* with any ``/t/<credential>/`` segment replaced.
+
+    USED ON EVERY MESSAGE THIS MODULE RAISES, and worth applying anywhere a
+    store URL could be stringified. The reason is not hypothetical: zarr's
+    not-found error quotes the store it tried, URL and all, and that string
+    travels into the session status document, which is served by an endpoint
+    taking no caller context. A presigned URL leaking there expires; a store
+    credential does not.
+
+    The path form is kept so the message still identifies the store.
+    """
+    return _CREDENTIAL_SEGMENT.sub(CREDENTIAL_PLACEHOLDER, str(text))
 
 
 class RegionSourceError(ValueError):
@@ -326,7 +349,35 @@ def read_region(
 
     if opener is None:
         opener = _zarr_opener
-    array = opener(ref["store_root"], level0_path(probe["dataset_paths"]))
+    path = level0_path(probe["dataset_paths"])
+    # EVERY FAILURE FROM HERE DOWN IS RE-RAISED WITHOUT THE URL IN IT.
+    #
+    # zarr's own errors quote the store they tried, which for a credentialed
+    # store is the credential. From here the exception text reaches the session
+    # status document and the log, and the endpoint that serves session status
+    # takes no caller context -- so one ordinary failure (a rotated credential,
+    # a moved store, a wrong multiscale name) publishes it. A presigned URL
+    # going the same way expires; this does not.
+    #
+    # The redaction keeps the path, so the message still says WHICH store.
+    # RAISED OUTSIDE THE HANDLER, which is the part that is easy to get wrong.
+    # ``raise ... from None`` clears __cause__ and suppresses the chain in the
+    # default traceback format, but Python still attaches the original as
+    # __context__, and anything that walks that attribute -- an error reporter,
+    # a structured logger -- reads the unredacted text straight off it. Leaving
+    # the except block first clears the handled exception, so the replacement
+    # carries no reference to the original at all.
+    array = None
+    failure = None
+    try:
+        array = opener(ref["store_root"], path)
+    except Exception as e:
+        failure = f"{type(e).__name__}: {redact_store_credential(e)}"
+    if failure is not None:
+        raise RegionSourceError(
+            f"could not open {path!r} in "
+            f"{redact_store_credential(ref['store_root'])}: {failure}"
+        )
 
     # THE OPENED ARRAY MUST BE THE ONE THE INDEX WAS COMPUTED FOR.
     #
@@ -362,7 +413,21 @@ def read_region(
             f"cannot be read by position), or the store changed since it was "
             f"imported: re-import the source."
         )
-    return to_hw_or_hwc(array[index], probe["axis_roles"], len(shape))
+    # The chunk GETs happen HERE, not at the open, so a credentialed URL reaches
+    # a reader's exception on this line too. Raised outside the handler for the
+    # same reason as above.
+    data = None
+    failure = None
+    try:
+        data = array[index]
+    except Exception as e:
+        failure = f"{type(e).__name__}: {redact_store_credential(e)}"
+    if failure is not None:
+        raise RegionSourceError(
+            f"could not read the region out of {path!r} in "
+            f"{redact_store_credential(ref['store_root'])}: {failure}"
+        )
+    return to_hw_or_hwc(data, probe["axis_roles"], len(shape))
 
 
 def _zarr_opener(store_root: str, array_path: str) -> Any:
