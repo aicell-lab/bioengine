@@ -33,6 +33,19 @@ import training
 
 VALID = "2026-11-25-150730-abcdef12"
 
+
+# The listing is per-caller now: a run with no recorded owner is returned only to
+# a caller holding rw or admin on `bioimage-io`. The runs planted below carry no
+# owner, so these tests list as an admin. Listing as anyone else would return {}
+# and every junk-tolerance assertion would pass while measuring nothing.
+ADMIN_CTX = {
+    "user": {
+        "id": "github|777000",
+        "is_anonymous": False,
+        "scope": {"workspaces": {"bioimage-io": "a"}},
+    }
+}
+
 # Every one of these must be refused. Each is a real shape an attacker or a
 # confused client can send, not a decorative variation.
 BAD_IDS = [
@@ -281,7 +294,7 @@ async def test_stopping_an_UNKNOWN_session_refuses_and_creates_nothing(root):
     cls, inst = _entry_instance()
     unknown = "2026-01-01-000000-deadbeef"
     with pytest.raises(training.SessionNotFound):
-        await cls.stop_training(inst, session_id=unknown)
+        await cls.stop_training(inst, session_id=unknown, context=ADMIN_CTX)
     assert (
         sorted(p.name for p in root.iterdir()) == []
     ), "stopping an unknown session created something in the sessions root"
@@ -293,7 +306,7 @@ async def test_stopping_an_UNKNOWN_session_refuses_and_creates_nothing(root):
 async def test_stopping_with_an_ESCAPING_id_refuses_and_creates_nothing(root, bad):
     cls, inst = _entry_instance()
     with pytest.raises(training.InvalidSessionId):
-        await cls.stop_training(inst, session_id=bad)
+        await cls.stop_training(inst, session_id=bad, context=ADMIN_CTX)
     assert sorted(p.name for p in root.iterdir()) == []
     # and nothing landed next to the root either
     assert sorted(p.name for p in root.parent.iterdir()) == ["sessions"]
@@ -312,7 +325,7 @@ async def test_stopping_with_an_ABSOLUTE_id_leaves_THAT_PATH_untouched(root, tmp
     target = tmp_path / "escape-target" / "abs-escape"
     cls, inst = _entry_instance()
     with pytest.raises(training.InvalidSessionId):
-        await cls.stop_training(inst, session_id=str(target))
+        await cls.stop_training(inst, session_id=str(target), context=ADMIN_CTX)
     assert not (target / "status.json").exists(), f"wrote into {target}"
     assert not target.exists(), f"created {target}"
     assert not target.parent.exists(), f"created {target.parent}"
@@ -338,7 +351,7 @@ async def test_a_REAL_session_can_still_be_stopped(root):
     cls, inst = _entry_instance()
     sid = training.new_session_id()
     training.write_status(sid, status="TRAINING", message="control")
-    out = await cls.stop_training(inst, session_id=sid)
+    out = await cls.stop_training(inst, session_id=sid, context=ADMIN_CTX)
     assert out["status"] == "STOPPED", out
     assert training.read_status(sid)["terminated_by"] == "user_stop"
 
@@ -374,7 +387,7 @@ def test_a_NON_CONFORMING_directory_is_SKIPPED_not_fatal(root, junk):
     """One junk directory must not hide the real runs."""
     real = _plant(root, VALID)
     _plant(root, junk)
-    listed = training.list_sessions()
+    listed = training.list_sessions(ADMIN_CTX)
     assert real in listed, (
         f"a directory named {junk!r} beside a real session made the whole "
         f"listing fail or drop the real run: {sorted(listed)}"
@@ -388,7 +401,7 @@ def test_the_listing_survives_MANY_junk_directories(root):
     real = _plant(root, VALID)
     for i in range(20):
         _plant(root, f"junk-{i}")
-    listed = training.list_sessions()
+    listed = training.list_sessions(ADMIN_CTX)
     assert sorted(listed) == [real], sorted(listed)
 
 
@@ -397,7 +410,7 @@ def test_the_listing_control_lists_what_it_SHOULD(root):
     returned {} for everything."""
     a = _plant(root, "2026-11-25-150730-abcdef12")
     b = _plant(root, "2026-11-25-150731-abcdef13")
-    assert sorted(training.list_sessions()) == sorted([a, b])
+    assert sorted(training.list_sessions(ADMIN_CTX)) == sorted([a, b])
 
 
 def test_a_SYMLINKED_session_directory_is_skipped_not_fatal(root):
@@ -415,7 +428,7 @@ def test_a_SYMLINKED_session_directory_is_skipped_not_fatal(root):
     (outside / "status.json").write_text(json.dumps({"status": "COMPLETED"}))
     (root / "2026-11-25-150731-abcdef13").symlink_to(outside, target_is_directory=True)
 
-    listed = training.list_sessions()
+    listed = training.list_sessions(ADMIN_CTX)
     assert (
         real in listed
     ), f"a symlinked session directory took the whole listing down: {sorted(listed)}"
@@ -430,7 +443,7 @@ def test_the_symlink_skip_does_not_swallow_a_LEGITIMATE_inner_symlink(root):
     _plant(root, VALID)
     link = root / "2026-11-25-150731-abcdef13"
     link.symlink_to(target, target_is_directory=True)
-    listed = training.list_sessions()
+    listed = training.list_sessions(ADMIN_CTX)
     assert sorted(listed) == sorted([VALID, "2026-11-25-150731-abcdef13"]), sorted(
         listed
     )
