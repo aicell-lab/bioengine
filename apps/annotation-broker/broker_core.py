@@ -1712,6 +1712,100 @@ def filename_to_artifact_id(filename: str) -> str:
     return stem.replace("__", "/")
 
 
+# ---------------------------------------------------------------------------
+# The public gallery
+# ---------------------------------------------------------------------------
+
+# What an anonymous visitor is told about a public dataset.
+#
+# An ALLOW-LIST, not a strip-list. Broker metadata holds the owner as
+# ``{"id", "email"}``, and the artifact manifests carry ``created_by`` with an
+# address in it, so a listing built by removing known-sensitive fields has to
+# be right about every field that exists now and every field added later. This
+# only has to be right about what a gallery card needs.
+PUBLIC_DATASET_FIELDS = (
+    "artifact_id",
+    "name",
+    "description",
+    "image_count",
+    "owner_display",
+)
+
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+
+
+def iter_public_metadata(root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Every dataset whose BROKER flag says public, in a stable order.
+
+    Reads the broker's own metadata rather than the artifacts, for two
+    reasons. The flag lives here and nowhere else -- ``set_public`` writes it
+    here -- so this is the same source ``resolve_role`` consults when it
+    decides whether an anonymous caller may read a dataset at all. A gallery
+    built on any other source could advertise a dataset the read path then
+    refuses, or hide one it would serve.
+
+    A file that cannot be parsed is skipped rather than fatal: one bad record
+    must not empty the gallery.
+    """
+    out: List[Dict[str, Any]] = []
+    for path in sorted(datasets_dir(root).glob("*.json")):
+        try:
+            meta = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(meta, dict) or not meta.get("public"):
+            continue
+        if not meta.get("artifact_id"):
+            continue
+        out.append(meta)
+    return out
+
+
+def owner_display(metadata: Dict[str, Any]) -> Optional[str]:
+    """A display string for the owner that is NEVER an email address.
+
+    Broker metadata stores ``{"id", "email"}`` and nothing resembling a name,
+    so the id is the only non-email identifier available. When the id is
+    itself an address -- some logins record one -- there is nothing publishable
+    and this returns ``None`` rather than inventing something.
+    """
+    owner = metadata.get("owner") or {}
+    ident = owner.get("id")
+    if isinstance(ident, str) and ident and not _EMAIL_RE.search(ident):
+        return ident
+    return None
+
+
+def public_dataset_entry(
+    metadata: Dict[str, Any],
+    *,
+    name: Optional[str],
+    description: Optional[str],
+    image_count: Optional[int],
+) -> Dict[str, Any]:
+    """Project one public dataset down to its gallery card.
+
+    Every value is scrubbed for email addresses on the way out, not just the
+    owner field: ``name`` and ``description`` are free text an owner typed and
+    could contain one.
+    """
+    entry = {
+        "artifact_id": metadata.get("artifact_id"),
+        "name": _scrub_emails(name),
+        "description": _scrub_emails(description),
+        "image_count": image_count,
+        "owner_display": _scrub_emails(owner_display(metadata)),
+    }
+    return {k: entry.get(k) for k in PUBLIC_DATASET_FIELDS}
+
+
+def _scrub_emails(value: Any) -> Any:
+    """Replace any email address in *value* with a placeholder."""
+    if not isinstance(value, str):
+        return value
+    return _EMAIL_RE.sub("[email removed]", value)
+
+
 def metadata_path(artifact_id: str, root: Optional[Path] = None) -> Path:
     return datasets_dir(root) / artifact_id_to_filename(artifact_id)
 
