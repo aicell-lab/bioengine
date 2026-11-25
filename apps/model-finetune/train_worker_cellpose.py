@@ -22,6 +22,7 @@ import threading
 import time
 import traceback
 
+import epoch_progress
 import training
 
 
@@ -200,28 +201,46 @@ _EPOCH_TOKEN = "train_loss="
 class _EpochProgressHandler(logging.Handler):
     """Turn cellpose's per-epoch log record into a status.json entry as it happens.
 
-    This is the ONLY live progress signal available. ``train_seg`` takes no callback,
-    exposes no per-epoch counter, and returns its loss arrays only on completion, so
-    without this a run is opaque from start to finish. The records are already routed
-    to stdout by ``_surface_cellpose_logs``; this reads them in-process instead of
-    tailing the log file, so no parsing of interleaved subprocess output is needed.
+    This carries what the loss hook in ``epoch_progress`` cannot see: the epoch's
+    VALIDATION loss and its learning rate. The hook skips the validation pass by
+    design (it runs under ``torch.no_grad()``), and cellpose computes ``lavgt``
+    nowhere else, so the log record is the only source for it.
+
+    What this does NOT carry is the epoch's own training loss, even though the
+    line prints one. Measured in cellpose 4.2.1.1's ``train_seg``: ``lavg`` and
+    ``nsum`` accumulate across epochs and are reset only inside the cadence
+    branch that logs, so the printed ``train_loss`` is the mean over every epoch
+    SINCE THE PREVIOUS REPORT — the mean of epochs 6..10 at the epoch-10 report,
+    not epoch 10's loss. It equals the epoch's own loss only for the first
+    report. Recorded under its real name, with the per-epoch value coming from
+    the hook, because publishing a window mean as ``train_loss`` would draw a
+    curve whose points are not the quantity the axis claims.
+
+    The records are already routed to stdout by ``_surface_cellpose_logs``; this
+    reads them in-process instead of tailing the log file, so no parsing of
+    interleaved subprocess output is needed.
 
     Never raises: a progress display must not be able to fail a training run.
     """
 
     def __init__(
-        self, session_id: str, has_val: bool, want_loss: bool = True
+        self,
+        recorder: "epoch_progress.EpochRecorder",
+        has_val: bool,
+        want_loss: bool = True,
     ) -> None:
         super().__init__(level=logging.INFO)
-        self._session_id = session_id
+        self._recorder = recorder
         self._has_val = has_val
         # ``metrics`` governs which quantitative metrics are COMPUTED, and the loss
         # curve is one of them. The epoch NUMBER is not a metric — it is progress —
         # so it is reported either way and only the loss values are withheld. A run
         # asking for 'pixel' alone therefore still shows where it has got to.
         self._want_loss = want_loss
-        self._epochs: list = []
-        self.unparsed = 0
+
+    @property
+    def unparsed(self) -> int:
+        return self._recorder.unparsed
 
     def _entry(self, msg: str):
         """Parse one record. Returns an entry dict, or None if this is not an epoch
@@ -229,15 +248,19 @@ class _EpochProgressHandler(logging.Handler):
         m = _EPOCH_LINE.match(msg)
         if m is None:
             if _EPOCH_TOKEN in msg:
-                self.unparsed += 1
+                self._recorder.unparsed += 1
             return None
         test = float(m.group("test"))
         if not self._want_loss:
-            return {"epoch": int(m.group("epoch")), "train_loss": None,
-                    "val_loss": None, "lr": float(m.group("lr"))}
+            return {
+                "epoch": int(m.group("epoch")),
+                "train_loss_window_mean": None,
+                "val_loss": None,
+                "lr": float(m.group("lr")),
+            }
         return {
             "epoch": int(m.group("epoch")),
-            "train_loss": float(m.group("train")),
+            "train_loss_window_mean": float(m.group("train")),
             # cellpose runs validation INSIDE the same cadence guard that emits this
             # line, but only when a test set exists. With none, the logged value is
             # the initialised 0.0 — not a measurement. A real segmentation loss is
@@ -252,29 +275,28 @@ class _EpochProgressHandler(logging.Handler):
             entry = self._entry(record.getMessage().strip())
             if entry is None:
                 return
-            # Re-reporting an epoch replaces it rather than appending a duplicate.
-            self._epochs = [e for e in self._epochs if e["epoch"] != entry["epoch"]]
-            self._epochs.append(entry)
-            self._epochs.sort(key=lambda e: e["epoch"])
-            training.write_status(
-                self._session_id,
-                epochs=list(self._epochs),
-                last_reported_epoch=entry["epoch"],
-                epoch_progress_unparsed=self.unparsed,
+            # Merged into the recorder's row for that epoch, so re-reporting an
+            # epoch replaces its fields rather than appending a duplicate, and the
+            # hook's own train_loss for the same epoch is not overwritten.
+            self._recorder.annotate(
+                entry["epoch"],
+                val_loss=entry["val_loss"],
+                lr=entry["lr"],
+                train_loss_window_mean=entry["train_loss_window_mean"],
             )
         except Exception:
             pass
 
 
 def _attach_epoch_progress(
-    session_id: str, has_val: bool, want_loss: bool = True
+    recorder: "epoch_progress.EpochRecorder", has_val: bool, want_loss: bool = True
 ) -> "_EpochProgressHandler":
     """Attach the progress handler to the ``cellpose`` logger.
 
     cellpose's own logger is ``cellpose.train`` (``logging.getLogger(__name__)``), a
     child of ``cellpose``, so a handler on the parent receives it by propagation —
     the same mechanism ``_surface_cellpose_logs`` relies on."""
-    handler = _EpochProgressHandler(session_id, has_val, want_loss)
+    handler = _EpochProgressHandler(recorder, has_val, want_loss)
     logging.getLogger("cellpose").addHandler(handler)
     return handler
 
@@ -309,14 +331,33 @@ def main(session_id: str) -> None:
     # moment to discover it.
     metrics_requested = training.validate_metrics(p.get("metrics"))
 
-    # Live progress. Attached before train_seg runs so the first reported epoch is
-    # captured, and declared in the status so a client knows the cadence to expect
-    # instead of reading the gaps as lost records.
-    progress = _attach_epoch_progress(
-        session_id,
-        has_val=bool(p.get("val_images")),
-        want_loss="loss" in metrics_requested,
+    # Live progress, from two sources merged into one row per epoch (see
+    # EpochRecorder): the loss hook for every epoch's own training loss, and
+    # cellpose's log record for the validation loss and learning rate of the
+    # epochs it reports. Both are attached before train_seg runs so the first
+    # epoch is captured, and the log's cadence is declared in the status so a
+    # client reading `train_loss_window_mean`/`val_loss` gaps knows they are
+    # expected rather than lost.
+    want_loss = "loss" in metrics_requested
+    recorder = epoch_progress.EpochRecorder(
+        lambda **fields: training.write_status(session_id, **fields)
     )
+    progress = _attach_epoch_progress(
+        recorder,
+        has_val=bool(p.get("val_images")),
+        want_loss=want_loss,
+    )
+    # nimg_per_epoch is len(train_files) because this worker never passes
+    # nimg_per_epoch to train_seg, and train_seg then defaults it to nimg
+    # (cellpose/train.py: `nimg_per_epoch = nimg if nimg_per_epoch is None`).
+    # It is what closes an epoch, so a wrong value would mis-time every tick.
+    tracker = epoch_progress.EpochLossTracker(
+        nimg_per_epoch=len(p["train_images"]),
+        on_epoch=lambda done, _curve: recorder.record_epoch_loss(
+            done, _curve[-1], publish_loss=want_loss
+        ),
+    )
+    hook = epoch_progress.install_cellpose_hook(tracker)
     training.write_status(
         session_id,
         status="TRAINING",
@@ -325,6 +366,12 @@ def main(session_id: str) -> None:
         last_reported_epoch=None,
         epoch_report_cadence=EPOCH_REPORT_CADENCE,
         n_epochs=p["n_epochs"],
+        # None means the loss functions this hook wraps were not found, i.e. a
+        # cellpose that moved them: no per-epoch claim is made at all, rather than
+        # a count that cannot be backed. `unavailable` until an epoch completes.
+        epoch_progress_basis=(
+            epoch_progress.BASIS_UNAVAILABLE if hook is not None else None
+        ),
     )
     stop = threading.Event()
     heartbeat = threading.Thread(
@@ -368,15 +415,31 @@ def main(session_id: str) -> None:
             rescale=False,
         )
         stop.set()
+        if hook is not None:
+            # The last batch of the run is still pending (a batch is flushed when
+            # the next one starts), so without this the final epoch is lost.
+            hook.close()
         # Stock train_seg returns (model_path, train_losses, test_losses); capture
         # defensively so a signature change can't break the run.
+        returned_train_losses = (
+            _loss_list(result[1])
+            if isinstance(result, (tuple, list)) and len(result) >= 3
+            else []
+        )
+        # The live curve against train_seg's own: `measured` only when they agree.
+        # Reconciled regardless of the metrics selection, because the question is
+        # whether the hook reproduces cellpose's arithmetic, not whether the caller
+        # asked for a loss curve.
+        epoch_basis = epoch_progress.agreement(
+            tracker.epoch_losses, returned_train_losses
+        )
         train_losses, test_losses = [], []
         if (
             "loss" in metrics_requested
             and isinstance(result, (tuple, list))
             and len(result) >= 3
         ):
-            train_losses, test_losses = _loss_list(result[1]), _loss_list(result[2])
+            train_losses, test_losses = returned_train_losses, _loss_list(result[2])
             # Stock train_seg validates under a HARDCODED cadence guard — not a
             # configurable interval: `if iepoch == 5 or iepoch % 10 == 0` in
             # cellpose/train.py at 4.2.1.1, with no parameter to change it. Off-cadence
@@ -403,11 +466,20 @@ def main(session_id: str) -> None:
                 want_pixel="pixel" in metrics_requested,
                 want_instance="instance" in metrics_requested,
             )
-        # train_seg has no early stopping and only checkpoints after the full
-        # range(n_epochs) loop, so a COMPLETED cellpose run ran exactly the
-        # requested epochs; a truncated run never checkpoints → never COMPLETED.
-        # Hence the count is a floor guaranteed only by COMPLETED, not a measured
-        # value (basis="floor_if_completed") — cellpose exposes no per-epoch counter.
+        # How many epochs ran, and what kind of number that is. The hook counts the
+        # epochs whose batches it SAW, so when it fired that count is an observation
+        # and survives a FAILED run — a run that died in epoch 3 of 10 reports 3
+        # rather than nothing. Without the hook the old floor stands: train_seg has
+        # no early stopping and only checkpoints after the full range(n_epochs)
+        # loop, so a COMPLETED run ran exactly the requested epochs and a truncated
+        # one never checkpoints, making the count a guaranteed lower bound rather
+        # than a measurement (basis="floor_if_completed").
+        measured_epochs = tracker.epochs_completed if hook is not None else 0
+        if measured_epochs:
+            epochs_done, epochs_basis = measured_epochs, epoch_progress.BASIS_MEASURED
+        else:
+            epochs_done = p["n_epochs"] if ok else None
+            epochs_basis = "floor_if_completed" if ok else None
         training.write_status(
             session_id,
             status="COMPLETED" if ok else "FAILED",
@@ -424,8 +496,16 @@ def main(session_id: str) -> None:
             # drift is visible here rather than looking like a run that simply never
             # reported, which is the same empty `epochs` either way.
             epoch_progress_unparsed=progress.unparsed,
-            n_epochs_completed=p["n_epochs"] if ok else None,
-            n_epochs_completed_basis="floor_if_completed" if ok else None,
+            epochs=recorder.rows(),
+            last_reported_epoch=recorder.last_epoch,
+            # `measured` means the live per-epoch curve was checked against the one
+            # train_seg returned and matched it; `measured_unreconciled` means it was
+            # reported live and did NOT match, so the published curve is train_seg's
+            # and the live one is not to be trusted; `unavailable` means no epoch was
+            # observed at all.
+            epoch_progress_basis=epoch_basis,
+            n_epochs_completed=epochs_done,
+            n_epochs_completed_basis=epochs_basis,
             cell_diameters=cell_diameters,
             metrics_requested=metrics_requested,
             train_losses=train_losses,
@@ -435,6 +515,10 @@ def main(session_id: str) -> None:
         )
     except Exception as e:
         stop.set()
+        # How far it got is the most useful thing a failed run can say, and the
+        # hook knows it even though train_seg returned nothing. Reported with its
+        # basis so it is not mistaken for the requested count.
+        crashed_after = tracker.epochs_completed if hook is not None else 0
         training.write_status(
             session_id,
             status="FAILED",
@@ -442,6 +526,16 @@ def main(session_id: str) -> None:
             traceback=traceback.format_exc()[-2500:],
             end_time=time.time(),
             terminated_by="child",
+            epochs=recorder.rows(),
+            last_reported_epoch=recorder.last_epoch,
+            **(
+                {
+                    "n_epochs_completed": crashed_after,
+                    "n_epochs_completed_basis": epoch_progress.BASIS_MEASURED,
+                }
+                if crashed_after
+                else {}
+            ),
         )
         raise
 
