@@ -934,6 +934,48 @@ def non_local_stems(entries: Dict[str, Dict[str, Any]], stems: List[str]) -> Lis
     )
 
 
+def ngff_source_of(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The readable remote OME-Zarr source behind an image entry, or ``None``.
+
+    ``None`` covers three different situations on purpose — a materialised image, an
+    entry with no source at all, and a source of some other kind — because every
+    caller treats them the same way: there is no store to read chunks from. A caller
+    that needs to tell them apart has the entry.
+
+    ``store_root`` is required rather than merely declared: an ``ngff`` source with
+    no root is a broken entry, and returning it would push the failure down to
+    whoever tried to fetch from an empty URL.
+    """
+    if not isinstance(entry, dict) or image_entry_is_local(entry):
+        return None
+    source = entry.get("source") or {}
+    if not isinstance(source, dict):
+        return None
+    if source.get("kind") != NGFF_SOURCE_KIND or not source.get("store_root"):
+        return None
+    return source
+
+
+def stems_without_a_readable_source(
+    entries: Dict[str, Dict[str, Any]], stems: List[str]
+) -> List[str]:
+    """Sorted stems that can be neither presigned nor read as a remote store.
+
+    This is the set that genuinely cannot feed a training run. It is narrower than
+    :func:`non_local_stems`, which also names every remote image — correct when the
+    consumer could only read a materialised file, and too wide once it can read a
+    region out of the source.
+    """
+    out = set()
+    for s in stems:
+        entry = entries.get(s)
+        if entry is None:
+            out.add(s)
+        elif not image_entry_is_local(entry) and ngff_source_of(entry) is None:
+            out.add(s)
+    return sorted(out)
+
+
 # ---------------------------------------------------------------------------
 # Materialisation (0.11.0, design §8)
 # ---------------------------------------------------------------------------

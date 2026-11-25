@@ -853,7 +853,7 @@ class AnnotationBroker:
         stems that are members of the split are included, partitioned by its
         train/test lists."""
         artifact_id = self._canonical_id(artifact_id)
-        self._require_role(context, artifact_id, "manager")
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         split = await self._read_split_or_raise(artifact_id, label, split_name)
         train_stems = set(split.get("train") or [])
         test_stems = set(split.get("test") or [])
@@ -895,15 +895,19 @@ class AnnotationBroker:
         # added here rather than left to KeyError at minting time.
         manifest = await self._image_manifest(artifact_id)
         stems = [p["stem"] for p in pairs]
-        unmaterialised = sorted(
-            set(core.non_local_stems(manifest, stems))
-            | {s for s in stems if s not in manifest}
-        )
-        if unmaterialised:
+        # A remote OME-Zarr source is now trainable: the consumer reads the annotated
+        # region's chunks out of the store instead of needing a whole file here. So
+        # the refusal narrows to stems that can be neither presigned nor read — an
+        # unknown stem, or an entry with no readable source. Refusing every remote
+        # image, as this did, is what made a whole-slide source untrainable, since
+        # materialising one means the browser reading its full level 0.
+        unreadable = core.stems_without_a_readable_source(manifest, stems)
+        if unreadable:
             raise ValueError(
-                f"Split '{split_name}' contains {len(unmaterialised)} image(s) with no "
-                f"file in the artifact: {', '.join(unmaterialised)}. Open each one in "
-                f"the annotator once to materialise it, then retry."
+                f"Split '{split_name}' contains {len(unreadable)} image(s) that can "
+                f"neither be read from the artifact nor from a remote source: "
+                f"{', '.join(unreadable)}. Open each one in the annotator once, then "
+                f"retry."
             )
 
         sem = asyncio.Semaphore(16)
@@ -914,19 +918,53 @@ class AnnotationBroker:
                     artifact_id=artifact_id, file_path=file_path, stage=True
                 )
 
+        # Only a materialised image has a file to presign; a remote one is handed
+        # over as its store instead, so it must not reach _mint at all — the entry
+        # carries no "path" and indexing it would KeyError.
+        for p in pairs:
+            p["kind"] = (
+                "file"
+                if core.image_entry_is_local(manifest.get(p["stem"]))
+                else core.NGFF_SOURCE_KIND
+            )
         image_urls, geojson_urls = await asyncio.gather(
-            asyncio.gather(*[_mint(manifest[p["stem"]]["path"]) for p in pairs]),
+            asyncio.gather(
+                *[
+                    _mint(manifest[p["stem"]]["path"])
+                    for p in pairs
+                    if p["kind"] == "file"
+                ]
+            ),
             asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs]),
         )
-        train_out: List[Dict[str, str]] = []
-        test_out: List[Dict[str, str]] = []
-        for p, img_url, geo_url in zip(pairs, image_urls, geojson_urls):
-            row = {
+        minted = iter(image_urls)
+        train_out: List[Dict[str, Any]] = []
+        test_out: List[Dict[str, Any]] = []
+        for p, geo_url in zip(pairs, geojson_urls):
+            # `kind` is on every row, including the file ones, so a consumer branches
+            # on a field that is always there rather than on whether a key is absent.
+            row: Dict[str, Any] = {
                 "stem": p["stem"],
                 "user": p["user"],
-                "image_url": img_url,
+                "kind": p["kind"],
                 "geojson_url": geo_url,
             }
+            if p["kind"] == "file":
+                row["image_url"] = next(minted)
+            else:
+                source = core.ngff_source_of(manifest.get(p["stem"])) or {}
+                store_root = source.get("store_root") or ""
+                credential = (meta.get("ngff_credentials") or {}).get(store_root)
+                # Spliced in HERE, after the role check, and never stored in the
+                # artifact — the same rule the annotate path follows.
+                row["source"] = {
+                    "kind": core.NGFF_SOURCE_KIND,
+                    "store_root": core.apply_store_credential(store_root, credential),
+                    "multiscale_path": source.get("multiscale_path"),
+                    # In level-0 pixels, and null for a source imported whole. The
+                    # consumer must confine its read to this.
+                    "region": source.get("region"),
+                }
             (test_out if p["stem"] in test_stems else train_out).append(row)
         return {
             "train": train_out,
