@@ -1406,6 +1406,32 @@ class AnnotationBroker:
             "content_hint": hashlib.sha256(
                 json.dumps(group["attrs"], sort_keys=True).encode("utf-8")
             ).hexdigest()[:16],
+            # The layout, for a caller that reads pixels itself.
+            #
+            # All four are already computed above, so returning them costs no extra
+            # request: ``dataset_paths`` and ``axes`` come from the one
+            # ``parse_ngff_multiscales`` call, ``axis_roles`` from the
+            # ``ngff_axis_roles`` call that ``dims`` needed, and ``level0_shape`` is
+            # the level-0 array metadata already parsed for the dtype and codec
+            # checks.
+            #
+            # WHY EXPOSE THEM. Slicing a crop out of a remote store needs the level-0
+            # dataset path and which axis is x and which is y. Without these a caller
+            # has to parse ``multiscales`` for itself, and this parsing is already
+            # duplicated once — ``parse_ngff_multiscales`` and ``ngff_axis_roles``
+            # both say they mirror ``ngffLayout.ts``. A third copy is how the three
+            # drift, and the one that drifts is the one nobody renders with, so it
+            # drifts silently. Returning the interpretation keeps one of them
+            # authoritative.
+            #
+            # This is metadata, not pixels. The no-pixel rule this app keeps (see
+            # ``materialise_image``: "The broker never touches a pixel, which is what
+            # keeps a 200 MB read off the worker") is about reads of image data; it is
+            # not weakened by handing back a path and two axis indices.
+            "dataset_paths": list(parsed["dataset_paths"]),
+            "axes": list(parsed["axes"]),
+            "axis_roles": dict(roles),
+            "level0_shape": [int(n) for n in full["shape"]],
         }
 
     @bioengine.method(context=True)

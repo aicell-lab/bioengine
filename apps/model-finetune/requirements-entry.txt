@@ -6,4 +6,10 @@ imageio>=2.37.0
 tifffile
 Pillow
 httpx
+# Reads one region of a remote OME-Zarr store instead of downloading the whole
+# image (ngff_region.py). ENTRY ONLY, on purpose: the two GPU runtimes pin numpy
+# irreconcilably (cellpose 1.26.4 vs micro-sam's python-elf >=2), and the crop is
+# read where image references are already resolved, so neither runtime needs it.
+# Measured with pip --dry-run against this file: adds donfig + numcodecs + zarr.
+zarr
 pyyaml

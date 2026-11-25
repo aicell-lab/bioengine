@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 import bioengine
 import busy
 import httpx
+
+import ngff_region
 import numpy as np
 import yaml
 from hypha_rpc import connect_to_server
@@ -812,6 +814,24 @@ class EntryApp:
         return await asyncio.to_thread(iio.imread, buffer)
 
     async def _resolve_image(self, source: Union[np.ndarray, str]) -> np.ndarray:
+        # A region reference is read BEFORE the string path, and only its own
+        # shape routes it here: `is_region_source` requires a mapping carrying
+        # kind="ngff" and a store_root, so every existing caller — array, URL or
+        # artifact path — falls through untouched.
+        #
+        # WHY THE CALLER SUPPLIES THE LAYOUT rather than this app asking the
+        # broker for it. The entry talks to `public/artifact-manager` and to
+        # nothing else today; calling annotation-broker from here would make
+        # training depend on that app being deployed and reachable, for metadata
+        # the caller already holds — it got `dataset_paths`, `axis_roles` and
+        # `level0_shape` from `probe_ngff_source` when it imported the source.
+        # So the reference carries the layout beside the region, and a caller
+        # that omits it is refused BY NAME in `read_region` rather than having a
+        # 2D no-channel layout guessed for it.
+        if ngff_region.is_region_source(source):
+            return await asyncio.to_thread(
+                ngff_region.read_region, source, dict(source)
+            )
         if isinstance(source, str):
             return await self._load_image_from_source(source)
         if isinstance(source, np.ndarray):
@@ -1466,9 +1486,12 @@ class EntryApp:
     @bioengine.method
     async def start_training(
         self,
-        train_images: List[Union[np.ndarray, str]] = Field(
+        train_images: List[Union[np.ndarray, str, Dict[str, Any]]] = Field(
             ...,
-            description="Training images: arrays, http(s) URLs, or get_upload_url paths.",
+            description="Training images: arrays, http(s) URLs, get_upload_url paths, "
+            "or an OME-Zarr region reference {kind: 'ngff', store_root, region: "
+            "{x,y,width,height}, dataset_paths, axis_roles, level0_shape} — the last "
+            "reads only that region's chunks from the source, never the whole image.",
         ),
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
@@ -1476,8 +1499,8 @@ class EntryApp:
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
             "needs DENSE labels — annotate all objects per image.",
         ),
-        val_images: Optional[List[Union[np.ndarray, str]]] = Field(
-            None, description="Optional validation images."
+        val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
+            None, description="Optional validation images; same forms as train_images."
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
             None, description="Validation labels."

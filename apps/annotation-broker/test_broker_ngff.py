@@ -638,6 +638,46 @@ class TestProbeNgffSourceRpc:
         assert prober._state["manifest"] is None
         assert prober._state["committed"] == 0
 
+    async def test_it_reports_the_store_layout_for_a_caller_that_reads_pixels(
+        self, prober
+    ):
+        """The probe already parses ``multiscales`` and resolves the axis roles;
+        returning them lets model-finetune read one region of this store without
+        parsing OME-NGFF a third time.
+
+        Why a third: ``parse_ngff_multiscales`` and ``ngff_axis_roles`` both say
+        they mirror ``ngffLayout.ts``, so two implementations already have to
+        agree. A copy inside another app drifts, and the copy that drifts is the
+        one nobody renders with.
+        """
+        out = await prober.probe_ngff_source(ROOT, context=None)
+        # The fixture store is a v0.4 two-level pyramid, axes (c, y, x),
+        # level 0 = (3, 600, 800).
+        assert out["dataset_paths"] == ["0", "1"]
+        assert out["axes"] == ["c", "y", "x"]
+        assert out["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+        assert out["level0_shape"] == [3, 600, 800]
+        # Still metadata only: no pixel was read into the broker to produce it.
+        assert prober._state["manifest"] is None
+        assert prober._state["committed"] == 0
+
+    async def test_the_reported_layout_agrees_with_the_reported_extent(self, prober):
+        """The tie that stops the new keys drifting from the old ones.
+
+        ``width``/``height`` were already trusted by every existing caller.
+        Indexing ``level0_shape`` with ``axis_roles`` has to reproduce them, or
+        one of the two is wrong and a crop would be taken from the wrong axis —
+        which is exactly the failure that would NOT show up as an error, only as
+        a transposed image.
+        """
+        out = await prober.probe_ngff_source(ROOT, context=None)
+        shape, roles = out["level0_shape"], out["axis_roles"]
+        assert shape[roles["x"]] == out["width"]
+        assert shape[roles["y"]] == out["height"]
+        # And the roles must point inside the array they describe.
+        assert len(shape) == len(out["axes"])
+        assert all(0 <= roles[k] < len(shape) for k in ("y", "x"))
+
     async def test_the_credential_is_used_but_not_returned(self, prober):
         tokened = "https://ov.example/t/secret-123/zarr/ds1/"
         prober._http.objects = {
