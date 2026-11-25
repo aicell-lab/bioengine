@@ -510,3 +510,45 @@ def test_the_RELEASE_does_not_delete_a_SUCCESSORS_mutex(run_dir, monkeypatch):
     assert mutex.stat().st_ino == successor_ino, (
         "the mutex at the path is no longer the successor's file"
     )
+
+
+def test_an_ABANDONED_lock_is_reaped_when_the_FILE_CLOCK_RUNS_AHEAD(run_dir, monkeypatch):
+    """The store's clock is not this process's clock, and the lock must not care.
+
+    On an NFS share, mtime is set by the SERVER. Measured on the de.NBI export
+    2026-11-25 from inside a pod: a file stamped with `os.utime(path, None)`
+    came back with an mtime 78.6 seconds AHEAD of the caller's `time.time()`.
+
+    A staleness test written as `time.time() - st_mtime` then reads every lock
+    as taken in the future, so no abandoned lock is ever reaped and every
+    subsequent writer waits out the whole timeout and raises. That is not
+    theoretical: on the share, before this was fixed, all 18 writes of a 6
+    writer x 3 trial run died with RunRecordLockTimeout -- one of them
+    reporting the lock as "held for -18.5s" -- and the lock file was left
+    behind. The same tests on local disk were green throughout, because there
+    the two clocks are one clock.
+
+    Simulated by moving the clock the CODE reads, which is the production shape:
+    file mtimes come from the real clock, `time.time()` is behind it.
+    """
+    SKEW = 79.0
+    real_time = time.time
+    monkeypatch.setattr(training.time, "time", lambda: real_time() - SKEW)
+    monkeypatch.setattr(training, "RECORD_LOCK_STALE_S", 1.0)
+    monkeypatch.setattr(training, "RECORD_LOCK_WAIT_S", 8.0)
+
+    (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+    mutex = run_dir / training.RECORD_LOCK_NAME
+    mutex.write_text("dead holder")
+    # Abandoned well beyond the window, by the clock that stamps files.
+    old = real_time() - 60.0
+    os.utime(mutex, (old, old))
+
+    training.write_status(SID, phase="after the reap")
+
+    rec = json.loads((run_dir / "status.json").read_text())
+    assert rec.get("phase") == "after the reap", (
+        "the abandoned lock was never judged stale, so the write never "
+        f"happened: {rec}"
+    )
+    assert rec.get("status") == "TRAINING", rec

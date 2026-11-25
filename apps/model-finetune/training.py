@@ -352,22 +352,26 @@ def read_status(session_id: str) -> Dict[str, Any]:
 
 # The mutex a writer holds while merging a record.
 #
-# ⚠ NOT flock, and not fcntl.lockf. MEASURED on the de.NBI share these replicas
-# actually use (an NFSv3 mount): both raise OSError errno 37, "No locks
-# available" -- the server offers no lock manager -- so a flock-based merge
-# would not merely fail to exclude, it would RAISE on every write and take out
-# every run operation on that worker. A control in the same probe lost 299 of
-# 600 increments with no lock at all, so the processes genuinely race there.
+# ⚠ NOT flock, and not fcntl.lockf -- and the reason is portability across
+# mounts, not that they always fail. Two measurements on the same de.NBI NFSv3
+# export disagree, and both are reported here because the disagreement is the
+# point:
 #
-# What DID hold on that mount, 600 of 600: os.link(). Creating a unique file
-# and linking it to a well-known name is atomic even over NFSv3, and fails with
-# EEXIST when somebody else holds it. That is the classic NFS-safe mutex and it
-# works on a local filesystem too, so there is one code path rather than two.
+#     flock  -> ENOLCK on one mount, SUCCEEDED on the worker pod's mount
+#     lockf  -> ENOLCK on one mount, SUCCEEDED on the worker pod's mount
+#     link   -> 600/600, and EEXIST when held, on both
+#     none   -> 301/600   (the control: the processes genuinely race)
 #
-#     flock  -> ENOLCK (child died)
-#     lockf  -> ENOLCK (child died)
-#     link   -> 600/600
-#     none   -> 301/600   (the control: the race is real)
+# Whether the NFS client was mounted with locking is a property of the pod spec,
+# and a Serve replica is a KubeRay pod in another namespace with its own mount
+# -- so the replica's answer is not the worker's answer. A lock that RAISES
+# ENOLCK on every write would take out every run operation on that replica, and
+# which replicas those are is not knowable from here.
+#
+# os.link() needs no lock manager: creating a unique file and linking it to a
+# well-known name is atomic over NFSv3 and fails with EEXIST when somebody holds
+# it. It is the classic NFS-safe mutex, it held on both mounts, and it works on
+# a local filesystem too, so there is one code path rather than two.
 RECORD_LOCK_NAME = ".status.mutex"
 
 # How long a mutex may be held before another writer treats it as abandoned.
@@ -413,6 +417,31 @@ _TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
 _TERMINATED_BY = {"entry": 1, "supervisor": 2, "child": 3, "user_stop": 4}
 
 
+def _store_age(reference: Path, target: os.stat_result) -> float:
+    """Seconds between *target*'s mtime and now, measured by the STORE's clock.
+
+    Never `time.time() - st_mtime`. On the NFS share these replicas use, mtime
+    is set by the SERVER, and the server's clock is not this process's.
+    Measured on the de.NBI share 2026-11-25: a file stamped with
+    `os.utime(path, None)` came back with an mtime **78.6 seconds in the
+    future** relative to the caller's `time.time()`.
+
+    That skew is fatal to a staleness test built on the local clock, in both
+    directions. Ahead, as measured, every lock looks like it was taken in the
+    future, no abandoned lock is EVER reaped, and every later writer waits out
+    `RECORD_LOCK_WAIT_S` and raises. Behind, every live lock looks ancient and
+    the mutex excludes nothing. Measured on the share before this fix: 18 of 18
+    writes lost to `RunRecordLockTimeout`, one reporting the mutex as "held for
+    -18.5s", and the lock file left behind.
+
+    *reference* must be a file on the SAME store whose mtime was just stamped,
+    so both sides of the subtraction come from one clock and the skew cancels.
+    The acquire loop stamps its unique file immediately before each attempt, so
+    it already has one.
+    """
+    return reference.stat().st_mtime - target.st_mtime
+
+
 def _reap_stale_mutex(run_dir: Path, mutex: Path, unique: Path, judged_ino: int) -> bool:
     """Replace a stale mutex with THIS writer's lock. True if we now hold it.
 
@@ -455,7 +484,7 @@ def _reap_stale_mutex(run_dir: Path, mutex: Path, unique: Path, judged_ino: int)
         os.link(unique, claim)
     except FileExistsError:
         try:
-            if time.time() - claim.stat().st_mtime > RECORD_LOCK_STALE_S:
+            if _store_age(unique, claim.stat()) > RECORD_LOCK_STALE_S:
                 claim.unlink()  # the reaper that claimed it died mid-reap
         except (FileNotFoundError, OSError):
             pass
@@ -495,8 +524,8 @@ def _record_mutex(run_dir: Path, session_id: str):
     """Hold the run's mutex for the duration of the block.
 
     `os.link` of a unique file onto a well-known name: atomic on NFSv3, where
-    flock and lockf both raise ENOLCK on the share these replicas use. See the
-    note above `RECORD_LOCK_NAME` for the measurement.
+    unlike flock and lockf, it needs no lock manager -- which one mount of this
+    share does not offer. See the note above `RECORD_LOCK_NAME`.
 
     An abandoned mutex older than `RECORD_LOCK_STALE_S` is reaped and the
     acquisition retried, because nothing releases a link-based lock when its
@@ -554,7 +583,7 @@ def _record_mutex(run_dir: Path, session_id: str):
                     judged = mutex.stat()
                 except FileNotFoundError:
                     continue  # released between the link and the stat
-                age = time.time() - judged.st_mtime
+                age = _store_age(unique, judged)
                 if age > RECORD_LOCK_STALE_S:
                     if _reap_stale_mutex(run_dir, mutex, unique, judged.st_ino):
                         break  # the reap replaced it with OUR lock
