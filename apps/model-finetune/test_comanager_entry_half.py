@@ -24,6 +24,7 @@ thing under test is the wiring in `entry.py`: which permissions document reaches
 
 import asyncio
 import json
+import pathlib
 
 import pytest
 
@@ -362,3 +363,106 @@ async def test_a_CO_MANAGER_may_resume_the_same_run(monkeypatch, tmp_path):
         raise AssertionError(f"a dataset co-manager was refused a resume: {exc}")
     except Exception:
         pass
+
+
+# ── resuming really does continue from the prior checkpoint ──────────────────
+#
+# Review's finding 2: the live harness counted a RETURN as a pass, against a
+# run that had no checkpoint -- so "continued from A's weights" and "quietly
+# started from the base model" looked identical to it. They are not identical
+# in the code, and these tests say which is which.
+
+
+def _run_with(root, sid, *, checkpoint: bool, model_type="cpsam"):
+    d = root / sid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "status.json").write_text(json.dumps({"status": "COMPLETED", "owner": "u"}))
+    (d / "training_params.json").write_text(json.dumps({"model_type": model_type}))
+    if checkpoint:
+        # cpsam -> <dir>/models/model, per checkpoint_path's backend split.
+        (d / "models").mkdir(exist_ok=True)
+        (d / "models" / "model").write_bytes(b"not really weights, but present")
+    return d
+
+
+@pytest.fixture()
+def runs_root(tmp_path, monkeypatch):
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(training, "sessions_root", lambda: root)
+    monkeypatch.setattr(training, "session_dir", lambda sid: root / sid)
+    import re as _re
+
+    monkeypatch.setattr(training, "SESSION_ID_PATTERN", _re.compile(r"\A[\w.-]+\Z"))
+    return root
+
+
+def test_the_resolved_checkpoint_POINTS_AT_THE_PRIOR_RUN(runs_root, monkeypatch):
+    """What "resumed from A" means concretely: A's file, not the base model."""
+    _run_with(runs_root, "prior-run", checkpoint=True)
+    monkeypatch.setattr(
+        training, "session_backend", lambda sid, status=None: "cellpose"
+    )
+    cls, inst = _app(FakeArtifactManager({}))
+    resolved = cls._session_checkpoint(inst, "prior-run")
+    assert "prior-run" in resolved, resolved
+    assert pathlib.Path(resolved).exists(), resolved
+
+
+def test_resuming_a_run_with_NO_CHECKPOINT_RAISES_rather_than_starting_from_base(
+    runs_root, monkeypatch
+):
+    """THE ONE THAT ANSWERS THE FINDING.
+
+    If a missing checkpoint were tolerated, a resume would silently train a
+    fresh model and report success -- indistinguishable, from outside, from
+    having continued. It is not tolerated: the resolution raises, so the run
+    fails and says why. That is what makes a *successful* resume evidence that
+    the weights were loaded, which the live harness could not establish on its
+    own.
+    """
+    _run_with(runs_root, "unfinished-run", checkpoint=False)
+    monkeypatch.setattr(
+        training, "session_backend", lambda sid, status=None: "cellpose"
+    )
+    cls, inst = _app(FakeArtifactManager({}))
+    with pytest.raises(FileNotFoundError, match="No trained checkpoint"):
+        cls._session_checkpoint(inst, "unfinished-run")
+
+
+def test_the_RESUME_PATH_calls_that_resolution_rather_than_defaulting(runs_root):
+    """The link between the two tests above and the code that runs.
+
+    A resolution that raises helps only if the resume path actually calls it on
+    every resume. Read from the source: inside the branch that handles
+    resume_session_id, checkpoint_path must be assigned from
+    _session_checkpoint, with no fallback that would let a missing file through.
+    """
+    import ast as _ast
+    import pathlib as _pathlib
+
+    src = _pathlib.Path(__file__).with_name("entry.py").read_text()
+    tree = _ast.parse(src)
+    target = None
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            if node.name == "_run_training":
+                target = node
+                break
+    assert target is not None, "_run_training not found"
+    branch_src = ""
+    for node in _ast.walk(target):
+        if isinstance(node, _ast.If):
+            test_src = _ast.get_source_segment(src, node.test) or ""
+            if test_src.strip() == "resume_id":
+                branch_src = _ast.get_source_segment(src, node) or ""
+                break
+    assert branch_src, "no `if resume_id:` branch in _run_training"
+    assert "_session_checkpoint(" in branch_src, (
+        "the resume branch no longer resolves the prior checkpoint through "
+        "_session_checkpoint, so a missing one may no longer raise"
+    )
+    assert "except" not in branch_src, (
+        "the resume branch now swallows an exception; a missing checkpoint "
+        "could fall through to training from the base model"
+    )
