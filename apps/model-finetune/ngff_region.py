@@ -25,6 +25,7 @@ that once let three skipped cases pass for a guard.
 from __future__ import annotations
 
 import re
+from collections.abc import MutableMapping as _MutableMapping
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 NGFF_SOURCE_KIND = "ngff"
@@ -430,13 +431,138 @@ def read_region(
     return to_hw_or_hwc(data, probe["axis_roles"], len(shape))
 
 
+class ShortStoreRead(RegionSourceError):
+    """A store object arrived shorter than the server said it would be.
+
+    Its own class because the response differs from a malformed reference: this is
+    a transfer that failed silently, and retrying it may well succeed.
+    """
+
+
+class LengthCheckedStore(_MutableMapping):
+    """A read-only Zarr store that supplies bytes and refuses a short body.
+
+    zarr keeps ALL of its indexing and decoding. This hands it the bytes for one
+    key and checks a single thing: that the body is as long as the server said it
+    would be.
+
+    **The measured reason it exists.** A chunk truncated mid-transfer decodes
+    WITHOUT raising, to the full chunk shape, with wrong content — and the first
+    pixels still match the source, so looking at the crop passes it. Both layers
+    were measured and both are blind: the decompressor does not notice, and the
+    HTTP layer underneath zarr does not notice either, even when the response
+    declares the full length. ``Content-Length`` is the last point at which the
+    truncation is still visible, which is why the check is here, on the BYTES, and
+    not on the image.
+
+    A mismatch raises with the KEY and both lengths and never the URL: the store
+    root carries the credential as a path segment.
+    """
+
+    def __init__(self, root: str, fetch: Optional[Any] = None) -> None:
+        self._root = root if root.endswith("/") else root + "/"
+        self._fetch = fetch or _http_fetch
+
+    def __getitem__(self, key: str) -> bytes:
+        try:
+            status, body, declared = self._fetch(self._root + str(key))
+        except ShortStoreRead as exc:
+            # The transport caught it first — which is the common case and the
+            # stronger one. Re-raise as this module's error WITH the key, so the
+            # message names what failed rather than only how.
+            raise ShortStoreRead(
+                redact_store_credential(f"store key {key!r}: {exc}")
+            ) from None
+        if status == 404:
+            # Zarr omits a chunk that is entirely the fill value, so absence is
+            # data and must arrive as KeyError rather than as an error.
+            raise KeyError(key)
+        if not 200 <= int(status) < 300:
+            raise RegionSourceError(
+                redact_store_credential(f"store key {key!r} returned HTTP {status}")
+            )
+        want: Optional[int]
+        try:
+            want = int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            want = None
+        if want is not None and len(body) != want:
+            raise ShortStoreRead(
+                redact_store_credential(
+                    f"store key {key!r} arrived with {len(body)} bytes but the "
+                    f"server declared {want}: the transfer was cut short. A "
+                    f"truncated chunk decodes to the right shape with the wrong "
+                    f"pixels, so it is refused here rather than trained on."
+                )
+            )
+        return body
+
+    def __contains__(self, key: object) -> bool:
+        try:
+            self[str(key)]
+        except KeyError:
+            return False
+        return True
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        raise RegionSourceError("this store is read-only")
+
+    def __delitem__(self, key: str) -> None:
+        raise RegionSourceError("this store is read-only")
+
+    def __iter__(self):
+        # Listing is NOT supported, and saying so is deliberate: zarr addresses
+        # `.zarray` and each chunk key directly when opening an array read-only. A
+        # store that answered an empty listing instead would turn "I cannot list"
+        # into "there is nothing here", which is the silent-wrong-answer shape this
+        # whole class exists to prevent.
+        raise NotImplementedError("this store does not support listing")
+
+    def __len__(self) -> int:
+        raise NotImplementedError("this store does not support listing")
+
+
+def _http_fetch(url: str):
+    """GET a store key, returning ``(status, body, declared_length)``.
+
+    httpx is lazy here for the same reason zarr is: this module is imported by a
+    path that must stay importable without the heavier stack.
+
+    **httpx is chosen over the client zarr would use by default, and that choice is
+    the protection.** Measured: with zarr's own HTTP store a body cut short of its
+    declared length is accepted silently and the crop comes back wrong, while httpx
+    raises on exactly that. Its error is converted here so the failure belongs to
+    this module and goes through the redactor — an httpx error can quote the URL it
+    tried, and the store root carries the credential.
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(url, timeout=60.0, follow_redirects=True)
+    except httpx.RemoteProtocolError as exc:
+        # "peer closed connection without sending complete message body
+        # (received N bytes, expected M)" — the truncation, named by the transport.
+        raise ShortStoreRead(redact_store_credential(str(exc))) from None
+    except httpx.HTTPError as exc:
+        raise RegionSourceError(
+            redact_store_credential(f"{type(exc).__name__}: {exc}")
+        ) from None
+    return resp.status_code, resp.content, resp.headers.get("Content-Length")
+
+
 def _zarr_opener(store_root: str, array_path: str) -> Any:
     """Open one array inside a remote Zarr group, read-only.
 
     Imported lazily: see this module's docstring on why zarr must not be a
     module-level import here.
+
+    The array is opened through :class:`LengthCheckedStore` rather than by URL, so
+    zarr does its own indexing over bytes that have been checked against the
+    length the server declared.
     """
     import zarr
 
     root = store_root if store_root.endswith("/") else store_root + "/"
-    return zarr.open_array(root + array_path, mode="r")
+    return zarr.open_array(
+        store=LengthCheckedStore(root + array_path), mode="r"
+    )
