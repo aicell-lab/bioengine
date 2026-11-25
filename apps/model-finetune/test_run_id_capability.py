@@ -48,8 +48,10 @@ OPEN_TO_ANY_HOLDER = frozenset(
     }
 )
 
-# NOT a third opinion, a third STATE: ungated today, and nobody has ruled that
-# it should be.
+# NOT a third opinion, a third STATE: ungated today, and SCHEDULED to be
+# restricted. The ruling exists -- these two are to be bound to the export's
+# creator, in a change of their own -- so this set records work that has not
+# shipped, not a question nobody has answered.
 #
 # An earlier version of this file put these two in OPEN_TO_ANY_HOLDER and
 # described an export handle as safe to pass around. That was wrong on the
@@ -60,10 +62,10 @@ OPEN_TO_ANY_HOLDER = frozenset(
 # weights, which is the thing the restricted set exists to protect, and
 # freezing it as "open" asserted a decision nobody had taken.
 #
-# They stay here, matching what the code does today, until that is ruled on.
-# Gating them is a behaviour change and belongs with the gate's own row, not
-# with a documentation change.
-UNGATED_PENDING_A_RULING = frozenset({"get_export_status", "push_export"})
+# They stay here, matching what the code does today, until that change ships.
+# Restricting them alters behaviour on a surface the page polls, so it belongs
+# in its own change rather than in a documentation one.
+UNGATED_UNTIL_RESTRICTED = frozenset({"get_export_status", "push_export"})
 
 OWNER_OR_ADMIN = frozenset(
     {
@@ -129,7 +131,7 @@ def test_EVERY_run_keyed_method_is_on_exactly_one_side():
     identifier or requires the owner. Adding one without saying which fails
     here, which is the only moment anybody is reliably forced to decide.
     """
-    declared = OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_PENDING_A_RULING
+    declared = OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_UNTIL_RESTRICTED
     undeclared = set(RUN_KEYED) - declared
     assert undeclared == set(), (
         f"these methods take a run identifier and are on neither side: "
@@ -138,15 +140,15 @@ def test_EVERY_run_keyed_method_is_on_exactly_one_side():
     )
     for a, b in (
         (OPEN_TO_ANY_HOLDER, OWNER_OR_ADMIN),
-        (OPEN_TO_ANY_HOLDER, UNGATED_PENDING_A_RULING),
-        (OWNER_OR_ADMIN, UNGATED_PENDING_A_RULING),
+        (OPEN_TO_ANY_HOLDER, UNGATED_UNTIL_RESTRICTED),
+        (OWNER_OR_ADMIN, UNGATED_UNTIL_RESTRICTED),
     ):
         assert not (a & b), "a method cannot be in two of the three sets"
 
 
 def test_the_declared_sets_do_not_name_methods_that_no_longer_EXIST():
     """The other direction, so a rename cannot leave a set asserting nothing."""
-    missing = (OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_PENDING_A_RULING) - set(
+    missing = (OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_UNTIL_RESTRICTED) - set(
         METHODS
     )
     assert (
@@ -242,13 +244,14 @@ def test_the_TUTORIAL_says_it_too_where_the_id_is_first_obtained():
     )
 
 
-@pytest.mark.parametrize("name", sorted(UNGATED_PENDING_A_RULING))
+@pytest.mark.parametrize("name", sorted(UNGATED_UNTIL_RESTRICTED))
 def test_the_UNRULED_methods_are_in_fact_ungated_today(name):
     """Records the state, not an endorsement of it.
 
-    If somebody gates these, this test fails and the fix is to move the method
-    into OWNER_OR_ADMIN and update the documentation -- not to delete the
-    assertion. That is the whole difference between this set and the open one.
+    When the change that restricts these lands, this test fails -- and the fix
+    is to move the method into OWNER_OR_ADMIN and update the README with it,
+    not to delete the assertion. Failing at that moment is the point: it is
+    what stops the documentation and the behaviour drifting apart.
     """
     node, _params = METHODS[name]
     assert not _calls_the_gate(node), (
@@ -334,8 +337,14 @@ def test_the_RESUME_gate_is_applied_to_the_RESUMED_run_not_the_new_one():
 def test_the_README_warns_that_an_EXPORT_HANDLE_is_the_weights():
     readme = pathlib.Path(__file__).with_name("README.md").read_text().lower()
     assert "download_url" in readme, "the README does not name download_url"
-    for phrase in ("export handle", "not yet decided"):
+    for phrase in ("export handle", "will be restricted"):
         assert phrase in readme, f"the README does not say {phrase!r}"
+    assert "not yet decided" not in readme, (
+        "the README still calls the export-handle policy undecided. It was "
+        "decided -- restrict them -- and a test that pins the older wording "
+        "freezes a statement nobody ratified, which is the failure this file "
+        "exists to prevent."
+    )
 
 
 def test_the_TUTORIAL_warns_about_the_export_handle_too():

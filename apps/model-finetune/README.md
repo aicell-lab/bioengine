@@ -89,7 +89,7 @@ The line is not "touches the weights" — it is whether the call **hands out or 
 
 ⚠ **An export handle is not a progress token — treat it as the weights themselves.** `export_model` is restricted, but the `export_id` it returns is not: a READY export record carries `download_url`, a presigned link anyone can fetch the packaged weights from for six hours, plus `resume_checkpoint_file`. So handing somebody an `export_id` "so they can watch the progress" hands them the model. Do not share one; share the run identifier instead if you want somebody to see the run or try its model.
 
-Whether those two calls should require the owner, the way `export_model` does, is **not yet decided** — today they do not, and that is recorded here as the current behaviour rather than as a judgement that it is right.
+Those two calls **will be restricted** to the export's creator, or to a holder of `rw`/admin on `bioimage-io`, the way `export_model` already is. Until that ships they are not restricted, which is why the warning above stands: today an export handle really does hand over the weights to anyone holding it.
 
 For the per-caller run listing, and what an id does and does not grant, see `list_training_sessions` under Methods below; that paragraph is the authoritative one and this section does not restate it.
 
