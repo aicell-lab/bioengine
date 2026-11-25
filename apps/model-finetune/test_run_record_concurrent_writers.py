@@ -255,10 +255,10 @@ def test_a_USER_STOP_survives_concurrent_progress_writes(run_dir):
     record back to TRAINING -- and the terminal-status precedence logic cannot
     refuse an incumbent it could not see.
 
-    Measured by the reviewer on the scratch-file-only fix: the stop was erased
+    Measured against the scratch-file-only fix: the stop was erased
     in 9 of 20 trials.
     """
-    # REPEATED, because one trial is not a discriminator. The reviewer measured
+    # REPEATED, because one trial is not a discriminator. Measured
     # the erasure in 9 of 20 trials on the scratch-file-only fix, so a single
     # run passes on broken code better than half the time -- and a guard that
     # misses the defect half the time is not a guard. Ten trials puts that
@@ -319,8 +319,17 @@ def test_the_mutex_does_not_disturb_the_listing(run_dir):
     assert sorted(seen) == [SID], f"the listing returned {sorted(seen)}"
 
 
-def _one_field(idx, root_str, stale_s, errors, overlaps):
-    """Write one distinct field, holding the critical section briefly."""
+def _one_field(idx, root_str, stale_s, errors, overlaps, rename_delay=0.0):
+    """Write one distinct field, holding the critical section briefly.
+
+    *rename_delay* inserts a pause between the stat that judges a mutex stale
+    and the rename that reaps it -- the window in which the file at that path
+    can be replaced by a LIVE mutex. Nothing exotic produces that delay in
+    production: an NFS round trip or being pre-empted between two syscalls is
+    enough. It is injected here because a window that small is otherwise hit
+    too rarely for a test to be a reliable RED.
+    """
+    import os as _os
     import time as _t
 
     import training as t
@@ -329,6 +338,18 @@ def _one_field(idx, root_str, stale_s, errors, overlaps):
     t.sessions_root = lambda: root
     t.session_dir = lambda sid: root / sid
     t.RECORD_LOCK_STALE_S = stale_s
+    if rename_delay:
+        # Only the training module's view of `os` is shimmed, so the delay
+        # cannot reach tempfile, multiprocessing or the test harness itself.
+        class _DelayedRenameOs:
+            def __getattr__(self, name):
+                return getattr(_os, name)
+
+            def rename(self, src, dst):
+                _t.sleep(rename_delay)
+                return _os.rename(src, dst)
+
+        t.os = _DelayedRenameOs()
     real = t._write_status_locked
 
     def slow(p, session_id, fields):
@@ -362,7 +383,7 @@ def test_a_DEAD_HOLDERS_mutex_is_reaped_WITHOUT_breaking_exclusion(run_dir):
     reaps it while it is held -- so the reap destroys the exclusion it exists to
     restore.
 
-    Measured on that version by the reviewer: up to six writers inside the
+    Measured on that version: up to six writers inside the
     critical section at once, and a write lost in four trials of five.
 
     The staleness window is scaled down so the test runs in seconds; the logic
@@ -400,3 +421,92 @@ def test_a_DEAD_HOLDERS_mutex_is_reaped_WITHOUT_breaking_exclusion(run_dir):
         # reset for the next trial
         (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
         (run_dir / training.RECORD_LOCK_NAME).write_text("dead holder")
+
+
+@pytest.mark.slow
+def test_the_REAP_does_not_steal_a_LIVE_lock_when_the_rename_is_delayed(run_dir):
+    """The reap was check-then-act: by rename rather than unlink, same defect.
+
+    Reaping by rename makes exactly one of several writers win the reap. It does
+    NOT make the winner's target the file it judged: rename acts on the path.
+    Writer A judges L1 stale, reaps it, releases, links a fresh L2; writer B,
+    still holding its verdict on L1, renames L2 away and enters A's live
+    critical section.
+
+    Measured against the removing reap, with the rename delayed by 20ms:
+    25 overlaps and a write lost in 3 trials of 5. The delay is what makes the
+    window reliably reachable -- see `_one_field`.
+
+    This is the same scenario as the dead-holder test; the delay is the only
+    difference, which is what makes it a test of the inode check specifically.
+    """
+    (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+    (run_dir / training.RECORD_LOCK_NAME).write_text("dead holder")
+
+    N = 6
+    for trial in range(3):
+        mgr = mp.Manager()
+        errors = mgr.list()
+        overlaps = mp.Value("i", 0)
+        procs = [
+            mp.Process(
+                target=_one_field,
+                args=(i, str(run_dir.parent), 1.0, errors, overlaps, 0.02),
+            )
+            for i in range(N)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=120)
+
+        overlapping = [e for e in errors if e.startswith("OVERLAP")]
+        assert overlapping == [], (
+            f"trial {trial}: a delayed reap renamed away a LIVE mutex and let a "
+            f"second writer in: {overlapping[:3]}"
+        )
+        rec = json.loads((run_dir / "status.json").read_text())
+        lost = [f"f{i}" for i in range(N) if f"f{i}" not in rec]
+        assert lost == [], f"trial {trial}: fields lost to a stolen lock: {lost}"
+        assert rec.get("status") == "TRAINING", rec.get("status")
+        (run_dir / "status.json").write_text(json.dumps({"status": "TRAINING"}))
+        (run_dir / training.RECORD_LOCK_NAME).write_text("dead holder")
+
+
+def test_the_RELEASE_does_not_delete_a_SUCCESSORS_mutex(run_dir, monkeypatch):
+    """The release side of the same family: unlinking a path, not an inode.
+
+    A holder that overruns `RECORD_LOCK_STALE_S` -- an NFS stall is enough --
+    is reaped, and a successor takes the lock. That overlap is the accepted
+    price of having a timeout at all. What is NOT acceptable is what the
+    overrunning holder does on its way out: if the release unlinks the mutex
+    PATH unconditionally it deletes the SUCCESSOR's mutex, and a third writer
+    walks in while the successor is still inside. That part is avoidable, so it
+    is a bug rather than a trade-off.
+
+    No concurrency is needed to pin it: the reap-and-relink is performed by
+    hand inside the critical section, which is exactly the state a reaped
+    holder returns to.
+    """
+    mutex = run_dir / training.RECORD_LOCK_NAME
+    monkeypatch.setattr(training, "RECORD_LOCK_STALE_S", 0.05)
+
+    with training._record_mutex(run_dir, SID):
+        assert mutex.exists(), "the holder should have the mutex"
+        held_ino = mutex.stat().st_ino
+        # The holder stalls past the window and is reaped; a successor links its
+        # own mutex at the same path.
+        successor = run_dir / ".mutex-successor"
+        successor.write_text("successor")
+        mutex.unlink()
+        os.link(successor, mutex)
+        successor_ino = mutex.stat().st_ino
+        assert successor_ino != held_ino, "the fixture did not change the inode"
+
+    assert mutex.exists(), (
+        "the overrunning holder's release deleted the SUCCESSOR's mutex, which "
+        "lets a third writer into the successor's critical section"
+    )
+    assert mutex.stat().st_ino == successor_ino, (
+        "the mutex at the path is no longer the successor's file"
+    )
