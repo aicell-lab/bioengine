@@ -1591,6 +1591,18 @@ class EntryApp:
             None,
             description="Continue fine-tuning from a prior session's checkpoint (same model_type).",
         ),
+        dataset_artifact_id: Optional[str] = Field(
+            None,
+            description="The dataset artifact this run is trained on, e.g. "
+            "'my-workspace/my-dataset'. Recorded on the run, and it decides who may "
+            "COLLABORATE on it: the run's owner always, plus anyone who owns or manages "
+            "this dataset, so a colleague can list the run and continue training from its "
+            "checkpoint. It does NOT widen stopping, exporting or contributing, which stay "
+            "with the run's owner and `bioimage-io` administrators. You must own or manage "
+            "the dataset you name — naming one you do not is refused, so a run cannot be "
+            "placed into another team's listing. Omit it for a private run with no "
+            "collaborators.",
+        ),
         init_checkpoint: Optional[str] = Field(
             None,
             description="Start fine-tuning from an existing checkpoint given as an "
@@ -1657,20 +1669,45 @@ class EntryApp:
                 "they select different starting checkpoints."
             )
 
-        # Resuming reads ANOTHER RUN'S CHECKPOINT, so it is gated like the other
-        # calls keyed by a session id: the run's own caller, or a `bioimage-io`
-        # admin. It does not CHANGE the other run, which is why it is not a
-        # mutating call -- but it takes that run's trained weights and continues
-        # from them, so the resulting model derives from a checkpoint the caller
-        # was never granted. "You shared the id so you shared the history" is a
-        # far easier thing to accept than "you shared the id so you shared the
-        # weights", and only the first is the documented position.
+        # A claimed dataset is VERIFIED before it is recorded. Without this a
+        # caller could name any dataset id and have their run appear in that
+        # team's listing — not a privilege escalation, since the run is their
+        # own, but a way to put arbitrary content in front of people who never
+        # agreed to see it. Checked before the session directory exists, so a
+        # refused claim leaves nothing behind.
+        if dataset_artifact_id:
+            if not await self._caller_managed_datasets([dataset_artifact_id], context):
+                raise training.NotTheOwner(
+                    "dataset_artifact_id names a dataset you do not own or manage; "
+                    "a run can only be attached to a dataset you manage"
+                )
+
+        # Resuming reads ANOTHER RUN'S CHECKPOINT and continues from it, so the
+        # resulting model DERIVES from weights the caller did not train. That is
+        # why it is gated at all despite changing nothing on the other run.
+        #
+        # It is gated by ACCESS, not by ownership: the run's owner, a MANAGER OF
+        # ITS DATASET, or an administrator. Wider than stop/export/contribute on
+        # purpose — continuing a colleague's training is what a shared dataset is
+        # for, while disposing of their run is not. Note the consequence for the
+        # documented position: "you shared the id so you shared the history" is
+        # still true, but a dataset's managers can now also build on each other's
+        # weights, which the id alone never permitted.
         #
         # Checked BEFORE the session directory exists and before anything else,
         # so a refused resume leaves no PREPARING session behind and reveals
         # nothing about whether the named run exists.
         if resume_session_id:
-            training.require_caller_may_mutate(resume_session_id, context)
+            prior_dataset = training.read_status(resume_session_id).get(
+                training.DATASET_FIELD
+            )
+            training.require_caller_may_resume_run(
+                resume_session_id,
+                context,
+                writable_datasets=await self._caller_managed_datasets(
+                    [prior_dataset] if prior_dataset else [], context
+                ),
+            )
 
         # Before the session dir exists, so a bad name fails the call outright
         # rather than leaving a PREPARING session behind.
@@ -1733,6 +1770,17 @@ class EntryApp:
             # at creation because it cannot be recovered later: nothing else on
             # the record says whose work it was.
             **training.caller_identity(context),
+            # Which dataset this run belongs to, and so who may collaborate on
+            # it. Recorded at creation for the same reason as the owner: nothing
+            # else on the record says it, and it is VERIFIED above, so what is
+            # stored is a dataset the caller actually manages rather than a
+            # claim. Absent when the caller named none, which leaves the run
+            # private to its owner.
+            **(
+                {training.DATASET_FIELD: dataset_artifact_id}
+                if dataset_artifact_id
+                else {}
+            ),
             model_type=model_type,
             backend=backend,
             label=label,
@@ -1943,6 +1991,11 @@ class EntryApp:
         connection — so it sees the runs it started on that connection and no
         others.
 
+        A run also comes back to a MANAGER of the dataset it was trained on: a
+        run's collaborators are its dataset's managers, so a colleague can pick
+        up where another left off. That is listing and resuming only — stopping,
+        exporting and contributing stay with the owner.
+
         `context=True` is load-bearing and not decoration: without it the proxy
         forwards no context, `training.list_sessions` reads no identity, and the
         honest consequence of that is an EMPTY listing for everybody. That is
@@ -1951,7 +2004,57 @@ class EntryApp:
         """
         import training
 
-        return training.list_sessions(context)
+        writable = await self._caller_managed_datasets(
+            training.dataset_ids_on_disk(), context
+        )
+        return training.list_sessions(context, writable_datasets=writable)
+
+    async def _caller_managed_datasets(self, dataset_ids, context) -> frozenset:
+        """Which of *dataset_ids* this caller owns or manages.
+
+        Resolved ONCE per listing and passed down, rather than per run: the
+        permission check is an artifact-manager round trip and the listing is a
+        synchronous loop over every run on disk. One RPC per run would be 261 of
+        them per call on the production store, and could not be expressed inside
+        a `def` anyway.
+
+        **Fails closed per artifact, not per call.** A dataset that cannot be
+        read — deleted, renamed, permissions withheld, the artifact-manager
+        down — is simply not in the returned set, so its runs stay invisible to
+        anyone but their owner and an administrator. One unreadable dataset must
+        not decide the answer for the others, and an unreadable one must never
+        read as permitted.
+
+        Short-circuits to empty when there is nothing to ask about, which is the
+        common case today: no run recorded a dataset before this feature, so a
+        worker full of older runs makes no RPCs at all.
+        """
+        import training
+
+        if not dataset_ids or not isinstance(context, dict):
+            return frozenset()
+        try:
+            am = await self._hypha.get_service("public/artifact-manager")
+        except Exception as exc:
+            print(
+                "[model-finetune] could not reach the artifact manager to resolve "
+                f"dataset managers; no co-manager access this call ({exc})",
+                flush=True,
+            )
+            return frozenset()
+        managed = set()
+        for artifact_id in dataset_ids:
+            try:
+                artifact = await am.read(artifact_id=artifact_id)
+            except Exception:
+                # Deliberately not logged per artifact: a caller can name a
+                # dataset, so this is attacker-reachable and would be a log
+                # amplifier. The closed outcome is the whole response.
+                continue
+            permissions = (artifact.get("config") or {}).get("permissions") or {}
+            if training.caller_manages_dataset(permissions, context):
+                managed.add(artifact_id)
+        return frozenset(managed)
 
     @bioengine.method(context=True)
     async def stop_training(

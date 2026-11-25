@@ -439,8 +439,9 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
 
     seen = {}
 
-    def spy(context):
+    def spy(context, *, writable_datasets=frozenset()):
         seen["context"] = context
+        seen["writable_datasets"] = writable_datasets
         return {"sentinel": {}}
 
     monkeypatch.setattr(training, "list_sessions", spy)
@@ -966,18 +967,22 @@ async def test_resuming_YOUR_OWN_run_gets_past_the_gate(runs):
     sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
     cls, inst = _entry()
     seen = []
-    real = training.require_caller_may_mutate
+    # Resume is gated by require_caller_may_RESUME_run, not by the mutate gate:
+    # a dataset's managers may continue a colleague's training, while stopping,
+    # exporting and contributing stay with the owner. Spying on the mutate gate
+    # here would pass vacuously -- it is never called on this path any more.
+    real = training.require_caller_may_resume_run
 
-    def spy(session_id, context):
+    def spy(session_id, context, **kw):
         seen.append(session_id)
-        return real(session_id, context)
+        return real(session_id, context, **kw)
 
-    training.require_caller_may_mutate = spy
+    training.require_caller_may_resume_run = spy
     try:
         with pytest.raises(Exception) as exc:
             await _start(cls, inst, sid, ctx(ME, anonymous=False))
     finally:
-        training.require_caller_may_mutate = real
+        training.require_caller_may_resume_run = real
     assert seen == [sid], f"the gate was not consulted for the resume: {seen}"
     assert not isinstance(exc.value, training.NotTheOwner)
 
