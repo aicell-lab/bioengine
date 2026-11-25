@@ -723,6 +723,64 @@ def run_names_on_disk() -> "tuple[List[str], List[str]]":
     return names, skipped
 
 
+# What an operator is shown about somebody else's run.
+#
+# An ALLOW-LIST, not a list of things to strip. `redact_private` removes `owner`
+# and `owner_anonymous`, and an earlier version of this view used it and then
+# claimed "nothing about whose it is". That was false: the record also carries
+# `dataset_artifact_id`, and a dataset the caller manages lives in the caller's
+# own workspace, so its id names them as surely as the owner field does. The
+# free-text `label` is a second such channel, and the next field somebody adds
+# would be a third. A strip-list has to be right about every field that exists
+# now and every field added later; an allow-list only has to be right about what
+# an operator needs.
+#
+# What an operator needs is: which run, what state, how long, and on which
+# backend -- enough to decide whether to stop it.
+OPERATOR_FIELDS = (
+    "session_id",  # how an operator stops it; the mapping key is not enough
+    #               for a caller holding one record on its own
+    "status",
+    "start_time",
+    "updated_at",
+    "end_time",
+    "elapsed_s",
+    "model_type",
+    "backend",
+    "n_epochs",
+    "n_epochs_completed",
+    "terminated_by",
+)
+
+
+def operator_view(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a run record down to what an operator may see, plus staleness.
+
+    `stale` is the second half of this, and it exists because a non-terminal
+    status is NOT the same as a running process. `get_status` sweeps a run to
+    STOPPED when it has gone quiet, but only from PREPARING or TRAINING --
+    QUEUED is deliberately exempt, so a run that was QUEUED when its replica
+    restarted stays QUEUED for ever. That is exactly the outlived-its-process
+    case this view exists for, and without a staleness mark an operator reading
+    the list sees a busy worker that is in fact idle: the inverse of the
+    blindness being fixed. A record whose status cannot be read at all is in
+    the same position.
+
+    Marked rather than dropped. A stale QUEUED record may be a genuinely stuck
+    run that somebody needs to see, and hiding it would reproduce the original
+    complaint in a new place.
+    """
+    out = {k: status[k] for k in OPERATOR_FIELDS if k in status}
+    state = status.get("status")
+    quiet_for = time.time() - status.get("updated_at", 0)
+    out["stale"] = bool(
+        state is None or state == "UNKNOWN" or quiet_for > STATUS_STALE_SECONDS
+    )
+    if out["stale"]:
+        out["stale_for_s"] = round(quiet_for, 1) if status.get("updated_at") else None
+    return out
+
+
 def non_terminal_runs() -> Dict[str, Dict[str, Any]]:
     """Every run on this worker that has NOT finished, keyed by session id.
 
@@ -733,11 +791,13 @@ def non_terminal_runs() -> Dict[str, Dict[str, Any]]:
     visible to nobody, while still occupying the worker. This reports those by
     LIFECYCLE rather than by ownership.
 
-    **Owners are redacted**, and that is the whole point of it being a separate
-    function rather than a widened listing. An operator needs to know that
-    something is running and which id to stop; they do not need to know whose it
-    is. Widening `list_sessions` instead would hand every owned run to every
-    administrator and undo a privacy rule that has a test pinning it.
+    **Each record is projected through `operator_view`**, an allow-list of the
+    fields an operator needs, which is the whole point of it being a separate
+    function rather than a widened listing. Stripping the owner fields is not
+    enough on its own -- `dataset_artifact_id` names a workspace, and so names
+    its owner -- which is why this projects rather than redacts. Widening
+    `list_sessions` instead would hand every owned run to every administrator
+    and undo a privacy rule that has a test pinning it.
 
     Read from the DISK, not from any in-memory task registry. A replica's
     `_training_tasks` dict is empty after a restart, which would miss precisely
@@ -753,7 +813,7 @@ def non_terminal_runs() -> Dict[str, Dict[str, Any]]:
         except InvalidSessionId:
             continue
         if status.get("status") not in _TERMINAL:
-            out[name] = redact_private(status)
+            out[name] = operator_view(status)
     return out
 
 

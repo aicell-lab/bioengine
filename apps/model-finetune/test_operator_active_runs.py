@@ -190,3 +190,132 @@ def test_the_ORDINARY_listing_is_still_narrow_for_an_administrator(runs):
     # ... and the operator surface still answers, so the assertion above is a
     # statement about the LISTING and not about the run being absent.
     assert sorted(training.non_terminal_runs()) == ["theirs"]
+
+
+@pytest.fixture()
+def operator_root(tmp_path, monkeypatch):
+    """A bare sessions root the projection tests write records into directly."""
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(training, "sessions_root", lambda: root)
+    monkeypatch.setattr(training, "session_dir", lambda sid: root / sid)
+    monkeypatch.setattr(training, "SESSION_ID_PATTERN", re.compile(r"\A[\w.-]+\Z"))
+    return root
+
+
+# ── what the operator view may and may not carry ─────────────────────────────
+
+
+def _write_run(root, sid, **fields):
+    d = root / sid
+    d.mkdir(parents=True, exist_ok=True)
+    rec = {"status": "TRAINING", "updated_at": time.time()}
+    rec.update(fields)
+    (d / "status.json").write_text(json.dumps(rec))
+    return d
+
+
+def test_the_operator_view_carries_NO_DATASET_ID_and_NO_LABEL(operator_root):
+    """The leak the owner-key check could not see.
+
+    Stripping `owner` and `owner_anonymous` left `dataset_artifact_id` in the
+    record. A dataset its manager owns lives in that manager's own workspace,
+    so the id names them -- which is the thing this view promised not to
+    publish. The free-text label is a second channel of the same kind.
+    """
+    _write_run(
+        operator_root,
+        "2026-11-25-100000-aaaaaaaa",
+        status="TRAINING",
+        owner="ws-user-someone/alice",
+        dataset_artifact_id="ws-user-anonymouz-abc/my-cells",
+        label="alice's third attempt at the mitochondria set",
+    )
+    out = training.non_terminal_runs()
+    rec = out["2026-11-25-100000-aaaaaaaa"]
+    for leaky in ("dataset_artifact_id", "label", "owner", "owner_anonymous"):
+        assert leaky not in rec, f"the operator view still carries {leaky!r}: {rec}"
+
+
+def test_the_operator_view_is_an_ALLOW_LIST_not_a_strip_list(operator_root):
+    """A field nobody thought about must not reach an operator.
+
+    This is the difference that matters: with a strip-list, a field added to
+    the record later arrives in the operator view by default and nothing fails.
+    """
+    _write_run(
+        operator_root,
+        "2026-11-25-100000-bbbbbbbb",
+        status="TRAINING",
+        some_future_field="a value nobody has considered yet",
+        contact_email="alice@example.org",
+    )
+    rec = training.non_terminal_runs()["2026-11-25-100000-bbbbbbbb"]
+    unexpected = set(rec) - set(training.OPERATOR_FIELDS) - {"stale", "stale_for_s"}
+    assert (
+        unexpected == set()
+    ), f"fields nobody allowed reached the operator view: {sorted(unexpected)}"
+
+
+def test_it_still_carries_what_an_OPERATOR_ACTUALLY_NEEDS(operator_root):
+    """THE CONTROL for the two tests above.
+
+    A projection that returned `{}` would satisfy both of them and be useless.
+    """
+    _write_run(
+        operator_root,
+        "2026-11-25-100000-cccccccc",
+        status="TRAINING",
+        start_time=time.time() - 60,
+        model_type="cpsam",
+    )
+    rec = training.non_terminal_runs()["2026-11-25-100000-cccccccc"]
+    for needed in ("status", "start_time", "model_type"):
+        assert needed in rec, f"an operator cannot act without {needed!r}: {rec}"
+
+
+# ── a non-terminal status is not a running process ───────────────────────────
+
+
+def test_a_long_QUEUED_run_is_marked_STALE(operator_root):
+    """The phantom case, and the one the stale sweep cannot reach.
+
+    `get_status` sweeps a quiet run to STOPPED only from PREPARING or TRAINING.
+    QUEUED is exempt on purpose, so a run that was QUEUED when its replica
+    restarted stays QUEUED for ever -- exactly the outlived-its-process case
+    this view exists for. Reported unmarked, it shows a busy worker that is
+    idle.
+    """
+    _write_run(
+        operator_root,
+        "2026-11-25-100000-dddddddd",
+        status="QUEUED",
+        updated_at=time.time() - 7 * 24 * 3600,
+    )
+    rec = training.non_terminal_runs()["2026-11-25-100000-dddddddd"]
+    assert rec["status"] == "QUEUED", "the sweep is not expected to move QUEUED"
+    assert rec["stale"] is True, f"a 7-day-old QUEUED run is not marked stale: {rec}"
+    assert rec["stale_for_s"] > 6 * 24 * 3600
+
+
+def test_a_FRESH_run_is_NOT_marked_stale(operator_root):
+    """THE CONTROL: a mark that is always set says nothing."""
+    _write_run(
+        operator_root,
+        "2026-11-25-100000-eeeeeeee",
+        status="TRAINING",
+        updated_at=time.time(),
+    )
+    rec = training.non_terminal_runs()["2026-11-25-100000-eeeeeeee"]
+    assert rec["stale"] is False, f"a run updated just now is marked stale: {rec}"
+
+
+def test_an_UNREADABLE_record_is_reported_but_marked(operator_root):
+    """A corrupt record arrives as status UNKNOWN; it must not read as busy."""
+    d = operator_root / "2026-11-25-100000-ffffffff"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "status.json").write_text("{ this is not json")
+    out = training.non_terminal_runs()
+    rec = out.get("2026-11-25-100000-ffffffff")
+    assert rec is not None, "an unreadable record vanished from the operator view"
+    assert rec["stale"] is True, f"an unreadable record is not marked stale: {rec}"

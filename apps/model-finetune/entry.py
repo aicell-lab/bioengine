@@ -2069,12 +2069,28 @@ class EntryApp:
         connection: the owner no longer exists to look, and the run is owned so
         no administrator may list it. It keeps occupying the worker regardless.
 
-        **Owners are redacted here too.** An operator needs to know that
-        something is running and which id to stop it by; they do not need to
-        know whose it is. That is why this is a separate call rather than a
-        loosened `list_training_sessions`: widening the administrator leg of
-        that one would hand every owned run to every administrator and undo a
-        privacy decision made on purpose, which a test pins.
+        **Each record is projected to an allow-list of operator fields** --
+        status, timings, backend and epoch counts -- rather than having its
+        owner fields stripped. An earlier version stripped `owner` and
+        `owner_anonymous` and claimed it said nothing about whose the run was;
+        that was false, because the record also carries `dataset_artifact_id`,
+        and a dataset its manager owns lives in that manager's own workspace,
+        so the id names them. The free-text label was a second such channel.
+        An allow-list has to be right only about what an operator needs; a
+        strip-list has to be right about every field anybody ever adds.
+
+        That is also why this is a separate call rather than a loosened
+        `list_training_sessions`: widening the administrator leg of that one
+        would hand every owned run to every administrator and undo a privacy
+        decision made on purpose, which a test pins.
+
+        **`stale` marks a record that is non-terminal but probably dead**, with
+        `stale_for_s` giving how long it has been quiet. A non-terminal status
+        is not a running process: the stale sweep in `get_status` only moves
+        PREPARING and TRAINING on, so a run that was QUEUED when its replica
+        restarted stays QUEUED for ever. Without the mark an operator would
+        read a busy worker that is in fact idle. Stale records are marked, not
+        hidden, because one of them may be a genuinely stuck run.
 
         Returns `{}` for anyone who is not a `bioimage-io` administrator --
         refusing rather than raising, because an operator surface should not
