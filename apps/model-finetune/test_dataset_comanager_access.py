@@ -291,25 +291,6 @@ def test_the_owner_may_still_mutate_their_own_run(runs):
 # ── the dataset scan that feeds the async resolver ───────────────────────────
 
 
-def test_dataset_ids_on_disk_returns_each_dataset_once(runs):
-    runs("a", OWNER, dataset=DATASET)
-    runs("b", COMANAGER, dataset=DATASET)
-    runs("c", OWNER, dataset=OTHER_DATASET)
-    runs("d", OWNER)
-    assert sorted(training.dataset_ids_on_disk()) == sorted({DATASET, OTHER_DATASET})
-
-
-def test_dataset_ids_on_disk_is_empty_when_no_run_names_one(runs):
-    """Today's production store, where nothing recorded a dataset. The resolver
-    short-circuits on this and makes no artifact calls at all."""
-    runs("a", OWNER)
-    runs("b", COMANAGER)
-    assert training.dataset_ids_on_disk() == []
-
-
-# ── the listing must not re-read what it has already read ────────────────────
-
-
 def test_the_listing_reads_each_run_record_ONCE(runs, monkeypatch):
     """A COST assertion, pinned because the regression is silent.
 
@@ -435,4 +416,60 @@ async def test_the_PUBLISHED_listing_reads_each_record_ONCE(runs, monkeypatch):
         f"the PUBLISHED listing read {len(calls)} records for 5 runs "
         f"({len(calls) / 5:.1f} each). One walk of the store is enough: the "
         "records and the dataset ids come back from the same scan."
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_PUBLISHED_listing_LOGS_a_stray_directory(runs, monkeypatch, capsys):
+    """The regression the single-scan change introduced.
+
+    `list_sessions` logs the directory names it skipped, and those names are
+    caller-controlled, so the log is their only trace. When the published
+    entry point began handing it pre-read records it stopped passing the
+    skipped names with them, so the scan found a stray directory and nobody
+    ever heard about it: a direct `list_sessions()` call still logged, which
+    is why the existing tests stayed green.
+    """
+
+    class _AM:
+        async def read(self, artifact_id):
+            return {"config": {"permissions": {}}}
+
+    class _Hypha:
+        async def get_service(self, name):
+            return _AM()
+
+    runs("run-ok", OWNER, dataset=DATASET)
+    # A name the id pattern REJECTS. The fixture relaxes the pattern to
+    # `[\w.-]+`, so a hyphenated name is a perfectly valid id there and would
+    # be listed rather than skipped -- which is how the first version of this
+    # test failed for the wrong reason.
+    stray = training.sessions_root() / "not a session"
+    stray.mkdir()
+    (stray / "status.json").write_text("{}")
+
+    import entry
+
+    cls = None
+    for obj in vars(entry).values():
+        if isinstance(obj, type) and obj.__name__ == "EntryApp":
+            cls = obj
+            break
+        inner = getattr(obj, "__wrapped_class__", None) or getattr(
+            obj, "func_or_class", None
+        )
+        if isinstance(inner, type) and inner.__name__ == "EntryApp":
+            cls = inner
+            break
+    assert cls is not None, "EntryApp not found"
+    inst = cls.__new__(cls)
+    inst._hypha = _Hypha()
+
+    capsys.readouterr()
+    await cls.list_training_sessions(inst, context=ctx(OWNER, anonymous=False))
+    printed = capsys.readouterr().out
+
+    assert "not a session" in printed, (
+        "the published listing skipped a stray directory without logging it; "
+        f"the name is caller-controlled and this log is its only trace. Got: {printed!r}"
     )

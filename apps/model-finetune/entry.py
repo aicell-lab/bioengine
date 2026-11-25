@@ -2008,10 +2008,13 @@ class EntryApp:
         # Asking for them separately read every record twice over on top of the
         # read inside `get_status` -- 3 per run, so 783 for the 261 runs on the
         # production store.
-        records, dataset_ids, _skipped = training.scan_runs_for_listing()
+        records, dataset_ids, skipped = training.scan_runs_for_listing()
         writable = await self._caller_managed_datasets(dataset_ids, context)
+        # `skipped` is passed on, not dropped: `list_sessions` logs the stray
+        # directory names it was handed, and those names are caller-controlled,
+        # so the log is their only trace.
         return training.list_sessions(
-            context, writable_datasets=writable, records=records
+            context, writable_datasets=writable, records=records, skipped=skipped
         )
 
     async def _caller_managed_datasets(self, dataset_ids, context) -> frozenset:

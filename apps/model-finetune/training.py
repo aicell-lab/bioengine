@@ -732,32 +732,6 @@ def run_names_on_disk() -> "tuple[List[str], List[str]]":
     return names, skipped
 
 
-def dataset_ids_on_disk() -> List[str]:
-    """Every distinct ``dataset_artifact_id`` recorded across the runs on disk.
-
-    Exists so the async entry point can resolve the caller's manageable
-    datasets in a number of artifact-manager round trips proportional to the
-    number of DATASETS, not the number of runs. Resolving per run would be one
-    RPC per run -- 261 of them on the production store -- on every listing.
-
-    Tolerant like the listing: a status that cannot be read contributes nothing
-    rather than raising. A run with no dataset contributes nothing, which today
-    is all of them.
-
-    Order is preserved and duplicates dropped, so the result is stable enough to
-    assert on in a test.
-    """
-    found: Dict[str, None] = {}
-    for name in run_names_on_disk()[0]:
-        try:
-            dataset = read_status(name).get(DATASET_FIELD)
-        except Exception:
-            continue
-        if isinstance(dataset, str) and dataset:
-            found.setdefault(dataset, None)
-    return list(found)
-
-
 def require_caller_may_resume_run(
     session_id: str, context: Any, *, writable_datasets: Any = frozenset()
 ) -> None:
@@ -861,6 +835,7 @@ def list_sessions(
     *,
     writable_datasets: Any = frozenset(),
     records: Optional[Dict[str, Dict[str, Any]]] = None,
+    skipped: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """The runs this caller may see, keyed by session id, owner redacted.
 
@@ -899,10 +874,16 @@ def list_sessions(
     out: Dict[str, Dict[str, Any]] = {}
     if records is not None:
         # Already read by `scan_runs_for_listing`; re-reading them here is the
-        # cost this parameter exists to avoid.
-        names, skipped = list(records), []
+        # cost this parameter exists to avoid. The names IT skipped have to be
+        # passed in with them: this function logs them, and a caller that
+        # supplies records but drops the skip list silently removes the only
+        # trace a stray directory leaves. That regressed once, when the single
+        # scan was introduced and the published entry point discarded them.
+        names = list(records)
+        skipped = list(skipped or [])
     else:
-        names, skipped = run_names_on_disk()
+        names, found_skipped = run_names_on_disk()
+        skipped = list(skipped or []) + found_skipped
     for name in names:
         try:
             status = (

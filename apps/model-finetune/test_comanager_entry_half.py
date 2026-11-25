@@ -199,7 +199,9 @@ async def test_the_LISTING_passes_only_the_RESOLVED_datasets_not_all_of_them(
     """
     seen = {}
 
-    def fake_list_sessions(context, *, writable_datasets=frozenset(), records=None):
+    def fake_list_sessions(
+        context, *, writable_datasets=frozenset(), records=None, skipped=None
+    ):
         seen["writable"] = writable_datasets
         return {}
 

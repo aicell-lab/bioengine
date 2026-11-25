@@ -439,7 +439,7 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
 
     seen = {}
 
-    def spy(context, *, writable_datasets=frozenset(), records=None):
+    def spy(context, *, writable_datasets=frozenset(), records=None, skipped=None):
         seen["context"] = context
         seen["writable_datasets"] = writable_datasets
         seen["records"] = records
