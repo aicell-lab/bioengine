@@ -366,6 +366,14 @@ async def _blob_from_the_real_builder(auto_redeploy):
     )
     b._build_env_vars = MagicMock(return_value={})
     b._build_submit_runtime_env = MagicMock(return_value={"env_vars": {}})
+    # Stubbed for the same reason as _introspect_via_ray_task above: build() submits Ray tasks to
+    # stage the app source on every alive node, and the real method calls ray.nodes(), which raises
+    # "Ray has not been started yet" with no cluster. This test's subject is the adoption blob, not
+    # staging — staging has its own guards in
+    # tests/apps/test_replica_runtime_env_excludes_download_token.py.
+    b._stage_source_on_nodes = AsyncMock(
+        return_value=[{"node_id": "n" * 56, "source": "/apps/x/source", "files": 3}]
+    )
     b._resolve_authorized_users = MagicMock(return_value=["*"])
     b._translate_kwargs_keys = MagicMock(
         side_effect=lambda kwargs, *a, **k: dict(kwargs or {})

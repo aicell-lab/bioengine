@@ -16,7 +16,11 @@ Reads its configuration from env_vars set by the BioEngine worker:
 * ``BIOENGINE_ARTIFACT_ID``             — artifact id (cache identity)
 * ``BIOENGINE_ARTIFACT_VERSION``        — committed version to materialise
 * ``BIOENGINE_ARTIFACT_FILES_URL``      — Hypha ``/files`` listing endpoint
-* ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` — read token (absent ⇒ anonymous/public)
+* ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN`` — read token, **only ever set in a Ray
+  task's env, never in a Serve replica's**: the worker's staging task receives it
+  as a task *argument* and applies it onto its own ``os.environ``. A replica
+  materialises from the already-staged directory instead and holds no
+  credential. Absent and a public artifact ⇒ anonymous read.
 
 Hypha is already a hard dependency (an app cannot register its service without
 it), so pulling source from Hypha at replica start adds no new availability
@@ -212,15 +216,72 @@ def _sync_source_from_hypha(
     )
 
 
+#: Set by the worker on the env it gives REPLICAS, once its staging tasks have materialised source
+#: on every alive node. Spelled out here rather than imported from the worker, for the same reason
+#: as the other keys in this module: the replica gets bioengine as raw source and must not import
+#: worker modules to learn one string.
+#:
+#: IT HAS TO BE AN EXPLICIT SIGNAL, not inferred from "source looks present". A committed artifact
+#: version is immutable, but a *staged* version is not and a deploy at "latest" can resolve to the
+#: same version string with changed content — which is why the worker also fingerprints the synced
+#: tree (``source_signature``). An unconditional "source exists and .version matches ⇒ use it"
+#: short-circuit therefore serves STALE code on a re-staged version, and that is not hypothetical:
+#: it broke three ``tests/_app/test_replica_init.py`` cases that assert incremental re-sync
+#: (changed timestamp, removed file, missing local file) the first time it was written that way.
+#:
+#: With the flag, the division is clean. A process that CAN sync (the worker's staging task, which
+#: holds the download token as a task argument) is never given the flag and always re-syncs. A
+#: process that CANNOT sync (a replica, which by design holds no credential) is given it and reads
+#: what the worker just staged for this exact deploy.
+_SOURCE_STAGED_KEY = "BIOENGINE_SOURCE_STAGED"
+
+
+def _is_staged(source: Path, version_marker: Path, identity: str) -> bool:
+    """Is ``source`` already a *complete* materialisation of ``identity``?
+
+    True iff the directory exists, is non-empty, and ``.version`` holds exactly
+    this ``<artifact_id>@<version>``.
+
+    **Completeness comes from the write ORDER, not from inspecting the tree.**
+    :func:`_sync_source_from_hypha` writes every file first and its caller
+    writes ``.version`` only after it returns, so a matching marker cannot
+    coexist with a half-populated tree. Checking file *counts* instead would be
+    the vacuous version of this test — an empty directory and a complete one
+    both "exist".
+
+    The non-empty check is belt-and-braces for a tree emptied by hand after the
+    marker was written; it is a cheap `any()`, not a full walk.
+    """
+    if not version_marker.is_file() or not source.is_dir():
+        return False
+    try:
+        if version_marker.read_text().strip() != identity:
+            return False
+    except OSError:
+        return False
+    return any(source.iterdir())
+
+
 def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     """Populate ``app_dir/source`` so it matches the artifact's ``version``.
 
     Backends, picked in order:
 
-    1. ``BIOENGINE_LOCAL_ARTIFACT_PATH`` — dev override, short-circuits to a
+    1. **Already staged**, and only when :data:`_SOURCE_STAGED_KEY` says the
+       worker staged it for this deploy. Needs **no credential**, which is the
+       whole point: it is what lets the per-replica ``runtime_env`` stop
+       carrying a download token (see
+       :meth:`bioengine.apps.builder.AppBuilder._stage_source_on_nodes`).
+    2. ``BIOENGINE_LOCAL_ARTIFACT_PATH`` — dev override, short-circuits to a
        locally-mounted artifact root.
-    2. ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional ``_DOWNLOAD_TOKEN``) —
+    3. ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional ``_DOWNLOAD_TOKEN``) —
        per-file incremental Hypha sync (:func:`_sync_source_from_hypha`).
+
+    Backend 1 is checked first so the credential-free path wins where it is
+    offered, and the flag is what stops it winning where it must not: without
+    it every caller keeps the previous behaviour of always re-syncing, so a
+    re-staged version or a redeploy at "latest" cannot be served stale. See
+    :data:`_SOURCE_STAGED_KEY`.
 
     A single ``fcntl`` lock per node serialises concurrent same-node starts.
     """
@@ -228,6 +289,13 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     version_marker = app_dir / ".version"
     snapshot_path = app_dir / ".source_snapshot.json"
     app_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact_id_for_identity = os.environ.get("BIOENGINE_ARTIFACT_ID", "")
+    identity_for_stage = f"{artifact_id_for_identity}@{version}"
+    staged_declared = bool(os.environ.get(_SOURCE_STAGED_KEY))
+    if staged_declared and _is_staged(source, version_marker, identity_for_stage):
+        logger.info(f"BioEngine: source already staged for {version} → {source}")
+        return source
 
     # Dev override: ``BIOENGINE_LOCAL_ARTIFACT_PATH`` points at a directory
     # holding ``<artifact_alias>/`` subdirs with the raw app sources.
@@ -255,18 +323,50 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     with open(lock_path, "w") as lock_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
+            # Another holder of the lock may have staged it while we waited.
+            if staged_declared and _is_staged(source, version_marker, identity):
+                logger.info(
+                    f"BioEngine: source staged by a concurrent start for "
+                    f"{version} → {source}"
+                )
+                return source
             files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
             if not files_url:
                 raise RuntimeError(
-                    "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
-                    "the app source. The worker is expected to populate it (and "
-                    "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
-                    "constructing the runtime_env for the task or deployment."
+                    "BIOENGINE_ARTIFACT_FILES_URL is not set, and no staged "
+                    "source was found at "
+                    f"{source} for {identity}; cannot materialise the app "
+                    "source. A replica reaches this only if the worker's "
+                    "staging step did not run for this node."
                 )
             token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
-            _sync_source_from_hypha(
-                files_url, version, token, source, snapshot_path, logger
-            )
+            try:
+                _sync_source_from_hypha(
+                    files_url, version, token, source, snapshot_path, logger
+                )
+            except Exception as exc:
+                if token:
+                    raise
+                # No staged source AND no credential. For a PUBLIC artifact the
+                # anonymous read above succeeds and we never get here, so this
+                # branch means a private artifact on a node the worker's staging
+                # step did not reach — a node that joined the cluster after the
+                # deploy, on a filesystem that is per-node rather than shared.
+                #
+                # It is raised with that diagnosis attached because the bare
+                # HTTP error is a 401/403 that reads like a broken token rather
+                # than like a missing stage, and the replica CANNOT self-heal:
+                # this hook runs before ``__init__``, which is exactly why the
+                # download token is not delivered through the proxy actor the
+                # way deploy-time secrets are.
+                raise RuntimeError(
+                    f"Could not materialise source for {identity}: no staged "
+                    f"copy at {source}, and the anonymous Hypha read failed "
+                    f"({exc}). The replica holds no download credential by "
+                    "design. If this node joined after the deploy and "
+                    "/home/bioengine is per-node rather than shared, redeploy "
+                    "the application so the worker stages source on it."
+                ) from exc
             version_marker.write_text(identity)
             return source
         finally:
