@@ -7,3 +7,10 @@ tifffile
 Pillow
 httpx
 pyyaml
+# Chunk decompression for reading a region out of a remote OME-Zarr, so training on
+# a region annotation costs the region rather than the whole image. numcodecs and
+# NOT zarr: the chunk indexing is already in ngff_region, so the decompressor is the
+# only part actually missing, and zarr would add its own indexing plus fsspec to
+# duplicate it. Imported lazily and only for a chunk that is compressed, so an
+# uncompressed store does not touch it at all.
+numcodecs
