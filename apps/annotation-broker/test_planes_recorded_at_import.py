@@ -141,59 +141,42 @@ def test_an_entry_without_a_plane_carries_no_planes_key_at_all():
     assert "planes" not in e["source"]
 
 
-def _import_ngff_image_body() -> str:
-    """The text of `import_ngff_image` from the FILE, not from `inspect`.
+# ── only NON-SPATIAL axes may carry a plane ──────────────────────────────────
 
-    `inspect.getsource` on this method is unreliable: the class is wrapped by
-    Ray Serve's `@deployment` and the methods by the app framework, so the
-    lookup can land on a wrapper and return a few hundred characters of
-    decorator instead of the method. That failure is invisible — the
-    assertions below would pass against text that is not the function — which
-    is why this reads the source file and slices the function out by name,
-    then proves the slice is the right one.
-    """
-    src = (pathlib.Path(__file__).parent / "broker.py").read_text()
-    start = src.find("    async def import_ngff_image(")
-    assert start > 0, "import_ngff_image not found in broker.py"
-    nxt = src.find("\n    async def ", start + 1)
-    body = src[start : nxt if nxt > 0 else len(src)]
-    assert len(body) > 2000, f"slice is implausibly short ({len(body)} chars)"
-    assert body.startswith("    async def import_ngff_image("), body[:60]
-    # One METHOD, checked at the method indent. The body legitimately contains
-    # nested `async def`s, so counting the bare keyword would be wrong -- it is
-    # 2 here, and asserting 1 made both tests in this file fail against correct
-    # code until the slice was printed.
-    assert body.count("\n    async def ") == 0, "the slice spans more than one method"
-    return body
+ROLES = {"t": None, "c": 1, "z": None, "y": 3, "x": 4}
 
 
-def test_the_import_path_validates_before_writing():
-    """THE WIRING. The validator and the parameter are each correct alone; this
-    pins that `import_ngff_image` actually calls one and passes the other, which
-    is the only reason either matters."""
-    body = _import_ngff_image_body()
-    assert "planes: Optional[Dict[str, int]] = Field(" in body, (
-        "import_ngff_image does not expose a `planes` parameter at all"
-    )
-    assert "core.normalise_planes(planes" in body, (
-        "import_ngff_image does not validate planes; a plane naming a missing "
-        "axis or an out-of-range index would reach the manifest and fail only "
-        "when somebody trained on it"
-    )
-    assert "planes=planes" in body, (
-        "import_ngff_image does not pass planes to remote_image_entry, so the "
-        "parameter would be accepted over RPC and silently dropped"
-    )
+@pytest.mark.parametrize("name,role", [("y", "y"), ("x", "x"), ("c", "c")])
+def test_a_plane_on_a_SPATIAL_or_CHANNEL_axis_is_refused(name, role):
+    """Measured consequence of accepting one: the reader keeps y and x whole
+    because they are the crop, and keeps the channel axis whole on purpose, so
+    `region_index` with planes={'z':4,'c':2,'y':5} returns
+    (0, slice(None), 4, slice(0,10), slice(0,10)) — the record says channel 2
+    and training reads every channel, with nothing reporting the difference."""
+    with pytest.raises(ValueError) as e:
+        core.normalise_planes({name: 0}, TCZYX, SHAPE, ROLES)
+    msg = str(e.value)
+    assert name in msg and role in msg, msg
+    assert "ignored" in msg or "read whole" in msg, msg
 
 
-def test_the_wiring_check_can_actually_fail():
-    """THE CONTROL on the test above. A text assertion over a slice is only
-    worth having if a missing call makes it fail, so this removes each call from
-    a COPY of the body and asserts the check would reject it."""
-    body = _import_ngff_image_body()
-    for needle in ("core.normalise_planes(planes", "planes=planes"):
-        assert needle in body
-        assert needle not in body.replace(needle, "", 1), (
-            f"removing {needle!r} from the body did not remove it, so the "
-            f"assertion keyed on it cannot fail"
-        )
+def test_a_plane_on_a_non_spatial_axis_is_still_accepted_with_roles_given():
+    """THE CONTROL for the three above. Without it, the refusal could be the
+    role check rejecting every plane rather than only the wrong ones."""
+    assert core.normalise_planes({"z": 4}, TCZYX, SHAPE, ROLES) == {"z": 4}
+    assert core.normalise_planes({"t": 0}, TCZYX, SHAPE, ROLES) == {"t": 0}
+
+
+def test_a_mixed_mapping_is_refused_whole_rather_than_partly_kept():
+    """{'z': 4, 'c': 1} must not quietly become {'z': 4}: a caller that sent a
+    channel believes the channel was recorded."""
+    with pytest.raises(ValueError):
+        core.normalise_planes({"z": 4, "c": 1}, TCZYX, SHAPE, ROLES)
+
+
+def test_absent_roles_forbid_nothing():
+    """A source that never recorded which axis is y cannot have a plane refused
+    for being y — the check is only as good as the layout, and inventing a role
+    would refuse legitimate planes on older imports."""
+    assert core.normalise_planes({"y": 5}, TCZYX, SHAPE, None) == {"y": 5}
+    assert core.normalise_planes({"c": 1}, TCZYX, SHAPE, {"c": None}) == {"c": 1}

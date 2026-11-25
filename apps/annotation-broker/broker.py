@@ -1616,7 +1616,9 @@ class AnnotationBroker:
         # the source does not have, or an index past its end, is refused at
         # import instead of being written into the manifest and failing later as
         # a training error.
-        planes = core.normalise_planes(planes, probe["axes"], probe["level0_shape"])
+        planes = core.normalise_planes(
+            planes, probe["axes"], probe["level0_shape"], probe["axis_roles"]
+        )
         # The entry's dimensions are the *patch's*, not the slide's. That one
         # choice is what makes a region cost nothing elsewhere: the 64 MiB
         # materialisation gate, the dataset index dims, the OME-TIFF that gets

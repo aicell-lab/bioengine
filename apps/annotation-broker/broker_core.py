@@ -821,7 +821,10 @@ def default_stem_from_store_root(root: str) -> str:
 
 
 def normalise_planes(
-    planes: Any, axes: Optional[List[str]], level0_shape: Optional[List[int]]
+    planes: Any,
+    axes: Optional[List[str]],
+    level0_shape: Optional[List[int]],
+    axis_roles: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, int]]:
     """A validated ``{axis_name: index}``, or ``None`` when none was given.
 
@@ -840,6 +843,22 @@ def normalise_planes(
 
     ``None`` rather than ``{}`` for an empty mapping, so an absent plane and an
     empty one cannot mean two things to a consumer.
+
+    **Only NON-SPATIAL axes may carry a plane, and that is enforced here rather
+    than left to the reader.** Measured: the reader keeps y and x whole (they are
+    the crop) and keeps the CHANNEL axis whole on purpose, so a recorded
+    ``{"c": 2}`` is silently ignored -- ``region_index`` with
+    ``planes={"z": 4, "c": 2, "y": 5}`` returns
+    ``(0, slice(None), 4, slice(0, 10), slice(0, 10))``. The record would then
+    say "channel 2" while training reads all three channels, with nothing
+    reporting the difference. That is precisely the "record that says something
+    training will not do" this validator exists to keep out of the manifest, so
+    a plane on y, x or c is REFUSED.
+
+    This matters concretely because the annotator sends the viewer's current
+    selection, and that selection can include a channel. Refusing it tells the
+    frontend to drop c from what it sends; accepting it would have the record
+    and the pixels disagree forever.
     """
     if not planes:
         return None
@@ -858,9 +877,29 @@ def normalise_planes(
             f"of {len(shape)} dimension(s) {shape!r}; planes cannot be resolved "
             f"against a layout that does not describe itself."
         )
+    # Axis roles map a role to an axis INDEX, so the forbidden NAMES are the
+    # names sitting at those indices. Absent roles forbid nothing: a source that
+    # does not say which axis is y cannot have a plane refused for being y.
+    forbidden: Dict[str, str] = {}
+    for role, idx in (axis_roles or {}).items():
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            continue
+        if 0 <= idx < len(names):
+            forbidden[names[idx]] = str(role)
+
     out: Dict[str, int] = {}
     for key, value in planes.items():
         name = str(key)
+        if name in forbidden:
+            role = forbidden[name]
+            raise ValueError(
+                f"planes names axis {name!r}, which is this source's "
+                f"{role!r} axis. A plane selects one slice of a NON-SPATIAL "
+                f"axis such as z or t; y and x are the crop, and the channel "
+                f"axis is read whole, so a plane on {name!r} would be recorded "
+                f"and then ignored -- the record would say one thing and "
+                f"training would do another."
+            )
         if name not in names:
             raise ValueError(
                 f"planes names axis {name!r}, which this source does not have. "
