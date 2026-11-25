@@ -309,12 +309,16 @@ def test_an_honest_206_is_NOT_refused(sharded):
         ("bytes=-8", "bytes 80-87/100", "suffix not at the end of the object"),
         ("bytes=10-19", None, "206 with no Content-Range at all"),
         ("bytes=10-19", "garbage", "unparsable Content-Range"),
+        # A SHORT suffix that ends at the last byte satisfies every other rule.
+        # Legitimate only if the object is smaller than the suffix, i.e. the
+        # whole object came back, i.e. it starts at 0. This one does not.
+        ("bytes=-10", "bytes 4107-4111/4112", "short suffix from the middle"),
     ],
 )
 def test_each_wrong_content_range_is_refused(requested, served, why):
     """The checker directly, so each disagreement is pinned rather than only the
     one shape a server happened to produce."""
-    n = 10 if requested == "bytes=10-19" else 8
+    n = {"bytes=10-19": 10, "bytes=-8": 8, "bytes=-10": 5}[requested]
     with pytest.raises(ngff_region.WrongRangeRead):
         ngff_region._check_content_range("k", requested, served, n)
 

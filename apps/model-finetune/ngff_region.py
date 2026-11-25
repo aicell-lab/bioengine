@@ -754,6 +754,19 @@ def _check_content_range(key: str, requested: str, content_range: Optional[str],
             refuse(f"a suffix range must end at the last byte ({total - 1})")
         if body_len > n:
             refuse(f"a suffix range of {n} bytes returned {body_len}")
+        if body_len < n and start != 0:
+            # FEWER bytes than a suffix asked for is legitimate in exactly one
+            # case: the object is smaller than the suffix, so the whole of it is
+            # the answer and it must therefore start at byte 0. Any other short
+            # suffix is the server choosing a different window — `bytes=-10`
+            # answered `bytes 4107-4111/4112` is 5 bytes from the middle of a
+            # 4112-byte object, which ends at the last byte and so satisfies
+            # every other rule here.
+            refuse(
+                f"only {body_len} of the {n} bytes asked for came back, and they "
+                f"start at {start} rather than 0, so the object is larger than "
+                f"the response and this is a different window"
+            )
     else:
         if start != int(a):
             refuse(f"it starts at {start}, not at {a}")
