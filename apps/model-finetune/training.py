@@ -990,13 +990,28 @@ def run_record(
     sid = validate_session_id(session_id)
     document = read_status(sid) if status is None else status
     try:
-        config = read_training_params(sid)
+        params = read_training_params(sid)
     except (OSError, ValueError):
-        config = None
+        params = None
+    # THE ALLOW-LIST, applied HERE as well as on the way out. A review found
+    # this missing and measured what it cost: the local listing filters the
+    # params through RUN_CONFIG_FIELDS, so one run read locally showed
+    # {model_type, n_epochs} while the same run read through a record showed
+    # train_images and init_checkpoint -- worker-local paths -- plus any field
+    # a later version adds to the params. The allow-list held on one replica
+    # and was bypassed on the other.
+    #
+    # Filtering at the WRITE means an excluded field never reaches the artifact
+    # at all, which matters because a published record outlives the code that
+    # wrote it. `status_from_record` filters again at the READ, so a record
+    # already written by an unfiltered version is contained too: one hop is not
+    # enough when the hops can be a year apart.
     return {
         "record_version": RUN_RECORD_VERSION,
         "session_id": sid,
-        "config": redact_urls(config) if config is not None else None,
+        "config": (
+            redact_urls(config_for_display(params)) if params is not None else None
+        ),
         "status": redact_urls(document or {}),
     }
 
@@ -1208,11 +1223,13 @@ def status_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     session_id = record.get("session_id")
     if not isinstance(st, dict) or not isinstance(session_id, str) or not session_id:
         return None
-    config = record.get("config")
+    # Filtered again on the way out. A record written by a version without the
+    # write-side filter still carries worker-local paths, and a reader that
+    # trusted the stored config would publish them.
     return shape_status(
         dict(st),
         session_id,
-        config=config if isinstance(config, dict) else {},
+        config=config_for_display(record.get("config")),
         checkpoint_available=False,
     )
 
@@ -1736,6 +1753,20 @@ RUN_CONFIG_FIELDS = (
 )
 
 
+def config_for_display(params: Any) -> Dict[str, Any]:
+    """The allow-listed view of a run's params. One definition, three callers.
+
+    `run_config` reads the params off local disk and projects them; the run
+    record projects them at the WRITE; `status_from_record` projects again at
+    the READ. All three go through this function, so the allow-list cannot hold
+    on one path and be bypassed on another -- which is exactly what happened
+    when the shared listing reported `record["config"]` unfiltered.
+    """
+    if not isinstance(params, dict):
+        return {}
+    return {k: params[k] for k in RUN_CONFIG_FIELDS if k in params}
+
+
 def run_config(session_id: str) -> Dict[str, Any]:
     """The run's configuration for display, restricted to :data:`RUN_CONFIG_FIELDS`.
 
@@ -1747,6 +1778,4 @@ def run_config(session_id: str) -> Dict[str, Any]:
         params = read_training_params(session_id)
     except Exception:
         return {}
-    if not isinstance(params, dict):
-        return {}
-    return {k: params[k] for k in RUN_CONFIG_FIELDS if k in params}
+    return config_for_display(params)

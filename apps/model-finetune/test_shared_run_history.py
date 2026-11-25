@@ -198,6 +198,23 @@ def _record_from_local(sid):
 
 
 def test_a_run_LISTED_BOTH_WAYS_comes_back_IDENTICAL(local):
+    # The params carry fields OUTSIDE the display allow-list, which is what
+    # the first version of this test lacked: with only allow-listed params it
+    # passed while the shared path was reporting the whole params document,
+    # worker-local paths included. A review measured that and named this test
+    # as the one that should have caught it.
+    (training.sessions_root() / "mine").mkdir(parents=True, exist_ok=True)
+    (training.sessions_root() / "mine" / "training_params.json").write_text(
+        json.dumps(
+            {
+                "model_type": "cpsam",
+                "n_epochs": 2,
+                "train_images": "/home/bioengine/apps/x/imgs",
+                "init_checkpoint": "/models/u1/ckpt.pth",
+                "a_field_added_next_year": "whatever",
+            }
+        )
+    )
     local("mine", ME, status="COMPLETED", updated_at=time.time(), start_time=1.0)
     rec = _record_from_local("mine")
 
@@ -211,6 +228,45 @@ def test_a_run_LISTED_BOTH_WAYS_comes_back_IDENTICAL(local):
         f"local-only keys {sorted(set(from_local) - set(from_shared))}, "
         f"shared-only keys {sorted(set(from_shared) - set(from_local))}"
     )
+
+
+def test_the_CONFIG_ALLOW_LIST_holds_on_the_SHARED_path_too(local):
+    """What the equality test above would miss if it were ever narrowed.
+
+    The local listing filters the params through RUN_CONFIG_FIELDS so that
+    worker-local paths and any field added later never reach a client.
+    Measured before this was fixed: the same run read locally gave
+    {model_type, n_epochs} and read through a record gave train_images,
+    init_checkpoint and a planted field as well.
+    """
+    (training.sessions_root() / "mine").mkdir(parents=True, exist_ok=True)
+    (training.sessions_root() / "mine" / "training_params.json").write_text(
+        json.dumps(
+            {
+                "model_type": "cpsam",
+                "n_epochs": 2,
+                "train_images": "/home/bioengine/apps/x/imgs",
+                "train_labels": "/home/bioengine/apps/x/labels",
+                "init_checkpoint": "/models/u1/ckpt.pth",
+                "pool_token": "A-TOKEN-THAT-MUST-NEVER-TRAVEL",
+            }
+        )
+    )
+    local("mine", ME, status="COMPLETED", updated_at=time.time())
+    rec = _record_from_local("mine")
+
+    # Not in the RECORD, so an excluded field never reaches the artifact.
+    assert set(rec["config"]) <= set(training.RUN_CONFIG_FIELDS), rec["config"]
+    assert "A-TOKEN-THAT-MUST-NEVER-TRAVEL" not in json.dumps(rec)
+
+    # And not in what a caller is handed, even from a record that carries them
+    # -- which is the case for any record an unfiltered version already wrote.
+    rec["config"]["train_images"] = "/home/bioengine/apps/x/imgs"
+    rec["config"]["pool_token"] = "A-TOKEN-THAT-MUST-NEVER-TRAVEL"
+    (training.sessions_root() / "mine" / "status.json").unlink()
+    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    assert set(out["config"]) <= set(training.RUN_CONFIG_FIELDS), out["config"]
+    assert "A-TOKEN-THAT-MUST-NEVER-TRAVEL" not in json.dumps(out)
 
 
 def test_a_STALE_shared_run_is_SWEPT_like_a_local_one(local):

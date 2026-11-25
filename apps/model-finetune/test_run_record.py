@@ -62,7 +62,18 @@ def _write(session_id, status=None, params=None):
         (d / "training_params.json").write_text(json.dumps(params))
 
 
-def test_a_presigned_url_keeps_its_path_and_loses_its_signature(session):
+def test_the_IMAGE_REFERENCES_ARE_NOT_IN_THE_RECORD_AT_ALL(session):
+    """STRONGER than the redaction this test used to assert, and the change is
+    deliberate.
+
+    It used to plant a presigned image URL in the params and check that the
+    query string was gone. The params are now projected through the display
+    allow-list before they are stored, so `train_images`, `train_labels`,
+    `val_images`, `val_labels` and `init_checkpoint` are not in the record in
+    any form -- there is no signature to redact because there is no URL. That
+    is what the local listing has always done, and a review found the shared
+    path bypassing it.
+    """
     _write(
         session,
         status={"status": "COMPLETED"},
@@ -71,18 +82,43 @@ def test_a_presigned_url_keeps_its_path_and_loses_its_signature(session):
                 "https://s3.example/bucket/img-1.tif?X-Amz-Signature=deadbeef&e=1",
                 "https://s3.example/bucket/img-2.tif",
             ],
+            "init_checkpoint": "/models/u1/ckpt.pth",
             "n_epochs": 5,
+            "model_type": "cpsam",
         },
     )
     rec = training.run_record(session)
-    urls = rec["config"]["train_images"]
-    assert urls[0] == "https://s3.example/bucket/img-1.tif?<redacted>"
-    assert "deadbeef" not in json.dumps(rec), "a signature survived into the record"
-    # A URL with no query string is untouched, so the redaction is not noise.
-    assert urls[1] == "https://s3.example/bucket/img-2.tif"
-    # And the path is kept: it identifies the object, which is what a reader needs.
-    assert "img-1.tif" in urls[0]
+    assert set(rec["config"]) == {"n_epochs", "model_type"}, rec["config"]
+    blob = json.dumps(rec)
+    assert "deadbeef" not in blob, "a signature survived into the record"
+    assert "img-1.tif" not in blob, "an image reference survived into the record"
+    assert "/models/u1/ckpt.pth" not in blob, "a worker-local path survived"
     assert rec["config"]["n_epochs"] == 5
+
+
+def test_a_presigned_url_in_an_ALLOW_LISTED_field_still_loses_its_signature(session):
+    """The redaction is not dead code after the allow-list: an allow-listed
+    field can carry a URL. `pool_provenance` is a free-form mapping recorded
+    with the run, so anything a caller put in it travels."""
+    _write(
+        session,
+        status={"status": "COMPLETED"},
+        params={
+            "model_type": "cpsam",
+            "pool_provenance": {
+                "dataset_artifact_id": "bioimage-io/x",
+                "source": "https://ov.example/zarr/ds1/?token=secret-123",
+            },
+        },
+    )
+    rec = training.run_record(session)
+    assert "secret-123" not in json.dumps(rec)
+    assert (
+        rec["config"]["pool_provenance"]["source"]
+        == "https://ov.example/zarr/ds1/?<redacted>"
+    )
+    # The path is kept, because it identifies the object.
+    assert "ds1" in rec["config"]["pool_provenance"]["source"]
 
 
 def test_a_presigned_url_in_the_STATUS_is_redacted_too(session):
@@ -107,24 +143,27 @@ def test_a_presigned_url_in_the_STATUS_is_redacted_too(session):
 
 
 def test_redaction_reaches_nested_structures(session):
-    """A region reference is a mapping inside a list; a signature hiding one
-    level down is still a signature."""
+    """A signature hiding one level down, inside a list inside an allow-listed
+    mapping, is still a signature."""
     _write(
         session,
         status={"status": "COMPLETED"},
         params={
-            "train_images": [
-                {
-                    "kind": "ngff",
-                    "store_root": "https://ov.example/zarr/ds1/?token=secret-123",
-                    "region": {"x": 1, "y": 2, "width": 3, "height": 4},
-                }
-            ]
+            "model_type": "cpsam",
+            "pool_provenance": {
+                "members": [
+                    {
+                        "kind": "ngff",
+                        "store_root": "https://ov.example/zarr/ds1/?token=secret-123",
+                        "region": {"x": 1, "y": 2, "width": 3, "height": 4},
+                    }
+                ]
+            },
         },
     )
     rec = training.run_record(session)
     assert "secret-123" not in json.dumps(rec)
-    src = rec["config"]["train_images"][0]
+    src = rec["config"]["pool_provenance"]["members"][0]
     assert src["store_root"].startswith("https://ov.example/zarr/ds1/")
     # Non-string leaves are untouched, so the region survives as numbers.
     assert src["region"] == {"x": 1, "y": 2, "width": 3, "height": 4}

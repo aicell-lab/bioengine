@@ -352,6 +352,45 @@ async def test_a_REMOVED_record_leaves_the_cache(app):
     assert set(await app._read_run_records(max_age_s=0)) == {S2}
 
 
+@pytest.mark.asyncio
+async def test_ONE_REPLICAS_bookkeeping_does_not_reach_ANOTHERS(app, monkeypatch):
+    """The class-level fallbacks must not become shared state.
+
+    They exist so a published method cannot raise AttributeError on an
+    instance whose `__init__` did not run -- and those are exactly the
+    instances that would write into the CLASS dict if a write mutated in place
+    instead of replacing. A review found the comment claiming "never mutated
+    in place" while the push was doing `self._runs_pushed[sid] = ...`.
+
+    THE INSTANCE HERE DELIBERATELY HAS NO `_runs_pushed` OF ITS OWN. The first
+    version of this test used the fixture's instance, which sets one -- so the
+    write landed on the instance dict, the class dict stayed clean, and the
+    test passed against the mutant it was written to catch.
+    """
+    cls = _entry_class()
+    assert cls._runs_pushed == {}, "the class default is already polluted"
+
+    bare = cls.__new__(cls)  # no __init__, so no instance _runs_pushed
+    assert "_runs_pushed" not in vars(bare), vars(bare).keys()
+    bare._runs_artifact_manager = app._runs_artifact_manager
+    bare._http = app._http
+    bare.RUNS_RETRY_DELAY_S = 0
+    app._plant(S1)
+
+    assert await bare._persist_run_record(S1) is True
+    assert S1 in bare._runs_pushed
+
+    assert cls._runs_pushed == {}, (
+        "the push wrote into the CLASS dict, so every replica without a "
+        f"constructor now shares this bookkeeping: {cls._runs_pushed}"
+    )
+    second = cls.__new__(cls)
+    assert second._runs_pushed == {}, (
+        "a second replica can see the first one's pushed records, so its sync "
+        "would skip runs it has never shared"
+    )
+
+
 # ── sharing is OFF when the deployment is unknown ──────────────────────────
 
 

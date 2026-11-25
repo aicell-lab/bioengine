@@ -1481,9 +1481,15 @@ class EntryApp:
     # AttributeError on an instance whose __init__ did not run. That is not a
     # hypothetical: a half-constructed instance is how the suite exercises a
     # single method, and it is also what a future refactor of the constructor
-    # would produce. NEVER mutated in place -- `_read_run_records` copies and
-    # then assigns to the instance -- so sharing these objects between
-    # instances cannot leak one replica's history into another's.
+    # would produce.
+    #
+    # Every write to these REPLACES the object and assigns the result to the
+    # INSTANCE; none mutates the shared default. That is a rule to keep rather
+    # than a property of the types: a review found this comment claiming it
+    # while `_persist_run_record` was doing `self._runs_pushed[sid] = ...`,
+    # which writes into the class dict on exactly the instances these
+    # fallbacks exist for, and would share one replica's bookkeeping with
+    # every other.
     _runs_cache: Optional[Dict[str, Dict[str, Any]]] = None
     _runs_meta: Dict[str, Any] = {}
     _runs_cache_at: float = 0.0
@@ -1542,7 +1548,15 @@ class EntryApp:
                 )
                 resp.raise_for_status()
                 await am.commit(artifact_id=training.RUNS_ARTIFACT_ID)
-                self._runs_pushed[session_id] = _json.dumps(record, sort_keys=True)
+                # REPLACED, not mutated: `_runs_pushed` has a class-level
+                # fallback for an instance whose __init__ did not run, and
+                # writing into it there would share one replica's bookkeeping
+                # with every other. A review caught the comment claiming these
+                # are never mutated in place while this line did exactly that.
+                self._runs_pushed = {
+                    **self._runs_pushed,
+                    session_id: _json.dumps(record, sort_keys=True),
+                }
                 return True
             except training.InvalidSessionId:
                 # Not retryable and not this method's business to repair: the
