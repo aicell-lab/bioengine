@@ -15,11 +15,14 @@ fine-tuned net to ``<session_dir>/models/model`` — the cellpose checkpoint lay
 ``training.checkpoint_path`` expects for a 'cellpose'-backend session.
 """
 
+import logging
+import re
 import sys
 import threading
 import time
 import traceback
 
+import epoch_progress
 import training
 
 
@@ -175,6 +178,108 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
         training.write_status(session_id)
 
 
+# cellpose emits its per-epoch line under a HARDCODED cadence guard
+# (`if iepoch == 5 or iepoch % 10 == 0`, cellpose/train.py at 4.2.1.1), so epochs
+# 0, 5, 10, 20, 30 … report and no others. Declared to the client because the gaps
+# are expected: a consumer that assumes one entry per epoch would render a 5-epoch
+# run (our default) as a single point and conclude the rest were lost.
+EPOCH_REPORT_CADENCE = "0,5,then every 10"
+
+# The exact line cellpose formats:
+#   f"{iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {...:.2f}s"
+# Anchored through LR so no other INFO record can match by accident.
+_EPOCH_LINE = re.compile(
+    r"^(?P<epoch>\d+),\s+train_loss=(?P<train>[-+0-9.eEnan]+),"
+    r"\s+test_loss=(?P<test>[-+0-9.eEnan]+),\s+LR=(?P<lr>[-+0-9.eEnan]+)"
+)
+# Anything carrying this token is meant to be an epoch record; if it does not parse,
+# the upstream format moved and progress reporting has gone silent. Counted so the
+# drift is VISIBLE in the status rather than looking like a run that reported nothing.
+_EPOCH_TOKEN = "train_loss="
+
+
+class _EpochProgressHandler(logging.Handler):
+    """Turn cellpose's per-epoch log record into a status.json entry as it happens.
+
+    This is the ONLY live progress signal available. ``train_seg`` takes no callback,
+    exposes no per-epoch counter, and returns its loss arrays only on completion, so
+    without this a run is opaque from start to finish. The records are already routed
+    to stdout by ``_surface_cellpose_logs``; this reads them in-process instead of
+    tailing the log file, so no parsing of interleaved subprocess output is needed.
+
+    Never raises: a progress display must not be able to fail a training run.
+    """
+
+    def __init__(
+        self, session_id: str, has_val: bool, want_loss: bool = True
+    ) -> None:
+        super().__init__(level=logging.INFO)
+        self._session_id = session_id
+        self._has_val = has_val
+        # ``metrics`` governs which quantitative metrics are COMPUTED, and the loss
+        # curve is one of them. The epoch NUMBER is not a metric — it is progress —
+        # so it is reported either way and only the loss values are withheld. A run
+        # asking for 'pixel' alone therefore still shows where it has got to.
+        self._want_loss = want_loss
+        self._epochs: list = []
+        self.unparsed = 0
+
+    def _entry(self, msg: str):
+        """Parse one record. Returns an entry dict, or None if this is not an epoch
+        line. Increments ``unparsed`` when a line claims to be one but does not fit."""
+        m = _EPOCH_LINE.match(msg)
+        if m is None:
+            if _EPOCH_TOKEN in msg:
+                self.unparsed += 1
+            return None
+        test = float(m.group("test"))
+        if not self._want_loss:
+            return {"epoch": int(m.group("epoch")), "train_loss": None,
+                    "val_loss": None, "lr": float(m.group("lr"))}
+        return {
+            "epoch": int(m.group("epoch")),
+            "train_loss": float(m.group("train")),
+            # cellpose runs validation INSIDE the same cadence guard that emits this
+            # line, but only when a test set exists. With none, the logged value is
+            # the initialised 0.0 — not a measurement. A real segmentation loss is
+            # never exactly 0.0, so both cases collapse to null rather than to a
+            # point that would drag a loss curve to the axis.
+            "val_loss": test if (self._has_val and test != 0.0) else None,
+            "lr": float(m.group("lr")),
+        }
+
+    def emit(self, record: "logging.LogRecord") -> None:
+        try:
+            entry = self._entry(record.getMessage().strip())
+            if entry is None:
+                return
+            # Re-reporting an epoch replaces it rather than appending a duplicate.
+            self._epochs = [e for e in self._epochs if e["epoch"] != entry["epoch"]]
+            self._epochs.append(entry)
+            self._epochs.sort(key=lambda e: e["epoch"])
+            training.write_status(
+                self._session_id,
+                epochs=list(self._epochs),
+                last_reported_epoch=entry["epoch"],
+                epoch_progress_unparsed=self.unparsed,
+            )
+        except Exception:
+            pass
+
+
+def _attach_epoch_progress(
+    session_id: str, has_val: bool, want_loss: bool = True
+) -> "_EpochProgressHandler":
+    """Attach the progress handler to the ``cellpose`` logger.
+
+    cellpose's own logger is ``cellpose.train`` (``logging.getLogger(__name__)``), a
+    child of ``cellpose``, so a handler on the parent receives it by propagation —
+    the same mechanism ``_surface_cellpose_logs`` relies on."""
+    handler = _EpochProgressHandler(session_id, has_val, want_loss)
+    logging.getLogger("cellpose").addHandler(handler)
+    return handler
+
+
 def _surface_cellpose_logs() -> None:
     """Route cellpose's per-epoch train/test-loss trace to stdout so the subprocess
     redirect captures it (into train.log / the session record). cellpose attaches a
@@ -184,8 +289,6 @@ def _surface_cellpose_logs() -> None:
     Setting the level + adding an explicit stdout handler is immune to root-handler
     state (unlike basicConfig) and has no filesystem side effect (unlike
     cellpose.io.logger_setup, which mkdirs ~/.cellpose and clears handlers)."""
-    import logging
-
     lg = logging.getLogger("cellpose")
     lg.setLevel(logging.INFO)
     if not any(isinstance(h, logging.StreamHandler) for h in lg.handlers):
@@ -207,7 +310,23 @@ def main(session_id: str) -> None:
     # moment to discover it.
     metrics_requested = training.validate_metrics(p.get("metrics"))
 
-    training.write_status(session_id, status="TRAINING", message="training started")
+    # Live progress. Attached before train_seg runs so the first reported epoch is
+    # captured, and declared in the status so a client knows the cadence to expect
+    # instead of reading the gaps as lost records.
+    progress = _attach_epoch_progress(
+        session_id,
+        has_val=bool(p.get("val_images")),
+        want_loss="loss" in metrics_requested,
+    )
+    training.write_status(
+        session_id,
+        status="TRAINING",
+        message="training started",
+        epochs=[],
+        last_reported_epoch=None,
+        epoch_report_cadence=EPOCH_REPORT_CADENCE,
+        n_epochs=p["n_epochs"],
+    )
     stop = threading.Event()
     heartbeat = threading.Thread(
         target=_heartbeat, args=(session_id, stop), daemon=True
@@ -259,11 +378,14 @@ def main(session_id: str) -> None:
             and len(result) >= 3
         ):
             train_losses, test_losses = _loss_list(result[1]), _loss_list(result[2])
-            # Stock train_seg validates only every validation_interval epochs and
-            # returns 0.0 for the off-cadence epochs; a real segmentation test loss
-            # is never exactly 0.0, so surface those as null — a consumer must not
-            # read a non-validated epoch as a test loss of 0.0 (verified on deNBI:
-            # a 4-epoch run gave [11.05, 0, 0, 0] = validated at epoch 0 only).
+            # Stock train_seg validates under a HARDCODED cadence guard — not a
+            # configurable interval: `if iepoch == 5 or iepoch % 10 == 0` in
+            # cellpose/train.py at 4.2.1.1, with no parameter to change it. Off-cadence
+            # epochs keep the initialised 0.0, so a real segmentation test loss is
+            # never exactly 0.0 and those surface as null — a consumer must not read a
+            # non-validated epoch as a test loss of 0.0 (verified on deNBI: a 4-epoch
+            # run gave [11.05, 0, 0, 0] = validated at epoch 0 only, which is that
+            # guard matching 0 % 10 and nothing else).
             test_losses = [
                 None if (v is not None and v == 0.0) else v for v in test_losses
             ]
@@ -297,6 +419,12 @@ def main(session_id: str) -> None:
             ),
             end_time=time.time(),
             terminated_by="child",
+            # Non-zero means cellpose logged lines that CLAIMED to be epoch records
+            # and did not fit the format this worker parses — i.e. the upstream format
+            # moved and live progress has gone silent. Recorded on every run so that
+            # drift is visible here rather than looking like a run that simply never
+            # reported, which is the same empty `epochs` either way.
+            epoch_progress_unparsed=progress.unparsed,
             n_epochs_completed=p["n_epochs"] if ok else None,
             n_epochs_completed_basis="floor_if_completed" if ok else None,
             cell_diameters=cell_diameters,
