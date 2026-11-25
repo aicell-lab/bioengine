@@ -1857,6 +1857,113 @@ class EntryApp:
 
         return training.list_sessions()
 
+    RUNS_DIR = "runs"
+
+    async def _runs_artifact_manager(self, caller_client=None):
+        """The artifact manager, through the caller's client when there is one.
+
+        Mirrors the export path: a write to a dataset artifact should carry the
+        caller's identity, not this app's, so a user cannot persist a run into a
+        dataset they could not otherwise write.
+        """
+        return await (caller_client or self._hypha).get_service(
+            "public/artifact-manager"
+        )
+
+    @bioengine.method
+    async def persist_run(
+        self,
+        session_id: str = Field(..., description="Session id from start_training."),
+        artifact_id: str = Field(
+            ...,
+            description="Dataset artifact the run record is stored in, under runs/.",
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Store one run's config and status in a dataset artifact, so its
+        history outlives this worker.
+
+        A session's record already survives a RESTART, because the sessions live
+        under the mounted ``~/.bioengine``. What it does not survive is this
+        worker being replaced or rolled, or the app running elsewhere: the record
+        is local filesystem state, and a runs page can only read it by asking
+        whichever worker happens to hold it. Writing it to the dataset makes
+        "previous runs" a property of the dataset instead of a property of who
+        answered.
+
+        Idempotent per session: the file is named for the session, so re-persisting
+        a run replaces its record rather than appending a second one. That matters
+        because a run is persisted when it finishes AND can be re-persisted later
+        by a caller catching up on history.
+        """
+        import json as _json
+        import training
+
+        record = training.run_record(session_id)
+        am = await self._runs_artifact_manager(
+            (context or {}).get("client") if isinstance(context, dict) else None
+        )
+        file_path = f"{self.RUNS_DIR}/{session_id}.json"
+        # Staged write then commit, the same shape the annotation broker uses for
+        # its manifest: a put_file URL is only valid against a staged artifact.
+        await am.edit(artifact_id=artifact_id, stage=True)
+        url = await am.put_file(artifact_id, file_path=file_path)
+        resp = await self._http.put(url, content=_json.dumps(record).encode("utf-8"))
+        resp.raise_for_status()
+        await am.commit(artifact_id)
+        return {
+            "session_id": session_id,
+            "artifact_id": artifact_id,
+            "file_path": file_path,
+            "status": record["status"].get("status"),
+        }
+
+    @bioengine.method
+    async def list_runs(
+        self,
+        artifact_id: str = Field(
+            ..., description="Dataset artifact whose run history is listed."
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Every persisted run record in a dataset, newest-looking last.
+
+        Reads what is stored rather than what this worker remembers, so it
+        answers the same way from any replica — which is the whole point of
+        persisting them.
+
+        A record that cannot be read is REPORTED, not skipped: a run page that
+        silently drops an unreadable record shows a shorter history and looks
+        correct, which is worse than showing the gap.
+        """
+        import json as _json
+
+        am = await self._runs_artifact_manager(
+            (context or {}).get("client") if isinstance(context, dict) else None
+        )
+        try:
+            listing = await am.list_files(artifact_id, dir_path=self.RUNS_DIR)
+        except Exception:
+            # No runs directory yet is an empty history, not an error.
+            return {"runs": [], "unreadable": []}
+        names = [
+            e.get("name") if isinstance(e, dict) else str(e) for e in (listing or [])
+        ]
+        names = [n for n in names if isinstance(n, str) and n.endswith(".json")]
+
+        runs, unreadable = [], []
+        for name in sorted(names):
+            try:
+                url = await am.get_file(
+                    artifact_id, file_path=f"{self.RUNS_DIR}/{name}"
+                )
+                resp = await self._http_retry("GET", url)
+                resp.raise_for_status()
+                runs.append(_json.loads(resp.text))
+            except Exception as exc:
+                unreadable.append({"file": name, "error": str(exc)[:200]})
+        return {"runs": runs, "unreadable": unreadable}
+
     @bioengine.method
     async def stop_training(
         self, session_id: str = Field(..., description="Session id to stop.")
