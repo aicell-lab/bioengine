@@ -224,7 +224,9 @@ def test_a_stem_that_is_ALREADY_an_image_is_not_silently_replaced():
     existing = {"scan01": core.local_image_entry("scan01.png")}
     stem, _ = core.split_local_image_filename("scan01.tif")
 
-    assert stem in existing, "the collision this guards against is on the STEM, not the filename"
+    assert (
+        stem in existing
+    ), "the collision this guards against is on the STEM, not the filename"
 
 
 # ── the role, guarded structurally so an edit cannot quietly drop it ───────
@@ -233,7 +235,10 @@ def test_a_stem_that_is_ALREADY_an_image_is_not_silently_replaced():
 def _method_node(name):
     src = (pathlib.Path(__file__).parent / "broker.py").read_text()
     for node in ast.walk(ast.parse(src)):
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name:
+        if (
+            isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+            and node.name == name
+        ):
             return node
     raise AssertionError(
         f"{name} is not defined in broker.py -- the upload route was renamed "
@@ -255,8 +260,7 @@ def test_the_upload_route_requires_the_MANAGER_role():
     roles = [
         a.value
         for n in ast.walk(node)
-        if isinstance(n, ast.Call)
-        and getattr(n.func, "attr", "") == "_require_role"
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "_require_role"
         for a in n.args
         if isinstance(a, ast.Constant) and isinstance(a.value, str)
     ]
