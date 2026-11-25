@@ -90,7 +90,9 @@ def test_list_dir_yields_bare_child_names(monkeypatch):
 
 
 def test_list_dir_under_a_prefix_is_relative_to_it(monkeypatch):
-    stub_transport(monkeypatch, ["plain.zarr/nested/gamma/", "plain.zarr/nested/zarr.json"])
+    stub_transport(
+        monkeypatch, ["plain.zarr/nested/gamma/", "plain.zarr/nested/zarr.json"]
+    )
     assert drain(bioengine_store().list_dir("nested")) == ["gamma", "zarr.json"]
 
 
@@ -107,7 +109,9 @@ def test_list_prefix_keeps_the_prefix_on_each_key(monkeypatch):
 
 
 def test_list_walks_from_the_store_root(monkeypatch):
-    seen = stub_transport(monkeypatch, ["plain.zarr/zarr.json", "plain.zarr/alpha/zarr.json"])
+    seen = stub_transport(
+        monkeypatch, ["plain.zarr/zarr.json", "plain.zarr/alpha/zarr.json"]
+    )
     assert drain(bioengine_store().list()) == ["zarr.json", "alpha/zarr.json"]
     assert seen["params"] == {"dir_path": "plain.zarr", "recursive": "true"}
 

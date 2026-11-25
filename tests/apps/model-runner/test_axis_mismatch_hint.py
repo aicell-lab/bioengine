@@ -74,9 +74,7 @@ def _load(path, *names):
             and any(isinstance(t, ast.Name) and t.id in names for t in node.targets)
         )
     ]
-    found = {
-        n.name if hasattr(n, "name") else n.targets[0].id for n in wanted
-    }
+    found = {n.name if hasattr(n, "name") else n.targets[0].id for n in wanted}
     if found != set(names):
         pytest.fail(f"missing {sorted(set(names) - found)} in {path.name}")
     # ONE namespace, used as both globals and locals. With two, the module-level regex
@@ -101,7 +99,9 @@ def test_the_real_workshop_message_names_the_channel_axis(hint):
     assert got is not None, "the real grayscale message was not recognised"
     assert "'channel' axis must be exactly 3 but the array supplies 1" in got
     assert "grayscale" in got
-    assert "np.repeat(arr, 3, axis=1)" in got, "the remedy must be runnable, not described"
+    assert (
+        "np.repeat(arr, 3, axis=1)" in got
+    ), "the remedy must be runnable, not described"
 
 
 def test_the_original_error_is_kept_verbatim(hint):
@@ -123,7 +123,9 @@ def test_a_shape_that_satisfies_every_axis_is_not_reported(hint):
     the point here is that the helper's own test is "does any axis fall outside its
     bounds", not "did the string contain the word channel".
     """
-    conforming = REAL.replace("Array shape (1, 1, 807, 696)", "Array shape (1, 3, 807, 696)")
+    conforming = REAL.replace(
+        "Array shape (1, 1, 807, 696)", "Array shape (1, 3, 807, 696)"
+    )
     assert hint(conforming) is None
 
 
@@ -154,7 +156,10 @@ def test_the_step_field_is_parsed_but_does_not_change_the_verdict(hint):
     stepped = REAL.replace("min=256, max=None, step=None", "min=256, max=None, step=16")
     assert stepped != REAL, "the substitution must actually change the string"
     assert hint(stepped) is not None
-    assert hint(stepped).split("Original error")[0] == hint(REAL).split("Original error")[0]
+    assert (
+        hint(stepped).split("Original error")[0]
+        == hint(REAL).split("Original error")[0]
+    )
 
 
 def test_a_length_mismatch_names_no_axis_but_still_states_the_requirement(hint):
@@ -191,13 +196,15 @@ def test_the_real_2d_grayscale_upload_is_given_the_requirement_and_a_remedy(hint
     conforming array.
     """
     got = hint(REAL_2D)
-    assert got is not None, "the shape reproduced from the workshop run was not recognised"
+    assert (
+        got is not None
+    ), "the shape reproduced from the workshop run was not recognised"
     assert "axis must be" not in got, "2 sizes against 4 axes cannot name an axis"
     assert "2 dimensions but this model declares 4 axes" in got
     assert "carries no channel axis at all" in got
-    assert "np.repeat(arr[np.newaxis, np.newaxis], 3, axis=1)" in got, (
-        "the remedy must be runnable: two leading axes added, then the channel replicated"
-    )
+    assert (
+        "np.repeat(arr[np.newaxis, np.newaxis], 3, axis=1)" in got
+    ), "the remedy must be runnable: two leading axes added, then the channel replicated"
     assert REAL_2D in got
 
 
@@ -208,5 +215,7 @@ def test_the_2d_fixture_differs_from_the_4d_one_only_in_the_shape(hint):
     identical; if a future recapture changes one and not the other, the two tests above
     would be measuring different models and nothing would say so.
     """
-    assert REAL_2D == REAL.replace("Array shape (1, 1, 807, 696)", "Array shape (807, 696)")
+    assert REAL_2D == REAL.replace(
+        "Array shape (1, 1, 807, 696)", "Array shape (807, 696)"
+    )
     assert REAL_2D != REAL

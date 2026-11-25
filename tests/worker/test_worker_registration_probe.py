@@ -690,3 +690,78 @@ async def real_registration_worker():
 
     for server in worker.rpc_servers:
         server.rpc.close()
+
+
+# ── the repair must not inherit the boot path's artifact-manager grace ───────
+
+
+@pytest.mark.asyncio
+async def test_the_repair_passes_NO_artifact_manager_grace_by_any_route():
+    """Observed at the real call site, so neither spelling of the bug survives.
+
+    `_connect_to_server` completes `AppsManager` initialization, which resolves
+    `public/artifact-manager`. Boot opts into a long grace there because there is
+    no request to fail and nothing to replay; this repair cannot, because it runs
+    inside one monitoring pass budgeted at RECONNECT_BUDGET_S. Letting the grace
+    reach here stalled every later step of the tick, let the heartbeat go stale
+    so the host census aged the worker out, and pushed the registration past the
+    condemn threshold on the first attempt.
+
+    An earlier guard asserted the keyword string was absent from
+    `_check_service_registration`'s source. That passes against a repair call
+    that passes the grace POSITIONALLY — the same defect, spelled differently —
+    so this records the ACTUAL call instead of reading the source. The parameter
+    is also keyword-only now, which makes the positional form a TypeError rather
+    than a silent regression; this arm is what fails if that is ever relaxed.
+    """
+    calls = []
+    server = _Server(serves=False)
+    worker = _bare_worker(server)
+
+    async def _recording_connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        worker.repair_steps.append("connect")
+        worker.server._socket_alive = True
+
+    worker._connect_to_server = _recording_connect
+
+    await worker._check_service_registration()
+
+    # CONTROL: the repair must actually have run, or the assertions below are
+    # satisfied by an empty list — which is how "nothing was called" passes for
+    # "nothing was called wrongly".
+    assert calls, "the repair path never called _connect_to_server"
+    args, kwargs = calls[-1]
+
+    assert (
+        "artifact_manager_grace_s" not in kwargs
+    ), f"the repair passed the boot grace as a keyword: {kwargs}"
+    assert args == (), (
+        f"the repair passed {len(args)} positional argument(s) {args}; the second "
+        f"positional slot of _connect_to_server was the artifact-manager grace, "
+        f"so a positional call here is the same regression as a keyword one"
+    )
+
+
+def test_the_grace_cannot_be_passed_POSITIONALLY_at_all():
+    """Belt to the previous arm's braces, and the cheaper of the two to keep.
+
+    Keyword-only means a future caller cannot reintroduce the bug by counting
+    arguments. Without this, relaxing the signature would be invisible until
+    something drove the repair path.
+    """
+    import inspect
+
+    from bioengine.apps.manager import AppsManager
+
+    for fn, name in (
+        (BioEngineWorker._connect_to_server, "artifact_manager_grace_s"),
+        (AppsManager.complete_initialization, "artifact_manager_grace_s"),
+        (AppsManager._resolve_artifact_manager_proxy, "grace_s"),
+    ):
+        param = inspect.signature(fn).parameters[name]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"{fn.__qualname__}'s {name} is {param.kind.name}, so it can be "
+            f"passed positionally and a source-level guard will not see it"
+        )
+        assert param.default == 0, f"{fn.__qualname__} defaults {name} to a wait"

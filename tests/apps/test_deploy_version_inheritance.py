@@ -70,9 +70,9 @@ async def test_a_stale_inherited_version_warns_and_names_both(caplog) -> None:
     # Both numbers must be present — one of them alone is not actionable.
     assert "'1.0.0'" in warnings[0]
     assert "'1.0.1'" in warnings[0]
-    assert "version='1.0.1'" in warnings[0], (
-        "The warning has to name the way out, or it just restates the symptom."
-    )
+    assert (
+        "version='1.0.1'" in warnings[0]
+    ), "The warning has to name the way out, or it just restates the symptom."
 
 
 @pytest.mark.asyncio
@@ -225,6 +225,7 @@ async def test_deploy_app_stays_quiet_when_the_caller_named_the_version(
 
 
 # ── CLI: `bioengine apps deploy` must deploy what it just uploaded ────────────
+
 
 def _manifest(version: str | None) -> str:
     # `version` is an optional manifest field, so a version-less manifest is a

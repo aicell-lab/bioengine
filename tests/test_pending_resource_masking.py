@@ -52,9 +52,12 @@ def test_masks_a_tasks_runtime_env_info():
     record = {"runtime_env_info": {"runtime_env": {"env_vars": dict(ENV_VARS)}}}
     masked = _mask_secret_env_vars(record)
     assert SECRET not in json.dumps(masked)
-    assert masked["runtime_env_info"]["runtime_env"]["env_vars"][
-        "_BIOENGINE_SECRET_HYPHA_TOKEN"
-    ] == "*****"
+    assert (
+        masked["runtime_env_info"]["runtime_env"]["env_vars"][
+            "_BIOENGINE_SECRET_HYPHA_TOKEN"
+        ]
+        == "*****"
+    )
 
 
 def test_masks_a_jobs_runtime_env():

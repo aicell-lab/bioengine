@@ -16,7 +16,7 @@ from hypha_rpc.utils.schema import schema_method
 from pydantic import Field
 
 from bioengine import __version__
-from bioengine.apps.manager import AppsManager
+from bioengine.apps.manager import AppsManager, _ARTIFACT_MANAGER_RESOLVE_GRACE_S
 from bioengine.datasets import BioEngineDatasets
 from bioengine.heartbeat import (
     DEFAULT_HEARTBEAT_PATH,
@@ -87,9 +87,13 @@ _ACCESS_REQUEST_DECISIONS = ("grant", "deny", "clear")
 # has to keep answering without a token. The deployed Kubernetes *startup*
 # probe curls it and greps ``is_ready``: gating the method fails every worker's
 # startup for 18 x 30 s and then crash-loops it permanently. Only the startup
-# probe — the deployed liveness probe is a local ``kill -0 1``, for the reason
-# recorded on _check_service_registration below; the manifests the website's
-# worker guide generates do curl ``get_status`` from both. Beyond the probes:
+# probe — the deployed liveness probe reads the monitoring loop's heartbeat file
+# via ``python -m bioengine.heartbeat`` and never calls this method, for the
+# reason recorded on _check_service_registration below; the manifests the
+# website's worker guide generates do curl ``get_status`` from both. No
+# readinessProbe is deployed on the Kubernetes deployment this was read from,
+# so there the startup probe is the only consumer of ``is_ready``. Beyond the
+# probes:
 # the worker-list cards read ``geo_location`` and ``bioengine_version``, and the
 # CLI's cluster view and the KTH gpu-cuda-watch script read ``ray_cluster``.
 #
@@ -406,6 +410,14 @@ class BioEngineWorker:
         self.server: Optional[RemoteService] = None
         self.workspace = workspace
         self._token = token or os.environ.get("HYPHA_TOKEN")
+        # The credential the worker STARTED with, kept so it is never lost. _token below is
+        # overwritten by each short-lived token the worker mints for itself, and that overwrite
+        # used to destroy the only copy of this one: a worker whose minted token expired while
+        # disconnected could not mint a replacement (minting needs the connection) and had
+        # nothing valid left to reconnect WITH. A restart cured it purely by re-reading this
+        # value from the environment, which is what proved it was still good. Re-assigned after
+        # an interactive login, which is where the real credential arrives.
+        self._bootstrap_token = self._token
         self._token_expires_at = 0
         self.client_id = client_id
         self.service_id = "bioengine-worker"
@@ -426,7 +438,9 @@ class BioEngineWorker:
         # reports the worker not-ready, so dashboards and callers can see a
         # degraded worker. The loop keeps running and usually recovers; a
         # loop that has stopped running entirely is caught by the heartbeat
-        # file instead, since a frozen loop never reaches this counter.
+        # file instead, since a frozen loop never reaches this counter. Only
+        # the Kubernetes liveness probe reads that file, so under Apptainer on
+        # SLURM and in a plain ``docker run`` a frozen loop restarts no worker.
         self._monitor_consecutive_errors = 0
         self._monitor_degraded_threshold = 5
 
@@ -468,6 +482,10 @@ class BioEngineWorker:
                 print("Login completed successfully!")
                 print("=" * 60, end="\n\n")
                 self.logger.info("Interactive login completed successfully")
+                # __init__ captured the bootstrap copy before this point, where it was None.
+                # Without refreshing it here a worker that logged in interactively has nothing
+                # to fall back to when a minted token expires while the connection is down.
+                self._bootstrap_token = self._token
 
             # Initialize geo location with unknown placeholder; actual fetch happens in monitoring loop
             self.geo_location = {
@@ -908,7 +926,10 @@ class BioEngineWorker:
             await self._ping_data_server()
 
     async def _connect_to_server(
-        self, retry_budget_seconds: float = RECONNECT_BUDGET_S
+        self,
+        retry_budget_seconds: float = RECONNECT_BUDGET_S,
+        *,
+        artifact_manager_grace_s: float = 0.0,
     ) -> None:
         """
         Establish connection to Hypha server and configure admin user permissions.
@@ -1006,6 +1027,9 @@ class BioEngineWorker:
             server=self.server,
             admin_users=self.admin_users,
             worker_service_id=self.full_service_id,
+            # 0 on the REPAIR path: this runs inside one monitoring pass with a 15 s
+            # budget, and a 300 s wait here stalls the whole tick.
+            artifact_manager_grace_s=artifact_manager_grace_s,
         )
         await self.code_executor.initialize(admin_users=self.admin_users)
 
@@ -1149,12 +1173,13 @@ class BioEngineWorker:
         feeds the monitoring loop's degraded counter; at the degraded threshold
         ``get_status`` reports the worker not-ready.
 
-        Nothing acts on that report today. The deployed liveness probe is a
-        local PID check that never reads readiness, and ``get_status`` is
-        served by the very registration that has been evicted, so in the case
-        this check exists for there is no one left to ask. Escalating is
-        therefore a log line and a status flag, not a restart; the restart
-        needs an external consumer that does not yet exist.
+        Nothing acts on that report today. The deployed liveness probe reads
+        the monitoring loop's heartbeat file and never reads readiness, and
+        ``get_status`` is served by the very registration that has been
+        evicted, so in the case this check exists for there is no one left to
+        ask. Escalating is therefore a log line and a status flag, not a
+        restart; the restart needs an external consumer that does not yet
+        exist.
 
         The grace is a deadline, not a budget, and it measures **continuous**
         unreachability: any successful probe resets it. A flapping connection
@@ -1237,21 +1262,47 @@ class BioEngineWorker:
 
     async def _check_token_expiry(self) -> None:
         if self._token_expires_at - time.time() < 3600:
-            # Renew token if it's about to expire
-            self.logger.info(
-                "Generating a new Hypha token with expiration time set to 3 hours."
-            )
-            self._token = await self.server.generate_token(
-                {
-                    "workspace": self.workspace,
-                    "client_id": self.client_id,
-                    "permission": "admin",
-                    "expires_in": 3600 * 3,
-                }
-            )
+            # ATTEMPT the mint and fall back on failure, rather than trying to PREDICT whether
+            # the connection is alive. Predicting does not work: `self.server.generate_token`
+            # is still a live callable after the connection dies -- `callable(getattr(...))`
+            # returns True in exactly the broken case -- and the None is deeper inside
+            # hypha_rpc, surfacing only when the call is made. A liveness guard is a presence
+            # check that survives the meaning inversion; only the call itself can tell you.
+            try:
+                self.logger.info(
+                    "Generating a new Hypha token with expiration time set to 3 hours."
+                )
+                self._token = await self.server.generate_token(
+                    {
+                        "workspace": self.workspace,
+                        "client_id": self.client_id,
+                        "permission": "admin",
+                        "expires_in": 3600 * 3,
+                    }
+                )
 
-            user_info = await self.server.parse_token(self._token)
-            self._token_expires_at = user_info.expires_at
+                user_info = await self.server.parse_token(self._token)
+                self._token_expires_at = user_info.expires_at
+            except Exception as mint_error:
+                # Minting requires the very connection that is down, so the two preconditions
+                # are each other's and nothing in the monitoring loop can break the cycle.
+                # Fall back to the credential this worker started with: it is
+                # long-lived, still held, and the next _check_service_registration tick
+                # reconnects with it. expires_at = 0 is deliberate -- once the connection is
+                # back this step runs again and mints a fresh short-lived token normally.
+                if self._bootstrap_token and self._token != self._bootstrap_token:
+                    self.logger.warning(
+                        f"Could not mint a Hypha token ({mint_error}). Falling back to the "
+                        "token this worker started with so the next reconnect has a usable "
+                        "credential."
+                    )
+                    self._token = self._bootstrap_token
+                    self._token_expires_at = 0
+                else:
+                    self.logger.debug(
+                        f"Token refresh failed ({mint_error}) and the bootstrap token is "
+                        "already in use; leaving it in place."
+                    )
 
     async def _cleanup(self) -> None:
         """
@@ -1632,7 +1683,12 @@ class BioEngineWorker:
 
             # Connect the BioEngine worker to the Hypha server
             # Completes initialization of AppsManager and CodeExecutor
-            await self._connect_to_server(STARTUP_CONNECT_BUDGET_S)
+            # BOOT is the only caller that opts into the grace: there is no request to
+            # fail and nothing to replay, so waiting beats crash-looping.
+            await self._connect_to_server(
+                STARTUP_CONNECT_BUDGET_S,
+                artifact_manager_grace_s=_ARTIFACT_MANAGER_RESOLVE_GRACE_S,
+            )
 
             # Check for running data server
             await self._discover_data_server()
@@ -2228,8 +2284,7 @@ class BioEngineWorker:
             "geo_location": self.geo_location,
             "is_ready": (
                 self.is_ready.is_set()
-                and self._monitor_consecutive_errors
-                < self._monitor_degraded_threshold
+                and self._monitor_consecutive_errors < self._monitor_degraded_threshold
                 # .get, not a subscript: this is the unauthenticated health
                 # surface, so raising here would fail the probe that reads it.
                 # The key's presence is pinned by tests instead.
@@ -2244,9 +2299,9 @@ class BioEngineWorker:
         # die quickly otherwise fall entirely between two ticks).
         if self.ray_cluster.slurm_workers is not None:
             try:
-                status["ray_cluster"]["slurm_jobs"] = (
-                    await self.ray_cluster.slurm_workers.get_job_status()
-                )
+                status["ray_cluster"][
+                    "slurm_jobs"
+                ] = await self.ray_cluster.slurm_workers.get_job_status()
             except Exception as e:
                 self.logger.warning(f"Failed to refresh slurm_jobs for get_status: {e}")
 

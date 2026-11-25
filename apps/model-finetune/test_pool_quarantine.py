@@ -46,12 +46,21 @@ def _rows():
     return [
         # weights_sha256 absent entirely — the legacy writer
         {"contribution_id": "c-legacy", "weights_path": "contrib/c-legacy/w.pt"},
-        {"contribution_id": "c-null", "weights_path": "contrib/c-null/w.pt",
-         "weights_sha256": None},
-        {"contribution_id": "c-good", "weights_path": "contrib/c-good/w.pt",
-         "weights_sha256": GOOD_SHA},
-        {"contribution_id": "c-mismatch", "weights_path": "contrib/c-mismatch/w.pt",
-         "weights_sha256": GOOD_SHA},
+        {
+            "contribution_id": "c-null",
+            "weights_path": "contrib/c-null/w.pt",
+            "weights_sha256": None,
+        },
+        {
+            "contribution_id": "c-good",
+            "weights_path": "contrib/c-good/w.pt",
+            "weights_sha256": GOOD_SHA,
+        },
+        {
+            "contribution_id": "c-mismatch",
+            "weights_path": "contrib/c-mismatch/w.pt",
+            "weights_sha256": GOOD_SHA,
+        },
     ]
 
 
@@ -70,10 +79,25 @@ def _actuals():
 
 # ── the digest predicate ─────────────────────────────────────────────────────
 
+
 class TestUsableDigest:
-    @pytest.mark.parametrize("value", [None, "", "deadbeef", GOOD_SHA[:63],
-                                       GOOD_SHA + "a", 0, 123, [], {}, b"x" * 64,
-                                       "z" * 64, GOOD_SHA[:-1] + "g"])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            "",
+            "deadbeef",
+            GOOD_SHA[:63],
+            GOOD_SHA + "a",
+            0,
+            123,
+            [],
+            {},
+            b"x" * 64,
+            "z" * 64,
+            GOOD_SHA[:-1] + "g",
+        ],
+    )
     def test_unusable_values_are_unusable(self, value):
         """Each of these has been seen or is one keystroke from being seen. The
         non-strings matter as much as the strings: ``len()`` on an int raises and
@@ -98,6 +122,7 @@ class TestUsableDigest:
 
 
 # ── the split ────────────────────────────────────────────────────────────────
+
 
 class TestDigestQuarantine:
     def test_the_good_row_is_admitted_and_it_is_the_only_one(self):
@@ -138,8 +163,13 @@ class TestDigestQuarantine:
         assert by_id["c-legacy"]["expected_sha256"] is None
 
     def test_case_difference_alone_does_not_quarantine(self):
-        rows = [{"contribution_id": "c-up", "weights_path": "p",
-                 "weights_sha256": GOOD_SHA.upper()}]
+        rows = [
+            {
+                "contribution_id": "c-up",
+                "weights_path": "p",
+                "weights_sha256": GOOD_SHA.upper(),
+            }
+        ]
         admitted, quarantined = pool.digest_quarantine(rows, {"p": GOOD_SHA})
         assert [r["contribution_id"] for r in admitted] == ["c-up"]
         assert quarantined == []
@@ -149,8 +179,13 @@ class TestDigestQuarantine:
         bytes that nothing checked; a version of ``digest_quarantine`` that treated
         an unhashed member as "nothing to compare against, carry on" would restore
         that failure exactly, and every other test in this file would still pass."""
-        rows = [{"contribution_id": "c-good", "weights_path": "contrib/c-good/w.pt",
-                 "weights_sha256": GOOD_SHA}]
+        rows = [
+            {
+                "contribution_id": "c-good",
+                "weights_path": "contrib/c-good/w.pt",
+                "weights_sha256": GOOD_SHA,
+            }
+        ]
         with pytest.raises(ValueError, match="ever being hashed"):
             pool.digest_quarantine(rows, {})
 
@@ -158,8 +193,13 @@ class TestDigestQuarantine:
         """A verifier that returns junk must not be allowed to quarantine a member
         as a mismatch: that would publish an integrity incident about the pool on
         the strength of a broken hasher."""
-        rows = [{"contribution_id": "c-good", "weights_path": "p",
-                 "weights_sha256": GOOD_SHA}]
+        rows = [
+            {
+                "contribution_id": "c-good",
+                "weights_path": "p",
+                "weights_sha256": GOOD_SHA,
+            }
+        ]
         with pytest.raises(ValueError, match="not a sha256"):
             pool.digest_quarantine(rows, {"p": "oops"})
 
@@ -195,37 +235,55 @@ class TestQuarantineRecord:
     def test_an_unknown_reason_is_refused(self):
         with pytest.raises(ValueError, match="not a quarantine reason"):
             pool.quarantine_record(
-                contribution_id="c", weights_path="p", reason="no-digest",
-                expected_sha256=None, actual_sha256=None)
+                contribution_id="c",
+                weights_path="p",
+                reason="no-digest",
+                expected_sha256=None,
+                actual_sha256=None,
+            )
 
     def test_counts_name_every_reason_even_at_zero(self):
         """An absent key and a zero read identically through ``.get()``. A caller
         testing whether this merge hit an integrity incident must get 0, not a
         KeyError, on the overwhelmingly common merge where it did not."""
         counts = pool.quarantine_counts([])
-        assert counts == {pool.QUARANTINE_NO_DIGEST: 0,
-                          pool.QUARANTINE_DIGEST_MISMATCH: 0}
+        assert counts == {
+            pool.QUARANTINE_NO_DIGEST: 0,
+            pool.QUARANTINE_DIGEST_MISMATCH: 0,
+        }
 
     def test_counts_partition_the_fixture(self):
         _, quarantined = pool.digest_quarantine(_rows(), _actuals())
         counts = pool.quarantine_counts(quarantined)
-        assert counts == {pool.QUARANTINE_NO_DIGEST: 2,
-                          pool.QUARANTINE_DIGEST_MISMATCH: 1}
+        assert counts == {
+            pool.QUARANTINE_NO_DIGEST: 2,
+            pool.QUARANTINE_DIGEST_MISMATCH: 1,
+        }
         assert sum(counts.values()) == len(quarantined)
 
 
 # ── the two floors ───────────────────────────────────────────────────────────
 
+
 class TestHeadIntegrityRefusal:
     def test_a_head_that_survives_intact_does_not_refuse(self):
-        assert pool.head_integrity_refusal(
-            head_version="v3", head_member_ids=["a", "b"], quarantined_ids=set(),
-            floor=2) is None
+        assert (
+            pool.head_integrity_refusal(
+                head_version="v3",
+                head_member_ids=["a", "b"],
+                quarantined_ids=set(),
+                floor=2,
+            )
+            is None
+        )
 
     def test_losing_a_head_member_refuses_and_names_it(self):
         reason = pool.head_integrity_refusal(
-            head_version="v3", head_member_ids=["a", "b"], quarantined_ids={"b"},
-            floor=2)
+            head_version="v3",
+            head_member_ids=["a", "b"],
+            quarantined_ids={"b"},
+            floor=2,
+        )
         assert reason is not None
         assert "'b'" in reason or "b" in reason
         assert "v3" in reason
@@ -235,26 +293,33 @@ class TestHeadIntegrityRefusal:
         whoever meets it, and the first thing they will do is try to repair a pool
         that is fine."""
         reason = pool.head_integrity_refusal(
-            head_version="v3", head_member_ids=["a"], quarantined_ids={"a"}, floor=1)
+            head_version="v3", head_member_ids=["a"], quarantined_ids={"a"}, floor=1
+        )
         assert "published" in reason and "removed" in reason
 
     def test_a_first_merge_with_no_head_is_not_a_refusal(self):
         """There is no composition to preserve, so this guard has nothing to say.
         Without the empty case it would refuse every brand-new pool."""
-        assert pool.head_integrity_refusal(
-            head_version=None, head_member_ids=[], quarantined_ids={"x"},
-            floor=1) is None
+        assert (
+            pool.head_integrity_refusal(
+                head_version=None, head_member_ids=[], quarantined_ids={"x"}, floor=1
+            )
+            is None
+        )
 
 
 class TestPublishFloorRefusal:
     def test_at_the_floor_it_publishes(self):
-        assert pool.publish_floor_refusal(
-            member_ids=["a", "b"], floor=2, quarantined=[]) is None
+        assert (
+            pool.publish_floor_refusal(member_ids=["a", "b"], floor=2, quarantined=[])
+            is None
+        )
 
     def test_below_the_floor_it_refuses_with_the_counts(self):
         _, quarantined = pool.digest_quarantine(_rows(), _actuals())
         reason = pool.publish_floor_refusal(
-            member_ids=["a"], floor=3, quarantined=quarantined)
+            member_ids=["a"], floor=3, quarantined=quarantined
+        )
         assert reason is not None
         assert "floor of 3" in reason
         assert pool.QUARANTINE_DIGEST_MISMATCH in reason
@@ -263,33 +328,51 @@ class TestPublishFloorRefusal:
         """A negative control. ``member_ids=[]`` must refuse, not pass trivially —
         the empty soup is the one case where a thinness guard written as "fewer
         than before" would say nothing at all."""
-        assert pool.publish_floor_refusal(
-            member_ids=[], floor=1, quarantined=[]) is not None
+        assert (
+            pool.publish_floor_refusal(member_ids=[], floor=1, quarantined=[])
+            is not None
+        )
 
 
 # ── the published record ─────────────────────────────────────────────────────
 
+
 class TestManifestCarriesTheQuarantine:
     def _manifest(self, quarantined):
         return pool.build_community_manifest(
-            community_version="v2", combine="uniform",
+            community_version="v2",
+            combine="uniform",
             selected_contribution_ids=["c-good"],
-            gate_split={"sha256": "ab"}, witness_split={"sha256": "cd"},
+            gate_split={"sha256": "ab"},
+            witness_split={"sha256": "cd"},
             selection_metric={"role": "selection"},
             witness_metric={"role": "witness"},
-            members=[{"contribution_id": "c-good", "marginal_score": 0.5,
-                      "gate_score": 0.5, "included": True}],
-            quarantined=quarantined, architecture_signature="sig",
-            weights_sha256=GOOD_SHA, created_at=1.0,
+            members=[
+                {
+                    "contribution_id": "c-good",
+                    "marginal_score": 0.5,
+                    "gate_score": 0.5,
+                    "included": True,
+                }
+            ],
+            quarantined=quarantined,
+            architecture_signature="sig",
+            weights_sha256=GOOD_SHA,
+            created_at=1.0,
         )
 
     def test_the_manifest_records_every_quarantined_member(self):
         _, quarantined = pool.digest_quarantine(_rows(), _actuals())
         man = self._manifest(quarantined)
         assert {q["contribution_id"] for q in man["quarantined"]} == {
-            "c-legacy", "c-null", "c-mismatch"}
-        assert man["quarantine_counts"] == {pool.QUARANTINE_NO_DIGEST: 2,
-                                            pool.QUARANTINE_DIGEST_MISMATCH: 1}
+            "c-legacy",
+            "c-null",
+            "c-mismatch",
+        }
+        assert man["quarantine_counts"] == {
+            pool.QUARANTINE_NO_DIGEST: 2,
+            pool.QUARANTINE_DIGEST_MISMATCH: 1,
+        }
 
     def test_a_quarantined_member_is_not_filed_as_a_rejected_member(self):
         """``members`` means "evaluated, not included" and carries the scores that
@@ -315,9 +398,15 @@ class TestManifestCarriesTheQuarantine:
         excluded members — silently, and forever, in an immutable artifact."""
         with pytest.raises(TypeError, match="quarantined"):
             pool.build_community_manifest(
-                community_version="v2", combine="uniform",
-                selected_contribution_ids=[], gate_split={}, witness_split={},
-                selection_metric={}, witness_metric={}, members=[],
-                architecture_signature="sig", weights_sha256=GOOD_SHA,
+                community_version="v2",
+                combine="uniform",
+                selected_contribution_ids=[],
+                gate_split={},
+                witness_split={},
+                selection_metric={},
+                witness_metric={},
+                members=[],
+                architecture_signature="sig",
+                weights_sha256=GOOD_SHA,
                 created_at=1.0,
             )

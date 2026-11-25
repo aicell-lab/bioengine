@@ -21,7 +21,10 @@ import pytest
 
 from bioengine.cluster import ray_cluster as rc_mod
 from bioengine.cluster.ray_cluster import RayCluster
-from bioengine.heartbeat import MISSED_PASSES_BEFORE_STALE, heartbeat_stale_after_seconds
+from bioengine.heartbeat import (
+    MISSED_PASSES_BEFORE_STALE,
+    heartbeat_stale_after_seconds,
+)
 
 # What a reconnect is EXPECTED to cost, which is not a ceiling on it.
 # Two terms, and only one is a bound: the geo lookup is a real
@@ -259,7 +262,9 @@ def test_no_unbounded_get_cluster_state_await_is_left_anywhere():
     sources = sorted(_package_root().rglob("*.py"))
     # A zero below has to mean "no raw call", never "walked nothing": if the
     # discovery breaks, every assertion after it passes vacuously.
-    assert len(sources) > 20, f"only found {len(sources)} sources under {_package_root()}"
+    assert (
+        len(sources) > 20
+    ), f"only found {len(sources)} sources under {_package_root()}"
 
     found = {}
     for path in sources:

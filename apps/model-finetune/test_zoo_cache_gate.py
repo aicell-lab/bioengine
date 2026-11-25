@@ -213,7 +213,10 @@ def test_the_pre_fix_gate_accepts_both_bad_entries(tmp_path: Path, monkeypatch) 
     import entry
 
     ns = dict(vars(entry))
-    exec(compile(src.replace(marker, "if True or " + marker[3:]), "<pre-fix>", "exec"), ns)
+    exec(
+        compile(src.replace(marker, "if True or " + marker[3:]), "<pre-fix>", "exec"),
+        ns,
+    )
     pre_fix = ns["_fetch_model_package"]
 
     short = tmp_path / "short"
@@ -227,5 +230,7 @@ def test_the_pre_fix_gate_accepts_both_bad_entries(tmp_path: Path, monkeypatch) 
     legacy.mkdir()
     _write_entry(legacy, WEIGHTS, {"model_type": "vit_b_lm"})
     caller = _Caller()
-    assert _fetch(caller, legacy, monkeypatch, fetch=pre_fix)["model_type"] == "vit_b_lm"
+    assert (
+        _fetch(caller, legacy, monkeypatch, fetch=pre_fix)["model_type"] == "vit_b_lm"
+    )
     assert not caller.downloaded, "the pre-fix gate was expected to hit, not download"

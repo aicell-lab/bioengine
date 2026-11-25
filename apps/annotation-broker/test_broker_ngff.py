@@ -95,8 +95,10 @@ def _install_runtime_stubs() -> dict:
     a fake ``bioengine`` behind for any other suite.
     """
     saved = {}
-    for name, factory in (("bioengine", _make_bioengine_stub),
-                          ("hypha_rpc", _make_hypha_rpc_stub)):
+    for name, factory in (
+        ("bioengine", _make_bioengine_stub),
+        ("hypha_rpc", _make_hypha_rpc_stub),
+    ):
         saved[name] = sys.modules.get(name, _ABSENT)
         sys.modules[name] = factory()
     return saved
@@ -207,7 +209,9 @@ def _store(
     for i, shape in enumerate(shapes):
         chunks = [1] * (len(shape) - 2) + [256, 256]
         objects[f"{ROOT}{i}/.zarray"] = (
-            200, _zarray(shape, chunks, dtype, compressor), {},
+            200,
+            _zarray(shape, chunks, dtype, compressor),
+            {},
         )
         key = ".".join(["0"] * len(shape))
         objects[f"{ROOT}{i}/{key}"] = (chunk_status, b"\x00\x00", chunk_headers)
@@ -247,7 +251,8 @@ class TestProbeNgffSource:
         broker = _broker(_store(shapes=((3, 4096, 4096), (3, 512, 512), (3, 64, 64))))
         await broker._probe_ngff_source(ROOT, None, ORIGIN)
         chunks = [
-            u for u in broker._http.requested
+            u
+            for u in broker._http.requested
             if "/.z" not in u and not u.endswith("zarr.json")
         ]
         assert chunks == [f"{ROOT}2/0.0.0"]
@@ -257,7 +262,8 @@ class TestProbeNgffSource:
         broker = _broker(_store(shapes=((3, 64, 64), (3, 4096, 4096))))
         await broker._probe_ngff_source(ROOT, None, ORIGIN)
         chunks = [
-            u for u in broker._http.requested
+            u
+            for u in broker._http.requested
             if "/.z" not in u and not u.endswith("zarr.json")
         ]
         assert chunks == [f"{ROOT}0/0.0.0"]
@@ -266,7 +272,9 @@ class TestProbeNgffSource:
         assert probe["width"] == 64
 
     async def test_reads_omero_channel_names(self):
-        broker = _broker(_store(omero={"channels": [{"label": "DAPI"}, {"label": "GFP"}]}))
+        broker = _broker(
+            _store(omero={"channels": [{"label": "DAPI"}, {"label": "GFP"}]})
+        )
         probe = await broker._probe_ngff_source(ROOT, None, ORIGIN)
         assert probe["channels"] == ["DAPI", "GFP"]
 
@@ -311,7 +319,9 @@ class TestProbeNgffSource:
     async def test_rejects_an_undecodable_filter(self):
         objects = _store()
         objects[f"{ROOT}0/.zarray"] = (
-            200, _zarray((3, 600, 800), (1, 256, 256), filters=[{"id": "delta"}]), {},
+            200,
+            _zarray((3, 600, 800), (1, 256, 256), filters=[{"id": "delta"}]),
+            {},
         )
         with pytest.raises(bc.NgffSourceError, match="delta"):
             await _broker(objects)._probe_ngff_source(ROOT, None, ORIGIN)
@@ -328,11 +338,17 @@ class TestProbeNgffSource:
 
     async def test_rejects_a_chunk_that_does_not_allow_our_origin(self):
         broker = _broker(_store(chunk_headers={}))
-        with pytest.raises(bc.NgffSourceError, match="Access-Control-Allow-Origin: absent"):
+        with pytest.raises(
+            bc.NgffSourceError, match="Access-Control-Allow-Origin: absent"
+        ):
             await broker._probe_ngff_source(ROOT, None, ORIGIN)
 
     async def test_rejects_a_chunk_that_allows_only_another_origin(self):
-        broker = _broker(_store(chunk_headers={"Access-Control-Allow-Origin": "https://evil.example"}))
+        broker = _broker(
+            _store(
+                chunk_headers={"Access-Control-Allow-Origin": "https://evil.example"}
+            )
+        )
         with pytest.raises(bc.NgffSourceError, match="cross-origin"):
             await broker._probe_ngff_source(ROOT, None, ORIGIN)
 
@@ -384,8 +400,14 @@ class TestProbeV3Store:
             "node_type": "array",
             "shape": [600, 800],
             "data_type": "uint16",
-            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [256, 256]}},
-            "chunk_key_encoding": {"name": "default", "configuration": {"separator": separator}},
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": {"chunk_shape": [256, 256]},
+            },
+            "chunk_key_encoding": {
+                "name": "default",
+                "configuration": {"separator": separator},
+            },
             "codecs": [{"name": "bytes"}, {"name": "blosc"}],
             "fill_value": 0,
         }
@@ -407,7 +429,11 @@ class TestProbeV3Store:
 
     async def test_zarr_json_wins_over_a_stale_zattrs(self):
         objects = self._objects()
-        objects[ROOT + ".zattrs"] = (200, {"multiscales": [{"datasets": [{"path": "old"}]}]}, {})
+        objects[ROOT + ".zattrs"] = (
+            200,
+            {"multiscales": [{"datasets": [{"path": "old"}]}]},
+            {},
+        )
         probe = await _broker(objects)._probe_ngff_source(ROOT, None, ORIGIN)
         assert probe["levels"] == 1
 
@@ -484,6 +510,166 @@ class TestImportNgffImage:
         # A staged-only write disappears after a restage, so it must commit.
         assert importer._state["committed"] == 1
 
+    async def test_a_bad_plane_is_REFUSED_BY_THE_IMPORT_and_writes_nothing(
+        self, importer
+    ):
+        """Through the real import, because that is the only thing that proves
+        the refusal reaches the manifest decision.
+
+        A source-text check that the validator is called was measured GREEN
+        against a mutant wrapping the call in `try/except ValueError: pass`:
+        with the refusal swallowed, {'z': 1.5} is written and then int()-coerced
+        to slice 1, which is the wrong-slice bug. Only driving the import can
+        see that, so this asserts BOTH that it raises AND that nothing was
+        stored -- a refusal that still commits a manifest is not a refusal.
+        """
+        # the fixture store is (c, y, x), so 'z' is not one of its axes at all
+        with pytest.raises(ValueError) as e:
+            await importer.import_ngff_image(
+                "ws/ds", ROOT, planes={"z": 0}, context=None
+            )
+        assert "'z'" in str(e.value) and "does not have" in str(e.value)
+        assert importer._state["manifest"] is None, "a refused import wrote a manifest"
+        assert importer._state["committed"] == 0, "a refused import committed"
+
+    async def test_a_fractional_plane_is_REFUSED_BY_THE_IMPORT(
+        self, importer, monkeypatch
+    ):
+        """The one the swallowed-refusal mutant let through: int(1.5) is 1, so a
+        permissive path records a real slice the caller never asked for.
+
+        On a z-STACK probe, not the fixture's (c, y, x) store. Sent as
+        {'c': 1.5} the channel rule refuses it first, so the test passed without
+        the whole-number check at all and its name claimed more than it showed.
+        """
+
+        async def _zstack_probe(_root, _mp, _origin):
+            return {
+                "store_root": ROOT,
+                "multiscale_path": None,
+                "stem": "sample",
+                "width": 800,
+                "height": 600,
+                "dtype": "|u1",
+                "channels": None,
+                "levels": 1,
+                "content_hint": "deadbeef",
+                "dataset_paths": ["0"],
+                "axis_roles": {"y": 1, "x": 2},
+                "level0_shape": [9, 600, 800],
+                "axes": ["z", "y", "x"],
+            }
+
+        monkeypatch.setattr(importer, "_probe_ngff_source", _zstack_probe)
+        with pytest.raises(ValueError) as e:
+            await importer.import_ngff_image(
+                "ws/ds", ROOT, planes={"z": 1.5}, context=None
+            )
+        assert importer._state["committed"] == 0
+        assert "whole number" in str(e.value), str(e.value)
+
+    async def test_a_plane_on_the_CHANNEL_axis_is_refused_by_the_import(self, importer):
+        """The fixture's axes are (c, y, x) with c as the channel, and the reader
+        keeps the channel whole, so recording a channel plane would have the
+        manifest claim something training does not do."""
+        with pytest.raises(ValueError) as e:
+            await importer.import_ngff_image(
+                "ws/ds", ROOT, planes={"c": 0}, context=None
+            )
+        assert "channel" in str(e.value).lower()
+        assert importer._state["committed"] == 0
+
+    async def test_a_RECORDED_plane_round_trips_to_what_the_READER_consumes(
+        self, importer, monkeypatch
+    ):
+        """Not just into the entry: through `ngff_region_source`, which is the
+        one place the stored source becomes the shape a trainer reads.
+
+        Asserting on `entry["source"]["planes"]` alone was measured GREEN
+        against a mutant that made `ngff_region_source` return
+        `"planes": None` -- the plane would be stored and never delivered.
+
+        The fixture's own store is (c, y, x) and has no z, so only the PROBE is
+        replaced here, with a z-stack layout. Rebuilding the broker instead was
+        tried and is the wrong shape: it loses the fixture's artifact-I/O stubs,
+        and the test then fails on a missing artifact manager rather than on
+        anything it means to check.
+        """
+
+        async def _zstack_probe(_root, _multiscale_path, _origin):
+            return {
+                "store_root": ROOT,
+                "multiscale_path": None,
+                "stem": "sample",
+                "width": 800,
+                "height": 600,
+                "dtype": "|u1",
+                "channels": None,
+                "levels": 1,
+                "content_hint": "deadbeef",
+                "dataset_paths": ["0"],
+                "axis_roles": {"t": None, "c": None, "z": None, "y": 1, "x": 2},
+                "level0_shape": [9, 600, 800],
+                "axes": ["z", "y", "x"],
+            }
+
+        monkeypatch.setattr(importer, "_probe_ngff_source", _zstack_probe)
+        out = await importer.import_ngff_image(
+            "ws/ds", ROOT, planes={"z": 4}, context=None
+        )
+        assert out["state"] == "remote"
+        stored = bc.parse_image_manifest(importer._state["manifest"])
+        entry = stored[out["stem"]]
+        assert entry["source"]["planes"] == {"z": 4}
+        ref = bc.ngff_region_source(entry)
+        assert ref is not None, "the stored entry yields no reader reference at all"
+        assert ref["planes"] == {
+            "z": 4
+        }, f"the plane does not reach the reader's reference: {ref.get('planes')!r}"
+
+    async def test_the_IMPORT_records_the_axis_names_in_the_layout(self, importer):
+        """Through the real import, because that is the only thing that writes a
+        layout, and a test that seeds a manifest cannot see this at all.
+
+        Dropping the axis names at this call site was measured GREEN against the
+        rest of the suite for exactly that reason: every other layout test hands
+        in a manifest entry that already has them. What it costs is the region
+        reader's refusal message, which would tell the owner of a z-stack to
+        re-import a source they had just imported.
+        """
+        await importer.import_ngff_image("ws/ds", ROOT, context=None)
+        stored = bc.parse_image_manifest(importer._state["manifest"])
+        layout = stored["sample"]["source"]["layout"]
+        assert layout["axes"] == [
+            "c",
+            "y",
+            "x",
+        ], f"the axis names were not recorded at import: {layout!r}"
+        # And the rest of the layout, so this test fails on a dropped key rather
+        # than on only the one that prompted it.
+        assert layout["dataset_paths"] == ["0", "1"]
+        assert layout["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+        assert layout["level0_shape"] == [3, 600, 800]
+
+    async def test_a_region_reference_built_from_a_REAL_import_is_readable(
+        self, importer
+    ):
+        """The end of the pipe, assembled by nobody's fixture.
+
+        Each half is covered -- the import records a layout, and
+        ``ngff_region_source`` turns a layout into a reference -- and the two
+        could still disagree about a key name without either test noticing. This
+        reads the reference out of what the import actually wrote.
+        """
+        await importer.import_ngff_image("ws/ds", ROOT, context=None)
+        stored = bc.parse_image_manifest(importer._state["manifest"])
+        src = bc.ngff_region_source(stored["sample"])
+        assert src is not None, "a freshly imported remote stem is not readable"
+        assert src["axes"] == ["c", "y", "x"]
+        assert src["dataset_paths"] == ["0", "1"]
+        assert src["level0_shape"] == [3, 600, 800]
+        assert src["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+
     async def test_derives_the_stem_from_the_store_root(self, importer):
         importer._http.objects = {
             k.replace(ROOT, "https://s3.example/bucket/my-sample.zarr/"): v
@@ -495,7 +681,9 @@ class TestImportNgffImage:
         assert out["stem"] == "my-sample"
 
     async def test_an_explicit_stem_wins(self, importer):
-        out = await importer.import_ngff_image("ws/ds", ROOT, stem="chosen", context=None)
+        out = await importer.import_ngff_image(
+            "ws/ds", ROOT, stem="chosen", context=None
+        )
         assert out["stem"] == "chosen"
 
     async def test_rejects_a_stem_that_could_be_a_path(self, importer):
@@ -511,9 +699,14 @@ class TestImportNgffImage:
     async def test_a_second_import_keeps_the_first(self, importer):
         await importer.import_ngff_image("ws/ds", ROOT, stem="one", context=None)
         await importer.import_ngff_image("ws/ds", ROOT, stem="two", context=None)
-        assert set(bc.parse_image_manifest(importer._state["manifest"])) == {"one", "two"}
+        assert set(bc.parse_image_manifest(importer._state["manifest"])) == {
+            "one",
+            "two",
+        }
 
-    async def test_a_query_string_credential_is_refused_before_any_fetch(self, importer):
+    async def test_a_query_string_credential_is_refused_before_any_fetch(
+        self, importer
+    ):
         with pytest.raises(bc.NgffSourceError, match="query string"):
             await importer.import_ngff_image("ws/ds", ROOT + "?token=abc", context=None)
         assert importer._http.requested == []
@@ -547,14 +740,19 @@ class TestImportARegion:
 
     async def test_a_whole_store_region_is_indistinguishable_from_none(self, importer):
         whole = await importer.import_ngff_image(
-            "ws/ds", ROOT, stem="a",
-            region={"x": 0, "y": 0, "width": 800, "height": 600}, context=None,
+            "ws/ds",
+            ROOT,
+            stem="a",
+            region={"x": 0, "y": 0, "width": 800, "height": 600},
+            context=None,
         )
         assert whole["source"]["region"] is None
 
     async def test_the_far_edge_is_clamped_to_the_store(self, importer):
         out = await importer.import_ngff_image(
-            "ws/ds", ROOT, region={"x": 700, "y": 500, "width": 400, "height": 400},
+            "ws/ds",
+            ROOT,
+            region={"x": 700, "y": 500, "width": 400, "height": 400},
             context=None,
         )
         assert (out["width"], out["height"]) == (100, 100)
@@ -562,7 +760,9 @@ class TestImportARegion:
     async def test_a_region_outside_the_store_writes_nothing(self, importer):
         with pytest.raises(ValueError, match="outside"):
             await importer.import_ngff_image(
-                "ws/ds", ROOT, region={"x": 900, "y": 0, "width": 8, "height": 8},
+                "ws/ds",
+                ROOT,
+                region={"x": 900, "y": 0, "width": 8, "height": 8},
                 context=None,
             )
         assert importer._state["manifest"] is None
@@ -598,9 +798,51 @@ class TestProbeNgffSourceRpc:
         assert prober._state["manifest"] is None
         assert prober._state["committed"] == 0
 
+    async def test_it_reports_the_store_layout_for_a_caller_that_reads_pixels(
+        self, prober
+    ):
+        """The probe already parses ``multiscales`` and resolves the axis roles;
+        returning them lets model-finetune read one region of this store without
+        parsing OME-NGFF a third time.
+
+        Why a third: ``parse_ngff_multiscales`` and ``ngff_axis_roles`` both say
+        they mirror ``ngffLayout.ts``, so two implementations already have to
+        agree. A copy inside another app drifts, and the copy that drifts is the
+        one nobody renders with.
+        """
+        out = await prober.probe_ngff_source(ROOT, context=None)
+        # The fixture store is a v0.4 two-level pyramid, axes (c, y, x),
+        # level 0 = (3, 600, 800).
+        assert out["dataset_paths"] == ["0", "1"]
+        assert out["axes"] == ["c", "y", "x"]
+        assert out["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+        assert out["level0_shape"] == [3, 600, 800]
+        # Still metadata only: no pixel was read into the broker to produce it.
+        assert prober._state["manifest"] is None
+        assert prober._state["committed"] == 0
+
+    async def test_the_reported_layout_agrees_with_the_reported_extent(self, prober):
+        """The tie that stops the new keys drifting from the old ones.
+
+        ``width``/``height`` were already trusted by every existing caller.
+        Indexing ``level0_shape`` with ``axis_roles`` has to reproduce them, or
+        one of the two is wrong and a crop would be taken from the wrong axis —
+        which is exactly the failure that would NOT show up as an error, only as
+        a transposed image.
+        """
+        out = await prober.probe_ngff_source(ROOT, context=None)
+        shape, roles = out["level0_shape"], out["axis_roles"]
+        assert shape[roles["x"]] == out["width"]
+        assert shape[roles["y"]] == out["height"]
+        # And the roles must point inside the array they describe.
+        assert len(shape) == len(out["axes"])
+        assert all(0 <= roles[k] < len(shape) for k in ("y", "x"))
+
     async def test_the_credential_is_used_but_not_returned(self, prober):
         tokened = "https://ov.example/t/secret-123/zarr/ds1/"
-        prober._http.objects = {k.replace(ROOT, tokened): v for k, v in _store().items()}
+        prober._http.objects = {
+            k.replace(ROOT, tokened): v for k, v in _store().items()
+        }
         out = await prober.probe_ngff_source(tokened, context=None)
         assert out["store_root"] == "https://ov.example/zarr/ds1/"
         assert all(u.startswith(tokened) for u in prober._http.requested)
@@ -628,7 +870,9 @@ class TestImportKeepsTheCredentialOutOfTheArtifact:
         return importer
 
     async def test_the_token_is_used_to_fetch_but_not_stored(self, tokened):
-        out = await tokened.import_ngff_image("ws/ds", self.TOKENED, stem="s", context=None)
+        out = await tokened.import_ngff_image(
+            "ws/ds", self.TOKENED, stem="s", context=None
+        )
 
         assert all(u.startswith(self.TOKENED) for u in tokened._http.requested)
         blob = json.dumps(tokened._state["manifest"])
@@ -738,9 +982,13 @@ class TestSplitsExcludeRemoteImages:
 
     async def test_a_remote_stem_is_refused_by_name(self, guard):
         with pytest.raises(ValueError, match="Not materialised.*remote-a"):
-            await guard._validate_split_stems_are_images("ws/ds", ["local-a", "remote-a"])
+            await guard._validate_split_stems_are_images(
+                "ws/ds", ["local-a", "remote-a"]
+            )
 
-    async def test_an_unknown_stem_still_reports_unknown_not_unmaterialised(self, guard):
+    async def test_an_unknown_stem_still_reports_unknown_not_unmaterialised(
+        self, guard
+    ):
         with pytest.raises(ValueError, match="Not images of this dataset: ghost"):
             await guard._validate_split_stems_are_images("ws/ds", ["ghost"])
 
@@ -780,7 +1028,9 @@ class TestForgetRemoteImage:
         with pytest.raises(FileNotFoundError, match="not an image"):
             await importer.forget_remote_image("ws/ds", "ghost", context=None)
 
-    async def test_a_local_file_absent_from_the_manifest_is_not_swept_in(self, importer):
+    async def test_a_local_file_absent_from_the_manifest_is_not_swept_in(
+        self, importer
+    ):
         # The write-back is stored-minus-one, never a merge, so a file the
         # manifest has not caught up with must not gain an entry here.
         await importer.import_ngff_image("ws/ds", ROOT, stem="remote-one", context=None)
@@ -789,3 +1039,237 @@ class TestForgetRemoteImage:
         await importer.forget_remote_image("ws/ds", "remote-one", context=None)
 
         assert bc.parse_image_manifest(importer._state["manifest"]) == {}
+
+
+class TestGetTrainingUrlsServesRegions:
+    """``get_training_urls`` hands a remote OME-Zarr stem over as a region.
+
+    These are the first tests this function has. It had none before: a grep for
+    ``get_training_urls`` across this app's suite matched nothing, and nothing
+    asserted the refusal it used to raise — so the 347 passing tests said
+    nothing whatever about the path that feeds every training run.
+    """
+
+    LAYOUT = {
+        "dataset_paths": ["0", "1"],
+        "axis_roles": {"y": 1, "x": 2, "c": 0},
+        "level0_shape": [3, 600, 800],
+        "axes": ["c", "y", "x"],
+    }
+    REGION = {"x": 16, "y": 32, "width": 64, "height": 48}
+
+    def _remote(self, with_layout=True):
+        return bc.remote_image_entry(
+            ROOT,
+            None,
+            self.REGION["width"],
+            self.REGION["height"],
+            dtype="|u1",
+            region=dict(self.REGION),
+            layout=dict(self.LAYOUT) if with_layout else None,
+        )
+
+    @pytest.fixture
+    def trainer(self, importer, monkeypatch):
+        """The broker with a split, a manifest and minting stubbed.
+
+        Only what this method reads is faked; the region decision itself runs
+        for real, which is the point.
+        """
+        state = {"manifest": {}, "minted": []}
+
+        async def _read_split_or_raise(_a, _l, _s):
+            return {"train": ["remote-stem", "local-stem"], "test": []}
+
+        async def _image_manifest(_a):
+            return state["manifest"]
+
+        async def _list_files_safe(_a, dir_path):
+            if dir_path.endswith("user-u1"):
+                # A pair needs BOTH a png and a geojson at the same timestamp,
+                # and the timestamp format is \d{8}-\d{6}; anything else parses
+                # to None and the stem is silently not annotated.
+                return [
+                    {"name": "remote-stem-20261125-080000.png"},
+                    {"name": "remote-stem-20261125-080000.geojson"},
+                    {"name": "local-stem-20261125-080000.png"},
+                    {"name": "local-stem-20261125-080000.geojson"},
+                ]
+            return [{"name": "user-u1", "type": "directory"}]
+
+        class _Am:
+            async def get_file(self, artifact_id=None, file_path=None, stage=None):
+                state["minted"].append(file_path)
+                return f"https://signed.invalid/{file_path}"
+
+        monkeypatch.setattr(importer, "_read_split_or_raise", _read_split_or_raise)
+        monkeypatch.setattr(importer, "_image_manifest", _image_manifest)
+        monkeypatch.setattr(importer, "_list_files_safe", _list_files_safe)
+        monkeypatch.setattr(importer, "_am", _Am())
+        importer._tstate = state
+        return importer
+
+    async def test_a_remote_region_stem_comes_back_as_a_region_reference(self, trainer):
+        """THE case this change exists for, and the one that used to raise.
+
+        The reference is exactly what the trainer consumes: store root, region
+        and the layout, in one mapping.
+        """
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        rows = {r["stem"]: r for r in out["train"]}
+
+        src = rows["remote-stem"]["image_source"]
+        assert src["kind"] == bc.NGFF_SOURCE_KIND
+        assert src["region"] == self.REGION
+        assert src["dataset_paths"] == ["0", "1"]
+        assert src["axis_roles"] == {"y": 1, "x": 2, "c": 0}
+        assert src["level0_shape"] == [3, 600, 800]
+        # No file exists for it, so no image URL was minted for it.
+        assert "image_url" not in rows["remote-stem"]
+        assert not any("remote-stem.tif" in m for m in trainer._tstate["minted"])
+
+    async def test_a_materialised_stem_still_gets_a_presigned_url(self, trainer):
+        """The regression guard. Every existing caller reads ``image_url``, and a
+        region stem must not change what a file stem returns."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        rows = {r["stem"]: r for r in out["train"]}
+        assert rows["local-stem"]["image_url"].endswith("images/local-stem.tif")
+        assert "image_source" not in rows["local-stem"]
+        # And both pairs got their geojson, region stem included.
+        assert all("geojson_url" in r for r in out["train"])
+
+    async def test_a_remote_stem_imported_before_the_layout_is_still_REFUSED(
+        self, trainer
+    ):
+        """An NGFF source with no recorded layout cannot be read: nothing says
+        which level is full resolution. Refused by name rather than guessed at —
+        guessing "0" is wrong for the stores that call it "s0"."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(with_layout=False),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        with pytest.raises(ValueError, match="neither be read as a region"):
+            await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+
+    async def test_a_stem_with_no_manifest_entry_is_still_refused(self, trainer):
+        """Deleted outright, so there is neither a file nor a source."""
+        trainer._tstate["manifest"] = {
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        with pytest.raises(ValueError, match="remote-stem"):
+            await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+
+    async def test_the_refusal_tells_the_owner_to_RE_IMPORT_not_to_annotate(
+        self, trainer
+    ):
+        """The message is the whole value of the refusal, and the first version
+        of it gave the wrong instruction.
+
+        Every NGFF stem imported before the layout was recorded lands here. It
+        is correctly refused, but telling its owner that "a remote OME-Zarr
+        image is trainable as imported" describes exactly the stem in front of
+        them and leaves them nothing to do. What fixes it is re-importing the
+        source, because that is when the layout is captured.
+        """
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(with_layout=False),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        with pytest.raises(ValueError) as err:
+            await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        msg = str(err.value)
+        assert "re-import" in msg, f"the repair is not stated: {msg}"
+        assert "older version" in msg, f"the cause is not named: {msg}"
+
+    async def test_the_axis_NAMES_reach_the_trainer(self, trainer):
+        """Not decoration. The reader refuses a z-stack it cannot resolve a
+        plane for, and it can only name the axis — or accept a plane for it —
+        if it knows the axis is called z. The y/x/c roles alone say which axes
+        are spatial and nothing about what the others are."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        rows = {r["stem"]: r for r in out["train"]}
+        assert rows["remote-stem"]["image_source"]["axes"] == ["c", "y", "x"]
+
+    async def test_a_CREDENTIALED_store_reaches_the_trainer_with_its_credential(
+        self, trainer
+    ):
+        """Without this the training path fails at its first chunk GET, on
+        exactly the stores the import flow accepted a credential for.
+
+        The credential is deliberately NOT in the artifact (design §12), so a
+        reference assembled from the manifest alone cannot open the store. The
+        browser path splices it in on the way out of ``get_image_url``; this is
+        the same splice on the way out of here, and the second assertion is the
+        one that keeps it from becoming a leak: the manifest the artifact holds
+        must still be untokened afterwards.
+        """
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        trainer._state["meta"]["ngff_credentials"] = {ROOT: "tok-abc"}
+
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        src = {r["stem"]: r for r in out["train"]}["remote-stem"]["image_source"]
+        assert (
+            "/t/tok-abc/" in src["store_root"]
+        ), f"the credential did not reach the trainer: {src['store_root']}"
+        assert src["store_root"] == bc.apply_store_credential(ROOT, "tok-abc")
+
+        stored = trainer._tstate["manifest"]["remote-stem"]["source"]["store_root"]
+        assert "tok-abc" not in stored, (
+            "the splice wrote the credential back into the manifest entry, which "
+            f"is what is persisted to the artifact: {stored}"
+        )
+
+    async def test_an_uncredentialed_store_is_handed_over_unchanged(self, trainer):
+        """The control. A splice that rewrote every root would pass the test
+        above while breaking every public store."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        # A credential recorded for a DIFFERENT store must not be applied here.
+        trainer._state["meta"]["ngff_credentials"] = {
+            "https://other.invalid/zarr/": "tok-xyz"
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        src = {r["stem"]: r for r in out["train"]}["remote-stem"]["image_source"]
+        assert src["store_root"] == ROOT
+        assert "/t/" not in src["store_root"]

@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 import bioengine
 import busy
 import httpx
+
+import ngff_region
 import numpy as np
 import yaml
 from hypha_rpc import connect_to_server
@@ -55,7 +57,9 @@ _ENABLED_BACKENDS = _parse_backends(os.getenv("MODEL_FINETUNE_BACKENDS"))
 # (serialize training so autoscaled replicas stay free for inference). Set >1
 # only when there is a distinct GPU per concurrent run (one runtime replica per
 # GPU); Ray Serve then spreads the concurrent train() calls across replicas.
-_MAX_CONCURRENT_TRAINING = max(1, int(os.getenv("MODEL_FINETUNE_MAX_CONCURRENT_TRAINING", "1") or "1"))
+_MAX_CONCURRENT_TRAINING = max(
+    1, int(os.getenv("MODEL_FINETUNE_MAX_CONCURRENT_TRAINING", "1") or "1")
+)
 RuntimeApp = None
 CellposeRuntime = None
 if "microsam" in _ENABLED_BACKENDS:
@@ -74,10 +78,18 @@ _HEALTH_CALL_TIMEOUT_S = 15.0
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal[
-    "vit_l_lm", "vit_b_lm", "vit_t_lm",
-    "vit_l_em_organelles", "vit_b_em_organelles", "vit_t_em_organelles",
-    "vit_b", "vit_l", "vit_h",
-    "cpsam", "cpdino", "cpdino-vitb",
+    "vit_l_lm",
+    "vit_b_lm",
+    "vit_t_lm",
+    "vit_l_em_organelles",
+    "vit_b_em_organelles",
+    "vit_t_em_organelles",
+    "vit_b",
+    "vit_l",
+    "vit_h",
+    "cpsam",
+    "cpdino",
+    "cpdino-vitb",
 ]
 # Model types served by the isolated Cellpose runtime rather than micro-sam.
 CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
@@ -212,11 +224,12 @@ def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     report["advice"] = (
         "Deploy one backend: pass "
         'application_env_vars={"*": {"MODEL_FINETUNE_BACKENDS": "cellpose"}} '
-        "(or \"microsam\") to deploy_app, or launch the worker from an image that "
+        '(or "microsam") to deploy_app, or launch the worker from an image that '
         "bakes it. Each single backend has a 1-GPU floor. See the app README, "
         "'Selecting backends'."
     )
     return report
+
 
 # Which backends each start_training parameter actually affects. The training UI
 # reads this (via get_training_capabilities) to show a control only for the
@@ -254,7 +267,8 @@ def _apply_clahe(img_array: np.ndarray) -> np.ndarray:
     Cellpose-SAM otherwise cannot segment (opt-in via preflight_training_dataset).
     Pure numpy — NO cv2 — so the CPU entry's numpy ABI is never perturbed: adding
     opencv dragged in an incompatible numpy and crashed EntryApp init at deploy
-    (numpy.dtype size mismatch vs the pandas imported at init; deNBI verify of 0.21.0)."""
+    (numpy.dtype size mismatch vs the pandas imported at init; deNBI verify of 0.21.0).
+    """
     arr = np.asarray(img_array)
     if arr.ndim == 3 and arr.shape[0] in (1, 2, 3, 4) and arr.shape[0] < arr.shape[1]:
         arr = arr.transpose(1, 2, 0)
@@ -276,7 +290,9 @@ def _apply_clahe(img_array: np.ndarray) -> np.ndarray:
     return _clahe_numpy(arr, clip_limit=3.0, grid=(16, 16))
 
 
-def _clahe_numpy(gray: np.ndarray, clip_limit: float = 3.0, grid=(16, 16)) -> np.ndarray:
+def _clahe_numpy(
+    gray: np.ndarray, clip_limit: float = 3.0, grid=(16, 16)
+) -> np.ndarray:
     """Contrast-limited adaptive histogram equalisation, bilinearly interpolated
     between per-tile clipped-CDF LUTs — a numpy reimplementation of
     ``cv2.createCLAHE(clipLimit, tileGridSize).apply()`` so no compiled dep is pulled
@@ -289,7 +305,7 @@ def _clahe_numpy(gray: np.ndarray, clip_limit: float = 3.0, grid=(16, 16)) -> np
     luts = np.empty((gy, gx, 256), dtype=np.float32)
     for i in range(gy):
         for j in range(gx):
-            tile = g[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            tile = g[ys[i] : ys[i + 1], xs[j] : xs[j + 1]]
             n = tile.size
             if n == 0:
                 luts[i, j] = np.arange(256, dtype=np.float32)
@@ -309,18 +325,26 @@ def _clahe_numpy(gray: np.ndarray, clip_limit: float = 3.0, grid=(16, 16)) -> np
         i1 = np.clip(idx, 0, len(centers) - 1)
         i0 = np.clip(idx - 1, 0, len(centers) - 1)
         c0, c1 = centers[i0], centers[i1]
-        wt = np.where(i0 == i1, 0.0,
-                      np.clip((coords - c0) / np.where(c1 > c0, c1 - c0, 1.0), 0, 1))
+        wt = np.where(
+            i0 == i1,
+            0.0,
+            np.clip((coords - c0) / np.where(c1 > c0, c1 - c0, 1.0), 0, 1),
+        )
         return i0, i1, wt
 
     ri0, ri1, rw = _iw(np.arange(h), cy)
     ci0, ci1, cw = _iw(np.arange(w), cx)
-    R0 = np.repeat(ri0[:, None], w, 1); R1 = np.repeat(ri1[:, None], w, 1)
-    C0 = np.repeat(ci0[None, :], h, 0); C1 = np.repeat(ci1[None, :], h, 0)
+    R0 = np.repeat(ri0[:, None], w, 1)
+    R1 = np.repeat(ri1[:, None], w, 1)
+    C0 = np.repeat(ci0[None, :], h, 0)
+    C1 = np.repeat(ci1[None, :], h, 0)
     gi = g.astype(np.int64)
-    v00 = luts[R0, C0, gi]; v01 = luts[R0, C1, gi]
-    v10 = luts[R1, C0, gi]; v11 = luts[R1, C1, gi]
-    RW = rw[:, None]; CW = cw[None, :]
+    v00 = luts[R0, C0, gi]
+    v01 = luts[R0, C1, gi]
+    v10 = luts[R1, C0, gi]
+    v11 = luts[R1, C1, gi]
+    RW = rw[:, None]
+    CW = cw[None, :]
     out = (v00 * (1 - CW) + v01 * CW) * (1 - RW) + (v10 * (1 - CW) + v11 * CW) * RW
     return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -632,7 +656,9 @@ class EntryApp:
                 "export, and training are unavailable until it starts."
             ) from e
 
-    async def _runtime_gpu_memory(self, model_type: Optional[str] = None) -> Dict[str, Any]:
+    async def _runtime_gpu_memory(
+        self, model_type: Optional[str] = None
+    ) -> Dict[str, Any]:
         """VRAM of the backend runtime that owns ``model_type`` (empty dict if the
         runtime doesn't answer)."""
         runtime = self._runtime_for(model_type)
@@ -695,7 +721,9 @@ class EntryApp:
         single-use and would be spent after a retry.
         """
         retry_status = {403, 404, 408, 429}
-        body_factory = kwargs.pop("content", None) if callable(kwargs.get("content")) else None
+        body_factory = (
+            kwargs.pop("content", None) if callable(kwargs.get("content")) else None
+        )
         for delay in (*self._HTTP_RETRY_BACKOFF, None):
             if body_factory is not None:
                 kwargs["content"] = body_factory()
@@ -706,7 +734,9 @@ class EntryApp:
                     raise
                 await asyncio.sleep(delay)
                 continue
-            if delay is not None and (resp.status_code in retry_status or resp.status_code >= 500):
+            if delay is not None and (
+                resp.status_code in retry_status or resp.status_code >= 500
+            ):
                 await asyncio.sleep(delay)
                 continue
             return resp
@@ -744,14 +774,17 @@ class EntryApp:
                     break
                 yield chunk
 
-    async def _put_file(self, url: str, fpath: Path, timeout: float = 600.0) -> httpx.Response:
+    async def _put_file(
+        self, url: str, fpath: Path, timeout: float = 600.0
+    ) -> httpx.Response:
         """PUT a file to a presigned URL, streaming from disk so large weights
         (cpsam packages ship a ~1.2GB model_weights.pth) never load whole into
         RAM and OOM the memory-constrained EntryApp actor. Content-Length is set
         explicitly because S3 presigned PUTs reject chunked transfer encoding."""
         size = await asyncio.to_thread(lambda: fpath.stat().st_size)
         return await self._http_retry(
-            "PUT", url,
+            "PUT",
+            url,
             content=lambda: self._file_chunks(fpath),
             headers={"Content-Length": str(size)},
             timeout=timeout,
@@ -764,8 +797,10 @@ class EntryApp:
                 f"Unsupported file extension '{ext}' in source '{source}'. "
                 f"Supported: {SUPPORTED_FILE_TYPES.__args__}"
             )
-        url = source if source.startswith(("http://", "https://")) else (
-            await self._get_download_url(source)
+        url = (
+            source
+            if source.startswith(("http://", "https://"))
+            else (await self._get_download_url(source))
         )
         resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
@@ -779,13 +814,33 @@ class EntryApp:
         return await asyncio.to_thread(iio.imread, buffer)
 
     async def _resolve_image(self, source: Union[np.ndarray, str]) -> np.ndarray:
+        # A region reference is read BEFORE the string path, and only its own
+        # shape routes it here: `is_region_source` requires a mapping carrying
+        # kind="ngff" and a store_root, so every existing caller — array, URL or
+        # artifact path — falls through untouched.
+        #
+        # WHY THE CALLER SUPPLIES THE LAYOUT rather than this app asking the
+        # broker for it. The entry talks to `public/artifact-manager` and to
+        # nothing else today; calling annotation-broker from here would make
+        # training depend on that app being deployed and reachable, for metadata
+        # the caller already holds — it got `dataset_paths`, `axis_roles` and
+        # `level0_shape` from `probe_ngff_source` when it imported the source.
+        # So the reference carries the layout beside the region, and a caller
+        # that omits it is refused BY NAME in `read_region` rather than having a
+        # 2D no-channel layout guessed for it.
+        if ngff_region.is_region_source(source):
+            return await asyncio.to_thread(
+                ngff_region.read_region, source, dict(source)
+            )
         if isinstance(source, str):
             return await self._load_image_from_source(source)
         if isinstance(source, np.ndarray):
             return source
         return np.asarray(source)
 
-    async def _resolve_label_array(self, source: Union[np.ndarray, str], ref_shape: tuple) -> np.ndarray:
+    async def _resolve_label_array(
+        self, source: Union[np.ndarray, str], ref_shape: tuple
+    ) -> np.ndarray:
         import training
 
         if isinstance(source, np.ndarray):
@@ -794,13 +849,44 @@ class EntryApp:
             return np.asarray(source)
         ext = Path(source.split("?")[0]).suffix.lower()
         if ext in (".geojson", ".json"):
-            url = source if source.startswith(("http://", "https://")) else (
-                await self._get_download_url(source)
+            url = (
+                source
+                if source.startswith(("http://", "https://"))
+                else (await self._get_download_url(source))
             )
             resp = await self._http.get(url)
             resp.raise_for_status()
             h, w = int(ref_shape[0]), int(ref_shape[1])
-            return training.rasterize_geojson(resp.json(), width=w, height=h)
+            payload = resp.json()
+            mask = training.rasterize_geojson(payload, width=w, height=h)
+            # A GeoJSON that carries polygons and rasterises to NOTHING is a
+            # coordinate-frame mismatch, and it is silent: training proceeds on
+            # an all-background mask and reports success, having learnt nothing.
+            #
+            # The case that motivates it: a crop read from a whole-slide source
+            # is a WxH canvas, while the broker describes a region "in level-0
+            # pixels". If the annotator writes polygons in slide coordinates,
+            # every one of them lands outside the crop. Which frame it writes is
+            # not settled in this repository, so rather than assume one, this
+            # refuses the outcome that is wrong under either.
+            #
+            # Deliberately not region-specific: features that draw nothing on a
+            # full image are the same defect with the same cause.
+            if mask.max() == 0:
+                bounds = training.polygon_coordinate_bounds(payload)
+                if bounds:
+                    raise ValueError(
+                        f"The annotation for this image has "
+                        f"{int(bounds['features'])} polygon(s) but rasterises to "
+                        f"an empty mask on the {w}x{h} canvas: their coordinates "
+                        f"span x {bounds['x_min']:.0f}..{bounds['x_max']:.0f}, "
+                        f"y {bounds['y_min']:.0f}..{bounds['y_max']:.0f}. Training "
+                        f"on it would learn only background. If this image is a "
+                        f"region of a larger source, the polygons are most likely "
+                        f"in the source's coordinates and need offsetting by the "
+                        f"region origin."
+                    )
+            return mask
         return await self._load_image_from_source(source)
 
     async def _save_npy_to_temp(self, array: np.ndarray) -> str:
@@ -814,8 +900,10 @@ class EntryApp:
     def _embedding_npz_bytes(features, input_size, original_size, model_type) -> bytes:
         buffer = BytesIO()
         np.savez(
-            buffer, features=np.asarray(features),
-            input_size=np.asarray(input_size), original_size=np.asarray(original_size),
+            buffer,
+            features=np.asarray(features),
+            input_size=np.asarray(input_size),
+            original_size=np.asarray(original_size),
             model_type=str(model_type),
         )
         return buffer.getvalue()
@@ -833,14 +921,22 @@ class EntryApp:
         compute_embedding) or an inline compute_embedding result dict.
         """
         if isinstance(e, str):
-            url = e if e.startswith(("http://", "https://")) else await self._get_download_url(e)
+            url = (
+                e
+                if e.startswith(("http://", "https://"))
+                else await self._get_download_url(e)
+            )
             resp = await self._http_retry("GET", url)
             resp.raise_for_status()
-            data = await asyncio.to_thread(np.load, BytesIO(resp.content), allow_pickle=False)
+            data = await asyncio.to_thread(
+                np.load, BytesIO(resp.content), allow_pickle=False
+            )
             return {
                 "features": np.asarray(data["features"]),
                 "input_size": [int(x) for x in np.asarray(data["input_size"]).tolist()],
-                "original_size": [int(x) for x in np.asarray(data["original_size"]).tolist()],
+                "original_size": [
+                    int(x) for x in np.asarray(data["original_size"]).tolist()
+                ],
                 "model_type": str(data["model_type"]),
             }
         if isinstance(e, dict):
@@ -848,7 +944,10 @@ class EntryApp:
             input_size = e.get("input_size")
             if input_size is None:
                 scale = float(e["sam_scale"])
-                input_size = [round(original_size[0] * scale), round(original_size[1] * scale)]
+                input_size = [
+                    round(original_size[0] * scale),
+                    round(original_size[1] * scale),
+                ]
             return {
                 "features": np.asarray(e["features"]),
                 "input_size": [int(x) for x in input_size],
@@ -881,7 +980,12 @@ class EntryApp:
         grants read access to a draft in their workspace; without it the app token
         is used, which only reaches published models.
         """
-        cache_dir = Path.home() / ".bioengine" / "micro_sam_zoo_cache" / re.sub(r"[^\w.-]", "_", model_id)
+        cache_dir = (
+            Path.home()
+            / ".bioengine"
+            / "micro_sam_zoo_cache"
+            / re.sub(r"[^\w.-]", "_", model_id)
+        )
         weights_path = cache_dir / "weights.pt"
         meta_path = cache_dir / "kwargs.json"
         if weights_path.exists() and meta_path.exists():
@@ -900,7 +1004,9 @@ class EntryApp:
             else None
         )
         try:
-            am = await (caller_client or self._hypha).get_service("public/artifact-manager")
+            am = await (caller_client or self._hypha).get_service(
+                "public/artifact-manager"
+            )
 
             # Prefer the new ``bioimageio.yaml`` name; fall back to legacy ``rdf.yaml``.
             rdf_url = None
@@ -970,7 +1076,8 @@ class EntryApp:
             None, description="Minimum object size in pixels (smaller objects dropped)."
         ),
         session_id: Optional[str] = Field(
-            None, description="Serve the fine-tuned model from this training session's checkpoint."
+            None,
+            description="Serve the fine-tuned model from this training session's checkpoint.",
         ),
         model_id: Optional[str] = Field(
             None,
@@ -1010,13 +1117,17 @@ class EntryApp:
             generate_kwargs["postprocessing"] = postprocessing
         if model_id is not None:
             if input_arrays is None:
-                raise ValueError("model_id requires input_arrays (images), not embeddings.")
+                raise ValueError(
+                    "model_id requires input_arrays (images), not embeddings."
+                )
             pkg = await self._fetch_model_package(model_id, model_token)
             await self._check_runtime_available(pkg["model_type"])
             images = [await self._resolve_image(src) for src in input_arrays]
             return await self._runtime_for(pkg["model_type"]).auto_segment(
-                images=images, model_type=pkg["model_type"],
-                checkpoint=pkg["weights_path"], generate_kwargs=generate_kwargs,
+                images=images,
+                model_type=pkg["model_type"],
+                checkpoint=pkg["weights_path"],
+                generate_kwargs=generate_kwargs,
             )
         if (input_arrays is None) == (embeddings is None):
             raise ValueError("Provide exactly one of 'input_arrays' or 'embeddings'.")
@@ -1025,10 +1136,14 @@ class EntryApp:
             # Embeddings are a micro-sam-only path (cpsam has no encoder embedding).
             await self._check_runtime_available()
             embs = [await self._resolve_embedding(e) for e in embeddings]
-            emb_model = next((e["model_type"] for e in embs if e.get("model_type")), None)
+            emb_model = next(
+                (e["model_type"] for e in embs if e.get("model_type")), None
+            )
             return await self.runtime.auto_segment_from_embedding(
-                embeddings=embs, model_type=emb_model or model_type,
-                generate_kwargs=generate_kwargs, checkpoint=checkpoint,
+                embeddings=embs,
+                model_type=emb_model or model_type,
+                generate_kwargs=generate_kwargs,
+                checkpoint=checkpoint,
             )
         # A fine-tuned session's backend fixes the runtime; otherwise route by model_type.
         served_type = model_type
@@ -1043,14 +1158,18 @@ class EntryApp:
         await self._check_runtime_available(served_type)
         images = [await self._resolve_image(src) for src in input_arrays]
         return await self._runtime_for(served_type).auto_segment(
-            images=images, model_type=served_type,
-            generate_kwargs=generate_kwargs, checkpoint=checkpoint,
+            images=images,
+            model_type=served_type,
+            generate_kwargs=generate_kwargs,
+            checkpoint=checkpoint,
         )
 
     @bioengine.method
     async def compute_embedding(
         self,
-        inputs: Union[np.ndarray, str] = Field(..., description="A single input image."),
+        inputs: Union[np.ndarray, str] = Field(
+            ..., description="A single input image."
+        ),
         model_type: ModelType = Field("vit_l_lm", description="μSAM model."),
         return_url: bool = Field(
             False,
@@ -1064,7 +1183,9 @@ class EntryApp:
             "embedding .npz at, instead of a temporary S3 file. You keep the matching "
             "download URL to pass to infer(embeddings=[...]).",
         ),
-        session_id: Optional[str] = Field(None, description="Serve a fine-tuned session checkpoint."),
+        session_id: Optional[str] = Field(
+            None, description="Serve a fine-tuned session checkpoint."
+        ),
     ) -> Dict[str, Any]:
         """Run the encoder once and return its embedding: ``{features |
         embedding_url, original_image_shape, input_size, sam_scale, mask_threshold,
@@ -1074,22 +1195,30 @@ class EntryApp:
         dropped from the return.
         """
         if model_type in CELLPOSE_MODEL_TYPES:
-            raise ValueError("compute_embedding is micro-sam only; cpsam has no embedding path.")
+            raise ValueError(
+                "compute_embedding is micro-sam only; cpsam has no embedding path."
+            )
         await self._check_runtime_available()
         checkpoint = self._session_checkpoint(session_id) if session_id else None
         image = await self._resolve_image(inputs)
         payload = await self.runtime.encode(
-            image=image, model_type=model_type, checkpoint=checkpoint,
+            image=image,
+            model_type=model_type,
+            checkpoint=checkpoint,
         )
         payload["model_type"] = model_type
         if embedding_upload_url or return_url:
             feat = payload.pop("features")
-            arr = np.frombuffer(feat["_rvalue"], dtype=feat["_rdtype"]).reshape(feat["_rshape"])
+            arr = np.frombuffer(feat["_rvalue"], dtype=feat["_rdtype"]).reshape(
+                feat["_rshape"]
+            )
             bundle = self._embedding_npz_bytes(
                 arr, payload["input_size"], payload["original_image_shape"], model_type
             )
             if embedding_upload_url:
-                resp = await self._http_retry("PUT", embedding_upload_url, content=bundle)
+                resp = await self._http_retry(
+                    "PUT", embedding_upload_url, content=bundle
+                )
                 resp.raise_for_status()
             else:
                 payload["embedding_url"] = await self._put_temp_embedding(bundle)
@@ -1099,11 +1228,15 @@ class EntryApp:
     async def get_onnx_model(
         self,
         model_type: ModelType = Field("vit_l_lm", description="μSAM model."),
-        quantize: bool = Field(True, description="Quantize for faster browser runtime."),
+        quantize: bool = Field(
+            True, description="Quantize for faster browser runtime."
+        ),
     ) -> bytes:
         """The interactive prompt decoder as ONNX bytes for onnxruntime-web."""
         if model_type in CELLPOSE_MODEL_TYPES:
-            raise ValueError("get_onnx_model is micro-sam only; cpsam has no ONNX prompt decoder.")
+            raise ValueError(
+                "get_onnx_model is micro-sam only; cpsam has no ONNX prompt decoder."
+            )
         await self._check_runtime_available()
         return await self.runtime.export_onnx(model_type=model_type, quantize=quantize)
 
@@ -1121,18 +1254,26 @@ class EntryApp:
             out = []
             for img_src, lbl_src in zip(images, labels):
                 img = await self._resolve_image(img_src)
-                lbl = await self._resolve_label_array(lbl_src, np.asarray(img).shape[:2])
+                lbl = await self._resolve_label_array(
+                    lbl_src, np.asarray(img).shape[:2]
+                )
                 out.append((img, lbl))
             return out
 
         train = await pairs(train_images, train_labels)
         val = await pairs(val_images, val_labels) if val_images and val_labels else None
         return await asyncio.to_thread(
-            training.materialize_pairs, session_id, train, val,
-            params["val_fraction"], params["patch_shape"],
+            training.materialize_pairs,
+            session_id,
+            train,
+            val,
+            params["val_fraction"],
+            params["patch_shape"],
         )
 
-    async def _preparing_heartbeat(self, session_id: str, interval: float = 60.0) -> None:
+    async def _preparing_heartbeat(
+        self, session_id: str, interval: float = 60.0
+    ) -> None:
         """Refresh status.json's ``updated_at`` while a run is still PREPARING.
 
         Nothing between the PREPARING write and the runtime's TRAINING write
@@ -1151,7 +1292,14 @@ class EntryApp:
             training.write_status(session_id)
 
     async def _run_training(
-        self, session_id, model_type, train_images, train_labels, val_images, val_labels, params
+        self,
+        session_id,
+        model_type,
+        train_images,
+        train_labels,
+        val_images,
+        val_labels,
+        params,
     ) -> None:
         import training
 
@@ -1193,13 +1341,19 @@ class EntryApp:
                 resolved["checkpoint_path"] = str(dest)
                 if params.get("pool_provenance"):
                     self._bump_transport(bytes_down=len(resp.content))
-            training.write_training_params(session_id, {
-                **params, "model_type": model_type,
-                "patch_shape": list(data["patch_shape"]),
-                "train_images": data["train_images"], "train_labels": data["train_labels"],
-                "val_images": data["val_images"], "val_labels": data["val_labels"],
-                **resolved,
-            })
+            training.write_training_params(
+                session_id,
+                {
+                    **params,
+                    "model_type": model_type,
+                    "patch_shape": list(data["patch_shape"]),
+                    "train_images": data["train_images"],
+                    "train_labels": data["train_labels"],
+                    "val_images": data["val_images"],
+                    "val_labels": data["val_labels"],
+                    **resolved,
+                },
+            )
             # Long-running: this await holds one GPU runtime replica for the whole
             # training run, and a concurrent infer queues behind it on that same
             # replica — at the effective target of 2, two calls in flight ask for
@@ -1209,7 +1363,8 @@ class EntryApp:
             # so a session waiting here is not false-flagged STOPPED.
             if self._training_sem.locked():
                 training.write_status(
-                    session_id, status="QUEUED",
+                    session_id,
+                    status="QUEUED",
                     message="waiting for GPU — another fine-tuning is in progress",
                 )
             async with self._training_sem:
@@ -1223,14 +1378,28 @@ class EntryApp:
             # running and owns the real outcome — recording that as a user stop
             # would discard the child's COMPLETED for good.
             if training.stop_requested(session_id):
-                training.write_status(session_id, status="STOPPED",
-                                       message="training task cancelled",
-                                       terminated_by="user_stop")
+                training.write_status(
+                    session_id,
+                    status="STOPPED",
+                    message="training task cancelled",
+                    terminated_by="user_stop",
+                )
             raise
         except Exception as e:
-            logger.error(f"Training session {session_id} failed: {e}")
-            training.write_status(session_id, status="FAILED",
-                                   message=str(e)[:800], terminated_by="entry")
+            # REDACTED HERE AS WELL AS AT THE RAISE SITE, and deliberately not
+            # only there. Everything this message can contain comes from some
+            # library's idea of a good error, and a store URL carries its
+            # credential as a path segment; the session status document is
+            # served by an endpoint that takes no caller context, so one of
+            # those strings reaching it publishes the credential to anyone who
+            # can list sessions. The region reader already refuses without
+            # quoting the URL. This catches the paths nobody has thought of,
+            # which is the only kind that matters for a credential.
+            safe = ngff_region.redact_store_credential(e)
+            logger.error(f"Training session {session_id} failed: {safe}")
+            training.write_status(
+                session_id, status="FAILED", message=safe[:800], terminated_by="entry"
+            )
         finally:
             preparing_hb.cancel()
             self._training_tasks.pop(session_id, None)
@@ -1256,8 +1425,16 @@ class EntryApp:
         ``UPSCALING``, which never times out."""
         import training
 
-        microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
-        cellpose = await self._gpu_view("cellpose") if "cellpose" in self._enabled_backends else {}
+        microsam = (
+            await self._gpu_view("microsam")
+            if "microsam" in self._enabled_backends
+            else {}
+        )
+        cellpose = (
+            await self._gpu_view("cellpose")
+            if "cellpose" in self._enabled_backends
+            else {}
+        )
         models = []
         for m in ModelType.__args__:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
@@ -1265,16 +1442,29 @@ class EntryApp:
             gpu = cellpose if backend == "cellpose" else microsam
             required = training.min_training_vram_mb(m)
             rec = {
-                "model_type": m, "backend": backend, "min_gpu_memory_mb": required,
-                "family": training.model_family(m), "size": training.model_size(m),
-                "source": "disabled" if not enabled else (gpu.get("source", "unavailable") if gpu else "unavailable"),
+                "model_type": m,
+                "backend": backend,
+                "min_gpu_memory_mb": required,
+                "family": training.model_family(m),
+                "size": training.model_size(m),
+                "source": (
+                    "disabled"
+                    if not enabled
+                    else (gpu.get("source", "unavailable") if gpu else "unavailable")
+                ),
             }
             if not enabled:
-                rec["trainable"], rec["reason"] = False, "backend not deployed on this worker"
+                rec["trainable"], rec["reason"] = (
+                    False,
+                    "backend not deployed on this worker",
+                )
             elif not gpu:
                 rec["trainable"], rec["reason"] = None, "runtime unavailable"
             elif not gpu.get("available"):
-                rec["trainable"], rec["reason"] = False, "no GPU detected on the runtime"
+                rec["trainable"], rec["reason"] = (
+                    False,
+                    "no GPU detected on the runtime",
+                )
             elif gpu["total_mb"] < required:
                 rec["trainable"] = False
                 rec["reason"] = f"needs ~{required} MB, GPU has {gpu['total_mb']} MB"
@@ -1283,8 +1473,16 @@ class EntryApp:
             models.append(rec)
         return {
             "gpus": {
-                "microsam": microsam if "microsam" in self._enabled_backends else {"enabled": False},
-                "cellpose": cellpose if "cellpose" in self._enabled_backends else {"enabled": False},
+                "microsam": (
+                    microsam
+                    if "microsam" in self._enabled_backends
+                    else {"enabled": False}
+                ),
+                "cellpose": (
+                    cellpose
+                    if "cellpose" in self._enabled_backends
+                    else {"enabled": False}
+                ),
             },
             "models": models,
             "parameters": self._training_parameter_schema(),
@@ -1311,77 +1509,120 @@ class EntryApp:
                 typed = next((s for s in spec["anyOf"] if s.get("type") != "null"), {})
             lo = typed.get("minimum", typed.get("exclusiveMinimum"))
             hi = typed.get("maximum", typed.get("exclusiveMaximum"))
-            out.append({
-                "name": name,
-                "applies_to": backends,
-                "type": typed.get("type"),
-                "default": spec.get("default"),
-                "min": lo,
-                "max": hi,
-                "description": spec.get("description", ""),
-            })
+            out.append(
+                {
+                    "name": name,
+                    "applies_to": backends,
+                    "type": typed.get("type"),
+                    "default": spec.get("default"),
+                    "min": lo,
+                    "max": hi,
+                    "description": spec.get("description", ""),
+                }
+            )
         return out
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def start_training(
         self,
-        train_images: List[Union[np.ndarray, str]] = Field(
-            ..., description="Training images: arrays, http(s) URLs, or get_upload_url paths."),
+        train_images: List[Union[np.ndarray, str, Dict[str, Any]]] = Field(
+            ...,
+            description="Training images: arrays, http(s) URLs, get_upload_url paths, "
+            "or an OME-Zarr region reference {kind: 'ngff', store_root, region: "
+            "{x,y,width,height}, dataset_paths, axis_roles, level0_shape} — the last "
+            "reads only that region's chunks from the source, never the whole image.",
+        ),
         train_labels: List[Union[np.ndarray, str]] = Field(
-            ..., description="Dense instance-label masks paired 1:1 with train_images "
+            ...,
+            description="Dense instance-label masks paired 1:1 with train_images "
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
-            "needs DENSE labels — annotate all objects per image."),
-        val_images: Optional[List[Union[np.ndarray, str]]] = Field(None, description="Optional validation images."),
-        val_labels: Optional[List[Union[np.ndarray, str]]] = Field(None, description="Validation labels."),
+            "needs DENSE labels — annotate all objects per image.",
+        ),
+        val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
+            None, description="Optional validation images; same forms as train_images."
+        ),
+        val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
+            None, description="Validation labels."
+        ),
         model_type: ModelType = Field(
             "vit_l_lm",
             description="Base model to fine-tune. vit_* → micro-sam (AIS decoder); "
             "'cpsam' → Cellpose-SAM, 'cpdino'/'cpdino-vitb' → Cellpose-DINO "
-            "(all cellpose types share the isolated Cellpose runtime)."),
+            "(all cellpose types share the isolated Cellpose runtime).",
+        ),
         n_epochs: int = Field(5, ge=1, description="Number of training epochs."),
         n_objects_per_batch: int = Field(
-            8, ge=1, description="micro-sam only: objects per batch — main GPU-memory knob; "
-            "lower it on small GPUs, raise it on large ones (8 fits vit_b on 24GB)."),
-        patch_size: int = Field(512, ge=16, description="micro-sam only: square training patch side (clamped to the smallest image)."),
-        diam_mean: float = Field(30.0, gt=0, description="cellpose only (cpsam/cpdino): mean object diameter in pixels."),
+            8,
+            ge=1,
+            description="micro-sam only: objects per batch — main GPU-memory knob; "
+            "lower it on small GPUs, raise it on large ones (8 fits vit_b on 24GB).",
+        ),
+        patch_size: int = Field(
+            512,
+            ge=16,
+            description="micro-sam only: square training patch side (clamped to the smallest image).",
+        ),
+        diam_mean: float = Field(
+            30.0,
+            gt=0,
+            description="cellpose only (cpsam/cpdino): mean object diameter in pixels.",
+        ),
         train_tile_size: Optional[int] = Field(
-            None, ge=16, description="cellpose only: square training tile side (cellpose "
+            None,
+            ge=16,
+            description="cellpose only: square training tile side (cellpose "
             "'bsize'). Omit for the backbone's own default — 256 for cpsam, 384 for "
             "cpdino. A smaller tile trains faster and in less VRAM, at some cost in "
             "accuracy: measured on synthetic narrow-object data, 256 matched the 384 "
             "default to within noise while 128 scored below it, so lower this when "
             "training cost is the constraint rather than to improve a narrow-data fit. "
             "cpsam accepts 256 and nothing else, so this is settable for "
-            "cpdino/cpdino-vitb only."),
+            "cpdino/cpdino-vitb only.",
+        ),
         batch_size: int = Field(1, ge=1, description="Training batch size."),
         learning_rate: float = Field(1e-5, gt=0, description="AdamW learning rate."),
-        val_fraction: float = Field(0.2, ge=0.0, le=0.9, description="Val split fraction when val is omitted."),
-        n_samples: Optional[int] = Field(None, ge=1, description="Patches sampled per epoch (auto if omitted)."),
+        val_fraction: float = Field(
+            0.2, ge=0.0, le=0.9, description="Val split fraction when val is omitted."
+        ),
+        n_samples: Optional[int] = Field(
+            None, ge=1, description="Patches sampled per epoch (auto if omitted)."
+        ),
         resume_session_id: Optional[str] = Field(
-            None, description="Continue fine-tuning from a prior session's checkpoint (same model_type)."),
+            None,
+            description="Continue fine-tuning from a prior session's checkpoint (same model_type).",
+        ),
         init_checkpoint: Optional[str] = Field(
-            None, description="Start fine-tuning from an existing checkpoint given as an "
+            None,
+            description="Start fine-tuning from an existing checkpoint given as an "
             "http(s) URL (or a get_upload_url path) — e.g. the resumable weights file of an "
             "exported BioImage.IO draft (see get_export_status.resume_checkpoint_file) — instead "
             "of the base model. Mutually exclusive with resume_session_id; model_type must match "
-            "the checkpoint's architecture."),
+            "the checkpoint's architecture.",
+        ),
         init_from_pool: Optional[str] = Field(
-            None, description="Seed this fine-tune from a community model-soup pool's CURRENT "
+            None,
+            description="Seed this fine-tune from a community model-soup pool's CURRENT "
             "checkpoint (artifact id, e.g. 'bioimage-io/cpsam-community-pool'). Resolves the "
             "pool's latest community weights and trains from them — the at-your-own-pace round "
             "start. Requires pool_token; mutually exclusive with init_checkpoint and "
-            "resume_session_id; the pool's model_type must match."),
+            "resume_session_id; the pool's model_type must match.",
+        ),
         init_from_pool_version: Optional[str] = Field(
-            None, description="Seed from a NAMED community version ('v1', 'v2', …) instead of the "
+            None,
+            description="Seed from a NAMED community version ('v1', 'v2', …) instead of the "
             "pool's current pointer. Resolves the version's own manifest.json rather than the "
             "index, so it still reaches a version whose weights were published but whose index "
             "entry was never committed (an aggregate interrupted between its two commits). "
-            "Requires init_from_pool."),
+            "Requires init_from_pool.",
+        ),
         pool_token: Optional[str] = Field(
-            None, description="Token with read access to init_from_pool's artifact. Scoped to "
-            "the pool, not the app's own token."),
+            None,
+            description="Token with read access to init_from_pool's artifact. Scoped to "
+            "the pool, not the app's own token.",
+        ),
         metrics: Optional[List[str]] = Field(
-            None, description="Which quantitative metrics to compute, chosen from the fixed "
+            None,
+            description="Which quantitative metrics to compute, chosen from the fixed "
             "set ['loss', 'pixel', 'instance'] — an unrecognised name is rejected, not "
             "ignored. 'loss': per-epoch train/validation loss curves, free, the default. "
             "'pixel': foreground/background accuracy, precision, recall, f1 and iou on the "
@@ -1389,8 +1630,12 @@ class EntryApp:
             "instance-segmentation eval, the expensive one, never computed unless asked. "
             "'pixel' and 'instance' score the finished model on held-out data and share one "
             "inference pass. Results surface in get_training_status. Cellpose backend only; "
-            "defaults to ['loss']."),
-        label: str = Field("", description="Optional human-readable tag for this session."),
+            "defaults to ['loss'].",
+        ),
+        label: str = Field(
+            "", description="Optional human-readable tag for this session."
+        ),
+        context=None,
     ) -> Dict[str, Any]:
         """Start a μSAM fine-tuning session (AIS decoder) and return immediately
         with the status incl. ``session_id``. Data prep runs on this CPU entry;
@@ -1400,7 +1645,13 @@ class EntryApp:
         """
         import training
 
-        if sum(x is not None and x != "" for x in (init_checkpoint, resume_session_id, init_from_pool)) > 1:
+        if (
+            sum(
+                x is not None and x != ""
+                for x in (init_checkpoint, resume_session_id, init_from_pool)
+            )
+            > 1
+        ):
             raise ValueError(
                 "Pass at most one of init_checkpoint, resume_session_id, or init_from_pool — "
                 "they select different starting checkpoints."
@@ -1419,7 +1670,11 @@ class EntryApp:
         # Refuse here rather than let cellpose raise it: train_seg checks this only
         # after data prep and after the run has taken the single GPU training slot.
         fixed_tile = CELLPOSE_FIXED_TILE_SIZE.get(model_type)
-        if train_tile_size is not None and fixed_tile is not None and train_tile_size != fixed_tile:
+        if (
+            train_tile_size is not None
+            and fixed_tile is not None
+            and train_tile_size != fixed_tile
+        ):
             raise ValueError(
                 f"{model_type} trains at a fixed tile size of {fixed_tile} — cellpose rejects "
                 f"any other value. Omit train_tile_size, or use a cpdino model type, which "
@@ -1437,10 +1692,12 @@ class EntryApp:
         gpu = await self._runtime_gpu_memory(model_type)
         required = training.min_training_vram_mb(model_type)
         if gpu.get("available") and gpu["total_mb"] < required:
-            same_backend = (model_type in CELLPOSE_MODEL_TYPES)
+            same_backend = model_type in CELLPOSE_MODEL_TYPES
             fits = [
-                m for m, req in training.MODEL_TRAIN_VRAM_MB.items()
-                if (m in CELLPOSE_MODEL_TYPES) == same_backend and req <= gpu["total_mb"]
+                m
+                for m, req in training.MODEL_TRAIN_VRAM_MB.items()
+                if (m in CELLPOSE_MODEL_TYPES) == same_backend
+                and req <= gpu["total_mb"]
             ]
             raise ValueError(
                 f"{model_type} needs ~{required} MB of GPU memory to fine-tune, but "
@@ -1454,24 +1711,48 @@ class EntryApp:
         backend = "cellpose" if model_type in CELLPOSE_MODEL_TYPES else "microsam"
         session_id = training.new_session_id()
         training.write_status(
-            session_id, status="PREPARING", created_at=time.time(),
-            model_type=model_type, backend=backend, label=label,
+            session_id,
+            status="PREPARING",
+            created_at=time.time(),
+            # Who this run belongs to, from Hypha's injected context. Recorded
+            # at creation because it cannot be recovered later: nothing else on
+            # the record says whose work it was.
+            **training.caller_identity(context),
+            model_type=model_type,
+            backend=backend,
+            label=label,
             n_train_inputs=len(train_images),
-            resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
+            resume_session_id=resume_session_id,
+            init_checkpoint=init_checkpoint,
             pool_provenance=pool_provenance,
         )
         params = dict(
-            n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,
-            batch_size=batch_size, learning_rate=learning_rate, diam_mean=diam_mean,
-            val_fraction=val_fraction, n_samples=n_samples,
-            resume_session_id=resume_session_id, init_checkpoint=init_checkpoint,
-            pool_provenance=pool_provenance, train_tile_size=train_tile_size,
-            patch_shape=(patch_size, patch_size), num_workers=0,
+            n_epochs=n_epochs,
+            n_objects_per_batch=n_objects_per_batch,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            diam_mean=diam_mean,
+            val_fraction=val_fraction,
+            n_samples=n_samples,
+            resume_session_id=resume_session_id,
+            init_checkpoint=init_checkpoint,
+            pool_provenance=pool_provenance,
+            train_tile_size=train_tile_size,
+            patch_shape=(patch_size, patch_size),
+            num_workers=0,
             metrics=selected_metrics,
         )
-        task = asyncio.create_task(self._run_training(
-            session_id, model_type, train_images, train_labels, val_images, val_labels, params
-        ))
+        task = asyncio.create_task(
+            self._run_training(
+                session_id,
+                model_type,
+                train_images,
+                train_labels,
+                val_images,
+                val_labels,
+                params,
+            )
+        )
         self._training_tasks[session_id] = task
         return training.get_status(session_id)
 
@@ -1479,25 +1760,36 @@ class EntryApp:
     async def preflight_training_dataset(
         self,
         train_images: List[str] = Field(
-            ..., description="Raw training image sources to ingest from an external "
+            ...,
+            description="Raw training image sources to ingest from an external "
             "store before a run: http(s) URLs (e.g. BioImage Archive FIRE files) or "
-            "get_upload_url paths, one per training pair."),
+            "get_upload_url paths, one per training pair.",
+        ),
         train_labels: List[str] = Field(
-            ..., description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection)."),
+            ...,
+            description="Instance-label mask sources paired 1:1 with train_images "
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
+        ),
         val_images: Optional[List[str]] = Field(
-            None, description="Optional validation image sources."),
+            None, description="Optional validation image sources."
+        ),
         val_labels: Optional[List[str]] = Field(
-            None, description="Optional validation label sources, paired with val_images."),
+            None,
+            description="Optional validation label sources, paired with val_images.",
+        ),
         enable_clahe: bool = Field(
-            False, description="Apply CLAHE (contrast-limited adaptive histogram "
+            False,
+            description="Apply CLAHE (contrast-limited adaptive histogram "
             "equalisation) to each image while staging — rescues low-contrast "
             "fluorescence Cellpose-SAM otherwise cannot segment. Off by default; the "
-            "min-max rescale during training is unaffected. Forces staging on."),
+            "min-max rescale during training is unaffected. Forces staging on.",
+        ),
         stage: bool = Field(
-            True, description="Download, validate and RE-STAGE each prepared image+label "
+            True,
+            description="Download, validate and RE-STAGE each prepared image+label "
             "into the app's temp store, returning URL lists ready to pass straight into "
-            "start_training. If False, validate the sources in place and report only."),
+            "start_training. If False, validate the sources in place and report only.",
+        ),
     ) -> Dict[str, Any]:
         """Validate and ingest a training dataset from an external store before a run.
 
@@ -1522,18 +1814,27 @@ class EntryApp:
         async def _prepare(split, img_sources, lbl_sources):
             report, staged_imgs, staged_lbls = [], [], []
             for i, (img_src, lbl_src) in enumerate(zip(img_sources, lbl_sources)):
-                item = {"split": split, "index": i,
-                        "image": str(img_src), "label": str(lbl_src)}
+                item = {
+                    "split": split,
+                    "index": i,
+                    "image": str(img_src),
+                    "label": str(lbl_src),
+                }
                 try:
                     img = await self._resolve_image(img_src)
-                    lbl = np.squeeze(await self._resolve_label_array(lbl_src, img.shape))
+                    lbl = np.squeeze(
+                        await self._resolve_label_array(lbl_src, img.shape)
+                    )
                     img_hw = tuple(int(x) for x in img.shape[:2])
                     if lbl.ndim != 2:
-                        raise ValueError(f"label is not 2-D (shape {tuple(lbl.shape)}).")
+                        raise ValueError(
+                            f"label is not 2-D (shape {tuple(lbl.shape)})."
+                        )
                     if tuple(int(x) for x in lbl.shape[:2]) != img_hw:
                         raise ValueError(
                             f"image/label shape mismatch: image H×W {img_hw} vs "
-                            f"label {tuple(int(x) for x in lbl.shape)}.")
+                            f"label {tuple(int(x) for x in lbl.shape)}."
+                        )
                     if not np.issubdtype(lbl.dtype, np.integer):
                         lbl = lbl.astype(np.int64)
                     n_inst = int(np.unique(lbl[lbl > 0]).size)
@@ -1541,10 +1842,16 @@ class EntryApp:
                         raise ValueError("label map has no foreground objects.")
                     if enable_clahe:
                         img = _apply_clahe(img)
-                    item.update(ok=True, image_shape=list(img.shape),
-                                label_shape=list(lbl.shape), n_instances=n_inst)
+                    item.update(
+                        ok=True,
+                        image_shape=list(img.shape),
+                        label_shape=list(lbl.shape),
+                        n_instances=n_inst,
+                    )
                     if do_stage:
-                        staged_imgs.append(await self._save_npy_to_temp(np.asarray(img)))
+                        staged_imgs.append(
+                            await self._save_npy_to_temp(np.asarray(img))
+                        )
                         staged_lbls.append(await self._save_npy_to_temp(lbl))
                 except Exception as exc:
                     item.update(ok=False, error=str(exc))
@@ -1552,11 +1859,13 @@ class EntryApp:
             return report, staged_imgs, staged_lbls
 
         train_report, train_imgs, train_lbls = await _prepare(
-            "train", train_images, train_labels)
+            "train", train_images, train_labels
+        )
         val_report, val_imgs, val_lbls = [], [], []
         if val_images is not None:
             val_report, val_imgs, val_lbls = await _prepare(
-                "val", val_images, val_labels)
+                "val", val_images, val_labels
+            )
 
         pairs = train_report + val_report
         n_bad = sum(1 for p in pairs if not p["ok"])
@@ -1581,19 +1890,25 @@ class EntryApp:
         if ok:
             msg = f"Validated {n_train_ok} training pair(s)"
             if val_report:
-                msg += f" and {sum(1 for p in val_report if p['ok'])} validation pair(s)"
-            result["message"] = (msg + "; staged for start_training.") if do_stage else (msg + ".")
+                msg += (
+                    f" and {sum(1 for p in val_report if p['ok'])} validation pair(s)"
+                )
+            result["message"] = (
+                (msg + "; staged for start_training.") if do_stage else (msg + ".")
+            )
         elif n_bad:
             result["message"] = (
                 f"{n_bad} of {len(pairs)} pair(s) failed validation; see 'pairs' for "
-                "per-pair errors.")
+                "per-pair errors."
+            )
         else:
             result["message"] = "No usable training pairs resolved."
         return result
 
     @bioengine.method
     async def get_training_status(
-        self, session_id: str = Field(..., description="Session id from start_training.")
+        self,
+        session_id: str = Field(..., description="Session id from start_training."),
     ) -> Dict[str, Any]:
         """Fine-tuning session status (PREPARING/QUEUED/TRAINING/COMPLETED/FAILED/
         STOPPED), elapsed time, and whether the checkpoint is servable. QUEUED
@@ -1613,21 +1928,39 @@ class EntryApp:
     async def stop_training(
         self, session_id: str = Field(..., description="Session id to stop.")
     ) -> Dict[str, Any]:
-        """Request cancellation (an in-flight training epoch may finish first)."""
+        """Request cancellation (an in-flight training epoch may finish first).
+
+        Refuses a session that does not exist, and creates nothing when it does
+        so. `write_status` below calls `mkdir(parents=True)`, which is how a real
+        session's directory comes into being on its first write — so without this
+        check, stopping a run that never existed MANUFACTURES it, complete with a
+        status record that then appears in the run listing.
+        """
         import training
+
+        if not training.session_dir(session_id).exists():
+            raise training.SessionNotFound(
+                f"no training session {session_id!r} on this worker"
+            )
 
         training.request_stop(session_id)
         task = self._training_tasks.get(session_id)
         if task is not None and not task.done():
             task.cancel()
-        training.write_status(session_id, status="STOPPED",
-                               message="stop requested by user", terminated_by="user_stop")
+        training.write_status(
+            session_id,
+            status="STOPPED",
+            message="stop requested by user",
+            terminated_by="user_stop",
+        )
         return training.get_status(session_id)
 
     @bioengine.method
     async def export_model(
         self,
-        session_id: str = Field(..., description="COMPLETED fine-tuning session to export."),
+        session_id: str = Field(
+            ..., description="COMPLETED fine-tuning session to export."
+        ),
         name: str = Field(..., description="Model name for the BioImage.IO package."),
         description: str = Field("", description="Model description for the RDF."),
         authors: Optional[List[Dict[str, Any]]] = Field(
@@ -1668,8 +2001,13 @@ class EntryApp:
             "provenance": provenance,
         }
         training.write_export(
-            export_id, status="PENDING", progress=0.0, message="queued",
-            download_url=None, size_bytes=None, error=None,
+            export_id,
+            status="PENDING",
+            progress=0.0,
+            message="queued",
+            download_url=None,
+            size_bytes=None,
+            error=None,
         )
         self._export_tasks[export_id] = asyncio.create_task(
             self._run_export(export_id, session_id, request)
@@ -1688,23 +2026,35 @@ class EntryApp:
 
         while True:
             await asyncio.sleep(interval)
-            if training.read_export(export_id).get("status") not in ("PENDING", "BUILDING"):
+            if training.read_export(export_id).get("status") not in (
+                "PENDING",
+                "BUILDING",
+            ):
                 return
             training.write_export(export_id)
 
-    async def _run_export(self, export_id: str, session_id: str, request: Dict[str, Any]) -> None:
+    async def _run_export(
+        self, export_id: str, session_id: str, request: Dict[str, Any]
+    ) -> None:
         import training
 
         export_hb = asyncio.create_task(self._export_heartbeat(export_id))
         try:
-            training.write_export(export_id, status="BUILDING", progress=0.1,
-                                  message="building package")
-            served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
+            training.write_export(
+                export_id, status="BUILDING", progress=0.1, message="building package"
+            )
+            served = (
+                "cpsam" if training.session_backend(session_id) == "cellpose" else None
+            )
             res = await self._runtime_for(served).export_bioimageio(
                 session_id=session_id, request=request
             )
-            training.write_export(export_id, _package_dir=res["package_dir"],
-                                  progress=0.8, message="staging package")
+            training.write_export(
+                export_id,
+                _package_dir=res["package_dir"],
+                progress=0.8,
+                message="staging package",
+            )
             zip_path = Path(res["zip"])
             file_path = f"temp/{export_id}/{zip_path.name}"
             upload_url = await self._s3.put_file(file_path=file_path, ttl=6 * 3600)
@@ -1712,14 +2062,20 @@ class EntryApp:
             resp.raise_for_status()
             download_url = await self._get_download_url(file_path)
             training.write_export(
-                export_id, status="READY", progress=1.0, message="ready",
-                download_url=download_url, size_bytes=res["zip_size"], files=res["files"],
+                export_id,
+                status="READY",
+                progress=1.0,
+                message="ready",
+                download_url=download_url,
+                size_bytes=res["zip_size"],
+                files=res["files"],
                 resume_checkpoint_file=res.get("resume_checkpoint_file"),
             )
         except Exception as e:
             logger.exception(f"Export {export_id} failed")
-            training.write_export(export_id, status="FAILED", progress=1.0,
-                                  message="failed", error=str(e))
+            training.write_export(
+                export_id, status="FAILED", progress=1.0, message="failed", error=str(e)
+            )
         finally:
             export_hb.cancel()
 
@@ -1762,13 +2118,17 @@ class EntryApp:
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         if rec.get("status") != "READY":
-            raise RuntimeError(f"Export '{export_id}' is not READY (status={rec.get('status')}).")
+            raise RuntimeError(
+                f"Export '{export_id}' is not READY (status={rec.get('status')})."
+            )
         pkg_dir = Path(rec["_package_dir"])
         pushed = []
         for rel, url in files.items():
             fpath = pkg_dir / rel
             if not fpath.is_file():
-                raise FileNotFoundError(f"Package file '{rel}' not found for export '{export_id}'.")
+                raise FileNotFoundError(
+                    f"Package file '{rel}' not found for export '{export_id}'."
+                )
             resp = await self._put_file(url, fpath, timeout=600.0)
             resp.raise_for_status()
             pushed.append(rel)
@@ -1803,7 +2163,9 @@ class EntryApp:
         except FileNotFoundError:
             pass
         except Exception as e:
-            logger.warning(f"pool transport counter unreadable, starting from zero: {e}")
+            logger.warning(
+                f"pool transport counter unreadable, starting from zero: {e}"
+            )
         return base
 
     def _persist_transport(self) -> None:
@@ -1829,7 +2191,9 @@ class EntryApp:
                 "pool_token is required for pool access — pass a token scoped to "
                 "the pool artifact, not the app's own token."
             )
-        client = await connect_to_server({"server_url": SERVER_URL, "token": pool_token})
+        client = await connect_to_server(
+            {"server_url": SERVER_URL, "token": pool_token}
+        )
         am = await client.get_service("public/artifact-manager")
         return am, client
 
@@ -1851,7 +2215,9 @@ class EntryApp:
         resp.raise_for_status()
         return resp.json()
 
-    async def _read_merge_journal(self, am, pool_artifact_id: str) -> Optional[Dict[str, Any]]:
+    async def _read_merge_journal(
+        self, am, pool_artifact_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Read aggregate()'s resume journal, or None when there is nothing to resume.
 
         Absent is the normal first-merge case, so unlike the pool index this never
@@ -1868,11 +2234,15 @@ class EntryApp:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            logger.warning(f"no usable merge journal for '{pool_artifact_id}' ({e}); "
-                           f"this merge starts from no saved passes.")
+            logger.warning(
+                f"no usable merge journal for '{pool_artifact_id}' ({e}); "
+                f"this merge starts from no saved passes."
+            )
             return None
 
-    async def _write_merge_journal(self, am, pool_artifact_id: str, journal: Dict[str, Any]) -> None:
+    async def _write_merge_journal(
+        self, am, pool_artifact_id: str, journal: Dict[str, Any]
+    ) -> None:
         """Persist the resume journal, after every score so none is paid for twice.
 
         Never raises. The journal buys resumability; it is not an input to the
@@ -1891,15 +2261,22 @@ class EntryApp:
         try:
             async with self._staged(am, pool_artifact_id):
                 url = await am.put_file(pool_artifact_id, file_path=pool.MERGE_JOURNAL)
-                (await self._http_retry(
-                    "PUT", url, content=json.dumps(journal).encode("utf-8"), timeout=120.0
-                )).raise_for_status()
+                (
+                    await self._http_retry(
+                        "PUT",
+                        url,
+                        content=json.dumps(journal).encode("utf-8"),
+                        timeout=120.0,
+                    )
+                ).raise_for_status()
                 await self._commit_with_retry(am, pool_artifact_id)
         except Exception as e:
-            logger.warning(f"could not persist the merge journal for "
-                           f"'{pool_artifact_id}' ({e}); a kill now would lose the "
-                           f"{len(journal.get('scores', {}))} scored pass(es) since "
-                           f"the last successful write.")
+            logger.warning(
+                f"could not persist the merge journal for "
+                f"'{pool_artifact_id}' ({e}); a kill now would lose the "
+                f"{len(journal.get('scores', {}))} scored pass(es) since "
+                f"the last successful write."
+            )
 
     @asynccontextmanager
     async def _staged(self, am, artifact_id: str):
@@ -1928,7 +2305,9 @@ class EntryApp:
                 )
             raise
 
-    async def _commit_with_retry(self, am, artifact_id: str, tries: int = 6, base: float = 2.0) -> None:
+    async def _commit_with_retry(
+        self, am, artifact_id: str, tries: int = 6, base: float = 2.0
+    ) -> None:
         """Commit a staged artifact, retrying the transient read-after-write 404 the
         deNBI/isilon S3 raises when a just-PUT object is not yet visible to commit's
         HeadObject check. The uploads themselves already succeeded (their PUT raises
@@ -1940,10 +2319,13 @@ class EntryApp:
                 return
             except Exception as e:
                 msg = str(e)
-                transient = any(s in msg for s in ("HeadObject", "does not exist", "Not Found", "404"))
+                transient = any(
+                    s in msg
+                    for s in ("HeadObject", "does not exist", "Not Found", "404")
+                )
                 if not transient or i == tries - 1:
                     raise
-                await asyncio.sleep(base * (2 ** i))
+                await asyncio.sleep(base * (2**i))
 
     async def _read_community_manifest(
         self, am, pool_artifact_id: str, community_version: str
@@ -1993,7 +2375,9 @@ class EntryApp:
             "witness_metric": pool.corrected_metric(manifest.get("witness_metric")),
         }
 
-    async def _next_free_community_version(self, am, pool_artifact_id: str, index: Dict[str, Any]) -> str:
+    async def _next_free_community_version(
+        self, am, pool_artifact_id: str, index: Dict[str, Any]
+    ) -> str:
         """The next ``vN`` that is not already published.
 
         pool.next_community_version derives it from the index pointer alone, so a pool
@@ -2015,7 +2399,9 @@ class EntryApp:
                 f"overwriting it."
             )
             v = f"v{int(v.lstrip('v')) + 1}"
-        raise RuntimeError(f"no free community version below v100 in '{pool_artifact_id}'.")
+        raise RuntimeError(
+            f"no free community version below v100 in '{pool_artifact_id}'."
+        )
 
     async def _resolve_pool_init(
         self, model_type, init_from_pool, pool_token, community_version=None
@@ -2073,14 +2459,26 @@ class EntryApp:
     @bioengine.method
     async def contribute(
         self,
-        session_id: str = Field(..., description="A COMPLETED cpsam fine-tuning session to contribute."),
-        pool_artifact_id: str = Field(..., description="Community pool artifact id, e.g. 'bioimage-io/cpsam-community-pool'."),
-        pool_token: str = Field(..., description="Token with write access to pool_artifact_id. Scoped to the pool, not the app's own token."),
+        session_id: str = Field(
+            ..., description="A COMPLETED cpsam fine-tuning session to contribute."
+        ),
+        pool_artifact_id: str = Field(
+            ...,
+            description="Community pool artifact id, e.g. 'bioimage-io/cpsam-community-pool'.",
+        ),
+        pool_token: str = Field(
+            ...,
+            description="Token with write access to pool_artifact_id. Scoped to the pool, not the app's own token.",
+        ),
         dataset_fingerprint: Optional[str] = Field(
-            None, description="Optional caller-supplied fingerprint of the local training set "
-            "(the data never moves; this only lets the pool tell contributions apart)."),
+            None,
+            description="Optional caller-supplied fingerprint of the local training set "
+            "(the data never moves; this only lets the pool tell contributions apart).",
+        ),
         solo_val_metric: Optional[float] = Field(
-            None, description="Optional solo validation score for this contribution, recorded for audit."),
+            None,
+            description="Optional solo validation score for this contribution, recorded for audit.",
+        ),
     ) -> Dict[str, Any]:
         """Upload a finished cpsam session's weights into a community model-soup
         pool. Records weights + an auditable metadata.json (architecture
@@ -2104,7 +2502,9 @@ class EntryApp:
                 f"finished fine-tune can be contributed."
             )
         if training.session_backend(session_id) != "cellpose":
-            raise ValueError("contribute currently accepts cpsam (cellpose) sessions only.")
+            raise ValueError(
+                "contribute currently accepts cpsam (cellpose) sessions only."
+            )
         params = training.read_training_params(session_id)
         model_type = params.get("model_type") or st.get("model_type")
         if model_type != "cpsam":
@@ -2154,7 +2554,8 @@ class EntryApp:
                 # to the presigned URL, and returns the signature + hashes, so nothing
                 # large or torch-dependent crosses the entry.
                 info = await runtime.prepare_contribution(
-                    session_id, w_url, model_type=model_type)
+                    session_id, w_url, model_type=model_type
+                )
                 signature = info["architecture_signature"]
                 if index is None:
                     # A fine-tune preserves the parameter layout, so the first
@@ -2170,9 +2571,12 @@ class EntryApp:
                     # deliberately no fallback. A bootstrap that omitted it produced a
                     # pool that could never merge.
                     index = pool.empty_index(
-                        model_type, signature, info.get("base_commitment"))
+                        model_type, signature, info.get("base_commitment")
+                    )
                 else:
-                    pool.assert_compatible(index, model_type=model_type, signature=signature)
+                    pool.assert_compatible(
+                        index, model_type=model_type, signature=signature
+                    )
 
                 # Earliest point a re-deposit is knowable: the digest is computed
                 # from the bytes by prepare_contribution, which has already PUT
@@ -2180,7 +2584,9 @@ class EntryApp:
                 # pool.find_contribution_by_digest for why metadata is not part of
                 # it, and why decided_contribution_ids is not consulted. Leaving by
                 # raise, never by return: see _RecognisedRedeposit.
-                existing = pool.find_contribution_by_digest(index, info["weights_sha256"])
+                existing = pool.find_contribution_by_digest(
+                    index, info["weights_sha256"]
+                )
                 if existing is not None:
                     raise _RecognisedRedeposit(existing)
 
@@ -2205,24 +2611,37 @@ class EntryApp:
                     uploaded_at=uploaded_at,
                 )
                 m_url = await am.put_file(pool_artifact_id, file_path=paths["metadata"])
-                (await self._http_retry(
-                    "PUT", m_url, content=json.dumps(metadata).encode("utf-8"), timeout=120.0
-                )).raise_for_status()
-                pool.append_contribution(index, {
-                    "contribution_id": cid,
-                    "weights_path": paths["weights"],
-                    "metadata_path": paths["metadata"],
-                    "weights_sha256": info["weights_sha256"],
-                    "architecture_signature": signature,
-                    "samples_seen": samples_seen,
-                    "n_train_images": int(n_inputs),
-                    "n_bytes": int(info["n_bytes"]),
-                    "uploaded_at": uploaded_at,
-                })
+                (
+                    await self._http_retry(
+                        "PUT",
+                        m_url,
+                        content=json.dumps(metadata).encode("utf-8"),
+                        timeout=120.0,
+                    )
+                ).raise_for_status()
+                pool.append_contribution(
+                    index,
+                    {
+                        "contribution_id": cid,
+                        "weights_path": paths["weights"],
+                        "metadata_path": paths["metadata"],
+                        "weights_sha256": info["weights_sha256"],
+                        "architecture_signature": signature,
+                        "samples_seen": samples_seen,
+                        "n_train_images": int(n_inputs),
+                        "n_bytes": int(info["n_bytes"]),
+                        "uploaded_at": uploaded_at,
+                    },
+                )
                 i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
-                (await self._http_retry(
-                    "PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0
-                )).raise_for_status()
+                (
+                    await self._http_retry(
+                        "PUT",
+                        i_url,
+                        content=json.dumps(index).encode("utf-8"),
+                        timeout=120.0,
+                    )
+                ).raise_for_status()
                 await self._commit_with_retry(am, pool_artifact_id)
         except _RecognisedRedeposit as recognised:
             # _staged has already discarded the stage on the way out, so the pool
@@ -2256,7 +2675,9 @@ class EntryApp:
                 # same stock base, not read back from the first deposit.
                 "contribution_id": redeposited.get("contribution_id"),
                 "pool_artifact_id": pool_artifact_id,
-                "architecture_signature": redeposited.get("architecture_signature", signature),
+                "architecture_signature": redeposited.get(
+                    "architecture_signature", signature
+                ),
                 "weights_sha256": info["weights_sha256"],
                 "samples_seen": int(redeposited.get("samples_seen", samples_seen)),
                 "l2_from_base": info["l2_from_base"],
@@ -2308,7 +2729,10 @@ class EntryApp:
     async def get_pool_state(
         self,
         pool_artifact_id: str = Field(..., description="Community pool artifact id."),
-        pool_token: str = Field(..., description="Token with read access to the pool. Scoped to the pool, not the app's own token."),
+        pool_token: str = Field(
+            ...,
+            description="Token with read access to the pool. Scoped to the pool, not the app's own token.",
+        ),
     ) -> Dict[str, Any]:
         """The pool's state projected onto the campaign-page wire contract
         (schema_version 0.15.0-draft): merge_trigger, baseline_metric (role=witness),
@@ -2334,11 +2758,21 @@ class EntryApp:
     async def evaluate_community(
         self,
         pool_artifact_id: str = Field(..., description="Community pool artifact id."),
-        pool_token: str = Field(..., description="Token with read access to the pool. Scoped to the pool, not the app's own token."),
-        val_images: List[Union[np.ndarray, str]] = Field(..., description="Validation images (arrays, URLs, or get_upload_url paths)."),
+        pool_token: str = Field(
+            ...,
+            description="Token with read access to the pool. Scoped to the pool, not the app's own token.",
+        ),
+        val_images: List[Union[np.ndarray, str]] = Field(
+            ...,
+            description="Validation images (arrays, URLs, or get_upload_url paths).",
+        ),
         community_version: Optional[str] = Field(
-            None, description="Which community checkpoint to evaluate; defaults to the pool's current one."),
-        diam_mean: float = Field(30.0, gt=0, description="Mean object diameter in pixels."),
+            None,
+            description="Which community checkpoint to evaluate; defaults to the pool's current one.",
+        ),
+        diam_mean: float = Field(
+            30.0, gt=0, description="Mean object diameter in pixels."
+        ),
     ) -> List[Dict[str, Any]]:
         """Run a community checkpoint over a validation set and return its
         instance masks — the hook a scoring pass builds on. It is parameterised on
@@ -2356,7 +2790,9 @@ class EntryApp:
                 weights_rel = pool.community_paths(community_version)["weights"]
             else:
                 if not cc:
-                    raise ValueError(f"pool '{pool_artifact_id}' has no community checkpoint to evaluate.")
+                    raise ValueError(
+                        f"pool '{pool_artifact_id}' has no community checkpoint to evaluate."
+                    )
                 weights_rel = cc["path"]
             w_url = await am.get_file(pool_artifact_id, file_path=weights_rel)
             content = await self._get_verified(w_url, timeout=600.0)
@@ -2371,8 +2807,18 @@ class EntryApp:
         # made every version reuse the first-loaded (current) model. Tagging the
         # path with the version gives each community checkpoint a distinct cache
         # key, so a requested historical version actually loads.
-        version_tag = re.sub(r"[^\w.-]", "_", str(community_version or (cc or {}).get("version") or "current"))
-        dest = Path.home() / ".bioengine" / "pool_eval" / re.sub(r"[^\w.-]", "_", pool_artifact_id) / f"community_{version_tag}.pt"
+        version_tag = re.sub(
+            r"[^\w.-]",
+            "_",
+            str(community_version or (cc or {}).get("version") or "current"),
+        )
+        dest = (
+            Path.home()
+            / ".bioengine"
+            / "pool_eval"
+            / re.sub(r"[^\w.-]", "_", pool_artifact_id)
+            / f"community_{version_tag}.pt"
+        )
         dest.parent.mkdir(parents=True, exist_ok=True)
         # dest is handed to the runtime as the checkpoint path below, so writing
         # it in place would let a concurrent evaluation of the same community
@@ -2384,8 +2830,10 @@ class EntryApp:
         await self._check_runtime_available(model_type)
         images = [await self._resolve_image(src) for src in val_images]
         return await self._runtime_for(model_type).auto_segment(
-            images=images, model_type=model_type,
-            checkpoint=str(dest), generate_kwargs={"diameter": diam_mean},
+            images=images,
+            model_type=model_type,
+            checkpoint=str(dest),
+            generate_kwargs={"diameter": diam_mean},
         )
 
     @staticmethod
@@ -2393,30 +2841,71 @@ class EntryApp:
         """Decode a runtime ndarray wire-dict (auto_segment returns these unchanged
         across the Ray hop; hypha only decodes at the RPC boundary, so an in-process
         caller must decode itself)."""
-        return np.frombuffer(d["_rvalue"], dtype=d["_rdtype"]).reshape(d["_rshape"]).copy()
+        return (
+            np.frombuffer(d["_rvalue"], dtype=d["_rdtype"]).reshape(d["_rshape"]).copy()
+        )
 
     async def _resolve_val_split(self, images, labels):
         """Resolve a (images, label-maps) split once: images to arrays, then each
         label to an instance map sized to its image."""
         imgs = [await self._resolve_image(src) for src in images]
-        gts = [await self._resolve_label_array(lb, im.shape) for lb, im in zip(labels, imgs)]
+        gts = [
+            await self._resolve_label_array(lb, im.shape)
+            for lb, im in zip(labels, imgs)
+        ]
         return imgs, gts
 
     @bioengine.method
     async def aggregate(
         self,
         pool_artifact_id: str = Field(..., description="Community pool artifact id."),
-        pool_token: str = Field(..., description="COORDINATOR token with WRITE access to the pool. Scoped to the pool, never the app's own HYPHA_TOKEN."),
-        gate_val_images: List[Union[np.ndarray, str]] = Field(..., description="Gate split A images — disjoint from ALL contributor training data; a precondition the app cannot check."),
-        gate_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Gate split A ground-truth instance label maps (0=background), one per image."),
-        witness_val_images: List[Union[np.ndarray, str]] = Field(..., description="Witness split B images — disjoint from A AND from all training data; never influences selection."),
-        witness_val_labels: List[Union[np.ndarray, str]] = Field(..., description="Witness split B ground-truth instance label maps, one per image."),
-        gate_split: Dict[str, Any] = Field(..., description="{artifact_id, sha256} provenance of split A, recorded in every community manifest."),
-        witness_split: Dict[str, Any] = Field(..., description="{artifact_id, sha256} provenance of split B."),
-        eps: float = Field(0.0, ge=0.0, description="Pre-registered non-degradation tolerance on split A (0 = strict). Do NOT tune post-hoc to hit an inclusion rate."),
-        max_batch: int = Field(32, ge=1, description="Max newly-arrived candidates weighed at this merge; overflow is deferred (and re-scored) to the next."),
-        min_members: Optional[int] = Field(None, ge=1, description="Refuse to publish a head with fewer members than this. Default: the published head's own member count (1 if there is no head), so quarantining can never silently thin the soup."),
-        diam_mean: float = Field(30.0, gt=0, description="Mean object diameter in pixels for auto-segmentation."),
+        pool_token: str = Field(
+            ...,
+            description="COORDINATOR token with WRITE access to the pool. Scoped to the pool, never the app's own HYPHA_TOKEN.",
+        ),
+        gate_val_images: List[Union[np.ndarray, str]] = Field(
+            ...,
+            description="Gate split A images — disjoint from ALL contributor training data; a precondition the app cannot check.",
+        ),
+        gate_val_labels: List[Union[np.ndarray, str]] = Field(
+            ...,
+            description="Gate split A ground-truth instance label maps (0=background), one per image.",
+        ),
+        witness_val_images: List[Union[np.ndarray, str]] = Field(
+            ...,
+            description="Witness split B images — disjoint from A AND from all training data; never influences selection.",
+        ),
+        witness_val_labels: List[Union[np.ndarray, str]] = Field(
+            ...,
+            description="Witness split B ground-truth instance label maps, one per image.",
+        ),
+        gate_split: Dict[str, Any] = Field(
+            ...,
+            description="{artifact_id, sha256} provenance of split A, recorded in every community manifest.",
+        ),
+        witness_split: Dict[str, Any] = Field(
+            ..., description="{artifact_id, sha256} provenance of split B."
+        ),
+        eps: float = Field(
+            0.0,
+            ge=0.0,
+            description="Pre-registered non-degradation tolerance on split A (0 = strict). Do NOT tune post-hoc to hit an inclusion rate.",
+        ),
+        max_batch: int = Field(
+            32,
+            ge=1,
+            description="Max newly-arrived candidates weighed at this merge; overflow is deferred (and re-scored) to the next.",
+        ),
+        min_members: Optional[int] = Field(
+            None,
+            ge=1,
+            description="Refuse to publish a head with fewer members than this. Default: the published head's own member count (1 if there is no head), so quarantining can never silently thin the soup.",
+        ),
+        diam_mean: float = Field(
+            30.0,
+            gt=0,
+            description="Mean object diameter in pixels for auto-segmentation.",
+        ),
     ) -> Dict[str, Any]:
         """Coordinator-only greedy merge — grow the community soup by full-weight
         uniform mean, gated on split A, reported on witness split B.
@@ -2448,8 +2937,12 @@ class EntryApp:
         model_type = "cpsam"
         await self._check_runtime_available(model_type)
         runtime = self._runtime_for(model_type)
-        gate_imgs, gate_gts = await self._resolve_val_split(gate_val_images, gate_val_labels)
-        wit_imgs, wit_gts = await self._resolve_val_split(witness_val_images, witness_val_labels)
+        gate_imgs, gate_gts = await self._resolve_val_split(
+            gate_val_images, gate_val_labels
+        )
+        wit_imgs, wit_gts = await self._resolve_val_split(
+            witness_val_images, witness_val_labels
+        )
 
         am, client = await self._pool_service(pool_token)
         # Held from the index read to the index commit, not just around the publish:
@@ -2468,7 +2961,9 @@ class EntryApp:
         try:
             index = await self._read_pool_index(am, pool_artifact_id)
             if index.get("model_type") != model_type:
-                raise ValueError(f"aggregate() is cpsam-only; pool model_type is '{index.get('model_type')}'.")
+                raise ValueError(
+                    f"aggregate() is cpsam-only; pool model_type is '{index.get('model_type')}'."
+                )
 
             async def _download(path: str) -> bytes:
                 url = await am.get_file(pool_artifact_id, file_path=path)
@@ -2490,8 +2985,9 @@ class EntryApp:
             replica_dl: Dict[str, int] = {}
 
             def _fold(result: Dict[str, Any]) -> Dict[str, Any]:
-                replica_dl[result["replica"]] = (
-                    replica_dl.get(result["replica"], 0) + int(result["soup_dl_bytes"]))
+                replica_dl[result["replica"]] = replica_dl.get(
+                    result["replica"], 0
+                ) + int(result["soup_dl_bytes"])
                 return result
 
             # What the pool recorded for each member's bytes, by path. Carried on
@@ -2531,7 +3027,10 @@ class EntryApp:
 
             journal = pool.usable_merge_journal(
                 await self._read_merge_journal(am, pool_artifact_id),
-                gate_split, witness_split, diam_mean)
+                gate_split,
+                witness_split,
+                diam_mean,
+            )
             resumed_from = len(journal["scores"])
             gate_id = pool.split_identity(gate_split)
             wit_id = pool.split_identity(witness_split)
@@ -2550,14 +3049,22 @@ class EntryApp:
                 if key in journal["scores"]:
                     # usable_merge_journal() prunes any entry missing its vector, so a
                     # hit on `scores` is a hit on both maps.
-                    return {"f1": float(journal["scores"][key]),
-                            "per_image": list(journal["per_image_scores"][key])}
+                    return {
+                        "f1": float(journal["scores"][key]),
+                        "per_image": list(journal["per_image_scores"][key]),
+                    }
                 imgs, gts = splits[split_id]
                 # A journal hit returns above without folding, which is correct: that
                 # pass transported nothing on this run.
-                scored = _fold(await runtime.score_soup(
-                    await _specs(member_paths), imgs, gts, diam_mean,
-                    base_commitment=index.get("base_commitment")))
+                scored = _fold(
+                    await runtime.score_soup(
+                        await _specs(member_paths),
+                        imgs,
+                        gts,
+                        diam_mean,
+                        base_commitment=index.get("base_commitment"),
+                    )
+                )
                 value, per_image = float(scored["f1"]), list(scored["per_image"])
                 pool.record_score(journal, key, value, per_image=per_image)
                 await self._write_merge_journal(am, pool_artifact_id, journal)
@@ -2569,10 +3076,14 @@ class EntryApp:
                 rather than dropping to a bare scalar. A record written before this app
                 banked vectors has none, and ``.get`` is deliberate: an absent key and
                 a null value must read alike here, because they mean the same thing."""
-                return {"f1": float(metric["aggregate"]),
-                        "per_image": list(metric.get("per_image") or [])}
+                return {
+                    "f1": float(metric["aggregate"]),
+                    "per_image": list(metric.get("per_image") or []),
+                }
 
-            def _metric(role: str, scored: Dict[str, Any], basis: str) -> Dict[str, Any]:
+            def _metric(
+                role: str, scored: Dict[str, Any], basis: str
+            ) -> Dict[str, Any]:
                 """One metric record from one scoring pass, breakdown attached.
 
                 The vector and its basis are passed together or not at all, from one
@@ -2583,7 +3094,9 @@ class EntryApp:
                 """
                 vector = scored.get("per_image") or None
                 return pool.round_metric(
-                    role=role, aggregate=round(float(scored["f1"]), 4), aggregate_basis=basis,
+                    role=role,
+                    aggregate=round(float(scored["f1"]), 4),
+                    aggregate_basis=basis,
                     per_image=vector,
                     per_image_basis=pool.PER_IMAGE_BASIS if vector else None,
                 )
@@ -2592,8 +3105,11 @@ class EntryApp:
             cur_member_ids: List[str] = []
             by_id = {c["contribution_id"]: c for c in index.get("contributions", [])}
             if cc and cc.get("path"):
-                cur_manifest = json.loads((await _download(
-                    pool.community_paths(cc["version"])["manifest"])).decode())
+                cur_manifest = json.loads(
+                    (
+                        await _download(pool.community_paths(cc["version"])["manifest"])
+                    ).decode()
+                )
                 cur_member_ids = list(cur_manifest.get("selected_contribution_ids", []))
             cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
 
@@ -2608,8 +3124,8 @@ class EntryApp:
             # members that will actually be loaded are known.
             budget = await runtime.soup_memory_budget()
             refusal = pool.soup_admission(
-                [c.get("n_bytes") for c in batch] + [by_id[cid].get("n_bytes")
-                                                     for cid in cur_member_ids],
+                [c.get("n_bytes") for c in batch]
+                + [by_id[cid].get("n_bytes") for cid in cur_member_ids],
                 budget_bytes=budget["declared_bytes"],
                 base_bytes=budget["rss_bytes"] or 0,
             )
@@ -2646,11 +3162,16 @@ class EntryApp:
             actual_by_path: Dict[str, str] = {}
             if to_hash:
                 actual_by_path = _fold(
-                    await runtime.verify_members(await _specs(to_hash)))["digests"]
+                    await runtime.verify_members(await _specs(to_hash))
+                )["digests"]
             _, quarantined = pool.digest_quarantine(verify_records, actual_by_path)
             quarantined_ids = {q["contribution_id"] for q in quarantined}
             q_counts = pool.quarantine_counts(quarantined)
-            floor = int(min_members) if min_members is not None else max(1, len(cur_member_ids))
+            floor = (
+                int(min_members)
+                if min_members is not None
+                else max(1, len(cur_member_ids))
+            )
 
             for q in quarantined:
                 if q["reason"] == pool.QUARANTINE_DIGEST_MISMATCH:
@@ -2689,7 +3210,9 @@ class EntryApp:
                 raise ValueError(f"aggregate() refused this merge: {head_refusal}")
 
             batch_all_ids = [c["contribution_id"] for c in batch]
-            cur_member_ids = [cid for cid in cur_member_ids if cid not in quarantined_ids]
+            cur_member_ids = [
+                cid for cid in cur_member_ids if cid not in quarantined_ids
+            ]
             cur_member_paths = [by_id[cid]["weights_path"] for cid in cur_member_ids]
             batch = [c for c in batch if c["contribution_id"] not in quarantined_ids]
             cand_path = {c["contribution_id"]: c["weights_path"] for c in batch}
@@ -2707,13 +3230,18 @@ class EntryApp:
                 stock_b = await _score([], wit_id)
                 baseline = {
                     "model": "stock-cpsam",
-                    "selection_metric": _metric("selection", stock_a, pool.SELECTION_BASIS),
+                    "selection_metric": _metric(
+                        "selection", stock_a, pool.SELECTION_BASIS
+                    ),
                     "witness_metric": _metric("witness", stock_b, pool.BASELINE_BASIS),
                     "created_at": time.time(),
                 }
 
-            cur = (await _score(cur_member_paths, gate_id)
-                   if cur_member_paths else _as_pass(baseline["selection_metric"]))
+            cur = (
+                await _score(cur_member_paths, gate_id)
+                if cur_member_paths
+                else _as_pass(baseline["selection_metric"])
+            )
             cur_a = cur["f1"]
 
             # Best-first ordering: individual marginal of adding each candidate to the
@@ -2722,8 +3250,12 @@ class EntryApp:
             marg = {}
             for c in batch:
                 cid = c["contribution_id"]
-                marg[cid] = (await _score(cur_member_paths + [cand_path[cid]], gate_id))["f1"]
-            ordered = sorted(batch, key=lambda c: marg[c["contribution_id"]], reverse=True)
+                marg[cid] = (
+                    await _score(cur_member_paths + [cand_path[cid]], gate_id)
+                )["f1"]
+            ordered = sorted(
+                batch, key=lambda c: marg[c["contribution_id"]], reverse=True
+            )
 
             s_paths = list(cur_member_paths)
             s_ids = list(cur_member_ids)
@@ -2740,8 +3272,14 @@ class EntryApp:
                 trial = await _score(s_paths + [cand_path[cid]], gate_id)
                 trial_a = trial["f1"]
                 included = trial_a >= (s_a - eps)
-                members_record.append({"contribution_id": cid, "marginal_score": round(marg[cid], 4),
-                                       "gate_score": round(trial_a, 4), "included": bool(included)})
+                members_record.append(
+                    {
+                        "contribution_id": cid,
+                        "marginal_score": round(marg[cid], 4),
+                        "gate_score": round(trial_a, 4),
+                        "included": bool(included),
+                    }
+                )
                 if included:
                     s_paths.append(cand_path[cid])
                     s_ids.append(cid)
@@ -2750,7 +3288,9 @@ class EntryApp:
                     admitted.append(cid)
 
             changed = bool(admitted)
-            baseline_version = cc["version"] if (cc and cc.get("path")) else "stock-cpsam"
+            baseline_version = (
+                cc["version"] if (cc and cc.get("path")) else "stock-cpsam"
+            )
 
             if changed:
                 # Last gate before anything is written: a merge does not publish a
@@ -2759,10 +3299,13 @@ class EntryApp:
                 # the head's survivors already cleared it above and admitting only
                 # adds — so it is the explicit min_members that this enforces.
                 thin = pool.publish_floor_refusal(
-                    member_ids=s_ids, floor=floor, quarantined=quarantined)
+                    member_ids=s_ids, floor=floor, quarantined=quarantined
+                )
                 if thin:
                     raise ValueError(f"aggregate() refused this merge: {thin}")
-                new_version = await self._next_free_community_version(am, pool_artifact_id, index)
+                new_version = await self._next_free_community_version(
+                    am, pool_artifact_id, index
+                )
                 head_a = s_a
                 wit_pass = await _score(s_paths, wit_id)
                 head_b = wit_pass["f1"]
@@ -2774,10 +3317,16 @@ class EntryApp:
                 # builds the soup and PUTs it straight to the pool, so the head weights
                 # never traverse the CPU entry.
                 async with self._staged(am, pool_artifact_id):
-                    w_url = await am.put_file(pool_artifact_id, file_path=paths["weights"])
-                    mat = _fold(await runtime.materialize_soup(
-                        await _specs(s_paths), w_url,
-                        base_commitment=index.get("base_commitment")))
+                    w_url = await am.put_file(
+                        pool_artifact_id, file_path=paths["weights"]
+                    )
+                    mat = _fold(
+                        await runtime.materialize_soup(
+                            await _specs(s_paths),
+                            w_url,
+                            base_commitment=index.get("base_commitment"),
+                        )
+                    )
                     head_sha = mat["sha256"]
                     head_bytes_out = int(mat["n_bytes"])
                     # The contributors' own measured diameters go in
@@ -2797,46 +3346,74 @@ class EntryApp:
                     if "non_learned_inherited" in mat:
                         _cid_of = dict(zip(s_paths, s_ids))
                         member_nl = []
-                        for _nl in (mat.get("member_non_learned") or []):
+                        for _nl in mat.get("member_non_learned") or []:
                             _cid = _cid_of.get(_nl.get("key"))
                             if _cid is None:
                                 raise RuntimeError(
                                     "materialize_soup returned a member key that is not "
-                                    f"among the admitted paths: {_nl.get('key')!r}")
-                            member_nl.append({
-                                "contribution_id": _cid,
-                                **{k: v for k, v in _nl.items() if k != "key"},
-                            })
+                                    f"among the admitted paths: {_nl.get('key')!r}"
+                                )
+                            member_nl.append(
+                                {
+                                    "contribution_id": _cid,
+                                    **{k: v for k, v in _nl.items() if k != "key"},
+                                }
+                            )
                         non_learned_block = pool.inherited_non_learned(
                             mat["non_learned_inherited"],
-                            source=mat["non_learned_source"])
+                            source=mat["non_learned_source"],
+                        )
                     else:
                         member_nl = None
                         non_learned_block = pool.unreported_non_learned(
                             reason="the Cellpose runtime serving this merge returned no "
-                                   "non_learned_inherited field, so it predates the base commitment")
+                            "non_learned_inherited field, so it predates the base commitment"
+                        )
                     manifest = pool.build_community_manifest(
-                        community_version=new_version, combine="uniform",
-                        selected_contribution_ids=s_ids, gate_split=gate_split, witness_split=witness_split,
-                        selection_metric=sel_metric, witness_metric=wit_metric, members=members_record,
+                        community_version=new_version,
+                        combine="uniform",
+                        selected_contribution_ids=s_ids,
+                        gate_split=gate_split,
+                        witness_split=witness_split,
+                        selection_metric=sel_metric,
+                        witness_metric=wit_metric,
+                        members=members_record,
                         quarantined=quarantined,
                         architecture_signature=index.get("architecture_signature"),
-                        weights_sha256=head_sha, created_at=time.time(),
+                        weights_sha256=head_sha,
+                        created_at=time.time(),
                         non_learned=non_learned_block,
                         member_non_learned=member_nl,
                     )
-                    m_url = await am.put_file(pool_artifact_id, file_path=paths["manifest"])
-                    (await self._http_retry("PUT", m_url, content=json.dumps(manifest).encode("utf-8"), timeout=120.0)).raise_for_status()
+                    m_url = await am.put_file(
+                        pool_artifact_id, file_path=paths["manifest"]
+                    )
+                    (
+                        await self._http_retry(
+                            "PUT",
+                            m_url,
+                            content=json.dumps(manifest).encode("utf-8"),
+                            timeout=120.0,
+                        )
+                    ).raise_for_status()
                     await self._commit_with_retry(am, pool_artifact_id)
                 self._bump_transport(bytes_up=head_bytes_out)
-                pool.set_current_community(index, community_version=new_version, weights_path=paths["weights"],
-                                           sha256=head_sha, selection_metric=sel_metric, witness_metric=wit_metric)
+                pool.set_current_community(
+                    index,
+                    community_version=new_version,
+                    weights_path=paths["weights"],
+                    sha256=head_sha,
+                    selection_metric=sel_metric,
+                    witness_metric=wit_metric,
+                )
             else:
                 new_version = None
                 head_a = cur_a
-                head_b = (cc["witness_metric"]["aggregate"]
-                          if (cc and cc.get("path") and cc.get("witness_metric"))
-                          else baseline["witness_metric"]["aggregate"])
+                head_b = (
+                    cc["witness_metric"]["aggregate"]
+                    if (cc and cc.get("path") and cc.get("witness_metric"))
+                    else baseline["witness_metric"]["aggregate"]
+                )
                 head_sha = None
                 head_bytes_out = 0
                 # Nothing admitted: the selection metric records the bar the assessed
@@ -2856,7 +3433,9 @@ class EntryApp:
             index["baseline"] = baseline
             # batch_all_ids, not batch: a quarantined candidate is decided too. See
             # the quarantine block above for why it is not left to be re-weighed.
-            index["decided_contribution_ids"] = list(index.get("decided_contribution_ids", [])) + batch_all_ids
+            index["decided_contribution_ids"] = (
+                list(index.get("decided_contribution_ids", [])) + batch_all_ids
+            )
             # bytes_in counts the assessed set (the batch weighed at this merge);
             # bytes_out is the published head, 0 when nothing was admitted. n_bytes is
             # written per contribution in a different function, so if any assessed member
@@ -2868,31 +3447,48 @@ class EntryApp:
                 "bytes_in": assessed_bytes,
                 "bytes_out": head_bytes_out,
                 "n_transfers": len(batch) + (1 if changed else 0),
-                "sources_complete": True if all(nb is not None for nb in member_bytes) else None,
+                "sources_complete": (
+                    True if all(nb is not None for nb in member_bytes) else None
+                ),
                 "soup_bytes_down": soup_bytes_down,
                 "soup_replicas": len(replica_dl),
             }
-            pool.append_merge(index, {
-                "published_version": new_version, "baseline_version": baseline_version,
-                "members": members_record,
-                # Kept out of "members": a members row reads "evaluated, not
-                # included" and carries the gate scores that decision rests on. A
-                # quarantined member was never evaluated and has no such scores, so
-                # filing it there would report an integrity failure as a rejection.
-                "quarantined": quarantined,
-                "quarantine_counts": q_counts,
-                "selection_metric": sel_metric, "witness_metric": wit_metric,
-                "global_sha256": head_sha,
-                # Written unconditionally, null included: a basis that is absent when
-                # there is no digest reads the same as one absent because the app
-                # predates the stamp, which is the ambiguity it exists to remove.
-                "global_sha256_basis": pool.CURRENT_DIGEST_BASIS if head_sha else None,
-                "transport": merge_transport,
-                "deferred": deferred_ids, "created_at": time.time(),
-            })
+            pool.append_merge(
+                index,
+                {
+                    "published_version": new_version,
+                    "baseline_version": baseline_version,
+                    "members": members_record,
+                    # Kept out of "members": a members row reads "evaluated, not
+                    # included" and carries the gate scores that decision rests on. A
+                    # quarantined member was never evaluated and has no such scores, so
+                    # filing it there would report an integrity failure as a rejection.
+                    "quarantined": quarantined,
+                    "quarantine_counts": q_counts,
+                    "selection_metric": sel_metric,
+                    "witness_metric": wit_metric,
+                    "global_sha256": head_sha,
+                    # Written unconditionally, null included: a basis that is absent when
+                    # there is no digest reads the same as one absent because the app
+                    # predates the stamp, which is the ambiguity it exists to remove.
+                    "global_sha256_basis": (
+                        pool.CURRENT_DIGEST_BASIS if head_sha else None
+                    ),
+                    "transport": merge_transport,
+                    "deferred": deferred_ids,
+                    "created_at": time.time(),
+                },
+            )
             async with self._staged(am, pool_artifact_id):
                 i_url = await am.put_file(pool_artifact_id, file_path=pool.POOL_INDEX)
-                (await self._http_retry("PUT", i_url, content=json.dumps(index).encode("utf-8"), timeout=120.0)).raise_for_status()
+                (
+                    await self._http_retry(
+                        "PUT",
+                        i_url,
+                        content=json.dumps(index).encode("utf-8"),
+                        timeout=120.0,
+                    )
+                ).raise_for_status()
                 await self._commit_with_retry(am, pool_artifact_id)
         finally:
             self._merges_in_flight -= 1
@@ -2906,7 +3502,9 @@ class EntryApp:
             "schema_version": pool.SCHEMA_VERSION,
             "published_version": new_version,
             "admitted": admitted,
-            "rejected": [m["contribution_id"] for m in members_record if not m["included"]],
+            "rejected": [
+                m["contribution_id"] for m in members_record if not m["included"]
+            ],
             # Reported separately from "rejected" and from "admitted", and always
             # present even when empty: a caller that wants to know whether this
             # merge excluded anything on provenance grounds must not have to infer
@@ -2925,7 +3523,10 @@ class EntryApp:
             # only on a page they would have to go and read.
             "global_sha256": head_sha,
             "global_sha256_provenance": pool.digest_provenance(
-                {"global_sha256": head_sha, "global_sha256_basis": pool.CURRENT_DIGEST_BASIS}
+                {
+                    "global_sha256": head_sha,
+                    "global_sha256_basis": pool.CURRENT_DIGEST_BASIS,
+                }
             ),
             "witness_metric": round(head_b, 4) if head_b is not None else None,
             "baseline": baseline,

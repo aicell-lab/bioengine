@@ -23,8 +23,16 @@ import json
 import math
 from pathlib import Path
 from typing import (
-    Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional,
-    Sequence, Tuple,
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
 )
 
 # Tracks the campaign-page wire contract this backend maps onto. Echoed on every
@@ -180,7 +188,9 @@ def round_metric(
     if per_image is not None:
         per_image = [float(v) for v in per_image]
         if not per_image:
-            raise ValueError("per_image must not be empty; omit it instead of publishing []")
+            raise ValueError(
+                "per_image must not be empty; omit it instead of publishing []"
+            )
         if not all(math.isfinite(v) for v in per_image):
             raise ValueError(f"per_image carries a non-finite score: {per_image!r}")
         if aggregate is None:
@@ -718,9 +728,7 @@ NON_LEARNED_NOTE = (
 )
 
 
-def inherited_non_learned(
-    values: Dict[str, float], *, source: str
-) -> Dict[str, Any]:
+def inherited_non_learned(values: Dict[str, float], *, source: str) -> Dict[str, Any]:
     """The manifest's provenance block for the non-learned values the soup inherited.
 
     ``source`` names the base the values came from (e.g. the cellpose base model
@@ -764,9 +772,7 @@ def key_set_digest(keys: Iterable[str]) -> str:
 BASE_COMMITMENT_FIELDS = ("non_learned", "key_set_sha256", "key_count", "source")
 
 
-def base_commitment(
-    state_dict: Dict[str, Any], *, source: str
-) -> Dict[str, Any]:
+def base_commitment(state_dict: Dict[str, Any], *, source: str) -> Dict[str, Any]:
     """The pool's record of the base it is anchored to — written ONCE, at pool creation.
 
     Holds the base's non-learned values (the operative value) and a
@@ -888,8 +894,10 @@ def state_dict_l2_from_base(current: Dict[str, Any], base: Dict[str, Any]) -> fl
             continue
         if is_non_weight_param(key):
             continue
-        total += float(torch.sum((cur.detach().float() - ref.detach().float()) ** 2).item())
-    return total ** 0.5
+        total += float(
+            torch.sum((cur.detach().float() - ref.detach().float()) ** 2).item()
+        )
+    return total**0.5
 
 
 # Resident set of a merge, as a multiple of ONE member's on-disk size. uniform_soup
@@ -914,7 +922,9 @@ SOUP_RESIDENT_FACTOR = 3
 
 
 def soup_admission(
-    member_bytes: Sequence[Optional[int]], budget_bytes: int, base_bytes: int,
+    member_bytes: Sequence[Optional[int]],
+    budget_bytes: int,
+    base_bytes: int,
 ) -> Optional[str]:
     """Reject a merge that cannot fit before it burns any GPU, or None to proceed.
 
@@ -944,7 +954,8 @@ def soup_admission(
 
 
 def split_provenance_error(
-    gate_split: Dict[str, Any], witness_split: Dict[str, Any],
+    gate_split: Dict[str, Any],
+    witness_split: Dict[str, Any],
 ) -> Optional[str]:
     """Reject split provenance that cannot safely identify a split, or None to proceed.
 
@@ -1025,7 +1036,10 @@ def new_merge_journal(gate_split, witness_split, diam_mean: float) -> Dict[str, 
 
 
 def usable_merge_journal(
-    journal: Optional[Dict[str, Any]], gate_split, witness_split, diam_mean: float,
+    journal: Optional[Dict[str, Any]],
+    gate_split,
+    witness_split,
+    diam_mean: float,
 ) -> Dict[str, Any]:
     """Return ``journal`` if every score in it is still valid for this merge's
     inputs, else a fresh empty one.
@@ -1041,8 +1055,10 @@ def usable_merge_journal(
     fresh = new_merge_journal(gate_split, witness_split, diam_mean)
     if not isinstance(journal, dict) or not isinstance(journal.get("scores"), dict):
         return fresh
-    if any(journal.get(field) != fresh[field]
-           for field in ("schema_version", "gate_split", "witness_split", "diam_mean")):
+    if any(
+        journal.get(field) != fresh[field]
+        for field in ("schema_version", "gate_split", "witness_split", "diam_mean")
+    ):
         return fresh
     # Prune to the entries that carry BOTH halves. An entry can be half-present in
     # two ways: a journal written before this app banked vectors at all (the stamp
@@ -1055,15 +1071,21 @@ def usable_merge_journal(
     vectors = journal.get("per_image_scores")
     if not isinstance(vectors, dict):
         vectors = {}
-    paired = {k: v for k, v in journal["scores"].items() if isinstance(vectors.get(k), list)}
+    paired = {
+        k: v for k, v in journal["scores"].items() if isinstance(vectors.get(k), list)
+    }
     journal["scores"] = paired
     journal["per_image_scores"] = {k: vectors[k] for k in paired}
     return journal
 
 
 def record_score(
-    journal: Dict[str, Any], key: str, value: float, *,
-    per_image: Sequence[float], cap: int = 512,
+    journal: Dict[str, Any],
+    key: str,
+    value: float,
+    *,
+    per_image: Sequence[float],
+    cap: int = 512,
 ) -> None:
     """Add a score and the per-image vector it is the mean of, evicting oldest-first
     so the journal cannot grow without bound.
@@ -1097,7 +1119,10 @@ def record_score(
 
 
 def evict_lru_to_cap(
-    directory: Path, pattern: str, cap_bytes: int, incoming_bytes: int = 0,
+    directory: Path,
+    pattern: str,
+    cap_bytes: int,
+    incoming_bytes: int = 0,
 ) -> int:
     """Delete least-recently-modified files matching ``pattern`` until the directory
     holds at most ``cap_bytes``, counting ``incoming_bytes`` as already present.
@@ -1205,9 +1230,7 @@ def uniform_soup(
     for index, load in enumerate(loaders):
         sd = load()
         if not sd:
-            raise ValueError(
-                f"uniform_soup member {index} loaded an empty state_dict"
-            )
+            raise ValueError(f"uniform_soup member {index} loaded an empty state_dict")
         # Fail-closed, against the pool's committed inventory. Both the
         # digest AND the count are checked: the digest alone would be enough
         # cryptographically, but the count makes the failure message actionable, and a
@@ -1256,15 +1279,18 @@ def uniform_soup(
                         f"non-learned key {key!r}, so the merge cannot say what the "
                         f"published checkpoint should hold for it"
                     )
-                carried[key] = torch.full_like(
-                    sd[key], float(base_non_learned[key]))
+                carried[key] = torch.full_like(sd[key], float(base_non_learned[key]))
             # Built after `carried` is filled: the accumulator must exclude exactly the
             # keys that are carried, and `key not in carried` only means that once the
             # loop above has run.
-            dtypes = {key: value.dtype for key, value in sd.items()
-                      if key not in carried}
-            acc = {key: torch.zeros_like(value, dtype=torch.float32)
-                   for key, value in sd.items() if key not in carried}
+            dtypes = {
+                key: value.dtype for key, value in sd.items() if key not in carried
+            }
+            acc = {
+                key: torch.zeros_like(value, dtype=torch.float32)
+                for key, value in sd.items()
+                if key not in carried
+            }
         # The contributors' OWN diameters are not discarded, they
         # are recorded in the community manifest. Collected here, in loader order, so
         # the caller gets them without a second pass over every member's weights — the
@@ -1272,8 +1298,11 @@ def uniform_soup(
         # converted off the tensor, so nothing is retained once `sd` is released.
         if member_non_learned is not None:
             member_non_learned.append(
-                {key: float(sd[key].detach().reshape(-1)[0])
-                 for key in sorted(sd) if is_non_weight_param(key)}
+                {
+                    key: float(sd[key].detach().reshape(-1)[0])
+                    for key in sorted(sd)
+                    if is_non_weight_param(key)
+                }
             )
         for key in acc:
             acc[key] += sd[key].detach().float()
@@ -1294,6 +1323,7 @@ def uniform_soup(
 # soup MUST be gated + reported with this exact code, not a reimplementation. It is
 # copied (not imported) because the paper repo is not on a deployed Ray actor's
 # path; keep it byte-faithful to that source.
+
 
 def _iou_matrix(pred: "np.ndarray", gt: "np.ndarray") -> "np.ndarray":
     """IoU for every (pred_id, gt_id) pair via a joint histogram — rows are pred
@@ -1326,7 +1356,9 @@ def _iou_matrix(pred: "np.ndarray", gt: "np.ndarray") -> "np.ndarray":
     return iou.astype(np.float32)
 
 
-def instance_f1(pred_labels: "np.ndarray", gt_labels: "np.ndarray", iou_thresh: float = 0.5) -> Dict[str, Any]:
+def instance_f1(
+    pred_labels: "np.ndarray", gt_labels: "np.ndarray", iou_thresh: float = 0.5
+) -> Dict[str, Any]:
     """Instance-level F1 at IoU >= iou_thresh via greedy descending-IoU matching,
     over two 2-D integer label maps (0 = background). Returns
     ``{f1, precision, recall, tp, fp, fn, n_pred, n_gt, mean_iou}``. The gate and
@@ -1359,7 +1391,11 @@ def instance_f1(pred_labels: "np.ndarray", gt_labels: "np.ndarray", iou_thresh: 
     fn = n_gt - tp
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    f1 = (
+        (2 * precision * recall / (precision + recall))
+        if (precision + recall) > 0
+        else 0.0
+    )
     mean_iou = float(sum(matched_ious) / n_gt) if n_gt > 0 else 0.0
 
     return {
@@ -1376,7 +1412,9 @@ def instance_f1(pred_labels: "np.ndarray", gt_labels: "np.ndarray", iou_thresh: 
 
 
 def per_image_instance_f1(
-    pred_maps: List["np.ndarray"], gt_maps: List["np.ndarray"], iou_thresh: float = 0.5,
+    pred_maps: List["np.ndarray"],
+    gt_maps: List["np.ndarray"],
+    iou_thresh: float = 0.5,
 ) -> List[float]:
     """One instance F1 per image of a split, in the order supplied — the breakdown
     the gate's scalar is the mean of.
@@ -1401,7 +1439,10 @@ def per_image_instance_f1(
             f"{len(gt_maps)} ground-truth map(s); zip would score only the shorter "
             f"prefix and report it as the whole split"
         )
-    return [instance_f1(p, g, iou_thresh=iou_thresh)["f1"] for p, g in zip(pred_maps, gt_maps)]
+    return [
+        instance_f1(p, g, iou_thresh=iou_thresh)["f1"]
+        for p, g in zip(pred_maps, gt_maps)
+    ]
 
 
 def mean_of_per_image(per_image: Sequence[float]) -> float:
@@ -1414,14 +1455,18 @@ def mean_of_per_image(per_image: Sequence[float]) -> float:
     return float(sum(per_image) / len(per_image))
 
 
-def mean_instance_f1(pred_maps: List["np.ndarray"], gt_maps: List["np.ndarray"], iou_thresh: float = 0.5) -> float:
+def mean_instance_f1(
+    pred_maps: List["np.ndarray"], gt_maps: List["np.ndarray"], iou_thresh: float = 0.5
+) -> float:
     """Mean of per-image instance F1 over a split — the scalar the gate compares and
     the witness curve plots. Empty split is undefined, so raise rather than invent 0.
 
     Defined as the mean of ``per_image_instance_f1``'s output rather than computing
     its own sum, so a record publishing both is publishing one measurement reduced
     once, not two measurements that agree today."""
-    return mean_of_per_image(per_image_instance_f1(pred_maps, gt_maps, iou_thresh=iou_thresh))
+    return mean_of_per_image(
+        per_image_instance_f1(pred_maps, gt_maps, iou_thresh=iou_thresh)
+    )
 
 
 def sha256_file(path: str, chunk: int = 1 << 20) -> str:
@@ -1497,8 +1542,11 @@ def build_contribution_metadata(
     }
 
 
-def empty_index(model_type: str, architecture_signature: str,
-                base_commitment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def empty_index(
+    model_type: str,
+    architecture_signature: str,
+    base_commitment: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """A fresh pool_index.json for a newly created pool artifact.
 
     ``baseline`` anchors the witness curve at stock cpsam (set on the first merge);
@@ -1544,7 +1592,11 @@ def undecided_contributions(index: Dict[str, Any]) -> List[Dict[str, Any]]:
     a merge sees only what has arrived and is not yet decided; overflow deferred at a
     merge stays undecided and is re-considered (and re-scored) at the next one."""
     decided = set(index.get("decided_contribution_ids", []))
-    pending = [c for c in index.get("contributions", []) if c.get("contribution_id") not in decided]
+    pending = [
+        c
+        for c in index.get("contributions", [])
+        if c.get("contribution_id") not in decided
+    ]
     return sorted(pending, key=lambda c: c.get("uploaded_at", 0.0))
 
 
@@ -1631,7 +1683,11 @@ def members_to_hash(records: Sequence[Dict[str, Any]]) -> List[str]:
     seen, out = set(), []
     for r in records:
         path = r.get("weights_path")
-        if not is_usable_digest(r.get("weights_sha256")) or path is None or path in seen:
+        if (
+            not is_usable_digest(r.get("weights_sha256"))
+            or path is None
+            or path in seen
+        ):
             continue
         seen.add(path)
         out.append(path)
@@ -1639,7 +1695,8 @@ def members_to_hash(records: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 def digest_quarantine(
-    records: Sequence[Dict[str, Any]], actual_by_path: Mapping[str, Any],
+    records: Sequence[Dict[str, Any]],
+    actual_by_path: Mapping[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split contribution records into ``(admitted, quarantined)`` on provenance.
 
@@ -1661,11 +1718,17 @@ def digest_quarantine(
         path = r.get("weights_path")
         recorded = r.get("weights_sha256")
         if not is_usable_digest(recorded):
-            quarantined.append(quarantine_record(
-                contribution_id=cid, weights_path=path,
-                reason=QUARANTINE_NO_DIGEST, expected_sha256=recorded,
-                actual_sha256=actual_by_path.get(path) if path is not None else None,
-            ))
+            quarantined.append(
+                quarantine_record(
+                    contribution_id=cid,
+                    weights_path=path,
+                    reason=QUARANTINE_NO_DIGEST,
+                    expected_sha256=recorded,
+                    actual_sha256=(
+                        actual_by_path.get(path) if path is not None else None
+                    ),
+                )
+            )
             continue
         if path not in actual_by_path:
             raise ValueError(
@@ -1682,11 +1745,15 @@ def digest_quarantine(
                 f"about this member on it."
             )
         if actual.lower() != str(recorded).lower():
-            quarantined.append(quarantine_record(
-                contribution_id=cid, weights_path=path,
-                reason=QUARANTINE_DIGEST_MISMATCH, expected_sha256=recorded,
-                actual_sha256=actual,
-            ))
+            quarantined.append(
+                quarantine_record(
+                    contribution_id=cid,
+                    weights_path=path,
+                    reason=QUARANTINE_DIGEST_MISMATCH,
+                    expected_sha256=recorded,
+                    actual_sha256=actual,
+                )
+            )
             continue
         admitted.append(r)
     return admitted, quarantined
@@ -1742,7 +1809,10 @@ def head_integrity_refusal(
 
 
 def publish_floor_refusal(
-    *, member_ids: Sequence[str], floor: int, quarantined: Sequence[Dict[str, Any]],
+    *,
+    member_ids: Sequence[str],
+    floor: int,
+    quarantined: Sequence[Dict[str, Any]],
 ) -> Optional[str]:
     """Reason not to publish a soup thinner than the caller's floor, or None.
 
@@ -1972,7 +2042,9 @@ def current_community(index: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return index.get("current_community")
 
 
-def assert_compatible(index: Dict[str, Any], *, model_type: str, signature: str) -> None:
+def assert_compatible(
+    index: Dict[str, Any], *, model_type: str, signature: str
+) -> None:
     """Refuse to read/write a pool whose model_type or parameter layout does not
     match the caller's — the guard that keeps a cpdino contribution out of the
     cpsam pool and flags a cellpose-revision drift before averaging."""
@@ -1997,6 +2069,7 @@ def assert_compatible(index: Dict[str, Any], *, model_type: str, signature: str)
 # audit-only per-member scores (a per-candidate score in the wire payload is a
 # contract violation — assessed is IDs only), and surfaces the role-tagged metrics
 # straight from storage. Pure and torch-free so the contract is unit-testable.
+
 
 def _iso(ts: Optional[float]) -> Optional[str]:
     """Epoch seconds → the page's ISO-8601 UTC millisecond format, or None."""
@@ -2121,7 +2194,10 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
     cumulative = 0
     for merge in merges:
         transport = merge.get("transport") or {
-            "bytes_in": 0, "bytes_out": 0, "n_transfers": 0, "sources_complete": True,
+            "bytes_in": 0,
+            "bytes_out": 0,
+            "n_transfers": 0,
+            "sources_complete": True,
         }
         if merge.get("published_version"):
             soup_id = f"soup-{len(soups)}"
@@ -2131,31 +2207,35 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
             for cid in taken:
                 merged_into[cid] = soup_id
             version = merge["published_version"]
-            soups.append({
-                "soup_id": soup_id,
-                "index": len(soups),
-                "merged_at": _iso(merge.get("created_at")),
-                "assessed": _assessed_ids(merge),
-                "contributions": taken,
-                "selection_metric": corrected_metric(merge.get("selection_metric")),
-                "witness_metric": corrected_metric(merge.get("witness_metric")),
-                "global_sha256": merge.get("global_sha256"),
-                "weights": None,
-                "transport": transport,
-                "community_model": {
-                    "artifact_id": pool_artifact_id,
-                    "version": version,
-                    "url": f"#/models/{alias}?version={version}",
-                    "n_contributions_cumulative": cumulative,
-                },
-            })
+            soups.append(
+                {
+                    "soup_id": soup_id,
+                    "index": len(soups),
+                    "merged_at": _iso(merge.get("created_at")),
+                    "assessed": _assessed_ids(merge),
+                    "contributions": taken,
+                    "selection_metric": corrected_metric(merge.get("selection_metric")),
+                    "witness_metric": corrected_metric(merge.get("witness_metric")),
+                    "global_sha256": merge.get("global_sha256"),
+                    "weights": None,
+                    "transport": transport,
+                    "community_model": {
+                        "artifact_id": pool_artifact_id,
+                        "version": version,
+                        "url": f"#/models/{alias}?version={version}",
+                        "n_contributions_cumulative": cumulative,
+                    },
+                }
+            )
         else:
-            empty_merges.append({
-                "merged_at": _iso(merge.get("created_at")),
-                "assessed": _assessed_ids(merge),
-                "selection_metric": corrected_metric(merge.get("selection_metric")),
-                "transport": transport,
-            })
+            empty_merges.append(
+                {
+                    "merged_at": _iso(merge.get("created_at")),
+                    "assessed": _assessed_ids(merge),
+                    "selection_metric": corrected_metric(merge.get("selection_metric")),
+                    "transport": transport,
+                }
+            )
 
     decided = set(index.get("decided_contribution_ids", []))
     contributions = []
@@ -2201,20 +2281,22 @@ def pool_wire_state(index: Dict[str, Any], *, pool_artifact_id: str) -> Dict[str
         if already is not None and already["basis"] != attribution["basis"]:
             attribution = colliding_contribution_provenance()
         digest_provenance_by_contribution[cid] = attribution
-        contributions.append({
-            "contribution_id": cid,
-            "received_at": _iso(c.get("uploaded_at")),
-            "weights_sha256": c.get("weights_sha256"),
-            # Published under the storage name on purpose: soup_admission fails
-            # open on a missing n_bytes, so the audit question is "did the pool
-            # record n_bytes?" and the view has to answer it under that word.
-            # bytes_out stays reserved for transport, one level up.
-            "n_bytes": c.get("n_bytes"),
-            "n_train_images": c.get("n_train_images"),
-            "samples_seen": c.get("samples_seen"),
-            "disposition": disposition,
-            "merged_into": merged_into.get(cid),
-        })
+        contributions.append(
+            {
+                "contribution_id": cid,
+                "received_at": _iso(c.get("uploaded_at")),
+                "weights_sha256": c.get("weights_sha256"),
+                # Published under the storage name on purpose: soup_admission fails
+                # open on a missing n_bytes, so the audit question is "did the pool
+                # record n_bytes?" and the view has to answer it under that word.
+                # bytes_out stays reserved for transport, one level up.
+                "n_bytes": c.get("n_bytes"),
+                "n_train_images": c.get("n_train_images"),
+                "samples_seen": c.get("samples_seen"),
+                "disposition": disposition,
+                "merged_into": merged_into.get(cid),
+            }
+        )
 
     baseline = index.get("baseline") or {}
     # Two independent corrections land on this one projection and both have to survive:

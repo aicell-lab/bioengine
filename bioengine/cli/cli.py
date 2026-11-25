@@ -13,6 +13,7 @@ Environment variables:
   BIOENGINE_WORKER_SERVICE_ID   BioEngine worker service ID (for apps + cluster commands)
   HYPHA_TOKEN / BIOENGINE_TOKEN Authentication token
 """
+
 import click
 
 from bioengine import __version__

@@ -20,6 +20,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -70,7 +71,11 @@ def _user_matches(
     entry_email = entry.get("email")
     if user_id and entry_id and str(entry_id) == str(user_id):
         return True
-    if user_email and entry_email and str(entry_email).lower() == str(user_email).lower():
+    if (
+        user_email
+        and entry_email
+        and str(entry_email).lower() == str(user_email).lower()
+    ):
         return True
     return False
 
@@ -115,14 +120,18 @@ def resolve_role(
     return "none"
 
 
-def set_user_role(metadata: Dict[str, Any], user: Dict[str, Any], role: str) -> Dict[str, Any]:
+def set_user_role(
+    metadata: Dict[str, Any], user: Dict[str, Any], role: str
+) -> Dict[str, Any]:
     """Add/move *user* into the ``managers``/``annotators`` list for *role*.
 
     A user has at most one non-owner role at a time, so they're removed from
     both lists first. Mutates and returns *metadata*.
     """
     if role not in ROLE_LIST_KEYS:
-        raise ValueError(f"Invalid role {role!r}; expected one of {sorted(ROLE_LIST_KEYS)}")
+        raise ValueError(
+            f"Invalid role {role!r}; expected one of {sorted(ROLE_LIST_KEYS)}"
+        )
     remove_user_role(metadata, user)
     metadata.setdefault(ROLE_LIST_KEYS[role], []).append(dict(user))
     return metadata
@@ -137,7 +146,9 @@ def remove_user_role(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str
     user_email = user.get("email")
     for key in ROLE_LIST_KEYS.values():
         metadata[key] = [
-            u for u in metadata.get(key, []) or [] if not _user_matches(u, user_id, user_email)
+            u
+            for u in metadata.get(key, []) or []
+            if not _user_matches(u, user_id, user_email)
         ]
     return metadata
 
@@ -148,7 +159,10 @@ def remove_user_role(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str
 
 
 def add_access_request(
-    metadata: Dict[str, Any], user: Dict[str, Any], requested_role: str, requested_at: str
+    metadata: Dict[str, Any],
+    user: Dict[str, Any],
+    requested_role: str,
+    requested_at: str,
 ) -> Dict[str, Any]:
     """Record that *user* asked for *requested_role* on this dataset.
 
@@ -174,7 +188,9 @@ def add_access_request(
     return metadata
 
 
-def remove_access_request(metadata: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+def remove_access_request(
+    metadata: Dict[str, Any], user: Dict[str, Any]
+) -> Dict[str, Any]:
     """Drop *user*'s pending access request, if any. Mutates and returns
     *metadata*."""
     user_id = user.get("id")
@@ -334,8 +350,12 @@ def parse_image_manifest(doc: Any) -> Dict[str, Dict[str, Any]]:
     return {
         stem: dict(entry)
         for stem, entry in images.items()
-        if stem and isinstance(entry, dict) and entry.get("state") in (
-            IMAGE_STATE_LOCAL, IMAGE_STATE_REMOTE,
+        if stem
+        and isinstance(entry, dict)
+        and entry.get("state")
+        in (
+            IMAGE_STATE_LOCAL,
+            IMAGE_STATE_REMOTE,
         )
     }
 
@@ -356,7 +376,9 @@ def image_names_from_listing(entries: List[Any]) -> List[str]:
         name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
         if not name or name == _IMAGE_MANIFEST_NAME:
             continue
-        if isinstance(entry, dict) and (entry.get("type") == "directory" or entry.get("is_dir")):
+        if isinstance(entry, dict) and (
+            entry.get("type") == "directory" or entry.get("is_dir")
+        ):
             continue
         names.append(name)
     return names
@@ -462,9 +484,18 @@ NGFF_NUMERIC_DTYPES = frozenset(
 # v3 spells a dtype out where v2 abbreviates it. Everything downstream works
 # in the v2 vocabulary, so this is the one translation table.
 NGFF_V3_TO_V2_DTYPE = {
-    "bool": "b1", "int8": "i1", "uint8": "u1", "int16": "i2",
-    "uint16": "u2", "int32": "i4", "uint32": "u4", "int64": "i8",
-    "uint64": "u8", "float16": "f2", "float32": "f4", "float64": "f8",
+    "bool": "b1",
+    "int8": "i1",
+    "uint8": "u1",
+    "int16": "i2",
+    "uint16": "u2",
+    "int32": "i4",
+    "uint32": "u4",
+    "int64": "i8",
+    "uint64": "u8",
+    "float16": "f2",
+    "float32": "f4",
+    "float64": "f8",
 }
 
 # Axis order implied by OME-NGFF before v0.4, which made `axes` optional.
@@ -490,9 +521,7 @@ def normalise_store_root(url: Any) -> str:
         raise NgffSourceError("Store root is required.")
     root = url.strip()
     if not root.lower().startswith(("http://", "https://")):
-        raise NgffSourceError(
-            f"Store root must be an http(s) URL, got {root!r}."
-        )
+        raise NgffSourceError(f"Store root must be an http(s) URL, got {root!r}.")
     if "?" in root or "#" in root:
         raise NgffSourceError(
             "Store root must not contain a query string or fragment: a Zarr "
@@ -522,7 +551,7 @@ def split_store_credential(root: str) -> tuple:
     match = _TOKEN_SEGMENT.search(root)
     if not match:
         return root, None
-    untokened = root[: match.start()] + "/" + root[match.end():]
+    untokened = root[: match.start()] + "/" + root[match.end() :]
     return untokened, match.group(1)
 
 
@@ -570,9 +599,7 @@ def parse_ngff_multiscales(
                 chosen = entry
                 break
         if chosen is None:
-            names = [
-                str(e.get("name")) for e in multiscales if isinstance(e, dict)
-            ]
+            names = [str(e.get("name")) for e in multiscales if isinstance(e, dict)]
             raise NgffSourceError(
                 f"No multiscale named {multiscale_path!r}; this store has: "
                 + (", ".join(n for n in names if n and n != "None") or "(unnamed)")
@@ -743,7 +770,11 @@ def ngff_channel_names(zattrs: Any) -> Optional[List[str]]:
     attrs = zattrs if isinstance(zattrs, dict) else {}
     if isinstance(attrs.get("ome"), dict):
         attrs = {**attrs, **attrs["ome"]}
-    channels = (attrs.get("omero") or {}).get("channels") if isinstance(attrs.get("omero"), dict) else None
+    channels = (
+        (attrs.get("omero") or {}).get("channels")
+        if isinstance(attrs.get("omero"), dict)
+        else None
+    )
     if not isinstance(channels, list) or not channels:
         return None
     names = [
@@ -790,6 +821,160 @@ def default_stem_from_store_root(root: str) -> str:
     return ""
 
 
+def normalise_planes(
+    planes: Any,
+    axes: Optional[List[str]],
+    level0_shape: Optional[List[int]],
+    axis_roles: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, int]]:
+    """A validated ``{axis_name: index}``, or ``None`` when none was given.
+
+    Recorded at import because the annotator knows which slice the region was
+    drawn on and nothing downstream can recover it. A reader refuses an axis of
+    size greater than one with no plane recorded -- deliberately, since picking
+    index 0 pairs the polygons with a different slice's pixels, leaves the mask
+    non-empty and the run reporting success. See ``ngff_region._plane_index``.
+
+    **Checked HERE as well as at read time, and that is not redundant.** The
+    reader's refusal protects the pixels; this one protects the RECORD. A plane
+    naming an axis the store does not have, or an index past its end, would
+    otherwise be written into the manifest and fail only when someone trained
+    on it -- long after the annotation was saved, and reported as a training
+    failure rather than as the bad import it was.
+
+    ``None`` rather than ``{}`` for an empty mapping, so an absent plane and an
+    empty one cannot mean two things to a consumer.
+
+    **Only NON-SPATIAL axes may carry a plane, and that is enforced here rather
+    than left to the reader.** Measured: the reader keeps y and x whole (they are
+    the crop) and keeps the CHANNEL axis whole on purpose, so a recorded
+    ``{"c": 2}`` is silently ignored -- ``region_index`` with
+    ``planes={"z": 4, "c": 2, "y": 5}`` returns
+    ``(0, slice(None), 4, slice(0, 10), slice(0, 10))``. The record would then
+    say "channel 2" while training reads all three channels, with nothing
+    reporting the difference. That is precisely the "record that says something
+    training will not do" this validator exists to keep out of the manifest, so
+    a plane on y, x or c is REFUSED.
+
+    This matters concretely because the annotator sends the viewer's current
+    selection, and that selection can include a channel. Refusing it tells the
+    frontend to drop c from what it sends; accepting it would have the record
+    and the pixels disagree forever.
+    """
+    # Only `None` and an EMPTY MAPPING mean "no plane". `0`, `""`, `False` and
+    # `[]` are all falsy and used to be swallowed as "none given", so a caller
+    # sending one got a silent no-op instead of being told its argument was not
+    # a mapping -- the quiet shape of wrongness this validator exists to refuse.
+    if planes is None:
+        return None
+    if not isinstance(planes, dict):
+        raise ValueError(
+            f"planes must be an object of axis name to index, not "
+            f"{type(planes).__name__}."
+        )
+    if not planes:
+        return None
+    names = [str(a) for a in (axes or [])]
+    shape = [int(n) for n in (level0_shape or [])]
+    if not names or not shape:
+        raise ValueError(
+            "planes was given but this source records no axis names or shape, so "
+            "an index cannot be checked against an axis; re-import the source."
+        )
+    if len(names) != len(shape):
+        raise ValueError(
+            f"this source records {len(names)} axis name(s) {names!r} and a shape "
+            f"of {len(shape)} dimension(s) {shape!r}; planes cannot be resolved "
+            f"against a layout that does not describe itself."
+        )
+    # Axis roles map a role to an axis INDEX, so the forbidden NAMES are the
+    # names sitting at those indices. Absent roles forbid nothing: a source that
+    # does not say which axis is y cannot have a plane refused for being y.
+    forbidden: Dict[str, str] = {}
+    for role, idx in (axis_roles or {}).items():
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            continue
+        if 0 <= idx < len(names):
+            forbidden[names[idx]] = str(role)
+
+    out: Dict[str, int] = {}
+    for key, value in planes.items():
+        name = str(key)
+        if name in forbidden:
+            role = forbidden[name]
+            raise ValueError(
+                f"planes names axis {name!r}, which is this source's "
+                f"{role!r} axis. A plane selects one slice of a NON-SPATIAL "
+                f"axis such as z or t; y and x are the crop, and the channel "
+                f"axis is read whole, so a plane on {name!r} would be recorded "
+                f"and then ignored -- the record would say one thing and "
+                f"training would do another."
+            )
+        if name not in names:
+            raise ValueError(
+                f"planes names axis {name!r}, which this source does not have. "
+                f"Its axes are {names!r}."
+            )
+        # STRICT on purpose: `int()` would turn 1.5 into slice 1 and True into
+        # slice 1, silently, which is the wrong-slice bug this field exists to
+        # prevent wearing a different hat. A plane must arrive as a whole
+        # number, and a caller sending anything else is told so rather than
+        # rounded into a plausible-looking answer.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a number. An index "
+                f"must be a whole number, not a string or a flag."
+            )
+        if not math.isfinite(float(value)):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a finite number. "
+                f"`inf` raises OverflowError and `nan` a message naming neither "
+                f"the axis nor the problem, so both are refused here instead."
+            )
+        if float(value) != int(value):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a whole number. "
+                f"There is no slice between two slices, and rounding one into "
+                f"the other would pick the wrong pixels silently."
+            )
+        index = int(value)
+        size = shape[names.index(name)]
+        if not 0 <= index < size:
+            raise ValueError(
+                f"planes[{name!r}]={index} is outside axis {name!r}, which has "
+                f"{size} element(s) (0..{size - 1})."
+            )
+        out[name] = index
+
+    # N4: a PARTIAL mapping used to be accepted -- {"t": 0} on a store whose z is
+    # 9 was recorded, and the reader then refused it at TRAINING time, which is
+    # exactly the "fails only when somebody trained on it" this validator claims
+    # to prevent. So once a caller names any plane, it must name them all: every
+    # axis that is neither spatial nor channel and has more than one element.
+    # An empty mapping is still fine -- that is "no plane recorded", which the
+    # reader refuses immediately and legibly.
+    # Only when the ROLES are known. Without them nothing is forbidden, so y, x
+    # and c would count as non-spatial and the rule would demand a plane for the
+    # crop axes themselves -- it broke six existing cases that way. The check is
+    # only as good as the layout, which is the same reason absent roles forbid
+    # nothing above.
+    if out and forbidden:
+        missing = [
+            n
+            for i, n in enumerate(names)
+            if n not in forbidden and n not in out and shape[i] > 1
+        ]
+        if missing:
+            raise ValueError(
+                f"planes names {sorted(out)} but leaves {missing!r} unset, and "
+                f"{'those axes have' if len(missing) > 1 else 'that axis has'} "
+                f"more than one element. A partial record is refused here rather "
+                f"than at training time: give every non-spatial axis a plane, or "
+                f"none at all."
+            )
+    return out or None
+
+
 def normalise_region(
     region: Any, store_width: int, store_height: int
 ) -> Optional[Dict[str, int]]:
@@ -825,7 +1010,9 @@ def normalise_region(
         raise ValueError(f"Region is empty: {width}x{height} pixels.")
     if x < 0 or y < 0:
         raise ValueError(f"Region starts outside the image at ({x}, {y}).")
-    if (store_width > 0 and x >= store_width) or (store_height > 0 and y >= store_height):
+    if (store_width > 0 and x >= store_width) or (
+        store_height > 0 and y >= store_height
+    ):
         raise ValueError(
             f"Region starts at ({x}, {y}), outside the "
             f"{store_width}x{store_height} image."
@@ -851,6 +1038,8 @@ def remote_image_entry(
     content_hint: Optional[str] = None,
     fetched_at: Optional[str] = None,
     region: Optional[Dict[str, int]] = None,
+    layout: Optional[Dict[str, Any]] = None,
+    planes: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """A ``remote`` manifest entry.
 
@@ -874,6 +1063,32 @@ def remote_image_entry(
             "content_hint": content_hint,
         },
     }
+    if planes:
+        # Which slice of each non-spatial axis the annotation belongs to, by
+        # axis NAME. A z-stack has no single answer and a pixel reader must not
+        # invent one: see ngff_region.region_index, which refuses an axis of
+        # size > 1 with nothing recorded here.
+        entry["source"]["planes"] = {str(k): int(v) for k, v in planes.items()}
+    if layout:
+        # The store's shape, recorded at import because the probe is already in
+        # hand here. A reader that wants pixels needs the level-0 dataset path
+        # and which axis is y and which is x; without this it would have to
+        # re-probe the store, or parse `multiscales` itself, and that parsing is
+        # already duplicated between this module and ngffLayout.ts.
+        #
+        # Captured ONCE, at the moment the source was proved readable, rather
+        # than re-derived per training run. ``content_hint`` beside it is what
+        # tells a later reader whether the store's metadata has changed since.
+        entry["source"]["layout"] = {
+            "dataset_paths": [str(p) for p in (layout.get("dataset_paths") or [])],
+            "axis_roles": dict(layout.get("axis_roles") or {}),
+            "level0_shape": [int(n) for n in (layout.get("level0_shape") or [])],
+            # The axis NAMES, not just the y/x/c roles. Without them a reader
+            # can see that an axis is neither y, x nor c but cannot tell
+            # whether it is z, t or something else, so it can neither name the
+            # axis in a refusal nor accept a plane for it.
+            "axes": [str(a) for a in (layout.get("axes") or [])],
+        }
     if dtype:
         entry["dtype"] = dtype
     if channels:
@@ -895,16 +1110,56 @@ def image_entry_is_local(entry: Optional[Dict[str, Any]]) -> bool:
     return entry.get("state") == IMAGE_STATE_LOCAL and bool(entry.get("path"))
 
 
-def non_local_stems(
-    entries: Dict[str, Dict[str, Any]], stems: List[str]
-) -> List[str]:
+def non_local_stems(entries: Dict[str, Dict[str, Any]], stems: List[str]) -> List[str]:
     """Sorted stems in *stems* that are known but not materialised."""
     return sorted(
-        {
-            s for s in stems
-            if s in entries and not image_entry_is_local(entries.get(s))
-        }
+        {s for s in stems if s in entries and not image_entry_is_local(entries.get(s))}
     )
+
+
+def ngff_region_source(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A reference a pixel reader can use for a remote NGFF stem, or ``None``.
+
+    This is the ONE place the manifest's stored source becomes the shape a
+    trainer consumes, so the two cannot drift into two descriptions of a crop.
+
+    ``None`` whenever the entry cannot be read without materialising: a local
+    entry (it has a file, so the file is the answer), a non-NGFF source, or an
+    NGFF source imported before the layout was recorded. That last case is why
+    this returns None rather than a partial reference — a reader handed a
+    reference with no ``dataset_paths`` cannot know which level is full
+    resolution, and guessing ``"0"`` is wrong for the stores that name it
+    ``"s0"``.
+    """
+    if not isinstance(entry, dict) or image_entry_is_local(entry):
+        return None
+    source = entry.get("source")
+    if not isinstance(source, dict) or source.get("kind") != NGFF_SOURCE_KIND:
+        return None
+    layout = source.get("layout")
+    if not isinstance(layout, dict):
+        return None
+    if not layout.get("dataset_paths") or not layout.get("level0_shape"):
+        return None
+    roles = layout.get("axis_roles")
+    if not isinstance(roles, dict) or not isinstance(roles.get("y"), int):
+        return None
+    if not isinstance(roles.get("x"), int):
+        return None
+    return {
+        "kind": NGFF_SOURCE_KIND,
+        "store_root": source.get("store_root"),
+        "multiscale_path": source.get("multiscale_path"),
+        "region": source.get("region"),
+        "dataset_paths": list(layout["dataset_paths"]),
+        "axis_roles": dict(roles),
+        "level0_shape": list(layout["level0_shape"]),
+        # Absent for a stem imported before axis names were recorded. Passed
+        # through as [] rather than omitted so the reader's refusal can say the
+        # names are missing, which is the actionable form of the problem.
+        "axes": [str(a) for a in (layout.get("axes") or [])],
+        "planes": source.get("planes") or None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -919,10 +1174,18 @@ def non_local_stems(
 
 # Bytes per sample, keyed by the normalised v2 dtype.
 _DTYPE_ITEMSIZE = {
-    "b1": 1, "i1": 1, "u1": 1,
-    "i2": 2, "u2": 2, "f2": 2,
-    "i4": 4, "u4": 4, "f4": 4,
-    "i8": 8, "u8": 8, "f8": 8,
+    "b1": 1,
+    "i1": 1,
+    "u1": 1,
+    "i2": 2,
+    "u2": 2,
+    "f2": 2,
+    "i4": 4,
+    "u4": 4,
+    "f4": 4,
+    "i8": 8,
+    "u8": 8,
+    "f8": 8,
 }
 
 # What one level-0 read is allowed to cost the annotator's browser, in bytes
@@ -986,8 +1249,7 @@ def check_materialisable(
         raise FileNotFoundError(f"'{stem}' is not an image of this dataset.")
     if entry.get("state") != IMAGE_STATE_REMOTE:
         raise ValueError(
-            f"'{stem}' is not a remote image, so there is nothing to "
-            f"materialise."
+            f"'{stem}' is not a remote image, so there is nothing to " f"materialise."
         )
     channels = entry.get("channels")
     count = len(channels) if isinstance(channels, list) else 0
@@ -1024,7 +1286,11 @@ def parse_png_dims(header: bytes) -> Optional[List[int]]:
     so 24 bytes are enough. Returns ``None`` for anything that is not a
     plausible PNG header (the caller treats that as "dimensions unknown",
     never an error)."""
-    if len(header) < 24 or not header.startswith(PNG_SIGNATURE) or header[12:16] != b"IHDR":
+    if (
+        len(header) < 24
+        or not header.startswith(PNG_SIGNATURE)
+        or header[12:16] != b"IHDR"
+    ):
         return None
     width = int.from_bytes(header[16:20], "big")
     height = int.from_bytes(header[20:24], "big")
@@ -1148,7 +1414,9 @@ def latest_pairs_by_stem(filenames: List[str]) -> Dict[str, Dict[str, str]]:
 
     result: Dict[str, Dict[str, str]] = {}
     for stem, ts_map in by_stem_ts.items():
-        complete = [ts for ts, files in ts_map.items() if "png" in files and "geojson" in files]
+        complete = [
+            ts for ts, files in ts_map.items() if "png" in files and "geojson" in files
+        ]
         if not complete:
             continue
         latest = max(complete)
@@ -1224,7 +1492,9 @@ def _clean_stems(stems: Any) -> List[str]:
     return out
 
 
-def _require_annotated(stems: List[str], annotation_counts: Dict[str, int], what: str) -> None:
+def _require_annotated(
+    stems: List[str], annotation_counts: Dict[str, int], what: str
+) -> None:
     missing = [s for s in stems if annotation_counts.get(s, 0) < 1]
     if missing:
         raise ValueError(
@@ -1253,7 +1523,9 @@ def new_split(
         raise ValueError("A split needs at least one training image.")
     overlap = set(train) & set(test)
     if overlap:
-        raise ValueError(f"Stems cannot be in both train and test: {', '.join(sorted(overlap))}")
+        raise ValueError(
+            f"Stems cannot be in both train and test: {', '.join(sorted(overlap))}"
+        )
     _require_annotated(train, annotation_counts, "train")
     _require_annotated(test, annotation_counts, "test")
     members = set(train) | set(test)
@@ -1313,7 +1585,9 @@ def extend_split(
         )
     both = set(add_train) & set(add_test)
     if both:
-        raise ValueError(f"Stems cannot be in both train and test: {', '.join(sorted(both))}")
+        raise ValueError(
+            f"Stems cannot be in both train and test: {', '.join(sorted(both))}"
+        )
     _require_annotated(add_train, annotation_counts, "train")
     _require_annotated(add_test, annotation_counts, "test")
 
@@ -1323,7 +1597,9 @@ def extend_split(
     # Refresh the snapshot for every member so the frontend's "+N new
     # annotations" indicator resets after each extension. A member that lost
     # its files entirely keeps count 0 rather than erroring.
-    split["annotation_counts"] = {s: int(annotation_counts.get(s, 0)) for s in sorted(members)}
+    split["annotation_counts"] = {
+        s: int(annotation_counts.get(s, 0)) for s in sorted(members)
+    }
     ts = now_iso()
     split["updated_at"] = ts
     split["updated_by"] = updated_by
@@ -1402,7 +1678,9 @@ def collect_embeddings(filenames: List[str]) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
     for stem, models in by_stem.items():
         model_types = sorted(models)
-        preferred = DEFAULT_MODEL_TYPE if DEFAULT_MODEL_TYPE in models else model_types[0]
+        preferred = (
+            DEFAULT_MODEL_TYPE if DEFAULT_MODEL_TYPE in models else model_types[0]
+        )
         result[stem] = {"model_type": preferred, "model_types": model_types}
     return result
 
@@ -1453,14 +1731,18 @@ def new_metadata(artifact_id: str, owner: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def read_metadata(artifact_id: str, root: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def read_metadata(
+    artifact_id: str, root: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
     p = metadata_path(artifact_id, root)
     if not p.exists():
         return None
     return json.loads(p.read_text())
 
 
-def write_metadata(metadata: Dict[str, Any], root: Optional[Path] = None) -> Dict[str, Any]:
+def write_metadata(
+    metadata: Dict[str, Any], root: Optional[Path] = None
+) -> Dict[str, Any]:
     """Atomically write *metadata* (write to a ``.tmp`` file, then
     ``os.replace``) — same pattern as ``training.write_status`` in the
     micro-sam app. Stamps ``updated_at`` and returns the written dict."""
@@ -1500,7 +1782,9 @@ def list_dataset_ids(root: Optional[Path] = None) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def add_label(metadata: Dict[str, Any], name: str, description: str = "") -> Dict[str, Any]:
+def add_label(
+    metadata: Dict[str, Any], name: str, description: str = ""
+) -> Dict[str, Any]:
     if not is_valid_label_name(name):
         raise ValueError(f"Invalid label name {name!r}: must match ^[a-z0-9._-]+$")
     labels = metadata.setdefault("labels", [])
@@ -1623,7 +1907,9 @@ async def ensure_staged(
 # ---------------------------------------------------------------------------
 
 
-def is_cache_fresh(cached_at: float, ttl_s: float = 60.0, now: Optional[float] = None) -> bool:
+def is_cache_fresh(
+    cached_at: float, ttl_s: float = 60.0, now: Optional[float] = None
+) -> bool:
     now = time.time() if now is None else now
     return (now - cached_at) < ttl_s
 

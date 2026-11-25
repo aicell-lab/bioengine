@@ -56,9 +56,7 @@ def test_introspect_missing_module_raises_user_error():
 
 def test_introspect_missing_class_raises_user_error():
     with pytest.raises(BioEngineUserError, match="has no attribute"):
-        introspect_app(
-            "tests._app.fixtures.single_app.deployment:NotARealClass"
-        )
+        introspect_app("tests._app.fixtures.single_app.deployment:NotARealClass")
 
 
 def test_introspect_undecorated_class_raises():

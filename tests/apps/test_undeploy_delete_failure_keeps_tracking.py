@@ -67,8 +67,7 @@ def _make_manager(delete_raises: bool) -> AppsManager:
     if delete_raises:
         ray_cluster.call_with_reconnect = AsyncMock(
             side_effect=RuntimeError(
-                "Some of these applications weren't deleted after 60s: "
-                f"['{APP_ID}']"
+                "Some of these applications weren't deleted after 60s: " f"['{APP_ID}']"
             )
         )
     else:

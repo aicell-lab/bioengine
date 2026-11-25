@@ -20,6 +20,7 @@ not from the call it makes, so it survives that mutation. The assertion that goe
 is the one reading the **kwargs the mock was called with**. The status-field assertion
 is kept because it is what a consumer actually sees, not because it pins the defect.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -37,8 +38,8 @@ ARTIFACT_ID = f"{WORKSPACE}/{APP_ID}"
 VERSION = "0.2.4"
 ENTRY = "NucleiSeg"
 ENTRY_ID = "deployment:NucleiSeg"
-SECOND = "NucleiPost"          # a SECOND deployment in the same app
-APP_ID_2 = "nuclei-seg-b"      # and a SECOND app
+SECOND = "NucleiPost"  # a SECOND deployment in the same app
+APP_ID_2 = "nuclei-seg-b"  # and a SECOND app
 ARTIFACT_ID_2 = f"{WORKSPACE}/{APP_ID_2}"
 WORKER_CLIENT_ID = "worker-1"
 CONTEXT = {"user": {"id": "u-1", "email": "u@lab.test"}}
@@ -135,7 +136,9 @@ async def _manager(*, query_raises: bool) -> tuple[AppsManager, AsyncMock, Async
 
     logs = AsyncMock(return_value={})
     proxy.get_deployment_logs.remote = logs
-    proxy.get_serve_instance_details.remote = AsyncMock(return_value=_instance_details())
+    proxy.get_serve_instance_details.remote = AsyncMock(
+        return_value=_instance_details()
+    )
     proxy.get_deployment_replicas.remote = AsyncMock(return_value=["r0"])
     proxy.get_service_registration.remote = AsyncMock(return_value=True)
     proxy.get_replica_identities.remote = AsyncMock(
@@ -191,7 +194,6 @@ async def test_a_failed_query_reaches_get_deployment_logs_as_the_flag() -> None:
     assert kwargs.get("death_causes", "<ABSENT>") is None
 
 
-
 @pytest.mark.asyncio
 async def test_a_failed_query_is_reported_in_the_status_as_unavailable() -> None:
     """What a consumer sees. NOT the pin — this survives the mutation above.
@@ -225,7 +227,9 @@ async def test_the_query_is_issued_ONCE_per_CALL_across_apps_and_deployments() -
     # The fixture must actually have presented four deployments; otherwise the count
     # below is being compared against a smaller number than the docstring claims.
     seen = sum(len(status[a]["deployments"]) for a in (APP_ID, APP_ID_2))
-    assert seen == 4, f"the fixture presented {seen} deployments, not 4 — arm is vacuous"
+    assert (
+        seen == 4
+    ), f"the fixture presented {seen} deployments, not 4 — arm is vacuous"
 
     assert death_query.await_count == 1, (
         f"the cluster-wide query ran {death_query.await_count} times for one "

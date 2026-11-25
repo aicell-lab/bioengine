@@ -13,6 +13,7 @@ module stays introspectable with only ``bioengine[worker]`` + the stdlib.
 
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -27,6 +28,7 @@ STATUS_STALE_SECONDS = 600
 
 # === session paths + file-backed status ===
 
+
 def sessions_root() -> Path:
     # Under the container's mounted ~/.bioengine so sessions survive restarts.
     root = Path.home() / ".bioengine" / "micro_sam_sessions"
@@ -34,8 +36,91 @@ def sessions_root() -> Path:
     return root
 
 
+# The exact shape ``new_session_id`` generates, and the ONLY shape accepted from
+# a caller. An allow-list, not a sanitiser: there is no attempt to clean a bad id
+# up, because every cleanup is a guess at what the caller meant and the guesses
+# are what get escaped.
+#
+# ``\A``/``\Z`` and not ``^``/``$``: in Python ``$`` also matches immediately
+# before a trailing newline, so ``re.match(r"^...$", "<valid-id>\n")`` SUCCEEDS.
+# An id with a newline on the end would then be accepted and used as a directory
+# name. There is a test for exactly that.
+SESSION_ID_PATTERN = re.compile(r"\A\d{4}-\d{2}-\d{2}-\d{6}-[0-9a-f]{8}\Z")
+
+
+class InvalidSessionId(ValueError):
+    """A session_id that this server could not have generated.
+
+    Raised BEFORE any filesystem call. It is a ``ValueError`` so that callers
+    which already report bad arguments keep reporting them the same way.
+    """
+
+
+class SessionNotFound(ValueError):
+    """A well-formed session_id for a session that does not exist here.
+
+    Deliberately distinct from :class:`InvalidSessionId`: one says the caller
+    sent something the server could not have issued, the other says the caller
+    sent something plausible that this worker does not have. Collapsing them
+    would make a legitimate "wrong worker" mistake read like an attack.
+    """
+
+
+def validate_session_id(session_id: Any) -> str:
+    """The session_id, or raise.
+
+    Checked against the generator's own shape, which was verified to cover every
+    run in production: all 261 live session ids match it, so nothing existing
+    becomes unreachable by enforcing it.
+    """
+    if not isinstance(session_id, str):
+        raise InvalidSessionId(
+            f"session_id must be a string, got {type(session_id).__name__}"
+        )
+    if not SESSION_ID_PATTERN.match(session_id):
+        # The value is NOT echoed in full: it is attacker-controlled and this
+        # message reaches logs. The length and a short prefix are enough to
+        # debug a genuine mistake.
+        raise InvalidSessionId(
+            f"session_id is not a valid session identifier "
+            f"(length {len(session_id)}, starts {session_id[:12]!r}). "
+            f"Expected the form YYYY-MM-DD-HHMMSS-xxxxxxxx."
+        )
+    return session_id
+
+
 def session_dir(session_id: str) -> Path:
-    return sessions_root() / session_id
+    """The directory for *session_id*, guaranteed to be inside the sessions root.
+
+    Two independent layers, deliberately not one:
+
+    1. :func:`validate_session_id` refuses anything the server would not itself
+       have generated, before any path is built.
+    2. The built path is resolved and asserted to be inside the resolved root.
+
+    Layer 2 is not redundant with layer 1 — it is what still holds if layer 1 is
+    ever loosened, and loosening an id format is a normal thing to want to do.
+    Softening either one alone leaves the other refusing, which is the whole
+    point: each has its own failing test.
+
+    This function is the chokepoint. ``_status_path``, ``_stop_path``,
+    ``_params_path`` and ``checkpoint_path`` all build on it, so guarding here
+    covers every method that takes a session_id rather than one of them.
+    """
+    validate_session_id(session_id)
+    root = sessions_root()
+    candidate = root / session_id
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    try:
+        # `Path.is_relative_to` is 3.9+, and this app's suite also runs on 3.8.
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise InvalidSessionId(
+            f"session_id resolves outside the sessions root "
+            f"(length {len(session_id)}, starts {session_id[:12]!r})"
+        )
+    return candidate
 
 
 def session_backend(session_id: str) -> str:
@@ -124,19 +209,31 @@ def min_training_vram_mb(model_type: str) -> int:
 # Machine-readable grouping keys the training UI keys off instead of string-matching
 # model_type: ``family`` groups by architecture, ``size`` is the capacity tier.
 MODEL_FAMILY = {
-    "vit_t_lm": "lm", "vit_b_lm": "lm", "vit_l_lm": "lm",
+    "vit_t_lm": "lm",
+    "vit_b_lm": "lm",
+    "vit_l_lm": "lm",
     "vit_t_em_organelles": "em_organelles",
     "vit_b_em_organelles": "em_organelles",
     "vit_l_em_organelles": "em_organelles",
-    "vit_b": "sam", "vit_l": "sam", "vit_h": "sam",
-    "cpsam": "cpsam", "cpdino": "cpdino", "cpdino-vitb": "cpdino",
+    "vit_b": "sam",
+    "vit_l": "sam",
+    "vit_h": "sam",
+    "cpsam": "cpsam",
+    "cpdino": "cpdino",
+    "cpdino-vitb": "cpdino",
 }
 MODEL_SIZE = {
-    "vit_t_lm": "tiny", "vit_t_em_organelles": "tiny",
-    "vit_b_lm": "base", "vit_b_em_organelles": "base", "vit_b": "base",
+    "vit_t_lm": "tiny",
+    "vit_t_em_organelles": "tiny",
+    "vit_b_lm": "base",
+    "vit_b_em_organelles": "base",
+    "vit_b": "base",
     "cpdino-vitb": "base",
-    "vit_l_lm": "large", "vit_l_em_organelles": "large", "vit_l": "large",
-    "cpsam": "large", "cpdino": "large",
+    "vit_l_lm": "large",
+    "vit_l_em_organelles": "large",
+    "vit_l": "large",
+    "cpsam": "large",
+    "cpdino": "large",
     "vit_h": "huge",
 }
 
@@ -183,6 +280,58 @@ def _status_path(session_id: str) -> Path:
 
 def _stop_path(session_id: str) -> Path:
     return session_dir(session_id) / "stop.requested"
+
+
+def caller_identity(context: Any) -> Dict[str, Any]:
+    """``{"owner", "owner_anonymous"}`` from Hypha's injected caller context.
+
+    Hypha injects ``context`` at the service boundary and the ProxyDeployment
+    forwards it, so the identity here is the live caller's and a client cannot
+    set it. That is the whole reason a run can be attributed at all.
+
+    **Three states, and the third is not the second.** A known user gives an id
+    and ``owner_anonymous`` False; a known anonymous caller gives its id and
+    True; and a call that arrives with no usable context gives ``None`` for
+    both. The last is NOT "anonymous" — it is "not recorded", which is the shape
+    every run written before this field existed also has. A reader that collapses
+    the two would either hide a user's own runs or expose an anonymous one, so
+    the distinction is kept here rather than flattened for convenience.
+
+    Never raises. A malformed context must not fail a training run that is
+    otherwise valid: the run is the user's work, the attribution is bookkeeping,
+    and losing the second is not worth losing the first.
+    """
+    unknown = {"owner": None, "owner_anonymous": None}
+    try:
+        return _caller_identity(context, unknown)
+    except Exception:
+        # TOTAL on purpose, and the docstring's promise depends on it. Type
+        # checks alone are not enough: a mapping whose own `get` raises slips
+        # past every isinstance and takes the training run down with it. That is
+        # not hypothetical hardening -- the test for this caught the unguarded
+        # version returning an exception instead of "unknown".
+        return unknown
+
+
+def _caller_identity(context: Any, unknown: Dict[str, Any]) -> Dict[str, Any]:
+    """The reading itself; :func:`caller_identity` owns the never-raise promise."""
+    if not isinstance(context, dict):
+        return unknown
+    user = context.get("user")
+    if not isinstance(user, dict):
+        return unknown
+    uid = user.get("id")
+    if not isinstance(uid, str) or not uid:
+        return unknown
+    flag = user.get("is_anonymous")
+    # Read the flag; do NOT infer anonymity from the shape of the id. An
+    # anonymous workspace happens to be named recognisably today and that is a
+    # convention, not a contract -- keying on it would silently mislabel the day
+    # it changes.
+    return {
+        "owner": uid,
+        "owner_anonymous": bool(flag) if isinstance(flag, bool) else None,
+    }
 
 
 def new_session_id() -> str:
@@ -236,29 +385,102 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
     return cur
 
 
-def get_status(session_id: str) -> Dict[str, Any]:
+# Fields recorded on a run but NOT returned by the public read path.
+#
+# `list_training_sessions` answers anonymous callers today, and it returns
+# whatever `get_status` returns. So the moment a run records who started it, that
+# identity is published to anyone who asks -- the public history would stop
+# saying only WHAT was trained and start saying WHO trained it. Recording the
+# owner and keeping it out of the response therefore have to be one change, not
+# two: "record now, filter later" publishes the identity in between.
+#
+# These come back only for a caller that asks with include_private=True, which is
+# the hook the per-caller filter will use to compare a request against the run's
+# owner. When that filter lands, the listing can return owned runs to their owner
+# and this redaction becomes the default for everyone else rather than for all.
+PRIVATE_STATUS_FIELDS = ("owner", "owner_anonymous")
+
+
+def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, Any]:
     st = read_status(session_id)
     if not st:
-        return {"session_id": session_id, "status": "UNKNOWN", "message": "no such session"}
+        return {
+            "session_id": session_id,
+            "status": "UNKNOWN",
+            "message": "no such session",
+        }
     st["session_id"] = session_id
     st["checkpoint_available"] = checkpoint_path(session_id).exists()
+    # The config a run used, so a history listing can say WHAT was trained and not
+    # merely that something was. It was already persisted per run and reachable only
+    # from inside this app; `{}` for a run that died before the file was written.
+    st["config"] = run_config(session_id)
     if st.get("start_time"):
         end = st.get("end_time") or time.time()
         st["elapsed_s"] = round(end - st["start_time"], 1)
     # A run with no live thread that hasn't updated in a while is stale → stopped.
-    if st.get("status") in ("PREPARING", "TRAINING") and \
-            time.time() - st.get("updated_at", 0) > STATUS_STALE_SECONDS:
+    if (
+        st.get("status") in ("PREPARING", "TRAINING")
+        and time.time() - st.get("updated_at", 0) > STATUS_STALE_SECONDS
+    ):
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
+    if not include_private:
+        for field in PRIVATE_STATUS_FIELDS:
+            st.pop(field, None)
+
     return st
 
 
 def list_sessions() -> Dict[str, Dict[str, Any]]:
+    """Every run on this worker whose directory name is a real session id.
+
+    **A non-conforming directory is SKIPPED, not fatal, and that is the whole
+    point of this function having a comment.** ``get_status`` validates the id,
+    so listing a directory whose name is not a session id raises — and one such
+    directory would then make the listing raise for *every* caller, turning a
+    stray directory into a total outage of the run history.
+
+    That is not hypothetical. Until this fix is deployed, the running version
+    lets any unauthenticated caller create exactly such a directory, so the
+    fixed version can come up with junk already on disk beside the real runs.
+    The "all 261 live ids conform" measurement was taken *before* the rollout
+    and cannot speak for what is on disk after it.
+
+    So the rule is: validate what a CALLER hands us, and tolerate what we FIND.
+    A name that cannot be a session id was not produced by this server, and the
+    honest thing is to leave it out of the history rather than to refuse to show
+    the history at all. It is logged once per listing so the junk is visible.
+    """
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
+    skipped: List[str] = []
     for d in sorted(root.iterdir()) if root.exists() else []:
-        if d.is_dir() and (d / "status.json").exists():
+        if not (d.is_dir() and (d / "status.json").exists()):
+            continue
+        if not SESSION_ID_PATTERN.match(d.name):
+            skipped.append(d.name)
+            continue
+        try:
             out[d.name] = get_status(d.name)
+        except InvalidSessionId:
+            # The name passed, but a deeper layer still refused it. Today that
+            # means the containment check: a directory whose NAME is a valid
+            # session id but which is a SYMLINK out of the sessions root. The
+            # name check above cannot see that, and without this the one bad
+            # link would raise and take the whole history down -- the same
+            # outage the name check was added to prevent, through the other
+            # layer. Caught here rather than by pre-checking the link, so that
+            # any future refusal inside `session_dir` is covered too.
+            skipped.append(d.name)
+    if skipped:
+        # Names are attacker-controlled, so log how many and a bounded sample
+        # rather than the lot.
+        print(
+            f"[model-finetune] skipped {len(skipped)} session directory(ies) whose "
+            f"name is not a valid session id: {skipped[:5]}",
+            flush=True,
+        )
     return out
 
 
@@ -315,8 +537,11 @@ def get_export(export_id: str) -> Dict[str, Any]:
     while the build is genuinely alive.
     """
     rec = read_export(export_id)
-    if rec and rec.get("status") in ("PENDING", "BUILDING") and \
-            time.time() - rec.get("updated_at", 0) > STATUS_STALE_SECONDS:
+    if (
+        rec
+        and rec.get("status") in ("PENDING", "BUILDING")
+        and time.time() - rec.get("updated_at", 0) > STATUS_STALE_SECONDS
+    ):
         rec["status"] = "FAILED"
         rec["message"] = "failed"
         rec["error"] = "the export was interrupted before the package was staged"
@@ -338,8 +563,12 @@ def _set_pdeathsig() -> None:
 
 
 def run_cancellable_subprocess(
-    argv: List[str], session_id: str, cwd: Optional[str] = None,
-    env: Optional[Dict[str, str]] = None, poll: float = 2.0, grace: float = 10.0,
+    argv: List[str],
+    session_id: str,
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    poll: float = 2.0,
+    grace: float = 10.0,
 ) -> Tuple[int, str, bool]:
     """Run a training subprocess that a concurrent ``stop_training`` can kill.
 
@@ -355,7 +584,12 @@ def run_cancellable_subprocess(
     stopped = False
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
-            argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
             preexec_fn=_set_pdeathsig,
         )
         while True:
@@ -381,6 +615,56 @@ def run_cancellable_subprocess(
 
 # === annotation interpretation ===
 
+
+def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
+    """``{"x_min","x_max","y_min","y_max","features"}`` over a FeatureCollection's
+    polygon rings, or ``None`` when it carries no polygon at all.
+
+    Used to say WHY a mask came back empty. A polygon list whose x runs to 40000
+    against a 512-wide canvas is a coordinate-frame mismatch, and printing the
+    range turns a silent all-background training set into a diagnosis.
+    """
+    feats = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(feats, list):
+        return None
+    xs: List[float] = []
+    ys: List[float] = []
+    n = 0
+
+    def _walk(coords: Any, depth: int = 0) -> None:
+        # Polygon is [[ [x,y], ... ]]; MultiPolygon one level deeper. Walk until
+        # a pair of numbers appears rather than trusting the declared type.
+        if (
+            isinstance(coords, (list, tuple))
+            and len(coords) == 2
+            and all(isinstance(v, (int, float)) for v in coords)
+        ):
+            xs.append(float(coords[0]))
+            ys.append(float(coords[1]))
+            return
+        if isinstance(coords, (list, tuple)) and depth < 6:
+            for item in coords:
+                _walk(item, depth + 1)
+
+    for feat in feats:
+        geom = feat.get("geometry") if isinstance(feat, dict) else None
+        if not isinstance(geom, dict):
+            continue
+        if str(geom.get("type") or "") not in ("Polygon", "MultiPolygon"):
+            continue
+        n += 1
+        _walk(geom.get("coordinates"))
+    if not n or not xs:
+        return None
+    return {
+        "x_min": min(xs),
+        "x_max": max(xs),
+        "y_min": min(ys),
+        "y_max": max(ys),
+        "features": float(n),
+    }
+
+
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
@@ -402,7 +686,11 @@ def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.nd
         geom = feature.get("geometry") or {}
         gtype = geom.get("type")
         coords = geom.get("coordinates") or []
-        polygons = [coords] if gtype == "Polygon" else (list(coords) if gtype == "MultiPolygon" else [])
+        polygons = (
+            [coords]
+            if gtype == "Polygon"
+            else (list(coords) if gtype == "MultiPolygon" else [])
+        )
         for poly in polygons:
             if not poly:
                 continue
@@ -487,7 +775,11 @@ def materialize_pairs(
     sdir = session_dir(session_id)
 
     def keep(pairs):
-        return [(im, lb) for im, lb in pairs if lb is not None and int(np.asarray(lb).max()) > 0]
+        return [
+            (im, lb)
+            for im, lb in pairs
+            if lb is not None and int(np.asarray(lb).max()) > 0
+        ]
 
     train = keep(train)
     val = keep(val) if val else []
@@ -528,13 +820,19 @@ def materialize_pairs(
     ph = (min(patch_shape[0], min_h), min(patch_shape[1], min_w))
 
     return {
-        "train_images": train_imgs, "train_labels": train_lbls,
-        "val_images": val_imgs, "val_labels": val_lbls,
-        "patch_shape": ph, "n_train": len(train_imgs), "n_val": len(val_imgs),
+        "train_images": train_imgs,
+        "train_labels": train_lbls,
+        "val_images": val_imgs,
+        "val_labels": val_lbls,
+        "patch_shape": ph,
+        "n_train": len(train_imgs),
+        "n_val": len(val_imgs),
         "val_reused_train": val_reused_train,
     }
 
+
 # === training params (written by the entry, read by train_worker.py) ===
+
 
 def _params_path(session_id: str) -> Path:
     return session_dir(session_id) / "training_params.json"
@@ -548,3 +846,47 @@ def write_training_params(session_id: str, params: Dict[str, Any]) -> None:
 
 def read_training_params(session_id: str) -> Dict[str, Any]:
     return json.loads(_params_path(session_id).read_text())
+
+
+# What a client may see of a run's configuration, as an ALLOW-LIST rather than a
+# redaction list. ``training_params.json`` is written by spreading ``**params`` plus a
+# ``**resolved`` block, so its contents are whatever those carry at the time: an
+# allow-list stays safe when a field is added there later, while a blocklist would have
+# to anticipate the new name. Today nothing in it is a credential — ``pool_token`` is
+# consumed during checkpoint resolution and never stored — but a read surface should not
+# depend on that staying true.
+#
+# Deliberately NOT included: ``train_images`` / ``train_labels`` / ``val_images`` /
+# ``val_labels``, which are local materialisation paths — useless to a client and
+# needless detail about the worker's filesystem — and ``init_checkpoint``, which is a
+# path; ``resume_session_id`` and ``pool_provenance`` carry the same meaning as ids.
+RUN_CONFIG_FIELDS = (
+    "model_type",
+    "n_epochs",
+    "batch_size",
+    "learning_rate",
+    "diam_mean",
+    "val_fraction",
+    "n_samples",
+    "train_tile_size",
+    "patch_shape",
+    "metrics",
+    "resume_session_id",
+    "pool_provenance",
+)
+
+
+def run_config(session_id: str) -> Dict[str, Any]:
+    """The run's configuration for display, restricted to :data:`RUN_CONFIG_FIELDS`.
+
+    Returns ``{}`` rather than raising when the params file is absent or unreadable: a
+    run that failed during preparation can terminate before the file is written, and
+    those are exactly the sessions a history page still has to list. ``get_status`` is
+    on every read path, so it must not acquire a new way to throw."""
+    try:
+        params = read_training_params(session_id)
+    except Exception:
+        return {}
+    if not isinstance(params, dict):
+        return {}
+    return {k: params[k] for k in RUN_CONFIG_FIELDS if k in params}

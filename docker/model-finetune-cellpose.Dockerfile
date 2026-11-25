@@ -1,7 +1,18 @@
 # BioEngine worker image with the model-finetune app's dependencies baked in.
 # Ray's runtime_env venv inherits the image's site-packages, so at deploy time
-# every pin resolves as already satisfied and the app skips the multi-GB
+# the pins resolve as already satisfied and the app skips the multi-GB
 # download/install that otherwise runs on first startup.
+#
+# Fast-start but NOT air-gapped: the two git+https pins in
+# apps/model-finetune/requirements-runtime-cellpose.txt (dinov3 and
+# segment-anything, each pinned to a commit) are re-cloned on every deploy, so
+# the install fails with no network. The reason is the BUILD, not the deploy:
+# pip re-resolves a direct VCS reference instead of reusing the baked install,
+# and PIP_NO_CACHE_DIR=1 is set below ahead of every `pip install` in this file,
+# so the image never stores a wheel for those two to fall back on. A deploy
+# therefore re-clones whatever IT sets PIP_NO_CACHE_DIR to — unsetting it at
+# deploy time does not help, because there is nothing cached in the image to
+# serve. Only vendoring those two pins removes the network requirement.
 #
 # Published as ONE general GHCR package, ghcr.io/aicell-lab/model-finetune, with
 # a per-backend tag suffix (e.g. 0.21.0-cellpose). This file builds the CELLPOSE

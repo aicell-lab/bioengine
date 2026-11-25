@@ -57,13 +57,18 @@ def process_table(monkeypatch):
 
 def _raylet(pid, session, ppid=1):
     return _FakeProcess(
-        pid, "raylet", f"/sp/ray/core/src/ray/raylet/raylet --raylet_socket_name={session}/sockets/raylet", ppid
+        pid,
+        "raylet",
+        f"/sp/ray/core/src/ray/raylet/raylet --raylet_socket_name={session}/sockets/raylet",
+        ppid,
     )
 
 
 def _gcs(pid, session):
     return _FakeProcess(
-        pid, "gcs_server", f"/sp/ray/core/src/ray/gcs/gcs_server --log_dir={session}/logs"
+        pid,
+        "gcs_server",
+        f"/sp/ray/core/src/ray/gcs/gcs_server --log_dir={session}/logs",
     )
 
 
@@ -152,7 +157,9 @@ def test_orders_the_buckets_raylet_first_and_gcs_last(process_table):
     processes = [
         _gcs(10, OUR_SESSION),
         _FakeProcess(
-            11, "python3.11", f"/sp/ray/_private/log_monitor.py --session-dir={OUR_SESSION}"
+            11,
+            "python3.11",
+            f"/sp/ray/_private/log_monitor.py --session-dir={OUR_SESSION}",
         ),
         _raylet(12, OUR_SESSION),
     ]
@@ -170,7 +177,9 @@ def test_claims_nothing_when_no_ray_process_is_running(process_table):
     assert buckets == [[], [], []]
 
 
-def test_does_not_claim_a_client_server_whose_port_merely_starts_with_ours(process_table):
+def test_does_not_claim_a_client_server_whose_port_merely_starts_with_ours(
+    process_table,
+):
     """THE PREFIX CASE, and the one that pins ``gcs_argument in argv`` (site 5).
 
     The address is compared against ``argv`` — a list, so an exact element match — and

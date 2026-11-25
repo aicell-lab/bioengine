@@ -32,10 +32,10 @@ from ray import serve
 
 logger = logging.getLogger("ray.serve")
 
-_MODEL_ID       = "poisonous-spider"
-_SERVER_URL     = "https://hypha.aicell.io"
-_WORKSPACE      = "bioimage-io"
-_MODEL_RUNNER   = "bioimage-io/model-runner"
+_MODEL_ID = "poisonous-spider"
+_SERVER_URL = "https://hypha.aicell.io"
+_WORKSPACE = "bioimage-io"
+_MODEL_RUNNER = "bioimage-io/model-runner"
 
 
 @serve.deployment(
@@ -47,8 +47,8 @@ _MODEL_RUNNER   = "bioimage-io/model-runner"
 )
 class MitoAnalysisDeployment:
     def __init__(self) -> None:
-        self.start_time    = time.time()
-        self._model_runner = None   # set in async_init
+        self.start_time = time.time()
+        self._model_runner = None  # set in async_init
 
     async def async_init(self) -> None:
         """Connect to the BioEngine model-runner service."""
@@ -59,17 +59,19 @@ class MitoAnalysisDeployment:
             raise RuntimeError("HYPHA_TOKEN environment variable is not set.")
 
         logger.info(f"Connecting to {_SERVER_URL} / {_WORKSPACE} ...")
-        server = await connect_to_server({
-            "server_url": _SERVER_URL,
-            "token": token,
-            "workspace": _WORKSPACE,
-        })
+        server = await connect_to_server(
+            {
+                "server_url": _SERVER_URL,
+                "token": token,
+                "workspace": _WORKSPACE,
+            }
+        )
         self._model_runner = await server.get_service(_MODEL_RUNNER)
         logger.info(f"Connected to model-runner. Using model: {_MODEL_ID}")
 
     async def test_deployment(self) -> None:
         """Smoke-test: run inference on a 64×64 synthetic tile."""
-        test_img = (np.random.rand(64, 64).astype(np.float32))
+        test_img = np.random.rand(64, 64).astype(np.float32)
         prob = await self._infer_full(test_img)
         assert prob.shape == (64, 64), f"Unexpected prob shape: {prob.shape}"
         logger.info("test_deployment passed.")
@@ -117,39 +119,39 @@ class MitoAnalysisDeployment:
         Gaussian-blended probability accumulation.
         Returns a float32 probability map the same shape as image_norm.
         """
-        H, W   = image_norm.shape
+        H, W = image_norm.shape
         stride = tile_size - overlap
-        sem    = asyncio.Semaphore(max_concurrent)
+        sem = asyncio.Semaphore(max_concurrent)
 
         # Gaussian blend window
         yy = np.linspace(-1, 1, tile_size)
         xx = np.linspace(-1, 1, tile_size)
         weight_win = np.outer(np.exp(-2 * yy**2), np.exp(-2 * xx**2)).astype(np.float32)
 
-        prob_acc   = np.zeros((H, W), dtype=np.float64)
+        prob_acc = np.zeros((H, W), dtype=np.float64)
         weight_acc = np.zeros((H, W), dtype=np.float64)
-        lock       = asyncio.Lock()
+        lock = asyncio.Lock()
 
         async def process_tile(y0, x0):
             y1, x1 = min(y0 + tile_size, H), min(x0 + tile_size, W)
-            tile   = image_norm[y0:y1, x0:x1].copy()
+            tile = image_norm[y0:y1, x0:x1].copy()
             th, tw = tile.shape
             if th < tile_size or tw < tile_size:
-                tile = np.pad(tile, ((0, tile_size - th), (0, tile_size - tw)), mode="reflect")
+                tile = np.pad(
+                    tile, ((0, tile_size - th), (0, tile_size - tw)), mode="reflect"
+                )
 
             async with sem:
                 prob = await self._infer_full(tile)
 
             prob = prob[:th, :tw]
-            w    = weight_win[:th, :tw]
+            w = weight_win[:th, :tw]
             async with lock:
-                prob_acc[y0:y1, x0:x1]   += prob * w
+                prob_acc[y0:y1, x0:x1] += prob * w
                 weight_acc[y0:y1, x0:x1] += w
 
         tile_coords = [
-            (y0, x0)
-            for y0 in range(0, H, stride)
-            for x0 in range(0, W, stride)
+            (y0, x0) for y0 in range(0, H, stride) for x0 in range(0, W, stride)
         ]
         await asyncio.gather(*[process_tile(y0, x0) for y0, x0 in tile_coords])
 
@@ -163,13 +165,13 @@ class MitoAnalysisDeployment:
         import scipy.ndimage as ndi
         from skimage import morphology, measure, segmentation, feature
 
-        binary  = morphology.remove_small_objects(prob > 0.5, min_size=300)
+        binary = morphology.remove_small_objects(prob > 0.5, min_size=300)
         if not binary.any():
             return np.zeros(prob.shape, dtype=np.int32)
-        closed  = ndi.binary_closing(binary, structure=morphology.disk(4))
-        dist    = ndi.distance_transform_edt(closed)
-        coords  = feature.peak_local_max(dist, min_distance=8, labels=closed)
-        m       = np.zeros(closed.shape, dtype=bool)
+        closed = ndi.binary_closing(binary, structure=morphology.disk(4))
+        dist = ndi.distance_transform_edt(closed)
+        coords = feature.peak_local_max(dist, min_distance=8, labels=closed)
+        m = np.zeros(closed.shape, dtype=bool)
         if len(coords):
             m[tuple(coords.T)] = True
         labels = segmentation.watershed(-dist, measure.label(m), mask=closed)
@@ -239,7 +241,9 @@ class MitoAnalysisDeployment:
 
         H, W = image_np.shape
         p1, p99 = np.percentile(image_np, [1, 99])
-        image_norm = np.clip((image_np - p1) / (p99 - p1 + 1e-6), 0, 1).astype(np.float32)
+        image_norm = np.clip((image_np - p1) / (p99 - p1 + 1e-6), 0, 1).astype(
+            np.float32
+        )
 
         logger.info(f"Analyzing {image_np.shape} image, tile_size={tile_size}")
 
@@ -247,15 +251,18 @@ class MitoAnalysisDeployment:
         if H <= tile_size and W <= tile_size:
             prob = await self._infer_full(image_norm)
         else:
-            prob = await self._infer_tiled(image_norm, tile_size=tile_size, overlap=overlap)
+            prob = await self._infer_tiled(
+                image_norm, tile_size=tile_size, overlap=overlap
+            )
 
-        labels  = self._prob_to_instances(prob)
-        n_mito  = int(labels.max())
+        labels = self._prob_to_instances(prob)
+        n_mito = int(labels.max())
         logger.info(f"Found {n_mito} mitochondria instances.")
 
         pixel_um = pixel_size_nm / 1000.0
         if n_mito > 0:
             from skimage.measure import regionprops
+
             labels_l, area_l, ar_l, ecc_l, cy_l, cx_l = [], [], [], [], [], []
             for rp in regionprops(labels):
                 labels_l.append(int(rp.label))
@@ -264,15 +271,24 @@ class MitoAnalysisDeployment:
                 ar_l.append(float(major / (minor + 1e-6)))
                 ecc_l.append(float(rp.eccentricity))
                 cy, cx = rp.centroid
-                cy_l.append(float(cy)); cx_l.append(float(cx))
+                cy_l.append(float(cy))
+                cx_l.append(float(cx))
             properties = {
-                "label": labels_l, "area_um2": area_l, "aspect_ratio": ar_l,
-                "eccentricity": ecc_l, "centroid_y": cy_l, "centroid_x": cx_l,
+                "label": labels_l,
+                "area_um2": area_l,
+                "aspect_ratio": ar_l,
+                "eccentricity": ecc_l,
+                "centroid_y": cy_l,
+                "centroid_x": cx_l,
             }
         else:
             properties = {
-                "label": [], "area_um2": [], "aspect_ratio": [],
-                "eccentricity": [], "centroid_y": [], "centroid_x": [],
+                "label": [],
+                "area_um2": [],
+                "aspect_ratio": [],
+                "eccentricity": [],
+                "centroid_y": [],
+                "centroid_x": [],
             }
 
         return {

@@ -31,6 +31,7 @@ reader who assumed they did would look for the wrong guarantee:
                                                          double-emit defect came back on an error
                                                          path
 """
+
 import logging
 import os
 
@@ -60,7 +61,9 @@ def test_a_line_is_emitted_once_after_repeat_calls(capsys):
         lg = create_logger("EmitOnceProbe")
     lg.warning("exactly once please")
     emitted = capsys.readouterr().err.count("exactly once please")
-    assert emitted == 1, "the line was emitted %d times, one per leaked handler" % emitted
+    assert emitted == 1, (
+        "the line was emitted %d times, one per leaked handler" % emitted
+    )
 
 
 def test_control_a_fresh_logger_still_gets_its_handler_and_emits(capsys):
@@ -94,7 +97,9 @@ def test_log_file_path_is_bounded_and_does_not_leak_descriptors(tmp_path):
         kept.extend(logging.getLogger("FdProbe").handlers)
         create_logger("FdProbe", log_file=str(target))
     after = len(os.listdir("/proc/self/fd"))
-    assert len(logging.getLogger("FdProbe").handlers) == 2, "console + file, not 2 per call"
+    assert (
+        len(logging.getLogger("FdProbe").handlers) == 2
+    ), "console + file, not 2 per call"
     # Load-bearing, and verified to be so: this fails on a mutant whose only change is
     # handler.close() -> pass, and passes on the fix.
     assert after == before, "leaked %d descriptors over 5 calls" % (after - before)
@@ -115,14 +120,14 @@ def test_a_repeat_call_without_log_file_replaces_the_file_destination(tmp_path):
     target = tmp_path / "replace.log"
     lg = create_logger("ReplaceDestProbe", log_file=str(target))
     lg.warning("while the file destination is attached")
-    assert "while the file destination is attached" in target.read_text(), (
-        "the file destination never worked, so this arm cannot test replacing it"
-    )
+    assert (
+        "while the file destination is attached" in target.read_text()
+    ), "the file destination never worked, so this arm cannot test replacing it"
 
     lg = create_logger("ReplaceDestProbe")
-    assert len(logging.getLogger("ReplaceDestProbe").handlers) == 1, (
-        "a no-log_file repeat call must leave the console handler alone"
-    )
+    assert (
+        len(logging.getLogger("ReplaceDestProbe").handlers) == 1
+    ), "a no-log_file repeat call must leave the console handler alone"
     before = target.read_text()
     lg.warning("after the destination was replaced")
     assert target.read_text() == before, (
@@ -156,7 +161,8 @@ def test_a_failing_repeat_call_leaves_the_logger_untouched(tmp_path):
 
     after = logging.getLogger("ExcProbe").handlers
     assert len(after) == 1, (
-        "a failed call left %d handlers, so a later line is emitted once per handler" % len(after)
+        "a failed call left %d handlers, so a later line is emitted once per handler"
+        % len(after)
     )
     assert after[0] is before[0], (
         "the original handler was swapped out by a call that raised, so the logger was mutated "
@@ -169,9 +175,9 @@ def test_a_handler_the_caller_attached_is_not_removed():
     mine = logging.NullHandler()
     lg.addHandler(mine)
     create_logger("CallerHandlerProbe")
-    assert mine in logging.getLogger("CallerHandlerProbe").handlers, (
-        "create_logger removed a handler it did not attach"
-    )
+    assert (
+        mine in logging.getLogger("CallerHandlerProbe").handlers
+    ), "create_logger removed a handler it did not attach"
     assert len(logging.getLogger("CallerHandlerProbe").handlers) == 2
 
 

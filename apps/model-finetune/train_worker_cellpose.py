@@ -15,11 +15,13 @@ fine-tuned net to ``<session_dir>/models/model`` — the cellpose checkpoint lay
 ``training.checkpoint_path`` expects for a 'cellpose'-backend session.
 """
 
+import logging
 import sys
 import threading
 import time
 import traceback
 
+import epoch_progress
 import training
 
 
@@ -112,7 +114,9 @@ def _instance_scores(gts, preds, thresholds):
     return out
 
 
-def _evaluate_validation(model, val_image_files, val_label_files, want_pixel, want_instance):
+def _evaluate_validation(
+    model, val_image_files, val_label_files, want_pixel, want_instance
+):
     """Score the fine-tuned net on the validation split, returning
     ``(pixel_metrics, instance_metrics)`` — each None when not requested and
     ``{"error": ...}`` when it could not be computed. One inference pass feeds
@@ -132,16 +136,22 @@ def _evaluate_validation(model, val_image_files, val_label_files, want_pixel, wa
         return both({"error": "needs validation data (val_images/val_labels)"})
     try:
         imgs = [np.asarray(cpio.imread(f)) for f in val_image_files]
-        gts = [np.squeeze(np.asarray(cpio.imread(f))).astype(np.int32)
-               for f in val_label_files]
-        preds = [np.asarray(m).astype(np.int32)
-                 for m in model.eval(imgs, normalize=True, rescale=False)[0]]
+        gts = [
+            np.squeeze(np.asarray(cpio.imread(f))).astype(np.int32)
+            for f in val_label_files
+        ]
+        preds = [
+            np.asarray(m).astype(np.int32)
+            for m in model.eval(imgs, normalize=True, rescale=False)[0]
+        ]
     except Exception as exc:
         return both({"error": f"validation inference failed: {str(exc)[:240]}"})
 
-    counts = {"n_val": len(gts),
-              "n_true": sum(int(g.max()) for g in gts),
-              "n_pred": sum(int(p.max()) for p in preds)}
+    counts = {
+        "n_val": len(gts),
+        "n_true": sum(int(g.max()) for g in gts),
+        "n_pred": sum(int(p.max()) for p in preds),
+    }
     pixel = instance = None
     if want_pixel:
         try:
@@ -150,8 +160,9 @@ def _evaluate_validation(model, val_image_files, val_label_files, want_pixel, wa
             pixel = {"error": str(exc)[:300]}
     if want_instance:
         try:
-            instance = dict(counts, **_instance_scores(
-                gts, preds, training.INSTANCE_IOU_THRESHOLDS))
+            instance = dict(
+                counts, **_instance_scores(gts, preds, training.INSTANCE_IOU_THRESHOLDS)
+            )
         except Exception as exc:
             instance = {"error": str(exc)[:300]}
     return pixel, instance
@@ -166,6 +177,80 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
         training.write_status(session_id)
 
 
+# Every epoch reports, because the curve is recomputed from cellpose's own per-batch
+# terms rather than read from its log. Declared to the client so a consumer knows
+# whether a gap is expected; cellpose's own per-epoch LOG line is far sparser
+# (`if iepoch == 5 or iepoch % 10 == 0` in cellpose/train.py at 4.2.1.1, so a
+# 5-epoch run logs epoch 0 and nothing else), which is exactly why the log is not
+# the source here.
+EPOCH_REPORT_CADENCE = "every epoch"
+
+
+def terminal_epoch_fields(ok, loss_basis, live_curve, n_epochs):
+    """``(n_epochs_completed, n_epochs_completed_basis)`` for the TERMINAL write.
+
+    A function rather than an inline conditional because it encodes a decision,
+    and a decision that cannot be tested gets reverted by accident. It used to be
+    inline and it was wrong: the terminal write overwrote the live count with the
+    REQUESTED total under the basis ``floor_if_completed``, so a run the page had
+    been showing real progress for lost that claim at the moment it succeeded —
+    the page makes no claim for any basis but ``measured``.
+
+    The rule: a counted curve that RECONCILES against train_seg's own returned
+    curve is observed and checked, so it is reported as ``measured`` with the
+    count actually observed — which is also the truer number if cellpose ended
+    early. Anything short of reconciled falls back to the floor, and why stays
+    visible in ``epoch_loss_basis`` instead of being smuggled into this field.
+    """
+    if not ok:
+        return None, None
+    if loss_basis == epoch_progress.BASIS_MEASURED and live_curve:
+        return len(live_curve), "measured"
+    return n_epochs, "floor_if_completed"
+
+
+def _publish_epoch(session_id: str, has_val: bool):
+    """A tracker callback that writes the growing curve into status.json.
+
+    Validation loss is deliberately absent from a live entry: cellpose only
+    validates on its own hardcoded cadence, so most epochs have no validation
+    number, and the off-cadence ones carry the initialised 0.0 rather than a
+    measurement. A real segmentation loss is never exactly 0.0, so publishing that
+    would drag a loss curve to the axis three epochs out of four. The authoritative
+    test curve is reconciled in at the end instead.
+    """
+
+    def on_epoch(n_completed: int, curve):
+        try:
+            training.write_status(
+                session_id,
+                epochs=[
+                    {"epoch": i, "train_loss": float(v), "val_loss": None}
+                    for i, v in enumerate(curve)
+                ],
+                last_reported_epoch=n_completed - 1,
+                n_epochs_completed=n_completed,
+                # WITHOUT THIS THE UI SHOWS NOTHING. The page refuses to claim
+                # any progress unless the basis is exactly "measured" —
+                # `epochProgressOf` in the Colab page's trainingProgress.ts
+                # returns {kind: 'none'} for a missing basis, which is what an
+                # earlier version of this writer produced: a count the page was
+                # right to ignore, because an unlabelled number could have been
+                # inferred from anything.
+                #
+                # "measured" is the honest label here and not a convenience: the
+                # count is epochs the hook watched CLOSE, one callback per epoch
+                # boundary, not a fraction of elapsed time and not the requested
+                # total assumed to have happened.
+                n_epochs_completed_basis="measured",
+            )
+        except Exception:
+            # Progress reporting must never be able to fail a training run.
+            pass
+
+    return on_epoch
+
+
 def _surface_cellpose_logs() -> None:
     """Route cellpose's per-epoch train/test-loss trace to stdout so the subprocess
     redirect captures it (into train.log / the session record). cellpose attaches a
@@ -175,8 +260,6 @@ def _surface_cellpose_logs() -> None:
     Setting the level + adding an explicit stdout handler is immune to root-handler
     state (unlike basicConfig) and has no filesystem side effect (unlike
     cellpose.io.logger_setup, which mkdirs ~/.cellpose and clears handlers)."""
-    import logging
-
     lg = logging.getLogger("cellpose")
     lg.setLevel(logging.INFO)
     if not any(isinstance(h, logging.StreamHandler) for h in lg.handlers):
@@ -198,9 +281,45 @@ def main(session_id: str) -> None:
     # moment to discover it.
     metrics_requested = training.validate_metrics(p.get("metrics"))
 
-    training.write_status(session_id, status="TRAINING", message="training started")
+    # Live progress, recomputed from cellpose's own per-batch loss terms. Installed
+    # before train_seg runs so epoch 0 is captured. nimg_per_epoch is not guessed:
+    # cellpose resolves it as `nimg if nimg_per_epoch is None else nimg_per_epoch`
+    # (cellpose/train.py:408 at 4.2.1.1) and this call passes none, so it is the
+    # training-image count. Getting it wrong would move every epoch boundary — and
+    # would be caught at the end by the reconciliation rather than published.
+    #
+    # THIS IS THE COUNT BEFORE cellpose's `min_train_masks` FILTER, which re-sets
+    # nimg after dropping images with too few masks (train.py:264-281). It is
+    # correct today only because three things hold together: materialise_pairs
+    # already drops empty-label pairs, this call passes min_train_masks=1, and no
+    # caller can raise that. Add a min_train_masks parameter and every live epoch
+    # boundary moves, with only the end-of-run reconciliation to notice — so if
+    # that parameter ever appears, this count has to come from the filtered set.
+    tracker = epoch_progress.EpochLossTracker(
+        nimg_per_epoch=max(1, len(p.get("train_images") or [])),
+        on_epoch=(
+            _publish_epoch(session_id, bool(p.get("val_images")))
+            if "loss" in metrics_requested
+            else None
+        ),
+    )
+    # None when the anchors are absent — a later cellpose that renames a loss
+    # function, or no torch. Nothing is patched then and no progress is claimed: a
+    # wrong number is worse than no number.
+    hook = epoch_progress.install_cellpose_hook(tracker)
+    training.write_status(
+        session_id,
+        status="TRAINING",
+        message="training started",
+        epochs=[],
+        last_reported_epoch=None,
+        epoch_report_cadence=EPOCH_REPORT_CADENCE,
+        n_epochs=p["n_epochs"],
+    )
     stop = threading.Event()
-    heartbeat = threading.Thread(target=_heartbeat, args=(session_id, stop), daemon=True)
+    heartbeat = threading.Thread(
+        target=_heartbeat, args=(session_id, stop), daemon=True
+    )
     heartbeat.start()
 
     try:
@@ -221,29 +340,50 @@ def main(session_id: str) -> None:
 
         result = train_seg(
             net,
-            train_files=p["train_images"], train_labels_files=p["train_labels"],
-            test_files=p["val_images"], test_labels_files=p["val_labels"],
-            save_path=str(sdir), model_name="model",
-            n_epochs=p["n_epochs"], learning_rate=p["learning_rate"],
-            weight_decay=p.get("weight_decay", 0.1), batch_size=p.get("batch_size", 1),
+            train_files=p["train_images"],
+            train_labels_files=p["train_labels"],
+            test_files=p["val_images"],
+            test_labels_files=p["val_labels"],
+            save_path=str(sdir),
+            model_name="model",
+            n_epochs=p["n_epochs"],
+            learning_rate=p["learning_rate"],
+            weight_decay=p.get("weight_decay", 0.1),
+            batch_size=p.get("batch_size", 1),
             min_train_masks=p.get("min_train_masks", 1),
             # None keeps cellpose's own per-backbone default: 256 for cpsam,
             # 384 for cpdino. cpsam rejects any other value outright.
             bsize=p.get("train_tile_size"),
-            normalize=True, rescale=False,
+            normalize=True,
+            rescale=False,
         )
         stop.set()
+        # Flush the batch still pending: a batch is only complete once the NEXT seg
+        # call arrives, so without this the final epoch never closes and the live
+        # curve comes up one epoch short of train_seg's. Only on the success path —
+        # flushing after a failure would publish a partial epoch as an epoch.
+        if hook is not None:
+            hook.close()
         # Stock train_seg returns (model_path, train_losses, test_losses); capture
         # defensively so a signature change can't break the run.
         train_losses, test_losses = [], []
-        if "loss" in metrics_requested and isinstance(result, (tuple, list)) and len(result) >= 3:
+        if (
+            "loss" in metrics_requested
+            and isinstance(result, (tuple, list))
+            and len(result) >= 3
+        ):
             train_losses, test_losses = _loss_list(result[1]), _loss_list(result[2])
-            # Stock train_seg validates only every validation_interval epochs and
-            # returns 0.0 for the off-cadence epochs; a real segmentation test loss
-            # is never exactly 0.0, so surface those as null — a consumer must not
-            # read a non-validated epoch as a test loss of 0.0 (verified on deNBI:
-            # a 4-epoch run gave [11.05, 0, 0, 0] = validated at epoch 0 only).
-            test_losses = [None if (v is not None and v == 0.0) else v for v in test_losses]
+            # Stock train_seg validates under a HARDCODED cadence guard — not a
+            # configurable interval: `if iepoch == 5 or iepoch % 10 == 0` in
+            # cellpose/train.py at 4.2.1.1, with no parameter to change it. Off-cadence
+            # epochs keep the initialised 0.0, so a real segmentation test loss is
+            # never exactly 0.0 and those surface as null — a consumer must not read a
+            # non-validated epoch as a test loss of 0.0 (verified on deNBI: a 4-epoch
+            # run gave [11.05, 0, 0, 0] = validated at epoch 0 only, which is that
+            # guard matching 0 % 10 and nothing else).
+            test_losses = [
+                None if (v is not None and v == 0.0) else v for v in test_losses
+            ]
         ok = training.checkpoint_path(session_id).exists()
         cell_diameters = None
         pixel_metrics = instance_metrics = None
@@ -253,7 +393,9 @@ def main(session_id: str) -> None:
             except Exception:
                 cell_diameters = None
             pixel_metrics, instance_metrics = _evaluate_validation(
-                model, p.get("val_images"), p.get("val_labels"),
+                model,
+                p.get("val_images"),
+                p.get("val_labels"),
                 want_pixel="pixel" in metrics_requested,
                 want_instance="instance" in metrics_requested,
             )
@@ -262,13 +404,55 @@ def main(session_id: str) -> None:
         # requested epochs; a truncated run never checkpoints → never COMPLETED.
         # Hence the count is a floor guaranteed only by COMPLETED, not a measured
         # value (basis="floor_if_completed") — cellpose exposes no per-epoch counter.
+        # The live curve is RECONCILED against train_seg's own return rather than
+        # trusted. `measured` means the two agree to within a float-association
+        # tolerance; `measured_unreconciled` means they do not, and the curve written
+        # below — the authoritative one — is what a reader should use. Publishing an
+        # unchecked curve as measured is the failure this avoids.
+        live_curve = list(tracker.epoch_losses)
+        loss_basis = epoch_progress.agreement(live_curve, train_losses)
+        # Placed after ALL THREE inputs exist: `ok` (did a checkpoint appear),
+        # `live_curve` and `loss_basis`. An earlier edit of mine put this call
+        # above `live_curve` and it would have raised NameError on every run.
+        _terminal_completed, _terminal_basis = terminal_epoch_fields(
+            ok, loss_basis, live_curve, p["n_epochs"]
+        )
+        final_epochs = [
+            {
+                "epoch": i,
+                "train_loss": float(train_losses[i]),
+                # Already nulled where cellpose did not validate, above.
+                "val_loss": (test_losses[i] if i < len(test_losses) else None),
+            }
+            for i in range(len(train_losses))
+        ]
         training.write_status(
             session_id,
             status="COMPLETED" if ok else "FAILED",
-            message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
-            end_time=time.time(), terminated_by="child",
-            n_epochs_completed=p["n_epochs"] if ok else None,
-            n_epochs_completed_basis="floor_if_completed" if ok else None,
+            message=(
+                "checkpoint saved"
+                if ok
+                else "training finished but no checkpoint was produced"
+            ),
+            end_time=time.time(),
+            terminated_by="child",
+            epoch_loss_basis=loss_basis,
+            # Only when there IS a final curve: write_status merges, so an empty list
+            # here would erase the live one a reader may already have seen.
+            **({"epochs": final_epochs} if final_epochs else {}),
+            # THE TERMINAL WRITE MUST NOT DOWNGRADE A MEASURED COUNT. It used to
+            # overwrite the live count with the REQUESTED total under the basis
+            # "floor_if_completed", so a run that the page had been showing real
+            # progress for lost that claim at the moment it succeeded.
+            #
+            # The rule: a counted curve that reconciles against train_seg's own
+            # returned curve is both observed AND checked, so it is reported as
+            # `measured` with the count that was actually observed — which is the
+            # truer number anyway if cellpose ended early. Anything less than
+            # reconciled falls back to the floor, and the reason stays visible in
+            # `epoch_loss_basis` rather than being smuggled into this field.
+            n_epochs_completed=_terminal_completed,
+            n_epochs_completed_basis=_terminal_basis,
             cell_diameters=cell_diameters,
             metrics_requested=metrics_requested,
             train_losses=train_losses,
@@ -279,8 +463,11 @@ def main(session_id: str) -> None:
     except Exception as e:
         stop.set()
         training.write_status(
-            session_id, status="FAILED", message=str(e)[:800],
-            traceback=traceback.format_exc()[-2500:], end_time=time.time(),
+            session_id,
+            status="FAILED",
+            message=str(e)[:800],
+            traceback=traceback.format_exc()[-2500:],
+            end_time=time.time(),
             terminated_by="child",
         )
         raise

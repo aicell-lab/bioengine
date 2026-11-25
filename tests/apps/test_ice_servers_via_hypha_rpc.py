@@ -17,6 +17,7 @@ The fix is to call the same TURN service through ``self.server``
 tests pin the code shape so a future refactor can't silently regress
 back to raw HTTP.
 """
+
 from __future__ import annotations
 
 import inspect

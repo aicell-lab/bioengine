@@ -314,6 +314,69 @@ from bioengine.apps._cache_fs_tasks import (
 _REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
 _REDEPLOY_BACKOFF_MAX_SECONDS = 600.0
 
+# How many consecutive failed redeploys an app gets before the worker stops
+# trying. The backoff above caps the RATE; it never capped the COUNT, so an app
+# that can never come back — a deleted artifact, a GPU that is gone, a manifest
+# the current worker refuses — was redeployed at the 10-minute floor for as long
+# as the worker lived. Each attempt is a real ``serve.run``: it builds a
+# runtime_env, schedules replicas, and on a GPU app holds the reservation while
+# it fails, so "bounded rate, unbounded count" still burns the cluster
+# indefinitely and buries every other line in the log an operator reads.
+#
+# 10 attempts with the schedule above is 2430 s — 40 minutes — of trying before
+# the monitor gives up: the 9 waits between the 10 fires are
+# 10+20+40+80+160+320+600+600+600. ``_retry_startup_applications`` sleeps BEFORE
+# each attempt rather than between them, so its 10 attempts span 3030 s, 50
+# minutes. Both comfortably outlast a Hypha restart, a node drain or an image
+# pull, and are past the point where the difference between "recovering" and
+# "never coming back" has stopped being interesting.
+#
+# Those two figures are computed by ``test_the_cap_is_finite_...`` rather than
+# trusted: an earlier version of this comment said "~85 minutes", which is about
+# double the real number and was arrived at by not adding the terms up.
+#
+# Giving up is NOT silent: it logs once at error level and is
+# reported as ``auto_redeploy_exhausted_at`` on the app's status, because an app
+# that quietly stops being retried is the same invisible failure as an app that
+# was never retried at all.
+_REDEPLOY_MAX_ATTEMPTS = 10
+
+# Grace and backoff for the artifact-manager resolution done at BOOT, which is
+# the only caller that opts into this wait. Every *later* call on a resolved
+# proxy is covered by _ReconnectingArtifactManager, which re-resolves on demand;
+# the boot one had nothing, so a worker starting while Hypha was not serving
+# ``public:artifact-manager`` raised out of startup and died, and the container
+# then crash-looped. A worker already running rode the same outage out untouched.
+#
+# ⚠ This is NOT a property of ``complete_initialization``, which resolves the
+# proxy: that method runs on EVERY reconnect, including the running worker's
+# registration repair in ``_check_service_registration``, whose whole monitoring
+# pass is budgeted at RECONNECT_BUDGET_S. Waiting this long there stalls every
+# later step of the tick, lets the heartbeat go stale so the host census ages the
+# worker out, and pushes ``unreachable_for`` past the condemn threshold on the
+# first repair attempt — making the absorb-silently branch unreachable. Hence the
+# grace is a per-call argument defaulting to 0, and only the boot call site
+# passes it. Measured before that split: a repair whose resolution never
+# succeeded took 304 s inside a 15 s budget.
+#
+# Measured 2026-11-19 on a production Kubernetes deployment, both halves inside
+# one hour: the pod that was already up re-registered unaided once the service
+# returned, while
+# a pod started during the window reached CrashLoopBackOff with restartCount 5
+# on ``KeyError: 'Service not found: public/*:artifact-manager@*'``. So a routine
+# rollout landing in a platform blip was terminal while doing nothing survived it.
+#
+# The grace deliberately equals the worker's registration grace, so "how long a
+# Hypha gap may last before we stop waiting" is one number in this codebase
+# rather than two that can drift apart.
+#
+# This bounds the wait; it does not remove the failure. Past the grace the last
+# error is re-raised, because a worker that waits forever for a service that is
+# never coming back is a worse outcome than one that exits and says why.
+_ARTIFACT_MANAGER_RESOLVE_GRACE_S = 300.0
+_ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S = 2.0
+_ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S = 30.0
+
 # Consecutive monitor ticks an app may be missing from the Serve status report
 # before absence is acted on as a failure. Absence is not a verdict — the report
 # can be momentarily incomplete — but it must still converge: never redeploying
@@ -911,12 +974,8 @@ class AppsManager:
             # hangs with no failure state. The other modes gain nothing from it
             # — one node on single-machine, and no gating on external-cluster.
             # For updates, add back the resources that will be freed
-            used_cpu = max(
-                0, node_resource["used_cpu"] - current_resources["num_cpus"]
-            )
-            used_gpu = max(
-                0, node_resource["used_gpu"] - current_resources["num_gpus"]
-            )
+            used_cpu = max(0, node_resource["used_cpu"] - current_resources["num_cpus"])
+            used_gpu = max(0, node_resource["used_gpu"] - current_resources["num_gpus"])
             used_memory = max(
                 0, node_resource["used_memory"] - current_resources["memory"]
             )
@@ -1234,9 +1293,7 @@ class AppsManager:
         self._deleted_pending_redeploy.discard(application_id)
         self.logger.info(f"Undeployment of application '{application_id}' completed.")
 
-    def _project_replicas(
-        self, replicas: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+    def _project_replicas(self, replicas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Pick the fields the dashboard needs from each ReplicaDetails entry.
 
         Keeps the payload small — `actor_id`, `worker_id`, `log_file_path`
@@ -1362,9 +1419,9 @@ class AppsManager:
                 if isinstance(deployment_logs, dict) and (
                     "_deliberately_stopped_replicas" in deployment_logs
                 ):
-                    deployments_info[deployment_name]["deliberately_stopped_replicas"] = (
-                        deployment_logs["_deliberately_stopped_replicas"]
-                    )
+                    deployments_info[deployment_name][
+                        "deliberately_stopped_replicas"
+                    ] = deployment_logs["_deliberately_stopped_replicas"]
                     deployment_logs = {
                         k: v
                         for k, v in deployment_logs.items()
@@ -1512,10 +1569,8 @@ class AppsManager:
         # id in between hands out an address that does not resolve yet.
         registered = None
         try:
-            registered = (
-                await self.ray_cluster.proxy_actor_handle.get_service_registration.remote(
-                    application_id
-                )
+            registered = await self.ray_cluster.proxy_actor_handle.get_service_registration.remote(
+                application_id
             )
         except Exception as exc:
             self.logger.debug(
@@ -1532,8 +1587,7 @@ class AppsManager:
         # surfaced separately via deployed_by_worker_client_id.
         info = self._deployed_applications.get(application_id, {})
         base_worker_client_id = (
-            info.get("deployed_by_worker_client_id")
-            or self.server.config.client_id
+            info.get("deployed_by_worker_client_id") or self.server.config.client_id
         )
         app_hash = hashlib.sha1(application_id.encode("utf-8")).hexdigest()[:8]
         proxy_client_id = f"{base_worker_client_id}-{app_hash}"
@@ -1761,6 +1815,15 @@ class AppsManager:
             "last_updated_at": application_info["last_updated_at"],
             "last_updated_by": application_info["last_updated_by"],
             "auto_redeploy": application_info["auto_redeploy"],
+            # None while the app is healthy or still being retried; a timestamp
+            # once the worker has STOPPED retrying it after
+            # _REDEPLOY_MAX_ATTEMPTS consecutive failures. A caller cannot infer
+            # this from `status` alone: DEPLOY_FAILED reads the same whether a
+            # redeploy is due in nine minutes or will never come again, and that
+            # ambiguity is what let a dead app sit unnoticed for 19 hours.
+            "auto_redeploy_exhausted_at": application_info.get(
+                "auto_redeploy_exhausted_at"
+            ),
             "deployed_by_worker_client_id": application_info.get(
                 "deployed_by_worker_client_id"
             ),
@@ -1800,10 +1863,8 @@ class AppsManager:
         under-states the remaining life, which errs toward alerting.
         """
         try:
-            reported = (
-                await self.ray_cluster.proxy_actor_handle.get_reported_token_issued_at.remote(
-                    application_id
-                )
+            reported = await self.ray_cluster.proxy_actor_handle.get_reported_token_issued_at.remote(
+                application_id
             )
         except Exception as exc:
             self.logger.debug(
@@ -1813,8 +1874,68 @@ class AppsManager:
             return deployed_at
         return deployed_at if reported is None else reported
 
+    async def _resolve_artifact_manager_proxy(self, *, grace_s: float = 0.0) -> Any:
+        """Resolve ``public/artifact-manager``, tolerating a transient Hypha gap.
+
+        ``grace_s`` defaults to **0**, i.e. one attempt and fail. The grace is opt-in
+        per call because this method is NOT boot-only: ``complete_initialization`` runs
+        on every reconnect, including the running worker's registration repair, and that
+        caller has a 15 s budget for a whole monitoring pass. Waiting 300 s there stalled
+        every later step in the tick, staled the 120 s heartbeat so the host census aged
+        the worker out, and pushed the repair past the condemn threshold on its FIRST
+        attempt. Defaulting to 0 means a caller that has not thought about it gets the
+        fail-fast behaviour rather than the 300 s one.
+
+        Every *later* use of this proxy is covered by
+        ``_ReconnectingArtifactManager``, which re-resolves on demand. This
+        first resolution had no such cover, and the asymmetry decided whether a
+        worker survived a Hypha outage: one already running rode it out, while
+        one that happened to start during the same window raised out of
+        ``complete_initialization`` and left the container crash-looping.
+
+        Retrying here rather than inside ``_re_resolve`` is deliberate. On the
+        running path a caller is already holding a request, and that path's rule
+        — one visible failure instead of an endless outage, with a write never
+        replayed — is load-bearing and tested. At boot there is no caller to
+        report to and nothing to replay: the only choices are to wait or to die.
+
+        The wait is bounded. Past ``_ARTIFACT_MANAGER_RESOLVE_GRACE_S`` the last
+        error is re-raised, so a worker whose platform is genuinely gone still
+        exits and says why instead of hanging forever looking healthy.
+        """
+        deadline = time.time() + grace_s
+        delay = _ARTIFACT_MANAGER_RESOLVE_BACKOFF_INITIAL_S
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self.server.get_service("public/artifact-manager")
+            except Exception as error:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self.logger.error(
+                        f"Could not resolve 'public/artifact-manager' after "
+                        f"{attempt} attempt(s) over "
+                        f"{_ARTIFACT_MANAGER_RESOLVE_GRACE_S:.0f}s: {error}"
+                    )
+                    raise
+                self.logger.warning(
+                    f"Could not resolve 'public/artifact-manager' (attempt "
+                    f"{attempt}, {remaining:.0f}s of grace left): {error}. "
+                    f"Retrying in {min(delay, remaining):.0f}s."
+                )
+                # Never sleep past the deadline: the grace is the budget, and
+                # overshooting it would silently widen the window this bounds.
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(delay * 2, _ARTIFACT_MANAGER_RESOLVE_BACKOFF_MAX_S)
+
     async def complete_initialization(
-        self, server: RemoteService, admin_users: List[str], worker_service_id: str
+        self,
+        server: RemoteService,
+        admin_users: List[str],
+        worker_service_id: str,
+        *,
+        artifact_manager_grace_s: float = 0.0,
     ) -> None:
         """
         Initialize the deployment manager with Hypha server connections and admin permissions.
@@ -1835,10 +1956,20 @@ class AppsManager:
             admin_users: List of user IDs or email addresses with administrative permissions
                         for managing applications and deployments
             worker_service_id: BioEngine worker service ID
+            artifact_manager_grace_s: how long to keep retrying the artifact-manager
+                        resolution before giving up, in seconds. **Defaults to 0 —
+                        one attempt and raise.** Only the worker's boot path opts
+                        into a non-zero grace, because this method also runs on
+                        every reconnect, including the running worker's
+                        registration repair, and that caller's whole monitoring
+                        pass is budgeted at RECONNECT_BUDGET_S. See the comment on
+                        _ARTIFACT_MANAGER_RESOLVE_GRACE_S.
 
         Raises:
-            Exception: If server connection fails, artifact manager is unavailable,
-                      or startup application deployment fails
+            Exception: If server connection fails, the artifact manager is still
+                      unavailable after ``artifact_manager_grace_s``, or startup
+                      application deployment fails. With the default grace of 0
+                      this is immediate; with a grace it can take that long.
         """
         if not server or not isinstance(server, RemoteService):
             raise ValueError("Invalid server connection provided.")
@@ -1854,10 +1985,14 @@ class AppsManager:
         try:
             # Get artifact manager service. Wrapped because the proxy is cached
             # for the process lifetime and the remote service can change client
-            # id without anything restarting.
+            # id without anything restarting. The first resolution is retried
+            # (see _resolve_artifact_manager_proxy) because the wrapper can only
+            # help once it exists.
             self.artifact_manager = _ReconnectingArtifactManager(
                 server=self.server,
-                proxy=await self.server.get_service("public/artifact-manager"),
+                proxy=await self._resolve_artifact_manager_proxy(
+                    grace_s=artifact_manager_grace_s
+                ),
                 logger=self.logger,
             )
             self.logger.info("Successfully connected to artifact manager.")
@@ -1953,8 +2088,7 @@ class AppsManager:
                 missing_keys = sorted(required_keys - set(app_data.keys()))
                 if missing_keys:
                     raise ValueError(
-                        "Missing required app_data keys: "
-                        f"{missing_keys}"
+                        "Missing required app_data keys: " f"{missing_keys}"
                     )
 
                 is_deployed = asyncio.Event()
@@ -2015,9 +2149,7 @@ class AppsManager:
                     "proxy_service_token_ttl_seconds": app_data.get(
                         "proxy_service_token_ttl_seconds"
                     ),
-                    "entry_deployment_name": _entry_deployment_name(
-                        app_data["entry"]
-                    ),
+                    "entry_deployment_name": _entry_deployment_name(app_data["entry"]),
                     # Stays None: an adopted app cannot be rebuilt from here,
                     # which is what _fire_redeploy and
                     # _recover_from_controller_loss both gate on.
@@ -2113,9 +2245,7 @@ class AppsManager:
                 )
 
                 deploy_app_kwargs = {
-                    key: value
-                    for key, value in app_config.items()
-                    if key in valid_keys
+                    key: value for key, value in app_config.items() if key in valid_keys
                 }
                 deploy_app_kwargs["context"] = admin_context
 
@@ -2150,9 +2280,11 @@ class AppsManager:
         """
         pending = list(app_configs)
         delay = _REDEPLOY_BACKOFF_INITIAL_SECONDS
-        while pending:
+        attempts = 0
+        while pending and attempts < _REDEPLOY_MAX_ATTEMPTS:
             await asyncio.sleep(delay)
             delay = min(delay * 2, _REDEPLOY_BACKOFF_MAX_SECONDS)
+            attempts += 1
 
             still_pending = []
             for app_config in pending:
@@ -2168,6 +2300,17 @@ class AppsManager:
                     )
                     still_pending.append(app_config)
             pending = still_pending
+
+        if pending:
+            # Same rule as monitor_applications: bounded attempts, and the
+            # give-up is announced. Without this the loop retried a startup
+            # application that can never deploy for the worker's whole life.
+            self.logger.error(
+                f"Giving up on {len(pending)} startup application(s) after "
+                f"{_REDEPLOY_MAX_ATTEMPTS} failed attempts: "
+                f"{', '.join(c['artifact_id'] for c in pending)}. They will NOT be "
+                f"retried again; deploy them explicitly once the cause is fixed."
+            )
 
     def cancel_startup_retry(self) -> None:
         """Stop retrying startup applications that failed to deploy."""
@@ -2258,8 +2401,15 @@ class AppsManager:
           unless the current time has passed the per-app deadline; when it has,
           fire the redeploy and double the backoff (capped at
           ``_REDEPLOY_BACKOFF_MAX_SECONDS``).
+        - After ``_REDEPLOY_MAX_ATTEMPTS`` consecutive failures the app is given
+          up on: no further redeploy is fired, one error-level line says so, and
+          ``auto_redeploy_exhausted_at`` appears on its status. The backoff caps
+          how OFTEN a redeploy fires and never capped HOW MANY, so without this
+          an app that can never come back was redeployed for the worker's whole
+          life.
         - The moment the app is observed healthy again, the per-app backoff
-          state is dropped — the next failure restarts from the initial delay.
+          state is dropped — the next failure restarts from the initial delay,
+          and a given-up app is eligible again if something else revives it.
 
         A worker with no opted-in app does not take that path, but still probes
         for a lost Serve controller and reports one; detection is what every
@@ -2290,14 +2440,22 @@ class AppsManager:
             if app_info["auto_redeploy"]
         ]
         if not apps_to_redeploy:
-            # Noticing is not redeploying. auto_redeploy defaults to False, so
-            # a worker tracking only opted-out apps used to return here and
-            # never read Serve's state at all, which made controller loss
-            # undetectable for it rather than merely unactioned. The actor
-            # lookup is the question being asked and costs a fraction of the
-            # serve.status RPC the path below makes, so detection is reported
+            # Noticing is not redeploying. A worker tracking only opted-out apps
+            # used to return here and never read Serve's state at all, which made
+            # controller loss undetectable for it rather than merely unactioned.
+            # The actor lookup is the question being asked and costs a fraction of
+            # the serve.status RPC the path below makes, so detection is reported
             # on it alone. No recovery sweep follows — an app that asked not to
             # be redeployed still is not.
+            #
+            # Since auto_redeploy became True for a new application, reaching here
+            # means every tracked app opted out EXPLICITLY, or was deployed before
+            # that default changed, or was adopted carrying False. It is now the
+            # rare path rather than the common one — but not a dead one, which is
+            # why the detection stays. Adoption is unaffected either way: it
+            # requires `auto_redeploy` in app_data (see the required_keys check in
+            # the recovery path), so an adopted app carries whatever it was
+            # deployed with and never picks up this default.
             #
             # The cooldown gates the probe, not just the line: the lookup runs
             # in a thread that outlives its own timeout, so asking once per
@@ -2392,6 +2550,11 @@ class AppsManager:
                         f"Application '{application_id}' recovered; "
                         f"auto-redeploy backoff cleared."
                     )
+                # Clear the give-up too. Without this an app that was abandoned
+                # and later revived by any other route keeps reporting
+                # auto_redeploy_exhausted_at forever, i.e. a healthy app reads
+                # as permanently dead.
+                application_info.pop("auto_redeploy_exhausted_at", None)
                 # RUNNING is not proof the new code is live: Ray Serve can reuse
                 # a replica of ANY deployment (not just the entry) after a
                 # version bump, serving stale in-memory code. If any live replica
@@ -2494,15 +2657,76 @@ class AppsManager:
                 # transition to settle before deciding to retry.
                 continue
 
+            # A retry budget belongs to ONE deploy. `deploy_app` bumps
+            # `last_updated_at` every time it (re)deploys an application_id, so a
+            # budget recorded against an older value is from a deploy that is no
+            # longer running and must not be charged to this one. Keying on the
+            # deploy rather than relying on `deploy_app` to remember to clear the
+            # dict is what makes this hold for every route that replaces a
+            # tracking entry — explicit redeploy, startup retry, adoption after a
+            # worker restart — rather than only the one that was remembered.
+            if backoff_state is not None and backoff_state.get("for_deploy") != (
+                application_info.get("last_updated_at")
+            ):
+                self._redeploy_backoff.pop(application_id, None)
+                backoff_state = None
+
             if backoff_state is None:
                 # First failure observation — fire immediately, seed backoff.
-                self._fire_redeploy(
+                fired = self._fire_redeploy(
                     application_id, application_info, attempt=1, reason=reason
                 )
                 self._redeploy_backoff[application_id] = {
                     "consecutive_failures": 1,
+                    # How many of the counted attempts never actually ran. An
+                    # app recovered from a previous worker carries no built
+                    # application, so its "attempt" is a skip — and a give-up
+                    # that called 10 skips "10 auto-redeploys all failed" was
+                    # saying something untrue of that case.
+                    "skipped": 0 if fired else 1,
                     "next_attempt_at": now + _REDEPLOY_BACKOFF_INITIAL_SECONDS,
+                    # Which deploy this budget belongs to. See the staleness
+                    # check immediately above.
+                    "for_deploy": application_info.get("last_updated_at"),
                 }
+                continue
+
+            # Give up after a bounded number of attempts. The deadline check
+            # below would otherwise let this app be redeployed forever: the
+            # backoff caps how OFTEN, never HOW MANY TIMES.
+            if backoff_state["consecutive_failures"] >= _REDEPLOY_MAX_ATTEMPTS:
+                if application_info.get("auto_redeploy_exhausted_at") is None:
+                    # Recorded on the app's own state, not on the backoff dict,
+                    # so _get_app_status reads only what it already reads. The
+                    # first version of this put it on _redeploy_backoff and the
+                    # status builder reached across for it, which broke 49 tests
+                    # that build an AppsManager with just the attributes the code
+                    # under test needs — a status surface should not depend on
+                    # the monitor's private bookkeeping existing.
+                    application_info["auto_redeploy_exhausted_at"] = now
+                    skipped = backoff_state.get("skipped", 0)
+                    if skipped >= _REDEPLOY_MAX_ATTEMPTS:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive attempts could "
+                            f"not run at all — this application was recovered from "
+                            f"a previous worker and carries no built application"
+                        )
+                    elif skipped:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive attempts failed "
+                            f"({skipped} of them could not run)"
+                        )
+                    else:
+                        what = (
+                            f"{_REDEPLOY_MAX_ATTEMPTS} consecutive auto-redeploys "
+                            f"all failed"
+                        )
+                    self.logger.error(
+                        f"Giving up on application '{application_id}': {what} "
+                        f"({reason}). It will NOT be retried again and is left in "
+                        f"its failed state; redeploy it explicitly once the cause "
+                        f"is fixed."
+                    )
                 continue
 
             # Subsequent failure — honour the per-app deadline.
@@ -2510,9 +2734,11 @@ class AppsManager:
                 continue
 
             attempt = backoff_state["consecutive_failures"] + 1
-            self._fire_redeploy(
+            fired = self._fire_redeploy(
                 application_id, application_info, attempt=attempt, reason=reason
             )
+            if not fired:
+                backoff_state["skipped"] = backoff_state.get("skipped", 0) + 1
             delay = min(
                 _REDEPLOY_BACKOFF_MAX_SECONDS,
                 _REDEPLOY_BACKOFF_INITIAL_SECONDS * (2 ** (attempt - 1)),
@@ -2520,9 +2746,7 @@ class AppsManager:
             backoff_state["consecutive_failures"] = attempt
             backoff_state["next_attempt_at"] = now + delay
 
-    async def _recover_from_controller_loss(
-        self, application_ids: List[str]
-    ) -> bool:
+    async def _recover_from_controller_loss(self, application_ids: List[str]) -> bool:
         """Re-establish Ray Serve in-place after the controller was lost.
 
         A Ray head restart destroys the Serve controller; ``reconnect`` has
@@ -2570,8 +2794,15 @@ class AppsManager:
         application_info: Dict[str, Any],
         attempt: int,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Schedule a redeploy task, logging what triggered it.
+
+        Returns True when a redeploy was actually started, False when the attempt
+        was counted against the cap but nothing ran — an application recovered
+        from a previous worker carries no built application, so there is nothing
+        to resubmit. The caller tallies the Falses so the give-up line can say
+        that attempts "could not run" rather than that redeploys "failed".
+
 
         ``reason`` is what makes an incident readable afterwards: an explicit
         UNHEALTHY verdict and a missing status entry are different failures and
@@ -2589,7 +2820,9 @@ class AppsManager:
                 f"application; skipping auto-redeploy (attempt #{attempt}). "
                 f"Redeploy it explicitly to bring it back under this worker."
             )
-            return
+            # False: the attempt was COUNTED against the cap but nothing ran, so
+            # the give-up line must not claim that redeploys "failed".
+            return False
         self.logger.warning(
             f"Application '{application_id}' for artifact "
             f"'{application_info['artifact_id']}' is unhealthy ({reason}); "
@@ -2600,6 +2833,7 @@ class AppsManager:
             name=f"Deploy_{application_id}",
         )
         application_info["deployment_task"] = deployment_task
+        return True
 
     @schema_method
     async def upload_app(
@@ -2681,7 +2915,9 @@ class AppsManager:
             remote_server = await connect_to_server(
                 {"server_url": server_url, "token": hypha_token, "workspace": workspace}
             )
-            artifact_manager = await remote_server.get_service("public/artifact-manager")
+            artifact_manager = await remote_server.get_service(
+                "public/artifact-manager"
+            )
             target_workspace = workspace
 
         try:
@@ -2739,9 +2975,7 @@ class AppsManager:
 
             if len(alive_node_ids) <= 1:
                 self._fs_topology_mode = "shared"
-                self.logger.info(
-                    f"FS topology: single Ray node ⇒ shared (trivially)."
-                )
+                self.logger.info(f"FS topology: single Ray node ⇒ shared (trivially).")
                 return self._fs_topology_mode
 
             marker_name = f".bioengine_fs_probe_{uuid.uuid4().hex}.txt"
@@ -2751,10 +2985,10 @@ class AppsManager:
                 return NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
 
             try:
-                write_ref = ray.remote(num_cpus=0)(
-                    _fs_probe_write
-                ).options(scheduling_strategy=_affinity(alive_node_ids[0])).remote(
-                    apps_workdir, marker_name, marker_content
+                write_ref = (
+                    ray.remote(num_cpus=0)(_fs_probe_write)
+                    .options(scheduling_strategy=_affinity(alive_node_ids[0]))
+                    .remote(apps_workdir, marker_name, marker_content)
                 )
                 await asyncio.to_thread(ray.get, write_ref)
 
@@ -3356,7 +3590,7 @@ class AppsManager:
         ),
         auto_redeploy: bool = Field(
             None,
-            description="If set to true, the worker's monitoring loop fires a fresh deploy_app whenever Ray Serve reports this application as DEPLOY_FAILED, UNHEALTHY, or missing. Subsequent failures back off exponentially per-app (10s, 20s, 40s, … capped at 10 min) so a persistently broken app does not retry-storm; the backoff clears the moment the app is observed healthy again. If not specified, uses False for a new application, or preserves the previous setting if updating an existing application (only when application_id is specified).",
+            description="If set to true, the worker's monitoring loop fires a fresh deploy_app whenever Ray Serve reports this application as DEPLOY_FAILED, UNHEALTHY, or missing. Subsequent failures back off exponentially per-app (10s, 20s, 40s, … capped at 10 min) so a persistently broken app does not retry-storm; the backoff clears the moment the app is observed healthy again. If not specified, uses True for a new application (including --startup-applications entries), or preserves the previous setting if updating an existing application (only when application_id is specified). Pass false explicitly to opt out. Attempts are bounded: after repeated consecutive failures the worker gives up and reports auto_redeploy_exhausted_at rather than retrying forever.",
         ),
         debug: bool = Field(
             None,
@@ -3364,12 +3598,16 @@ class AppsManager:
         ),
         ice_servers: Optional[List[Dict[str, Any]]] = Field(
             None,
-            description="Custom ICE server configurations for WebRTC connections. If provided, these are used instead of fetching from the default Hypha TURN server endpoint. Each entry should have a 'urls' key and optionally 'username' and 'credential' for TURN servers. Example: [{\"urls\": \"stun:stun.example.com:19302\"}, {\"urls\": \"turn:turn.example.com:3478\", \"username\": \"user\", \"credential\": \"pass\"}]. If not specified, ICE servers are fetched automatically.",
+            description='Custom ICE server configurations for WebRTC connections. If provided, these are used instead of fetching from the default Hypha TURN server endpoint. Each entry should have a \'urls\' key and optionally \'username\' and \'credential\' for TURN servers. Example: [{"urls": "stun:stun.example.com:19302"}, {"urls": "turn:turn.example.com:3478", "username": "user", "credential": "pass"}]. If not specified, ICE servers are fetched automatically.',
             examples=[
                 [{"urls": "stun:stun.example.com:19302"}],
                 [
                     {"urls": "stun:stun.example.com:19302"},
-                    {"urls": "turn:turn.example.com:3478", "username": "user", "credential": "pass"},
+                    {
+                        "urls": "turn:turn.example.com:3478",
+                        "username": "user",
+                        "credential": "pass",
+                    },
                 ],
             ],
         ),
@@ -3387,7 +3625,16 @@ class AppsManager:
             description="Per-user-deployment scaling map keyed by the @bioengine.app class name (as shown under 'deployments' in get_app_status). Each entry is {'num_replicas': int} or {'autoscaling_config': {'min_replicas': int, 'max_replicas': int, ...}} — the two are mutually exclusive per Ray Serve. A class absent from the map gets no override at all: it keeps whatever num_replicas or autoscaling_config its own @bioengine.app decorator declared, and runs at one fixed replica only if the decorator declares neither — so omitting an entry does NOT pin a class that autoscales itself. The ProxyDeployment is always one replica and not addressable. On update (matching application_id) the full map replaces the previous one — pass the previous value back unmodified for any deployment you don't want to change. If not specified: empty map for a new app, preserved from the previous deploy when updating.",
             examples=[
                 {"DemoApp": {"num_replicas": 3}},
-                {"EntryDeployment": {"autoscaling_config": {"min_replicas": 1, "max_replicas": 8, "target_ongoing_requests": 4}}, "RuntimeDeployment": {"num_replicas": 1}},
+                {
+                    "EntryDeployment": {
+                        "autoscaling_config": {
+                            "min_replicas": 1,
+                            "max_replicas": 8,
+                            "target_ongoing_requests": 4,
+                        }
+                    },
+                    "RuntimeDeployment": {"num_replicas": 1},
+                },
             ],
         ),
         context: Dict[str, Any] = Field(
@@ -3579,7 +3826,25 @@ class AppsManager:
                 if proxy_memory_in_gb is None:
                     proxy_memory_in_gb = 0.5
                 if auto_redeploy is None:
-                    auto_redeploy = False
+                    # TRUE by default. A sub-minute Hypha outage permanently kills
+                    # a replica that is still STARTING, while one already RUNNING
+                    # rides it out — so the app that dies is the one nobody is
+                    # watching yet, and it stays dead until a human notices.
+                    # Observed in production as a 19-hour outage of exactly that
+                    # shape: a replica died during a brief platform gap and
+                    # nothing brought it back.
+                    #
+                    # Defaulting this on used to mean trading a dead app for
+                    # indefinite retries. It no longer does: attempts are bounded
+                    # to _REDEPLOY_MAX_ATTEMPTS consecutive failures, after which
+                    # the worker gives up, logs it, and reports
+                    # auto_redeploy_exhausted_at on the app's status. This default
+                    # MUST NOT land without that bound.
+                    #
+                    # An explicit auto_redeploy=False still opts out, and an UPDATE
+                    # that omits the argument still preserves whatever the running
+                    # instance had — handled above, not here.
+                    auto_redeploy = True
                 if debug is None:
                     debug = False
                 # ice_servers defaults to None (fetch from URL)
@@ -3677,8 +3942,7 @@ class AppsManager:
             # introspect task discovered. The ProxyDeployment is intentionally
             # not in the spec — it always runs as a single replica.
             user_deployment_names = sorted(
-                meta["qualname"].split(".")[-1]
-                for meta in app.spec["classes"].values()
+                meta["qualname"].split(".")[-1] for meta in app.spec["classes"].values()
             )
             _validate_scaling_map(scaling, user_deployment_names, application_id)
 
@@ -3967,7 +4231,8 @@ class AppsManager:
 
         # Wait for all undeployment tasks to complete
         undeployment_tasks = [
-            undeploy_and_track(application_id) for application_id in deployed_application_ids
+            undeploy_and_track(application_id)
+            for application_id in deployed_application_ids
         ]
         results = await asyncio.gather(*undeployment_tasks)
 
@@ -3982,7 +4247,7 @@ class AppsManager:
         self,
         application_ids: Optional[List[str]] = Field(
             None,
-            description="List of application IDs to retrieve status for. If not provided, status for all deployed applications will be returned. If a list with only one application ID is provided, only that application's status is returned directly (not nested in a dictionary).",
+            description="List of application IDs to retrieve status for. If not provided, status for all deployed applications will be returned. The result is always a dictionary keyed by application id, including when exactly one id is requested, so a caller never has to branch on how many it asked for.",
         ),
         logs_tail: int = Field(
             30,
@@ -4039,15 +4304,112 @@ class AppsManager:
         Args:
             application_ids: Optional list of specific application IDs to query.
                            If None, returns status for all tracked applications.
-                           If a list with exactly one application ID, returns only
-                           that application's status directly (not wrapped in a dictionary).
 
         Returns:
-            - If application_ids is None or contains multiple IDs: Dictionary mapping
-              application IDs to their detailed status information.
-            - If application_ids contains exactly one ID: The status information for
-              that single application (not nested in a dictionary).
-            - Empty dictionary if no applications match the criteria (when application_ids is None).
+            Always a dictionary KEYED BY application id, whatever the query — including a
+            query naming exactly one application. Empty when application_ids is None and
+            nothing is deployed.
+
+            The shape does not special-case a single id, so a caller never has to branch on
+            how many it asked for:
+
+                status = await get_app_status(application_ids=["app1"])
+                app = status["app1"]
+
+            Each value has the fields built by ``_get_app_status``. Two of them are nested
+            deeper than the rest and are easy to mis-read:
+
+            ``deployments`` maps the user's ``@bioengine.app`` class name to that
+            deployment's state. Its ``logs`` key is keyed again, mostly by replica id — but
+            NOT every entry is a replica record, and the records do not all carry the same
+            keys. Handle four shapes:
+
+                logs[<replica_id>] = {                    # a live replica
+                    "stdout": list[str], "stderr": list[str],
+                    "creation_timestamp": <epoch float>,  # ONLY when known
+                    "timezone": <tz name, e.g. "CET">,    # ONLY when known
+                }
+                logs[<replica_id>] = {                    # abnormally dead; the DEFAULT
+                    "stdout": [], "stderr": [],           # n_previous_replica=0 shape
+                    "death_cause": ..., "logs_omitted": True,
+                }                                         # no timezone, no timestamp
+                logs["error"] = "<message>"               # retrieval failed: a STRING value
+
+            So a loop over ``logs.items()`` must not assume the value is a record — the
+            ``error`` entry's value is a string — and a record must not be assumed to carry
+            ``timezone``: it is added only when the replica's zone is known, which excludes
+            the error entry and every abnormally dead replica on default arguments. Treating
+            an absent ``timezone`` as UTC is a guess, not a default.
+
+            Two fields live BESIDE ``logs`` rather than inside it, and both are easy to miss.
+            **Both are present only sometimes**, so read them with ``.get`` — indexing either
+            raises on a perfectly healthy deployment. And for the count, **absent never simply
+            means "none"**:
+
+            ``deliberately_stopped_replicas`` is a SUMMARY produced only on the default
+            ``n_previous_replica=0`` path, and only when the death-cause lookup succeeded. So it
+            is absent — while replicas really were stopped deliberately — whenever
+
+              * ``n_previous_replica != 0`` (including a per-deployment override in
+                ``deployment_logs``, which this method's own example uses). On that path the
+                stopped replicas appear as ``logs`` entries carrying ``death_cause`` with
+                reason ``RAY_KILL``, and no count is emitted at all — **but the page is the
+                ``n_previous_replica`` most recently REGISTERED dead replicas, of ANY cause**,
+                and all of them only at ``-1``. Two things follow. Counting ``RAY_KILL``
+                entries does NOT recover the number stopped: a deployment scaled down thirty
+                times, queried with ``n_previous_replica=3``, shows three such entries and no
+                count — the bound is a page size, not a total. And abnormal deaths take up
+                room in that same page, so with ``n_previous_replica=3`` and two recent
+                crashes a single ``RAY_KILL`` entry can be all that is left of thirty stops.
+                "Most recently registered" is also not "most recently dead": Ray's
+                ``ActorState`` carries no death timestamp, so death order is not knowable
+                here at all; or
+              * the death-cause lookup failed, which ``death_causes_unavailable`` marks.
+
+            So read an absent count as **"none, or not counted on this query"**. A caller that
+            reads it as "none stopped" will report a deployment that was scaled down thirty times
+            as having been scaled down never — which is the same mistake as reading an absent
+            ``timezone`` as UTC.
+
+            The two fields themselves, for reference — ``deliberately_stopped_replicas`` as
+            described above, and ``death_causes_unavailable`` set only when the cause lookup
+            FAILED:
+
+                deployments[<class_name>].deliberately_stopped_replicas = <int>
+                deployments[<class_name>].death_causes_unavailable = True
+
+            The first is lifted out of the logs map before this method returns, precisely so a
+            caller iterating ``logs`` never meets an int where it expects a record — the proxy's
+            own ``get_deployment_logs`` does still carry it under
+            ``_deliberately_stopped_replicas``, so a caller of THAT must handle it. The second
+            exists so "no deaths shown" cannot be read as "nothing died": an empty answer and an
+            unanswered question are different, and only this key distinguishes them.
+
+            Be precise about WHAT is missing when it is set, because the plausible reading is the
+            wrong one. On the default path the lookup failure returns **before** anything is
+            counted or listed, so the dead replicas are **absent from** ``logs`` **altogether** —
+            they are not present-but-unexplained. A reader who takes the flag to mean "shown
+            without a reason" goes looking for entries that were never emitted, and concludes the
+            deployment had no dead replicas.
+
+            **AND NONE OF THE THREE REACHES AN UNAUTHORIZED CALLER AT ALL.** For a caller outside
+            the application's roster, ``public_app_status`` keeps only
+            ``PUBLIC_DEPLOYMENT_FIELDS`` — ``status``, ``message``, ``replica_states``,
+            ``replicas``, ``max_ongoing_requests`` — so ``logs``,
+            ``deliberately_stopped_replicas`` and ``death_causes_unavailable`` are **absent**.
+            There their absence means WITHHELD: not "zero", not "no deaths", not "nothing to
+            show". A client that cannot tell those apart reports a healthy application as having
+            no logs and no stopped replicas when it simply was not entitled to see them. Check
+            whether you are an admin or named in ``authorized_users`` before reading an absence
+            as a value.
+
+            When ``timezone`` IS present it names the zone of the timestamps INSIDE the
+            ``stdout``/``stderr`` text — the replica's local zone, not necessarily UTC.
+            Comparing those against a UTC clock without applying it shifts every line by the
+            offset; which way depends on the offset's sign, and for a zone ahead of UTC the
+            lines land in the future, so an "age" computed from them can come out negative.
+            ``creation_timestamp``, when present, is a plain epoch value and is the field to
+            prefer for arithmetic.
 
         Raises:
             RuntimeError: If Ray cluster connection is unavailable
@@ -4066,9 +4428,25 @@ class AppsManager:
             apps = await get_app_status(application_ids=["app1", "app2"])
             # Returns: {"app1": {...}, "app2": {...}}
 
-            # Get single application (returns status directly)
-            app = await get_app_status(application_ids=["app1"])
-            # Returns: {...} (single app status, not {"app1": {...}})
+            # Get a single application — STILL keyed by its id, not unwrapped
+            status = await get_app_status(application_ids=["app1"])
+            # Returns: {"app1": {...}}
+            app = status["app1"]
+
+            # Replica logs are two levels below the deployment. Not every entry is a
+            # record, and a record need not carry a zone — so check both.
+            logs = app["deployments"]["MyApp"]["logs"]
+            if isinstance(logs.get("error"), str):
+                ...                                   # retrieval failed; no replicas here
+            for replica_id, rec in logs.items():
+                if not isinstance(rec, dict):
+                    continue                          # the "error" entry's value is a string
+                lines = rec.get("stdout", []) + rec.get("stderr", [])
+                zone = rec.get("timezone")            # may be absent; do NOT assume UTC
+
+            # the counts are SIBLINGS of logs, not entries in it
+            dep = app["deployments"]["MyApp"]
+            dep.get("deliberately_stopped_replicas"), dep.get("death_causes_unavailable")
         """
         _validate_deployment_logs_map(deployment_logs)
 

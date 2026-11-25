@@ -117,9 +117,7 @@ def method(
         properties = dict(params_schema.get("properties") or {})
         properties.pop("context", None)
         params_schema["properties"] = properties
-        required = [
-            r for r in (params_schema.get("required") or []) if r != "context"
-        ]
+        required = [r for r in (params_schema.get("required") or []) if r != "context"]
         if required:
             params_schema["required"] = required
         else:
@@ -437,9 +435,7 @@ def _scan_class(cls: type) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
             # decide whether to inject the Hypha caller context on each
             # call. The flag survives JSON serialisation via _sanitise_schemas.
             entry = dict(member.__schema__)
-            entry["wants_context"] = bool(
-                getattr(member, _WANTS_CONTEXT_ATTR, False)
-            )
+            entry["wants_context"] = bool(getattr(member, _WANTS_CONTEXT_ATTR, False))
             method_schemas.append(entry)
         elif kind in lifecycle:
             if lifecycle[kind] is not None:
@@ -502,7 +498,9 @@ def _resolve_app_user_class(annotation: Any) -> Optional[type]:
     inner = getattr(annotation, "func_or_class", None)
     if inner is not None and getattr(inner, "_bioengine_app_marker", False):
         return inner
-    if inspect.isclass(annotation) and getattr(annotation, "_bioengine_app_marker", False):
+    if inspect.isclass(annotation) and getattr(
+        annotation, "_bioengine_app_marker", False
+    ):
         return annotation
     return None
 
@@ -549,11 +547,7 @@ def _build_ray_actor_options(
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
     merged = dict(base)
     for key, value in overlay.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
             merged[key] = _deep_merge(merged[key], value)
         else:
             merged[key] = value

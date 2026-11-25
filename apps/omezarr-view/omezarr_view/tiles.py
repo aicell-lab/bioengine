@@ -8,6 +8,7 @@ So this renders PNG tiles on demand from the same lazy view. It is a second
 consumer of the same bytes, not a second copy of them: a tile request pulls
 exactly the source chunks it overlaps and nothing is stored.
 """
+
 from __future__ import annotations
 
 import io
@@ -27,7 +28,7 @@ def _hex_rgb(value: str) -> Tuple[float, float, float]:
     value = (value or "FFFFFF").lstrip("#")
     if len(value) != 6:
         value = "FFFFFF"
-    return tuple(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore
+    return tuple(int(value[i : i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore
 
 
 class TileRenderer:
@@ -39,8 +40,7 @@ class TileRenderer:
         from .recipes import _ViewStore
 
         self.view = view
-        self._group = zarr.open_group(
-            zarr.storage.KVStore(_ViewStore(view)), mode="r")
+        self._group = zarr.open_group(zarr.storage.KVStore(_ViewStore(view)), mode="r")
         self._arrays: Dict[int, Any] = {}
         self._png: "OrderedDict[str, bytes]" = OrderedDict()
         self._max = cache_tiles
@@ -65,15 +65,17 @@ class TileRenderer:
         levels = []
         for lvl in range(len(self.level_shapes) - 1, -1, -1):
             shape = self.level_shapes[lvl]
-            levels.append({
-                "zoom": len(levels),
-                "view_level": lvl,
-                "width": shape[xi],
-                "height": shape[yi],
-                "resolution": base_x / shape[xi],
-                "tiles_x": -(-shape[xi] // TILE),
-                "tiles_y": -(-shape[yi] // TILE),
-            })
+            levels.append(
+                {
+                    "zoom": len(levels),
+                    "view_level": lvl,
+                    "width": shape[xi],
+                    "height": shape[yi],
+                    "resolution": base_x / shape[xi],
+                    "tiles_x": -(-shape[xi] // TILE),
+                    "tiles_y": -(-shape[yi] // TILE),
+                }
+            )
         sizes = self.view.mapping.mapped.get("physical_pixel_sizes") or {}
         return {
             "width": base_x,
@@ -83,15 +85,23 @@ class TileRenderer:
             "resolutions": [lv["resolution"] for lv in levels],
             "axes": self.axes.upper(),
             "index_axes": [a for a in self.axes if a not in "yxc"],
-            "index_sizes": {a: self.level_shapes[0][i]
-                            for i, a in enumerate(self.axes) if a not in "yxc"},
+            "index_sizes": {
+                a: self.level_shapes[0][i]
+                for i, a in enumerate(self.axes)
+                if a not in "yxc"
+            },
             "channels": [
-                {"label": c.get("label"), "color": c.get("color"),
-                 "window": c.get("window"), "active": c.get("active")}
-                for c in self.channels],
+                {
+                    "label": c.get("label"),
+                    "color": c.get("color"),
+                    "window": c.get("window"),
+                    "active": c.get("active"),
+                }
+                for c in self.channels
+            ],
             "physical_pixel_sizes": sizes,
             "note": "tiles are rendered on demand from the lazy view; nothing "
-                    "is pre-rendered or stored",
+            "is pre-rendered or stored",
         }
 
     # -- rendering --------------------------------------------------------
@@ -101,8 +111,16 @@ class TileRenderer:
             self._arrays[level] = self._group[str(level)]
         return self._arrays[level]
 
-    def _plane_region(self, level: int, channel: int, indices: Dict[str, int],
-                      y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+    def _plane_region(
+        self,
+        level: int,
+        channel: int,
+        indices: Dict[str, int],
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+    ) -> np.ndarray:
         sel: List[Any] = []
         for i, a in enumerate(self.axes):
             if i == len(self.axes) - 2:
@@ -115,8 +133,14 @@ class TileRenderer:
                 sel.append(int(indices.get(a, 0)))
         return np.asarray(self._array(level)[tuple(sel)], dtype=np.float32)
 
-    def render(self, zoom: int, tx: int, ty: int, indices: Dict[str, int],
-               channels: Optional[Sequence[int]] = None) -> Optional[bytes]:
+    def render(
+        self,
+        zoom: int,
+        tx: int,
+        ty: int,
+        indices: Dict[str, int],
+        channels: Optional[Sequence[int]] = None,
+    ) -> Optional[bytes]:
         grid = self.grid()
         if not 0 <= zoom < len(grid["levels"]):
             return None
@@ -138,8 +162,11 @@ class TileRenderer:
         y1, x1 = min(y0 + TILE, shape[yi]), min(x0 + TILE, shape[xi])
 
         n_c = shape[self.axes.index("c")] if "c" in self.axes else 1
-        wanted = list(channels) if channels else [
-            i for i, c in enumerate(self.channels) if c.get("active")] or [0]
+        wanted = (
+            list(channels)
+            if channels
+            else [i for i, c in enumerate(self.channels) if c.get("active")] or [0]
+        )
         wanted = [c for c in wanted if 0 <= c < n_c] or [0]
 
         rgb = np.zeros((y1 - y0, x1 - x0, 3), dtype=np.float32)
@@ -152,8 +179,7 @@ class TileRenderer:
             if hi <= lo:
                 lo, hi = float(plane.min()), float(plane.max() or 1.0)
             norm = np.clip((plane - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-            colour = _hex_rgb(spec.get("color") or
-                              _FALLBACK[ci % len(_FALLBACK)])
+            colour = _hex_rgb(spec.get("color") or _FALLBACK[ci % len(_FALLBACK)])
             for k in range(3):
                 rgb[..., k] += norm * colour[k]
 

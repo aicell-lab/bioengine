@@ -37,6 +37,14 @@ import pytest
 
 import training
 
+# A session id must match the shape the server itself generates
+# (YYYY-MM-DD-HHMMSS-xxxxxxxx). `training.session_dir` refuses anything else --
+# a caller-supplied id was previously used as a directory name unchecked, which
+# let `../x` and absolute paths write outside the sessions root. So a descriptive
+# id like "s-stale" can no longer be a directory name; these constants keep the
+# tests readable while using ids the app accepts.
+S_CANCELLED = "2026-11-25-120005-00000005"
+
 
 @pytest.fixture(autouse=True)
 def _sandbox_home(monkeypatch, tmp_path):
@@ -76,9 +84,13 @@ async def test_get_export_status_answers_after_the_replica_is_gone() -> None:
     would be.
     """
     training.write_export(
-        "e-ready", status="READY", progress=1.0,
-        message="ready", download_url="https://example.invalid/pkg.zip",
-        size_bytes=123, error=None,
+        "e-ready",
+        status="READY",
+        progress=1.0,
+        message="ready",
+        download_url="https://example.invalid/pkg.zip",
+        size_bytes=123,
+        error=None,
     )
 
     class _FreshReplica:
@@ -97,6 +109,7 @@ async def test_an_unknown_export_id_still_raises_keyerror() -> None:
     If ``get_export_status`` returned something for every id, the previous test
     would pass against a store that was not storing anything.
     """
+
     class _FreshReplica:
         pass
 
@@ -112,8 +125,10 @@ async def test_push_export_recovers_the_package_dir_after_a_restart(tmp_path) ->
     pkg.mkdir()
     (pkg / "weights.pt").write_bytes(b"x" * 16)
     training.write_export(
-        "e-push", status="READY",
-        _package_dir=str(pkg), files=[{"name": "weights.pt", "size": 16}],
+        "e-push",
+        status="READY",
+        _package_dir=str(pkg),
+        files=[{"name": "weights.pt", "size": 16}],
     )
 
     pushed_to = []
@@ -148,7 +163,9 @@ async def test_the_private_package_dir_is_not_leaked_to_the_caller() -> None:
     ``get_export_status``, and so stayed green when the filter was deleted.
     """
     training.write_export(
-        "e-private", status="READY", _package_dir="/srv/secret",
+        "e-private",
+        status="READY",
+        _package_dir="/srv/secret",
         files=[{"name": "weights.pt", "size": 16}],
     )
 
@@ -198,7 +215,9 @@ async def test_the_export_heartbeat_keeps_a_live_build_alive() -> None:
     training.write_export("e-live", status="BUILDING")
     _backdate_export("e-live", training.STATUS_STALE_SECONDS + 60)
 
-    beat = asyncio.create_task(_method_of("_export_heartbeat", object())("e-live", interval=0.05))
+    beat = asyncio.create_task(
+        _method_of("_export_heartbeat", object())("e-live", interval=0.05)
+    )
     await asyncio.sleep(0.25)
     status_while_beating = training.get_export("e-live")["status"]
     beat.cancel()
@@ -225,7 +244,7 @@ async def _cancel_during_prepare(stop_requested_first: bool) -> str:
     """Drive the real ``_run_training`` to its ``CancelledError`` handler."""
     import entry
 
-    session_id = "s-cancelled"
+    session_id = S_CANCELLED
     training.write_status(session_id, status="TRAINING", message="in flight")
     if stop_requested_first:
         training.request_stop(session_id)

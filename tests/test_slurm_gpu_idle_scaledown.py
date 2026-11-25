@@ -75,9 +75,7 @@ async def _sample(monkeypatch, result, timeout=None):
     fake_ray = _FakeRay(result)
     monkeypatch.setattr(slurm_workers_module, "ray", fake_ray)
     if timeout is not None:
-        monkeypatch.setattr(
-            slurm_workers_module, "GPU_PROBE_TIMEOUT_SECONDS", timeout
-        )
+        monkeypatch.setattr(slurm_workers_module, "GPU_PROBE_TIMEOUT_SECONDS", timeout)
     worker = SimpleNamespace(logger=logger)
     is_busy = await SlurmWorkers._sample_gpu_is_busy(worker, "12345")
     return is_busy, fake_ray

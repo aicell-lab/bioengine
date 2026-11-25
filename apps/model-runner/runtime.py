@@ -17,7 +17,6 @@ by the ``@bioengine.app(pip=REQUIREMENTS)`` declaration and imported
 inside method bodies (or, for prediction, inside the child process).
 """
 
-
 import asyncio
 import json
 import logging
@@ -454,9 +453,11 @@ def _axis_mismatch_hint(message: str) -> Optional[str]:
         return None
 
     wanted = ", ".join(
-        f"{a}={lo_ if lo_ != 'None' else 1}"
-        if lo_ == hi_
-        else f"{a}>={lo_ if lo_ != 'None' else 1}"
+        (
+            f"{a}={lo_ if lo_ != 'None' else 1}"
+            if lo_ == hi_
+            else f"{a}>={lo_ if lo_ != 'None' else 1}"
+        )
         for a, _t, lo_, hi_ in axes
     )
     tail = (
@@ -476,7 +477,11 @@ def _axis_mismatch_hint(message: str) -> Optional[str]:
         # missing are the LEADING ones — i.e. every axis it does supply is
         # a space axis. Otherwise the missing axes could be trailing and
         # ``arr[np.newaxis, ...]`` would put the data in the wrong place.
-        if missing > 0 and chan and all(t == "space" for _a, t, _lo, _hi in axes[missing:]):
+        if (
+            missing > 0
+            and chan
+            and all(t == "space" for _a, t, _lo, _hi in axes[missing:])
+        ):
             c_idx, c_n = chan[0]
             if c_idx < missing:
                 news = ", ".join(["np.newaxis"] * missing)
@@ -857,8 +862,7 @@ class RuntimeDeployment:
                 # "# packages in environment at <path>:" line, so that doubles as
                 # the section delimiter — nothing needs inventing.
                 return "\n\n".join(
-                    _run([conda_bin, "list", "-n", name])
-                    for name in sorted(env_names)
+                    _run([conda_bin, "list", "-n", name]) for name in sorted(env_names)
                 )
             return _run([sys.executable, "-m", "pip", "list", "--format=freeze"])
         except Exception as e:
@@ -1397,9 +1401,7 @@ class RuntimeDeployment:
         with open(lp_path, "w") as f:
             json.dump(load_params, f)
 
-        logger.info(
-            f"🐍 [predict] Spawning resident inference child for {rdf_path}"
-        )
+        logger.info(f"🐍 [predict] Spawning resident inference child for {rdf_path}")
         proc = subprocess.Popen(
             [
                 self._interpreter(python_env),
@@ -1443,9 +1445,7 @@ class RuntimeDeployment:
             self._evict_warm()
             shutil.rmtree(lp_dir, ignore_errors=True)
             if "out of memory" in tail_str.lower():
-                raise RuntimeError(
-                    f"CUDA out of memory during inference: {tail_str}"
-                )
+                raise RuntimeError(f"CUDA out of memory during inference: {tail_str}")
             raise RuntimeError(
                 f"Inference child failed to load model (stderr tail: {tail_str!r})"
             )
@@ -1480,9 +1480,7 @@ class RuntimeDeployment:
             tail_str = "\n".join(warm["tail"])[-800:]
             self._evict_warm()
             if "out of memory" in tail_str.lower():
-                raise RuntimeError(
-                    f"CUDA out of memory during inference: {tail_str}"
-                )
+                raise RuntimeError(f"CUDA out of memory during inference: {tail_str}")
             raise RuntimeError(
                 f"Inference child exited during prediction (stderr tail: {tail_str!r})"
             )
@@ -1492,9 +1490,7 @@ class RuntimeDeployment:
             message = resp.get("message", "")
             self._evict_warm()
             if "out of memory" in message.lower():
-                raise RuntimeError(
-                    f"CUDA out of memory during inference: {message}"
-                )
+                raise RuntimeError(f"CUDA out of memory during inference: {message}")
             hint = _axis_mismatch_hint(message)
             if hint:
                 raise RuntimeError(f"Inference failed: {hint}")
@@ -1720,9 +1716,11 @@ class RuntimeDeployment:
                     reason = (
                         "forced reload (cache=skip)"
                         if force_reload
-                        else "model switch"
-                        if warm["key"] != key
-                        else "warm child exited"
+                        else (
+                            "model switch"
+                            if warm["key"] != key
+                            else "warm child exited"
+                        )
                     )
                     logger.info(
                         f"🔄 [predict] Evicting warm child ({reason}) before "
@@ -1747,9 +1745,7 @@ class RuntimeDeployment:
             )
 
             # Free the input images now the child has consumed them.
-            await asyncio.to_thread(
-                shutil.rmtree, str(input_dir), ignore_errors=True
-            )
+            await asyncio.to_thread(shutil.rmtree, str(input_dir), ignore_errors=True)
 
             cpu_after, gpu_after = self._get_memory_usage()
             logger.info(

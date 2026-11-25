@@ -18,6 +18,7 @@ enforced by the shape of the code rather than by care:
    loss defeats the entire point of a generated report — worse than a disclosed
    one, because the reader has no way to know to ask.
 """
+
 from __future__ import annotations
 
 import re
@@ -29,10 +30,20 @@ OME_NS = "{http://www.openmicroscopy.org/Schemas/OME/2016-06}"
 
 # OME PhysicalSize*Unit values -> UDUNITS-2 names, which NGFF 0.4 requires.
 _UNITS = {
-    "m": "meter", "dm": "decimeter", "cm": "centimeter", "mm": "millimeter",
-    "µm": "micrometer", "um": "micrometer", "micron": "micrometer",
-    "nm": "nanometer", "pm": "picometer", "Å": "angstrom",
-    "s": "second", "ms": "millisecond", "min": "minute", "h": "hour",
+    "m": "meter",
+    "dm": "decimeter",
+    "cm": "centimeter",
+    "mm": "millimeter",
+    "µm": "micrometer",
+    "um": "micrometer",
+    "micron": "micrometer",
+    "nm": "nanometer",
+    "pm": "picometer",
+    "Å": "angstrom",
+    "s": "second",
+    "ms": "millisecond",
+    "min": "minute",
+    "h": "hour",
 }
 
 _AXIS_TYPE = {"t": "time", "c": "channel", "z": "space", "y": "space", "x": "space"}
@@ -43,10 +54,19 @@ _DEFAULT_COLORS = ["00FF00", "FF0000", "0000FF", "FFFF00", "FF00FF", "00FFFF", "
 # Every field this module knows how to drop. Anything here must end up in the
 # mapped list or the not-mapped list; the builder asserts it.
 ACCOUNTABLE = (
-    "physical pixel sizes", "time increment", "channel names", "channel colours",
-    "display windows", "bit depth", "acquisition date", "pyramid levels",
-    "scenes", "objective / instrument metadata", "stage position",
-    "plate / well context", "ROIs and annotations",
+    "physical pixel sizes",
+    "time increment",
+    "channel names",
+    "channel colours",
+    "display windows",
+    "bit depth",
+    "acquisition date",
+    "pyramid levels",
+    "scenes",
+    "objective / instrument metadata",
+    "stage position",
+    "plate / well context",
+    "ROIs and annotations",
 )
 
 
@@ -105,8 +125,9 @@ class MetadataMapping:
         so it is the default, and it is the phrasing that survives contact with
         a file nobody has seen.
         """
-        reason = ("not declared in the source" if checked
-                  else "not mapped by this recipe")
+        reason = (
+            "not declared in the source" if checked else "not mapped by this recipe"
+        )
         self.miss(field_name, f"{reason}{'; ' + detail if detail else ''}")
 
     def named(self, field_name: str) -> bool:
@@ -120,21 +141,26 @@ class MetadataMapping:
         parts: List[str] = []
         dims = self.mapped.get("dimensions")
         if dims:
-            parts.append("dimensions (" + ", ".join(f"{a} {n}" for a, n in dims.items()) + ")")
+            parts.append(
+                "dimensions (" + ", ".join(f"{a} {n}" for a, n in dims.items()) + ")"
+            )
         sizes = self.mapped.get("physical_pixel_sizes")
         if sizes:
             inner = ", ".join(
                 f"{a} {v['size']:g} "
                 f"{'µm' if v['unit'] == 'micrometer' else (v['unit'] or 'units')}"
-                for a, v in sizes.items())
+                for a, v in sizes.items()
+            )
             parts.append(f"physical pixel sizes ({inner})")
         inc = self.mapped.get("time_increment")
         if isinstance(inc, dict):
             parts.append(f"time increment ({inc['value']:g} {inc['unit'] or 'units'})")
         names = [n for n in (self.mapped.get("channel_names") or []) if n]
         if names:
-            parts.append(f"{len(names)} channel name{'s' if len(names) != 1 else ''} "
-                         f"({', '.join(names)})")
+            parts.append(
+                f"{len(names)} channel name{'s' if len(names) != 1 else ''} "
+                f"({', '.join(names)})"
+            )
         if self.mapped.get("channel_colours"):
             parts.append("channel colours as the source declares them")
         if self.mapped.get("bit_depth"):
@@ -142,6 +168,7 @@ class MetadataMapping:
         dtype = self.mapped.get("dtype")
         if dtype:
             import numpy as _np
+
             try:
                 dtype = _np.dtype(dtype).name
             except TypeError:
@@ -149,19 +176,30 @@ class MetadataMapping:
             parts.append(f"data type {dtype}")
         levels = self.mapped.get("pyramid_levels")
         if levels:
-            parts.append(f"{levels} pyramid levels with their true scale factors"
-                         if levels > 1 else "a single resolution level")
+            parts.append(
+                f"{levels} pyramid levels with their true scale factors"
+                if levels > 1
+                else "a single resolution level"
+            )
         if self.mapped.get("acquisition_date"):
             parts.append(f"acquisition date {self.mapped['acquisition_date']}")
         if self.mapped.get("scenes"):
-            parts.append(f"scene {self.mapped.get('served_scene')!r} of "
-                         f"{len(self.mapped['scenes'])}")
+            parts.append(
+                f"scene {self.mapped.get('served_scene')!r} of "
+                f"{len(self.mapped['scenes'])}"
+            )
 
         unmapped = [m.split(":", 1)[0] for m in self.unmapped]
-        mapped = ("Mapped from the source: " + "; ".join(parts) + "."
-                  if parts else "Nothing could be mapped from the source.")
-        not_mapped = ("Not mapped: " + "; ".join(unmapped) + "."
-                      if unmapped else "Everything the source declares is mapped.")
+        mapped = (
+            "Mapped from the source: " + "; ".join(parts) + "."
+            if parts
+            else "Nothing could be mapped from the source."
+        )
+        not_mapped = (
+            "Not mapped: " + "; ".join(unmapped) + "."
+            if unmapped
+            else "Everything the source declares is mapped."
+        )
         return {"mapped": mapped, "not_mapped": not_mapped}
 
 
@@ -185,9 +223,13 @@ def _hex_colour(value: str) -> Optional[str]:
     return f"{(rgba >> 24) & 0xFF:02X}{(rgba >> 16) & 0xFF:02X}{(rgba >> 8) & 0xFF:02X}"
 
 
-def from_ome_xml(ome_xml: Optional[str], axes: str,
-                 level_shapes: Sequence[Sequence[int]], dtype: str,
-                 name: str) -> SourceMetadata:
+def from_ome_xml(
+    ome_xml: Optional[str],
+    axes: str,
+    level_shapes: Sequence[Sequence[int]],
+    dtype: str,
+    name: str,
+) -> SourceMetadata:
     """Extract source metadata from a file's OME-XML."""
     md = SourceMetadata(axes=axes, level_shapes=level_shapes, dtype=dtype, name=name)
     if not ome_xml:
@@ -206,14 +248,22 @@ def from_ome_xml(ome_xml: Optional[str], axes: str,
     if pixels is None:
         return md
 
-    md.mark("physical pixel sizes", "time increment", "channel names",
-            "channel colours", "bit depth", "display windows")
+    md.mark(
+        "physical pixel sizes",
+        "time increment",
+        "channel names",
+        "channel colours",
+        "bit depth",
+        "display windows",
+    )
 
     for axis in ("X", "Y", "Z"):
         raw = pixels.get(f"PhysicalSize{axis}")
         if raw is not None:
             md.physical_sizes[axis.lower()] = (
-                float(raw), pixels.get(f"PhysicalSize{axis}Unit", "µm"))
+                float(raw),
+                pixels.get(f"PhysicalSize{axis}Unit", "µm"),
+            )
     increment = pixels.get("TimeIncrement")
     if increment is not None:
         md.time_increment = (float(increment), pixels.get("TimeIncrementUnit", "s"))
@@ -251,16 +301,22 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
         size, unit_raw = md.physical_sizes[axis]
         unit = _UNITS.get(unit_raw) if unit_raw else None
         if unit_raw and unit is None:
-            mapping.miss(f"physical pixel size {axis.upper()} unit",
-                         f"source unit {unit_raw!r} has no UDUNITS-2 equivalent; "
-                         "size mapped, unit dropped")
+            mapping.miss(
+                f"physical pixel size {axis.upper()} unit",
+                f"source unit {unit_raw!r} has no UDUNITS-2 equivalent; "
+                "size mapped, unit dropped",
+            )
         sizes[axis] = (size, unit)
     if sizes:
-        mapping.add("physical_pixel_sizes",
-                    {k: {"size": v[0], "unit": v[1]} for k, v in sizes.items()})
+        mapping.add(
+            "physical_pixel_sizes",
+            {k: {"size": v[0], "unit": v[1]} for k, v in sizes.items()},
+        )
     if missing_axes:
-        mapping.absent(f"physical pixel size {', '.join(missing_axes)}",
-                       "physical pixel sizes" in md.checked)
+        mapping.absent(
+            f"physical pixel size {', '.join(missing_axes)}",
+            "physical pixel sizes" in md.checked,
+        )
     elif not sizes:
         mapping.absent("physical pixel sizes", "physical pixel sizes" in md.checked)
 
@@ -274,14 +330,18 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
             t_unit = _UNITS.get(unit_raw) if unit_raw else None
             mapping.add("time_increment", {"value": value, "unit": t_unit or unit_raw})
             if unit_raw and t_unit is None:
-                mapping.miss("time increment unit",
-                             f"source unit {unit_raw!r} has no UDUNITS-2 "
-                             "equivalent; interval mapped, unit dropped")
+                mapping.miss(
+                    "time increment unit",
+                    f"source unit {unit_raw!r} has no UDUNITS-2 "
+                    "equivalent; interval mapped, unit dropped",
+                )
         else:
             mapping.absent(
-                "time increment", "time increment" in md.checked,
+                "time increment",
+                "time increment" in md.checked,
                 "the t axis is served with scale 1.0 and no unit, so intervals "
-                "between timepoints are NOT preserved")
+                "between timepoints are NOT preserved",
+            )
     else:
         # No t axis, or a single timepoint: there is no interval to lose, so
         # saying anything here would be noise rather than disclosure.
@@ -305,19 +365,26 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
     datasets = []
     for lvl, shape in enumerate(md.level_shapes):
         scale = [axis_scale(a) * (base[i] / shape[i]) for i, a in enumerate(axes)]
-        datasets.append({"path": str(lvl), "coordinateTransformations": [
-            {"type": "scale", "scale": scale}]})
+        datasets.append(
+            {
+                "path": str(lvl),
+                "coordinateTransformations": [{"type": "scale", "scale": scale}],
+            }
+        )
 
     mapping.add("dimensions", {a: base[i] for i, a in enumerate(axes)})
     mapping.add("pyramid_levels", len(md.level_shapes))
     mapping.add("dtype", md.dtype)
     if len(md.level_shapes) == 1:
-        mapping.miss("pyramid levels",
-                     "source is single-scale; view is single-scale, not downsampled")
+        mapping.miss(
+            "pyramid levels",
+            "source is single-scale; view is single-scale, not downsampled",
+        )
 
     attrs: Dict[str, Any] = {
-        "multiscales": [{"version": "0.4", "name": md.name, "axes": ngff_axes,
-                         "datasets": datasets}],
+        "multiscales": [
+            {"version": "0.4", "name": md.name, "axes": ngff_axes, "datasets": datasets}
+        ],
     }
 
     # --- channels ----------------------------------------------------------
@@ -337,40 +404,59 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
         if any(colours):
             mapping.add("channel_colours", colours)
         else:
-            mapping.absent("channel colours", "channel colours" in md.checked,
-                           "view assigns defaults")
+            mapping.absent(
+                "channel colours",
+                "channel colours" in md.checked,
+                "view assigns defaults",
+            )
 
         # Bit depth decides the honest full-scale, not the container width.
         window = _dtype_window(md.dtype)
         if md.bit_depth:
             mapping.add("bit_depth", md.bit_depth)
-            window = {"start": 0, "end": 2 ** md.bit_depth - 1,
-                      "min": 0, "max": 2 ** md.bit_depth - 1}
+            window = {
+                "start": 0,
+                "end": 2**md.bit_depth - 1,
+                "min": 0,
+                "max": 2**md.bit_depth - 1,
+            }
         else:
-            mapping.absent("bit depth", "bit depth" in md.checked,
-                           "window range taken from the container dtype, which "
-                           "may overstate the real full scale")
+            mapping.absent(
+                "bit depth",
+                "bit depth" in md.checked,
+                "window range taken from the container dtype, which "
+                "may overstate the real full scale",
+            )
 
         declared = list(md.declared_windows or [])[:n_c]
         declared += [None] * (n_c - len(declared))
         if any(w is not None for w in declared):
-            mapping.miss("display windows",
-                         "the source declares them, but this view publishes "
-                         "windows measured from the pixels instead; the "
-                         "declared values are recorded here and not applied")
+            mapping.miss(
+                "display windows",
+                "the source declares them, but this view publishes "
+                "windows measured from the pixels instead; the "
+                "declared values are recorded here and not applied",
+            )
             mapping.add("declared_display_windows", declared)
         else:
-            mapping.absent("display windows", "display windows" in md.checked,
-                           "view computes them from the data")
+            mapping.absent(
+                "display windows",
+                "display windows" in md.checked,
+                "view computes them from the data",
+            )
 
         attrs["omero"] = {
-            "version": "0.4", "name": md.name,
-            "channels": [{
-                "label": names[i] or f"Channel {i}",
-                "color": colours[i] or _DEFAULT_COLORS[i % len(_DEFAULT_COLORS)],
-                "window": dict(window),
-                "active": i < 3,
-            } for i in range(n_c)],
+            "version": "0.4",
+            "name": md.name,
+            "channels": [
+                {
+                    "label": names[i] or f"Channel {i}",
+                    "color": colours[i] or _DEFAULT_COLORS[i % len(_DEFAULT_COLORS)],
+                    "window": dict(window),
+                    "active": i < 3,
+                }
+                for i in range(n_c)
+            ],
             "rdefs": {"model": "color"},
         }
 
@@ -384,17 +470,23 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
         # every single-series file is noise that buries the real case.
         mapping.add("scenes", md.scenes)
         mapping.add("served_scene", md.served_scene)
-        mapping.miss("scenes",
-                     f"the source holds {len(md.scenes)} scenes and this view "
-                     f"serves only {md.served_scene!r}; the rest are not "
-                     "reachable through it")
+        mapping.miss(
+            "scenes",
+            f"the source holds {len(md.scenes)} scenes and this view "
+            f"serves only {md.served_scene!r}; the rest are not "
+            "reachable through it",
+        )
     elif md.scenes:
         mapping._named.add("scenes")
     else:
         mapping.absent("scenes", "scenes" in md.checked)
 
-    for absent in ("objective / instrument metadata", "stage position",
-                   "plate / well context", "ROIs and annotations"):
+    for absent in (
+        "objective / instrument metadata",
+        "stage position",
+        "plate / well context",
+        "ROIs and annotations",
+    ):
         mapping.miss(absent, "not mapped by this recipe")
 
     # Nothing this module knows how to drop may go unmentioned. The mapped dict
@@ -405,12 +497,22 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
 
     # _named also carries fields deliberately settled as "nothing to say here"
     # (no t axis, a single scene), which are accounted for without a line.
-    accounted = ({_slug(k) for k in mapping.mapped}
-                 | {_slug(m.split(":", 1)[0]) for m in mapping.unmapped}
-                 | {_slug(n) for n in mapping._named})
-    aliases = {"physical_pixel_sizes", "channel_colours", "channel_names",
-               "time_increment", "bit_depth", "acquisition_date", "scenes",
-               "pyramid_levels", "display_windows"}
+    accounted = (
+        {_slug(k) for k in mapping.mapped}
+        | {_slug(m.split(":", 1)[0]) for m in mapping.unmapped}
+        | {_slug(n) for n in mapping._named}
+    )
+    aliases = {
+        "physical_pixel_sizes",
+        "channel_colours",
+        "channel_names",
+        "time_increment",
+        "bit_depth",
+        "acquisition_date",
+        "scenes",
+        "pyramid_levels",
+        "display_windows",
+    }
     for name in ACCOUNTABLE:
         slug = _slug(name)
         if slug in accounted:

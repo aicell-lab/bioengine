@@ -4,5 +4,10 @@
     "model-finetune": 90,
     "model-runner": 22
   },
-  "skip": {}
+  "skip": {},
+  "max_skipped": {
+    "annotation-broker": 0,
+    "model-finetune": 4,
+    "model-runner": 0
+  }
 }

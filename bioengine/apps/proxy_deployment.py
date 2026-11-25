@@ -47,6 +47,7 @@ except ImportError:
     def schema_method(fn):
         return fn
 
+
 logger = logging.getLogger("ray.serve")
 
 # Hypha connection upkeep runs in a background task:
@@ -376,7 +377,9 @@ class ProxyDeployment:
         # declares a big cap gets a proportionate queue and a small one does not get a backlog
         # many times its own size.
         self.max_queued_requests = (
-            self.max_ongoing_requests if max_queued_requests is None else max_queued_requests
+            self.max_ongoing_requests
+            if max_queued_requests is None
+            else max_queued_requests
         )
         self.request_timeout_s = request_timeout_s
         self._queued_requests = 0
@@ -509,9 +512,7 @@ class ProxyDeployment:
                     "workspace": self.workspace,
                     "artifact_id": self.app_data.get("artifact_id"),
                     "app_version": self.app_data.get("version"),
-                    "worker_service_id": os.environ.get(
-                        "BIOENGINE_WORKER_SERVICE_ID"
-                    ),
+                    "worker_service_id": os.environ.get("BIOENGINE_WORKER_SERVICE_ID"),
                 },
             )
         except Exception as e:
@@ -605,7 +606,9 @@ class ProxyDeployment:
         user_email = user.get("email", "")
 
         # Resolve the effective authorized list: method-specific > wildcard > deny
-        allowed = self.authorized_users.get(method_name) or self.authorized_users.get("*")
+        allowed = self.authorized_users.get(method_name) or self.authorized_users.get(
+            "*"
+        )
         if not allowed:
             logger.error(
                 f"❌ No authorization rule for method '{method_name}' and no wildcard '*' rule"
@@ -616,14 +619,20 @@ class ProxyDeployment:
             )
 
         if "*" in allowed:
-            logger.debug(f"✅ Public access granted for '{method_name}' to user: {user_id}")
+            logger.debug(
+                f"✅ Public access granted for '{method_name}' to user: {user_id}"
+            )
             return
 
         if user_id in allowed or user_email in allowed:
-            logger.debug(f"✅ User authorized for '{method_name}': {user_id} ({user_email})")
+            logger.debug(
+                f"✅ User authorized for '{method_name}': {user_id} ({user_email})"
+            )
             return
 
-        logger.error(f"❌ User not authorized for '{method_name}': {user_id} ({user_email})")
+        logger.error(
+            f"❌ User not authorized for '{method_name}': {user_id} ({user_email})"
+        )
         raise PermissionError(
             f"User '{user_id}' ({user_email}) is not authorized to call "
             f"'{method_name}' on application '{self.application_id}'"
@@ -913,9 +922,9 @@ class ProxyDeployment:
                 # Update connection state
                 if connection_id in self._active_peer_connections:
                     self._active_peer_connections[connection_id]["state"] = state
-                    self._active_peer_connections[connection_id]["state_changed_at"] = (
-                        time.time()
-                    )
+                    self._active_peer_connections[connection_id][
+                        "state_changed_at"
+                    ] = time.time()
 
                     # Remove connection if it's closed or failed
                     if state in ["closed", "failed"]:
@@ -1715,7 +1724,9 @@ class ProxyDeployment:
         await self._collect_renewed_token()
 
         needs_registration = (
-            self.server is None or self.websocket_service_id is None or self._connection_lost
+            self.server is None
+            or self.websocket_service_id is None
+            or self._connection_lost
         )
 
         if needs_registration:
@@ -1982,7 +1993,6 @@ class ProxyDeployment:
                 except Exception:
                     pass
             os._exit(1)
-
 
     async def __del__(self) -> None:
         """Free the Hypha client_id before Ray Serve tears the replica down.

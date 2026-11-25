@@ -1073,6 +1073,9 @@ The `deploy_app` method supports these parameters:
 - **`application_env_vars`** *(optional)*: Environment variables per deployment  
 - **`hypha_token`** *(optional)*: Authentication token for user permissions. Use this to run the application with specific user credentials, which determines access to datasets and other resources. Can be obtained from `await login()` or from the [Hypha dashboard](https://hypha.aicell.io/) (Login → Profile Picture → My Workspace → Development tab → Generate Token). See [Per-deployment credentials](#per-deployment-credentials) below.
 - **`disable_gpu`** *(optional)*: Force CPU-only execution (default: False)
+- **`auto_redeploy`** *(optional)*: Whether the worker re-deploys this application by itself when Ray Serve reports it `DEPLOY_FAILED`, `UNHEALTHY` or missing. **Defaults to `True` for a new application**, including entries given to `--startup-applications`; pass `false` to opt out. When updating an existing `application_id` and omitting the argument, the running instance's setting is preserved rather than reset to the default.
+
+  It defaults on because a short platform outage kills a replica that is still *starting* while one already serving rides it out — so without this the application that dies is the one nobody is watching yet, and it stays dead until someone notices. Retries are bounded: after repeated consecutive failures the worker gives up, logs it, and reports `auto_redeploy_exhausted_at` on the application's status, so a permanently broken application does not retry forever.
 - **`max_ongoing_requests`** *(optional)*: Concurrent request limit (default: 10)
 
 #### Per-deployment credentials

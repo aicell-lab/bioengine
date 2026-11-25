@@ -18,6 +18,7 @@ unloadable. There is deliberately **no `pytest.importorskip`** anywhere here: CI
 `pytest apps/model-finetune` inside `bioengine-worker`, and a skip would turn this guard into
 nothing exactly when it matters -- the shape a previous review spent a refusal on.
 """
+
 import ast
 import pathlib
 
@@ -40,9 +41,17 @@ def _entryapp_autoscaling_config():
     Returns a dict of the keys it declares, with constant values where they are literals.
     """
     tree = ast.parse((HERE / "entry.py").read_text())
-    cls = next((n for n in ast.walk(tree)
-                if isinstance(n, ast.ClassDef) and n.name == "EntryApp"), None)
-    assert cls is not None, "class EntryApp not found in entry.py — this test has stopped looking"
+    cls = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.ClassDef) and n.name == "EntryApp"
+        ),
+        None,
+    )
+    assert (
+        cls is not None
+    ), "class EntryApp not found in entry.py — this test has stopped looking"
     for dec in cls.decorator_list:
         if not isinstance(dec, ast.Call):
             continue
@@ -123,9 +132,9 @@ def test_both_keys_are_real_autoscaling_config_fields():
     fields = AutoscalingConfig.model_fields
     for key in ("metrics_interval_s", "look_back_period_s"):
         assert key in fields, f"{key} is not an AutoscalingConfig field in this Ray"
-    assert "zzz_not_a_field" not in fields, (
-        "the membership test matched a key that cannot exist, so it discriminates nothing"
-    )
+    assert (
+        "zzz_not_a_field" not in fields
+    ), "the membership test matched a key that cannot exist, so it discriminates nothing"
 
 
 def test_the_declared_values_survive_autoscaling_config_construction():
