@@ -820,6 +820,79 @@ def default_stem_from_store_root(root: str) -> str:
     return ""
 
 
+def normalise_planes(
+    planes: Any, axes: Optional[List[str]], level0_shape: Optional[List[int]]
+) -> Optional[Dict[str, int]]:
+    """A validated ``{axis_name: index}``, or ``None`` when none was given.
+
+    Recorded at import because the annotator knows which slice the region was
+    drawn on and nothing downstream can recover it. A reader refuses an axis of
+    size greater than one with no plane recorded -- deliberately, since picking
+    index 0 pairs the polygons with a different slice's pixels, leaves the mask
+    non-empty and the run reporting success. See ``ngff_region._plane_index``.
+
+    **Checked HERE as well as at read time, and that is not redundant.** The
+    reader's refusal protects the pixels; this one protects the RECORD. A plane
+    naming an axis the store does not have, or an index past its end, would
+    otherwise be written into the manifest and fail only when someone trained
+    on it -- long after the annotation was saved, and reported as a training
+    failure rather than as the bad import it was.
+
+    ``None`` rather than ``{}`` for an empty mapping, so an absent plane and an
+    empty one cannot mean two things to a consumer.
+    """
+    if not planes:
+        return None
+    if not isinstance(planes, dict):
+        raise ValueError("planes must be an object of axis name to index.")
+    names = [str(a) for a in (axes or [])]
+    shape = [int(n) for n in (level0_shape or [])]
+    if not names or not shape:
+        raise ValueError(
+            "planes was given but this source records no axis names or shape, so "
+            "an index cannot be checked against an axis; re-import the source."
+        )
+    if len(names) != len(shape):
+        raise ValueError(
+            f"this source records {len(names)} axis name(s) {names!r} and a shape "
+            f"of {len(shape)} dimension(s) {shape!r}; planes cannot be resolved "
+            f"against a layout that does not describe itself."
+        )
+    out: Dict[str, int] = {}
+    for key, value in planes.items():
+        name = str(key)
+        if name not in names:
+            raise ValueError(
+                f"planes names axis {name!r}, which this source does not have. "
+                f"Its axes are {names!r}."
+            )
+        # STRICT on purpose: `int()` would turn 1.5 into slice 1 and True into
+        # slice 1, silently, which is the wrong-slice bug this field exists to
+        # prevent wearing a different hat. A plane must arrive as a whole
+        # number, and a caller sending anything else is told so rather than
+        # rounded into a plausible-looking answer.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a number. An index "
+                f"must be a whole number, not a string or a flag."
+            )
+        if float(value) != int(value):
+            raise ValueError(
+                f"planes[{name!r}] is {value!r}, which is not a whole number. "
+                f"There is no slice between two slices, and rounding one into "
+                f"the other would pick the wrong pixels silently."
+            )
+        index = int(value)
+        size = shape[names.index(name)]
+        if not 0 <= index < size:
+            raise ValueError(
+                f"planes[{name!r}]={index} is outside axis {name!r}, which has "
+                f"{size} element(s) (0..{size - 1})."
+            )
+        out[name] = index
+    return out or None
+
+
 def normalise_region(
     region: Any, store_width: int, store_height: int
 ) -> Optional[Dict[str, int]]:

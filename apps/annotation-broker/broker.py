@@ -1557,6 +1557,18 @@ class AnnotationBroker:
                 "Omit for the whole image."
             ),
         ),
+        planes: Optional[Dict[str, int]] = Field(
+            None,
+            description=(
+                "Which slice of each non-spatial axis the annotation was drawn "
+                "on, by axis NAME, e.g. {'z': 4}. REQUIRED for a store whose t "
+                "or z is larger than one: training refuses such a source with "
+                "no plane recorded rather than reading index 0, because index 0 "
+                "would pair the polygons with a different slice's pixels and "
+                "still look like a successful run. Omit for a 2-D store or one "
+                "whose non-spatial axes are all singleton."
+            ),
+        ),
         origin: str = Field(
             "https://bioimage.io",
             description="Browser origin the CORS preflight is checked against.",
@@ -1600,6 +1612,11 @@ class AnnotationBroker:
 
         probe = await self._probe_ngff_source(root, multiscale_path, origin)
         region = core.normalise_region(region, probe["width"], probe["height"])
+        # Checked against THIS store's axes and shape, so a plane naming an axis
+        # the source does not have, or an index past its end, is refused at
+        # import instead of being written into the manifest and failing later as
+        # a training error.
+        planes = core.normalise_planes(planes, probe["axes"], probe["level0_shape"])
         # The entry's dimensions are the *patch's*, not the slide's. That one
         # choice is what makes a region cost nothing elsewhere: the 64 MiB
         # materialisation gate, the dataset index dims, the OME-TIFF that gets
@@ -1615,6 +1632,7 @@ class AnnotationBroker:
             levels=probe["levels"],
             content_hint=probe["content_hint"],
             region=region,
+            planes=planes,
             layout={
                 "dataset_paths": probe["dataset_paths"],
                 "axis_roles": probe["axis_roles"],
