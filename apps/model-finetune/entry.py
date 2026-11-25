@@ -604,7 +604,8 @@ class EntryApp:
             raise RuntimeError("S3 storage service not connected")
 
         # The run store has to be WRITABLE, and this replica is the only thing
-        # that can find out. Every run-touching method resolves it, so a replica
+        # that can find out -- so this probe writes, rather than asking whether
+        # the directory exists. Every run-touching method resolves it, so a replica
         # that cannot reach it serves none of them -- but it answers everything
         # else perfectly well, so without this check Serve sees a healthy actor
         # and leaves it in the routing table.
@@ -616,15 +617,42 @@ class EntryApp:
         # still worked, which is why nothing looked wrong from outside.
         #
         # Raising makes Serve replace the replica, which is the remedy this
-        # method already relies on for a dead Hypha connection below -- and here
-        # it may genuinely fix the problem, since the replacement can land in a
-        # container whose home IS writable. Cheap for the same reason stated
-        # there: the records a caller polls are on disk, so a teardown between
-        # calls is invisible to the frontend.
+        # method already relies on for a dead Hypha connection below. Do NOT
+        # read that as "rescheduling fixes this": the broken replica and a
+        # working one had the SAME read-only /home/ray, and what differed was
+        # whether the per-application HOME override took effect inside the
+        # process (`bioengine/_app/replica_init.py` sets HOME to the app's own
+        # directory on the shared mount). So replacement helps only if that
+        # failure was transient; if it is not, the replica keeps failing this
+        # check and the app reports UNHEALTHY, which is the honest outcome and
+        # the one this issue asks for. Cheap either way: the records a caller
+        # polls are on disk, so a teardown between calls is invisible to the
+        # frontend.
+        #
+        # The probe WRITES. `sessions_root()` alone proves only that the
+        # directory could be created, and `mkdir(exist_ok=True)` succeeds on a
+        # directory that already exists however read-only it is -- Linux reports
+        # EEXIST before EROFS. A store that exists and refuses writes is exactly
+        # this issue's symptom, so checking creatability would have passed the
+        # replica that provoked the report.
+        #
+        # Off the event loop and time-limited, like the echo probe below: this
+        # is a synchronous round trip to an NFS mount, and a hung mount would
+        # otherwise block the whole replica's loop and fail only via Serve's own
+        # 30s timeout, with the less specific failure that probe exists to avoid.
         import training
 
+        loop = asyncio.get_event_loop()
         try:
-            training.sessions_root()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, training.assert_sessions_root_writable),
+                timeout=_HEALTH_CALL_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"training-run store did not answer a write within "
+                f"{_HEALTH_CALL_TIMEOUT_S:.0f}s; treating the mount as hung"
+            ) from exc
         except Exception as exc:
             raise RuntimeError(f"training-run store unusable: {exc}") from exc
         # The `is None` test above cannot fail on a DEAD handle. hypha_rpc pins a proxy

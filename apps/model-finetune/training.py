@@ -30,7 +30,12 @@ STATUS_STALE_SECONDS = 600
 
 
 class SessionsRootUnavailable(RuntimeError):
-    """This replica cannot create or write the directory runs are kept in.
+    """This replica cannot create, or cannot write, the directory runs are kept in.
+
+    Raised from two places, because they are two different facts: `sessions_root`
+    raises it when the store cannot be CREATED, and `assert_sessions_root_writable`
+    when the store exists but refuses a WRITE. A store that exists read-only
+    satisfies the first and fails the second.
 
     A ``RuntimeError`` and not a ``ValueError``: nothing the caller asked for is
     wrong. The replica cannot serve ANY run operation, and that is a property of
@@ -59,10 +64,43 @@ def sessions_root() -> Path:
         # this so the condition reports as UNHEALTHY and Serve replaces the
         # replica, rather than it staying in the routing table forever.
         raise SessionsRootUnavailable(
-            f"cannot create or write the training-run store at {root}: {exc}. "
-            "This replica cannot serve any training-run operation while that "
-            "path is unwritable."
+            f"cannot create the training-run store at {root}: {exc}. This "
+            "replica cannot serve any training-run operation while that path "
+            "cannot be created."
         ) from exc
+    return root
+
+
+def assert_sessions_root_writable() -> Path:
+    """Prove the run store accepts a WRITE, not merely that it exists.
+
+    `sessions_root` only establishes that the directory could be CREATED, and
+    `mkdir(exist_ok=True)` succeeds on a directory that already exists however
+    read-only it is: Linux reports EEXIST before EROFS and `exist_ok` swallows
+    it. So a store that exists and refuses every write left this replica
+    HEALTHY while every run write failed -- the precise symptom this check was
+    added for. Measured two ways: a pre-created store chmod'ed 0o555, where
+    `sessions_root()` returns the path and writing into it raises EACCES; and a
+    real read-only mount, where `mkdir(exist_ok=True)` on the existing
+    directory succeeds while creating anything inside it raises EROFS.
+
+    So write something. A create-and-unlink is the cheapest probe that cannot
+    be satisfied by a path that merely exists.
+    """
+    root = sessions_root()
+    probe = root / f".writable-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        probe.write_text("")
+    except OSError as exc:
+        raise SessionsRootUnavailable(
+            f"the training-run store at {root} exists but refuses writes: "
+            f"{exc}. This replica cannot serve any training-run operation."
+        ) from exc
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
     return root
 
 
