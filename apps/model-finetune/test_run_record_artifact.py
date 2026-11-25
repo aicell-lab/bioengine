@@ -12,12 +12,27 @@ where a record goes, and that the artifact id cannot be chosen by a caller.
 """
 
 import ast
+import json
 import pathlib
-import re
 
 import pytest
 
 import training
+
+
+@pytest.fixture
+def absent_sessions_root(tmp_path, monkeypatch):
+    """A sessions root with nothing in it.
+
+    ``run_record`` reads the params from disk, so without this the record
+    tests would read the real sessions root of whatever machine the suite runs
+    on -- passing or failing on data they did not create.
+    """
+    monkeypatch.setattr(
+        training, "sessions_root", lambda: tmp_path / "sessions", raising=True
+    )
+    (tmp_path / "sessions").mkdir()
+    return tmp_path / "sessions"
 
 
 # ── the artifact id is not an input ──────────────────────────────────────────
@@ -39,6 +54,7 @@ def test_NO_PUBLISHED_METHOD_TAKES_AN_ARTIFACT_ID_FOR_THE_RUNS_RECORD():
     src = pathlib.Path(__file__).with_name("entry.py").read_text()
     tree = ast.parse(src)
     offenders = []
+    touching = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -46,8 +62,17 @@ def test_NO_PUBLISHED_METHOD_TAKES_AN_ARTIFACT_ID_FOR_THE_RUNS_RECORD():
         body = ast.get_source_segment(src, node) or ""
         if "RUNS_ARTIFACT_ID" not in body:
             continue
+        touching.append(node.name)
         if "artifact_id" in params:
             offenders.append(node.name)
+    # Without this the test is VACUOUS: before the write path existed, no
+    # function mentioned the artifact at all, so `offenders == []` held for a
+    # tree that could not have offended. It has to fail when the thing it
+    # guards is absent, not pass.
+    assert touching, (
+        "no function in entry.py touches RUNS_ARTIFACT_ID, so this test "
+        "examined nothing. Either the write path is gone or it was renamed."
+    )
     assert offenders == [], (
         f"these methods touch the runs artifact AND take an artifact_id: "
         f"{offenders}. The id must not be a caller's choice."
@@ -57,7 +82,17 @@ def test_NO_PUBLISHED_METHOD_TAKES_AN_ARTIFACT_ID_FOR_THE_RUNS_RECORD():
 # ── what a record carries ────────────────────────────────────────────────────
 
 
-def test_the_record_STRIPS_every_private_field():
+def test_the_record_KEEPS_the_owner_because_the_FILTER_needs_it(absent_sessions_root):
+    """The correction to my own plan, pinned so it cannot be "tidied" back.
+
+    I planned to strip the private fields here. The landed per-caller listing
+    decides visibility by comparing the caller to the run's recorded owner, so
+    a record arriving from another replica without one is unattributable: the
+    listing would show it to everybody or to nobody, and two replicas
+    answering the same caller differently is the failure this record exists to
+    fix. So the owner travels with the record, and the fence is the artifact's
+    permissions plus `redact_private` on the way out -- both checked below.
+    """
     status = {
         "status": "COMPLETED",
         "owner": "github|1",
@@ -65,44 +100,63 @@ def test_the_record_STRIPS_every_private_field():
         "n_epochs": 3,
     }
     rec = training.run_record("2026-11-25-120000-abcdef12", status)
+    assert rec["status"]["owner"] == "github|1", (
+        "the owner was stripped from the stored record, so a run from another "
+        "replica can no longer be attributed and the per-caller listing breaks"
+    )
+    assert rec["status"]["status"] == "COMPLETED"
+    assert rec["status"]["n_epochs"] == 3
+
+
+def test_WHAT_IS_RETURNED_to_a_caller_still_carries_no_private_field():
+    """The other half of the same statement: the strip happens on the way out.
+
+    `redact_private` is the single place it happens, which is what makes the
+    record able to carry an owner safely. If this ever passes while the record
+    is also stripped, the strip has been duplicated and the two copies can
+    drift.
+    """
+    out = training.redact_private(
+        {"status": "COMPLETED", "owner": "github|1", "owner_anonymous": False}
+    )
     for field in training.PRIVATE_STATUS_FIELDS:
-        assert field not in rec, f"{field} survived into the persisted record"
-    assert rec["status"] == "COMPLETED"
-    assert rec["n_epochs"] == 3
+        assert field not in out, f"{field} reached a caller"
+    assert out["status"] == "COMPLETED"
 
 
-def test_a_field_ADDED_to_PRIVATE_STATUS_FIELDS_is_stripped_too(monkeypatch):
-    """The test the plan asks for, and the reason it exists.
+def test_a_field_ADDED_to_PRIVATE_STATUS_FIELDS_is_withheld_too(monkeypatch):
+    """The test the plan asks for, at the place the plan was wrong about.
 
-    This app has already had a field stripped on one path and published on
-    another. `run_record` iterates the tuple rather than naming fields, so
-    adding one to the tuple must be enough -- and this fails if somebody
-    reintroduces an explicit list.
+    This app has already had a field withheld on one path and published on
+    another. The strip iterates the tuple rather than naming fields, so adding
+    one to the tuple must be enough -- and this fails if somebody reintroduces
+    an explicit list.
     """
     monkeypatch.setattr(
         training,
         "PRIVATE_STATUS_FIELDS",
         training.PRIVATE_STATUS_FIELDS + ("a_new_private_field",),
     )
-    rec = training.run_record(
-        "2026-11-25-120000-abcdef12",
-        {"status": "TRAINING", "a_new_private_field": "secret"},
+    out = training.redact_private(
+        {"status": "TRAINING", "a_new_private_field": "secret"}
     )
-    assert "a_new_private_field" not in rec, (
-        "a field added to PRIVATE_STATUS_FIELDS was still persisted, so the "
+    assert "a_new_private_field" not in out, (
+        "a field added to PRIVATE_STATUS_FIELDS still reached a caller, so the "
         "stripping is naming fields instead of iterating the tuple"
     )
+    assert "secret" not in json.dumps(out)
 
 
-def test_the_record_is_SELF_DESCRIBING():
+def test_the_record_is_SELF_DESCRIBING(absent_sessions_root):
     """A record read on its own must say which run it is, not rely on its key."""
     rec = training.run_record("2026-11-25-120000-abcdef12", {"status": "FAILED"})
     assert rec["session_id"] == "2026-11-25-120000-abcdef12"
+    assert rec["record_version"] == training.RUN_RECORD_VERSION
 
 
-def test_an_empty_or_missing_status_does_not_raise():
-    assert training.run_record("2026-11-25-120000-abcdef12", {})["session_id"]
-    assert training.run_record("2026-11-25-120000-abcdef12", None)["session_id"]
+def test_an_empty_status_does_not_raise(absent_sessions_root):
+    rec = training.run_record("2026-11-25-120000-abcdef12", {})
+    assert rec["session_id"] and rec["status"] == {} and rec["config"] is None
 
 
 # ── where a record goes ──────────────────────────────────────────────────────

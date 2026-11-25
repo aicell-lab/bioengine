@@ -856,26 +856,96 @@ OWNERLESS_GRANTS = frozenset({"rw", "a"})
 # not have to infer which applies.
 RUNS_ARTIFACT_ID = "bioimage-io/model-finetune-runs"
 
-# One run's entry in that artifact: the status document minus anything private.
+# One run's entry in that artifact.
 RUN_RECORD_PATH_TEMPLATE = "runs/{session_id}.json"
 
+RUN_RECORD_VERSION = 1
 
-def run_record(session_id: str, status: Dict[str, Any]) -> Dict[str, Any]:
-    """The record persisted for *session_id*, with private fields removed.
 
-    Strips exactly :data:`PRIVATE_STATUS_FIELDS`, by iterating that tuple
-    rather than naming the fields again. Naming them twice is how a field
-    added to the tuple ends up stripped on one path and published on the
-    other, which is the failure this app has already had once on the listing
-    path -- so there is a test that adds a field to the tuple and fails if
-    this function does not strip it.
+def redact_urls(value: Any) -> Any:
+    """Strip the query string from any http(s) URL, recursively.
 
-    The session id is written INTO the record as well as being the key, so a
-    record read on its own is self-describing.
+    A run's params carry the image and label references it was given, and those
+    can be PRESIGNED: the query string is the credential. A run record is meant
+    to outlive the worker and be readable by whoever opens the run history, so
+    it must not be the place a signature gets archived. The path is kept
+    because it identifies the object; only what authorises access is dropped.
+
+    Nothing else is filtered. The record is otherwise verbatim -- see
+    :func:`run_record`.
     """
-    out = {k: v for k, v in (status or {}).items() if k not in PRIVATE_STATUS_FIELDS}
-    out["session_id"] = session_id
-    return out
+    if isinstance(value, str):
+        if value.startswith(("http://", "https://")) and "?" in value:
+            return value.split("?", 1)[0] + "?<redacted>"
+        return value
+    if isinstance(value, dict):
+        return {k: redact_urls(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_urls(v) for v in value]
+    return value
+
+
+def run_record(
+    session_id: str, status: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """One run, as a document that can outlive the worker that produced it.
+
+    ``config`` is the training params and ``status`` is the status document,
+    both VERBATIM apart from two subtractions. That is deliberate and is the
+    whole design: per-epoch metrics are written into the status document by the
+    training workers, so a record that enumerated known fields would have to be
+    edited every time a worker learns to report something new -- by whoever
+    happened to add it, in a second place. Copying the document means a new
+    metric appears here the moment it appears there, with nothing to keep in
+    step. The cost, stated so a reader is not surprised: a consumer sees
+    whatever the worker wrote, including keys it does not know. Tolerating
+    unknown keys is a better failure than a schema that silently drops a
+    metric.
+
+    The one subtraction is :func:`redact_urls`: a presigned URL loses its query
+    string, because the record outlives the handle and the query string IS the
+    credential.
+
+    **The recorded owner STAYS, and that is a correction to an earlier plan of
+    mine rather than an oversight.** I intended to strip
+    :data:`PRIVATE_STATUS_FIELDS` here. Measured against the landed per-caller
+    listing, that cannot work: :func:`list_sessions` decides visibility by
+    comparing the caller to the run's recorded owner, so a record arriving from
+    ANOTHER replica with no owner in it is unattributable, and the listing
+    would either show it to everybody or to nobody. Two replicas answering the
+    same caller differently is the exact failure this record exists to fix, so
+    the owner has to travel with the record.
+
+    What keeps the owner out of a caller's hands is therefore not this
+    function. It is two things, both of which can be checked:
+
+    * the record lives in a PRIVATE, standalone artifact
+      (:data:`RUNS_ARTIFACT_ID`) that only this app's credential can read --
+      measured on creation: anonymous `read`, anonymous `list_files` and an
+      anonymous HTTP GET are all refused;
+    * everything returned to a caller goes through :func:`redact_private`,
+      which iterates :data:`PRIVATE_STATUS_FIELDS` so that adding a field there
+      is enough. That is the single place the strip happens, rather than two
+      places that can drift.
+
+    *status* is accepted so a caller that has just written the document does
+    not read it back; omitted, it is read from disk. An unknown session gives a
+    record rather than raising, because a run history asking about a vanished
+    id wants an answer, and an absent config is recorded as ``None`` rather
+    than ``{}``, which would read as "trained with no settings".
+    """
+    sid = validate_session_id(session_id)
+    document = read_status(sid) if status is None else status
+    try:
+        config = read_training_params(sid)
+    except (OSError, ValueError):
+        config = None
+    return {
+        "record_version": RUN_RECORD_VERSION,
+        "session_id": sid,
+        "config": redact_urls(config) if config is not None else None,
+        "status": redact_urls(document or {}),
+    }
 
 
 def run_record_path(session_id: str) -> str:
@@ -1030,8 +1100,17 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
     return st
 
 
-def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
+def list_sessions(
+    context: Any, *, records: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Dict[str, Dict[str, Any]]:
     """The runs this caller may see, keyed by session id, owner redacted.
+
+    *records* is the shared run history -- every run as persisted to the app's
+    own runs artifact, keyed by session id. It is a keyword with a default so
+    the local-only listing keeps working when the shared copy cannot be read:
+    a run history that answers from this worker's disk is incomplete, and one
+    that raises is useless. Passing nothing is therefore the degraded mode, not
+    an error, and the caller logs it.
 
     *context* is REQUIRED and has no default, deliberately. There is no
     unfiltered listing to call by mistake: the previous `list_sessions()`
@@ -1062,6 +1141,7 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
     skipped: List[str] = []
+    local_ids: set = set()
     for d in sorted(root.iterdir()) if root.exists() else []:
         if not (d.is_dir() and (d / "status.json").exists()):
             continue
@@ -1087,10 +1167,53 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
             visible = see_ownerless
         if visible:
             out[d.name] = redact_private(status)
+        local_ids.add(d.name)
     if skipped:
         print(
             f"[model-finetune] skipped {len(skipped)} session directory(ies) that "
             f"are not a session on this worker: {skipped[:5]}",
+            flush=True,
+        )
+
+    # Runs this worker never held. Everything above is this worker's own disk,
+    # which is exactly why a second instance of the app lists a different
+    # history: measured on one worker as one administrator, the production
+    # instance listed 261 runs, a second instance listed 19, and the two had
+    # nothing in common. `records` is the shared copy, so a run started
+    # anywhere is listed everywhere.
+    #
+    # LOCAL WINS, and it wins by ID rather than by visibility. A session this
+    # worker holds is skipped here even when the caller cannot see it --
+    # otherwise the shared copy would be a second route to a run the local
+    # rule just refused, which is a visibility bypass rather than a fallback.
+    # Local is also FRESHER: the local status is re-read on every call while a
+    # record is only as new as the last sync.
+    unusable = 0
+    for session_id, record in (records or {}).items():
+        if session_id in local_ids:
+            continue
+        if not isinstance(session_id, str) or not SESSION_ID_PATTERN.match(session_id):
+            unusable += 1
+            continue
+        status = (record or {}).get("status") if isinstance(record, dict) else None
+        if not isinstance(status, dict):
+            # A record whose status is missing or not a mapping says nothing
+            # about who may see it, and the visibility rule below would read a
+            # missing owner as "ownerless" and show it to an admin. Counted and
+            # dropped instead: fail closed, and say how many.
+            unusable += 1
+            continue
+        owner = status.get("owner")
+        if isinstance(owner, str) and owner:
+            visible = caller is not None and caller == owner
+        else:
+            visible = see_ownerless
+        if visible:
+            out[session_id] = redact_private(dict(status))
+    if unusable:
+        print(
+            f"[model-finetune] dropped {unusable} shared run record(s) that carry "
+            "no usable status; they are not listed to anybody",
             flush=True,
         )
     return out

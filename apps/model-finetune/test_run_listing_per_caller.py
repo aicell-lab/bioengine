@@ -439,8 +439,9 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
 
     seen = {}
 
-    def spy(context):
+    def spy(context, *, records=None):
         seen["context"] = context
+        seen["records"] = records
         return {"sentinel": {}}
 
     monkeypatch.setattr(training, "list_sessions", spy)
@@ -448,6 +449,11 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
     fn = getattr(cls, "list_training_sessions")
     inst = cls.__new__(cls)
     out = await fn(inst, context=ADMIN)
+    # This instance has no connection, so the shared run record cannot be read.
+    # The listing must still answer -- from local disk alone -- rather than
+    # raise: a short history beats no history. That it is `{}` and not None is
+    # the filter's contract, which has no None branch.
+    assert seen["records"] == {}, seen["records"]
     assert out == {"sentinel": {}}
     assert seen["context"] is ADMIN, seen
     # The spy takes `context` POSITIONALLY-or-by-keyword and would accept a

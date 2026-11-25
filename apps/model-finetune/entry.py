@@ -547,6 +547,14 @@ class EntryApp:
         # process. Raising max_replicas voids it and needs a pool-side lease instead.
         self._pool_locks: Dict[str, asyncio.Lock] = {}
 
+        # session_id -> the JSON this instance last pushed to the shared run
+        # record. Only used to skip an unchanged write; it is NOT a claim about
+        # what the artifact holds, since another instance may have written the
+        # same path since. Starting empty after a restart therefore costs one
+        # re-push per run and cannot lose anything.
+        self._runs_pushed: Dict[str, str] = {}
+        self._runs_sync_task: Optional[asyncio.Task] = None
+
     @bioengine.async_init
     async def _connect(self) -> None:
         self._hypha = await connect_to_server(
@@ -576,6 +584,10 @@ class EntryApp:
         )
         self._http = httpx.AsyncClient(timeout=60.0)
         self._busy.start()
+        # Started here rather than in __init__ because it needs the connection
+        # and the HTTP client this method builds. A restart re-runs _connect, so
+        # the loop comes back with the replica.
+        self._runs_sync_task = asyncio.create_task(self._runs_sync_loop())
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
         self._log_gpu_placement()
 
@@ -1403,6 +1415,232 @@ class EntryApp:
         finally:
             preparing_hb.cancel()
             self._training_tasks.pop(session_id, None)
+            # NOTHING is shared from here, deliberately. The terminal state is
+            # what a run history is most often asked about, so pushing it
+            # immediately is tempting -- but this `finally` also runs while a
+            # replica is being torn down, with a CancelledError in flight
+            # (`_prepare_training_data` raising CancelledError is a tested
+            # case). Awaiting a network call there either delays the
+            # cancellation or swallows it, and an export that reported a user
+            # stop it never received is a bug this app has already had. The
+            # record is on disk; the sync loop shares it within one poll, and
+            # after a restart it is re-read from disk and shared then.
+
+    # ------------------------------------------------------------------
+    # The shared run record
+    #
+    # Run history used to be this worker's own filesystem, which is why two
+    # instances of the app answered differently: measured on one worker as one
+    # administrator, the production instance listed 261 runs, a second instance
+    # listed 19, and the two had NOTHING in common. The records below are the
+    # shared copy that makes the history a property of the project rather than
+    # of whichever instance answered.
+    #
+    # Written with the APP's own credential, to ONE artifact named in
+    # `training.RUNS_ARTIFACT_ID`. Deliberately not a parameter anywhere: a
+    # Hypha token cannot be narrowed below its workspace, so a caller who could
+    # name the artifact could make this app write anything its credential
+    # reaches -- and `commit` on an artifact somebody else is staging publishes
+    # their pending work. The dataset paths in this app keep the opposite rule
+    # (`_pool_service`: a caller token, because the write acts as the caller);
+    # the two rules sit side by side, so which is which is stated rather than
+    # inferred.
+    #
+    # Measured on the live artifact before this was written: `edit(stage=True)`
+    # + `put_file` + `commit()` does NOT add a version -- the version list
+    # stayed at one entry across two commits -- and a second write to the same
+    # path replaces the first. A commit per record is therefore affordable; a
+    # design that added an immutable version per status update would have
+    # reached thousands.
+    # ------------------------------------------------------------------
+
+    #: How often an instance pushes the records whose content has changed.
+    #: Clause 3 of the issue is "within one poll", so this interval IS the
+    #: promise; it is a class attribute so a test can shorten it.
+    RUNS_SYNC_INTERVAL_S = 60.0
+
+    #: How long to wait before the single retry of a share. A class attribute
+    #: so a test can set it to zero: patching `asyncio.sleep` instead is how a
+    #: no-op lambda ends up calling the function it replaced, which recurses.
+    RUNS_RETRY_DELAY_S = 2.0
+
+    async def _runs_artifact_manager(self):
+        """The artifact manager on the APP's own connection.
+
+        No caller client, by construction: there is no argument to pass one.
+        An earlier draft of this took `context["client"]` so the write could
+        carry the caller's identity, and measured on that branch the framework
+        never injected a context at all -- the method was declared without
+        `context=True`, so the fence read as present and was absent, while
+        `context` became a *published* parameter a caller could supply.
+        """
+        return await self._hypha.get_service("public/artifact-manager")
+
+    async def _persist_run_record(
+        self,
+        session_id: str,
+        status: Optional[Dict[str, Any]] = None,
+        *,
+        log_failure: bool = False,
+    ) -> bool:
+        """Share one run's record. True if it landed.
+
+        Returns rather than raises, because every caller is doing something
+        else that must not fail with it: a finished run, or a poll that will
+        come round again.
+
+        A commit can legitimately lose a race -- two instances can hold
+        `stage=True` on one artifact, and the first commit clears the single
+        artifact-level flag, so the second can find nothing staged. The bytes
+        are already uploaded at that point and the other commit may well have
+        published them, so one retry is attempted and then it is left to the
+        next poll.
+        """
+        import json as _json
+        import training
+
+        for attempt in (1, 2):
+            try:
+                record = training.run_record(session_id, status)
+                path = training.run_record_path(session_id)
+                am = await self._runs_artifact_manager()
+                await am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True)
+                url = await am.put_file(training.RUNS_ARTIFACT_ID, file_path=path)
+                resp = await self._http.put(
+                    url, content=_json.dumps(record).encode("utf-8")
+                )
+                resp.raise_for_status()
+                await am.commit(artifact_id=training.RUNS_ARTIFACT_ID)
+                self._runs_pushed[session_id] = _json.dumps(record, sort_keys=True)
+                return True
+            except training.InvalidSessionId:
+                # Not retryable and not this method's business to repair: the
+                # id never came from this server.
+                logger.warning(
+                    f"refusing to share a record for an id that is not a "
+                    f"session (length {len(str(session_id))})"
+                )
+                return False
+            except Exception as exc:
+                if attempt == 1:
+                    await asyncio.sleep(self.RUNS_RETRY_DELAY_S)
+                    continue
+                if log_failure:
+                    logger.warning(
+                        f"could not share the run record for {session_id}: "
+                        f"{type(exc).__name__}: {str(exc)[:200]}. The run is "
+                        "unaffected; the next sync retries."
+                    )
+                return False
+        return False
+
+    async def _read_run_records(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Every shared record, keyed by session id, or None if unreadable.
+
+        None and `{}` are different answers and the caller treats them
+        differently: `{}` is "the shared history is empty", None is "the shared
+        history could not be read", and only the second one is a reason to say
+        so in the log while still answering from local disk.
+
+        A record that will not parse is COUNTED and skipped rather than
+        dropping the whole read: one bad file must not empty a run history.
+        """
+        import json as _json
+        import training
+
+        try:
+            am = await self._runs_artifact_manager()
+            listing = await am.list_files(
+                artifact_id=training.RUNS_ARTIFACT_ID, dir_path="runs"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"the shared run history could not be listed "
+                f"({type(exc).__name__}: {str(exc)[:160]}); answering from this "
+                "instance's own disk only, which is incomplete"
+            )
+            return None
+
+        names = [
+            e.get("name") if isinstance(e, dict) else str(e) for e in (listing or [])
+        ]
+        names = [n for n in names if isinstance(n, str) and n.endswith(".json")]
+        out: Dict[str, Dict[str, Any]] = {}
+        unreadable = 0
+        for name in names:
+            try:
+                url = await am.get_file(
+                    artifact_id=training.RUNS_ARTIFACT_ID,
+                    file_path=f"runs/{name}",
+                )
+                resp = await self._http.get(url)
+                resp.raise_for_status()
+                record = _json.loads(resp.text)
+                session_id = (record or {}).get("session_id") or name[: -len(".json")]
+                out[session_id] = record
+            except Exception:
+                unreadable += 1
+        if unreadable:
+            logger.warning(
+                f"{unreadable} shared run record(s) could not be read; the rest "
+                f"({len(out)}) are listed"
+            )
+        return out
+
+    async def _sync_run_records(self) -> Dict[str, int]:
+        """Push the records whose content has changed since the last push.
+
+        Content-addressed rather than time-addressed: a record is pushed when
+        its JSON differs from what this instance last pushed. A poll that
+        re-pushed everything would rewrite 261 files a minute, and one that
+        pushed only on a status TRANSITION would miss a per-epoch metric, which
+        is most of what a run history is for.
+        """
+        import json as _json
+        import training
+
+        pushed = skipped = failed = 0
+        root = training.sessions_root()
+        for d in sorted(root.iterdir()) if root.exists() else []:
+            if not (d.is_dir() and (d / "status.json").exists()):
+                continue
+            if not training.SESSION_ID_PATTERN.match(d.name):
+                continue
+            try:
+                record = training.run_record(d.name)
+            except Exception:
+                failed += 1
+                continue
+            digest = _json.dumps(record, sort_keys=True)
+            if self._runs_pushed.get(d.name) == digest:
+                skipped += 1
+                continue
+            if await self._persist_run_record(d.name):
+                pushed += 1
+            else:
+                failed += 1
+        return {"pushed": pushed, "unchanged": skipped, "failed": failed}
+
+    async def _runs_sync_loop(self) -> None:
+        """The poll clause 3 is measured against.
+
+        Deliberately never raises out: a loop that dies takes the shared
+        history with it silently, and the instance would keep serving its own
+        disk as if that were the whole story.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.RUNS_SYNC_INTERVAL_S)
+                counts = await self._sync_run_records()
+                if counts["pushed"] or counts["failed"]:
+                    logger.info(f"shared run records: {counts}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"a run-record sync pass failed ({type(exc).__name__}: "
+                    f"{str(exc)[:160]}); the next pass retries"
+                )
 
     @bioengine.method
     async def get_training_capabilities(self) -> Dict[str, Any]:
@@ -1948,10 +2186,19 @@ class EntryApp:
         honest consequence of that is an EMPTY listing for everybody. That is
         the safe direction, and it is also indistinguishable from "this worker
         has no runs", so the decorator is covered by a test rather than trusted.
+
+        The runs come from the SHARED record, with this instance's own disk
+        layered on top of it -- so a run started on another instance is listed
+        here, and a run this instance started a moment ago is listed before the
+        next sync has shared it. If the shared record cannot be read the
+        listing still answers from local disk, which is incomplete and says so
+        in the log: a run history that is short is worse than one that is
+        slow, and both are better than one that raises.
         """
         import training
 
-        return training.list_sessions(context)
+        records = await self._read_run_records()
+        return training.list_sessions(context, records=records or {})
 
     @bioengine.method(context=True)
     async def stop_training(
