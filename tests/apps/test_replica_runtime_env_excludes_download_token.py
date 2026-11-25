@@ -320,6 +320,72 @@ def test_the_staging_result_is_logged_with_a_file_count(monkeypatch):
     assert TOKEN not in staged[0]
 
 
+def test_build_stages_FIRST_and_only_then_declares_the_stage():
+    """``build()`` must call ``_stage_source_on_nodes`` and *then* set the staged flag.
+
+    STRUCTURAL, by AST, for the reason the sibling file gives: ``build()`` is a long async method
+    no test in this suite drives, so behavioural coverage stops at its collaborators. Without this
+    arm, deleting the ``env_vars[_SOURCE_STAGED_KEY] = "1"`` line passes the entire suite — the
+    whole fix then does nothing at run time, since every replica falls back to a Hypha sync it has
+    no credential for, and a public-artifact smoke test still goes green via anonymous read.
+
+    The ORDER is the load-bearing part, not just the presence of both. The staging tasks must not
+    see the flag: a process that can re-sync has to keep re-syncing, or a redeploy at "latest" onto
+    an unchanged version string serves stale code. Setting the flag before the staging call would
+    hand it to the tasks and reintroduce exactly that.
+    """
+    import ast
+    import pathlib
+
+    builder_src = (
+        pathlib.Path(__file__).resolve().parents[2] / "bioengine" / "apps" / "builder.py"
+    )
+    tree = ast.parse(builder_src.read_text())
+
+    build_fn = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "build"
+        ),
+        None,
+    )
+    assert build_fn is not None, "control: build() was not found, so nothing was inspected"
+
+    stage_calls = [
+        node.lineno
+        for node in ast.walk(build_fn)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "_stage_source_on_nodes"
+    ]
+    assert len(stage_calls) == 1, (
+        f"expected exactly one _stage_source_on_nodes call in build(), found {len(stage_calls)}; "
+        "replicas read source the worker staged, so build() has to stage it"
+    )
+
+    flag_sets = [
+        node.lineno
+        for node in ast.walk(build_fn)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Subscript)
+            and getattr(t.value, "id", None) == "env_vars"
+            and getattr(t.slice, "id", None) == "_SOURCE_STAGED_KEY"
+            for t in node.targets
+        )
+    ]
+    assert len(flag_sets) == 1, (
+        f"expected exactly one env_vars[_SOURCE_STAGED_KEY] assignment in build(), found "
+        f"{len(flag_sets)}; without it no replica takes the credential-free branch and the "
+        "download token's removal starves every private-artifact deploy"
+    )
+    assert flag_sets[0] > stage_calls[0], (
+        f"the staged flag is set at line {flag_sets[0]}, before staging at line "
+        f"{stage_calls[0]}; the staging tasks would then be told source is already staged and "
+        "would skip their own re-sync"
+    )
+
+
 def test_the_build_task_argument_no_longer_carries_the_token(monkeypatch):
     """``submit`` hands ``replica_env_vars`` to ``build_and_run_application``.
 
