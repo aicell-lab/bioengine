@@ -894,6 +894,7 @@ class TestGetTrainingUrlsServesRegions:
         "dataset_paths": ["0", "1"],
         "axis_roles": {"y": 1, "x": 2, "c": 0},
         "level0_shape": [3, 600, 800],
+        "axes": ["c", "y", "x"],
     }
     REGION = {"x": 16, "y": 32, "width": 64, "height": 48}
 
@@ -1017,3 +1018,98 @@ class TestGetTrainingUrlsServesRegions:
         }
         with pytest.raises(ValueError, match="remote-stem"):
             await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+
+    async def test_the_refusal_tells_the_owner_to_RE_IMPORT_not_to_annotate(
+        self, trainer
+    ):
+        """The message is the whole value of the refusal, and the first version
+        of it gave the wrong instruction.
+
+        Every NGFF stem imported before the layout was recorded lands here. It
+        is correctly refused, but telling its owner that "a remote OME-Zarr
+        image is trainable as imported" describes exactly the stem in front of
+        them and leaves them nothing to do. What fixes it is re-importing the
+        source, because that is when the layout is captured.
+        """
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(with_layout=False),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        with pytest.raises(ValueError) as err:
+            await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        msg = str(err.value)
+        assert "re-import" in msg, f"the repair is not stated: {msg}"
+        assert "older version" in msg, f"the cause is not named: {msg}"
+
+    async def test_the_axis_NAMES_reach_the_trainer(self, trainer):
+        """Not decoration. The reader refuses a z-stack it cannot resolve a
+        plane for, and it can only name the axis — or accept a plane for it —
+        if it knows the axis is called z. The y/x/c roles alone say which axes
+        are spatial and nothing about what the others are."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        rows = {r["stem"]: r for r in out["train"]}
+        assert rows["remote-stem"]["image_source"]["axes"] == ["c", "y", "x"]
+
+    async def test_a_CREDENTIALED_store_reaches_the_trainer_with_its_credential(
+        self, trainer
+    ):
+        """Without this the training path fails at its first chunk GET, on
+        exactly the stores the import flow accepted a credential for.
+
+        The credential is deliberately NOT in the artifact (design §12), so a
+        reference assembled from the manifest alone cannot open the store. The
+        browser path splices it in on the way out of ``get_image_url``; this is
+        the same splice on the way out of here, and the second assertion is the
+        one that keeps it from becoming a leak: the manifest the artifact holds
+        must still be untokened afterwards.
+        """
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        trainer._state["meta"]["ngff_credentials"] = {ROOT: "tok-abc"}
+
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        src = {r["stem"]: r for r in out["train"]}["remote-stem"]["image_source"]
+        assert (
+            "/t/tok-abc/" in src["store_root"]
+        ), f"the credential did not reach the trainer: {src['store_root']}"
+        assert src["store_root"] == bc.apply_store_credential(ROOT, "tok-abc")
+
+        stored = trainer._tstate["manifest"]["remote-stem"]["source"]["store_root"]
+        assert "tok-abc" not in stored, (
+            "the splice wrote the credential back into the manifest entry, which "
+            f"is what is persisted to the artifact: {stored}"
+        )
+
+    async def test_an_uncredentialed_store_is_handed_over_unchanged(self, trainer):
+        """The control. A splice that rewrote every root would pass the test
+        above while breaking every public store."""
+        trainer._tstate["manifest"] = {
+            "remote-stem": self._remote(),
+            "local-stem": {
+                "state": bc.IMAGE_STATE_LOCAL,
+                "path": "images/local-stem.tif",
+            },
+        }
+        # A credential recorded for a DIFFERENT store must not be applied here.
+        trainer._state["meta"]["ngff_credentials"] = {
+            "https://other.invalid/zarr/": "tok-xyz"
+        }
+        out = await trainer.get_training_urls("ws/ds", "lbl", "sp", context=None)
+        src = {r["stem"]: r for r in out["train"]}["remote-stem"]["image_source"]
+        assert src["store_root"] == ROOT
+        assert "/t/" not in src["store_root"]

@@ -855,7 +855,7 @@ class AnnotationBroker:
         without downloading the image. ONLY stems that are members of the split
         are included, partitioned by its train/test lists."""
         artifact_id = self._canonical_id(artifact_id)
-        self._require_role(context, artifact_id, "manager")
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         split = await self._read_split_or_raise(artifact_id, label, split_name)
         train_stems = set(split.get("train") or [])
         test_stems = set(split.get("test") or [])
@@ -914,10 +914,29 @@ class AnnotationBroker:
             raise ValueError(
                 f"Split '{split_name}' contains {len(unreadable)} image(s) that can "
                 f"neither be read as a region nor fetched as a file: "
-                f"{', '.join(unreadable)}. A remote OME-Zarr image is trainable as "
-                f"imported; anything else has to be opened in the annotator once to "
-                f"materialise it."
+                f"{', '.join(unreadable)}. A remote OME-Zarr image is trainable "
+                f"without materialising only if its store layout was recorded when "
+                f"it was imported, which an image imported by an older version of "
+                f"this service has not got: re-import those sources, or open each "
+                f"one in the annotator once to materialise it."
             )
+
+        # The credential is spliced in HERE, on the way out, exactly as the
+        # browser path does it in get_image_url -- and for the same reason: it
+        # is never stored in the artifact (design §12), so a reference built
+        # from the manifest alone cannot open a credentialed store. Without
+        # this the training path fails at its first chunk GET on precisely the
+        # stores the import flow went to the trouble of accepting a credential
+        # for.
+        credentials = meta.get("ngff_credentials") or {}
+        if credentials:
+            for src in region_sources.values():
+                if src is None:
+                    continue
+                root = src.get("store_root") or ""
+                src["store_root"] = core.apply_store_credential(
+                    root, credentials.get(root)
+                )
 
         sem = asyncio.Semaphore(16)
 
@@ -1600,6 +1619,7 @@ class AnnotationBroker:
                 "dataset_paths": probe["dataset_paths"],
                 "axis_roles": probe["axis_roles"],
                 "level0_shape": probe["level0_shape"],
+                "axes": probe["axes"],
             },
         )
 

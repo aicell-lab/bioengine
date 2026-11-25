@@ -884,6 +884,7 @@ def remote_image_entry(
     fetched_at: Optional[str] = None,
     region: Optional[Dict[str, int]] = None,
     layout: Optional[Dict[str, Any]] = None,
+    planes: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """A ``remote`` manifest entry.
 
@@ -907,6 +908,12 @@ def remote_image_entry(
             "content_hint": content_hint,
         },
     }
+    if planes:
+        # Which slice of each non-spatial axis the annotation belongs to, by
+        # axis NAME. A z-stack has no single answer and a pixel reader must not
+        # invent one: see ngff_region.region_index, which refuses an axis of
+        # size > 1 with nothing recorded here.
+        entry["source"]["planes"] = {str(k): int(v) for k, v in planes.items()}
     if layout:
         # The store's shape, recorded at import because the probe is already in
         # hand here. A reader that wants pixels needs the level-0 dataset path
@@ -921,6 +928,11 @@ def remote_image_entry(
             "dataset_paths": [str(p) for p in (layout.get("dataset_paths") or [])],
             "axis_roles": dict(layout.get("axis_roles") or {}),
             "level0_shape": [int(n) for n in (layout.get("level0_shape") or [])],
+            # The axis NAMES, not just the y/x/c roles. Without them a reader
+            # can see that an axis is neither y, x nor c but cannot tell
+            # whether it is z, t or something else, so it can neither name the
+            # axis in a refusal nor accept a plane for it.
+            "axes": [str(a) for a in (layout.get("axes") or [])],
         }
     if dtype:
         entry["dtype"] = dtype
@@ -987,6 +999,11 @@ def ngff_region_source(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, An
         "dataset_paths": list(layout["dataset_paths"]),
         "axis_roles": dict(roles),
         "level0_shape": list(layout["level0_shape"]),
+        # Absent for a stem imported before axis names were recorded. Passed
+        # through as [] rather than omitted so the reader's refusal can say the
+        # names are missing, which is the actionable form of the problem.
+        "axes": [str(a) for a in (layout.get("axes") or [])],
+        "planes": source.get("planes") or None,
     }
 
 

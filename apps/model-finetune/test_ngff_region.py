@@ -146,6 +146,133 @@ def test_axis_roles_pointing_outside_the_array_are_refused():
         nr.region_index({"y": 0, "x": 7, "c": None}, 2, [10, 20], None)
 
 
+# ── which plane, for an axis that has more than one ──────────────────────────
+#
+# This block exists because of a measured defect, not a hypothetical one. The
+# annotator displays the MIDDLE slice of a z-stack, this module used to take
+# index 0 for every non-spatial axis, and nothing downstream could tell: the
+# mask rasterises non-empty, the shapes agree, and the run reports success
+# having trained polygons from one plane against pixels from another.
+
+BOX = {"x": 5, "y": 7, "width": 11, "height": 13}
+AXES_TCZYX = ["t", "c", "z", "y", "x"]
+
+
+def test_a_multi_slice_z_axis_with_no_plane_is_REFUSED():
+    """THE case. A 9-slice stack, annotated on whichever slice the viewer showed.
+
+    The refusal has to name the axis, its size, and that 0 is not assumed —
+    a message saying only "cannot read" would send the reader looking at the
+    store rather than at the missing plane.
+    """
+    with pytest.raises(nr.RegionSourceError) as err:
+        nr.region_index(ROLES_TCZYX, 5, [1, 3, 9, 1000, 2000], BOX, axes=AXES_TCZYX)
+    msg = str(err.value)
+    assert "'z'" in msg, f"the axis is not named: {msg}"
+    assert "9 elements" in msg, f"the size is not given: {msg}"
+    assert "Index 0 is NOT" in msg, f"the wrong default is not ruled out: {msg}"
+    assert "middle slice" in msg, f"the annotator's convention is not named: {msg}"
+    assert "planes=" in msg, f"the repair is not stated: {msg}"
+
+
+def test_a_named_plane_is_taken():
+    """The control for the refusal above: with the plane given, the SAME call
+    reads the slice that was asked for."""
+    idx = nr.region_index(
+        ROLES_TCZYX, 5, [1, 3, 9, 1000, 2000], BOX, axes=AXES_TCZYX, planes={"z": 4}
+    )
+    assert idx == (0, slice(None), 4, slice(7, 20), slice(5, 16))
+
+
+def test_a_singleton_axis_needs_no_plane():
+    """Not a choice, so not a refusal. Most OME-Zarr stores from a slide scanner
+    are 5D with t and z of size 1, and demanding a plane for them would make the
+    common case unreadable for nothing."""
+    idx = nr.region_index(ROLES_TCZYX, 5, [1, 3, 1, 1000, 2000], BOX, axes=AXES_TCZYX)
+    assert idx == (0, slice(None), 0, slice(7, 20), slice(5, 16))
+
+
+def test_a_plane_outside_its_axis_is_refused_with_the_range():
+    with pytest.raises(nr.RegionSourceError) as err:
+        nr.region_index(
+            ROLES_TCZYX,
+            5,
+            [1, 3, 9, 1000, 2000],
+            BOX,
+            axes=AXES_TCZYX,
+            planes={"z": 9},
+        )
+    assert "0..8" in str(err.value)
+
+
+def test_a_multi_slice_axis_with_no_recorded_NAME_is_refused_saying_so():
+    """A stem imported before axis names were recorded reaches here with no
+    names. It must still refuse — the ambiguity is identical — but the repair is
+    different, so the message has to be too: no plane can be named for an axis
+    whose name is unknown."""
+    with pytest.raises(nr.RegionSourceError) as err:
+        nr.region_index(ROLES_TCZYX, 5, [1, 3, 9, 1000, 2000], BOX)
+    msg = str(err.value)
+    assert "at position 2" in msg, f"the axis is not located: {msg}"
+    assert "re-import" in msg, f"the repair is not stated: {msg}"
+
+
+def test_axes_that_disagree_with_the_rank_are_refused():
+    """``axes`` and ``shape`` come from one probe. If they describe arrays of
+    different rank, neither can be trusted to say which axis is z."""
+    with pytest.raises(nr.RegionSourceError, match="different array"):
+        nr.region_index(ROLES_2D, 2, [10, 20], None, axes=["t", "y", "x"])
+
+
+def test_a_plane_survives_parse_and_a_bad_one_does_not():
+    ref = nr.parse_region_source(
+        {"kind": "ngff", "store_root": "https://x/y/", "planes": {"z": 4}}
+    )
+    assert ref["planes"] == {"z": 4}
+    assert (
+        nr.parse_region_source({"kind": "ngff", "store_root": "https://x/y/"})["planes"]
+        is None
+    ), "an absent planes mapping must stay None rather than becoming {}"
+
+
+@pytest.mark.parametrize(
+    "planes, expected",
+    [
+        ("z=4", "mapping"),
+        ({"z": "4"}, "not an integer"),
+        ({"z": 1.5}, "not an integer"),
+        ({"z": True}, "not an integer"),  # bool is an int in Python; it is not an index
+        ({"z": -1}, "negative"),
+    ],
+)
+def test_a_malformed_planes_mapping_is_refused(planes, expected):
+    with pytest.raises(nr.RegionSourceError, match=expected):
+        nr.parse_region_source(
+            {"kind": "ngff", "store_root": "https://x/y/", "planes": planes}
+        )
+
+
+def test_the_plane_is_refused_BEFORE_the_store_is_opened():
+    """A wrong-plane reference must cost no requests. The opener here raises if
+    it is called at all, so a refusal that happened after the open would fail
+    with that error instead of the plane one."""
+
+    def _never(_root, _path):
+        raise AssertionError("the store was opened despite an unresolvable plane")
+
+    with pytest.raises(nr.RegionSourceError, match="no plane was given"):
+        nr.read_region(
+            {"kind": "ngff", "store_root": "https://x/y/", "region": BOX},
+            {
+                "dataset_paths": ["0"],
+                "axis_roles": ROLES_TCZYX,
+                "level0_shape": [1, 3, 9, 1000, 2000],
+                "axes": AXES_TCZYX,
+            },
+            opener=_never,
+        )
+
+
 # ── layout normalisation ─────────────────────────────────────────────────────
 
 

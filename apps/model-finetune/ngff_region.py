@@ -77,6 +77,20 @@ def parse_region_source(source: Any) -> Dict[str, Any]:
             )
         if region["x"] < 0 or region["y"] < 0:
             raise RegionSourceError("region origin is negative.")
+    planes = source.get("planes")
+    if planes is not None:
+        if not isinstance(planes, dict):
+            raise RegionSourceError("planes must be a mapping of axis name to index.")
+        cleaned: Dict[str, int] = {}
+        for key, value in planes.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise RegionSourceError(
+                    f"planes[{str(key)!r}]={value!r} is not an integer index."
+                )
+            if value < 0:
+                raise RegionSourceError(f"planes[{str(key)!r}]={value} is negative.")
+            cleaned[str(key)] = int(value)
+        planes = cleaned
     return {
         "kind": NGFF_SOURCE_KIND,
         "store_root": str(source["store_root"]).strip(),
@@ -84,6 +98,10 @@ def parse_region_source(source: Any) -> Dict[str, Any]:
         # None means the whole image, which is how the broker records it: its
         # normalise_region returns None when the box covers the store.
         "region": region,
+        # Which slice of each non-spatial axis the annotation belongs to. None
+        # is NOT "the first one" -- see region_index, which refuses rather than
+        # choose.
+        "planes": planes,
     }
 
 
@@ -92,14 +110,29 @@ def region_index(
     rank: int,
     shape: Sequence[int],
     region: Optional[Dict[str, int]],
+    axes: Optional[Sequence[str]] = None,
+    planes: Optional[Dict[str, int]] = None,
 ) -> Tuple[Any, ...]:
     """The index expression that selects *region* from a level-0 array.
 
     ``axis_roles`` is the broker's ``{"y", "x", "c"}`` axis indices. Every axis
-    that is not y, x or c is reduced to its FIRST element rather than kept: a
-    5D tczyx store would otherwise come back with singleton t and z dimensions
+    that is not y, x or c is reduced to ONE element rather than kept: a 5D
+    tczyx store would otherwise come back with singleton t and z dimensions
     that neither trainer accepts. The channel axis is kept whole, because
     dropping it would silently turn an RGB crop into one band.
+
+    WHICH element, for an axis of size > 1, is not this module's to guess, and
+    guessing it was a real defect rather than a hypothetical one. The annotator
+    displays the MIDDLE slice of a z-stack (``Math.floor(size / 2)`` in the
+    frontend's layout code), so an index of 0 pairs the polygons drawn on one
+    plane with the pixels of another. Nothing downstream catches that: the mask
+    is non-empty, so the empty-mask guard does not fire, the shapes match, and
+    training reports success having learnt a plane the annotator never saw.
+
+    So an axis of size > 1 with no entry in *planes* is REFUSED. Size 1 needs no
+    choice and is taken. *planes* maps an axis NAME to its index, which needs
+    *axes* to resolve; both come from the probe, through the layout recorded at
+    import. A store with only y, x and c reaches none of this.
     """
     y, x = axis_roles.get("y"), axis_roles.get("x")
     c = axis_roles.get("c")
@@ -136,6 +169,14 @@ def region_index(
             )
         y_sel, x_sel = slice(y0, y1), slice(x0, x1)
 
+    names = [str(n) for n in axes] if axes is not None else []
+    if names and len(names) != rank:
+        raise RegionSourceError(
+            f"axes {names!r} has {len(names)} entries for an array of rank "
+            f"{rank}; the probe describes a different array."
+        )
+    want = dict(planes or {})
+
     out: List[Any] = []
     for axis in range(rank):
         if axis == y:
@@ -145,8 +186,46 @@ def region_index(
         elif isinstance(c, int) and axis == c:
             out.append(slice(None))
         else:
-            out.append(0)
+            out.append(_plane_index(axis, int(shape[axis]), names, want))
     return tuple(out)
+
+
+def _plane_index(
+    axis: int, size: int, names: Sequence[str], planes: Dict[str, int]
+) -> int:
+    """The one index to take along a non-spatial axis, or raise.
+
+    Size 1 is not a choice. Any larger size needs the caller to say which plane
+    the annotation came from; see ``region_index``'s docstring for why a default
+    of 0 is wrong and silent.
+    """
+    name = str(names[axis]) if axis < len(names) else ""
+    if size == 1:
+        return 0
+    if name and name in planes:
+        index = int(planes[name])
+        if not (0 <= index < size):
+            raise RegionSourceError(
+                f"planes[{name!r}]={index} is outside axis {name!r}, which has "
+                f"{size} elements (0..{size - 1})."
+            )
+        return index
+    label = f"{name!r}" if name else f"at position {axis}"
+    known = (
+        f"Its name is not in the recorded axes ({list(names)!r}), so a plane "
+        f"cannot be named for it; re-import the source so the layout records "
+        f"its axis names."
+        if not name
+        else f"Pass planes={{{name!r}: <index>}} on the region reference."
+    )
+    raise RegionSourceError(
+        f"axis {label} has {size} elements and no plane was given, so there is "
+        f"no way to tell which one the annotation was drawn on. Index 0 is NOT "
+        f"assumed: the annotator shows the middle slice, so index 0 would pair "
+        f"the polygons with a different plane's pixels, the mask would still be "
+        f"non-empty, and the run would report success having trained on the "
+        f"wrong image. {known}"
+    )
 
 
 def to_hw_or_hwc(array: Any, axis_roles: Dict[str, Any], rank: int) -> Any:
@@ -233,7 +312,17 @@ def read_region(
                 f"a whole-level read. Pass a region, or allow_whole_level=True if "
                 f"the whole level really is wanted."
             )
-    index = region_index(probe["axis_roles"], len(shape), shape, ref["region"])
+    # axes and planes are passed so a multi-plane store refuses rather than
+    # reading plane 0 -- and refuses BEFORE the open below, so a wrong-plane
+    # reference costs no requests.
+    index = region_index(
+        probe["axis_roles"],
+        len(shape),
+        shape,
+        ref["region"],
+        axes=probe.get("axes"),
+        planes=ref["planes"],
+    )
 
     if opener is None:
         opener = _zarr_opener
