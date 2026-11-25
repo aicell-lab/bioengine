@@ -1,0 +1,173 @@
+"""The artifact-backed run record: what is persisted, and where.
+
+Run history lives on the worker's own disk, so two replicas of one app list
+different runs. The fix is one app-owned artifact, written with the app's own
+credential. Measured on creation: `bioimage-io/model-finetune-runs` is
+standalone (no parent, which is what makes "private" mean anything -- a parent
+decides a child's visibility), carries no `"*"` or `"@"` grant, and refuses an
+anonymous caller on RPC `read`, RPC `list_files` and HTTP (403).
+
+These tests cover the parts that need no network: which fields are persisted,
+where a record goes, and that the artifact id cannot be chosen by a caller.
+"""
+
+import ast
+import pathlib
+import re
+
+import pytest
+
+import training
+
+
+# ── the artifact id is not an input ──────────────────────────────────────────
+
+
+def test_the_runs_artifact_id_is_FIXED_in_the_app():
+    assert training.RUNS_ARTIFACT_ID == "bioimage-io/model-finetune-runs"
+
+
+def test_NO_PUBLISHED_METHOD_TAKES_AN_ARTIFACT_ID_FOR_THE_RUNS_RECORD():
+    """The finding this design closes, closed by removal rather than validation.
+
+    The app writes the runs artifact with its OWN credential. A caller who
+    could name that artifact could make the app write anywhere the credential
+    reaches, and an allow-list of acceptable ids is a thing to get wrong. So
+    the id is not a parameter anywhere, and this reads the source to say so --
+    including for methods nobody has written yet.
+    """
+    src = pathlib.Path(__file__).with_name("entry.py").read_text()
+    tree = ast.parse(src)
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = {a.arg for a in node.args.args} | {a.arg for a in node.args.kwonlyargs}
+        body = ast.get_source_segment(src, node) or ""
+        if "RUNS_ARTIFACT_ID" not in body:
+            continue
+        if "artifact_id" in params:
+            offenders.append(node.name)
+    assert offenders == [], (
+        f"these methods touch the runs artifact AND take an artifact_id: "
+        f"{offenders}. The id must not be a caller's choice."
+    )
+
+
+# ── what a record carries ────────────────────────────────────────────────────
+
+
+def test_the_record_STRIPS_every_private_field():
+    status = {
+        "status": "COMPLETED",
+        "owner": "github|1",
+        "owner_anonymous": False,
+        "n_epochs": 3,
+    }
+    rec = training.run_record("2026-11-25-120000-abcdef12", status)
+    for field in training.PRIVATE_STATUS_FIELDS:
+        assert field not in rec, f"{field} survived into the persisted record"
+    assert rec["status"] == "COMPLETED"
+    assert rec["n_epochs"] == 3
+
+
+def test_a_field_ADDED_to_PRIVATE_STATUS_FIELDS_is_stripped_too(monkeypatch):
+    """The test the plan asks for, and the reason it exists.
+
+    This app has already had a field stripped on one path and published on
+    another. `run_record` iterates the tuple rather than naming fields, so
+    adding one to the tuple must be enough -- and this fails if somebody
+    reintroduces an explicit list.
+    """
+    monkeypatch.setattr(
+        training,
+        "PRIVATE_STATUS_FIELDS",
+        training.PRIVATE_STATUS_FIELDS + ("a_new_private_field",),
+    )
+    rec = training.run_record(
+        "2026-11-25-120000-abcdef12",
+        {"status": "TRAINING", "a_new_private_field": "secret"},
+    )
+    assert "a_new_private_field" not in rec, (
+        "a field added to PRIVATE_STATUS_FIELDS was still persisted, so the "
+        "stripping is naming fields instead of iterating the tuple"
+    )
+
+
+def test_the_record_is_SELF_DESCRIBING():
+    """A record read on its own must say which run it is, not rely on its key."""
+    rec = training.run_record("2026-11-25-120000-abcdef12", {"status": "FAILED"})
+    assert rec["session_id"] == "2026-11-25-120000-abcdef12"
+
+
+def test_an_empty_or_missing_status_does_not_raise():
+    assert training.run_record("2026-11-25-120000-abcdef12", {})["session_id"]
+    assert training.run_record("2026-11-25-120000-abcdef12", None)["session_id"]
+
+
+# ── where a record goes ──────────────────────────────────────────────────────
+
+
+def test_the_path_is_derived_from_a_VALIDATED_session_id():
+    p = training.run_record_path("2026-11-25-120000-abcdef12")
+    assert p == "runs/2026-11-25-120000-abcdef12.json", p
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["../escape", "a/b", "..", ".", "", "with space", "sub/dir/x", None, 7],
+)
+def test_a_session_id_THAT_IS_NOT_ONE_cannot_become_a_path(bad):
+    """The id becomes a path component inside the artifact, so traversal and
+    separators have to be impossible rather than unlikely."""
+    with pytest.raises((training.InvalidSessionId, TypeError, AttributeError)):
+        training.run_record_path(bad)
+
+
+# ── the context guard, generalised ───────────────────────────────────────────
+
+
+def _entry_class():
+    import entry
+
+    for obj in vars(entry).values():
+        if isinstance(obj, type) and obj.__name__ == "EntryApp":
+            return obj
+        inner = getattr(obj, "__wrapped_class__", None) or getattr(
+            obj, "func_or_class", None
+        )
+        if isinstance(inner, type) and inner.__name__ == "EntryApp":
+            return inner
+    raise AssertionError("EntryApp not found")
+
+
+def test_NO_METHOD_WITH_A_CONTEXT_PARAMETER_PUBLISHES_IT():
+    """Generalised from the single-method guard, because the risk is general.
+
+    A method declared `@bioengine.method` (without `context=True`) that still
+    takes a `context` parameter publishes `context` in its schema and is never
+    handed one -- so every caller looks anonymous and nothing raises. The
+    existing guard asserted this for one method by name. This asserts it for
+    EVERY method that takes a context, so a method written next year is
+    covered without anybody remembering to add it here.
+    """
+    cls = _entry_class()
+    checked = []
+    offenders = []
+    for name in dir(cls):
+        if name.startswith("_"):
+            continue
+        fn = getattr(cls, name, None)
+        schema = getattr(fn, "__schema__", None)
+        if not schema:
+            continue
+        props = (schema.get("parameters") or {}).get("properties") or {}
+        checked.append(name)
+        if "context" in props:
+            offenders.append(name)
+    assert checked, "no method schemas were found at all; this test read nothing"
+    assert offenders == [], (
+        f"these methods publish `context` in their schema: {offenders}. That "
+        "means @bioengine.method was used without context=True, so Hypha never "
+        "injects a caller and every request looks anonymous. Nothing raises."
+    )

@@ -839,6 +839,57 @@ OWNERLESS_WORKSPACE = "bioimage-io"
 OWNERLESS_GRANTS = frozenset({"rw", "a"})
 
 
+# The artifact the app keeps run history in.
+#
+# FIXED HERE, and deliberately NOT a parameter of any method. The app writes
+# this artifact with its OWN credential, so a caller who could name the
+# artifact could make the app write anywhere that credential reaches. There is
+# no allow-list to get wrong because there is nothing to validate: the id is
+# not an input. Measured on creation 2026-11-25: standalone (no `parent_id`,
+# which is what makes "private" mean anything -- a parent decides a child's
+# visibility), permissions `{<app>: "*"}` with no `"*"` or `"@"` key, and an
+# anonymous caller refused on RPC `read`, RPC `list_files` and HTTP (403).
+#
+# A *dataset* write on a caller's behalf is the opposite case and keeps its own
+# rule: it needs a caller token, because it acts as the caller. Stated here
+# because the two rules sit next to each other in this app and a reader should
+# not have to infer which applies.
+RUNS_ARTIFACT_ID = "bioimage-io/model-finetune-runs"
+
+# One run's entry in that artifact: the status document minus anything private.
+RUN_RECORD_PATH_TEMPLATE = "runs/{session_id}.json"
+
+
+def run_record(session_id: str, status: Dict[str, Any]) -> Dict[str, Any]:
+    """The record persisted for *session_id*, with private fields removed.
+
+    Strips exactly :data:`PRIVATE_STATUS_FIELDS`, by iterating that tuple
+    rather than naming the fields again. Naming them twice is how a field
+    added to the tuple ends up stripped on one path and published on the
+    other, which is the failure this app has already had once on the listing
+    path -- so there is a test that adds a field to the tuple and fails if
+    this function does not strip it.
+
+    The session id is written INTO the record as well as being the key, so a
+    record read on its own is self-describing.
+    """
+    out = {k: v for k, v in (status or {}).items() if k not in PRIVATE_STATUS_FIELDS}
+    out["session_id"] = session_id
+    return out
+
+
+def run_record_path(session_id: str) -> str:
+    """Where one run's record lives inside the runs artifact.
+
+    Validated, not formatted blindly: the session id becomes a path component,
+    so a value that is not a session id must be impossible rather than
+    unlikely. `validate_session_id` already refuses traversal and separators,
+    and is the same check every on-disk path goes through -- reused rather
+    than restated, because a second copy of the rule is how the two drift.
+    """
+    return RUN_RECORD_PATH_TEMPLATE.format(session_id=validate_session_id(session_id))
+
+
 def caller_is_workspace_admin(
     context: Any, *, workspace: str = OWNERLESS_WORKSPACE
 ) -> bool:
