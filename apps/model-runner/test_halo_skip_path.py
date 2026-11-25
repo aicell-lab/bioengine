@@ -19,7 +19,7 @@ The dispatch is **not importable code**. It lives inside
 run as a separate process — and inside that script it sits inline in a ``for``
 loop rather than in a function, so there is no callable to drive. The script's
 own imports (``bioimageio.core``, ``bioimageio.spec``) are also absent from the
-CI image, which is why importing it is not an option either.
+CI image, so importing it is not an option either.
 
 So the branch itself is pinned by parsing the shipped source and asserting
 *about the one site*, via ``ast.get_source_segment``. A whole-file grep cannot do
@@ -149,13 +149,12 @@ def test_a_fixed_extent_model_is_not_gated_behind_cellpose() -> None:
     true is that a model with FIXED space extents reaches the skip pair without
     being Cellpose.
 
-    An earlier version of this test asserted ``not isinstance(branch.test,
-    ast.BoolOp)`` — i.e. no conjunct at all. That was wrong twice over: it
-    pinned the syntax rather than the behaviour, and it would have gone RED on
-    the CORRECT narrower guard, which must exclude parameterized non-Cellpose
-    models and therefore needs a conjunct. Review round 1 refused on exactly
-    that. So: assert what the guard must ADMIT and what it must EXCLUDE, and let
-    its shape be whatever expresses that.
+    Asserting ``not isinstance(branch.test, ast.BoolOp)`` — no conjunct at all —
+    is wrong twice over: it pins the syntax rather than the behaviour, and it
+    goes RED on the CORRECT narrower guard, which must exclude parameterized
+    non-Cellpose models and therefore needs a conjunct. So: assert what the
+    guard must ADMIT and what it must EXCLUDE, and let its shape be whatever
+    expresses that.
     """
     branch = _fits_whole_branch(SCRIPT)
     src = ast.get_source_segment(SCRIPT, branch.test) or ""
@@ -181,7 +180,7 @@ def test_a_fixed_extent_model_is_not_gated_behind_cellpose() -> None:
 
 
 def test_the_guard_excludes_parameterized_non_cellpose_models() -> None:
-    """Review round 1, finding 2: the narrowing is REQUIRED, not optional.
+    """The narrowing is REQUIRED, not optional.
 
     ``_fits_whole`` also returns True for a ParameterizedSize axis that is
     on-grid and <= DINO_BLOCK_SIZE. For such a model the padding is the spec's
@@ -191,8 +190,8 @@ def test_the_guard_excludes_parameterized_non_cellpose_models() -> None:
     for models that already worked.
 
     So the guard must consult something beyond ``_fits_whole`` that is false for
-    a parameterized model. Goes RED on the over-broad `elif _fits_whole(...)`
-    alone, which is what round 1 refused.
+    a parameterized model. Goes RED on the over-broad ``elif _fits_whole(...)``
+    alone.
     """
     branch = _fits_whole_branch(SCRIPT)
     src = ast.get_source_segment(SCRIPT, branch.test) or ""
@@ -408,7 +407,7 @@ def test_a_non_space_axis_is_ignored_by_the_predicate() -> None:
     assert fits_whole(with_channel, _sample(256, 256)) is True
 
 
-# --- the two cases the broad fix got wrong, and the one round 2 refused ------
+# --- the three cases a broad skip-padding guard gets wrong -------------------
 
 
 def _load_fn(name: str, dino_block_size: int = 384):
@@ -545,16 +544,15 @@ def test_a_parameterized_model_is_never_refused_by_the_too_small_check() -> None
 
 
 def test_the_refusal_is_reached_only_AFTER_the_cellpose_branch() -> None:
-    """Round 2 finding A, pinned structurally.
+    """The refusal sits after the Cellpose branch, pinned structurally.
 
     The refusal must NOT run before the dispatch: a Cellpose fixed-extent model
-    with a large input has to reach ``elif cellpose:`` and tile. Goes RED on the
-    round-2 code, where the raise sat above ``if default_blocksize_parameter:``.
+    with a large input has to reach ``elif cellpose:`` and tile. Goes RED if the
+    raise is hoisted above ``if default_blocksize_parameter:``.
     """
-    # The CALL, not the def. An earlier version of this test used the bare name
-    # and matched `def _fixed_extent_too_small(...)` itself, which of course
-    # sits above the dispatch — a pattern matching the shape I pictured rather
-    # than the thing I meant.
+    # Anchor on the CALL, not the def: the bare name also matches
+    # `def _fixed_extent_too_small(...)` itself, which sits above the dispatch,
+    # so an assertion keyed on it would hold even with the call deleted.
     CALL = "_fixed_extent_too_small(pipeline.model_description"
     chain_src = SCRIPT[SCRIPT.index("if default_blocksize_parameter:") :]
     assert CALL in chain_src, "the too-small check is never called in the dispatch"
@@ -597,13 +595,12 @@ def test_a_fixed_non_cellpose_model_that_does_not_fit_goes_to_BLOCKING() -> None
     the model refuse the padded size — the original 576 defect, one size up.
     """
     # Scope to the ONE chain link whose body holds the refusal, and read only
-    # that link's BODY. An earlier version of this test walked every ast.If and
-    # matched the first whose SOURCE contained the call -- but the outermost If
-    # of an if/elif chain spans the whole chain, so it saw
+    # that link's BODY. Walking every ``ast.If`` and taking the first whose
+    # SOURCE contains the call is not enough: the outermost If of an if/elif
+    # chain spans the whole chain, so it also sees
     # `predict_sample_with_blocking` from the blocksize and cellpose branches
-    # and passed even when this branch stopped tiling. The mutation that
-    # swapped this branch to predict_sample_without_blocking was GREEN 25/25
-    # against it.
+    # and holds even if THIS branch stops tiling — a mutation swapping this
+    # branch to predict_sample_without_blocking stays green against it.
     link = None
     for node in ast.walk(ast.parse(SCRIPT)):
         if not isinstance(node, ast.If):

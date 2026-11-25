@@ -246,9 +246,9 @@ def _fixed_extent_too_small(descr, sample):
     # block_shape - sum(halo)), and ``get_io_sample_block_metas`` uses the
     # model's own fixed axis sizes as the block shape. So a fixed-256 model gets
     # 256-px tiles, which is exactly how the Cellpose path has always worked.
-    # An earlier version of this helper refused on ANY mismatch and told the
-    # caller a fixed model "cannot be tiled" -- that was false, and acting on it
-    # made Cellpose-SAM refuse every image over 256 px.
+    # So refusing on ANY mismatch would be wrong, not merely conservative: a
+    # fixed model CAN be tiled, and rejecting every Cellpose-SAM image over
+    # 256 px is the cost of pretending otherwise.
     #
     # Smaller cannot be rescued the same way: there is no way to tile up to a
     # size the input does not have, and padding would make the tensor the wrong
@@ -366,11 +366,11 @@ for line in sys.stdin:
             # Untouched on purpose. A Cellpose model that does not fit whole has
             # always tiled here, and that includes a FIXED-extent one such as
             # Cellpose-SAM: core carves the halo out of the block, so a fixed-256
-            # model is fed 256-px tiles. An earlier version of this change
-            # refused before reaching this branch and so refused every
+            # model is fed 256-px tiles. Any fixed-extent refusal must therefore
+            # sit AFTER this branch: placed before it, it rejects every
             # Cellpose-SAM image over 256 px. A too-small input on this path
-            # still fails inside core rather than with an actionable message;
-            # that is pre-existing and belongs to the small-image row, not here.
+            # still fails inside core rather than with an actionable message,
+            # which is pre-existing and out of scope here.
             result = pipeline.predict_sample_with_blocking(
                 sample,
                 ns=_block_size_ns(pipeline.model_description, sample),
