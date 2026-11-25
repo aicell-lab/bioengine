@@ -54,7 +54,7 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
             if n is not None
             else {}
         )
-        training.write_status(session_id, **extra)
+        training.write_status_best_effort(session_id, **extra)
 
 
 def main(session_id: str) -> None:
