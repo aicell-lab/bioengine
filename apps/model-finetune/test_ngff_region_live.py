@@ -4,11 +4,13 @@ This file exists because of two findings against the first version of this work,
 and it is written to fail if either comes back.
 
 1. THE PRODUCTION PATH COULD NOT RUN. ``requirements-entry.txt`` listed ``zarr``
-   alone, measured with ``pip install --dry-run``. But zarr reaches an http(s)
-   store through fsspec's HTTPFileSystem, which needs fsspec, aiohttp and
-   requests, and none of them is a zarr dependency -- so every region read died
-   at its first open with ``ModuleNotFoundError: fsspec``. A dry run answers what
-   RESOLVES, never what WORKS; only exercising the real opener does.
+   alone, measured with ``pip install --dry-run``. A bare ``zarr`` resolves to
+   3.1.6, the one release declaring ``numpy>=2.0``, which replaced the worker
+   image's numpy 1.26.4 in the entry overlay and broke every numpy-1.x-compiled
+   module in that image -- including the pandas ``ray.serve`` imports, so the
+   replica died in its constructor and the deployment reported DEPLOY_FAILED with
+   no logs at all. A dry run answers what RESOLVES, never what WORKS; only
+   deploying it does. The pin is now ``zarr>=3.1,<3.1.6``.
 
 2. THE TESTS COULD NOT TELL A CROP FROM A FULL DOWNLOAD. Every test passed
    against a mutant that read all of level 0 and then sliced it, because the one
@@ -19,13 +21,16 @@ So the test below uses ``opener=None`` -- the default, the one that ships -- and
 COUNTS the chunks the server is asked for. A reader that fetches the level and
 slices locally fails it on the count, with the values still correct.
 
-WHY ``importorskip`` HERE, having argued against it elsewhere. CI installs the
-test and datasets requirements, not the entry's, so zarr is absent there and this
-file would otherwise ERROR at collection. The alternative is no test for the
-claim at all. The pure arithmetic stays in ``test_ngff_region.py``, which needs
-nothing and always runs; this file covers what only a real store can show, and
-its result is recorded on the row from a run in an environment that has the
-entry's dependencies.
+WHY ``importorskip`` HERE, having argued against it elsewhere -- and why the
+reason it used to give was wrong. It said zarr is absent in CI. zarr is NOT
+absent in CI: ``requirements-datasets.txt`` pins ``zarr==3.1.3`` and
+``test-suite.yml`` installs it, so these tests RUN there. They were failing
+rather than skipping, which is how the store being written against the wrong zarr
+major went unnoticed. The guard stays only so the file does not ERROR at
+collection in an environment with no zarr at all; it is not expected to fire in
+CI, and if it ever does, that is a finding about the environment and not a pass.
+The pure arithmetic stays in ``test_ngff_region.py``, which needs nothing and
+always runs; this file covers what only a served store can show.
 """
 
 from __future__ import annotations
@@ -38,8 +43,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-zarr = pytest.importorskip("zarr", reason="entry-env dependency; absent in CI")
-pytest.importorskip("fsspec", reason="entry-env dependency; absent in CI")
+zarr = pytest.importorskip("zarr", reason="entry-env dependency")
+# NO fsspec guard. There used to be one, and by the time it was removed it was
+# doing harm: the opener no longer reaches fsspec at all, so the guard could only
+# SKIP these tests for a reason that had stopped being true — and a skipped guard
+# and a passing one look the same in a CI summary.
 
 import ngff_region as nr  # noqa: E402  (after the skip guard, on purpose)
 

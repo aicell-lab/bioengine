@@ -25,7 +25,6 @@ that once let three skipped cases pass for a guard.
 from __future__ import annotations
 
 import re
-from collections.abc import MutableMapping as _MutableMapping
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 NGFF_SOURCE_KIND = "ngff"
@@ -439,91 +438,240 @@ class ShortStoreRead(RegionSourceError):
     """
 
 
-class LengthCheckedStore(_MutableMapping):
-    """A read-only Zarr store that supplies bytes and refuses a short body.
+# The zarr-3 ``Store`` subclass is built on FIRST USE, not at import time.
+#
+# This module must stay importable without zarr (there is a test pinning that),
+# and a subclass needs its base class at class-creation time, so the class body
+# cannot live at module scope. ``LengthCheckedStore`` below is therefore a
+# factory function with the same call shape as the class it returns.
+_LENGTH_CHECKED_STORE_CLASS: Optional[Any] = None
 
-    zarr keeps ALL of its indexing and decoding. This hands it the bytes for one
-    key and checks a single thing: that the body is as long as the server said it
-    would be.
 
-    **The measured reason it exists.** A chunk truncated mid-transfer decodes
-    WITHOUT raising, to the full chunk shape, with wrong content — and the first
-    pixels still match the source, so looking at the crop passes it. Both layers
-    were measured and both are blind: the decompressor does not notice, and the
-    HTTP layer underneath zarr does not notice either, even when the response
-    declares the full length. ``Content-Length`` is the last point at which the
-    truncation is still visible, which is why the check is here, on the BYTES, and
-    not on the image.
+def _length_checked_store_class() -> Any:
+    """The read-only zarr-3 store class, created once and cached."""
+    global _LENGTH_CHECKED_STORE_CLASS
+    if _LENGTH_CHECKED_STORE_CLASS is not None:
+        return _LENGTH_CHECKED_STORE_CLASS
 
-    A mismatch raises with the KEY and both lengths and never the URL: the store
-    root carries the credential as a path segment.
-    """
+    import asyncio
 
-    def __init__(self, root: str, fetch: Optional[Any] = None) -> None:
-        self._root = root if root.endswith("/") else root + "/"
-        self._fetch = fetch or _http_fetch
+    from zarr.abc.store import (
+        OffsetByteRequest,
+        RangeByteRequest,
+        Store,
+        SuffixByteRequest,
+    )
 
-    def __getitem__(self, key: str) -> bytes:
-        try:
-            status, body, declared = self._fetch(self._root + str(key))
-        except ShortStoreRead as exc:
-            # The transport caught it first — which is the common case and the
-            # stronger one. Re-raise as this module's error WITH the key, so the
-            # message names what failed rather than only how.
-            raise ShortStoreRead(
-                redact_store_credential(f"store key {key!r}: {exc}")
-            ) from None
-        if status == 404:
-            # Zarr omits a chunk that is entirely the fill value, so absence is
-            # data and must arrive as KeyError rather than as an error.
-            raise KeyError(key)
-        if not 200 <= int(status) < 300:
-            raise RegionSourceError(
-                redact_store_credential(f"store key {key!r} returned HTTP {status}")
+    class _LengthCheckedStore(Store):  # type: ignore[misc]
+        """A read-only Zarr store that supplies bytes and refuses a bad length.
+
+        zarr keeps ALL of its indexing and decoding. This hands it the bytes for
+        one key and checks a single thing: that as many bytes arrived on the wire
+        as the server said it would send.
+
+        **The measured reason it exists.** A chunk truncated mid-transfer decodes
+        WITHOUT raising, to the full chunk shape, with wrong content — and the
+        first pixels still match the source, so looking at the crop passes it.
+        Both layers underneath were measured and both are blind: the decompressor
+        does not notice a truncated stream, and zarr's own HTTP store does not
+        notice either, even when the response declares the full length.
+        ``Content-Length`` is the last point at which the truncation is still
+        visible, which is why the check is here, on the BYTES, and not on the
+        image.
+
+        **The comparison is against the bytes on the WIRE, which is not the same
+        as the bytes zarr gets.** ``Content-Length`` counts the ENCODED body. An
+        object served with ``Content-Encoding: gzip`` is decoded by httpx before
+        we see it, so comparing the decoded length against the declared one calls
+        a perfectly intact object "cut short" — measured, and it is why the fetch
+        reports the wire count separately. A long body is reported as long rather
+        than as short, for the same reason: the message has to describe what
+        happened.
+
+        A mismatch raises with the KEY and both lengths and never the URL: the
+        store root carries the credential as a path segment.
+        """
+
+        def __init__(self, root: str, fetch: Optional[Any] = None) -> None:
+            super().__init__(read_only=True)
+            self._root = root if root.endswith("/") else root + "/"
+            self._fetch = fetch or _http_fetch
+
+        # ── identity ──────────────────────────────────────────────────────
+        def __eq__(self, other: object) -> bool:
+            return (
+                isinstance(other, _LengthCheckedStore)
+                and other._root == self._root
             )
-        want: Optional[int]
-        try:
-            want = int(declared) if declared is not None else None
-        except (TypeError, ValueError):
-            want = None
-        if want is not None and len(body) != want:
-            raise ShortStoreRead(
-                redact_store_credential(
-                    f"store key {key!r} arrived with {len(body)} bytes but the "
-                    f"server declared {want}: the transfer was cut short. A "
-                    f"truncated chunk decodes to the right shape with the wrong "
-                    f"pixels, so it is refused here rather than trained on."
+
+        def __hash__(self) -> int:
+            return hash(("LengthCheckedStore", self._root))
+
+        def __repr__(self) -> str:
+            return f"LengthCheckedStore({redact_store_credential(self._root)!r})"
+
+        # ── the one method that does the work ─────────────────────────────
+        def _get_whole(self, key: str) -> Optional[bytes]:
+            """The whole object's bytes, or ``None`` when it is absent.
+
+            ``None`` rather than an error because zarr omits a chunk that is
+            entirely the fill value, so absence is DATA. A store that raised here
+            would turn every sparse source into a failed read.
+            """
+            try:
+                status, body, declared, wire = self._fetch(self._root + str(key))
+            except ShortStoreRead as exc:
+                # The transport caught it first — the common case and the
+                # stronger one, since a connection that went away mid-body is
+                # unambiguous. Re-raise with the KEY, so the message names what
+                # failed and not only how.
+                #
+                # "the transfer was cut short" is stated HERE as well as on the
+                # length-mismatch path below, deliberately: the two paths detect
+                # the same fault and an operator should not have to know which
+                # layer noticed in order to recognise it. The transport's own
+                # wording ("peer closed connection without sending complete
+                # message body (received N bytes, expected M)") is kept after it,
+                # because it carries both counts.
+                raise ShortStoreRead(
+                    redact_store_credential(
+                        f"store key {key!r}: the transfer was cut short. {exc}"
+                    )
+                ) from None
+            if int(status) == 404:
+                return None
+            if not 200 <= int(status) < 300:
+                raise RegionSourceError(
+                    redact_store_credential(
+                        f"store key {key!r} returned HTTP {status}"
+                    )
                 )
+            want: Optional[int]
+            try:
+                want = int(declared) if declared is not None else None
+            except (TypeError, ValueError):
+                want = None
+            got: Optional[int]
+            try:
+                got = int(wire) if wire is not None else None
+            except (TypeError, ValueError):
+                got = None
+            if want is not None and got is not None and got != want:
+                how = (
+                    "the transfer was cut short"
+                    if got < want
+                    else "the body was LONGER than declared"
+                )
+                raise ShortStoreRead(
+                    redact_store_credential(
+                        f"store key {key!r} arrived with {got} bytes on the wire "
+                        f"but the server declared {want}: {how}. A truncated "
+                        f"chunk decodes to the right shape with the wrong pixels, "
+                        f"so it is refused here rather than trained on."
+                    )
+                )
+            return body
+
+        @staticmethod
+        def _slice(body: bytes, byte_range: Any) -> bytes:
+            """Apply zarr's byte-range request to an object already fetched.
+
+            Every variant is handled explicitly and an unknown one REFUSES. The
+            tempting fallback — ignore it and hand back the whole object — would
+            return the wrong bytes to a caller that asked for a slice, silently,
+            which is the exact failure class this module exists to prevent.
+            """
+            if byte_range is None:
+                return body
+            if isinstance(byte_range, RangeByteRequest):
+                return body[byte_range.start : byte_range.end]
+            if isinstance(byte_range, OffsetByteRequest):
+                return body[byte_range.offset :]
+            if isinstance(byte_range, SuffixByteRequest):
+                return body[-byte_range.suffix :]
+            raise RegionSourceError(
+                f"unsupported byte range request "
+                f"{type(byte_range).__name__}: refusing, rather than returning "
+                f"the whole object, which would be the wrong bytes."
             )
-        return body
 
-    def __contains__(self, key: object) -> bool:
-        try:
-            self[str(key)]
-        except KeyError:
+        async def get(
+            self, key: str, prototype: Any, byte_range: Any = None
+        ) -> Any:
+            body = await asyncio.to_thread(self._get_whole, key)
+            if body is None:
+                return None
+            return prototype.buffer.from_bytes(self._slice(body, byte_range))
+
+        async def get_partial_values(
+            self, prototype: Any, key_ranges: Any
+        ) -> Any:
+            out = []
+            for key, rng in key_ranges:
+                out.append(await self.get(key, prototype, rng))
+            return out
+
+        async def exists(self, key: str) -> bool:
+            return (await asyncio.to_thread(self._get_whole, key)) is not None
+
+        # ── what this store deliberately does NOT do ──────────────────────
+        @property
+        def supports_writes(self) -> bool:
             return False
-        return True
 
-    def __setitem__(self, key: str, value: Any) -> None:
-        raise RegionSourceError("this store is read-only")
+        @property
+        def supports_deletes(self) -> bool:
+            return False
 
-    def __delitem__(self, key: str) -> None:
-        raise RegionSourceError("this store is read-only")
+        @property
+        def supports_partial_writes(self) -> bool:
+            return False
 
-    def __iter__(self):
-        # Listing is NOT supported, and saying so is deliberate: zarr addresses
-        # `.zarray` and each chunk key directly when opening an array read-only. A
-        # store that answered an empty listing instead would turn "I cannot list"
-        # into "there is nothing here", which is the silent-wrong-answer shape this
-        # whole class exists to prevent.
-        raise NotImplementedError("this store does not support listing")
+        @property
+        def supports_listing(self) -> bool:
+            return False
 
-    def __len__(self) -> int:
-        raise NotImplementedError("this store does not support listing")
+        async def set(self, key: str, value: Any) -> None:
+            raise RegionSourceError("this store is read-only")
+
+        async def delete(self, key: str) -> None:
+            raise RegionSourceError("this store is read-only")
+
+        def _no_listing(self) -> Any:
+            # Listing is NOT supported, and saying so is deliberate: zarr
+            # addresses the metadata key and each chunk key directly when opening
+            # an array read-only, and HTTP has no listing to offer. A store that
+            # answered an EMPTY listing instead would turn "I cannot list" into
+            # "there is nothing here", which is the silent-wrong-answer shape
+            # this whole class exists to prevent. `supports_listing` is False, so
+            # a correct caller asks first.
+            raise NotImplementedError("this store does not support listing")
+
+        def list(self) -> Any:
+            return self._no_listing()
+
+        def list_prefix(self, prefix: str) -> Any:
+            return self._no_listing()
+
+        def list_dir(self, prefix: str) -> Any:
+            return self._no_listing()
+
+    _LENGTH_CHECKED_STORE_CLASS = _LengthCheckedStore
+    return _LENGTH_CHECKED_STORE_CLASS
+
+
+def LengthCheckedStore(root: str, fetch: Optional[Any] = None) -> Any:
+    """Build a read-only, length-checking zarr store rooted at ``root``.
+
+    A function rather than a class so that zarr is imported on first use; see
+    :func:`_length_checked_store_class`.
+    """
+    return _length_checked_store_class()(root, fetch=fetch)
+
 
 
 def _http_fetch(url: str):
-    """GET a store key, returning ``(status, body, declared_length)``.
+    """GET a store key, returning ``(status, body, declared_length, wire_length)``.
 
     httpx is lazy here for the same reason zarr is: this module is imported by a
     path that must stay importable without the heavier stack.
@@ -534,11 +682,30 @@ def _http_fetch(url: str):
     raises on exactly that. Its error is converted here so the failure belongs to
     this module and goes through the redactor — an httpx error can quote the URL it
     tried, and the store root carries the credential.
+
+    **``body`` and ``wire_length`` are deliberately two different measurements,
+    and conflating them was a bug.** ``Content-Length`` counts the bytes the
+    server put ON THE WIRE, which for a response carrying
+    ``Content-Encoding: gzip`` is the COMPRESSED size; ``resp.content`` is what
+    httpx hands back after decoding it. httpx sends ``Accept-Encoding: gzip`` by
+    default, so comparing ``len(resp.content)`` against the declared length
+    reports an intact, correctly-served object as "cut short" — measured, with
+    the decoded body coming back LONGER than declared. Two things are done about
+    it: ``identity`` is requested, so there is normally nothing to decode; and
+    the count actually compared is ``num_bytes_downloaded``, the wire bytes,
+    which stays correct even if a server ignores that and encodes anyway.
     """
     import httpx
 
     try:
-        resp = httpx.get(url, timeout=60.0, follow_redirects=True)
+        resp = httpx.get(
+            url,
+            timeout=60.0,
+            follow_redirects=True,
+            # Ask for no transfer encoding, so the body we measure and the body
+            # zarr decodes are the same bytes. See the docstring.
+            headers={"Accept-Encoding": "identity"},
+        )
     except httpx.RemoteProtocolError as exc:
         # "peer closed connection without sending complete message body
         # (received N bytes, expected M)" — the truncation, named by the transport.
@@ -547,7 +714,12 @@ def _http_fetch(url: str):
         raise RegionSourceError(
             redact_store_credential(f"{type(exc).__name__}: {exc}")
         ) from None
-    return resp.status_code, resp.content, resp.headers.get("Content-Length")
+    return (
+        resp.status_code,
+        resp.content,
+        resp.headers.get("Content-Length"),
+        resp.num_bytes_downloaded,
+    )
 
 
 def _zarr_opener(store_root: str, array_path: str) -> Any:
