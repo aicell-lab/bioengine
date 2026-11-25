@@ -100,6 +100,23 @@ class _RangeServer:
                         start, end = int(a), total - 1
                     else:
                         start, end = int(a), min(int(b), total - 1)
+                    if outer.shift_range and rel == outer.victim and a != "":
+                        # The hostile case: serve the NEIGHBOURING bytes and
+                        # report them honestly. Content-Length and Content-Range
+                        # agree with each other and with the body; only the
+                        # REQUEST disagrees, which is why nothing but comparing
+                        # the two can catch it.
+                        #
+                        # Explicit start-end ranges ONLY (`a != ""`), i.e. the
+                        # inner-chunk reads. Shifting the shard INDEX instead is
+                        # a different and already-covered story: a suffix range
+                        # may legitimately return fewer bytes than asked, so the
+                        # wrapper cannot call it wrong -- and it does not need
+                        # to, because zarr puts a crc32c on the index and raises
+                        # "Stored and computed checksum do not match". Measured
+                        # here. The inner-chunk read is the one with no such
+                        # backstop, which is why it is the case under test.
+                        start, end = start + 1, min(end + 1, total - 1)
                     body = body[start : end + 1]
                 self.send_response(206 if start is not None else 200)
                 if start is not None:
@@ -114,6 +131,8 @@ class _RangeServer:
 
         self.root = root
         self.ignore_range = False
+        self.shift_range = False
+        self.victim = None
         self.bytes_served = 0
         self.requests = []
         self._srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -242,3 +261,74 @@ def test_an_unknown_byte_request_is_REFUSED_not_sent_unranged():
     with pytest.raises(ngff_region.RegionSourceError) as e:
         ngff_region._range_header(_Future())
     assert "_Future" in str(e.value)
+
+
+# ── the bytes actually served must be the bytes asked for ────────────────────
+
+
+def test_a_206_carrying_the_WRONG_bytes_is_refused(sharded):
+    """RED before Content-Range was checked. A server that answers a range with
+    the NEIGHBOURING bytes, and reports those bytes honestly in Content-Length
+    and Content-Range, passes every other check in this module: the body is
+    complete, its length matches what was declared, and nothing is truncated.
+    Only comparing the request against Content-Range catches it.
+
+    Measured consequence without that comparison, on an uncompressed shard: the
+    crop came back with NO error and the wrong pixels. Compression and the shard
+    index's CRC catch most variants; neither is guaranteed to be there, and this
+    store is uncompressed on purpose so the check is tested rather than a codec.
+    """
+    srv, full, on_disk = sharded
+    srv.victim = "c/0/0"
+    srv.shift_range = True
+    srv.reset()
+    a = ngff_region._zarr_opener(srv.base, "")
+    with pytest.raises(ngff_region.RegionSourceError) as e:
+        a[0:128, 0:128]
+    msg = str(e.value)
+    assert "Content-Range" in msg, f"the refusal does not name the header: {msg}"
+    assert "not the bytes that were requested" in msg, msg
+
+
+def test_an_honest_206_is_NOT_refused(sharded):
+    """THE CONTROL for the test above. Without it, the refusal could be the
+    Content-Range check rejecting every ranged read rather than the bad one."""
+    srv, full, on_disk = sharded
+    srv.shift_range = False
+    srv.reset()
+    a = ngff_region._zarr_opener(srv.base, "")
+    assert np.array_equal(a[0:128, 0:128], full[0:128, 0:128])
+    assert any(r[1] for r in srv.requests), "no ranged request was made at all"
+
+
+@pytest.mark.parametrize(
+    "requested, served, why",
+    [
+        ("bytes=10-19", "bytes 11-20/100", "shifted start"),
+        ("bytes=10-19", "bytes 10-18/100", "short end, self-consistent"),
+        ("bytes=-8", "bytes 80-87/100", "suffix not at the end of the object"),
+        ("bytes=10-19", None, "206 with no Content-Range at all"),
+        ("bytes=10-19", "garbage", "unparsable Content-Range"),
+    ],
+)
+def test_each_wrong_content_range_is_refused(requested, served, why):
+    """The checker directly, so each disagreement is pinned rather than only the
+    one shape a server happened to produce."""
+    n = 10 if requested == "bytes=10-19" else 8
+    with pytest.raises(ngff_region.WrongRangeRead):
+        ngff_region._check_content_range("k", requested, served, n)
+
+
+@pytest.mark.parametrize(
+    "requested, served, body_len",
+    [
+        ("bytes=10-19", "bytes 10-19/100", 10),
+        ("bytes=10-", "bytes 10-99/100", 90),
+        ("bytes=-8", "bytes 92-99/100", 8),
+        ("bytes=-8", "bytes 0-4/5", 5),  # object SMALLER than the suffix asked for
+    ],
+)
+def test_a_matching_content_range_passes(requested, served, body_len):
+    """The accept side, including the legitimate case of an object shorter than
+    the suffix requested -- refusing that would break small shard indexes."""
+    ngff_region._check_content_range("k", requested, served, body_len)

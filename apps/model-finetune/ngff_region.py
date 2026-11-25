@@ -528,7 +528,7 @@ def _length_checked_store_class() -> Any:
             precisely what this module exists not to do.
             """
             try:
-                status, body, declared, wire = self._fetch(
+                status, body, declared, wire, content_range = self._fetch(
                     self._root + str(key), range_header
                 )
             except ShortStoreRead as exc:
@@ -574,6 +574,9 @@ def _length_checked_store_class() -> Any:
                         f"sharded array would cost a full download of its shard."
                     )
                 )
+            if range_header is not None:
+                # 206 established above. Now: are these the bytes we asked for?
+                _check_content_range(key, range_header, content_range, len(body))
             want: Optional[int]
             try:
                 want = int(declared) if declared is not None else None
@@ -679,6 +682,85 @@ def LengthCheckedStore(root: str, fetch: Optional[Any] = None) -> Any:
 
 
 
+class WrongRangeRead(RegionSourceError):
+    """The server answered a range request with a DIFFERENT range.
+
+    Its own class because it is not a short read and not a malformed reference:
+    the response is complete and well-formed and describes bytes other than the
+    ones asked for. Measured consequence, on an uncompressed sharded store: the
+    crop comes back with no error and the wrong pixels.
+    """
+
+
+def _check_content_range(key: str, requested: str, content_range: Optional[str],
+                         body_len: int) -> None:
+    """Refuse unless the 206 describes the range that was actually requested.
+
+    **Why this is not covered by the length check.** The wire-byte check compares
+    what arrived against what the server SAID it was sending, so a server that
+    returns the wrong bytes with self-consistent headers passes it. Measured on
+    an uncompressed sharded store: a 206 carrying the NEIGHBOURING bytes, with an
+    honest Content-Length and an honest Content-Range for those bytes, produced a
+    crop with no error and the wrong pixels. Compression and the shard index's
+    own CRC catch most variants of this; neither is guaranteed to be present.
+
+    So the one remaining question — "are these the bytes I asked for?" — is
+    answered by comparing the request against ``Content-Range``, which is the
+    only place the server states which bytes it sent.
+    """
+    if content_range is None:
+        raise WrongRangeRead(
+            redact_store_credential(
+                f"store key {key!r}: the server answered 206 to range "
+                f"{requested!r} without a Content-Range header, so there is no "
+                f"way to tell which bytes it sent."
+            )
+        )
+    m = re.fullmatch(
+        r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*", content_range, re.IGNORECASE
+    )
+    if not m:
+        raise WrongRangeRead(
+            redact_store_credential(
+                f"store key {key!r}: unparsable Content-Range "
+                f"{content_range!r} for range {requested!r}."
+            )
+        )
+    start, end = int(m.group(1)), int(m.group(2))
+    total = None if m.group(3) == "*" else int(m.group(3))
+    served = end - start + 1
+
+    def refuse(why: str) -> None:
+        raise WrongRangeRead(
+            redact_store_credential(
+                f"store key {key!r}: asked for {requested!r} and the server "
+                f"answered Content-Range {content_range!r} — {why}. These are "
+                f"not the bytes that were requested, and they decode without "
+                f"complaint into the wrong pixels."
+            )
+        )
+
+    if served != body_len:
+        refuse(f"it describes {served} bytes but {body_len} arrived")
+
+    rm = re.fullmatch(r"bytes=(\d*)-(\d*)", requested)
+    if not rm:  # pragma: no cover -- _range_header only emits these three forms
+        refuse("the request itself could not be re-parsed")
+        return
+    a, b = rm.group(1), rm.group(2)
+    if a == "":  # suffix: bytes=-N, the LAST n bytes
+        n = int(b)
+        if total is not None and end != total - 1:
+            refuse(f"a suffix range must end at the last byte ({total - 1})")
+        if body_len > n:
+            refuse(f"a suffix range of {n} bytes returned {body_len}")
+    else:
+        if start != int(a):
+            refuse(f"it starts at {start}, not at {a}")
+        if b != "" and end != int(b):
+            refuse(f"it ends at {end}, not at {b}")
+
+
 def _range_header(byte_range: Any) -> Optional[str]:
     """zarr's byte-range request as an HTTP ``Range`` header value, or ``None``.
 
@@ -716,7 +798,7 @@ def _range_header(byte_range: Any) -> Optional[str]:
 
 
 def _http_fetch(url: str, range_header: Optional[str] = None):
-    """GET a store key, returning ``(status, body, declared_length, wire_length)``.
+    """GET a store key: ``(status, body, declared_length, wire_length, content_range)``.
 
     httpx is lazy here for the same reason zarr is: this module is imported by a
     path that must stay importable without the heavier stack.
@@ -767,6 +849,7 @@ def _http_fetch(url: str, range_header: Optional[str] = None):
         resp.content,
         resp.headers.get("Content-Length"),
         resp.num_bytes_downloaded,
+        resp.headers.get("Content-Range"),
     )
 
 
