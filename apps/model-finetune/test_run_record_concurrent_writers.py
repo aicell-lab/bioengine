@@ -706,7 +706,11 @@ def test_the_CHILDS_OWN_TERMINAL_WRITES_still_raise():
                 "raise: otherwise the record stays TRAINING and the stale "
                 "sweep later reports a finished run as STOPPED."
             )
-    assert checked >= 3, (
-        f"only {checked} terminal write(s) found in the worker files; the "
-        "parse is not seeing them, so this test would pass vacuously"
+    # Four terminal writes exist (two per worker file: the COMPLETED/FAILED
+    # outcome and the except-path FAILED). The floor is exact, so a marker
+    # match that stopped seeing one of them fails here instead of passing.
+    assert checked >= 4, (
+        f"only {checked} terminal write(s) found in the worker files, expected "
+        "at least 4; the parse is not seeing them all, so this test would pass "
+        "while covering less than it claims"
     )
