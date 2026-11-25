@@ -25,7 +25,7 @@ import broker_core as core
 
 # ── the shape of a real multi-plane store ─────────────────────────────────────
 TCZYX = ["t", "c", "z", "y", "x"]
-SHAPE = [1, 3, 9, 1000, 2000]        # z has NINE slices: the case that must be recorded
+SHAPE = [1, 3, 9, 1000, 2000]  # z has NINE slices: the case that must be recorded
 
 
 def test_no_planes_is_None_not_an_empty_mapping():
@@ -59,14 +59,15 @@ def test_a_PARTIAL_mapping_is_refused_at_import_not_at_training_time():
     """SHAPE has z=9 and c=3; t is singleton. Naming only z leaves nothing
     missing, but on a store with two multi-slice non-spatial axes a partial
     record would be accepted and then refused by the reader far away from here."""
-    two_stacks = [5, 3, 9, 1000, 2000]          # t=5 AND z=9
+    two_stacks = [5, 3, 9, 1000, 2000]  # t=5 AND z=9
     roles = {"c": 1, "y": 3, "x": 4}
     with pytest.raises(ValueError) as e:
         core.normalise_planes({"z": 4}, TCZYX, two_stacks, roles)
     assert "'t'" in str(e.value) and "unset" in str(e.value)
     # naming both is accepted
     assert core.normalise_planes({"z": 4, "t": 1}, TCZYX, two_stacks, roles) == {
-        "z": 4, "t": 1
+        "z": 4,
+        "t": 1,
     }
     # and naming none is still fine -- the reader refuses that legibly
     assert core.normalise_planes(None, TCZYX, two_stacks, roles) is None
@@ -159,8 +160,12 @@ def _entry(planes):
         150,
         dtype="|u1",
         planes=planes,
-        layout={"dataset_paths": ["0"], "axis_roles": {"y": 3, "x": 4, "c": 1},
-                "level0_shape": SHAPE, "axes": TCZYX},
+        layout={
+            "dataset_paths": ["0"],
+            "axis_roles": {"y": 3, "x": 4, "c": 1},
+            "level0_shape": SHAPE,
+            "axes": TCZYX,
+        },
     )
 
 
@@ -207,7 +212,8 @@ def test_a_plane_on_a_non_spatial_axis_is_still_accepted_with_roles_given():
     until that rule landed."""
     assert core.normalise_planes({"z": 4}, TCZYX, SHAPE, ROLES) == {"z": 4}
     assert core.normalise_planes({"z": 4, "t": 0}, TCZYX, SHAPE, ROLES) == {
-        "z": 4, "t": 0
+        "z": 4,
+        "t": 0,
     }
     with pytest.raises(ValueError) as e:
         core.normalise_planes({"t": 0}, TCZYX, SHAPE, ROLES)

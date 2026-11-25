@@ -542,12 +542,21 @@ class TestImportNgffImage:
         {'c': 1.5} the channel rule refuses it first, so the test passed without
         the whole-number check at all and its name claimed more than it showed.
         """
+
         async def _zstack_probe(_root, _mp, _origin):
             return {
-                "store_root": ROOT, "multiscale_path": None, "stem": "sample",
-                "width": 800, "height": 600, "dtype": "|u1", "channels": None,
-                "levels": 1, "content_hint": "deadbeef", "dataset_paths": ["0"],
-                "axis_roles": {"y": 1, "x": 2}, "level0_shape": [9, 600, 800],
+                "store_root": ROOT,
+                "multiscale_path": None,
+                "stem": "sample",
+                "width": 800,
+                "height": 600,
+                "dtype": "|u1",
+                "channels": None,
+                "levels": 1,
+                "content_hint": "deadbeef",
+                "dataset_paths": ["0"],
+                "axis_roles": {"y": 1, "x": 2},
+                "level0_shape": [9, 600, 800],
                 "axes": ["z", "y", "x"],
             }
 
@@ -559,9 +568,7 @@ class TestImportNgffImage:
         assert importer._state["committed"] == 0
         assert "whole number" in str(e.value), str(e.value)
 
-    async def test_a_plane_on_the_CHANNEL_axis_is_refused_by_the_import(
-        self, importer
-    ):
+    async def test_a_plane_on_the_CHANNEL_axis_is_refused_by_the_import(self, importer):
         """The fixture's axes are (c, y, x) with c as the channel, and the reader
         keeps the channel whole, so recording a channel plane would have the
         manifest claim something training does not do."""
@@ -588,6 +595,7 @@ class TestImportNgffImage:
         and the test then fails on a missing artifact manager rather than on
         anything it means to check.
         """
+
         async def _zstack_probe(_root, _multiscale_path, _origin):
             return {
                 "store_root": ROOT,
@@ -615,9 +623,9 @@ class TestImportNgffImage:
         assert entry["source"]["planes"] == {"z": 4}
         ref = bc.ngff_region_source(entry)
         assert ref is not None, "the stored entry yields no reader reference at all"
-        assert ref["planes"] == {"z": 4}, (
-            f"the plane does not reach the reader's reference: {ref.get('planes')!r}"
-        )
+        assert ref["planes"] == {
+            "z": 4
+        }, f"the plane does not reach the reader's reference: {ref.get('planes')!r}"
 
     async def test_the_IMPORT_records_the_axis_names_in_the_layout(self, importer):
         """Through the real import, because that is the only thing that writes a
