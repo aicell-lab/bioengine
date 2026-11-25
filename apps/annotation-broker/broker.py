@@ -848,12 +848,36 @@ class AnnotationBroker:
         ),
         context=None,
     ) -> Dict[str, Any]:
-        """Training inputs for micro-sam fine-tuning: for the LATEST pair per
-        (user, stem) under the label, presigned image + geojson URLs. ONLY
-        stems that are members of the split are included, partitioned by its
-        train/test lists."""
+        """Training inputs for fine-tuning: for the LATEST pair per (user, stem)
+        under the label, what the trainer needs to read that image and its
+        annotation. ONLY stems that are members of the split are included,
+        partitioned by its train/test lists.
+
+        Two row shapes, discriminated by which key is present:
+
+        * ``{"stem", "user", "image_url", "geojson_url"}`` -- a materialised
+          image, presigned as before.
+        * ``{"stem", "user", "image_source", "geojson_url"}`` -- a remote
+          OME-Zarr source, as ``{store_root, array_path, axes, region}``. The
+          trainer reads the region out of the store over range requests, so
+          nothing fetches the source whole.
+
+        The second shape is what makes a whole-slide image trainable. Such an
+        image is imported as a PATCH and has no file in the artifact to
+        presign: materialising one means reading level 0 whole in the browser,
+        which a gigapixel source cannot survive, so this used to refuse the
+        stem outright and the annotations drawn on it were unusable.
+
+        ``array_path`` and ``axes`` come from one read of the store's own
+        metadata, because resolving them is this app's job: the trainer is
+        given the level to read rather than choosing it, so the multiscale
+        parsing stays in one place. Any credential is spliced into
+        ``store_root`` here, after the role check, exactly as
+        ``get_image_url`` does, and is never stored in the artifact (design
+        §12).
+        """
         artifact_id = self._canonical_id(artifact_id)
-        self._require_role(context, artifact_id, "manager")
+        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         split = await self._read_split_or_raise(artifact_id, label, split_name)
         train_stems = set(split.get("train") or [])
         test_stems = set(split.get("test") or [])
@@ -886,23 +910,26 @@ class AnnotationBroker:
                     }
                 )
 
-        # model-finetune fetches each image URL whole and hands the buffer to
-        # imageio.imread, so a not-yet-materialised image has nothing that can
-        # be passed. Name the offenders here rather than minting a URL that
-        # fails downstream with an opaque unsupported-extension error.
-        # A stem whose image was deleted outright is caught by the same check:
-        # `non_local_stems` only names stems it knows, so the unknown ones are
-        # added here rather than left to KeyError at minting time.
+        # A stem the trainer cannot read at all is named here rather than left
+        # to fail downstream with an opaque error. There are two ways to be
+        # readable — a file to presign, or an OME-Zarr source to read a region
+        # out of — so only a stem with neither is an offender. A stem whose
+        # image was deleted outright is caught by the same check: it is not in
+        # the manifest, so it has neither.
         manifest = await self._image_manifest(artifact_id)
         stems = [p["stem"] for p in pairs]
-        unmaterialised = sorted(
-            set(core.non_local_stems(manifest, stems))
-            | {s for s in stems if s not in manifest}
+        unreadable = sorted(
+            s
+            for s in set(stems)
+            if not core.image_entry_is_local(manifest.get(s))
+            and (manifest.get(s) or {}).get("source", {}).get("kind")
+            != core.NGFF_SOURCE_KIND
         )
-        if unmaterialised:
+        if unreadable:
             raise ValueError(
-                f"Split '{split_name}' contains {len(unmaterialised)} image(s) with no "
-                f"file in the artifact: {', '.join(unmaterialised)}. Open each one in "
+                f"Split '{split_name}' contains {len(unreadable)} image(s) that "
+                f"cannot be read for training: {', '.join(unreadable)}. They have "
+                f"no file in the artifact and no remote source. Open each one in "
                 f"the annotator once to materialise it, then retry."
             )
 
@@ -914,19 +941,52 @@ class AnnotationBroker:
                     artifact_id=artifact_id, file_path=file_path, stage=True
                 )
 
+        # One metadata read per distinct store, not per stem: every patch of one
+        # slide shares its pyramid, and a split can hold dozens of them.
+        credentials = meta.get("ngff_credentials") or {}
+        plans: Dict[tuple, Dict[str, Any]] = {}
+
+        async def _source_for(stem: str) -> Dict[str, Any]:
+            source = (manifest.get(stem) or {}).get("source") or {}
+            store_root = source.get("store_root") or ""
+            multiscale_path = source.get("multiscale_path")
+            key = (store_root, multiscale_path)
+            if key not in plans:
+                root = core.apply_store_credential(
+                    store_root, credentials.get(store_root)
+                )
+                group = await self._read_zarr_node(root)
+                parsed = core.parse_ngff_multiscales(group["attrs"], multiscale_path)
+                plans[key] = {
+                    "store_root": root,
+                    # Level 0. The region is recorded in full-resolution pixels,
+                    # so reading any other level would train on a different crop.
+                    "array_path": parsed["dataset_paths"][0],
+                    "axes": parsed["axes"],
+                }
+            return {**plans[key], "region": source.get("region")}
+
+        local_pairs = [
+            p for p in pairs if core.image_entry_is_local(manifest.get(p["stem"]))
+        ]
         image_urls, geojson_urls = await asyncio.gather(
-            asyncio.gather(*[_mint(manifest[p["stem"]]["path"]) for p in pairs]),
+            asyncio.gather(*[_mint(manifest[p["stem"]]["path"]) for p in local_pairs]),
             asyncio.gather(*[_mint(p["geojson_path"]) for p in pairs]),
         )
-        train_out: List[Dict[str, str]] = []
-        test_out: List[Dict[str, str]] = []
-        for p, img_url, geo_url in zip(pairs, image_urls, geojson_urls):
-            row = {
+        urls_by_stem = {p["stem"]: u for p, u in zip(local_pairs, image_urls)}
+
+        train_out: List[Dict[str, Any]] = []
+        test_out: List[Dict[str, Any]] = []
+        for p, geo_url in zip(pairs, geojson_urls):
+            row: Dict[str, Any] = {
                 "stem": p["stem"],
                 "user": p["user"],
-                "image_url": img_url,
                 "geojson_url": geo_url,
             }
+            if p["stem"] in urls_by_stem:
+                row["image_url"] = urls_by_stem[p["stem"]]
+            else:
+                row["image_source"] = await _source_for(p["stem"])
             (test_out if p["stem"] in test_stems else train_out).append(row)
         return {
             "train": train_out,

@@ -839,3 +839,223 @@ class TestForgetRemoteImage:
         await importer.forget_remote_image("ws/ds", "remote-one", context=None)
 
         assert bc.parse_image_manifest(importer._state["manifest"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# get_training_urls: a region-imported slide has to be trainable
+# ---------------------------------------------------------------------------
+#
+# Before this, every stem without a file in the artifact was refused outright,
+# with the advice to "open it in the annotator once to materialise it". For a
+# whole-slide source that advice cannot be followed: materialising reads level 0
+# whole in the browser, which is why such a source is imported as a PATCH in the
+# first place. So the annotations drawn on those patches were unusable, and the
+# refusal was the only thing standing in the way.
+
+
+@pytest.fixture
+def trainer(tmp_path, monkeypatch):
+    """A broker whose artifact I/O is in memory, wired for get_training_urls.
+
+    The Zarr store behind it is the same two-level fixture the preflight tests
+    use, so ``array_path`` and ``axes`` are read from real metadata rather than
+    asserted against a hand-written answer.
+    """
+    monkeypatch.setattr(bk, "STATE_ROOT", tmp_path)
+    broker = _broker(_store())
+    state = {
+        "meta": {
+            "artifact_id": "ws/ds",
+            "owner": {"id": "u1"},
+            "labels": [],
+            "image_dims": {},
+            # Held in the broker's own state, never in the artifact (design §12).
+            # Empty by default: a credential is one arm's subject, not every
+            # arm's background, and a tokened root is a DIFFERENT URL that the
+            # store behind this fixture would have to serve.
+            "ngff_credentials": {},
+        },
+        "manifest": {},
+        "listing": [],
+        "files": [],
+        "split": {"name": "s1", "label": "cells", "train": [], "test": []},
+        "minted": [],
+    }
+    broker._state = state
+
+    def _require_role(_context, _artifact_id, _minimum):
+        return state["meta"], {"id": "u1"}, "owner"
+
+    async def _read_split_or_raise(_artifact_id, _label, _name):
+        return state["split"]
+
+    async def _image_manifest(_artifact_id):
+        return state["manifest"]
+
+    async def _list_files_safe(_artifact_id, dir_path):
+        if dir_path.endswith("/user-1"):
+            return [{"name": f} for f in state["files"]]
+        return state["listing"]
+
+    class _Am:
+        async def get_file(self, artifact_id=None, file_path=None, stage=False):
+            state["minted"].append(file_path)
+            return f"https://s3.example/{file_path}?sig=abc"
+
+    monkeypatch.setattr(broker, "_require_role", _require_role)
+    monkeypatch.setattr(broker, "_read_split_or_raise", _read_split_or_raise)
+    monkeypatch.setattr(broker, "_image_manifest", _image_manifest)
+    monkeypatch.setattr(broker, "_list_files_safe", _list_files_safe)
+    broker._am = _Am()
+    return broker
+
+
+def _annotated(stem):
+    return [f"{stem}-20261125-120000.png", f"{stem}-20261125-120000.geojson"]
+
+
+def _remote_entry(region=None):
+    # ROOT keeps its trailing slash: `normalise_store_root` guarantees exactly
+    # one, every chunk URL is the root plus the key, and a root without it makes
+    # the first metadata read ask for `...samples.zattrs`.
+    return bc.remote_image_entry(
+        store_root=ROOT,
+        multiscale_path=None,
+        width=(region or {}).get("width", 800),
+        height=(region or {}).get("height", 600),
+        region=region,
+    )
+
+
+def _local_entry(stem):
+    return {
+        "state": "local",
+        "path": f"images/{stem}.ome.tiff",
+        "width": 8,
+        "height": 8,
+    }
+
+
+class TestGetTrainingUrls:
+    def _wire(self, trainer, stems, entries):
+        trainer._state["listing"] = [{"name": "user-1", "type": "directory"}]
+        trainer._state["files"] = [f for s in stems for f in _annotated(s)]
+        trainer._state["manifest"] = entries
+        trainer._state["split"] = {
+            "name": "s1",
+            "label": "cells",
+            "train": list(stems),
+            "test": [],
+        }
+
+    async def test_a_region_imported_slide_yields_a_source_not_a_url(self, trainer):
+        """THE ARM. ``array_path`` and ``axes`` come from the store's own
+        metadata: the trainer is told which level to read rather than choosing
+        it, so the multiscale parsing stays in one place."""
+        region = {"x": 50000, "y": 40000, "width": 512, "height": 512}
+        self._wire(trainer, ["slide"], {"slide": _remote_entry(region)})
+
+        out = await trainer.get_training_urls("ws/ds", "cells", "s1", context=None)
+
+        assert len(out["train"]) == 1
+        row = out["train"][0]
+        assert "image_url" not in row, "a remote source was presigned as a file"
+        src = row["image_source"]
+        assert src["array_path"] == "0"
+        assert src["axes"] == ["c", "y", "x"]
+        assert src["region"] == region
+        assert row["geojson_url"].startswith("https://s3.example/label_cells/user-1/")
+
+    async def test_a_materialised_image_still_yields_a_presigned_url(self, trainer):
+        """CONTROL. The old shape is what every non-remote image still uses, and
+        a change that returned a source for everything would pass the arm above
+        while breaking every dataset in use."""
+        self._wire(trainer, ["cells01"], {"cells01": _local_entry("cells01")})
+
+        out = await trainer.get_training_urls("ws/ds", "cells", "s1", context=None)
+        row = out["train"][0]
+        assert "image_source" not in row
+        assert row["image_url"].startswith("https://s3.example/images/cells01.ome.tiff")
+
+    async def test_a_stem_with_neither_a_file_nor_a_source_is_still_refused(
+        self, trainer
+    ):
+        """The refusal is narrowed, not removed: an image with nothing behind it
+        has to be named here rather than failing opaquely in the trainer."""
+        self._wire(
+            trainer,
+            ["ghost"],
+            {"ghost": {"state": "remote", "width": 8, "height": 8, "source": {}}},
+        )
+        with pytest.raises(ValueError, match="cannot be read for training: ghost"):
+            await trainer.get_training_urls("ws/ds", "cells", "s1", context=None)
+
+    async def test_a_stem_missing_from_the_manifest_is_refused_too(self, trainer):
+        self._wire(trainer, ["deleted"], {})
+        with pytest.raises(ValueError, match="cannot be read for training: deleted"):
+            await trainer.get_training_urls("ws/ds", "cells", "s1", context=None)
+
+    async def test_the_credential_is_spliced_in_and_is_not_in_the_manifest(
+        self, trainer
+    ):
+        """Same splice ``get_image_url`` already does, after the role check. The
+        manifest lives in something ``set_public`` can expose, so the token has
+        to come from the broker's own state at read time."""
+        self._wire(trainer, ["slide"], {"slide": _remote_entry()})
+        trainer._state["meta"]["ngff_credentials"] = {ROOT: "tok123"}
+        tokened = bc.apply_store_credential(ROOT, "tok123")
+        # The protected store answers on the TOKENED path and nowhere else,
+        # which is the whole point of a path-form credential: an arm that served
+        # both would pass even if the token were dropped.
+        trainer._http.objects = {
+            k.replace(ROOT, tokened): v for k, v in trainer._http.objects.items()
+        }
+
+        out = await trainer.get_training_urls("ws/ds", "cells", "s1", context=None)
+        root = out["train"][0]["image_source"]["store_root"]
+        assert "tok123" in root, "the credential was not spliced into the store root"
+        stored = json.dumps(trainer._state["manifest"])
+        assert "tok123" not in stored
+
+    async def test_one_metadata_read_per_store_not_per_stem(self, trainer):
+        """A split can hold dozens of patches of one slide, and they share its
+        pyramid. Reading the store's metadata per stem would turn one training
+        call into dozens of round trips for the same bytes."""
+        self._wire(
+            trainer,
+            ["p1", "p2", "p3"],
+            {
+                "p1": _remote_entry({"x": 0, "y": 0, "width": 64, "height": 64}),
+                "p2": _remote_entry({"x": 64, "y": 0, "width": 64, "height": 64}),
+                "p3": _remote_entry({"x": 0, "y": 64, "width": 64, "height": 64}),
+            },
+        )
+
+        out = await trainer.get_training_urls("ws/ds", "cells", "s1", context=None)
+        assert len(out["train"]) == 3
+        attr_reads = [u for u in trainer._http.requested if u.endswith(".zattrs")]
+        assert len(attr_reads) == 1, f"metadata was read {len(attr_reads)} times"
+        # Each patch still carries its OWN region: a cached plan must not leak
+        # one patch's crop into another's.
+        regions = sorted(r["image_source"]["region"]["x"] for r in out["train"])
+        assert regions == [0, 0, 64]
+
+    async def test_a_mixed_split_partitions_both_shapes(self, trainer):
+        trainer._state["listing"] = [{"name": "user-1", "type": "directory"}]
+        trainer._state["files"] = _annotated("slide") + _annotated("cells01")
+        trainer._state["manifest"] = {
+            "slide": _remote_entry({"x": 0, "y": 0, "width": 64, "height": 64}),
+            "cells01": _local_entry("cells01"),
+        }
+        trainer._state["split"] = {
+            "name": "s1",
+            "label": "cells",
+            "train": ["slide"],
+            "test": ["cells01"],
+        }
+
+        out = await trainer.get_training_urls("ws/ds", "cells", "s1", context=None)
+        assert [r["stem"] for r in out["train"]] == ["slide"]
+        assert [r["stem"] for r in out["test"]] == ["cells01"]
+        assert "image_source" in out["train"][0]
+        assert "image_url" in out["test"][0]
