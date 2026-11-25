@@ -136,9 +136,17 @@ async def test_the_HEALTH_CHECK_fails_when_the_run_store_is_unwritable(
 
     Without this the replica answers `get_training_capabilities` happily, passes
     its health check, stays in the routing table, and raises on every run call
-    forever. Raising here is what makes Serve replace it -- which is also the
-    only thing that can actually fix it, since the replacement may land in a
-    container whose home is writable.
+    forever. Raising is what makes Serve replace it.
+
+    Replacement is NOT established as the cure, and an earlier version of this
+    docstring said it was, on the grounds that a replacement might come up
+    somewhere its home directory could be written. The measurement says the
+    opposite: the broken replica and
+    a working one had the same read-only `/home/ray`, and what differed was
+    whether the per-application HOME override took effect inside the process. So
+    replacement helps only if that failure was transient. If it is not, the
+    replica keeps failing this check and the app reports UNHEALTHY -- which is
+    the honest outcome, and is what the clause asks for either way.
     """
     cls = _entry_class()
     inst = cls.__new__(cls)
