@@ -2152,9 +2152,11 @@ class EntryApp:
         import training
 
         # BEFORE the record is read, so the refusal cannot depend on what the
-        # record says -- and before the stale sweep in `get_export`, which
-        # WRITES. An unauthorised caller must not be able to tell "not yours"
-        # from "no such export": both come out of this call.
+        # record says. An unauthorised caller must not be able to tell "not
+        # yours" from "no such export": both come out of this call. (`get_export`
+        # does NOT write the swept record -- an earlier version of this comment
+        # said it did -- so the ordering is about the refusal, not a side
+        # effect.)
         training.require_caller_may_use_export(export_id, context)
         rec = training.get_export(export_id)
         if not rec:
@@ -2194,7 +2196,15 @@ class EntryApp:
         pkg_dir = Path(rec["_package_dir"])
         pushed = []
         for rel, url in files.items():
-            fpath = pkg_dir / rel
+            # BOUNDED, because `files` keys come from the caller. Before this,
+            # the key was joined to the package directory unchecked, and a
+            # caller holding any READY export of their own could push
+            # "../../<another run>/best.pt" -- another run's checkpoint -- to a
+            # URL of their choosing. `package_member_path` requires the name to
+            # be one this export announced AND to resolve inside the package.
+            fpath = training.package_member_path(
+                pkg_dir, rel, announced=rec.get("files")
+            )
             if not fpath.is_file():
                 raise FileNotFoundError(
                     f"Package file '{rel}' not found for export '{export_id}'."

