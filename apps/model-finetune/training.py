@@ -29,10 +29,40 @@ STATUS_STALE_SECONDS = 600
 # === session paths + file-backed status ===
 
 
+class SessionsRootUnavailable(RuntimeError):
+    """This replica cannot create or write the directory runs are kept in.
+
+    A ``RuntimeError`` and not a ``ValueError``: nothing the caller asked for is
+    wrong. The replica cannot serve ANY run operation, and that is a property of
+    where it is running rather than of the request.
+
+    Measured 2026-11-25 on a de.NBI replica whose ``Path.home()`` was
+    ``/home/ray`` on a read-only filesystem: `start_training`,
+    `list_training_sessions` and `get_training_status` all raised an identical
+    bare ``OSError`` from the ``mkdir`` below, while the app reported RUNNING
+    and every deployment HEALTHY. Nothing said which of those failures was the
+    same failure, or that the replica could never serve a run at all.
+    """
+
+
 def sessions_root() -> Path:
     # Under the container's mounted ~/.bioengine so sessions survive restarts.
     root = Path.home() / ".bioengine" / "micro_sam_sessions"
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # NAMED, and says what it means for the app rather than for the syscall.
+        # Every run-touching path funnels through here, so a bare mkdir error
+        # surfaces identically at a dozen call sites with nothing tying them
+        # together -- which is exactly how a replica came to look healthy while
+        # being unable to do anything with runs. `_health` in entry.py calls
+        # this so the condition reports as UNHEALTHY and Serve replaces the
+        # replica, rather than it staying in the routing table forever.
+        raise SessionsRootUnavailable(
+            f"cannot create or write the training-run store at {root}: {exc}. "
+            "This replica cannot serve any training-run operation while that "
+            "path is unwritable."
+        ) from exc
     return root
 
 

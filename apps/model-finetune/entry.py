@@ -602,6 +602,31 @@ class EntryApp:
         # CPU-only methods stay served when the runtime is down/scaling.
         if self._s3 is None:
             raise RuntimeError("S3 storage service not connected")
+
+        # The run store has to be WRITABLE, and this replica is the only thing
+        # that can find out. Every run-touching method resolves it, so a replica
+        # that cannot reach it serves none of them -- but it answers everything
+        # else perfectly well, so without this check Serve sees a healthy actor
+        # and leaves it in the routing table.
+        #
+        # Measured 2026-11-25: a replica whose `Path.home()` was `/home/ray` on
+        # a read-only filesystem reported RUNNING with every deployment HEALTHY
+        # while `start_training`, `list_training_sessions` and
+        # `get_training_status` all failed identically. `get_training_capabilities`
+        # still worked, which is why nothing looked wrong from outside.
+        #
+        # Raising makes Serve replace the replica, which is the remedy this
+        # method already relies on for a dead Hypha connection below -- and here
+        # it may genuinely fix the problem, since the replacement can land in a
+        # container whose home IS writable. Cheap for the same reason stated
+        # there: the records a caller polls are on disk, so a teardown between
+        # calls is invisible to the frontend.
+        import training
+
+        try:
+            training.sessions_root()
+        except Exception as exc:
+            raise RuntimeError(f"training-run store unusable: {exc}") from exc
         # The `is None` test above cannot fail on a DEAD handle. hypha_rpc pins a proxy
         # to one client instance of the server; when that instance is gone every call
         # fails at send time forever while the websocket underneath happily reconnects.
