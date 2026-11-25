@@ -413,6 +413,55 @@ def run_cancellable_subprocess(
 # === annotation interpretation ===
 
 
+def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
+    """``{"x_min","x_max","y_min","y_max","features"}`` over a FeatureCollection's
+    polygon rings, or ``None`` when it carries no polygon at all.
+
+    Used to say WHY a mask came back empty. A polygon list whose x runs to 40000
+    against a 512-wide canvas is a coordinate-frame mismatch, and printing the
+    range turns a silent all-background training set into a diagnosis.
+    """
+    feats = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(feats, list):
+        return None
+    xs: List[float] = []
+    ys: List[float] = []
+    n = 0
+
+    def _walk(coords: Any, depth: int = 0) -> None:
+        # Polygon is [[ [x,y], ... ]]; MultiPolygon one level deeper. Walk until
+        # a pair of numbers appears rather than trusting the declared type.
+        if (
+            isinstance(coords, (list, tuple))
+            and len(coords) == 2
+            and all(isinstance(v, (int, float)) for v in coords)
+        ):
+            xs.append(float(coords[0]))
+            ys.append(float(coords[1]))
+            return
+        if isinstance(coords, (list, tuple)) and depth < 6:
+            for item in coords:
+                _walk(item, depth + 1)
+
+    for feat in feats:
+        geom = feat.get("geometry") if isinstance(feat, dict) else None
+        if not isinstance(geom, dict):
+            continue
+        if str(geom.get("type") or "") not in ("Polygon", "MultiPolygon"):
+            continue
+        n += 1
+        _walk(geom.get("coordinates"))
+    if not n or not xs:
+        return None
+    return {
+        "x_min": min(xs),
+        "x_max": max(xs),
+        "y_min": min(ys),
+        "y_max": max(ys),
+        "features": float(n),
+    }
+
+
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 

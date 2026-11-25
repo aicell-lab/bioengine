@@ -857,7 +857,36 @@ class EntryApp:
             resp = await self._http.get(url)
             resp.raise_for_status()
             h, w = int(ref_shape[0]), int(ref_shape[1])
-            return training.rasterize_geojson(resp.json(), width=w, height=h)
+            payload = resp.json()
+            mask = training.rasterize_geojson(payload, width=w, height=h)
+            # A GeoJSON that carries polygons and rasterises to NOTHING is a
+            # coordinate-frame mismatch, and it is silent: training proceeds on
+            # an all-background mask and reports success, having learnt nothing.
+            #
+            # The case that motivates it: a crop read from a whole-slide source
+            # is a WxH canvas, while the broker describes a region "in level-0
+            # pixels". If the annotator writes polygons in slide coordinates,
+            # every one of them lands outside the crop. Which frame it writes is
+            # not settled in this repository, so rather than assume one, this
+            # refuses the outcome that is wrong under either.
+            #
+            # Deliberately not region-specific: features that draw nothing on a
+            # full image are the same defect with the same cause.
+            if mask.max() == 0:
+                bounds = training.polygon_coordinate_bounds(payload)
+                if bounds:
+                    raise ValueError(
+                        f"The annotation for this image has "
+                        f"{int(bounds['features'])} polygon(s) but rasterises to "
+                        f"an empty mask on the {w}x{h} canvas: their coordinates "
+                        f"span x {bounds['x_min']:.0f}..{bounds['x_max']:.0f}, "
+                        f"y {bounds['y_min']:.0f}..{bounds['y_max']:.0f}. Training "
+                        f"on it would learn only background. If this image is a "
+                        f"region of a larger source, the polygons are most likely "
+                        f"in the source's coordinates and need offsetting by the "
+                        f"region origin."
+                    )
+            return mask
         return await self._load_image_from_source(source)
 
     async def _save_npy_to_temp(self, array: np.ndarray) -> str:
