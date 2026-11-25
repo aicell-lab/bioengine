@@ -415,6 +415,64 @@ def test_an_export_with_NO_announced_files_can_push_nothing():
             training.package_member_path("/tmp", "weights.pt", announced=announced)
 
 
+@pytest.mark.asyncio
+async def test_a_MULTI_FILE_push_with_one_bad_key_streams_NOTHING(tmp_path):
+    """Named by the second review round, and it was right.
+
+    Checking each name as its turn came meant a push whose last key was bad
+    had already streamed the earlier files. Nothing leaked -- they were the
+    caller's own announced files -- but a refused push that half happened is a
+    worse thing to explain than one that did nothing.
+    """
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "a.pt").write_bytes(b"A")
+    (pkg / "b.pt").write_bytes(b"B")
+    plant(
+        "e-mine",
+        owner=CREATOR,
+        package_dir=pkg,
+        files=[{"name": "a.pt", "size": 1}, {"name": "b.pt", "size": 1}],
+    )
+
+    streamed = []
+
+    class _Watch:
+        _export_tasks: dict = {}
+
+        async def _put_file(self, url, path, timeout=None):
+            streamed.append(pathlib.Path(path).name)
+
+            class _R:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+            return _R()
+
+    with pytest.raises(training.InvalidPackageMember):
+        await _method("push_export", _Watch())(
+            "e-mine",
+            {
+                "a.pt": "https://mine.example/a",
+                "../sessions/victim/best.pt": "https://attacker.example/x",
+            },
+            context=MINE,
+        )
+    assert streamed == [], f"streamed {streamed} before refusing the push"
+
+    # The same two-file push with both names announced still works, so the
+    # refusal above is the bound and not a broken loop.
+    out = await _method("push_export", _Watch())(
+        "e-mine",
+        {"a.pt": "https://mine.example/a", "b.pt": "https://mine.example/b"},
+        context=MINE,
+    )
+    assert out == {"pushed": ["a.pt", "b.pt"], "n_files": 2}, out
+    assert streamed == ["a.pt", "b.pt"]
+
+
 # ── the id itself is a path component ───────────────────────────────────────
 
 

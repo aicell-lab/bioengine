@@ -2194,14 +2194,21 @@ class EntryApp:
                 f"Export '{export_id}' is not READY (status={rec.get('status')})."
             )
         pkg_dir = Path(rec["_package_dir"])
-        pushed = []
-        for rel, url in files.items():
-            # BOUNDED, because `files` keys come from the caller. Before this,
-            # the key was joined to the package directory unchecked, and a
-            # caller holding any READY export of their own could push
-            # "../../<another run>/best.pt" -- another run's checkpoint -- to a
-            # URL of their choosing. `package_member_path` requires the name to
-            # be one this export announced AND to resolve inside the package.
+        # EVERY name is bounded BEFORE the first byte moves, not as each file
+        # comes up. `files` keys come from the caller: before this bound
+        # existed, a key was joined to the package directory unchecked and a
+        # caller holding any READY export of their own could push
+        # "../../<another run>/best.pt" -- another run's checkpoint -- to a URL
+        # of their choosing. `package_member_path` requires the name to be one
+        # this export ANNOUNCED and to resolve inside the package.
+        #
+        # Validating the whole mapping first is the review's point and it is
+        # right: checking inside the loop meant a push whose last key was bad
+        # had already streamed the earlier files. Nothing leaked -- they were
+        # the caller's own announced files -- but a refused push that half
+        # happened is a worse thing to explain than one that did nothing.
+        resolved = []
+        for rel in files:
             fpath = training.package_member_path(
                 pkg_dir, rel, announced=rec.get("files")
             )
@@ -2209,6 +2216,10 @@ class EntryApp:
                 raise FileNotFoundError(
                     f"Package file '{rel}' not found for export '{export_id}'."
                 )
+            resolved.append((rel, files[rel], fpath))
+
+        pushed = []
+        for rel, url, fpath in resolved:
             resp = await self._put_file(url, fpath, timeout=600.0)
             resp.raise_for_status()
             pushed.append(rel)
