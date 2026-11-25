@@ -352,10 +352,15 @@ OWNERLESS_WORKSPACE = "bioimage-io"
 OWNERLESS_GRANTS = frozenset({"rw", "a"})
 
 
-def caller_can_see_ownerless(
+def caller_is_workspace_admin(
     context: Any, *, workspace: str = OWNERLESS_WORKSPACE
 ) -> bool:
     """True iff the caller holds rw or admin on *workspace* — ``bioimage-io``.
+
+    Named for what it TESTS, not for one of its uses. Two different rules ask
+    this same question: an ownerless run is visible only to such a caller, and
+    a mutating call on somebody else's run is allowed only for such a caller.
+    Naming it after the first use made the second one read like a mistake.
 
     A run that carries no owner cannot be attributed to anybody, and there are
     261 of them written before the field existed. They are not guessed at, not
@@ -414,13 +419,21 @@ def caller_may_mutate(session_id: str, context: Any) -> bool:
     then applies — a non-admin is refused before any write can happen.
 
     Fails closed: an unreadable context yields no identity and so no match, and
-    `caller_can_see_ownerless` is False for it too.
+    `caller_is_workspace_admin` is False for it too.
     """
     owner = read_status(session_id).get("owner")
     if isinstance(owner, str) and owner:
         caller = caller_identity(context).get("owner")
-        return caller is not None and caller == owner
-    return caller_can_see_ownerless(context)
+        if caller is not None and caller == owner:
+            return True
+        # NOT a fall-through to "refuse". The rule is "the owner OR an admin",
+        # and an earlier version reached the admin test only for OWNERLESS runs
+        # -- so an administrator could not touch an owned run, while this
+        # function's own docstring said they could. The tests missed it because
+        # their admin fixture used the SAME id as the owner, so "the admin can"
+        # passed as "the owner can".
+        return caller_is_workspace_admin(context)
+    return caller_is_workspace_admin(context)
 
 
 def require_caller_may_mutate(session_id: str, context: Any) -> None:
@@ -497,7 +510,7 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
     """
     identity = caller_identity(context)
     caller = identity.get("owner")
-    see_ownerless = caller_can_see_ownerless(context)
+    see_ownerless = caller_is_workspace_admin(context)
 
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}

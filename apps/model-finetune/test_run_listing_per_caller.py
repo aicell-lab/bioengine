@@ -56,7 +56,11 @@ def ctx(uid, *, anonymous=True, grants=None):
     return {"user": user}
 
 
-ADMIN = ctx(ME, anonymous=False, grants={"bioimage-io": "a"})
+# A DISTINCT identity from every owner used below. Using ME here made
+# "the admin can" indistinguishable from "the owner can", which is exactly how
+# a bug where the admin could not touch an OWNED run passed the suite.
+ADMIN_ID = "github|777000"
+ADMIN = ctx(ADMIN_ID, anonymous=False, grants={"bioimage-io": "a"})
 
 
 @pytest.fixture()
@@ -108,10 +112,14 @@ def test_the_fixture_really_writes_runs_that_the_listing_can_see(runs):
     only meaningful if a caller who SHOULD see runs does. If this fails, the
     empty results elsewhere mean the fixture is broken, not that the filter
     works."""
-    runs("r1", ME)
+    runs("r1", ADMIN_ID)
     runs("r2", None)
     runs("r3", OTHER)
-    # The admin is the one identity that can see all three classes at once.
+    # The admin sees ITS OWN run plus the ownerless one, and NOT the run owned by
+    # somebody else. That last part is the listing rule and it does NOT change
+    # for an administrator: admin rights grant the ownerless rows, not everyone's
+    # history. Stopping somebody else's run is a different rule -- see clause 5
+    # below -- and the two are deliberately not the same.
     assert sorted(training.list_sessions(ADMIN)) == ["r1", "r2"], (
         "the admin should see its own run and the ownerless one, and NOT the "
         "run owned by somebody else"
@@ -230,7 +238,7 @@ def test_READ_permission_on_the_NAMED_workspace_is_NOT_authority(runs):
     runs("old", None)
     reader = ctx(OTHER, anonymous=False, grants={"bioimage-io": "r"})
     assert training.list_sessions(reader) == {}
-    assert training.caller_can_see_ownerless(reader) is False
+    assert training.caller_is_workspace_admin(reader) is False
     # paired demonstration: the SAME caller with rw does see it
     assert sorted(
         training.list_sessions(
@@ -249,7 +257,7 @@ def test_ADMIN_ON_THE_CALLERS_OWN_WORKSPACE_is_NOT_authority(runs):
     """
     runs("old", None)
     anon = ctx(ANON_A, grants={"ws-user-" + ANON_A: "a"})
-    assert training.caller_can_see_ownerless(anon) is False
+    assert training.caller_is_workspace_admin(anon) is False
     assert training.list_sessions(anon) == {}
     # paired demonstration: the runs are there for someone with real authority
     assert sorted(training.list_sessions(ADMIN)) == ["old"]
@@ -268,7 +276,7 @@ def test_a_WILDCARD_grant_NEVER_qualifies(runs, grant):
     """
     runs("old", None)
     who = ctx(OTHER, anonymous=False, grants={"*": grant})
-    assert training.caller_can_see_ownerless(who) is False, grant
+    assert training.caller_is_workspace_admin(who) is False, grant
     assert training.list_sessions(who) == {}
     # paired demonstration: the run IS there for the named workspace's admin
     assert sorted(training.list_sessions(ADMIN)) == ["old"]
@@ -279,7 +287,7 @@ def test_a_wildcard_does_not_help_even_ALONGSIDE_a_read_grant(runs):
     credit toward the other."""
     runs("old", None)
     who = ctx(OTHER, anonymous=False, grants={"*": "a", "bioimage-io": "r"})
-    assert training.caller_can_see_ownerless(who) is False
+    assert training.caller_is_workspace_admin(who) is False
     assert training.list_sessions(who) == {}
 
 
@@ -287,7 +295,7 @@ def test_authority_is_decided_only_by_the_named_workspace(runs):
     """A grant on an unrelated workspace is not authority here."""
     runs("old", None)
     elsewhere = ctx(OTHER, anonymous=False, grants={"some-other-ws": "a"})
-    assert training.caller_can_see_ownerless(elsewhere) is False
+    assert training.caller_is_workspace_admin(elsewhere) is False
     assert training.list_sessions(elsewhere) == {}
 
 
@@ -296,15 +304,15 @@ def test_the_workspace_being_checked_is_not_hardcoded_past_its_constant():
     changes one name. Asserted by checking a DIFFERENT workspace via the
     keyword, which must then be the one that counts."""
     who = ctx(OTHER, anonymous=False, grants={"other-home": "a"})
-    assert training.caller_can_see_ownerless(who) is False
-    assert training.caller_can_see_ownerless(who, workspace="other-home") is True
+    assert training.caller_is_workspace_admin(who) is False
+    assert training.caller_is_workspace_admin(who, workspace="other-home") is True
 
 
 # ── the owner decides visibility and is never published ──────────────────────
 
 
 def test_the_owner_fields_are_absent_from_every_returned_record(runs):
-    runs("mine", ME)
+    runs("mine", ADMIN_ID)
     runs("old", None)
     got = training.list_sessions(ADMIN)
     assert sorted(got) == ["mine", "old"]
@@ -434,7 +442,7 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
     # dropped context only if the method passed None explicitly; assert the
     # object identity so a method that rebuilt a context from somewhere else
     # fails here too.
-    assert seen["context"]["user"]["id"] == ME
+    assert seen["context"]["user"]["id"] == ADMIN_ID
 
 
 # ── clause 5: only the owner, or a bioimage-io admin, may CHANGE a run ───────
@@ -601,3 +609,191 @@ def test_caller_may_mutate_fails_closed_on_an_unreadable_context(runs):
         assert training.caller_may_mutate(sid, bad) is False, bad
     # paired control
     assert training.caller_may_mutate(sid, ctx(ME, anonymous=False)) is True
+
+
+# ── the admin leg, with an id DISTINCT from the owner ───────────────────────
+#
+# THE BUG THESE EXIST FOR. The rule is "the owner OR a bioimage-io admin", and
+# an earlier version reached the admin test only for OWNERLESS runs — so an
+# administrator could not touch an owned run, while the function's own docstring
+# said they could. The suite missed it because its admin fixture used the SAME id
+# as the owner, so "the admin can" was passing as "the owner can".
+#
+# Every test below therefore uses ADMIN_ID, which owns nothing.
+
+
+@pytest.mark.asyncio
+async def test_an_ADMIN_WITH_A_DISTINCT_ID_can_stop_someone_elses_run(runs):
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ANON_A, owner_anonymous=True)
+    assert training.read_status(sid)["owner"] != ADMIN_ID, "fixture: ids must differ"
+    cls, inst = _entry()
+    out = await cls.stop_training(inst, session_id=sid, context=ADMIN)
+    assert out["status"] == "STOPPED", out
+
+
+@pytest.mark.asyncio
+async def test_an_ADMIN_WITH_A_DISTINCT_ID_can_export_someone_elses_run(runs):
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ANON_A, owner_anonymous=True)
+    cls, inst = _entry()
+    # The gate must PASS, so the call proceeds past it and fails later on the
+    # missing checkpoint instead. NotTheOwner here would mean the gate refused.
+    with pytest.raises(Exception) as exc:
+        await cls.export_model(inst, session_id=sid, name="x", context=ADMIN)
+    assert not isinstance(
+        exc.value, training.NotTheOwner
+    ), "the admin was refused by the owner gate on an owned run"
+
+
+@pytest.mark.parametrize("grant", ["a", "rw"])
+def test_caller_may_mutate_grants_an_admin_on_an_OWNED_run(runs, grant):
+    """The unit-level statement of the same thing, across both grants."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ANON_A, owner_anonymous=True)
+    admin = ctx("github|999", anonymous=False, grants={"bioimage-io": grant})
+    assert training.caller_may_mutate(sid, admin) is True, grant
+    # paired control: the same identity WITHOUT the grant is refused
+    assert training.caller_may_mutate(sid, ctx("github|999", anonymous=False)) is False
+
+
+def test_READ_permission_does_not_grant_mutation_of_an_OWNED_run(runs):
+    """The "r" narrowing applies to the admin override too, not just to the
+    ownerless rule."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ANON_A, owner_anonymous=True)
+    reader = ctx("github|999", anonymous=False, grants={"bioimage-io": "r"})
+    assert training.caller_may_mutate(sid, reader) is False
+
+
+def test_a_NON_admin_third_party_still_cannot_mutate_an_owned_run(runs):
+    """THE CONTROL for the admin tests: the override must come from the grant,
+    not from being a third party."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ANON_A, owner_anonymous=True)
+    assert training.caller_may_mutate(sid, ctx(OTHER, anonymous=False)) is False
+    assert training.caller_may_mutate(sid, ctx(ANON_B)) is False
+
+
+# ── contribute is a mutating call keyed by session_id, so it is gated ───────
+#
+# It uploads a finished run's weights into the SHARED community model-soup pool
+# and appends to the pool index. Publishing somebody else's checkpoint is the
+# same harm as exporting it and worse in reach: the index is append-only and
+# shared, so a contribution cannot simply be withdrawn. Gating export_model did
+# NOT cover this — contribute does not go through export.
+
+
+async def _contribute(cls, inst, sid, who):
+    """Call contribute with every REQUIRED argument supplied.
+
+    `pool_artifact_id` and `pool_token` are required, and the framework's own
+    argument check raises TypeError before the method body runs if they are
+    missing -- so omitting them never reaches the gate at all. The values are
+    placeholders: a refused caller never gets near the pool, and an allowed one
+    fails later on them, which is what the control above asserts.
+    """
+    return await cls.contribute(
+        inst,
+        session_id=sid,
+        pool_artifact_id="bioimage-io/does-not-exist",
+        pool_token="placeholder-not-a-real-token",
+        context=who,
+    )
+
+
+@pytest.mark.asyncio
+async def test_CONTRIBUTE_refuses_a_run_the_caller_does_not_own(runs):
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    with pytest.raises(training.NotTheOwner):
+        await _contribute(cls, inst, sid, ctx(OTHER, anonymous=False))
+    with pytest.raises(training.NotTheOwner):
+        await _contribute(cls, inst, sid, ctx(ANON_A))
+
+
+@pytest.mark.asyncio
+async def test_CONTRIBUTE_refuses_BEFORE_revealing_the_runs_state(runs):
+    """Its "is <status>, not COMPLETED" error is an existence-and-state oracle,
+    so the gate has to run first. A refused caller must not learn the status."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    with pytest.raises(training.NotTheOwner) as exc:
+        await _contribute(cls, inst, sid, ctx(OTHER, anonymous=False))
+    msg = str(exc.value)
+    for leak in ("COMPLETED", "not COMPLETED", sid):
+        assert leak not in msg, f"the refusal leaked {leak!r}: {msg}"
+
+
+@pytest.mark.asyncio
+async def test_CONTRIBUTE_lets_the_OWNER_past_the_gate(runs):
+    """THE CONTROL. Both refusals above would read the same if the gate refused
+    everybody. The owner gets past it and fails later, on the real work."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    seen = []
+    real = training.require_caller_may_mutate
+
+    def spy(session_id, context):
+        seen.append(session_id)
+        return real(session_id, context)
+
+    training.require_caller_may_mutate = spy
+    try:
+        with pytest.raises(Exception) as exc:
+            await _contribute(cls, inst, sid, ctx(ME, anonymous=False))
+    finally:
+        training.require_caller_may_mutate = real
+    # The gate was CONSULTED. Without this the test passes whenever the call
+    # blows up BEFORE reaching the gate -- which is exactly what the first
+    # version of it did, on a TypeError about a missing required argument. A
+    # control that passes for the wrong reason is worse than no control.
+    assert seen == [sid], f"the gate was never consulted: {seen}"
+    assert not isinstance(
+        exc.value, training.NotTheOwner
+    ), "the owner was refused by its own run's gate"
+
+
+@pytest.mark.parametrize("method", ["stop_training", "export_model", "contribute"])
+def test_EVERY_mutating_method_keyed_by_session_id_is_gated(method):
+    """A structural guard over the three, so a fourth is a deliberate decision.
+    The decorator alone is not enough — without it the gate sees no identity and
+    refuses everybody, which is safe but silent."""
+    fn = _entry_method(method)
+    schema = getattr(fn, "__schema__", None)
+    assert schema, f"{method} carries no __schema__"
+    props = (schema.get("parameters") or {}).get("properties") or {}
+    assert "context" not in props, f"`context` is published on {method}"
+    flags = [
+        getattr(fn, n)
+        for n in dir(fn)
+        if "context" in n.lower() and isinstance(getattr(fn, n, None), bool)
+    ]
+    assert flags and any(flags), f"{method} is not flagged as wanting the context"
+
+
+def test_no_OTHER_entry_method_takes_a_session_id_without_the_gate():
+    """Structural: every @bioengine.method whose signature has `session_id` is
+    either gated or listed here as a deliberate read-only exception. A new one
+    fails this until someone decides which it is."""
+    import pathlib
+    import re
+
+    import entry
+
+    src = pathlib.Path(entry.__file__).read_text()
+    lines = src.splitlines()
+    taking = []
+    for i, line in enumerate(lines):
+        m = re.match(r"\s+async def (\w+)\(", line)
+        if not m:
+            continue
+        block = "\n".join(lines[i : i + 30])
+        sig = block.split(") ->")[0] if ") ->" in block else block
+        if "session_id" in sig and "@bioengine.method" in lines[i - 1] + lines[i - 2]:
+            taking.append(m.group(1))
+    gated = {"stop_training", "export_model", "contribute"}
+    # Deliberate read-only exceptions. `get_training_status` is tracked as its
+    # own question (is a run id a bearer capability?); infer/compute_embedding
+    # read a model, not a run's ownership.
+    read_only = {"get_training_status", "infer", "compute_embedding"}
+    unaccounted = sorted(set(taking) - gated - read_only)
+    assert not unaccounted, (
+        f"method(s) taking a session_id that are neither gated nor a listed "
+        f"read-only exception: {unaccounted}. Decide which, then add it here."
+    )

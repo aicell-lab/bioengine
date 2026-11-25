@@ -2474,7 +2474,7 @@ class EntryApp:
             except Exception:
                 pass
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def contribute(
         self,
         session_id: str = Field(
@@ -2497,6 +2497,7 @@ class EntryApp:
             None,
             description="Optional solo validation score for this contribution, recorded for audit.",
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Upload a finished cpsam session's weights into a community model-soup
         pool. Records weights + an auditable metadata.json (architecture
@@ -2513,6 +2514,14 @@ class EntryApp:
         import pool
         import training
 
+        # BEFORE get_status, whose "session ... is <status>, not COMPLETED" error
+        # would otherwise tell an unauthorised caller that a run exists and what
+        # state it is in -- the same oracle deliberately avoided in export_model.
+        #
+        # Publishing someone else's checkpoint into the shared community pool is
+        # the same harm as exporting it, and worse in reach: the pool index is
+        # append-only and shared, so a contribution cannot simply be withdrawn.
+        training.require_caller_may_mutate(session_id, context)
         st = training.get_status(session_id)
         if st.get("status") != "COMPLETED":
             raise ValueError(
