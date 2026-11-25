@@ -268,7 +268,9 @@ def test_an_EXPORT_RECORD_really_does_hand_over_the_weights():
     assert "download_url" in SOURCE, "the export record no longer mentions download_url"
     node, _params = METHODS["get_export_status"]
     body = ast.get_source_segment(SOURCE, node) or ""
-    assert "startswith" in body and "_" in body, (
+    # Review caught the previous form of this: it asserted `"_" in body`, which
+    # every method body in Python satisfies. Assert the actual filter instead.
+    assert 'startswith("_")' in body or "startswith('_')" in body, (
         "get_export_status no longer returns the record filtered only by a "
         "leading-underscore convention; re-check what it exposes"
     )
@@ -283,7 +285,12 @@ def test_the_RESUME_gate_is_applied_to_the_RESUMED_run_not_the_new_one():
     `_calls_the_gate` passes when the gate is called anywhere in the body with
     any argument, so `start_training` gating the freshly minted `session_id`,
     or gating unconditionally, would have stayed green while the docstring
-    claimed it gates "when resume_session_id is given". Assert the argument.
+    claimed it gates "when resume_session_id is given".
+
+    So this checks BOTH halves of that sentence: the argument is
+    `resume_session_id`, and the call sits inside a branch conditioned on it.
+    An earlier version checked only the argument while the docstring claimed
+    both -- the same gap, one level up.
     """
     node, _params = METHODS["start_training"]
     args_seen = []
@@ -301,6 +308,26 @@ def test_the_RESUME_gate_is_applied_to_the_RESUMED_run_not_the_new_one():
     assert any("resume_session_id" in a for a in args_seen), (
         f"start_training calls {GATE} with {args_seen}, never with "
         "resume_session_id. The gate must be applied to the run being resumed."
+    )
+
+    # ...and it must be CONDITIONAL on a resume being asked for. Gating every
+    # call would refuse an ordinary new run for anyone but the owner of some
+    # other run, which no ruling asks for.
+    guarded = False
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.If):
+            continue
+        test_src = ast.get_source_segment(SOURCE, sub.test) or ""
+        if "resume_session_id" not in test_src:
+            continue
+        for inner in ast.walk(sub):
+            if isinstance(inner, ast.Call):
+                fn = inner.func
+                if (getattr(fn, "attr", None) or getattr(fn, "id", None)) == GATE:
+                    guarded = True
+    assert guarded, (
+        f"{GATE} is called in start_training but not under a branch testing "
+        "resume_session_id, so it would gate an ordinary new run too."
     )
 
 
@@ -325,3 +352,26 @@ def test_the_TUTORIAL_warns_about_the_export_handle_too():
     assert (
         "not a progress token" in text
     ), "the tutorial hands the reader an export_id without saying what it grants"
+
+
+def test_the_README_TABLE_ROW_itself_names_the_weights():
+    """Review's surviving mutant: the original wording could come back.
+
+    Restoring "progress of an export already started" in the `get_export_status`
+    row left all 20 tests green, because only the separate paragraph below was
+    pinned. A reader scanning the table is exactly who the first version of
+    this documentation misled, so the row has to carry the warning too.
+    """
+    readme = pathlib.Path(__file__).with_name("README.md").read_text()
+    rows = [
+        ln
+        for ln in readme.splitlines()
+        if ln.startswith("|") and "get_export_status" in ln
+    ]
+    assert rows, "no README table row for get_export_status"
+    for row in rows:
+        low = row.lower()
+        assert "weights" in low, f"the table row does not name the weights: {row}"
+        assert (
+            "progress of an export already started" not in low
+        ), "the table row has reverted to describing the handle as progress"
