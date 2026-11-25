@@ -301,7 +301,23 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
     return cur
 
 
-def get_status(session_id: str) -> Dict[str, Any]:
+# Fields recorded on a run but NOT returned by the public read path.
+#
+# `list_training_sessions` answers anonymous callers today, and it returns
+# whatever `get_status` returns. So the moment a run records who started it, that
+# identity is published to anyone who asks -- the public history would stop
+# saying only WHAT was trained and start saying WHO trained it. Recording the
+# owner and keeping it out of the response therefore have to be one change, not
+# two: "record now, filter later" publishes the identity in between.
+#
+# These come back only for a caller that asks with include_private=True, which is
+# the hook the per-caller filter will use to compare a request against the run's
+# owner. When that filter lands, the listing can return owned runs to their owner
+# and this redaction becomes the default for everyone else rather than for all.
+PRIVATE_STATUS_FIELDS = ("owner", "owner_anonymous")
+
+
+def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, Any]:
     st = read_status(session_id)
     if not st:
         return {
@@ -325,6 +341,10 @@ def get_status(session_id: str) -> Dict[str, Any]:
     ):
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
+    if not include_private:
+        for field in PRIVATE_STATUS_FIELDS:
+            st.pop(field, None)
+
     return st
 
 

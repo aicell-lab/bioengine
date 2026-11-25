@@ -103,61 +103,155 @@ def test_identity_never_raises_whatever_it_is_handed():
 # ── the wiring: the entry must ASK for the context and record what it returns ──
 
 
-def _start_training_body() -> str:
-    """`start_training`'s source, sliced out of the file by name.
-
-    Read from disk rather than through `inspect`: the class is wrapped by the
-    app framework and Ray Serve, so an attribute lookup can land on a wrapper
-    and return a few hundred characters of decorator — which would make the
-    assertions below pass against text that is not the function.
-    """
-    import pathlib
-
-    src = (pathlib.Path(__file__).parent / "entry.py").read_text()
-    start = src.find("    async def start_training(")
-    assert start > 0, "start_training not found in entry.py"
-    nxt = src.find("\n    async def ", start + 1)
-    body = src[start : nxt if nxt > 0 else len(src)]
-    assert len(body) > 2000, f"slice implausibly short ({len(body)} chars)"
-    assert body.startswith("    async def start_training("), body[:60]
-    assert body.count("\n    async def ") == 0, "the slice spans more than one method"
-    return body
+# ── behaviourally: the owner is WRITTEN, and the public read path REDACTS it ──
+#
+# The previous tests here were substring greps over entry.py. The reviewer broke
+# them twice while keeping the substring alive -- once by calling the helper and
+# discarding its result, once by passing `None` instead of `context` with the
+# original kept in a comment -- and both mutations left the suite green. A grep
+# cannot see what a write actually stores, so these drive the write and read the
+# file back.
 
 
-def test_start_training_asks_hypha_for_the_caller():
-    """`@bioengine.method(context=True)` is what makes Hypha inject the context.
-    Without it the parameter is simply never filled and every run records no
-    owner — green tests, no attribution."""
-    import pathlib
+@pytest.fixture()
+def sessions(tmp_path, monkeypatch):
+    """Point the session store at a temp dir, so the real write/read runs."""
+    monkeypatch.setattr(training, "SESSIONS_ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(training, "sessions_root", lambda: tmp_path)
+    return tmp_path
 
-    src = (pathlib.Path(__file__).parent / "entry.py").read_text()
-    i = src.find("    async def start_training(")
-    assert i > 0
-    decorator_region = src[max(0, i - 200) : i]
-    assert "@bioengine.method(context=True)" in decorator_region, (
-        "start_training is not declared with context=True, so Hypha will not "
-        f"inject the caller and the owner can never be recorded. Saw: "
-        f"{decorator_region[-80:]!r}"
+
+def _write_owned(sid, ctx):
+    training.write_status(
+        sid, status="PREPARING", created_at=1.0, **training.caller_identity(ctx)
     )
 
 
-def test_start_training_takes_a_context_parameter_and_records_it():
-    body = _start_training_body()
-    assert "context=None," in body, "no context parameter to receive the injection"
-    assert "training.caller_identity(context)" in body, (
-        "start_training does not record the caller, so the context would be "
-        "injected and then dropped"
+def test_the_owner_REACHES_THE_STORED_RECORD(sessions):
+    """What a grep cannot check: that the write stores the injected identity."""
+    _write_owned("s1", {"user": {"id": "github|49943582", "is_anonymous": False}})
+    on_disk = training.read_status("s1")
+    assert on_disk["owner"] == "github|49943582", on_disk
+    assert on_disk["owner_anonymous"] is False
+
+
+def test_an_unidentified_caller_stores_no_owner(sessions):
+    _write_owned("s2", None)
+    on_disk = training.read_status("s2")
+    assert on_disk.get("owner") is None
+    assert on_disk.get("owner_anonymous") is None
+
+
+def test_THE_PUBLIC_READ_PATH_DOES_NOT_RETURN_THE_OWNER(sessions):
+    """THE FINDING THIS COMMIT EXISTS FOR. `list_training_sessions` answers
+    anonymous callers and returns whatever get_status returns, so recording an
+    owner without redacting it publishes the creator's user id to anybody."""
+    _write_owned("s3", {"user": {"id": "github|49943582", "is_anonymous": False}})
+    public = training.get_status("s3")
+    assert "owner" not in public, f"the owner is in the public response: {public}"
+    assert "owner_anonymous" not in public
+    listed = training.list_sessions()
+    assert "s3" in listed, "the run vanished from the listing entirely"
+    assert "owner" not in listed["s3"], (
+        f"list_sessions publishes the owner: {listed['s3']}"
     )
 
 
-def test_the_owner_is_written_on_the_record_that_is_CREATED():
-    """Not on a later update. A run that fails during preparation must still be
-    attributable, and `created_at` is the write that always happens."""
-    body = _start_training_body()
-    i = body.find('status="PREPARING"')
-    assert i > 0, "the PREPARING write moved; this test is keyed on it"
-    window = body[i : i + 900]
-    assert "caller_identity(context)" in window, (
-        "the owner is not part of the PREPARING write, so a run that never "
-        "reaches TRAINING would have no owner at all"
+def test_a_caller_THAT_ASKS_can_still_read_the_owner(sessions):
+    """THE CONTROL for the redaction. Without it, the assertions above would also
+    pass if the owner were never stored at all -- which is the bug the reviewer
+    produced twice. This proves the field is present and merely withheld, and it
+    is the hook the per-caller filter will use."""
+    _write_owned("s4", {"user": {"id": "github|7", "is_anonymous": False}})
+    private = training.get_status("s4", include_private=True)
+    assert private["owner"] == "github|7"
+    assert private["owner_anonymous"] is False
+
+
+def test_redaction_does_not_disturb_the_rest_of_the_record(sessions):
+    """A blanket strip would be easy to write and would take the status with it."""
+    _write_owned("s5", {"user": {"id": "github|7"}})
+    public = training.get_status("s5")
+    assert public["status"] == "PREPARING"
+    assert public["session_id"] == "s5"
+    assert public["created_at"] == 1.0
+
+
+# ── the REAL call site: what entry.py passes to the write ─────────────────────
+#
+# The tests above compose `caller_identity` and `write_status` themselves, so
+# they prove each piece works and NOTHING about whether entry.py wires them.
+# Two mutations of that call site -- calling the helper and discarding its
+# result, and passing `None` with the original kept alive in a comment -- both
+# left them green. This drives `start_training` itself and captures what it
+# hands the writer, which is exactly what those mutations change.
+
+
+class _Stop(Exception):
+    """Raised from the captured write, to stop start_training at that point."""
+
+
+def _capture_preparing_write(monkeypatch):
+    import entry
+
+    seen = {}
+
+    def _write(session_id, **fields):
+        seen["session_id"] = session_id
+        seen.update(fields)
+        raise _Stop()
+
+    # On the `training` MODULE, not on `entry`: start_training does a local
+    # `import training` inside the function body, so there is no `entry.training`
+    # attribute to patch -- the name is resolved from sys.modules at call time.
+    monkeypatch.setattr(training, "write_status", _write)
+    # `object.__new__` skips __init__ on purpose -- constructing the real app
+    # needs Hypha. Only the attributes this path touches before the write are
+    # supplied, and they were read off the source rather than guessed one
+    # exception at a time: _check_runtime_available, _resolve_pool_init and
+    # _runtime_gpu_memory are the three.
+    cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
+    inst = object.__new__(cls)
+    inst._enabled_backends = {"microsam", "cellpose"}
+    async def _async_none(*a, **k):
+        return None
+
+    async def _async_pool(*a, **k):
+        return None, None
+
+    # Two of these are awaited on this path, so a plain lambda gives
+    # "object NoneType can't be used in 'await' expression" -- which is a
+    # harness fault that looks nothing like the thing under test.
+    inst._check_runtime_available = _async_none
+    inst._resolve_pool_init = _async_pool
+    async def _async_gpu(*a, **k):
+        # `available: False` so the VRAM floor check is skipped -- this harness
+        # is about attribution, not about placement.
+        return {"available": False}
+
+    inst._runtime_gpu_memory = _async_gpu
+    fn = getattr(cls, "start_training")
+    return fn, inst, seen
+
+
+@pytest.mark.asyncio
+async def test_entry_passes_the_INJECTED_caller_to_the_write(monkeypatch):
+    fn, inst, seen = _capture_preparing_write(monkeypatch)
+    ctx = {"user": {"id": "github|49943582", "is_anonymous": False}}
+    with pytest.raises(_Stop):
+        await fn(inst, train_images=["a.tif"], train_labels=["b.tif"], context=ctx)
+    assert seen.get("status") == "PREPARING", seen
+    assert seen.get("owner") == "github|49943582", (
+        f"start_training did not pass the injected caller to the write: {seen}"
     )
+    assert seen.get("owner_anonymous") is False
+
+
+@pytest.mark.asyncio
+async def test_entry_passes_NOTHING_when_there_is_no_caller(monkeypatch):
+    """THE CONTROL: the owner must track the context, not be a constant. A call
+    site hard-coding `None` passes the test above's negation but fails here."""
+    fn, inst, seen = _capture_preparing_write(monkeypatch)
+    with pytest.raises(_Stop):
+        await fn(inst, train_images=["a.tif"], train_labels=["b.tif"], context=None)
+    assert seen.get("owner") is None, seen
