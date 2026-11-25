@@ -311,10 +311,75 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
 # two: "record now, filter later" publishes the identity in between.
 #
 # These come back only for a caller that asks with include_private=True, which is
-# the hook the per-caller filter will use to compare a request against the run's
-# owner. When that filter lands, the listing can return owned runs to their owner
-# and this redaction becomes the default for everyone else rather than for all.
+# the hook the per-caller filter uses to compare a request against the run's owner.
+# The owner is therefore READ on every listing and PUBLISHED on none.
 PRIVATE_STATUS_FIELDS = ("owner", "owner_anonymous")
+
+# The workspace whose members may see runs that carry no owner, and the grants
+# that count as membership. BOTH halves are narrower than they look, and each
+# narrowing is there because the wider version is wrong:
+#
+#   * "r" is EXCLUDED. ``usage_ledger.classify_caller`` treats {"r", "rw", "a"} as
+#     operator grants, which is right for its own question (is this caller an
+#     insider, for a usage figure that should be a floor) and wrong for this one.
+#     Read permission is not authority over other people's run history.
+#   * the workspace is NAMED, and the caller's own workspace does not count.
+#     Measured 2026-11-25: every token-less caller is minted a fresh identity
+#     holding "a" ON ITS OWN personal workspace (`ws-user-anonymouz-...`). So a
+#     check of the form "does this caller hold an operator grant anywhere" is
+#     true for EVERY caller including anonymous ones, and would hand the whole
+#     unowned history to exactly the callers it is meant to exclude.
+OWNERLESS_WORKSPACE = "bioimage-io"
+OWNERLESS_GRANTS = frozenset({"rw", "a"})
+
+
+def caller_can_see_ownerless(
+    context: Any, *, workspace: str = OWNERLESS_WORKSPACE
+) -> bool:
+    """True iff the caller holds rw or admin on *workspace*.
+
+    A run that carries no owner cannot be attributed to anybody, and there are
+    261 of them written before the field existed. They are not guessed at, not
+    made public and not deleted: they are shown only to a caller with authority
+    over the workspace that hosts the app.
+
+    Decided from the INJECTED context and from nothing else — there is no
+    parameter, so a caller cannot ask to be treated as an administrator. A
+    wildcard grant qualifies when it carries rw or admin, because a genuine
+    global operator does have that authority over this workspace; a wildcard
+    carrying only "r" does not, for the same reason "r" on the named workspace
+    does not.
+
+    Never raises: an unusable context is "no authority", which is the closed
+    direction. A caller that cannot be read must not inherit the open one.
+    """
+    if not isinstance(context, dict):
+        return False
+    user = context.get("user")
+    if not isinstance(user, dict):
+        return False
+    scope = user.get("scope")
+    if not isinstance(scope, dict):
+        return False
+    grants = scope.get("workspaces")
+    if not isinstance(grants, dict):
+        return False
+    for key in (workspace, "*"):
+        if grants.get(key) in OWNERLESS_GRANTS:
+            return True
+    return False
+
+
+def redact_private(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop every private field, in place, and return the same dict.
+
+    One definition, used by both the single-run read and the listing. Two copies
+    of this loop is how a field added to :data:`PRIVATE_STATUS_FIELDS` ends up
+    stripped on one path and published on the other.
+    """
+    for field in PRIVATE_STATUS_FIELDS:
+        status.pop(field, None)
+    return status
 
 
 def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, Any]:
@@ -342,18 +407,60 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
     if not include_private:
-        for field in PRIVATE_STATUS_FIELDS:
-            st.pop(field, None)
+        redact_private(st)
 
     return st
 
 
-def list_sessions() -> Dict[str, Dict[str, Any]]:
+def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
+    """The runs this caller may see, keyed by session id, owner redacted.
+
+    *context* is REQUIRED and has no default, deliberately. There is no
+    unfiltered listing to call by mistake: the previous `list_sessions()`
+    returned every run on the worker to whoever asked, and leaving that
+    signature available with a filtered sibling beside it would make the open
+    behaviour one forgotten argument away. A caller with nothing to pass passes
+    ``None`` and gets what ``None`` deserves.
+
+    A run is visible iff its recorded owner IS this caller, or it carries no
+    owner and the caller may see ownerless runs. Both legs fail closed: an
+    unreadable context yields no identity, no authority, and so an empty
+    listing. The owner is read here and redacted from everything returned, so
+    the field decides visibility and is never itself published.
+    """
+    identity = caller_identity(context)
+    caller = identity.get("owner")
+    see_ownerless = caller_can_see_ownerless(context)
+
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
     for d in sorted(root.iterdir()) if root.exists() else []:
-        if d.is_dir() and (d / "status.json").exists():
-            out[d.name] = get_status(d.name)
+        if not (d.is_dir() and (d / "status.json").exists()):
+            continue
+        status = get_status(d.name, include_private=True)
+        owner = status.get("owner")
+        if isinstance(owner, str) and owner:
+            # A recorded owner is matched EXACTLY, and only against a caller we
+            # could actually read.
+            #
+            # `caller is not None` is REDUNDANT as this branch is written, and
+            # measured to be: `owner` here is a non-empty string, so
+            # `owner == caller` is already False for `caller is None`, and a
+            # mutant dropping the guard keeps the whole suite green. It is kept
+            # because the branch CONDITION is what makes it redundant, and that
+            # condition is the fragile part -- loosening it to `"owner" in
+            # status` sends a null owner into this comparison, where
+            # `None == None` is True and every run by an unidentified caller
+            # becomes visible to every unidentifiable caller. That mutant turns
+            # 10 tests red. So: the guard is defence for an edit nobody has made
+            # yet, not live logic, and no test can distinguish it today.
+            visible = caller is not None and owner == caller
+        else:
+            # No owner, or an owner we cannot use as an identity (empty string,
+            # wrong type). Both are "unattributable", which is the ownerless case.
+            visible = see_ownerless
+        if visible:
+            out[d.name] = redact_private(status)
     return out
 
 

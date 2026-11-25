@@ -1917,12 +1917,26 @@ class EntryApp:
 
         return training.get_status(session_id)
 
-    @bioengine.method
-    async def list_training_sessions(self) -> Dict[str, Any]:
-        """All fine-tuning sessions on this worker, keyed by session_id."""
+    @bioengine.method(context=True)
+    async def list_training_sessions(self, context=None) -> Dict[str, Any]:
+        """The fine-tuning runs YOU may see, keyed by session_id.
+
+        Not every run on the worker: a run is returned to the caller whose
+        identity it was recorded under, and a run carrying no owner only to a
+        caller holding rw or admin on the workspace hosting this app. An
+        anonymous caller is a real identity here — Hypha mints a fresh one per
+        connection — so it sees the runs it started on that connection and no
+        others.
+
+        `context=True` is load-bearing and not decoration: without it the proxy
+        forwards no context, `training.list_sessions` reads no identity, and the
+        honest consequence of that is an EMPTY listing for everybody. That is
+        the safe direction, and it is also indistinguishable from "this worker
+        has no runs", so the decorator is covered by a test rather than trusted.
+        """
         import training
 
-        return training.list_sessions()
+        return training.list_sessions(context)
 
     @bioengine.method
     async def stop_training(
