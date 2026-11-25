@@ -240,6 +240,29 @@ def _install_secret_env_vars(instance: Any, logger: logging.Logger) -> None:
     ``BIOENGINE_SECRET_KEYS``, so nothing is fetched and the old path is the
     only one that runs.
     """
+    # Fenced keys FIRST, so a deploy that asked for no credential cannot run
+    # the user's __init__ as an identity it inherited. On single-machine the
+    # replica shares the worker's container and therefore its environment, so
+    # the worker declining to inject a token is not the same as this process
+    # not holding one (#0535). The worker names the keys rather than this side
+    # guessing them, and an older worker names none, so the loop is a no-op
+    # against one.
+    fenced = [
+        key
+        for key in os.environ.get("BIOENGINE_FENCED_ENV_KEYS", "").split(",")
+        if key
+    ]
+    for key in fenced:
+        os.environ.pop(key, None)
+    if fenced:
+        # Names only. A fenced key has no value worth printing by definition,
+        # but the replica's logs are readable through get_app_status, so the
+        # habit is kept.
+        logger.info(
+            f"🚫 Removed {len(fenced)} inherited env var(s) this deployment "
+            f"asked to be fenced from: {sorted(fenced)}"
+        )
+
     prefix = "_BIOENGINE_SECRET_"
     for key, value in list(os.environ.items()):
         if key.startswith(prefix):
