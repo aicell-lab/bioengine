@@ -1522,7 +1522,7 @@ class EntryApp:
             )
         return out
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def start_training(
         self,
         train_images: List[Union[np.ndarray, str, Dict[str, Any]]] = Field(
@@ -1635,6 +1635,7 @@ class EntryApp:
         label: str = Field(
             "", description="Optional human-readable tag for this session."
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Start a μSAM fine-tuning session (AIS decoder) and return immediately
         with the status incl. ``session_id``. Data prep runs on this CPU entry;
@@ -1713,6 +1714,10 @@ class EntryApp:
             session_id,
             status="PREPARING",
             created_at=time.time(),
+            # Who this run belongs to, from Hypha's injected context. Recorded
+            # at creation because it cannot be recovered later: nothing else on
+            # the record says whose work it was.
+            **training.caller_identity(context),
             model_type=model_type,
             backend=backend,
             label=label,
