@@ -361,11 +361,43 @@ def get_status(session_id: str) -> Dict[str, Any]:
 
 
 def list_sessions() -> Dict[str, Dict[str, Any]]:
+    """Every run on this worker whose directory name is a real session id.
+
+    **A non-conforming directory is SKIPPED, not fatal, and that is the whole
+    point of this function having a comment.** ``get_status`` validates the id,
+    so listing a directory whose name is not a session id raises — and one such
+    directory would then make the listing raise for *every* caller, turning a
+    stray directory into a total outage of the run history.
+
+    That is not hypothetical. Until this fix is deployed, the running version
+    lets any unauthenticated caller create exactly such a directory, so the
+    fixed version can come up with junk already on disk beside the real runs.
+    The "all 261 live ids conform" measurement was taken *before* the rollout
+    and cannot speak for what is on disk after it.
+
+    So the rule is: validate what a CALLER hands us, and tolerate what we FIND.
+    A name that cannot be a session id was not produced by this server, and the
+    honest thing is to leave it out of the history rather than to refuse to show
+    the history at all. It is logged once per listing so the junk is visible.
+    """
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
+    skipped: List[str] = []
     for d in sorted(root.iterdir()) if root.exists() else []:
-        if d.is_dir() and (d / "status.json").exists():
-            out[d.name] = get_status(d.name)
+        if not (d.is_dir() and (d / "status.json").exists()):
+            continue
+        if not SESSION_ID_PATTERN.match(d.name):
+            skipped.append(d.name)
+            continue
+        out[d.name] = get_status(d.name)
+    if skipped:
+        # Names are attacker-controlled, so log how many and a bounded sample
+        # rather than the lot.
+        print(
+            f"[model-finetune] skipped {len(skipped)} session directory(ies) whose "
+            f"name is not a valid session id: {skipped[:5]}",
+            flush=True,
+        )
     return out
 
 

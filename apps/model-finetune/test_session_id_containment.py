@@ -213,12 +213,37 @@ def test_no_path_helper_bypasses_the_chokepoint():
         line.strip()
         for line in src.splitlines()
         if "sessions_root()" in line and not line.strip().startswith("#")
+        # the DEFINITION is not a use -- counting it is how this test came to
+        # allow 3 when only 2 call sites exist, which tolerated exactly the
+        # extra call site it is supposed to catch
+        and not line.strip().startswith("def sessions_root")
     ]
-    # Expected: inside session_dir itself, and the listing that iterates the root.
-    assert len(uses) <= 3, (
-        "a new caller of sessions_root() may be building a session path without "
-        f"going through session_dir: {uses}"
+    # EXACT, not an upper bound, for that same reason.
+    assert uses == ["root = sessions_root()", "root = sessions_root()"], (
+        f"expected exactly 2 call sites for sessions_root() -- one in session_dir, "
+        f"one in the listing that iterates the root -- and found {len(uses)}: "
+        f"{uses}. A new caller may be building a session path without going "
+        "through session_dir. If it is legitimate, change this assertion "
+        "deliberately rather than relaxing it."
     )
+
+
+def test_that_chokepoint_guard_CAN_fail(tmp_path, monkeypatch):
+    """The control for the structural test above, which reads a file and so can
+    silently measure the wrong thing. Point it at a module that really does have
+    a third call site and it must complain."""
+    import pathlib
+
+    fake = tmp_path / "fake_training.py"
+    fake.write_text(
+        "def sessions_root():\n    pass\n"
+        "root = sessions_root()\n"
+        "root = sessions_root()\n"
+        "sneaky = sessions_root() / 'x'\n"
+    )
+    monkeypatch.setattr(training, "__file__", str(fake))
+    with pytest.raises(AssertionError):
+        test_no_path_helper_bypasses_the_chokepoint()
 
 
 # ── reads refuse too, and the status reader does not swallow it ──────────────
@@ -264,7 +289,7 @@ async def test_stopping_an_UNKNOWN_session_refuses_and_creates_nothing(root):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", ["../escaped", "/tmp/escape-target", ""])
+@pytest.mark.parametrize("bad", ["../escaped", ""])
 async def test_stopping_with_an_ESCAPING_id_refuses_and_creates_nothing(root, bad):
     cls, inst = _entry_instance()
     with pytest.raises(training.InvalidSessionId):
@@ -272,6 +297,38 @@ async def test_stopping_with_an_ESCAPING_id_refuses_and_creates_nothing(root, ba
     assert sorted(p.name for p in root.iterdir()) == []
     # and nothing landed next to the root either
     assert sorted(p.name for p in root.parent.iterdir()) == ["sessions"]
+
+
+@pytest.mark.asyncio
+async def test_stopping_with_an_ABSOLUTE_id_leaves_THAT_PATH_untouched(root, tmp_path):
+    """Asserts on the ESCAPED path itself, which is the clause's exact wording.
+
+    The parametrised test above only checks the sessions root and its parent.
+    For an absolute id the escape lands somewhere else entirely — `Path(a) / b`
+    discards `a` when `b` is absolute — so checking the root proves nothing
+    about where the write would have gone. This names the target and asserts the
+    file is absent there.
+    """
+    target = tmp_path / "escape-target" / "abs-escape"
+    cls, inst = _entry_instance()
+    with pytest.raises(training.InvalidSessionId):
+        await cls.stop_training(inst, session_id=str(target))
+    assert not (target / "status.json").exists(), f"wrote into {target}"
+    assert not target.exists(), f"created {target}"
+    assert not target.parent.exists(), f"created {target.parent}"
+    assert sorted(p.name for p in root.iterdir()) == []
+
+
+def test_the_absolute_escape_control_WOULD_have_landed_there(root, tmp_path):
+    """The paired control for the test above. It asserts an absence, and an
+    absence is only evidence if the write would otherwise have happened THERE.
+    This reproduces the path arithmetic the old code performed."""
+    target = tmp_path / "escape-target" / "abs-escape"
+    # What the unguarded `sessions_root() / session_id` produced:
+    assert root / str(target) == target, (
+        "Path join no longer discards the left side for an absolute right side, "
+        "so this control no longer reproduces the original escape"
+    )
 
 
 @pytest.mark.asyncio
@@ -284,3 +341,60 @@ async def test_a_REAL_session_can_still_be_stopped(root):
     out = await cls.stop_training(inst, session_id=sid)
     assert out["status"] == "STOPPED", out
     assert training.read_status(sid)["terminated_by"] == "user_stop"
+
+
+# ── the listing must TOLERATE junk on disk, not die on it ───────────────────
+#
+# THE REGRESSION THIS FIX INTRODUCED, caught in review. `get_status` validates
+# the id, and `list_sessions` called it for every directory under the root — so
+# ONE directory whose name is not a session id made `list_training_sessions`
+# raise for every caller, turning a stray directory into a total outage of the
+# run history.
+#
+# It is not hypothetical: until this fix is deployed the running version lets
+# any unauthenticated caller create exactly such a directory, so the fixed
+# version can come up with junk already on disk. The "all 261 live ids conform"
+# measurement was taken BEFORE the rollout and cannot speak for after it.
+#
+# The rule: validate what a CALLER hands us, tolerate what we FIND.
+
+
+def _plant(root, name):
+    d = root / name
+    d.mkdir(parents=True)
+    (d / "status.json").write_text(json.dumps({"status": "COMPLETED"}))
+    return name
+
+
+@pytest.mark.parametrize(
+    "junk",
+    ["never-existed-123", "escaped", "s-cold", "2026-13-99-999999-zzzzzzzz", "x"],
+)
+def test_a_NON_CONFORMING_directory_is_SKIPPED_not_fatal(root, junk):
+    """One junk directory must not hide the real runs."""
+    real = _plant(root, VALID)
+    _plant(root, junk)
+    listed = training.list_sessions()
+    assert real in listed, (
+        f"a directory named {junk!r} beside a real session made the whole "
+        f"listing fail or drop the real run: {sorted(listed)}"
+    )
+    assert junk not in listed, f"{junk!r} was listed as a session"
+    assert sorted(listed) == [real]
+
+
+def test_the_listing_survives_MANY_junk_directories(root):
+    """The shape an abuser would actually leave behind."""
+    real = _plant(root, VALID)
+    for i in range(20):
+        _plant(root, f"junk-{i}")
+    listed = training.list_sessions()
+    assert sorted(listed) == [real], sorted(listed)
+
+
+def test_the_listing_control_lists_what_it_SHOULD(root):
+    """THE CONTROL. Every assertion above would also pass if list_sessions
+    returned {} for everything."""
+    a = _plant(root, "2026-11-25-150730-abcdef12")
+    b = _plant(root, "2026-11-25-150731-abcdef13")
+    assert sorted(training.list_sessions()) == sorted([a, b])
