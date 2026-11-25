@@ -1938,13 +1938,25 @@ class EntryApp:
 
         return training.list_sessions(context)
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def stop_training(
-        self, session_id: str = Field(..., description="Session id to stop.")
+        self,
+        session_id: str = Field(..., description="Session id to stop."),
+        context=None,
     ) -> Dict[str, Any]:
-        """Request cancellation (an in-flight training epoch may finish first)."""
+        """Request cancellation (an in-flight training epoch may finish first).
+
+        Only the run's own caller, or a `bioimage-io` administrator, may stop it.
+        A run with no recorded owner is administrator-only: it cannot be
+        attributed to anybody, and guessing is worse than admitting that.
+
+        `context=True` is load-bearing. Without it the proxy forwards no context,
+        the check sees no identity, and it then refuses EVERYBODY — the safe
+        direction, but a silent outage, so a test asserts the decorator.
+        """
         import training
 
+        training.require_caller_may_mutate(session_id, context)
         training.request_stop(session_id)
         task = self._training_tasks.get(session_id)
         if task is not None and not task.done():
@@ -1957,7 +1969,7 @@ class EntryApp:
         )
         return training.get_status(session_id)
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def export_model(
         self,
         session_id: str = Field(
@@ -1975,6 +1987,7 @@ class EntryApp:
             description="Baked server-side into RDF config.microsam_provenance, e.g. "
             "{dataset_artifact_id, label, split_name, session_lineage}.",
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Start building a BioImage.IO model package from a COMPLETED fine-tuning
         session — a **combined SAM+decoder** package (interactive prompt head + AIS
@@ -1991,6 +2004,9 @@ class EntryApp:
         """
         import training
 
+        # BEFORE any work, and before the checkpoint lookup, which would tell an
+        # unauthorised caller whether the session exists and whether it trained.
+        training.require_caller_may_mutate(session_id, context)
         self._session_checkpoint(session_id)  # raises if no trained checkpoint
         served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
         await self._check_runtime_available(served)

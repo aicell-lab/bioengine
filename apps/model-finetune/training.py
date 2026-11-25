@@ -309,8 +309,7 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
 # every listing; publishing it would turn a history that says WHAT was trained
 # into one that says WHO trained it, for every run the caller can see. Recording
 # the owner and keeping it out of the response therefore have to be one change,
-# not
-# two: "record now, filter later" publishes the identity in between.
+# not two: "record now, filter later" publishes the identity in between.
 #
 # These come back only for a caller that asks with include_private=True, which is
 # the hook the per-caller filter uses to compare a request against the run's owner.
@@ -388,6 +387,54 @@ def caller_can_see_ownerless(
     if not isinstance(grants, dict):
         return False
     return grants.get(workspace) in OWNERLESS_GRANTS
+
+
+class NotTheOwner(PermissionError):
+    """A caller asked to change a run that is not theirs.
+
+    A ``PermissionError`` rather than a ``ValueError``: the request was
+    well-formed and the session exists, and the only thing wrong is who is
+    asking. Callers that already distinguish "bad argument" from "not allowed"
+    keep distinguishing them.
+    """
+
+
+def caller_may_mutate(session_id: str, context: Any) -> bool:
+    """True iff *context* identifies the run's owner, or a ``bioimage-io`` admin.
+
+    A run with a recorded owner is matched EXACTLY against the caller's injected
+    identity. A run with no usable owner cannot be attributed to anybody, so it
+    is admin-only — the same rule the listing applies to the 261 runs recorded
+    before the field existed, and for the same reason: guessing an owner is worse
+    than admitting there is none.
+
+    Reads nothing but the status that is already on disk and CREATES NOTHING, so
+    asking the question about a session that does not exist is safe. It answers
+    False for one, because an absent status has no owner and the ownerless rule
+    then applies — a non-admin is refused before any write can happen.
+
+    Fails closed: an unreadable context yields no identity and so no match, and
+    `caller_can_see_ownerless` is False for it too.
+    """
+    owner = read_status(session_id).get("owner")
+    if isinstance(owner, str) and owner:
+        caller = caller_identity(context).get("owner")
+        return caller is not None and caller == owner
+    return caller_can_see_ownerless(context)
+
+
+def require_caller_may_mutate(session_id: str, context: Any) -> None:
+    """:func:`caller_may_mutate`, or raise :class:`NotTheOwner`.
+
+    The message deliberately does NOT say whether the run exists, who owns it,
+    or whether the caller merely lacks admin — a refusal that explains itself
+    tells an unauthorised caller which session ids are real.
+    """
+    if not caller_may_mutate(session_id, context):
+        raise NotTheOwner(
+            "this training run belongs to another caller; only its owner or a "
+            "workspace administrator can change it"
+        )
 
 
 def redact_private(status: Dict[str, Any]) -> Dict[str, Any]:

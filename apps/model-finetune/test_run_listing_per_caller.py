@@ -435,3 +435,169 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
     # object identity so a method that rebuilt a context from somewhere else
     # fails here too.
     assert seen["context"]["user"]["id"] == ME
+
+
+# ── clause 5: only the owner, or a bioimage-io admin, may CHANGE a run ───────
+#
+# The listing stopped showing other people's runs. Changing them was still open:
+# `stop_training` took a session_id with no caller check at all, so anyone who
+# knew or could read an id could stop anyone's training. Export is the same
+# shape and worse in kind -- it builds a publishable package out of somebody
+# else's checkpoint.
+#
+# An ownerless run is ADMIN-ONLY, the same rule the listing applies to the 261
+# runs recorded before the owner field existed, and for the same reason: a run
+# that cannot be attributed to anybody must not be handed to the first caller
+# who asks.
+
+
+def _entry():
+    import entry
+
+    cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
+    inst = cls.__new__(cls)
+    inst._training_tasks = {}
+    return cls, inst
+
+
+def _owned(runs, sid, owner, **kw):
+    runs(sid, owner, **kw)
+    return sid
+
+
+@pytest.mark.asyncio
+async def test_a_DIFFERENT_caller_cannot_stop_my_run(runs):
+    """The reviewer's first named RED-able case."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    with pytest.raises(training.NotTheOwner):
+        await cls.stop_training(
+            inst, session_id=sid, context=ctx(OTHER, anonymous=False)
+        )
+    assert (
+        training.read_status(sid).get("status") == "COMPLETED"
+    ), "the refused call still changed the run"
+
+
+@pytest.mark.asyncio
+async def test_an_ANONYMOUS_caller_cannot_stop_an_owned_run(runs):
+    """The reviewer's second named RED-able case."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    for who in (ctx(ANON_A), ctx(ANON_B), None, {}):
+        with pytest.raises(training.NotTheOwner):
+            await cls.stop_training(inst, session_id=sid, context=who)
+    assert training.read_status(sid).get("status") == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_THE_OWNER_CAN_stop_their_own_run(runs):
+    """THE CONTROL. Every refusal above would read the same if the gate refused
+    everybody, which is an outage rather than a fix."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    out = await cls.stop_training(
+        inst, session_id=sid, context=ctx(ME, anonymous=False)
+    )
+    assert out["status"] == "STOPPED", out
+    assert training.read_status(sid)["terminated_by"] == "user_stop"
+
+
+@pytest.mark.asyncio
+async def test_an_ANONYMOUS_caller_CAN_stop_the_run_IT_started(runs):
+    """An anonymous identity is a real identity here, so it owns what it started
+    and must be able to stop it. A gate keyed on `is_anonymous` instead of on the
+    id would refuse this and look correct."""
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ANON_A, owner_anonymous=True)
+    cls, inst = _entry()
+    out = await cls.stop_training(inst, session_id=sid, context=ctx(ANON_A))
+    assert out["status"] == "STOPPED", out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omit_key", [False, True], ids=["null-owner", "no-owner-key"])
+async def test_an_OWNERLESS_run_is_ADMIN_ONLY(runs, omit_key):
+    sid = "2026-11-25-150730-abcdef12"
+    runs(sid, None, omit_key=omit_key)
+    cls, inst = _entry()
+    for who in (ctx(ANON_A), ctx(OTHER, anonymous=False), None):
+        with pytest.raises(training.NotTheOwner):
+            await cls.stop_training(inst, session_id=sid, context=who)
+    assert training.read_status(sid).get("status") == "COMPLETED"
+    # paired demonstration: the admin CAN
+    out = await cls.stop_training(inst, session_id=sid, context=ADMIN)
+    assert out["status"] == "STOPPED", out
+
+
+@pytest.mark.asyncio
+async def test_READ_permission_does_not_let_you_stop_an_ownerless_run(runs):
+    """The same narrowing as the listing: "r" is not authority."""
+    sid = "2026-11-25-150730-abcdef12"
+    runs(sid, None)
+    cls, inst = _entry()
+    reader = ctx(OTHER, anonymous=False, grants={"bioimage-io": "r"})
+    with pytest.raises(training.NotTheOwner):
+        await cls.stop_training(inst, session_id=sid, context=reader)
+    # paired demonstration: rw is enough
+    out = await cls.stop_training(
+        inst,
+        session_id=sid,
+        context=ctx(OTHER, anonymous=False, grants={"bioimage-io": "rw"}),
+    )
+    assert out["status"] == "STOPPED"
+
+
+@pytest.mark.asyncio
+async def test_EXPORT_is_gated_too_and_refuses_BEFORE_touching_the_session(runs):
+    """Export builds a publishable package from a run's checkpoint, so it is a
+    mutating call in the sense that matters. The gate runs before the checkpoint
+    lookup, so the refusal does not reveal whether the session exists or trained.
+    """
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    cls, inst = _entry()
+    with pytest.raises(training.NotTheOwner):
+        await cls.export_model(
+            inst, session_id=sid, name="x", context=ctx(OTHER, anonymous=False)
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_gate_CREATES_NOTHING_for_a_session_that_does_not_exist(
+    runs, root=None
+):
+    """Asking the question must not manufacture the run. A non-admin is refused
+    before any write, so the directory must still be absent afterwards."""
+    cls, inst = _entry()
+    missing = "2026-01-01-000000-deadbeef"
+    with pytest.raises(training.NotTheOwner):
+        await cls.stop_training(inst, session_id=missing, context=ctx(ANON_A))
+    assert not training.session_dir(missing).exists(), "the refused call created it"
+
+
+@pytest.mark.parametrize("method", ["stop_training", "export_model"])
+def test_every_gated_method_is_declared_with_the_injected_context(method):
+    """Without the decorator the proxy forwards nothing, the gate sees no
+    identity and refuses EVERYBODY — safe, silent, and indistinguishable from a
+    broken worker."""
+    fn = _entry_method(method)
+    schema = getattr(fn, "__schema__", None)
+    assert schema, f"{method} carries no __schema__"
+    props = (schema.get("parameters") or {}).get("properties") or {}
+    assert "context" not in props, (
+        f"`context` is published on {method}, so it was not declared "
+        "@bioengine.method(context=True) and will never receive a caller"
+    )
+    flags = [
+        getattr(fn, n)
+        for n in dir(fn)
+        if "context" in n.lower() and isinstance(getattr(fn, n, None), bool)
+    ]
+    assert flags and any(flags), f"{method} is not flagged as wanting the context"
+
+
+def test_caller_may_mutate_fails_closed_on_an_unreadable_context(runs):
+    sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
+    for bad in (None, {}, {"user": None}, {"user": {}}, "nope", 7):
+        assert training.caller_may_mutate(sid, bad) is False, bad
+    # paired control
+    assert training.caller_may_mutate(sid, ctx(ME, anonymous=False)) is True
