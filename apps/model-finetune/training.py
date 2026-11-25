@@ -592,5 +592,63 @@ def write_training_params(session_id: str, params: Dict[str, Any]) -> None:
     p.write_text(json.dumps(params))
 
 
+RUN_RECORD_VERSION = 1
+
+
+def redact_urls(value: Any) -> Any:
+    """Strip the query string from any http(s) URL, recursively.
+
+    A run's params carry the image and label references it was given, and those
+    can be PRESIGNED: the query string is the credential. A run record is meant
+    to outlive the worker and be readable by whoever opens the dataset, so it
+    must not be the place a signature gets archived. The path is kept because it
+    identifies the object; only what authorises access is dropped.
+
+    Nothing else is filtered. The record is otherwise verbatim -- see
+    :func:`run_record`.
+    """
+    if isinstance(value, str):
+        if value.startswith(("http://", "https://")) and "?" in value:
+            return value.split("?", 1)[0] + "?<redacted>"
+        return value
+    if isinstance(value, dict):
+        return {k: redact_urls(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_urls(v) for v in value]
+    return value
+
+
+def run_record(session_id: str) -> Dict[str, Any]:
+    """One run, as a document that can outlive the worker that produced it.
+
+    ``config`` is the training params and ``status`` is the status document, both
+    VERBATIM apart from URL redaction. That is deliberate and is the whole design:
+    per-epoch metrics are written into the status document by the training
+    workers, so a record that enumerated known fields would have to be edited
+    every time a worker learns to report something new -- by whoever happened to
+    add it, in a second place. Copying the document means a new metric appears
+    here the moment it appears there, with nothing to keep in step.
+
+    The cost, stated so a reader is not surprised: a consumer sees whatever the
+    worker wrote, including keys it does not know. Tolerating unknown keys is a
+    better failure than a schema that silently drops a metric.
+    """
+    status = read_status(session_id)
+    try:
+        config = read_training_params(session_id)
+    except (OSError, ValueError):
+        # A run that failed before its params were written still deserves a
+        # record: the status says what happened, and an absent config is
+        # reported as absent rather than as an empty dict that reads like
+        # "trained with no settings".
+        config = None
+    return {
+        "record_version": RUN_RECORD_VERSION,
+        "session_id": session_id,
+        "config": redact_urls(config) if config is not None else None,
+        "status": redact_urls(status),
+    }
+
+
 def read_training_params(session_id: str) -> Dict[str, Any]:
     return json.loads(_params_path(session_id).read_text())
