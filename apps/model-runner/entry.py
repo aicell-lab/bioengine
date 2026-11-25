@@ -578,7 +578,7 @@ class EntryDeployment:
         by EntryDeployment are visible to RuntimeDeployment on the same path.
 
         This used to cite ``/home/ray/anaconda3/envs/``, the
-        ``rayproject/ray`` layout no image this repo builds has (myco #0527).
+        ``rayproject/ray`` layout no image this repo builds has.
         """
         env_vars = self._safe_subprocess_env()
         mamba_root = Path(os.environ["HOME"]) / ".bioengine-conda"
@@ -635,7 +635,7 @@ class EntryDeployment:
 
         A no-op when no conda implementation is installed: there is then no
         package cache to clean, and spawning a missing binary would only log a
-        confusing ``FileNotFoundError`` from the housekeeping path (#0527).
+        confusing ``FileNotFoundError`` from the housekeeping path.
         """
         conda_bin = resolve_conda_binary()
         if conda_bin is None:
@@ -667,7 +667,7 @@ class EntryDeployment:
         because one stale env couldn't be reaped.
 
         A no-op when no conda implementation is installed — nothing built the
-        env, so nothing here can reap it (#0527).
+        env, so nothing here can reap it.
         """
         conda_bin = resolve_conda_binary()
         if conda_bin is None:
@@ -952,7 +952,13 @@ class EntryDeployment:
         granted in entry order, so the job actually building must be the
         one reported at position 0 — keeping the position consistent with
         the ``env_setup`` start timestamp (start set iff position 0).
-        Infer never enters ``env_setup``, so this is test-only.
+
+        Both a test and an inference can be in this queue. A
+        ``custom_environment=True`` inference solves the same environment
+        under the same name and takes the same lock, so the two kinds of job
+        queue against each other and a predict can report a non-zero position
+        because a test is building. This used to say the stage was test-only,
+        which stopped being true when inference gained that route.
         """
         if job["state"] != "env_setup":
             return None
@@ -1520,6 +1526,103 @@ class EntryDeployment:
                 return True
         return False
 
+    #: Weight formats that can carry a declared environment, in the order
+    #: ``_prebuild_conda_envs`` walks them — that method reads this tuple
+    #: rather than keeping its own copy, so inference cannot ask for an
+    #: environment the pre-build never created.
+    #:
+    #: ``tensorflow_js`` is deliberately absent: ``bioimageio.core`` refuses to
+    #: test it, so no environment is ever built for it and inference must not
+    #: offer one.
+    _ENV_WEIGHT_FORMATS = (
+        "pytorch_state_dict",
+        "torchscript",
+        "keras_hdf5",
+        "onnx",
+        "tensorflow_saved_model_bundle",
+        "keras_v3",
+    )
+
+    async def _conda_env_for_weights(
+        self, rdf_path: str, weights_format: Optional[str]
+    ) -> tuple:
+        """``(weight_format, env_name)`` for the ONE environment an inference
+        request will run in.
+
+        This is where inference differs from testing and why it needs its own
+        resolution. ``test`` exercises every weight format the model carries,
+        so it pre-builds every environment and lets
+        ``bioimageio.core.test_description`` pick each in turn. A predict runs
+        exactly one weight format in exactly one interpreter, so the caller has
+        to know *which* environment before the child is spawned.
+
+        Resolution is deliberately narrow rather than clever:
+
+        * an explicit ``weights_format`` selects that one;
+        * otherwise, a model carrying exactly one weight format selects it;
+        * otherwise this refuses, naming the formats, instead of guessing.
+
+        The third case is a refusal and not a default because picking one
+        would mean reproducing ``bioimageio.core``'s own preference order
+        here. ``_compute_conda_env_name``'s docstring is explicit about what
+        that costs: it is already a mechanical reproduction of one upstream
+        algorithm, kept bit-identical by hand, and a second one would be a
+        second thing to keep in step with no test able to notice the drift.
+        """
+        from bioimageio.spec import load_description
+
+        descr = await asyncio.to_thread(load_description, rdf_path)
+        present = [
+            wf_name
+            for wf_name in self._ENV_WEIGHT_FORMATS
+            if getattr(descr.weights, wf_name, None)
+        ]
+        if not present:
+            raise RuntimeError(
+                "custom_environment=True needs a weight format that declares an "
+                "environment, and this model carries none that can."
+            )
+        if weights_format:
+            if weights_format not in present:
+                raise RuntimeError(
+                    f"weights_format={weights_format!r} is not one this model "
+                    f"carries ({present}), so the environment for it cannot be "
+                    "resolved."
+                )
+            chosen = weights_format
+        elif len(present) == 1:
+            chosen = present[0]
+        else:
+            raise RuntimeError(
+                f"this model carries several weight formats ({present}) and each "
+                "declares its own environment, so custom_environment=True is "
+                "ambiguous. Pass weights_format to say which one to run in. This "
+                "is a refusal rather than a guess: choosing here would mean "
+                "duplicating bioimageio.core's preference order, which nothing "
+                "in this repository can keep in step with it."
+            )
+        wf = getattr(descr.weights, chosen)
+        env_name, _ = self._compute_conda_env_name(wf)
+        return chosen, env_name
+
+    def _conda_env_python(self, env_name: str) -> str:
+        """Absolute path to ``env_name``'s own interpreter.
+
+        Handed to ``runtime.predict_from_disk(python_env=...)``, which uses an
+        absolute path verbatim. An interpreter path rather than a ``conda run``
+        wrapper because the warm inference child reports "model loaded" over an
+        inherited file descriptor, and ``conda run`` does not pass one through —
+        the same reason the Cellpose 3 split swaps interpreters.
+        """
+        return str(
+            Path(os.environ["HOME"])
+            / ".bioengine-conda"
+            / "envs"
+            / env_name
+            / "bin"
+            / "python"
+        )
+
     async def _prebuild_conda_envs(
         self, rdf_path: str, model_id: str, job: Optional[dict] = None
     ) -> List[str]:
@@ -1561,14 +1664,10 @@ class EntryDeployment:
         # it; skip anything the descr doesn't carry at all (v0.4
         # pydantic-v2 raises AttributeError on missing fields, so
         # guard with getattr default).
-        weight_formats = [
-            "pytorch_state_dict",
-            "torchscript",
-            "keras_hdf5",
-            "onnx",
-            "tensorflow_saved_model_bundle",
-            "keras_v3",
-        ]
+        # The same tuple inference resolves against, not a second copy: a
+        # format listed in only one of the two would mean either an
+        # environment built and never used, or one asked for and never built.
+        weight_formats = list(self._ENV_WEIGHT_FORMATS)
         env_specs: List[tuple] = []  # (wf, env_name, encoded_yaml)
         for wf_name in weight_formats:
             wf = getattr(descr.weights, wf_name, None)
@@ -1678,7 +1777,7 @@ class EntryDeployment:
 
         With no conda implementation installed an unmarked directory is
         reported as NOT existing: the completeness probe cannot be run, and an
-        unverifiable env must not be admitted as usable (#0527).
+        unverifiable env must not be admitted as usable.
         """
         env_dir = self._conda_envs_dir() / env_name
         if (env_dir / self._ENV_COMPLETE_MARKER).exists():
@@ -1759,7 +1858,7 @@ class EntryDeployment:
         the child's stderr.
 
         Raises a named error, rather than ``FileNotFoundError: 'mamba'`` from
-        the spawn, when no conda implementation is installed (#0527).
+        the spawn, when no conda implementation is installed.
         ``_execute_test`` refuses the whole call before reaching here; this
         keeps the precondition stated at the spawn site too.
         """
@@ -2587,7 +2686,7 @@ class EntryDeployment:
             job["custom_environment"] = False
 
         # Refuse a custom-env run this image cannot serve, instead of letting
-        # it fail as a verdict on the model (myco #0527).
+        # it fail as a verdict on the model.
         #
         # Without this, the first thing to happen is
         # ``FileNotFoundError: 'mamba'`` from the env build below — inside the
@@ -3465,6 +3564,20 @@ class EntryDeployment:
             "None returns the model's raw output — "
             '{"cellpose_flow_dynamics": None} yields Cellpose-4 flow fields.',
         ),
+        custom_environment: Optional[bool] = Field(
+            False,
+            description="If True, run the inference inside the conda environment "
+            "declared by the model's own weights description instead of this "
+            "runner's serving runtime. Use it for a model whose dependencies the "
+            "serving runtime does not carry: a micro-SAM model needs micro_sam, "
+            "which otherwise fails at model load with ModuleNotFoundError. The "
+            "environment is the same one ``test`` uses, cached under the same "
+            "name, so a model already tested this way starts in seconds. Needs "
+            "mamba or conda on the serving replica's image and is refused by name "
+            "without one. A model carrying several weight formats also needs "
+            "``weights_format``, because each format declares its own environment "
+            "and inference runs exactly one.",
+        ),
         return_download_url: Optional[bool] = Field(
             False,
             description="If True, each array in the output will be saved to a temporary .npy file in S3 and the output value will be a presigned download URL (str) instead of the raw np.ndarray. The URL is valid for 1 hour.",
@@ -3583,6 +3696,7 @@ class EntryDeployment:
                 default_blocksize_parameter=default_blocksize_parameter,
                 sample_id=sample_id,
                 cache=cache,
+                custom_environment=bool(custom_environment),
                 overrides={
                     "preprocessing": preprocessing or {},
                     "postprocessing": postprocessing or {},
@@ -3600,6 +3714,7 @@ class EntryDeployment:
         sample_id: Optional[str],
         cache: str,
         overrides: Dict[str, Dict[str, Optional[dict]]],
+        custom_environment: bool = False,
     ) -> None:
         """Background inference driver — model download → runtime dispatch.
 
@@ -3616,6 +3731,10 @@ class EntryDeployment:
         from ray.exceptions import RayTaskError
 
         request_id = job["job_id"]
+        # Set before the try so the finally can release whatever was marked in
+        # use, including on a failure part-way through the env solve.
+        needed_envs: List[str] = []
+        interpreter: Optional[str] = None
         try:
             self._update_infer_job(job, state="model_download")
             await self._persist_infer_job(job)
@@ -3638,6 +3757,58 @@ class EntryDeployment:
                 # token.
                 await self._localize_hf_weights(package, model_id)
 
+                # ``custom_environment=True``: run the inference child inside
+                # the environment the model declares, which is the only place a
+                # dependency the serving runtime does not carry can be found.
+                # Refuse BEFORE spawning anything and before any env solve, for
+                # the reason the test path refuses in the same place: with no
+                # conda implementation installed, the first thing that happens
+                # otherwise is a FileNotFoundError from deep inside the call,
+                # and a caller reads that as the model being broken.
+                #
+                # Unlike the test path this does NOT silently fall back to the
+                # serving runtime when the model declares no environment. A test
+                # that quietly ran in the standard env still returns a report
+                # about the model; an inference that quietly ran there returns
+                # the ModuleNotFoundError this route exists to avoid, so the
+                # caller is told instead of being given the failure back.
+                if custom_environment:
+                    conda_bin = resolve_conda_binary()
+                    if conda_bin is None:
+                        raise RuntimeError(
+                            f"Cannot run '{model_id}' with custom_environment=True: "
+                            f"this model-runner image installs none of "
+                            f"{list(CONDA_IMPLEMENTATIONS)}, so the conda "
+                            f"environment the model declares cannot be built. This "
+                            f"is a limitation of the deployment, not a fault in the "
+                            f"model — no inference was run. Re-run with "
+                            f"custom_environment=False to use the serving "
+                            f"runtime's own environment, or deploy on a worker "
+                            f"image that ships one."
+                        )
+                    if not self._model_declares_custom_env(package.source):
+                        raise RuntimeError(
+                            f"Cannot run '{model_id}' with custom_environment=True: "
+                            f"this model declares no environment of its own, so "
+                            f"there is nothing to build. Re-run with "
+                            f"custom_environment=False."
+                        )
+                    chosen_wf, env_name = await self._conda_env_for_weights(
+                        package.source, weights_format
+                    )
+                    self._update_infer_job(job, state="env_setup")
+                    await self._persist_infer_job(job)
+                    needed_envs = await self._prebuild_conda_envs(
+                        rdf_path=package.source,
+                        model_id=model_id,
+                        job=job,
+                    )
+                    interpreter = self._conda_env_python(env_name)
+                    logger.info(
+                        f"🐍 [predict] '{model_id}' will run its {chosen_wf} "
+                        f"weights in its declared environment ({env_name[:12]}…)"
+                    )
+
                 # Move to ``running`` before the RPC. The RPC itself
                 # may queue at the runtime router; the poll refines
                 # ``running_ts`` from the state.json marker.
@@ -3652,7 +3823,12 @@ class EntryDeployment:
                     remote_modified=package.latest_remote_modified,
                     force_reload=(cache == "skip"),
                     overrides=overrides,
-                    python_env=_python_env_for(model_id),
+                    # The model's declared environment wins over the Cellpose 3
+                    # alt-venv when both could apply: an explicit
+                    # custom_environment=True asks for the environment the model
+                    # itself names, and that is a stronger statement than a
+                    # runner-side mapping from the model's id.
+                    python_env=interpreter or _python_env_for(model_id),
                 )
 
             self._update_infer_job(job, state="completed")
@@ -3682,6 +3858,14 @@ class EntryDeployment:
             # so the caller still gets the error after a replica swap
             # instead of a bare "unknown request_id".
             await self._persist_infer_job(job)
+        finally:
+            # ``_prebuild_conda_envs`` marks each env it needs in use so the
+            # sweep and the LRU eviction cannot reap it mid-run, and states
+            # that the caller MUST release them afterwards. In a finally
+            # because a failed inference holds the same marks: leaving them
+            # set would pin those envs on the shared disk for good.
+            if needed_envs:
+                self._release_inuse_envs(needed_envs)
 
     async def _materialize_infer_result(self, job: dict) -> None:
         """Read outputs off disk, apply ``return_download_url`` conversion

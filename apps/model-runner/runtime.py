@@ -318,7 +318,7 @@ def _axis_mismatch_hint(message: str) -> Optional[str]:
     ``AxisInfo`` objects and leaves the caller to work out which axis is
     wrong and what to do. A participant hit exactly this in the 2026-11-11
     workshop with a grayscale image against Cellpose-SAM, whose channel
-    axis is ``min=3, max=3`` (myco #0308).
+    axis is ``min=3, max=3``.
 
     Returns ``None`` whenever anything is unrecognised, so an unparsed
     message falls through to the original text and is never made worse.
@@ -332,7 +332,8 @@ def _axis_mismatch_hint(message: str) -> Optional[str]:
     actionable one. A grayscale file uploaded the ordinary way is exactly
     this case: ``imageio`` yields ``(H, W)`` and nothing between the
     upload and ``create_sample_for_model`` adds an axis, so the caller
-    who prompted #0308 lands here rather than in the per-axis branch.
+    who hit the workshop case above lands here rather than in the per-axis
+    branch.
     """
     shape_m = _ARRAY_SHAPE_RE.search(message)
     if not shape_m:
@@ -479,7 +480,7 @@ def _read_pip(name: str) -> List[str]:
 #: reused.
 #:
 #: HOW THIS PIN RETIRES, mechanically rather than by someone re-reading this block
-#: (myco #0530). The condition above — "a core release that pairs with spec >=
+#: The condition above — "a core release that pairs with spec >=
 #: 0.5.14.3" — is only reachable by moving ``bioimageio.core`` off 0.11.0 in
 #: ``requirements-entry.txt`` and ``requirements-runtime.txt``, and
 #: ``tests/apps/model-runner/test_custom_env_pydantic_pin.py`` FAILS the moment either
@@ -487,8 +488,8 @@ def _read_pip(name: str) -> List[str]:
 #: told to check the spec pairing and delete this pin if the fix is in. Do not silence
 #: that test by updating its constant: check the pairing first.
 #:
-#: The same test file also pins the OTHER two inputs to the env-name hash (myco
-#: #0529): ``core_version`` and ``spec_version`` are parameters, not literals, and
+#: The same test file also pins the OTHER two inputs to the env-name hash:
+#: ``core_version`` and ``spec_version`` are parameters, not literals, and
 #: each call site fills them from its own interpreter, so the hashes agree only while
 #: both deployments install the same core.
 CUSTOM_ENV_PYDANTIC_PIN = "pydantic<2.14"
@@ -528,7 +529,7 @@ def resolve_conda_binary() -> Optional[str]:
     ``docker/worker.Dockerfile`` and ``docker/model-runner.Dockerfile`` are
     both ``FROM python:3.11-slim``, and measured in
     ``ghcr.io/aicell-lab/bioengine-worker:0.16.112`` all three of ``conda``,
-    ``mamba`` and ``micromamba`` are absent (myco #0527). The code predates
+    ``mamba`` and ``micromamba`` are absent. The code predates
     that: it was written against a ``rayproject/ray`` base, which ships
     anaconda at ``/home/ray/anaconda3`` — still visible in the recorded
     output of ``tutorial_model_runner.ipynb``, where ``conda list`` reports
@@ -841,7 +842,7 @@ class RuntimeDeployment:
 
         This used to cite ``/home/ray/anaconda3/envs/`` as the prefix being
         redirected away from. That is the ``rayproject/ray`` layout and no
-        image this repo builds has it (myco #0527) — the redirect is still
+        image this repo builds has it — the redirect is still
         needed, just not for that reason.
         """
         env_vars = self._safe_subprocess_env()
@@ -887,7 +888,7 @@ class RuntimeDeployment:
             **Neither is guaranteed:** this used to claim "both binaries
             ship in the replica image at ``/home/ray/anaconda3/bin/``",
             which was true of the ``rayproject/ray`` base and is false of
-            every image this repo builds (myco #0527). So the branch
+            every image this repo builds. So the branch
             raises up front when neither resolves, rather than spawning a
             missing binary. Envs are pre-built and
             cached on the shared PVC by the EntryDeployment (LRU eviction under
@@ -941,7 +942,7 @@ class RuntimeDeployment:
             # single unnamed detail. The model is not what failed. The
             # EntryDeployment refuses this call earlier (``_execute_test``);
             # this guard covers a direct ``runtime.test`` caller and keeps the
-            # precondition stated where it is actually needed (myco #0527).
+            # precondition stated where it is actually needed.
             conda_bin = resolve_conda_binary()
             if conda_bin is None:
                 raise RuntimeError(
@@ -1168,7 +1169,7 @@ class RuntimeDeployment:
             # never propagated, so it cannot fail the test itself.
             # A model that declares its own environment does so because the
             # runner venv lacks its dependencies, so this check would fail on an
-            # import every time and report nothing about the model (#0079).
+            # import every time and report nothing about the model.
             if custom_environment:
                 # ``error`` rather than a new key because that is the field the
                 # website renders in its failure dialog; leaving it null blanks
@@ -1433,11 +1434,35 @@ class RuntimeDeployment:
         is to run one of them under a different interpreter. Swapping the
         interpreter keeps ``pass_fds`` and the whole warm-child protocol
         intact, which wrapping the spawn in ``mamba run`` would not.
+
+        An ABSOLUTE PATH is a pre-built environment's own interpreter and is
+        used verbatim. That is how a custom-environment inference request runs
+        inside the environment the model declares: the EntryDeployment solves
+        the env (the same one its tests use, under the same name hash) and
+        passes its ``bin/python`` here. The reason it is an interpreter path
+        rather than a ``conda run`` wrapper is the sentence above — the warm
+        child signals "model loaded" over an inherited fd, and ``conda run``
+        does not pass it through.
+
+        It is deliberately not a separate parameter: ``python_env`` is already
+        part of the warm-child identity key, so switching a model between the
+        serving runtime and its declared environment evicts the resident child
+        instead of reusing one loaded under the wrong interpreter.
         """
         import sys
 
         if not python_env:
             return sys.executable
+        if os.path.isabs(python_env):
+            if not os.path.exists(python_env):
+                raise RuntimeError(
+                    f"the environment interpreter {python_env!r} does not exist. "
+                    "A custom-environment request reached the runtime without its "
+                    "environment having been built; the caller is expected to "
+                    "solve it first and pass the interpreter only once it is on "
+                    "disk."
+                )
+            return python_env
         return self._ensure_alt_venv(python_env)
 
     def _ensure_alt_venv(self, name: str) -> str:
