@@ -63,7 +63,18 @@ jobs:
         # what it is for; installing the whole entry requirements file would drag
         # in bioimageio.core==0.11.0 and numpy==1.26.4 and re-resolve the image's
         # own pins underneath the rest of the suite.
-        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow aiofiles
+        # fsspec is the same case as aiofiles, and it cost a real guard. zarr is
+        # in the datasets requirements and aiohttp and requests are in the image,
+        # but fsspec is not, and zarr reaches an http(s) store THROUGH fsspec. So
+        # model-finetune's live region tests — the only ones that can tell a crop
+        # from a full download, because they count the chunk requests a real
+        # store receives — skipped as a whole FILE, which pytest reports as ONE
+        # skipped entry. Measured in this exact image: without fsspec, 521 passed
+        # and 5 skipped with none of that file's four cases collected; with it,
+        # 525 passed and 4 skipped and all four run. A floor on the number that
+        # ran could not see a 3-case drop, which is why max_skipped exists in
+        # .github/app-bundle-suites.json.
+        run: pip install --no-cache-dir -r requirements-test.txt -r requirements-datasets.txt pillow aiofiles fsspec
 
       - name: Run the suite
         # tests/end_to_end needs a live Hypha workspace and a real cluster.
