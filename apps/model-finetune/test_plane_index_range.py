@@ -136,21 +136,21 @@ def test_a_valid_plane_is_refused_if_an_INVALID_one_rides_along():
 
 # ── names absent: a non-empty `planes` is REFUSED, not quietly dropped ──────
 #
-# THE GAP THIS CLOSES, and it was in my own decision comment. The role check is
-# gated on the axis names being known, and a stem imported before names were
-# recorded arrives with `axes=[]` — the very legacy population the decision is
-# motivated by. So the check was skipped, `_plane_index` took the size-1
-# shortcut without looking at `planes`, and this row's own defect survived in
-# the same form. Measured on that version, axes=[], shape [3, 1, 64, 64]:
+# WHY THIS IS PARAMETRISED OVER THREE SHAPES rather than one. `_plane_index`
+# reports unresolvable names only when some non-spatial axis has size > 1, so a
+# four-element stack is the single shape that refuses on its own. On a
+# single-element axis or a plain cyx store nothing fires, and without the
+# explicit refusal a plane naming nothing is accepted and dropped:
 #
-#     {"z": 7}      -> ACCEPTED, z index 0
-#     {"c": 2}      -> ACCEPTED, z index 0
-#     {"bogus": 1}  -> ACCEPTED, z index 0
+#     axes=[], shape [3, 1, 64, 64]
+#       {"z": 7}      -> index 0
+#       {"c": 2}      -> index 0
+#       {"bogus": 1}  -> index 0
 #
-# The first version of the test below used STACK only. That is the ONE shape
-# where `_plane_index` does refuse (a size-4 axis with no resolvable plane), so
-# the test passed and the gap stayed hidden. The parametrisation now covers the
-# shapes where it does not.
+# A test covering only the stack therefore passes whether or not the rule is
+# implemented. The axes-absent and axes-empty cases are both covered because a
+# stem imported before axis names were recorded produces the second, and that is
+# the population the rule exists for.
 
 
 @pytest.mark.parametrize(

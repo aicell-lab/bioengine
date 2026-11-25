@@ -218,25 +218,26 @@ def region_index(
     #
     # WITHOUT AXIS NAMES, A NON-EMPTY `planes` IS REFUSED OUTRIGHT.
     #
-    # An earlier version of this comment claimed the refusals below applied
-    # generally and that `_plane_index` reported the names-absent case itself.
-    # Both were wrong, and wrong in the worst place: a stem imported before axis
-    # names were recorded arrives with `axes=[]` -- the exact legacy population
-    # this decision is motivated by -- and the role check below is gated on
-    # `names`, so it was skipped. `_plane_index` then took the size-1 shortcut
-    # without looking at `planes` at all. Measured on that version, axes=[],
-    # shape [3, 1, 64, 64]: `{"z": 7}`, `{"c": 2}` and `{"bogus": 1}` were ALL
-    # accepted and discarded -- this row's own defect, in the same form.
+    # With no names a key cannot be resolved to an axis, which makes honouring it
+    # and range-checking it equally impossible -- so the only alternatives are
+    # refusing and discarding, and discarding is the silence this decision exists
+    # to rule out.
     #
-    # `_plane_index` only reports the missing names when some non-spatial axis
-    # has size > 1. For a singleton, or a plain cyx store, it never fires, and
-    # those are precisely where the silence lived.
+    # This case needs its own refusal rather than falling to the checks below,
+    # which are gated on `names`, or to `_plane_index`, which reports missing
+    # names ONLY when some non-spatial axis has size > 1. For a single-element
+    # axis or a plain cyx store neither fires, so without this a plane naming
+    # nothing at all would be accepted and dropped: on `axes=[]` with shape
+    # [3, 1, 64, 64], `{"z": 7}`, `{"c": 2}` and `{"bogus": 1}` all resolve to
+    # index 0.
     #
-    # So refuse: with no names the keys cannot be resolved to any axis, which
-    # makes honouring them and range-checking them equally impossible, and
-    # ignoring them is the silence this decision exists to rule out. Nothing
-    # written through the supported path has this shape, because the import
-    # validator records planes only alongside the names they refer to.
+    # A stem imported before axis names were recorded arrives with `axes=[]`, so
+    # this is exactly the legacy population the decision above is motivated by --
+    # which is why the gap mattered more here than anywhere else.
+    #
+    # Nothing written through the supported path has this shape: the import
+    # validator is given the probe's axes and records planes only alongside the
+    # names they refer to.
     if want and not names:
         raise RegionSourceError(
             f"planes {sorted(want)!r} was given, but this array's axis names are "
