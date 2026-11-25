@@ -13,6 +13,7 @@ module stays introspectable with only ``bioengine[worker]`` + the stdlib.
 
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -35,8 +36,91 @@ def sessions_root() -> Path:
     return root
 
 
+# The exact shape ``new_session_id`` generates, and the ONLY shape accepted from
+# a caller. An allow-list, not a sanitiser: there is no attempt to clean a bad id
+# up, because every cleanup is a guess at what the caller meant and the guesses
+# are what get escaped.
+#
+# ``\A``/``\Z`` and not ``^``/``$``: in Python ``$`` also matches immediately
+# before a trailing newline, so ``re.match(r"^...$", "<valid-id>\n")`` SUCCEEDS.
+# An id with a newline on the end would then be accepted and used as a directory
+# name. There is a test for exactly that.
+SESSION_ID_PATTERN = re.compile(r"\A\d{4}-\d{2}-\d{2}-\d{6}-[0-9a-f]{8}\Z")
+
+
+class InvalidSessionId(ValueError):
+    """A session_id that this server could not have generated.
+
+    Raised BEFORE any filesystem call. It is a ``ValueError`` so that callers
+    which already report bad arguments keep reporting them the same way.
+    """
+
+
+class SessionNotFound(ValueError):
+    """A well-formed session_id for a session that does not exist here.
+
+    Deliberately distinct from :class:`InvalidSessionId`: one says the caller
+    sent something the server could not have issued, the other says the caller
+    sent something plausible that this worker does not have. Collapsing them
+    would make a legitimate "wrong worker" mistake read like an attack.
+    """
+
+
+def validate_session_id(session_id: Any) -> str:
+    """The session_id, or raise.
+
+    Checked against the generator's own shape, which was verified to cover every
+    run in production: all 261 live session ids match it, so nothing existing
+    becomes unreachable by enforcing it.
+    """
+    if not isinstance(session_id, str):
+        raise InvalidSessionId(
+            f"session_id must be a string, got {type(session_id).__name__}"
+        )
+    if not SESSION_ID_PATTERN.match(session_id):
+        # The value is NOT echoed in full: it is attacker-controlled and this
+        # message reaches logs. The length and a short prefix are enough to
+        # debug a genuine mistake.
+        raise InvalidSessionId(
+            f"session_id is not a valid session identifier "
+            f"(length {len(session_id)}, starts {session_id[:12]!r}). "
+            f"Expected the form YYYY-MM-DD-HHMMSS-xxxxxxxx."
+        )
+    return session_id
+
+
 def session_dir(session_id: str) -> Path:
-    return sessions_root() / session_id
+    """The directory for *session_id*, guaranteed to be inside the sessions root.
+
+    Two independent layers, deliberately not one:
+
+    1. :func:`validate_session_id` refuses anything the server would not itself
+       have generated, before any path is built.
+    2. The built path is resolved and asserted to be inside the resolved root.
+
+    Layer 2 is not redundant with layer 1 — it is what still holds if layer 1 is
+    ever loosened, and loosening an id format is a normal thing to want to do.
+    Softening either one alone leaves the other refusing, which is the whole
+    point: each has its own failing test.
+
+    This function is the chokepoint. ``_status_path``, ``_stop_path``,
+    ``_params_path`` and ``checkpoint_path`` all build on it, so guarding here
+    covers every method that takes a session_id rather than one of them.
+    """
+    validate_session_id(session_id)
+    root = sessions_root()
+    candidate = root / session_id
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    try:
+        # `Path.is_relative_to` is 3.9+, and this app's suite also runs on 3.8.
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise InvalidSessionId(
+            f"session_id resolves outside the sessions root "
+            f"(length {len(session_id)}, starts {session_id[:12]!r})"
+        )
+    return candidate
 
 
 def session_backend(session_id: str) -> str:
@@ -349,11 +433,54 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
 
 
 def list_sessions() -> Dict[str, Dict[str, Any]]:
+    """Every run on this worker whose directory name is a real session id.
+
+    **A non-conforming directory is SKIPPED, not fatal, and that is the whole
+    point of this function having a comment.** ``get_status`` validates the id,
+    so listing a directory whose name is not a session id raises — and one such
+    directory would then make the listing raise for *every* caller, turning a
+    stray directory into a total outage of the run history.
+
+    That is not hypothetical. Until this fix is deployed, the running version
+    lets any unauthenticated caller create exactly such a directory, so the
+    fixed version can come up with junk already on disk beside the real runs.
+    The "all 261 live ids conform" measurement was taken *before* the rollout
+    and cannot speak for what is on disk after it.
+
+    So the rule is: validate what a CALLER hands us, and tolerate what we FIND.
+    A name that cannot be a session id was not produced by this server, and the
+    honest thing is to leave it out of the history rather than to refuse to show
+    the history at all. It is logged once per listing so the junk is visible.
+    """
     root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
+    skipped: List[str] = []
     for d in sorted(root.iterdir()) if root.exists() else []:
-        if d.is_dir() and (d / "status.json").exists():
+        if not (d.is_dir() and (d / "status.json").exists()):
+            continue
+        if not SESSION_ID_PATTERN.match(d.name):
+            skipped.append(d.name)
+            continue
+        try:
             out[d.name] = get_status(d.name)
+        except InvalidSessionId:
+            # The name passed, but a deeper layer still refused it. Today that
+            # means the containment check: a directory whose NAME is a valid
+            # session id but which is a SYMLINK out of the sessions root. The
+            # name check above cannot see that, and without this the one bad
+            # link would raise and take the whole history down -- the same
+            # outage the name check was added to prevent, through the other
+            # layer. Caught here rather than by pre-checking the link, so that
+            # any future refusal inside `session_dir` is covered too.
+            skipped.append(d.name)
+    if skipped:
+        # Names are attacker-controlled, so log how many and a bounded sample
+        # rather than the lot.
+        print(
+            f"[model-finetune] skipped {len(skipped)} session directory(ies) whose "
+            f"name is not a valid session id: {skipped[:5]}",
+            flush=True,
+        )
     return out
 
 

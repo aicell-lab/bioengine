@@ -1928,8 +1928,20 @@ class EntryApp:
     async def stop_training(
         self, session_id: str = Field(..., description="Session id to stop.")
     ) -> Dict[str, Any]:
-        """Request cancellation (an in-flight training epoch may finish first)."""
+        """Request cancellation (an in-flight training epoch may finish first).
+
+        Refuses a session that does not exist, and creates nothing when it does
+        so. `write_status` below calls `mkdir(parents=True)`, which is how a real
+        session's directory comes into being on its first write — so without this
+        check, stopping a run that never existed MANUFACTURES it, complete with a
+        status record that then appears in the run listing.
+        """
         import training
+
+        if not training.session_dir(session_id).exists():
+            raise training.SessionNotFound(
+                f"no training session {session_id!r} on this worker"
+            )
 
         training.request_stop(session_id)
         task = self._training_tasks.get(session_id)

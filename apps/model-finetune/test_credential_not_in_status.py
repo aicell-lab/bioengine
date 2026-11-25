@@ -31,6 +31,17 @@ import pytest
 import ngff_region
 import training
 
+# A session id must match the shape the server itself generates
+# (YYYY-MM-DD-HHMMSS-xxxxxxxx). `training.session_dir` refuses anything else --
+# a caller-supplied id was previously used as a directory name unchecked, which
+# let `../x` and absolute paths write outside the sessions root. So a descriptive
+# id like "s-stale" can no longer be a directory name; these constants keep the
+# tests readable while using ids the app accepts.
+S_PLAIN = "2026-11-25-120003-00000003"
+S_PRESIGNED = "2026-11-25-120004-00000004"
+S_RAW = "2026-11-25-120002-00000002"
+S_REGION = "2026-11-25-120001-00000001"
+
 SECRET = "SECRET-TOKEN-123"
 CRED_ROOT = f"https://ov.example/t/{SECRET}/zarr/ds1/"
 
@@ -75,7 +86,7 @@ async def test_a_region_read_failure_leaves_no_credential_in_the_status(
         f"FileNotFoundError: No array found in store "
         f"{ngff_region.redact_store_credential(CRED_ROOT)}0"
     )
-    st = await _run_and_read("s-region", exc, monkeypatch, tmp_path)
+    st = await _run_and_read(S_REGION, exc, monkeypatch, tmp_path)
     assert st["status"] == "FAILED"
     assert SECRET not in st["message"], f"the credential was published: {st['message']}"
     # The message still has to be useful, or the redaction has traded one
@@ -96,7 +107,7 @@ async def test_a_RAW_library_error_is_redacted_by_the_status_write_itself(
     the status document.
     """
     exc = FileNotFoundError(f"No array found in store <FsspecStore({CRED_ROOT}0)>")
-    st = await _run_and_read("s-raw", exc, monkeypatch, tmp_path)
+    st = await _run_and_read(S_RAW, exc, monkeypatch, tmp_path)
     assert st["status"] == "FAILED"
     assert SECRET not in st["message"], f"the credential was published: {st['message']}"
     assert ngff_region.CREDENTIAL_PLACEHOLDER in st["message"]
@@ -107,7 +118,7 @@ async def test_an_ordinary_failure_message_is_recorded_unchanged(monkeypatch, tm
     """The control. A status write that mangled or dropped every message would
     pass both tests above while making every other failure undiagnosable."""
     exc = RuntimeError("cellpose ran out of memory on a 4096x4096 tile")
-    st = await _run_and_read("s-plain", exc, monkeypatch, tmp_path)
+    st = await _run_and_read(S_PLAIN, exc, monkeypatch, tmp_path)
     assert st["status"] == "FAILED"
     assert st["message"] == "cellpose ran out of memory on a 4096x4096 tile"
 
@@ -124,7 +135,7 @@ async def test_a_presigned_signature_is_NOT_claimed_to_be_redacted(
     clean of credentials in general. If that is wanted it is its own change.
     """
     exc = RuntimeError("GET https://s3.example/i.tif?X-Amz-Signature=abc123 failed")
-    st = await _run_and_read("s-presigned", exc, monkeypatch, tmp_path)
+    st = await _run_and_read(S_PRESIGNED, exc, monkeypatch, tmp_path)
     assert "abc123" in st["message"], (
         "a presigned signature is now scrubbed too; that is an improvement, but "
         "this test and the module docstring describe the narrower guarantee and "
