@@ -2069,7 +2069,9 @@ class AnnotationBroker:
           ``planes`` is which slice of each non-spatial axis the annotation
           belongs to, by axis NAME, or null when none was recorded; and
           ``level0_shape`` is the level-0 dataset shape the per-level plane
-          index is derived from, or null. Both are needed together: a pyramid
+          index is derived from, or null. Note it is POSITIONAL and the axis
+          names are NOT returned, so a reader must take axis order from the
+          store's own ``multiscales`` metadata. Both are needed together: a pyramid
           that resamples z has a different index per level for the same
           physical slice, and neither value alone lets a reader work out which.
 

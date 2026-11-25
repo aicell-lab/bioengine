@@ -1002,20 +1002,28 @@ class TestGetImageUrl:
             "shape promises them"
         )
 
-    async def test_a_Z_DOWNSAMPLED_pyramid_carries_what_the_viewer_derives_from(
-        self, served
-    ):
-        """The case the whole row exists for, and the one a y/x-only fixture
-        cannot test.
+    async def test_a_3D_source_carries_BOTH_fields_together(self, served):
+        """Both fields travel for a source that records a plane AND a layout.
 
-        On a pyramid that resamples z, the same physical slice has a different
-        index at every level. level-0 z=4 of 9 maps to level-1 index 2 of 5,
-        which covers level-0 slices 4.5 to 6.75 -- and does NOT contain 4. The
-        viewer can only work that out from `level0_shape` together with each
-        level's own shape, so both fields must arrive.
+        ⚠ THIS TEST DOES NOT, AND CANNOT, COVER THE Z-DOWNSAMPLING CASE. An
+        earlier version of it was named for that and claimed to, and the claim
+        was false in two ways worth recording:
 
-        On a store that pyramids only in y and x every level agrees by accident
-        and this assertion would pass with the fields dropped.
+        * its fixture had no z-downsampled level at all. It was identical to
+          `test_a_recorded_PLANE_reaches_the_reader`'s but for the store_root;
+          the "level 1 has 5 slices" existed only in a comment, so every mutant
+          that reddened it reddened that test too and it had ZERO unique kills;
+        * its docstring said a y/x-only pyramid would let the assertion pass
+          with the fields dropped. That is not true of any pyramid:
+          `get_image_url` is a PASS-THROUGH and never sees a level's shape, so
+          dropping the fields fails identically everywhere.
+
+        The per-level index is derived by the VIEWER from `level0_shape` plus
+        the store's own level shapes. Nothing in this repo reads a level shape,
+        so the z-downsampling behaviour is not verifiable on the broker side at
+        all -- it belongs to the page, which is where the row's clause 2 puts
+        it. This test is therefore scoped to what it really checks: the two
+        fields arrive together and unmangled.
         """
         served._state["entries"] = {
             "r": bc.remote_image_entry(
@@ -1027,17 +1035,16 @@ class TestGetImageUrl:
                 layout={
                     "dataset_paths": ["0", "1"],
                     "axis_roles": {"y": 1, "x": 2},
-                    # 9 z-slices at level 0; a level-1 that halves z has 5.
                     "level0_shape": [9, 64, 64],
                     "axes": ["z", "y", "x"],
                 },
             )
         }
         out = await served.get_image_url("ws/ds", "r", context=None)
-        assert out["planes"] == {"z": 4}, "the plane itself must survive"
-        assert out["level0_shape"][0] == 9, (
-            "the level-0 z extent is what a per-level index is derived FROM; "
-            "without it the viewer cannot tell 4-of-9 from 4-of-5"
+        assert out["planes"] == {"z": 4}
+        assert out["level0_shape"] == [9, 64, 64], (
+            "the level-0 extent is what the VIEWER derives a per-level index "
+            "from; this asserts it arrives, not that the derivation is right"
         )
 
     async def test_a_remote_image_whose_layout_is_absent_does_not_raise(self, served):
