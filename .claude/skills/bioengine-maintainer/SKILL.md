@@ -432,7 +432,8 @@ def worker_service_id(workspace: str, match: str, server="https://hypha.aicell.i
     """Resolve a worker's fully-qualified service id without enumerating by RPC."""
     # TRAP 3: send a token only if you HAVE one. A public workspace's listing answers 200
     # anonymously, and an invalid token answers 401 -- so an absent variable
-    # works where a wrong one does not. An unconditional os.environ[...] raises KeyError.
+    # works where a wrong one does not. A valid token scoped to another workspace
+    # answered 200, so a 200 does not mean the token belongs to this workspace. An unconditional os.environ[...] raises KeyError.
     headers = {}
     token = os.environ.get("BIOIMAGE_IO_TOKEN") or os.environ.get("HYPHA_TOKEN")
     if token:
