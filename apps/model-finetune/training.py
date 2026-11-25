@@ -303,11 +303,13 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
 
 # Fields recorded on a run but NOT returned by the public read path.
 #
-# `list_training_sessions` answers anonymous callers today, and it returns
-# whatever `get_status` returns. So the moment a run records who started it, that
-# identity is published to anyone who asks -- the public history would stop
-# saying only WHAT was trained and start saying WHO trained it. Recording the
-# owner and keeping it out of the response therefore have to be one change, not
+# `list_training_sessions` is now per-caller (see `list_sessions`), so a run is
+# only returned to the identity it was recorded under. That is NOT why these
+# fields are withheld. The owner is what the filter COMPARES, so it is read on
+# every listing; publishing it would turn a history that says WHAT was trained
+# into one that says WHO trained it, for every run the caller can see. Recording
+# the owner and keeping it out of the response therefore have to be one change,
+# not
 # two: "record now, filter later" publishes the identity in between.
 #
 # These come back only for a caller that asks with include_private=True, which is
@@ -315,20 +317,38 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
 # The owner is therefore READ on every listing and PUBLISHED on none.
 PRIVATE_STATUS_FIELDS = ("owner", "owner_anonymous")
 
-# The workspace whose members may see runs that carry no owner, and the grants
-# that count as membership. BOTH halves are narrower than they look, and each
-# narrowing is there because the wider version is wrong:
+# Runs that carry no owner are shown ONLY to a caller holding rw or admin on
+# this exact workspace. Three narrowings, each deliberate:
 #
-#   * "r" is EXCLUDED. ``usage_ledger.classify_caller`` treats {"r", "rw", "a"} as
-#     operator grants, which is right for its own question (is this caller an
-#     insider, for a usage figure that should be a floor) and wrong for this one.
-#     Read permission is not authority over other people's run history.
-#   * the workspace is NAMED, and the caller's own workspace does not count.
+#   * "r" is EXCLUDED. Read permission is not authority over other people's run
+#     history. ``usage_ledger.classify_caller`` counts {"r", "rw", "a"} as
+#     operator grants, which is right for its own question — is this caller an
+#     insider, for a usage figure meant to be a floor — and wrong for this one.
+#     Measured: that function buckets a caller holding only "r" on this
+#     workspace as `internal`, where this one refuses it.
+#   * the workspace is NAMED, and the caller's OWN workspace does not count.
 #     Measured 2026-11-25: every token-less caller is minted a fresh identity
-#     holding "a" ON ITS OWN personal workspace (`ws-user-anonymouz-...`). So a
-#     check of the form "does this caller hold an operator grant anywhere" is
-#     true for EVERY caller including anonymous ones, and would hand the whole
-#     unowned history to exactly the callers it is meant to exclude.
+#     holding "a" on its own personal workspace (`ws-user-anonymouz-...`). This
+#     function deliberately does NOT short-circuit on `is_anonymous`, because an
+#     anonymous caller is a real identity that owns its own runs — so an
+#     implementation reading "does this caller hold an operator grant anywhere"
+#     would be true for every caller alive, anonymous ones included, and hand
+#     the whole unowned history to exactly the callers it must exclude. A mutant
+#     doing that turns three tests red.
+#   * a WILDCARD grant does NOT count, even carrying rw or admin. A global
+#     operator arguably does hold authority here, so accepting "*" would be
+#     defensible — but the rule this implements names one workspace, and
+#     widening a privacy filter past its rule is not a call to make in passing.
+#     Refusing "*" costs a genuine global operator nothing but the ownerless
+#     rows; accepting it would show 261 other people's runs to an identity
+#     nobody authorised. If "*" is ever wanted, it should arrive as a decision
+#     with a name on it.
+#
+# NB `classify_caller` would NOT have leaked to anonymous callers if reused: it
+# returns `anonymous` before ever reading the grants (measured, including with
+# `*: a`). The leak above is a hazard of a naive implementation of THIS
+# function, which has no such short-circuit. Recorded because an earlier note
+# here attributed it to that function, and that was wrong.
 OWNERLESS_WORKSPACE = "bioimage-io"
 OWNERLESS_GRANTS = frozenset({"rw", "a"})
 
@@ -336,19 +356,22 @@ OWNERLESS_GRANTS = frozenset({"rw", "a"})
 def caller_can_see_ownerless(
     context: Any, *, workspace: str = OWNERLESS_WORKSPACE
 ) -> bool:
-    """True iff the caller holds rw or admin on *workspace*.
+    """True iff the caller holds rw or admin on *workspace* — ``bioimage-io``.
 
     A run that carries no owner cannot be attributed to anybody, and there are
     261 of them written before the field existed. They are not guessed at, not
-    made public and not deleted: they are shown only to a caller with authority
-    over the workspace that hosts the app.
+    made public and not deleted: they are shown only to a caller with rw or
+    admin on ``bioimage-io`` specifically.
 
-    Decided from the INJECTED context and from nothing else — there is no
+    **Not "the workspace hosting the app".** The name is the constant above, so
+    an instance of this app deployed into some other workspace — a dev worker —
+    does not treat its own hosting workspace as authoritative. That is the
+    intended reading of the rule and not an oversight; it is also why the
+    workspace is a keyword argument, so a test can state the name it means.
+
+    Decided from the INJECTED context and from nothing else: there is no
     parameter, so a caller cannot ask to be treated as an administrator. A
-    wildcard grant qualifies when it carries rw or admin, because a genuine
-    global operator does have that authority over this workspace; a wildcard
-    carrying only "r" does not, for the same reason "r" on the named workspace
-    does not.
+    wildcard grant does not qualify — see the note above the constant.
 
     Never raises: an unusable context is "no authority", which is the closed
     direction. A caller that cannot be read must not inherit the open one.
@@ -364,10 +387,7 @@ def caller_can_see_ownerless(
     grants = scope.get("workspaces")
     if not isinstance(grants, dict):
         return False
-    for key in (workspace, "*"):
-        if grants.get(key) in OWNERLESS_GRANTS:
-            return True
-    return False
+    return grants.get(workspace) in OWNERLESS_GRANTS
 
 
 def redact_private(status: Dict[str, Any]) -> Dict[str, Any]:

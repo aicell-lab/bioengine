@@ -1,16 +1,29 @@
 """The run listing returns the caller's own runs, and nobody else's.
 
 The listing used to return every run on the worker to whoever asked. These tests
-pin the three visibility rules and, more importantly, the two NARROWINGS that
-make the ownerless rule correct — both of which were measured against the live
-platform before being written down, and both of which the obvious implementation
-gets wrong:
+pin the three visibility rules and, more importantly, the three NARROWINGS that
+make the ownerless rule correct — each measured against the live platform before
+being written down, and each one something the obvious implementation gets wrong:
 
-* read permission on the hosting workspace is NOT authority over other people's
-  runs, even though the app's existing caller classifier counts it as operator;
-* every token-less caller is minted a fresh identity holding ADMIN on its own
-  personal workspace, so "holds an operator grant somewhere" is true for every
-  caller alive and would publish the whole unowned history to anonymous callers.
+* read permission on the NAMED workspace is NOT authority over other people's
+  runs. The app's existing classifier, `usage_ledger.classify_caller`, does count
+  it as operator — measured: it buckets a caller holding only "r" here as
+  `internal`, where this check refuses it.
+* the workspace is NAMED, and the caller's OWN workspace does not count. Every
+  token-less caller is minted a fresh identity holding ADMIN on its own personal
+  workspace, so an implementation asking "does this caller hold an operator grant
+  anywhere" is true for every caller alive and would publish the whole unowned
+  history to anonymous callers.
+* a WILDCARD grant does not count either, not even carrying admin. The rule names
+  one workspace, and widening a privacy filter past its rule is not a call to
+  make in passing.
+
+**The second bullet is a hazard of THIS function, not of reusing that one.**
+`classify_caller` returns `anonymous` before it ever reads the grants — measured,
+including for an anonymous caller holding `*: a` — so reusing it would not have
+leaked to anonymous callers. This check deliberately has no such short-circuit,
+because here an anonymous caller is a real identity that owns its own runs. An
+earlier version of this note pinned the leak on that function, which was wrong.
 
 **Every test that asserts somebody sees NOTHING is paired with a demonstration
 that the runs are really there.** Without that pairing, a fixture that silently
@@ -203,18 +216,17 @@ def test_ownerless_runs_are_hidden_from_a_caller_without_authority(runs):
 
 
 @pytest.mark.parametrize("grant", ["a", "rw"])
-def test_rw_and_admin_on_the_hosting_workspace_BOTH_grant_the_ownerless_runs(
-    runs, grant
-):
+def test_rw_and_admin_on_the_NAMED_workspace_BOTH_grant_the_ownerless_runs(runs, grant):
     runs("old", None)
     who = ctx(OTHER, anonymous=False, grants={"bioimage-io": grant})
     assert sorted(training.list_sessions(who)) == ["old"], grant
 
 
-def test_READ_permission_on_the_hosting_workspace_is_NOT_authority(runs):
+def test_READ_permission_on_the_NAMED_workspace_is_NOT_authority(runs):
     """The first narrowing. ``usage_ledger.classify_caller`` counts "r" as an
-    operator grant, which is right for its question and wrong for this one;
-    reusing it here would hand every reader the unowned history."""
+    operator grant, which is right for its question and wrong for this one.
+    Measured: that function buckets a caller holding only "r" on this workspace
+    as `internal`, where this one refuses it."""
     runs("old", None)
     reader = ctx(OTHER, anonymous=False, grants={"bioimage-io": "r"})
     assert training.list_sessions(reader) == {}
@@ -243,15 +255,32 @@ def test_ADMIN_ON_THE_CALLERS_OWN_WORKSPACE_is_NOT_authority(runs):
     assert sorted(training.list_sessions(ADMIN)) == ["old"]
 
 
-@pytest.mark.parametrize(
-    "grant,expected", [("a", True), ("rw", True), ("r", False), ("x", False)]
-)
-def test_a_wildcard_grant_counts_only_when_it_carries_rw_or_admin(grant, expected):
-    """A genuine global operator does hold authority over this workspace, so a
-    wildcard is honoured — but it is narrowed by the same grant set, so a
-    wildcard carrying only read does not qualify either."""
+@pytest.mark.parametrize("grant", ["a", "rw", "r", "x"])
+def test_a_WILDCARD_grant_NEVER_qualifies(runs, grant):
+    """Not even carrying admin.
+
+    A global operator arguably does hold authority here, so accepting `"*"`
+    would be defensible — but the rule this implements names ONE workspace, and
+    widening a privacy filter past its rule is not a call to make in passing.
+    Refusing a wildcard costs a genuine global operator nothing but these rows;
+    accepting it would show 261 other people's runs to an identity nobody
+    authorised.
+    """
+    runs("old", None)
     who = ctx(OTHER, anonymous=False, grants={"*": grant})
-    assert training.caller_can_see_ownerless(who) is expected, grant
+    assert training.caller_can_see_ownerless(who) is False, grant
+    assert training.list_sessions(who) == {}
+    # paired demonstration: the run IS there for the named workspace's admin
+    assert sorted(training.list_sessions(ADMIN)) == ["old"]
+
+
+def test_a_wildcard_does_not_help_even_ALONGSIDE_a_read_grant(runs):
+    """The two refused shapes combined are still refused — neither is a partial
+    credit toward the other."""
+    runs("old", None)
+    who = ctx(OTHER, anonymous=False, grants={"*": "a", "bioimage-io": "r"})
+    assert training.caller_can_see_ownerless(who) is False
+    assert training.list_sessions(who) == {}
 
 
 def test_authority_is_decided_only_by_the_named_workspace(runs):

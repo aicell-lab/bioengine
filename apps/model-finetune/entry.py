@@ -1923,7 +1923,7 @@ class EntryApp:
 
         Not every run on the worker: a run is returned to the caller whose
         identity it was recorded under, and a run carrying no owner only to a
-        caller holding rw or admin on the workspace hosting this app. An
+        caller holding rw or admin on the `bioimage-io` workspace. An
         anonymous caller is a real identity here — Hypha mints a fresh one per
         connection — so it sees the runs it started on that connection and no
         others.
