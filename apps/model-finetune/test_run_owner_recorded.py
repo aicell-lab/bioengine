@@ -255,3 +255,68 @@ async def test_entry_passes_NOTHING_when_there_is_no_caller(monkeypatch):
     with pytest.raises(_Stop):
         await fn(inst, train_images=["a.tif"], train_labels=["b.tif"], context=None)
     assert seen.get("owner") is None, seen
+
+
+# ── the decorator itself: context must be INJECTED, never client-supplied ─────
+#
+# This replaces a test I deleted, and deleting it was the worse mistake of the
+# two. The old one grepped entry.py for `@bioengine.method(context=True)`; I
+# removed it as "another substring grep" and put nothing in its place, so
+# reverting the decorator passed the whole file. The behavioural tests cannot
+# see it either, because they pass `context=` straight to the function and so
+# cannot tell an injected context from a client-supplied one.
+#
+# The consequence is not merely that no owner is recorded. With `context=True`,
+# the framework strips `context` from the schema Hypha publishes, so a client
+# CANNOT send it. Without it, the parameter is published and anyone could pass
+# context={"user": {"id": "<somebody else>"}} and file a run under that name --
+# which the per-caller filter would then show to the victim. So this asserts the
+# effect on the published schema, not the presence of the decorator's text.
+
+
+def _start_training_attr():
+    import entry
+
+    cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
+    fn = getattr(cls, "start_training")
+    assert fn is not None
+    return fn
+
+
+def test_context_is_NOT_in_the_schema_hypha_publishes_to_clients():
+    """The whole protection: a parameter absent from the published schema is one
+    a client cannot set, which is what makes the recorded owner trustworthy."""
+    fn = _start_training_attr()
+    schema = getattr(fn, "__schema__", None)
+    assert schema, "start_training carries no __schema__ to check"
+    props = (schema.get("parameters") or {}).get("properties") or {}
+    assert props, f"the schema exposes no properties at all: {schema!r}"
+    assert "train_images" in props, (
+        f"this test is reading the wrong schema -- it has no train_images: "
+        f"{sorted(props)[:8]}"
+    )
+    assert "context" not in props, (
+        "`context` is published to clients, so a caller can supply its own "
+        "identity and record a run as somebody else. start_training must be "
+        "declared @bioengine.method(context=True), which strips it."
+    )
+
+
+def test_the_method_is_FLAGGED_as_wanting_the_injected_context():
+    """A second, independent arm. The schema check above would also pass if the
+    parameter were renamed or removed entirely; this asserts the framework was
+    actually asked to inject."""
+    fn = _start_training_attr()
+    flags = [
+        getattr(fn, name)
+        for name in dir(fn)
+        if "context" in name.lower() and isinstance(getattr(fn, name, None), bool)
+    ]
+    assert flags, (
+        f"no wants-context flag on start_training; attrs: "
+        f"{[n for n in dir(fn) if not n.startswith('__')][:12]}"
+    )
+    assert any(flags), (
+        "start_training is not flagged as wanting the injected context, so "
+        "Hypha will never pass one and every run records no owner"
+    )
