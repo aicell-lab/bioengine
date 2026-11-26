@@ -24,9 +24,11 @@ import math
 import os
 import re
 import time
+import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -1411,6 +1413,202 @@ def oversized_image_refusal(
             "'max_bytes' by the call that mints the upload URL."
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# The upload marker: provenance for the discard
+# ---------------------------------------------------------------------------
+#
+# Discarding an object that is too big needs an answer to exactly one question
+# first: did THIS route put it there? Nothing readable in the store answers it.
+# Measured against the live artifact manager, an object that has just been PUT
+# into an open stage is returned by EVERY listing view there is -- `stage=True`,
+# `stage` unset, `stage=False`, `version="v0"` and `version="latest"` all listed
+# it. So the committed listing cannot distinguish "the caller uploaded this a
+# moment ago" from "this was already an image in the dataset", and a guard built
+# on that distinction does not merely fail to protect the pre-existing image: it
+# refuses every legitimate upload, because every legitimate upload also appears
+# in the committed view.
+#
+# So the route records the fact at the moment it creates it, instead of trying
+# to infer it afterwards. Minting an upload URL writes a marker OUTSIDE
+# `images/`; finishing requires one, and the marker is the only thing that
+# authorises touching the object. That bounds the discard to objects this route
+# minted -- and because the mint refuses a filename that is already an image, an
+# object with a marker is provably not a pre-existing image. The guarantee is
+# the conjunction of those two rules, so neither may be removed alone.
+
+UPLOAD_MARKER_DIR = ".uploads"
+UPLOAD_MARKER_VERSION = 1
+
+# An hour. Long enough that a slow client pushing the 64 MB ceiling over a poor
+# link is not refused in mid-flight, short enough that a crashed client's marker
+# does not sit in the artifact indefinitely.
+UPLOAD_MARKER_TTL_S = 3600.0
+
+# Housekeeping only: how many markers one mint will read while sweeping expired
+# ones. Bounded so that minting stays O(1)-ish no matter how many markers have
+# accumulated; the sweep is tidiness, and the AUTHORISATION check below already
+# treats an expired marker as no marker whether or not it was ever swept.
+UPLOAD_MARKER_SWEEP_LIMIT = 50
+
+# Hex only, fixed length. A mint id becomes a FILENAME, so an id that could
+# contain `/` or `..` would let a caller aim the marker read -- and therefore
+# the discard decision -- at a path of their choosing. A charset that cannot
+# express a path separator or a parent reference makes that impossible here,
+# rather than leaving it to a check somewhere else that could be moved.
+MINT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def new_mint_id() -> str:
+    """A fresh mint id: 32 lowercase hex characters, matching MINT_ID_RE."""
+    return uuid.uuid4().hex
+
+
+def upload_marker_path(mint_id: Any) -> Optional[str]:
+    """``.uploads/<mint_id>.json``, or None if that is not a valid mint id.
+
+    None rather than a raise, because a mint id arrives from the network and the
+    route's answer to a malformed one is the same refusal it gives for one that
+    is well-formed but unknown: no marker, nothing touched. Building a path only
+    from a validated id is what keeps every marker read inside
+    :data:`UPLOAD_MARKER_DIR`.
+    """
+    if not isinstance(mint_id, str) or not MINT_ID_RE.match(mint_id):
+        return None
+    return f"{UPLOAD_MARKER_DIR}/{mint_id}.json"
+
+
+def upload_marker_document(
+    *,
+    path: str,
+    mint_id: str,
+    max_bytes: int,
+    minted_at: float,
+    ttl_s: float = UPLOAD_MARKER_TTL_S,
+) -> Dict[str, Any]:
+    """The marker to store for one minted upload.
+
+    ``expires_at`` is an ABSOLUTE instant, written from the same clock that will
+    later be compared against it -- this app's own. That is the whole reason the
+    expiry is recorded at mint time rather than derived at read time from the
+    object's modification time: on the production NFS filer the server's clock
+    runs about 79 seconds ahead of the pods, measured, so `time.time()` compared
+    against a stored `st_mtime` or `last_modified` compares two different clocks.
+    A marker written a moment ago can then look stale, or dated in the future,
+    with nothing in either value saying which clock set it. Two stamps taken
+    from one clock cannot do that.
+    """
+    minted_at = float(minted_at)
+    return {
+        "marker_version": UPLOAD_MARKER_VERSION,
+        "mint_id": mint_id,
+        "path": path,
+        "max_bytes": int(max_bytes),
+        "minted_at": minted_at,
+        "expires_at": minted_at + float(ttl_s),
+    }
+
+
+def parse_upload_marker(doc: Any) -> Optional[Dict[str, Any]]:
+    """A stored marker as a validated record, or None if it cannot be used.
+
+    Fail-closed on every doubt. An unusable marker has to read as NO marker, so
+    that the route refuses and touches nothing, rather than authorising a
+    deletion on the strength of a document it does not understand.
+    """
+    # Mapping, not dict: a document that arrived over hypha-rpc is a `dotdict`,
+    # which is NOT a dict subclass, so `isinstance(doc, dict)` is False for it
+    # and the whole marker would read as unusable.
+    if not isinstance(doc, Mapping):
+        return None
+    if doc.get("marker_version") != UPLOAD_MARKER_VERSION:
+        return None
+    mint_id = doc.get("mint_id")
+    if not isinstance(mint_id, str) or not MINT_ID_RE.match(mint_id):
+        return None
+    path = doc.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    expires_at = doc.get("expires_at")
+    # A bool is an int in Python, so `True` would pass a numeric check and then
+    # compare as 1.0 -- an expiry in 1970, i.e. always stale.
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return None
+    max_bytes = doc.get("max_bytes")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        return None
+    if max_bytes <= 0:
+        return None
+    return {
+        "marker_version": UPLOAD_MARKER_VERSION,
+        "mint_id": mint_id,
+        "path": path,
+        "max_bytes": max_bytes,
+        "expires_at": float(expires_at),
+    }
+
+
+def upload_marker_is_expired(marker: Mapping, *, now: float) -> bool:
+    """True once *now* has passed the marker's OWN recorded expiry.
+
+    *now* must come from this app's clock -- the clock that wrote ``expires_at``.
+    Nothing in here reads a file time or a listing's ``last_modified``; see
+    :func:`upload_marker_document` for the measurement that forbids it.
+    """
+    return float(now) > float(marker["expires_at"])
+
+
+def marker_authorises_discard(
+    marker: Any, *, path: str, mint_id: str, now: float
+) -> bool:
+    """Whether this marker permits touching the object at *path*.
+
+    Every condition must hold: the marker parses, it was minted for exactly this
+    path, it is the marker for exactly this mint id, and it has not expired.
+
+    A false answer means the route refuses and leaves the object alone. That is
+    the behaviour this route had before any discard existed, and it is the safe
+    direction: an object no marker vouches for is an object whose provenance is
+    unknown, and the one thing the discard must never do is delete an image the
+    dataset already had.
+    """
+    parsed = parse_upload_marker(marker)
+    if parsed is None:
+        return False
+    if parsed["path"] != path:
+        return False
+    if parsed["mint_id"] != mint_id:
+        return False
+    return not upload_marker_is_expired(parsed, now=now)
+
+
+def expired_marker_removals(
+    markers: Any, *, now: float, limit: int = UPLOAD_MARKER_SWEEP_LIMIT
+) -> List[str]:
+    """Which marker paths the housekeeping sweep should remove.
+
+    *markers* is an iterable of ``(marker_path, document)`` pairs as read from
+    :data:`UPLOAD_MARKER_DIR`. A document that does not parse is swept too: it
+    authorises nothing, so it is litter, and leaving it would mean the only
+    thing that ever cleans it up is a human.
+
+    Returns at most *limit* paths, so a mint cannot turn into an unbounded
+    series of removals.
+    """
+    out: List[str] = []
+    for item in markers or []:
+        if len(out) >= max(0, int(limit)):
+            break
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        marker_path, doc = item
+        if not isinstance(marker_path, str) or not marker_path:
+            continue
+        parsed = parse_upload_marker(doc)
+        if parsed is None or upload_marker_is_expired(parsed, now=now):
+            out.append(marker_path)
+    return out
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

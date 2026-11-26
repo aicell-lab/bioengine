@@ -253,11 +253,20 @@ class AnnotationBroker:
     ) -> List[Dict[str, Any]]:
         """Entries under *dir_path*, staged view by default.
 
-        `stage=False` asks what is COMMITTED, which answers a different
-        question: the staged view includes an object this request has just
-        PUT, so it cannot distinguish "the caller uploaded this" from "this was
-        already somebody's image". One caller needs that distinction and must
-        not get it wrong -- see the finishing half of `upload_local_image`.
+        **`stage=False` does not answer "was this already here?", and nothing
+        in this app may use it as though it did.** The intuition is that the
+        committed view excludes an object the current request has just PUT into
+        the open stage, so comparing the two views would separate "the caller
+        uploaded this" from "this was already somebody's image". Measured
+        against the live artifact manager, it does not: a just-PUT staged object
+        was returned by `stage=True`, by `stage` unset, by `stage=False`, by
+        `version="v0"` and by `version="latest"` alike. A guard built on the
+        difference matches every upload, so it refuses the legitimate ones and
+        still cannot see the case it was written for.
+
+        The route that needs that distinction -- the finishing half of
+        `upload_local_image`, which may delete the object -- therefore gets it
+        from a marker it wrote itself at mint time, not from any listing.
         """
         try:
             files = await self._am.list_files(
@@ -1956,6 +1965,102 @@ class AnnotationBroker:
             )
             return False
 
+    # === the upload marker ===
+    # Provenance for the discard. See the block comment above
+    # `UPLOAD_MARKER_DIR` in broker_core for why no listing can supply it.
+
+    async def _write_upload_marker(self, artifact_id: str, marker: Dict[str, Any]):
+        """Record a minted upload. Raises, so a failure refuses the mint.
+
+        Deliberately not tolerant: a mint whose marker did not land hands the
+        client a URL it can never discharge, and the object it uploads would
+        then be unauthorised litter that nothing is allowed to clean up. Better
+        to refuse the mint and let the client ask again.
+        """
+        path = core.upload_marker_path(marker["mint_id"])
+        if path is None:  # unreachable via new_mint_id; a guard, not a branch
+            raise ValueError("refusing to write a marker for an invalid mint id")
+        await self._write_json_file(artifact_id, path, marker)
+
+    async def _read_upload_marker(self, artifact_id: str, mint_id: Any) -> Any:
+        """The stored marker document for *mint_id*, or None.
+
+        None covers every way the marker can fail to be usable -- a malformed
+        mint id, no such marker, a transport hiccup reading it -- because the
+        route's response to all of them is identical: refuse, touch nothing.
+        """
+        path = core.upload_marker_path(mint_id)
+        if path is None:
+            return None
+        return await self._read_json_file(artifact_id, path, None)
+
+    async def _remove_upload_marker(self, artifact_id: str, mint_id: str) -> bool:
+        """Consume a marker. Never raises, for the reasons in the discard.
+
+        The local is `marker_path`, not `path`, deliberately: `path` in this
+        module means the IMAGE path, and the two removals must not be confusable
+        -- by a reader or by a textual mutation aimed at one of them.
+        """
+        marker_path = core.upload_marker_path(mint_id)
+        if marker_path is None:
+            return False
+        try:
+            await self._am.remove_file(
+                artifact_id=artifact_id, file_path=marker_path
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"could not remove the upload marker at {marker_path}: "
+                f"{type(exc).__name__}: {str(exc)[:160]}. It will be swept once "
+                "it expires."
+            )
+            return False
+
+    async def _sweep_expired_markers(self, artifact_id: str) -> int:
+        """Housekeeping: drop markers whose recorded expiry has passed.
+
+        Not a safety mechanism and deliberately best-effort. The authorisation
+        check treats an expired marker as no marker whether or not this ever
+        ran, so a sweep that fails costs disk and nothing else -- which is why
+        every failure here is logged rather than raised into a caller that was
+        in the middle of minting a perfectly good upload.
+        """
+        try:
+            entries = await self._list_files_safe(
+                artifact_id, core.UPLOAD_MARKER_DIR
+            )
+        except Exception:
+            return 0
+        pairs = []
+        for entry in entries[: core.UPLOAD_MARKER_SWEEP_LIMIT]:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name.endswith(".json"):
+                continue
+            marker_path = f"{core.UPLOAD_MARKER_DIR}/{name}"
+            try:
+                doc = await self._read_json_file(artifact_id, marker_path, None)
+            except Exception:
+                doc = None
+            pairs.append((marker_path, doc))
+        # `now` is THIS app's clock, the one that wrote `expires_at`. Never a
+        # listing's `last_modified`: on the production filer the server clock
+        # runs ~79 s ahead of the pods, so that comparison crosses two clocks.
+        removals = core.expired_marker_removals(pairs, now=time.time())
+        gone = 0
+        for marker_path in removals:
+            try:
+                await self._am.remove_file(
+                    artifact_id=artifact_id, file_path=marker_path
+                )
+                gone += 1
+            except Exception as exc:
+                logger.warning(
+                    f"could not sweep the expired marker {marker_path}: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+        return gone
+
     @bioengine.method(context=True)
     async def upload_local_image(
         self,
@@ -1974,6 +2079,13 @@ class AnnotationBroker:
                 "(verifies the bytes landed and commits them)."
             ),
         ),
+        mint_id: str = Field(
+            "",
+            description=(
+                "The 'mint_id' returned by the starting call. Required when "
+                "done=true; a finish without it is refused and changes nothing."
+            ),
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Presigned PUT for ONE local image, in two calls.
@@ -1987,10 +2099,20 @@ class AnnotationBroker:
 
         Call once with ``done=False``:
 
-            {"already": false, "stem", "path", "put_url", "max_bytes"}
+            {"already": false, "stem", "path", "put_url", "max_bytes", "mint_id"}
             {"already": true,  "stem", "path"}   # that stem is already an image
 
-        then, after the PUT lands, once with ``done=True``.
+        then, after the PUT lands, once with ``done=True`` and that ``mint_id``.
+
+        **The ``mint_id`` is what makes the finish safe to act on.** Finishing
+        may have to DELETE the object -- that is what enforcing a size ceiling
+        after the bytes have landed means -- and the one thing it must never
+        delete is an image the dataset already had. No listing can tell those
+        apart (measured: an object just PUT into the stage is returned by every
+        listing view, committed included), so the fact has to be recorded when
+        it is created. The starting call writes a marker outside ``images/``;
+        this id names it. A finish whose marker is missing, expired, or minted
+        for a different path is refused and changes nothing at all.
 
         As with ``materialise_image`` the PUT must send the body **bare, with
         no Content-Type header**: the presigned signature covers that header,
@@ -2061,20 +2183,44 @@ class AnnotationBroker:
                     "path": existing.get("path"),
                 }
 
+            # Reaching here means `path` is NOT an image in this dataset, by
+            # the reconciled check above. That is the fact the marker records,
+            # and it is the entire warrant for the discard on the finishing
+            # call: an object with a marker cannot be a pre-existing image,
+            # because a marker is only ever minted after this check passes.
+            # Removing either half breaks the guarantee, so the no-overwrite
+            # check above and the marker requirement below are one mechanism.
+            new_id = core.new_mint_id()
+            marker = core.upload_marker_document(
+                path=path,
+                mint_id=new_id,
+                max_bytes=core.MAX_LOCAL_IMAGE_BYTES,
+                minted_at=time.time(),
+            )
             put_url_holder: Dict[str, str] = {}
 
             async def _mint():
+                # The marker FIRST. A URL handed out before the marker exists
+                # is a URL the client could discharge against no marker if the
+                # marker write then failed, and the finish would refuse an
+                # upload that did everything right.
+                await self._write_upload_marker(artifact_id, marker)
                 put_url_holder["url"] = await self._am.put_file(
                     artifact_id, file_path=path
                 )
 
             await self._ensure_staged(artifact_id, _mint)
+            # Housekeeping, after the client's answer is already secured: a
+            # sweep failure must not cost a good mint. Awaited rather than
+            # fired off, so nothing outlives the request.
+            await self._sweep_expired_markers(artifact_id)
             return {
                 "already": False,
                 "stem": stem,
                 "path": path,
                 "put_url": put_url_holder["url"],
                 "max_bytes": core.MAX_LOCAL_IMAGE_BYTES,
+                "mint_id": new_id,
             }
 
         # THE CEILING, enforced here rather than advertised and forgotten. The
@@ -2091,30 +2237,43 @@ class AnnotationBroker:
         # Checked BEFORE the signature, deliberately: the signature check
         # fetches the first bytes of the object, and there is no reason to
         # reach into something already known to be over the limit.
-        # AN EXISTING IMAGE IS NEVER TOUCHED, and this guard is the reason the
-        # discard below is safe. A review measured the hole it closes: the
-        # discard removed whatever sat at `images/<name>` whenever the size
-        # check refused, and an image ALREADY in the dataset can be over this
-        # route's ceiling, because the mounted-folder path has no cap and
-        # MAX_LOCAL_IMAGE_BYTES binds this route only. So one finishing call
-        # for an existing image's filename -- a client that ignores
-        # `already: True` and finishes anyway, a stray retry, or exactly the
-        # client bug this ceiling exists for -- deleted that image from the
-        # stage, and the next commit from any route published the removal and
-        # orphaned its annotations. Before the discard existed the same call
-        # was a harmless commit.
+        # AN EXISTING IMAGE IS NEVER TOUCHED, and the marker is the reason the
+        # discard below is safe. A review measured the hole: the discard removed
+        # whatever sat at `images/<name>` whenever the size check refused, and
+        # an image ALREADY in the dataset can be over this route's ceiling,
+        # because the mounted-folder path has no cap and MAX_LOCAL_IMAGE_BYTES
+        # binds this route only. So one finishing call for an existing image's
+        # filename -- a client that ignores `already: True` and finishes anyway,
+        # a stray retry, or exactly the client bug this ceiling exists for --
+        # deleted that image from the stage, and the next commit from any route
+        # published the removal and orphaned its annotations. Before the discard
+        # existed the same call was a harmless commit.
         #
-        # The COMMITTED listing is the one that answers this. The staged view
-        # includes the object this request just PUT, so it cannot tell "the
-        # caller uploaded this" from "this was already an image".
-        committed = await self._list_files_safe(artifact_id, "images", stage=False)
-        if any(isinstance(e, dict) and e.get("name") == name for e in committed):
+        # THE COMMITTED LISTING CANNOT ANSWER THIS, and an earlier round of this
+        # fix assumed it could. Measured against the live artifact manager: an
+        # object PUT into an open stage is returned by `stage=True`, by `stage`
+        # unset, by `stage=False`, by `version="v0"` and by `version="latest"`
+        # alike. So "is `<name>` in the committed listing?" is true for every
+        # upload that has landed, and a guard asking it would have refused every
+        # legitimate finish while still not distinguishing the case it was
+        # written for. That is why provenance is RECORDED at mint time instead.
+        #
+        # The marker is therefore not a convenience: it is the only fact
+        # available that separates "this request's object" from "somebody's
+        # image". No marker means no permission to touch anything -- not the
+        # object, not the manifest, not the stage.
+        marker = await self._read_upload_marker(artifact_id, mint_id)
+        if not core.marker_authorises_discard(
+            marker, path=path, mint_id=mint_id, now=time.time()
+        ):
             raise ValueError(
-                f"'{name}' is already an image in this dataset, so this upload "
-                "was not accepted and NOTHING was changed. A name that is "
-                "already taken is reported by the call that mints the upload "
-                "URL, which answers 'already': true and hands out no URL. "
-                "Upload under a different name."
+                f"This upload of '{name}' cannot be completed and NOTHING was "
+                "changed. Finishing needs the 'mint_id' returned by the call "
+                "that handed out the upload URL, and that upload must still be "
+                "open: the record of it is missing, already used, older than "
+                f"{int(core.UPLOAD_MARKER_TTL_S)} seconds, or belongs to a "
+                "different file. Start again with done=false, PUT the bytes, "
+                "and finish with the 'mint_id' from that answer."
             )
 
         listing = await self._list_files_safe(artifact_id, "images")
@@ -2141,7 +2300,13 @@ class AnnotationBroker:
             # whose size cannot be read is exactly the case the ceiling exists
             # for. A removal that fails is logged and does not replace the
             # refusal: the caller must still hear why the upload was rejected.
+            #
+            # THE MARKER GOES WITH THE OBJECT. Leaving it would let the same
+            # mint id be finished again against whatever lands at that path
+            # next, and the whole point of consuming it here is that one mint
+            # authorises exactly one finish.
             await self._discard_staged_upload(artifact_id, path)
+            await self._remove_upload_marker(artifact_id, mint_id)
             raise ValueError(refusal)
 
         # A presigned PUT reports success from S3, not from the artifact
@@ -2153,12 +2318,28 @@ class AnnotationBroker:
         # with nothing pointing back here.
         head = await self._object_head(artifact_id, path, 8)
         if not core.header_matches_ext(ext, head):
+            # DISCARDED on this refusal too, for the same measured reason as
+            # the size refusal above: the dataset's image list is built from the
+            # staged listing, so an object left at `images/<stem><ext>` becomes
+            # an image anyway and the refusal would have stopped only THIS
+            # route's commit. The object the marker vouches for is not a readable
+            # image, and publishing it is the outcome the check exists to stop.
+            # Safe for exactly the same reason the size discard is safe -- the
+            # marker -- and unsafe without it, which is why this moved only now.
+            await self._discard_staged_upload(artifact_id, path)
+            await self._remove_upload_marker(artifact_id, mint_id)
             raise ValueError(
                 f"The bytes at '{path}' are not a {ext.lstrip('.').upper()} "
                 f"image. The upload did not land, or something other than the "
-                f"file was stored. Re-run with done=False and PUT again, "
-                f"sending the body with no Content-Type header."
+                f"file was stored, so it was not accepted. Re-run with "
+                f"done=False and PUT again, sending the body with no "
+                f"Content-Type header."
             )
+        # The marker is consumed BEFORE the commit, so the commit publishes the
+        # image without it. Removing it afterwards would leave the removal
+        # staged and waiting on somebody else's commit, which is how `.uploads/`
+        # would end up in a published dataset.
+        await self._remove_upload_marker(artifact_id, mint_id)
         await self._commit_tolerating_pending_uploads(artifact_id)
         # Drop the cached image list. Every other route that adds or removes an
         # image refreshes it; without this the next `get_dataset_index` can be

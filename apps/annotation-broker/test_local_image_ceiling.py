@@ -21,11 +21,14 @@ method with the size coming from the listing it reads.
 
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 
 import broker_core as core
 from test_broker_ngff import bk
-from test_local_image_upload_route import ARTIFACT, _broker
+from test_local_image_upload_route import ARTIFACT, _broker, _open_mint
 
 CEILING = core.MAX_LOCAL_IMAGE_BYTES
 
@@ -96,16 +99,25 @@ def test_an_UNREADABLE_size_is_refused_and_says_which_case_it_is():
 class _Store:
     """A tiny object store: PUT records bytes, the listing reports lengths.
 
-    STAGED and COMMITTED are separate, because the route now asks a different
-    question of each: the staged view includes what this request just PUT, and
-    only the committed view can say whether a name was ALREADY an image. A
-    double that collapsed the two could not have caught the regression this
-    models.
+    `published` models an object a MOUNTED-folder upload already committed --
+    the case the discard must never touch. It is deliberately ALSO visible in
+    the staged view, and the staged and committed listings here are deliberately
+    the same, because that is what the real store does: measured against the
+    live artifact manager, an object just PUT into an open stage is returned by
+    `stage=True`, by `stage` unset, by `stage=False`, by `version="v0"` and by
+    `version="latest"` alike. An earlier version of this double kept the two
+    views apart, which modelled a distinction the store does not make -- and a
+    guard resting on that distinction passed here while being certain to refuse
+    every real upload in production.
+
+    Markers are ordinary objects in `objects`, under `.uploads/`, so removing
+    one goes through the same `remove_file` as an image and shows up in
+    `removed`. Nothing about the marker is special-cased in the double.
     """
 
     def __init__(self):
-        self.objects: dict = {}  # staged
-        self.published: dict = {}  # committed
+        self.objects: dict = {}  # everything staged, markers included
+        self.published: dict = {}  # committed by some other route
         self.removed: list = []
         self.committed = 0
 
@@ -129,7 +141,10 @@ class _Store:
         self.objects[path] = body
 
     def listing(self, dir_path: str, stage: bool = True):
-        source = {**self.published, **self.objects} if stage else self.published
+        # `stage` is accepted and IGNORED, on purpose: see the class docstring.
+        # The real store answers both views the same for a staged object, and a
+        # double that disagreed with it is what let the previous round ship.
+        source = {**self.published, **self.objects}
         out = []
         for path, body in sorted(source.items()):
             head, _, nm = path.rpartition("/")
@@ -150,8 +165,16 @@ def _store_broker(monkeypatch, store, *, ceiling):
         lambda context, artifact_id, minimum: ({}, {"id": "u1"}, "manager"),
     )
 
-    async def _read_json_file(_a, _path, _default=None):
-        return {"manifest_version": core.IMAGE_MANIFEST_VERSION, "images": {}}
+    async def _read_json_file(_a, path, _default=None):
+        if path == core.IMAGE_MANIFEST_PATH:
+            return {"manifest_version": core.IMAGE_MANIFEST_VERSION, "images": {}}
+        raw = store.objects.get(path)
+        if raw is None:
+            return _default
+        return json.loads(raw.decode("utf-8"))
+
+    async def _write_json_file(_a, path, data):
+        store.objects[path] = json.dumps(data).encode("utf-8")
 
     async def _list_files_safe(_a, dir_path, stage=True):
         return store.listing(dir_path, stage=stage)
@@ -166,6 +189,7 @@ def _store_broker(monkeypatch, store, *, ceiling):
         return store.objects.get(path, b"")[:n]
 
     monkeypatch.setattr(b, "_read_json_file", _read_json_file)
+    monkeypatch.setattr(b, "_write_json_file", _write_json_file)
     monkeypatch.setattr(b, "_list_files_safe", _list_files_safe)
     monkeypatch.setattr(b, "_am", store)
     monkeypatch.setattr(b, "_ensure_staged", _ensure_staged)
@@ -197,7 +221,9 @@ async def test_a_REAL_oversized_body_is_refused_AND_does_not_become_an_image(
     store.put(mint["put_url"], _png(65))  # one byte over
 
     with pytest.raises(ValueError) as exc:
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+        )
     assert "65" in str(exc.value) and "64" in str(exc.value), str(exc.value)
 
     assert store.committed == 0, "the oversized object was committed"
@@ -207,6 +233,10 @@ async def test_a_REAL_oversized_body_is_refused_AND_does_not_become_an_image(
     assert "images/scan01.png" in store.removed, "the refused object was left staged"
     manifest = await b._image_manifest(ARTIFACT)
     assert "scan01" not in manifest, f"the refused object is still an image: {manifest}"
+    # The marker goes with the object: one mint authorises exactly one finish.
+    marker_path = core.upload_marker_path(mint["mint_id"])
+    assert marker_path in store.removed, store.removed
+    assert marker_path not in store.objects
 
 
 @pytest.mark.asyncio
@@ -219,17 +249,33 @@ async def test_after_a_refusal_the_SAME_NAME_can_be_RETRIED(monkeypatch):
     mint = await b.upload_local_image(ARTIFACT, "scan01.png")
     store.put(mint["put_url"], _png(65))
     with pytest.raises(ValueError):
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+        )
 
     again = await b.upload_local_image(ARTIFACT, "scan01.png")
     assert again["already"] is False, f"the name is still taken: {again}"
     assert "put_url" in again
+    # A FRESH mint, not the discarded one. The discard consumed the first
+    # marker, so the first mint_id is spent and the retry gets its own.
+    assert again["mint_id"] != mint["mint_id"], again
 
     # And the retry with a body that fits completes.
     store.put(again["put_url"], _png(32))
-    out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    out = await b.upload_local_image(
+        ARTIFACT, "scan01.png", done=True, mint_id=again["mint_id"]
+    )
     assert out["committed"] is True
     assert store.committed == 1
+
+    # The spent first mint_id cannot be replayed against the committed image.
+    store.removed.clear()
+    with pytest.raises(ValueError) as exc:
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+        )
+    assert "NOTHING was changed" in str(exc.value), str(exc.value)
+    assert store.removed == [], f"a replayed mint id deleted something: {store.removed}"
 
 
 @pytest.mark.asyncio
@@ -254,7 +300,9 @@ async def test_a_FAILED_DISCARD_does_not_replace_the_refusal(monkeypatch):
     monkeypatch.setattr(store, "remove_file", _boom)
 
     with pytest.raises(ValueError) as exc:
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+        )
     msg = str(exc.value)
     assert "65" in msg and "64" in msg, msg
     assert "refused the delete" not in msg, "the cleanup error replaced the refusal"
@@ -271,9 +319,18 @@ async def test_a_REAL_body_AT_the_ceiling_becomes_a_LOCAL_manifest_entry(monkeyp
     mint = await b.upload_local_image(ARTIFACT, "scan01.png")
     store.put(mint["put_url"], _png(64))  # exactly at the ceiling
 
-    out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    out = await b.upload_local_image(
+        ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+    )
     assert out["committed"] is True
-    assert store.removed == [], f"a good upload was discarded: {store.removed}"
+    # The MARKER is removed on success -- it is consumed, not discarded -- but
+    # no image is. Asserting on `removed` wholesale would conflate the two, so
+    # this names the object and the marker separately.
+    marker_path = core.upload_marker_path(mint["mint_id"])
+    assert store.removed == [marker_path], f"a good upload was discarded: {store.removed}"
+    assert "images/scan01.png" in store.objects, "the accepted image was removed"
+    # And `.uploads/` is not left behind in the committed dataset.
+    assert marker_path not in store.objects
 
     manifest = await b._image_manifest(ARTIFACT)
     entry = manifest.get("scan01")
@@ -299,7 +356,9 @@ async def test_an_OVERSIZED_object_does_not_become_a_dataset_image(monkeypatch):
     b = _broker(monkeypatch, manifest={}, listing=_listing(CEILING + 1))
 
     with pytest.raises(ValueError) as exc:
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
 
     msg = str(exc.value)
     assert str(CEILING) in msg and str(CEILING + 1) in msg, msg
@@ -313,7 +372,9 @@ async def test_an_object_AT_the_ceiling_still_completes(monkeypatch):
     feature passes for the wrong reason."""
     b = _broker(monkeypatch, manifest={}, listing=_listing(CEILING))
 
-    out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    out = await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
 
     assert out["committed"] is True, out
     assert b._tstate["committed"] == 1
@@ -322,7 +383,9 @@ async def test_an_object_AT_the_ceiling_still_completes(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_ordinary_small_object_still_completes(monkeypatch):
     b = _broker(monkeypatch, manifest={}, listing=_listing(2048))
-    out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    out = await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
     assert out["committed"] is True, out
     assert b._tstate["committed"] == 1
 
@@ -331,7 +394,9 @@ async def test_an_ordinary_small_object_still_completes(monkeypatch):
 async def test_an_object_whose_size_is_UNREADABLE_is_refused(monkeypatch):
     b = _broker(monkeypatch, manifest={}, listing=_listing(None))
     with pytest.raises(ValueError) as exc:
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
     assert "could not be read" in str(exc.value)
     assert b._tstate["committed"] == 0
 
@@ -349,7 +414,9 @@ async def test_finishing_with_NOTHING_IN_THE_LISTING_is_refused(monkeypatch):
     """
     b = _broker(monkeypatch, manifest={}, listing=[])
     with pytest.raises(ValueError) as exc:
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
     assert "could not be read" in str(exc.value)
     assert b._tstate["committed"] == 0
 
@@ -367,7 +434,9 @@ async def test_the_SIZE_CHECK_RUNS_BEFORE_the_object_is_read(monkeypatch):
 
     monkeypatch.setattr(b, "_object_head", _spy)
     with pytest.raises(ValueError):
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
     assert read == [], f"the oversized object was read anyway: {read}"
 
 
@@ -399,15 +468,30 @@ async def test_finishing_for_an_EXISTING_IMAGE_destroys_nothing(monkeypatch):
     b = _store_broker(monkeypatch, store, ceiling=64)
     store.publish("images/big.png", _png(100))  # committed, over this ceiling
 
-    # The mint refuses the name, as it always did.
+    # The mint refuses the name, as it always did -- and THEREFORE mints no
+    # marker. That is the chain the safety rests on: no marker is ever written
+    # for a path that is already an image, so nothing can ever authorise
+    # touching one. The two halves are one mechanism.
     mint = await b.upload_local_image(ARTIFACT, "big.png")
     assert mint["already"] is True, mint
+    assert "mint_id" not in mint, mint
+    assert not [p for p in store.objects if p.startswith(core.UPLOAD_MARKER_DIR)], (
+        f"a marker was minted for an existing image: {sorted(store.objects)}"
+    )
 
-    # A client that ignores that and finishes anyway must change NOTHING.
-    with pytest.raises(ValueError) as exc:
-        await b.upload_local_image(ARTIFACT, "big.png", done=True)
-    assert "already an image" in str(exc.value), str(exc.value)
-    assert "NOTHING was changed" in str(exc.value)
+    # A client that ignores that and finishes anyway must change NOTHING --
+    # with no mint id, with a made-up one, and with a well-formed one that
+    # names no marker.
+    for bad in (None, "not-a-mint-id", core.new_mint_id()):
+        with pytest.raises(ValueError) as exc:
+            if bad is None:
+                await b.upload_local_image(ARTIFACT, "big.png", done=True)
+            else:
+                await b.upload_local_image(
+                    ARTIFACT, "big.png", done=True, mint_id=bad
+                )
+        assert "NOTHING was changed" in str(exc.value), str(exc.value)
+        assert store.removed == [], f"an existing image was deleted: {store.removed}"
 
     assert store.removed == [], f"an existing image was deleted: {store.removed}"
     assert store.committed == 0
@@ -437,10 +521,15 @@ async def test_an_existing_image_WITH_NO_REPORTED_SIZE_is_also_safe(monkeypatch)
 
     monkeypatch.setattr(store, "listing", no_sizes)
 
+    # The marker check runs BEFORE the size is read, so an existing image is
+    # safe whether or not its size can be read at all. That ordering is the
+    # point: the unreadable-size branch refuses AND discards, so reaching it
+    # without a marker is what used to delete the image.
     with pytest.raises(ValueError) as exc:
         await b.upload_local_image(ARTIFACT, "odd.png", done=True)
-    assert "already an image" in str(exc.value), str(exc.value)
+    assert "NOTHING was changed" in str(exc.value), str(exc.value)
     assert store.removed == [], store.removed
+    assert "images/odd.png" in store.objects, "the existing image was deleted"
 
 
 @pytest.mark.asyncio
@@ -454,6 +543,11 @@ async def test_a_GENUINE_upload_still_discards_on_refusal(monkeypatch):
     store.put(mint["put_url"], _png(65))
 
     with pytest.raises(ValueError) as exc:
-        await b.upload_local_image(ARTIFACT, "fresh.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "fresh.png", done=True, mint_id=mint["mint_id"]
+        )
     assert "65" in str(exc.value), str(exc.value)
-    assert store.removed == ["images/fresh.png"], store.removed
+    assert store.removed == [
+        "images/fresh.png",
+        core.upload_marker_path(mint["mint_id"]),
+    ], store.removed

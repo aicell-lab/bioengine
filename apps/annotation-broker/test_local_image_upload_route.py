@@ -45,6 +45,10 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
         "committed": 0,
         "manifest": manifest or {},
         "listing": listing or [],
+        # path -> document, for the upload markers the route writes at mint
+        # time and requires at finish time.
+        "markers": {},
+        "removed": [],
     }
 
     monkeypatch.setattr(b, "_canonical_id", lambda a: a)
@@ -54,25 +58,43 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
         lambda context, artifact_id, minimum: ({}, {"id": "u1"}, "manager"),
     )
 
-    async def _read_json_file(_a, _path, _default=None):
+    async def _read_json_file(_a, path, _default=None):
+        if path in state["markers"]:
+            return state["markers"][path]
+        if path.startswith(f"{core.UPLOAD_MARKER_DIR}/"):
+            return _default
         return {
             "manifest_version": core.IMAGE_MANIFEST_VERSION,
             "images": state["manifest"],
         }
 
-    async def _list_files_safe(_a, _dir, stage=True):
+    async def _write_json_file(_a, path, data):
+        state["markers"][path] = data
+
+    async def _list_files_safe(_a, dir_path, stage=True):
+        if dir_path == core.UPLOAD_MARKER_DIR:
+            return [
+                {"name": p.split("/")[-1], "type": "file", "size": 1}
+                for p in sorted(state["markers"])
+            ]
         # `listing` is the STAGED view: what is there after this request's PUT.
-        # The committed view is empty, because every test using this fixture
-        # models a FRESH upload -- an object staged and not yet published. A
-        # fixture that returned the same entries for both would make the route
-        # read its own in-flight upload as somebody's existing image, which is
-        # the distinction the route now depends on.
-        return state["listing"] if stage else []
+        # It is returned for the committed view too, because MEASURED against
+        # the live artifact manager the two views are not different -- a
+        # just-PUT staged object is listed by `stage=True`, by `stage` unset, by
+        # `stage=False`, by `version="v0"` and by `version="latest"` alike. The
+        # earlier version of this fixture returned `[]` for the committed view,
+        # which modelled a distinction the store does not make and let a guard
+        # that would refuse every real upload pass its tests.
+        return state["listing"]
 
     class _Am:
         async def put_file(self, _a, file_path=None):
             state["minted"].append(file_path)
             return f"https://signed.invalid/{file_path}"
+
+        async def remove_file(self, artifact_id=None, file_path=None):
+            state["removed"].append(file_path)
+            state["markers"].pop(file_path, None)
 
     async def _ensure_staged(_a, fn):
         return await fn()
@@ -84,6 +106,7 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
         return core.PNG_SIGNATURE
 
     monkeypatch.setattr(b, "_read_json_file", _read_json_file)
+    monkeypatch.setattr(b, "_write_json_file", _write_json_file)
     monkeypatch.setattr(b, "_list_files_safe", _list_files_safe)
     monkeypatch.setattr(b, "_am", _Am())
     monkeypatch.setattr(b, "_ensure_staged", _ensure_staged)
@@ -91,6 +114,29 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
     monkeypatch.setattr(b, "_object_head", _object_head)
     b._tstate = state
     return b
+
+
+def _open_mint(b, path="images/scan01.png", *, ttl_s=core.UPLOAD_MARKER_TTL_S):
+    """Record an OPEN mint for *path*, exactly as the minting call leaves one.
+
+    Used by the tests that exercise the finishing half against a fixed listing,
+    where calling the real mint is impossible: that listing already contains the
+    object, so the mint would correctly answer `already: True` and hand out
+    nothing. The marker DOCUMENT is built by the shipped builder, so a change
+    to its shape reaches these tests; only its storage is faked, like every
+    other collaborator in this fixture.
+    """
+    mint_id = core.new_mint_id()
+    b._tstate["markers"][core.upload_marker_path(mint_id)] = (
+        core.upload_marker_document(
+            path=path,
+            mint_id=mint_id,
+            max_bytes=core.MAX_LOCAL_IMAGE_BYTES,
+            minted_at=time.time(),
+            ttl_s=ttl_s,
+        )
+    )
+    return mint_id
 
 
 # ── the defect the review found ─────────────────────────────────────────────
@@ -210,7 +256,9 @@ async def test_FINISHING_an_upload_drops_the_cached_image_list(monkeypatch):
     )
     b._image_manifest_cache[ARTIFACT] = (time.time(), {"stale": {}})
 
-    out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    out = await b.upload_local_image(
+        ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+    )
 
     assert out["committed"] is True
     assert ARTIFACT not in b._image_manifest_cache, "the stale image list survived"
@@ -235,7 +283,16 @@ async def test_finishing_still_REFUSES_bytes_that_are_not_the_declared_format(
     monkeypatch.setattr(b, "_object_head", _bad_head)
 
     with pytest.raises(ValueError) as e:
-        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
 
     assert "not a PNG" in str(e.value)
     assert b._tstate["committed"] == 0, "it committed despite refusing"
+    # Discarded now, where it used to be left staged. Same measured reason as
+    # the size refusal: the image list is built from the staged listing, so an
+    # object left at `images/scan01.png` becomes an image anyway and the refusal
+    # would have stopped only this route's own commit. Safe only because a
+    # marker vouches for the object -- which is why it moved with this change
+    # and not earlier.
+    assert "images/scan01.png" in b._tstate["removed"], b._tstate["removed"]
