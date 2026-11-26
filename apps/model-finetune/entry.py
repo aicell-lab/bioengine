@@ -3181,15 +3181,22 @@ class EntryApp:
         # serves hashes to what the plan said it would. Dropping the last term
         # is what let a record land with the wrong content and still be called
         # complete.
-        # "NOT LANDED" AND "LANDED, BUT NOT BY OUR COMMIT" ARE DIFFERENT, and a
-        # report that cannot distinguish them invites the wrong repair. When
-        # another writer's commit publishes this replica's staged uploads and
-        # clears the flag under it, the commit here fails while the artifact
-        # verifiably holds every planned record. `complete` stays False --
-        # this replica did not establish that state and should not claim it --
-        # but a caller seeing only False would re-run, and re-uploading 313
-        # records to fix nothing is the cost of not saying so.
-        plan["records_present_despite_commit_error"] = bool(
+        # "NOT LANDED" AND "PRESENT, BUT NOT PUT THERE BY THIS RUN" ARE
+        # DIFFERENT, and a report that cannot distinguish them invites the wrong
+        # repair: a caller seeing only `complete: False` re-runs, and re-uploading
+        # 313 records to fix nothing is the cost of not saying so.
+        #
+        # Named for a WRITE error, not a commit error, because a review showed it
+        # fires on a failed STAGE too -- and truthfully so. With the stage
+        # refused nothing is uploaded, yet the artifact can still hold every
+        # planned record from an EARLIER run, which is exactly what an
+        # interrupted caller wants to know. The earlier name said "commit" and
+        # the comment claimed another writer's commit had published our uploads;
+        # neither is true in the stage case.
+        #
+        # `complete` stays False either way: this run did not establish that
+        # state and must not claim it.
+        plan["records_present_despite_write_error"] = bool(
             (stage_error or commit_error)
             and verify_error is None
             and not plan["mismatched"]

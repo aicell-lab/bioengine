@@ -782,7 +782,7 @@ def test_a_STICKY_cleared_stage_flag_fails_CLOSED_and_says_the_records_are_there
     # and the records ARE in the artifact, which the report must say
     assert plan["verified"] == 6, plan
     assert plan["mismatched"] == [], plan
-    assert plan["records_present_despite_commit_error"] is True, plan
+    assert plan["records_present_despite_write_error"] is True, plan
 
 
 def test_a_CLEAN_run_does_not_claim_records_present_despite_a_commit_error(store):
@@ -799,7 +799,7 @@ def test_a_CLEAN_run_does_not_claim_records_present_despite_a_commit_error(store
     plan = _run(cls, inst, apply=True, confirm="3")
 
     assert plan["complete"] is True, plan
-    assert plan["records_present_despite_commit_error"] is False, plan
+    assert plan["records_present_despite_write_error"] is False, plan
 
 
 # ── verify_only: what an interrupted caller can ask the app ────────────────
@@ -875,3 +875,33 @@ def test_VERIFY_ONLY_does_not_require_confirm(store):
     out = _run(cls, inst, verify_only=True)  # no confirm passed; must not raise
 
     assert out["verify_only"] is True, out
+
+
+def test_the_field_also_fires_on_a_failed_STAGE_which_is_why_it_is_named_for_a_WRITE(
+    store,
+):
+    """The rename, pinned. A review found the field firing on a stage error too.
+
+    With the stage refused nothing is uploaded, yet the artifact can still hold every
+    planned record from an EARLIER run -- which is precisely what an interrupted
+    caller wants to know. The content was always truthful; the NAME said "commit" and
+    the comment claimed another writer's commit had published our uploads, and neither
+    is true here.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-eeff001{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    first = _run(cls, inst, apply=True, confirm="4")
+    assert first["complete"] is True, first
+
+    am.fail_edits = 2  # both attempts of the retry
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["stage_error"], plan
+    assert plan["commit_error"] is None, plan
+    assert plan["applied"] == 0, plan
+    assert plan["failed"] == plan["ids"], plan
+    assert plan["verified"] == 4, plan
+    assert plan["records_present_despite_write_error"] is True, plan
+    assert plan["complete"] is False, plan
