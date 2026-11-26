@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import time
 import logging
 import os
 import shutil
@@ -212,6 +213,14 @@ def _sync_source_from_hypha(
     )
 
 
+# How long a replica waits for a concurrent replica to publish the same identity before it
+# either takes over a stale claim or refuses. A full cold materialisation of a large app is
+# minutes, not seconds, so the wait is generous and the takeover threshold is longer still.
+_CLAIM_WAIT_SECONDS = 300.0
+_CLAIM_STALE_SECONDS = 900.0
+_CLAIM_POLL_SECONDS = 1.0
+
+
 def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     """Populate ``app_dir/source`` so it matches the artifact's ``version``.
 
@@ -222,7 +231,11 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     2. ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional ``_DOWNLOAD_TOKEN``) —
        per-file incremental Hypha sync (:func:`_sync_source_from_hypha`).
 
-    A single ``fcntl`` lock per node serialises concurrent same-node starts.
+    Concurrent starts on one ``app_dir`` are serialised by an atomically created
+    claim directory, not by an advisory lock: the store is shared and may be an
+    NFS export whose lock manager is not serving, where ``flock`` answers
+    ``ENOLCK`` rather than blocking. A caller that does not win the claim waits
+    for the winner's version marker and reuses its tree.
     """
     source = app_dir / "source"
     version_marker = app_dir / ".version"
@@ -249,60 +262,98 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
             logger.info(f"BioEngine: source mirrored from local path {candidate}")
             return source
 
-    import errno
-    import fcntl
+    files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
+    if not files_url:
+        raise RuntimeError(
+            "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
+            "the app source. The worker is expected to populate it (and "
+            "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
+            "constructing the runtime_env for the task or deployment."
+        )
+    token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
 
-    # The lock serialises concurrent replicas materialising the same app_dir.
-    # It lives on the shared store, which on an external cluster is NFS — and an
-    # NFS export whose lock manager is not serving returns ENOLCK rather than
-    # blocking. Advisory locking is an optimisation here, not a correctness
-    # requirement: the sync is idempotent and writes through a snapshot plus a
-    # version marker. So a store that cannot lock degrades to an unlocked sync
-    # instead of failing the whole replica setup.
+    # NOTE: there is deliberately NO fast path that skips the sync when the version marker
+    # already matches. The sync is not only a first-time materialisation -- it reconciles the
+    # tree against the artifact on every start, re-downloading a file whose timestamp changed,
+    # restoring one deleted locally, and removing one dropped from the artifact. Short-circuiting
+    # on the identity broke exactly those three behaviours, which this suite already covered.
+
+    # MUTUAL EXCLUSION WITHOUT ADVISORY LOCKS.
     #
-    # EOPNOTSUPP/ENOSYS are included because some filesystems reject flock
-    # outright rather than reporting no locks available. Any OTHER errno still
-    # raises: this widens the no-lock path to filesystems that cannot lock, and
-    # deliberately does not swallow a genuine failure such as EBADF.
-    _NO_LOCK_ERRNOS = (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS)
-
-    lock_path = app_dir / ".lock"
-    with open(lock_path, "w") as lock_fh:
-        locked = False
+    # Advisory locking is unusable here. ``app_dir`` lives on a shared store that
+    # may be an NFS export whose lock manager is not serving, and there
+    # ``fcntl.flock`` answers ``ENOLCK`` instead of blocking. Since the caller of
+    # ``setup_replica_environment`` swallows exceptions, such a failure takes out
+    # the whole replica environment setup and leaves ``HOME`` on a read-only path.
+    #
+    # ``os.mkdir`` is atomic on NFS and is not part of the advisory-lock
+    # protocol, so it cannot answer ENOLCK: exactly one caller creates the
+    # directory and everyone else gets ``FileExistsError``. The loser does NOT
+    # proceed unlocked — it waits for the winner's version marker and uses the
+    # winner's tree, so two replicas never materialise one ``source/`` at once.
+    claim = app_dir / ".materialising"
+    wait_deadline = time.monotonic() + _CLAIM_WAIT_SECONDS
+    while True:
         try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-            locked = True
-        except OSError as exc:
-            if exc.errno not in _NO_LOCK_ERRNOS:
-                raise
-            logger.warning(
-                f"BioEngine: advisory locking unavailable on {lock_path} "
-                f"({exc.strerror}, errno={exc.errno}); syncing source WITHOUT a "
-                f"lock. Concurrent replicas on this app_dir may duplicate work. "
-                f"HOME and TMPDIR are already set, so this cannot leave the "
-                f"replica writing to a read-only HOME."
-            )
-        try:
-            files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
-            if not files_url:
-                raise RuntimeError(
-                    "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
-                    "the app source. The worker is expected to populate it (and "
-                    "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
-                    "constructing the runtime_env for the task or deployment."
+            os.mkdir(claim)
+            break
+        except FileExistsError:
+            # Someone else holds the claim. Wait for their marker rather than
+            # racing them.
+            if source.is_dir() and version_marker.is_file():
+                try:
+                    if version_marker.read_text() == identity:
+                        logger.info(
+                            f"BioEngine: source materialised concurrently by "
+                            f"another replica → {source}"
+                        )
+                        return source
+                except OSError:
+                    pass
+            if time.monotonic() >= wait_deadline:
+                # Take over a claim that is older than any plausible sync: a
+                # replica killed mid-materialise would otherwise wedge every
+                # later start on this app dir forever.
+                age = None
+                try:
+                    age = time.time() - claim.stat().st_mtime
+                except OSError:
+                    pass
+                if age is not None and age > _CLAIM_STALE_SECONDS:
+                    logger.warning(
+                        f"BioEngine: taking over a stale materialisation claim "
+                        f"{claim} (age {age:.0f}s > {_CLAIM_STALE_SECONDS}s)"
+                    )
+                    break
+                raise TimeoutError(
+                    f"another replica has held the materialisation claim {claim} "
+                    f"for more than {_CLAIM_WAIT_SECONDS}s without publishing "
+                    f"{identity}; refusing to materialise concurrently"
                 )
-            token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
-            _sync_source_from_hypha(
-                files_url, version, token, source, snapshot_path, logger
+            time.sleep(_CLAIM_POLL_SECONDS)
+        except OSError as exc:
+            # Never silent, and never mistaken for "no lock available": name the
+            # path and the errno so the next reader does not have to guess.
+            raise RuntimeError(
+                f"cannot create the materialisation claim {claim}: "
+                f"{exc.strerror} (errno={exc.errno})"
+            ) from exc
+
+    try:
+        _sync_source_from_hypha(
+            files_url, version, token, source, snapshot_path, logger
+        )
+        version_marker.write_text(identity)
+        return source
+    finally:
+        try:
+            claim.rmdir()
+        except OSError:
+            # Losing the claim directory would wedge later starts until the
+            # staleness takeover above fires, so say so rather than passing.
+            logger.warning(
+                f"BioEngine: could not release the materialisation claim {claim}"
             )
-            version_marker.write_text(identity)
-            return source
-        finally:
-            # Only unlock what was actually locked: on the ENOLCK path the
-            # LOCK_UN would raise the same error out of a `finally` and mask
-            # whatever the sync was doing — including a successful return.
-            if locked:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def setup_replica_environment() -> None:
