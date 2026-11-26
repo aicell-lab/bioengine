@@ -437,16 +437,21 @@ class AnnotationBroker:
             # nothing, then declare the read incomplete. That is a bound rather
             # than a proof, and it is deliberately generous; the alternative
             # designs are recorded on the row.
-            names = [
-                entry.get("name") if isinstance(entry, dict) else str(entry)
-                for entry in batch
-            ]
-            before = len(seen)
-            for entry in batch:
-                name = entry.get("name") if isinstance(entry, dict) else str(entry)
-                if isinstance(name, str) and name not in seen:
-                    seen.add(name)
-                    out.append(entry)
+            #
+            # `before` is taken ABOVE, before the page is merged, and there is
+            # exactly ONE merge loop. There used to be a second copy of both
+            # here: the page was added, `before` was then taken from the
+            # already-grown set, and the second loop added nothing -- so
+            # `len(seen) == before` was true for EVERY non-empty page and
+            # `stalled` climbed on all of them. A correctly paging server was
+            # therefore declared INCOMPLETE after _NO_PROGRESS_PAGES pages.
+            # Measured by a review, through the shipped method against a double
+            # that serves every page in full: at a 1000-entry page, 7000
+            # entries came back complete and 8000 came back as 8000 entries
+            # with complete=False; at 10000, the cliff was at 80000. Harmless
+            # before the image reads depended on the flag, and not harmless
+            # after: every mint, import and finish into a dataset that size
+            # refused permanently and the pruning sync always skipped.
             if len(seen) == before:
                 stalled += 1
                 if stalled >= _NO_PROGRESS_PAGES:
@@ -533,10 +538,30 @@ class AnnotationBroker:
         before 0.10.0) still resolves through this one path.
 
         Cached for ``MANIFEST_CACHE_TTL_S``, because ``get_image_url`` is the
-        annotate page's featherweight first call and must not grow two
-        round-trips. *require_stem* forces a refresh when the cache does not
-        contain it, so a just-uploaded image is never reported missing --
-        the cache can be stale, but only in the harmless direction.
+        annotate page's featherweight first call. *require_stem* forces a
+        refresh when the cache does not contain it, so a just-uploaded image is
+        never reported missing -- the cache can be stale, but only in the
+        harmless direction.
+
+        **THE LISTING IS PAGED, AND THAT COSTS A SECOND ROUND TRIP ON A CACHE
+        MISS.** This comment used to say the call "must not grow two
+        round-trips", and the reason it now does is that one call was not
+        reading the directory. `list_files`'s `limit` defaults to 1000 --
+        measured from the live artifact manager's own published schema,
+        ``{"default": 1000, "minimum": 1, "maximum": 10000}`` -- so a single
+        call answers a PAGE, and every image past the first page was simply
+        missing from the dataset's image list, with no error and nothing saying
+        so. `_list_files_all` pages until an EMPTY page, which for any
+        non-empty directory under 10000 entries is two calls rather than one.
+        That is the whole cost, it is paid only on a cache MISS, and the
+        alternative to it is an image list that is silently wrong above 1000
+        images. A test pins the call count so a change that doubles it again is
+        visible rather than inferred.
+
+        ``complete`` is discarded here, DELIBERATELY and named so. This is a
+        read: a short answer under-reports for one cache period and the next
+        read recomputes it. The callers that must NOT be handed a partial
+        listing are the ones that WRITE, and each of those checks it.
         """
         cached = self._image_manifest_cache.get(artifact_id)
         if (
@@ -547,7 +572,7 @@ class AnnotationBroker:
             return cached[1]
 
         doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
-        listing = await self._list_files_safe(artifact_id, "images")
+        listing, _listing_complete = await self._list_files_all(artifact_id, "images")
         # Uploads still in flight are withheld from the LISTING side. An object
         # that has only been PUT would otherwise be a dataset image whether or
         # not the finishing call was ever made, which is how a caller that
@@ -1573,7 +1598,19 @@ class AnnotationBroker:
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
-            listing = await self._list_files_safe(artifact_id, "images")
+            # THE LISTING IS PAGED AND A SHORT ONE SKIPS THE WRITE, for the
+            # same reason as the withheld set below and with a worse
+            # consequence. This writer PRUNES: it drops a stored entry whose
+            # file it cannot see in the listing. `list_files` answers at most
+            # its default page of 1000 entries, so on a dataset above that,
+            # every image from page two onwards looked like an entry whose file
+            # had gone -- and this call would have deleted their manifest
+            # entries and committed. The images themselves survive (reads union
+            # the manifest with the listing), but their stored metadata does
+            # not, and a commit cannot be taken back.
+            listing, listing_complete = await self._list_files_all(
+                artifact_id, "images"
+            )
             # THE WITHHELD SET IS PASSED HERE TOO, and omitting it was a
             # measured data-loss hole rather than an oversight about style.
             # This writes the stored manifest and COMMITS, so an unfinished
@@ -1596,13 +1633,30 @@ class AnnotationBroker:
             # never their visibility, since reads union the manifest with the
             # listing anyway.
             withheld, complete = await self._withheld_upload_paths(artifact_id)
+            # ONE SKIP, TWO REASONS, and each names itself. A single `if not
+            # (complete and listing_complete)` would report "the markers could
+            # not be read" for a short image listing, which sends whoever reads
+            # the result to the wrong store.
+            skipped = None
             if not complete:
+                skipped = "the upload markers could not be read in full"
+                detail = (
+                    "writing on a short marker set would record an unfinished "
+                    "upload as an image permanently"
+                )
+            elif not listing_complete:
+                skipped = "the images directory could not be read in full"
+                detail = (
+                    "this call PRUNES, and on a short listing an image whose "
+                    "file is simply on a later page looks like one whose file "
+                    "has gone, so its stored entry would be dropped and "
+                    "committed"
+                )
+            if skipped:
                 logger.warning(
-                    f"skipping the manifest write for {artifact_id}: the upload "
-                    "markers could not be read in full, and writing on a short "
-                    "set would record an unfinished upload as an image "
-                    "permanently. Nothing was changed; run this again once the "
-                    "store is healthy."
+                    f"skipping the manifest write for {artifact_id}: {skipped}, "
+                    f"and {detail}. Nothing was changed; run this again once "
+                    "the store is healthy."
                 )
                 entries = core.parse_image_manifest(doc)
                 return {
@@ -1613,7 +1667,7 @@ class AnnotationBroker:
                         for e in entries.values()
                         if e.get("state") == core.IMAGE_STATE_REMOTE
                     ),
-                    "skipped": "the upload markers could not be read in full",
+                    "skipped": skipped,
                 }
             entries, changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
@@ -1977,7 +2031,27 @@ class AnnotationBroker:
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
-            listing = await self._list_files_safe(artifact_id, "images")
+            # THE LISTING IS PAGED, AND A SHORT ONE MAKES THE CHECK BELOW
+            # LOOSER -- which is the opposite of the withheld set's direction
+            # and is why this needs its own refusal. Fewer listed names means
+            # fewer names look taken, so on a dataset above `list_files`'s
+            # default page of 1000 a remote import could take a stem whose local
+            # FILE sits on a later page. The write is the stored manifest plus
+            # this one entry, so that file is not deleted -- it is shadowed: the
+            # stem now resolves to a remote source, and the local object at
+            # `images/<stem><ext>` is unreachable through the manifest while
+            # still occupying the path.
+            listing, listing_complete = await self._list_files_all(
+                artifact_id, "images"
+            )
+            if not listing_complete:
+                raise RuntimeError(
+                    f"The images in '{artifact_id}' could not be listed in "
+                    f"full, so whether '{stem}' is already an image in this "
+                    "dataset cannot be decided. NOTHING was imported. Try "
+                    "again in a moment; if this repeats, the dataset's storage "
+                    "is not answering and a manager should look at it."
+                )
             # THE CHECK AND THE WRITE USE DIFFERENT SETS, deliberately, and
             # separating them is what makes this writer safe without a
             # fail-closed branch of its own.
@@ -2627,7 +2701,35 @@ class AnnotationBroker:
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
-            listing = await self._list_files_safe(artifact_id, "images")
+            # AN INCOMPLETE LISTING REFUSES THE MINT, and this is the direction
+            # the paged read matters most. `list_files` answers at most its
+            # default page of 1000, and a name missing from the answer looks
+            # free: on a dataset above 1000 images this check handed out an
+            # upload URL for a stem that ALREADY HAD AN IMAGE on a later page,
+            # the PUT overwrote that object at `images/<stem><ext>`, and the
+            # marker then recorded "not a pre-existing image" -- which is the
+            # whole warrant for the finish's discard. So a short listing here
+            # does not merely under-report, it loses an image and takes the
+            # justification for the deletion with it.
+            #
+            # Refusing is safe in a way answering is not. `already: True` on a
+            # short read would be the cautious answer for the stem it names, but
+            # it is the wrong statement -- it tells the caller an image exists
+            # when nothing here knows that -- and it cannot be given for a stem
+            # the short answer did not mention at all, which is every stem on a
+            # later page. A refusal names the condition and the caller retries.
+            listing, listing_complete = await self._list_files_all(
+                artifact_id, "images"
+            )
+            if not listing_complete:
+                raise RuntimeError(
+                    f"The images in '{artifact_id}' could not be listed in "
+                    f"full, so whether '{name}' would overwrite an existing "
+                    "image cannot be decided. NOTHING was changed and no "
+                    "upload URL was handed out. Try again in a moment; if this "
+                    "repeats, the dataset's storage is not answering and a "
+                    "manager should look at it."
+                )
             # A WITHHELD PATH IS NOT TAKEN, and omitting this made a refusal's
             # own instructions false. The refusals that leave the object staged
             # -- the marker removal failing, and before it the incomplete
@@ -2776,12 +2878,43 @@ class AnnotationBroker:
                 "and finish with the 'mint_id' from that answer."
             )
 
-        listing = await self._list_files_safe(artifact_id, "images")
-        refusal = core.oversized_image_refusal(
-            name,
-            core.file_size_from_listing(listing, name),
-            core.MAX_LOCAL_IMAGE_BYTES,
-        )
+        # THE LISTING IS PAGED, AND HERE A SHORT ONE ALREADY FAILED CLOSED --
+        # which is worth saying plainly, because the obvious guess is that this
+        # was a size-ceiling bypass and it was not. `file_size_from_listing`
+        # returns None for a name it does not find, and
+        # `oversized_image_refusal` refuses on None by design. So before this
+        # change, finishing an upload into a dataset of more than 1000 images
+        # refused every time the just-PUT object landed past the first page,
+        # with a message blaming the store for not reporting sizes. Wrong, and
+        # a dead end for the user, but never a way past the ceiling.
+        #
+        # Paging fixes the false refusal. The completeness flag is still
+        # checked, so that the one refusal left names the real condition
+        # instead of the store's size reporting.
+        listing, listing_complete = await self._list_files_all(artifact_id, "images")
+        if not listing_complete:
+            # A REFUSAL STRING, NOT A `raise` HERE, and the difference is the
+            # staged object. Raising at this point would skip the discard below,
+            # which the comment there explains is the whole reason the refusal
+            # is safe: an object left at `images/<stem><ext>` becomes a dataset
+            # image anyway, because the image list is built from the staged
+            # listing and the next commit from any route commits the stage. So
+            # this joins the existing path instead, and the ceiling's own
+            # unreadable-size branch is the precedent -- it also removes.
+            refusal = (
+                f"The images in '{artifact_id}' could not be listed in full, "
+                f"so the size of '{name}' could not be checked against the "
+                f"{core.MAX_LOCAL_IMAGE_BYTES}-byte limit. The upload was NOT "
+                "accepted and the file has been removed. Start again with "
+                "done=false once the dataset's storage is answering; if this "
+                "repeats, a manager should look at it."
+            )
+        else:
+            refusal = core.oversized_image_refusal(
+                name,
+                core.file_size_from_listing(listing, name),
+                core.MAX_LOCAL_IMAGE_BYTES,
+            )
         if refusal:
             # THE STAGED OBJECT IS REMOVED, and raising without removing it was
             # a defect rather than an omission: a review measured that the
