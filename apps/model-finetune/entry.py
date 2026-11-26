@@ -2635,7 +2635,9 @@ class EntryApp:
                 record = training.run_record(name, document)
                 path = training.run_record_path(name, store)
             except Exception as exc:
-                unreadable.append({"id": name, "error": "%s: %s" % (type(exc).__name__, exc)})
+                unreadable.append(
+                    {"id": name, "error": "%s: %s" % (type(exc).__name__, exc)}
+                )
                 continue
             body = _json.dumps(record).encode("utf-8")
             planned.append(
@@ -2717,9 +2719,7 @@ class EntryApp:
                 )
                 resp = await self._http.get(url)
                 resp.raise_for_status()
-                verified[sid] = hashlib.sha256(
-                    resp.text.encode("utf-8")
-                ).hexdigest()
+                verified[sid] = hashlib.sha256(resp.text.encode("utf-8")).hexdigest()
         except Exception as exc:
             verify_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
 

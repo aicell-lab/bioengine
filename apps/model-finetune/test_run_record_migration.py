@@ -24,8 +24,13 @@ import pytest
 
 import training
 
-ADMIN = {"user": {"id": "gh|admin", "is_anonymous": False,
-                  "scope": {"workspaces": {"bioimage-io": "a"}}}}
+ADMIN = {
+    "user": {
+        "id": "gh|admin",
+        "is_anonymous": False,
+        "scope": {"workspaces": {"bioimage-io": "a"}},
+    }
+}
 PLAIN = {"user": {"id": "gh|plain", "is_anonymous": False}}
 
 
@@ -84,7 +89,12 @@ class FakeAM:
             raise RuntimeError("the artifact could not be listed")
         prefix = f"{dir_path}/"
         return [
-            {"type": "file", "name": p[len(prefix):], "size": len(t), "last_modified": 1.0}
+            {
+                "type": "file",
+                "name": p[len(prefix) :],
+                "size": len(t),
+                "last_modified": 1.0,
+            }
             for p, t in sorted(self.files.items())
             if p.startswith(prefix)
         ]
@@ -287,8 +297,13 @@ def test_the_PLANNED_HASH_is_a_hash_of_the_BYTES_ACTUALLY_UPLOADED(store):
     # A run left mid-flight with an old timestamp: this is the one the stale
     # sweep rewrites in the shaped status, so the shaped and raw documents
     # differ in the STATUS ITSELF and not merely in extra keys.
-    store("2026-01-01-000003-cccccccc", owner="me", status="TRAINING",
-          updated_at=1.0, start_time=0.0)
+    store(
+        "2026-01-01-000003-cccccccc",
+        owner="me",
+        status="TRAINING",
+        updated_at=1.0,
+        start_time=0.0,
+    )
 
     cls = _entry_cls()
     inst = object.__new__(cls)
@@ -297,11 +312,11 @@ def test_the_PLANNED_HASH_is_a_hash_of_the_BYTES_ACTUALLY_UPLOADED(store):
     plan = _run(cls, inst, apply=True, confirm="3")
 
     assert plan["applied"] == 3, plan
-    uploaded = {
-        p.rsplit("/", 1)[-1][: -len(".json")]: t
-        for p, t in am.files.items()
-    }
-    assert set(uploaded) == set(plan["hashes"]), (sorted(uploaded), sorted(plan["hashes"]))
+    uploaded = {p.rsplit("/", 1)[-1][: -len(".json")]: t for p, t in am.files.items()}
+    assert set(uploaded) == set(plan["hashes"]), (
+        sorted(uploaded),
+        sorted(plan["hashes"]),
+    )
     for sid, text in uploaded.items():
         got = hashlib.sha256(text.encode("utf-8")).hexdigest()
         assert got == plan["hashes"][sid], (
@@ -318,8 +333,9 @@ def test_a_record_that_lands_with_the_WRONG_CONTENT_is_NOT_complete(store):
     Every write succeeds here; one of them deposits a different document. The
     id sets match and nothing failed, so a check built on either would pass.
     """
-    for i, sid in enumerate(("2026-01-01-000001-aaaaaaaa",
-                             "2026-01-01-000002-bbbbbbbb"), start=1):
+    for i, sid in enumerate(
+        ("2026-01-01-000001-aaaaaaaa", "2026-01-01-000002-bbbbbbbb"), start=1
+    ):
         store(sid, owner="me")
     cls, inst = _app(tamper={"2026-01-01-000002-bbbbbbbb"})
     plan = _run(cls, inst, apply=True, confirm="2")
@@ -366,8 +382,8 @@ def test_a_CORRUPT_run_is_NOT_backfilled_as_an_EMPTY_record(store):
     with pytest.raises(RuntimeError) as exc:
         _run(cls, inst, apply=True, confirm="1")
     assert "could not be read" in str(exc.value)
-    assert inst._am.files == {}, (
-        "a refused apply still wrote to the artifact: " + repr(inst._am.files)
+    assert inst._am.files == {}, "a refused apply still wrote to the artifact: " + repr(
+        inst._am.files
     )
 
 
@@ -410,8 +426,13 @@ def test_a_BACKFILLED_record_is_IDENTICAL_to_what_the_ORDINARY_SYNC_writes(store
     applied and reports STOPPED, while the document on disk says TRAINING.
     """
     store("2026-01-01-000001-aaaaaaaa", owner="me")
-    stale = store("2026-01-01-000003-cccccccc", owner="me", status="TRAINING",
-                  updated_at=1.0, start_time=0.0)
+    stale = store(
+        "2026-01-01-000003-cccccccc",
+        owner="me",
+        status="TRAINING",
+        updated_at=1.0,
+        start_time=0.0,
+    )
 
     cls = _entry_cls()
     inst = object.__new__(cls)
@@ -428,7 +449,9 @@ def test_a_BACKFILLED_record_is_IDENTICAL_to_what_the_ORDINARY_SYNC_writes(store
 
     # And name the discriminator explicitly, so this cannot pass because every
     # run in the fixture happened to be finished.
-    written_stale = json.loads(am.files[f"{training.run_record_dir('an-app')}/{stale}.json"])
+    written_stale = json.loads(
+        am.files[f"{training.run_record_dir('an-app')}/{stale}.json"]
+    )
     assert (written_stale.get("status") or {}).get("status") == "TRAINING", (
         "the stale sweep reached the permanent record: it holds a status the "
         "run's own document on disk does not have"
@@ -452,6 +475,6 @@ def test_the_writer_USES_the_record_it_was_GIVEN(store):
 
     assert ok is True
     path = f"{training.run_record_dir('an-app')}/{sid}.json"
-    assert json.loads(am.files[path]) == sentinel, (
-        "the writer rebuilt the record instead of writing the one it was handed"
-    )
+    assert (
+        json.loads(am.files[path]) == sentinel
+    ), "the writer rebuilt the record instead of writing the one it was handed"
