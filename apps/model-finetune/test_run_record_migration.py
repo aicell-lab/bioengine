@@ -76,6 +76,10 @@ class FakeAM:
         self.page_size = page_size
         #: Serve page one forever, as a store that dropped `offset` would.
         self.ignores_offset = ignores_offset
+        #: Hard ceiling on how many times this fake may be LISTED. See the
+        #: note on `list_files`: it turns a non-terminating caller into an
+        #: error rather than a hang.
+        self.max_asks = 50
         self.list_asks = []  # (dir_path, limit, offset) as ASKED, not as served
 
     def store(self, path, text):
@@ -104,10 +108,25 @@ class FakeAM:
 
         It records what each call ASKED for, not only what was served, because
         the entire defect is that those two differ.
+
+        **BOUNDED, so a missing termination guard FAILS instead of HANGING.**
+        Removing the production loop's no-progress guard used not to turn this
+        suite red -- it hung, and had to be killed. A hang is not a verdict:
+        pytest-timeout is not installed, so CI would hang the same way rather
+        than report, and the very test that says "it must stop, not spin" was
+        the one outcome it could not report. The ceiling turns that mutant into
+        a loud error.
         """
         if self.fail_list:
             raise RuntimeError("the artifact could not be listed")
         self.list_asks.append((dir_path, limit, offset))
+        if len(self.list_asks) > self.max_asks:
+            raise RuntimeError(
+                f"list_files asked {len(self.list_asks)} times, past the "
+                f"{self.max_asks}-call ceiling: the caller is not terminating. "
+                "This ceiling exists so that a missing no-progress guard fails "
+                "LOUDLY instead of hanging a suite that cannot time out."
+            )
         prefix = f"{dir_path}/"
         rows = [
             {

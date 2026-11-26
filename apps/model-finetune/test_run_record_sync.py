@@ -70,6 +70,9 @@ class FakeAM:
         self.page_size = page_size
         #: Serve page one forever, as a store that drops `offset` would.
         self.ignores_offset = ignores_offset
+        #: Hard ceiling on how many times this fake may be LISTED, so a
+        #: caller that never terminates ERRORS instead of hanging.
+        self.max_asks = 50
         self._clock = 1000.0
 
     # -- the calls the app makes ------------------------------------------
@@ -106,6 +109,13 @@ class FakeAM:
         """
         self.calls.append(("list_files", artifact_id, dir_path))
         self.list_asks.append((dir_path, limit, offset))
+        if len(self.list_asks) > self.max_asks:
+            raise RuntimeError(
+                f"list_files asked {len(self.list_asks)} times, past the "
+                f"{self.max_asks}-call ceiling: the caller is not terminating. "
+                "This ceiling exists so that a missing no-progress guard fails "
+                "LOUDLY instead of hanging a suite that cannot time out."
+            )
         if self._fail_list:
             raise RuntimeError("the artifact could not be listed")
         prefix = f"{dir_path}/" if dir_path else ""
