@@ -905,8 +905,63 @@ class AppsManager:
 
         return application_id
 
+    @staticmethod
+    def _format_resource_refusal(
+        application_id: str,
+        required_resources: Dict[str, int],
+        free_per_node: Dict[str, Dict[str, float]],
+        proxy_memory_in_gb: Optional[float] = None,
+    ) -> str:
+        """Explain a resource refusal in terms the caller can act on.
+
+        Two things were missing and both were already in hand at the point of refusal.
+
+        **The number printed was not the number asked for.** ``memory`` is the SUM of every
+        deployment's reservation plus the app's own ProxyDeployment, which is a fixed
+        ``proxy_memory_in_gb`` (default 0.5 GiB = 512 MiB) rather than a percentage. A user who
+        wrote ``memory_mb=4096`` was shown ``4831838208`` -- 4608 MiB -- and had no way to get
+        from one to the other. Two independent reporters read that as a ~12.5% padding, which is
+        only true at 4096 MiB: the proxy adds a constant, so the ratio changes with every size.
+        The breakdown is spelled out instead of leaving it to be inferred.
+
+        **It said what was wanted and never what was free.** ``free_per_node`` is computed a few
+        lines above the refusal and then discarded, so the one fact that tells a caller whether to
+        shrink the request or add a node was thrown away. Both reporters asked for it by name.
+        """
+        lines = [f"Insufficient resources for application '{application_id}'."]
+
+        mem = required_resources.get("memory")
+        if mem is not None and proxy_memory_in_gb is not None:
+            proxy_b = int(proxy_memory_in_gb * (1024**3))
+            own_b = mem - proxy_b
+            lines.append(
+                f"  memory: your deployments requested {own_b / 1024**2:.0f} MiB and the app's "
+                f"ProxyDeployment reserves {proxy_b / 1024**2:.0f} MiB "
+                f"(proxy_memory_in_gb={proxy_memory_in_gb}), totalling "
+                f"{mem / 1024**2:.0f} MiB ({mem} bytes). The proxy reservation is a fixed "
+                "amount, not a percentage."
+            )
+        lines.append(f"  requested: {required_resources}")
+
+        if free_per_node:
+            lines.append("  free per node:")
+            for node_id, free in free_per_node.items():
+                lines.append(
+                    f"    {node_id}: num_cpus={free.get('num_cpus')} "
+                    f"num_gpus={free.get('num_gpus')} "
+                    f"memory={(free.get('memory') or 0) / 1024**2:.0f} MiB"
+                )
+        else:
+            # Never silently omit it: "no nodes" and "nodes with nothing free" are different
+            # problems and the empty section would read as the second.
+            lines.append("  free per node: NO NODES REPORTED resources at all")
+        return "\n".join(lines)
+
     async def _check_resources(
-        self, application_id: str, required_resources: Dict[str, int]
+        self,
+        application_id: str,
+        required_resources: Dict[str, int],
+        proxy_memory_in_gb: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Verify that sufficient resources are available for deploying an application.
@@ -1033,19 +1088,23 @@ class AppsManager:
 
         if insufficient_resources:
             if self.ray_cluster.mode != "external-cluster":
-                self.logger.error(
-                    f"Insufficient resources for application '{application_id}'. "
-                    f"Requested: {required_resources}"
+                detail = self._format_resource_refusal(
+                    application_id,
+                    required_resources,
+                    free_per_node,
+                    proxy_memory_in_gb,
                 )
-                raise ValueError(
-                    f"Insufficient resources for application '{application_id}'. "
-                    f"Requested: {required_resources}"
-                )
+                self.logger.error(detail)
+                raise ValueError(detail)
             else:
                 self.logger.warning(
-                    f"Currently insufficient resources for application '{application_id}'. "
-                    "Assuming Ray autoscaling is available. "
-                    f"Requested resources: {required_resources}"
+                    self._format_resource_refusal(
+                        application_id,
+                        required_resources,
+                        free_per_node,
+                        proxy_memory_in_gb,
+                    )
+                    + "\n  Assuming Ray autoscaling is available."
                 )
                 return {
                     "requested": dict(required_resources),
@@ -3999,6 +4058,7 @@ class AppsManager:
             resource_shortfall = await self._check_resources(
                 application_id=application_id,
                 required_resources=app.metadata["resources"],
+                proxy_memory_in_gb=proxy_memory_in_gb,
             )
 
             # Derive static site URL from the manifest's frontend_entry field.
