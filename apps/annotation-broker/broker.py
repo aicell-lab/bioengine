@@ -40,6 +40,22 @@ COLLECTION_ID = "bioimage-io/colab-annotations"
 STATE_ROOT = Path.home() / "annotation_broker"
 MANIFEST_CACHE_TTL_S = 60.0
 
+#: How long the public gallery may reuse one dataset's name and description.
+#: The gallery is an anonymous read whose cost was one uncached artifact read
+#: per published dataset on EVERY visit, so it got slower the more data the
+#: project shared -- for exactly the audience it exists for. Short, because the
+#: alternative to a short window is a record of somebody's dataset name living
+#: in this app's state and going stale with nothing to refresh it.
+PUBLIC_CARD_CACHE_TTL_S = 60.0
+
+#: How many of a cold gallery fill's per-dataset reads may be in flight at once.
+#: The reads were issued one dataset after another, so a cold fill cost N round
+#: trips end to end however fast each one was. A bound rather than "all of
+#: them": the point is to stop N round trips being N serial round trips, not to
+#: let one anonymous visit open an unbounded number of connections to the
+#: artifact manager.
+PUBLIC_CARD_FILL_CONCURRENCY = 8
+
 
 # A send-side RPC failure: the request never reached the server, so re-resolving
 # the service and retrying is safe even for writes.
@@ -150,6 +166,11 @@ class AnnotationBroker:
         self._manifest_name_cache: Dict[str, tuple] = {}
         # artifact_id -> (cached_at, {stem: entry}); see _image_manifest
         self._image_manifest_cache: Dict[str, tuple] = {}
+        # artifact_id -> (stamped_at, {"name": ..., "description": ...}) for the
+        # public gallery's cards. NOT a record of which datasets are public:
+        # `iter_public_metadata` is the only thing that decides that, and this
+        # is consulted only for ids it has already returned.
+        self._public_card_cache: Dict[str, tuple] = {}
         self._image_manifest_locks: Dict[str, asyncio.Lock] = {}
 
     @bioengine.async_init
@@ -1495,42 +1516,100 @@ class AnnotationBroker:
         owner". See the block comment above `public_dataset_entry` in
         broker_core for the measurement behind that.
 
-        One artifact read per public dataset, for the name, description and
-        image count. That is proportional to the number of PUBLIC datasets
-        rather than to all of them, and a dataset whose artifact cannot be
-        read is listed with whatever is known rather than dropped -- a
-        gallery that silently shrinks is worse than one with a sparse card.
+        **The per-dataset reads are CACHED and the cold fill is CONCURRENT, and
+        those are two different costs rather than one.** This method used to
+        make one uncached ``_am.read`` per public dataset on every visit, issued
+        one dataset after another, so the page meant to show the project's
+        shared data was the page that got slower the more data the project
+        shared -- for anonymous visitors, who are the audience it exists for.
+        Measured on a counting double before the change: at N datasets, N
+        ``read`` calls per visit, repeating in full on the next visit, plus N
+        more for the image counts (those already behind a cache).
+
+        What each half buys, kept separate because a fix aimed at the wrong one
+        would have shown no improvement:
+
+        * the CACHE removes the repeat. A warm visit costs **zero** artifact
+          reads at any N.
+        * the CONCURRENCY removes the serialisation. A cold fill still costs N
+          reads -- the data is in N artifacts and no cache can invent it -- but
+          they are no longer N round trips end to end.
+
+        **A cold call is still proportional to N, deliberately, and the TTL is
+        what bounds the damage**: one cold fill per window is shared by every
+        visitor in it. The alternative -- copying each dataset's name into this
+        app's own state at publish time, so the gallery never reads an artifact
+        at all -- was not taken: it makes this app a second record of somebody
+        else's dataset name, with nothing to refresh it when they rename the
+        dataset, and a gallery showing a name the dataset no longer has is a
+        worse failure than a slow first visit.
+
+        **The cache is NOT a second source of truth for whether a dataset is
+        public.** ``iter_public_metadata`` decides that and nothing else does;
+        the cache is consulted only for ids that call has already returned, so
+        an unpublished dataset cannot be served from it however warm it is.
+        ``set_public`` drops the entry it changes, so a rename or a republish
+        shows up at once rather than after the TTL.
+
+        A dataset whose artifact cannot be read is listed with whatever is
+        known rather than dropped -- a gallery that silently shrinks is worse
+        than one with a sparse card -- and a failed read is NOT cached, so the
+        next visit retries it.
         """
-        entries: List[Dict[str, Any]] = []
-        for meta in core.iter_public_metadata(STATE_ROOT):
+        metas = core.iter_public_metadata(STATE_ROOT)
+        now = time.time()
+
+        async def _card(meta: Dict[str, Any]) -> Dict[str, Any]:
             artifact_id = meta["artifact_id"]
-            name = description = None
+            cached = self._public_card_cache.get(artifact_id)
+            if cached is not None and core.is_cache_fresh(
+                cached[0], ttl_s=PUBLIC_CARD_CACHE_TTL_S, now=now
+            ):
+                name = cached[1].get("name")
+                description = cached[1].get("description")
+            else:
+                name = description = None
+                try:
+                    art = await self._am.read(artifact_id=artifact_id)
+                    manifest = (art or {}).get("manifest") or {}
+                    name = manifest.get("name")
+                    description = manifest.get("description")
+                    self._public_card_cache[artifact_id] = (
+                        time.time(),
+                        {"name": name, "description": description},
+                    )
+                except Exception:
+                    # Deliberately not logged per dataset: the id comes from the
+                    # broker's own state, but the read is a network call and a
+                    # transient failure must not turn the gallery into a log
+                    # amplifier. The sparse card is the whole response -- and
+                    # the failure is NOT cached, or one bad moment would hold a
+                    # blank card for the whole TTL.
+                    pass
             image_count = None
-            try:
-                art = await self._am.read(artifact_id=artifact_id)
-                manifest = (art or {}).get("manifest") or {}
-                name = manifest.get("name")
-                description = manifest.get("description")
-            except Exception:
-                # Deliberately not logged per dataset: the id comes from the
-                # broker's own state, but the read is a network call and a
-                # transient failure must not turn the gallery into a log
-                # amplifier. The sparse card is the whole response.
-                pass
             try:
                 manifest_images = await self._image_manifest(artifact_id)
                 image_count = len(manifest_images)
             except Exception:
                 pass
-            entries.append(
-                core.public_dataset_entry(
-                    meta,
-                    name=name,
-                    description=description,
-                    image_count=image_count,
-                )
+            return core.public_dataset_entry(
+                meta,
+                name=name,
+                description=description,
+                image_count=image_count,
             )
-        return entries
+
+        # Bounded concurrency, and the ORDER IS PRESERVED: `gather` returns
+        # results positionally, so the stable order `iter_public_metadata`
+        # guarantees survives. A gallery that reshuffled itself between visits
+        # would be a worse change than the one it fixed.
+        gate = asyncio.Semaphore(PUBLIC_CARD_FILL_CONCURRENCY)
+
+        async def _guarded(meta):
+            async with gate:
+                return await _card(meta)
+
+        return list(await asyncio.gather(*(_guarded(m) for m in metas)))
 
     @bioengine.method(context=True)
     async def set_public(
@@ -1546,6 +1625,11 @@ class AnnotationBroker:
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         meta["public"] = bool(is_public)
         meta = core.write_metadata(meta, root=STATE_ROOT)
+        # The gallery card is dropped here, so publishing, unpublishing or
+        # republishing a renamed dataset shows up at once instead of after
+        # PUBLIC_CARD_CACHE_TTL_S. Only this dataset's entry: a publish must not
+        # cost every other card its cache.
+        self._public_card_cache.pop(artifact_id, None)
         await self._apply_permissions(artifact_id, meta)
         return meta
 
