@@ -26,16 +26,18 @@ deployment fails, and ``auto_redeploy`` retries.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import json
 import logging
 import os
 import shutil
 import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 #: Excludes mirror v0.11.3's ``AppBuilder._PY_MODULES_EXCLUDES`` with one
 #: addition (``.dotfiles`` per user request) — the artifact carries everything,
@@ -212,6 +214,162 @@ def _sync_source_from_hypha(
     )
 
 
+#: A claim older than this is treated as abandoned. Generous on purpose: a slow first
+#: sync of a large artifact over a loaded NFS mount is not a dead replica, and breaking a
+#: live claim is worse than waiting.
+_CLAIM_STALE_S = 900
+#: How long to wait for someone else's claim before giving up LOUDLY. It MUST exceed
+#: ``_CLAIM_STALE_S``: a waiter that gives up first can never reach the age at which it
+#: would be allowed to break an abandoned claim, so the replacement for a replica that
+#: died mid-sync would raise instead of taking over — which is the very case this claim
+#: exists to survive. Derived from the staleness bound rather than written as a second
+#: literal, so the two cannot drift apart.
+_CLAIM_WAIT_S = _CLAIM_STALE_S + 300
+#: Poll interval while waiting for someone else's claim.
+_CLAIM_POLL_S = 2
+
+
+def _store_now(app_dir: Path) -> float:
+    """Return "now" as the STORE's clock sees it.
+
+    Staleness must compare two timestamps from ONE clock. ``time.time()`` is the local
+    clock and ``st_mtime`` comes from the file server, and the two are not guaranteed to
+    agree: a network file server's clock can run ahead of its clients by tens of seconds.
+    ``time.time() - st_mtime`` can therefore be negative, and a naive age test reads a
+    brand-new claim as ancient or an abandoned one as fresh. Writing a probe into the
+    same directory and stat-ing it yields a timestamp from the same clock that stamped
+    the claim.
+    """
+    probe = app_dir / f".claim-probe-{os.getpid()}"
+    try:
+        probe.touch()
+        return probe.stat().st_mtime
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def _wait_or_give_up(
+    claim: Path,
+    deadline: float,
+    age: Optional[float],
+    exc: Optional[OSError],
+) -> None:
+    """Sleep one poll interval, or raise because the deadline has passed.
+
+    Factored out so that *every* retry path in :func:`_acquire_claim` is bounded by the
+    same deadline and pays the same sleep. A retry path that bypassed this is how a
+    bounded wait became an unbounded spin.
+    """
+    if time.monotonic() > deadline:
+        parts = []
+        if age is not None:
+            parts.append(f"held by another replica for {age:.0f}s")
+        if exc is not None:
+            # Always included, even when an age is known: the errno is the part a reader
+            # can act on, and reporting only the age sends them looking for a busy peer
+            # when the real answer is EPERM or ENOTEMPTY on the store.
+            parts.append(f"last error {exc.__class__.__name__}: {exc}")
+        detail = "; ".join(parts) if parts else "no further detail"
+        raise RuntimeError(
+            f"BioEngine: timed out after {_CLAIM_WAIT_S}s waiting for the source claim "
+            f"at {claim} ({detail}). Refusing to materialise source without a claim."
+        )
+    time.sleep(_CLAIM_POLL_S)
+
+
+def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
+    """Serialise same-store source materialisation with an atomic directory create.
+
+    Returns ``(claim, waited)``. ``waited`` is True when another replica held the claim
+    at any point before we got it, which is the *only* situation in which the caller may
+    trust the version marker instead of reconciling — see :func:`_ensure_source`.
+
+    A byte-range lock cannot do this job. The app directory may be an NFS mount with no
+    lock manager, where ``fcntl.flock(LOCK_EX)`` raises
+    ``OSError: [Errno 37] No locks available``. Raised from here that error escapes
+    ``setup_replica_environment`` before it has set ``HOME``, is swallowed by the
+    bootstrap finder, and leaves the replica serving with ``HOME`` still pointing at the
+    image's ``/home/ray``, which is read-only — so the app's first write under
+    ``Path.home()`` fails with ``Errno 30`` and the cause is two steps from the symptom.
+
+    ``mkdir`` is atomic on NFS (it is a single namespace operation, not a byte-range
+    lock), so exactly one of N racing replicas creates the directory and the rest see
+    ``FileExistsError``. Degrading to an **unlocked** sync was considered and rejected:
+    ENOLCK is frequent on this mount, not rare, so the unlocked path would have become
+    the normal path and concurrent writers into one tree the normal case.
+
+    Failure is LOUD — this raises rather than proceeding unclaimed.
+
+    One race is accepted rather than closed: two replicas can both judge the same claim
+    abandoned, and the second's ``rmdir`` can delete the *fresh* claim the first has just
+    created, leaving two holders. It needs both to arrive inside the same few
+    milliseconds after a claim has sat untouched past the staleness bound, and the
+    consequence is the one the claim already tolerates on a first materialisation — two
+    concurrent incremental syncs into one tree, which the snapshot makes convergent.
+    Closing it properly wants a claim whose identity can be checked before deletion (a
+    token file written into it, re-read after the rmdir), which is a larger change than
+    this fix should carry.
+    """
+    claim = app_dir / ".claim"
+    deadline = time.monotonic() + _CLAIM_WAIT_S
+    waited = False
+    while True:
+        try:
+            # NOT exist_ok=True: the collision IS the signal being waited on.
+            claim.mkdir()
+            return claim, waited
+        except FileExistsError:
+            # Someone else holds it. Record that, because it changes what the caller
+            # is allowed to conclude from the version marker afterwards.
+            waited = True
+        except OSError as exc:
+            raise RuntimeError(
+                f"BioEngine: cannot create the source claim directory {claim}: {exc}. "
+                f"The replica refuses to materialise source without a claim."
+            ) from exc
+
+        # Every path from here back to the mkdir goes through _wait_or_give_up below.
+        # An `except: continue` that skipped it span the loop with no sleep and no
+        # deadline check: a persistently failing stat (a full or read-only store, a
+        # vanished mount) turned a bounded wait into a busy loop that never ended.
+        try:
+            age = _store_now(app_dir) - claim.stat().st_mtime
+        except OSError as exc:
+            # Either it vanished between the mkdir and the stat (the holder finished,
+            # and the next mkdir wins) or the store cannot be read at all. The two are
+            # indistinguishable here, and only the deadline tells them apart.
+            _wait_or_give_up(claim, deadline, None, exc)
+            continue
+
+        if age > _CLAIM_STALE_S:
+            logger.warning(
+                f"BioEngine: breaking an abandoned source claim at {claim} "
+                f"(age {age:.0f}s > {_CLAIM_STALE_S}s, both times from the store's clock)"
+            )
+            try:
+                claim.rmdir()
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    # NOT "someone else broke it first": that case succeeds, or raises
+                    # ENOENT and is handled above. This is EPERM in a sticky directory
+                    # whose claim another uid created, ENOTEMPTY from an NFS
+                    # silly-rename file left inside it, ESTALE, EACCES — each of which
+                    # recurs on the next pass, so retrying with no deadline check and
+                    # no sleep is the same unbounded spin as the stat path. Only a
+                    # rmdir that removed the claim earns an immediate retry, because
+                    # only then does the next mkdir have a chance.
+                    _wait_or_give_up(claim, deadline, age, exc)
+                # ENOENT: the claim is already gone, so nothing is being waited for and
+                # the next mkdir can win straight away. Sleeping here would delay a
+                # replica that is in fact unblocked.
+            continue
+
+        _wait_or_give_up(claim, deadline, age, None)
+
+
 def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     """Populate ``app_dir/source`` so it matches the artifact's ``version``.
 
@@ -222,7 +380,9 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     2. ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional ``_DOWNLOAD_TOKEN``) —
        per-file incremental Hypha sync (:func:`_sync_source_from_hypha`).
 
-    A single ``fcntl`` lock per node serialises concurrent same-node starts.
+    Concurrent same-store starts are serialised by :func:`_acquire_claim`, an atomic
+    ``mkdir``. A byte-range lock is deliberately not used: it raises ``ENOLCK`` on an NFS
+    store with no lock manager — see that function.
     """
     source = app_dir / "source"
     version_marker = app_dir / ".version"
@@ -249,28 +409,55 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
             logger.info(f"BioEngine: source mirrored from local path {candidate}")
             return source
 
-    import fcntl
-
-    lock_path = app_dir / ".lock"
-    with open(lock_path, "w") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        try:
-            files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
-            if not files_url:
-                raise RuntimeError(
-                    "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
-                    "the app source. The worker is expected to populate it (and "
-                    "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
-                    "constructing the runtime_env for the task or deployment."
-                )
-            token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
-            _sync_source_from_hypha(
-                files_url, version, token, source, snapshot_path, logger
+    claim, waited = _acquire_claim(app_dir, logger)
+    try:
+        # Trust the marker ONLY when we actually waited for another replica's claim.
+        # It is written only after a completed sync, so a replica that queued behind the
+        # winner finds the winner's tree already correct and skips re-downloading the
+        # same bytes — that is what makes the loser of a race cheap.
+        #
+        # It must NOT short-circuit a replica that took the claim uncontended, which is
+        # every ordinary (re)start. This module's contract is to RECONCILE on each start:
+        # the snapshot makes that cheap (unchanged files are not re-fetched) but the pass
+        # is what re-downloads a file that changed under the same version, restores one
+        # lost from the shared store, and deletes one the artifact no longer lists. An
+        # unconditional short-circuit silently retired all three, which the pre-existing
+        # `test_{missing_local_file,changed_timestamp,removed_file}` cases caught.
+        if (
+            waited
+            and source.is_dir()
+            and version_marker.is_file()
+            and version_marker.read_text().strip() == identity
+        ):
+            logger.info(
+                f"BioEngine: source already at {identity}; another replica "
+                f"materialised it"
             )
-            version_marker.write_text(identity)
             return source
-        finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+        files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
+        if not files_url:
+            raise RuntimeError(
+                "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
+                "the app source. The worker is expected to populate it (and "
+                "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
+                "constructing the runtime_env for the task or deployment."
+            )
+        token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
+        _sync_source_from_hypha(
+            files_url, version, token, source, snapshot_path, logger
+        )
+        version_marker.write_text(identity)
+        return source
+    finally:
+        try:
+            claim.rmdir()
+        except OSError as exc:
+            # Leaving it behind would stall every later replica for _CLAIM_WAIT_S
+            # before the staleness check frees it, so say so rather than passing.
+            logger.warning(
+                f"BioEngine: could not release the source claim {claim}: {exc}"
+            )
 
 
 def setup_replica_environment() -> None:
@@ -297,8 +484,15 @@ def setup_replica_environment() -> None:
             "which version of the source to materialise."
         )
 
-    source = _ensure_source(app_dir, version, logger)
-
+    # Point HOME/TMPDIR at the per-app workspace BEFORE materialising the
+    # source. These four assignments are local and cheap; the source sync
+    # reaches the network and can fail. The ordering matters: with the sync
+    # first, a sync that raises leaves HOME pointing at the image's
+    # `/home/ray`, which is read-only, so the app's first write fails with
+    # `OSError: [Errno 30] Read-only file system` and the real cause (a
+    # source sync that raised) is two steps from the symptom. Nothing is
+    # gained by deferring them behind the download, and a replica that cannot
+    # fetch its source is still better off with a writable HOME.
     home = app_dir / "home"
     tmp = app_dir / "tmp"
     home.mkdir(parents=True, exist_ok=True)
@@ -307,6 +501,8 @@ def setup_replica_environment() -> None:
     os.environ["TMPDIR"] = str(tmp)
     os.environ["TMP"] = str(tmp)
     os.environ["TEMP"] = str(tmp)
+
+    source = _ensure_source(app_dir, version, logger)
 
     src_str = str(source)
     if src_str not in sys.path:

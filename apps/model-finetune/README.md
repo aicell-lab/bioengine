@@ -228,6 +228,8 @@ launch instead of OOMing mid-train.
   `{model_state, decoder_state}` checkpoint; cellpose: `model_weights.pth`) — to
   feed back into `start_training(init_checkpoint=<presigned url of that file>)`.
 
+  **An `export_id` is bound to the identity that created it.** Unlike a `session_id`, it is not a shareable link: `get_export_status` and `push_export` are allowed only for the caller `export_model` recorded, or for a holder of `rw`/admin on `bioimage-io`. That is because the READY record carries a presigned `download_url` to the packaged weights with a six-hour life, plus `resume_checkpoint_file`, and `push_export` streams the whole package to any presigned URL the caller supplies — so the id would otherwise hand over the trained weights to whoever learned it. A refusal does not say whether the export exists, so a wrong id and somebody else's id are answered identically. An export minted before this rule existed records no creator and is admin-only; those expire within hours.
+
 **Serve the just-trained model:** once `checkpoint_available` is true, pass
 `session_id` to any serving method — the fine-tuned checkpoint flows through the
 exact same path as the pretrained model:
@@ -251,6 +253,10 @@ once per image:    emb  = compute_embedding(img)
 per user box:      decode locally via onnxruntime-web using onnx + emb.features   # no GPU
 auto pre-seg:      infer([img], "vit_l_lm") -> [{"output": int32 [H,W]}]          # propose-and-prune
 ```
+
+## Operator notes
+
+- **Stray `.mutex-<pid>-<uuid>` files in a run's directory are expected and harmless.** Each writer creates one to take the record lock by hard link, and removes it on the way out; a writer that dies mid-write leaves its copy behind. Nothing reads them, and the run listing only looks at directories, so they do not appear as runs. They are not cleaned up automatically: a sweep that deleted another process's lock file would be the same check-then-act race the lock itself is built to avoid. Delete them by hand if a store accumulates many, which means writers are dying.
 
 ## Deployment
 
