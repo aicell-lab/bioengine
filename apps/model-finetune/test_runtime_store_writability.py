@@ -345,3 +345,139 @@ def test_START_TRAINING_ASKS_before_it_accepts_anything():
         "new_session_id"
     ), "the store check runs AFTER the session is created, so a refused run is "
     "left behind as FAILED"
+
+
+# ── the STATUS surface, which is what the page reads ───────────────────────
+#
+# Round 1 of the review: the verdict reached only internal composition
+# endpoints, so `get_training_capabilities` -- the status the annotate page
+# polls -- still answered `trainable: True, reason: "fits"` for a backend whose
+# runtime could not write a single run record. The refusal at `start_training`
+# tells a user who has already committed to a run; the page reads this.
+
+
+class _PingRuntime:
+    """A runtime that answers `ping` with a given store verdict."""
+
+    def __init__(self, store, *, fail=False):
+        self._store = store
+        self._fail = fail
+        self.pings = 0
+        self.store_status_calls = 0
+
+    async def ping(self):
+        self.pings += 1
+        if self._fail:
+            raise RuntimeError("the runtime did not answer")
+        return {"status": "ok", "store": self._store}
+
+    async def store_status(self, max_age_s=None):
+        # Counted so a test can assert the STATUS path does not probe.
+        self.store_status_calls += 1
+        return self._store
+
+
+def _caps_entry(monkeypatch, store, *, backends=("cellpose",), fail=False):
+    cls = _entry_class()
+    inst = cls.__new__(cls)
+    rt = _PingRuntime(store, fail=fail)
+    inst._enabled_backends = set(backends)
+    inst._runtime_for = lambda model_type=None: rt
+    # The two deploy-time declarations `_gpu_view` reads. Set explicitly
+    # because this instance skips __init__: a GPU big enough for every model,
+    # so the only thing that can make a model untrainable here is the store.
+    inst.declared_gpu_memory_mb = 40000
+    inst.declared_gpu_device = "declared-for-test"
+    inst._rt = rt
+    return inst
+
+
+@pytest.mark.asyncio
+async def test_CAPABILITIES_reports_an_unwritable_store_per_backend(monkeypatch):
+    detail = "the training-run store at /home/ray/.bioengine/x refuses writes"
+    inst = _caps_entry(monkeypatch, {"writable": False, "detail": detail})
+
+    caps = await inst.get_training_capabilities()
+
+    assert caps["stores"]["cellpose"]["writable"] is False, caps["stores"]
+    assert detail in caps["stores"]["cellpose"]["detail"]
+    cellpose_models = [m for m in caps["models"] if m["backend"] == "cellpose"]
+    assert cellpose_models, caps["models"]
+    for m in cellpose_models:
+        assert m["trainable"] is False, m
+        assert detail in m["reason"], m
+
+
+@pytest.mark.asyncio
+async def test_a_WRITABLE_store_leaves_capabilities_unchanged(monkeypatch):
+    """Clause 3 at the status surface. A change that marked everything
+    untrainable would satisfy the test above on its own."""
+    inst = _caps_entry(
+        monkeypatch, {"writable": True, "detail": "the run store accepts writes"}
+    )
+    caps = await inst.get_training_capabilities()
+    assert caps["stores"]["cellpose"]["writable"] is True
+    for m in [m for m in caps["models"] if m["backend"] == "cellpose"]:
+        assert m["trainable"] is True, m
+        assert m["reason"] == "fits", m
+
+
+@pytest.mark.asyncio
+async def test_CAPABILITIES_NEVER_PROBES_the_store(monkeypatch):
+    """It is polled by the page. It reads the runtime's CACHED verdict through
+    `ping` and must not call `store_status`, which may write and may block on a
+    wedged mount."""
+    inst = _caps_entry(monkeypatch, {"writable": True, "detail": "ok"})
+    await inst.get_training_capabilities()
+    assert inst._rt.pings >= 1
+    assert inst._rt.store_status_calls == 0, "capabilities probed the store"
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_that_cannot_be_ASKED_is_not_reported_as_either(monkeypatch):
+    """`writable: None` is a third answer. Collapsing it into False would make
+    an unreachable runtime look like a broken filesystem, and into True would
+    hide the fault this row is about."""
+    inst = _caps_entry(monkeypatch, {"writable": False, "detail": "x"}, fail=True)
+    caps = await inst.get_training_capabilities()
+    assert caps["stores"]["cellpose"]["writable"] is None, caps["stores"]
+    for m in [m for m in caps["models"] if m["backend"] == "cellpose"]:
+        assert m["trainable"] is not False or "store" not in m["reason"], m
+
+
+# ── the gate is REACHED, not merely present in the source ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_START_TRAINING_actually_awaits_the_store_gate(monkeypatch):
+    """Closes the hole round 1 named in my ordering test: that one reads AST
+    call names in source order, so it stays GREEN if the gate sits in a dead
+    branch or its await is dropped. This one runs the method and requires the
+    refusal to come OUT of it, with no session created."""
+    import entry
+
+    cls = _entry_class()
+    inst = cls.__new__(cls)
+    started = []
+
+    inst._enabled_backends = {"cellpose"}
+    inst._runtime_for = lambda model_type=None: _PingRuntime(
+        {"writable": False, "detail": "store at /home/ray/.bioengine refuses writes"}
+    )
+
+    async def _check(model_type=None):
+        return None
+
+    monkeypatch.setattr(inst, "_check_runtime_available", _check, raising=False)
+    monkeypatch.setattr(
+        training, "new_session_id", lambda: started.append(1) or "x", raising=True
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        await cls.start_training.__get__(inst)(
+            train_images=[], train_labels=[], model_type="cpsam", n_epochs=1
+        )
+    msg = str(exc.value)
+    assert "/home/ray/.bioengine" in msg, msg
+    assert "No run was started" in msg, msg
+    assert started == [], "a session was created before the store was checked"

@@ -737,6 +737,32 @@ class EntryApp:
             )
             return {}
 
+    async def _backend_store_view(self, backend: str) -> Dict[str, Any]:
+        """A backend's store verdict for the STATUS surface, from the cache.
+
+        Read through `ping`, which reports the runtime's cached verdict and
+        never probes -- so this cannot write a file and cannot hang on a wedged
+        mount, which matters because `get_training_capabilities` is what the
+        annotate page polls. `store_status` would be the fresher answer and is
+        deliberately NOT used here for that reason; the refusal path uses it,
+        where one probe per training request is affordable.
+
+        `{}` means "could not ask", which is a third answer and is reported as
+        `writable: None` rather than collapsed into either verdict.
+        """
+        probe = "cpsam" if backend == "cellpose" else None
+        try:
+            runtime = self._runtime_for(probe)
+            out = await asyncio.wait_for(runtime.ping(), timeout=5.0)
+            store = (out or {}).get("store")
+            return store if isinstance(store, dict) else {}
+        except Exception as exc:
+            logger.warning(
+                f"could not read the {backend} runtime's store verdict: "
+                f"{type(exc).__name__}: {str(exc)[:120]}"
+            )
+            return {}
+
     async def _require_runtime_store_writable(
         self, model_type: Optional[str] = None
     ) -> None:
@@ -1541,11 +1567,25 @@ class EntryApp:
             if "cellpose" in self._enabled_backends
             else {}
         )
+        # THE RUN STORE, per backend. A runtime replica has its own HOME, so a
+        # backend can have a perfectly good GPU and still be unable to write a
+        # single run record -- which is what happened in production while this
+        # method answered `trainable: True, reason: "fits"`. A review called
+        # that the status half of this row's clause 1, and it was right: the
+        # refusal at `start_training` tells a user who has already committed to
+        # a run, while the page reads THIS.
+        stores = {
+            b: await self._backend_store_view(b)
+            for b in ("microsam", "cellpose")
+            if b in self._enabled_backends
+        }
+
         models = []
         for m in ModelType.__args__:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
             enabled = backend in self._enabled_backends
             gpu = cellpose if backend == "cellpose" else microsam
+            store = stores.get(backend) or {}
             required = training.min_training_vram_mb(m)
             rec = {
                 "model_type": m,
@@ -1571,6 +1611,15 @@ class EntryApp:
                     False,
                     "no GPU detected on the runtime",
                 )
+            elif store.get("writable") is False:
+                # Before the VRAM comparison on purpose: a replica that cannot
+                # write its run store cannot train whatever its GPU has, and
+                # reporting the VRAM reason would send the user to buy a bigger
+                # card for a read-only filesystem.
+                rec["trainable"] = False
+                rec["reason"] = str(
+                    store.get("detail") or "the runtime cannot write its run store"
+                )
             elif gpu["total_mb"] < required:
                 rec["trainable"] = False
                 rec["reason"] = f"needs ~{required} MB, GPU has {gpu['total_mb']} MB"
@@ -1591,6 +1640,18 @@ class EntryApp:
                 ),
             },
             "models": models,
+            # The per-backend store verdict as DATA, not only folded into a
+            # model's reason string: an operator wants to see which backend
+            # cannot write, and a UI should not have to parse prose for it.
+            # `writable: None` means the runtime could not be asked.
+            "stores": {
+                b: (
+                    stores.get(b) or {"writable": None, "detail": "not reported"}
+                    if b in self._enabled_backends
+                    else {"enabled": False}
+                )
+                for b in ("microsam", "cellpose")
+            },
             "parameters": self._training_parameter_schema(),
             # Why a backend reads 'runtime unavailable' when nothing is broken: on
             # a cluster with fewer GPUs than enabled backends the runtime never
