@@ -237,6 +237,79 @@ METRICS_NEEDING_VALIDATION = ("pixel", "instance")
 INSTANCE_IOU_THRESHOLDS = (0.5, 0.75, 0.9)
 
 
+def base_checkpoint_refusal(model_type: Any, status: Any) -> Optional[str]:
+    """The refusal text for a base checkpoint this site cannot produce, or None.
+
+    *status* is what `RuntimeApp.base_checkpoint_status` returns: the PARTS,
+    not a verdict. The decision lives here, away from the network, so the rule
+    can be tested without one and so a reviewer can read the rule in one place.
+
+    FAILS CLOSED ON ITS OWN IGNORANCE, deliberately. A probe that errored, a
+    part with no URL and no cached copy, or a part that is neither cached nor
+    reachable all refuse. The alternative -- admitting the run when the check
+    could not tell -- restores exactly the behaviour this guard exists to
+    remove: the caller waits for a GPU slot and finds out minutes later.
+
+    THE MODEL TYPE IS NAMED IN EVERY REFUSAL. The message a caller sees has to
+    say which model they asked for, because the fix on their side is to pick a
+    different one.
+
+    Returns None when every published part is cached or reachable, so a site
+    that CAN train a type still starts -- the control that stops this becoming
+    a check which refuses everything.
+    """
+    if not isinstance(status, dict):
+        return (
+            f"the base checkpoint for '{model_type}' could not be checked on this "
+            f"site, so the run is refused rather than started: the availability "
+            f"probe returned {type(status).__name__}, not a result"
+        )
+    err = status.get("probe_error")
+    if err:
+        return (
+            f"the base checkpoint for '{model_type}' could not be checked on this "
+            f"site, so the run is refused rather than started ({err})"
+        )
+    parts = status.get("parts")
+    if not isinstance(parts, dict) or not parts:
+        return (
+            f"the base checkpoint for '{model_type}' could not be checked on this "
+            f"site, so the run is refused rather than started: the probe reported "
+            f"no parts for it"
+        )
+    missing = []
+    for name, info in sorted(parts.items()):
+        if not isinstance(info, dict):
+            missing.append(f"{name} (unreadable probe result)")
+            continue
+        if info.get("cached"):
+            continue
+        if info.get("reachable") is True:
+            continue
+        # AN EXPLICIT REASON WINS over anything derived from the fields. A
+        # caller that already knows WHY a part is unobtainable -- a probe that
+        # timed out, say -- must be able to say so, because the derived text
+        # would otherwise describe the wrong thing entirely: a part with no URL
+        # reads as "micro-sam publishes no URL for it", which sends a reader to
+        # the registry when the real trouble is this site's network.
+        reason = info.get("reason")
+        if isinstance(reason, str) and reason:
+            where = reason
+        elif not info.get("url"):
+            where = "not cached here and micro-sam publishes no URL for it"
+        else:
+            where = "not cached here and not reachable from here"
+        missing.append(f"{name} ({where})")
+    if not missing:
+        return None
+    return (
+        f"'{model_type}' cannot be trained at this site: its base checkpoint is "
+        f"unavailable — {', '.join(missing)}. Nothing was started and no GPU was "
+        f"claimed. Pick a model type whose weights this site can reach, or ask an "
+        f"administrator to mirror this one."
+    )
+
+
 def validate_metrics(metrics: Optional[List[str]]) -> List[str]:
     """Normalise a caller's metric selection against ``TRAINING_METRICS``.
 
