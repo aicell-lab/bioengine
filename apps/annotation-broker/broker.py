@@ -1720,7 +1720,13 @@ class AnnotationBroker:
             metas.append(core.parse_zarr_array_meta(node["meta_doc"]))
 
         full = metas[0]
-        roles = core.ngff_axis_roles(parsed["axes"], len(full["shape"]))
+        # THE TYPES ARE PASSED, and this is the whole call-site half of the
+        # fix: `axis_types` is optional on `ngff_axis_roles` only so that a
+        # caller holding names alone still works, and a caller that HAS the
+        # types and omits them reintroduces the defect without any error.
+        roles = core.ngff_axis_roles(
+            parsed["axes"], len(full["shape"]), parsed["axis_types"]
+        )
         dims = core.ngff_level_dims(full["shape"], roles)
 
         if not core.ngff_dtype_is_readable(full["dtype"]):
@@ -1743,7 +1749,9 @@ class AnnotationBroker:
             range(len(metas)),
             key=lambda i: core.ngff_level_dims(
                 metas[i]["shape"],
-                core.ngff_axis_roles(parsed["axes"], len(metas[i]["shape"])),
+                core.ngff_axis_roles(
+                    parsed["axes"], len(metas[i]["shape"]), parsed["axis_types"]
+                ),
             )["width"],
         )
         chunk_url = (
