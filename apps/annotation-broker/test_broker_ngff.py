@@ -472,6 +472,20 @@ def importer(tmp_path, monkeypatch):
     async def _list_files_safe(_artifact_id, _dir_path):
         return state["listing"]
 
+    async def _list_files_all(_artifact_id, _dir_path, stage=True):
+        """``(entries, complete)``, because the image reads are PAGED now.
+
+        A double patched only over `_list_files_safe` stopped intercepting when
+        the reads moved to `_list_files_all`, and the calls fell through to the
+        real method and the absent `_am` -- 19 tests in this file failed that
+        way. ``complete=True`` here on purpose: these tests are about the import
+        logic, and the short-read refusals have their own cases, so a double
+        that reported an incomplete read would make every one of them refuse for
+        a reason none of them is about. A test that wants the short read says so
+        by patching this with ``False``.
+        """
+        return state["listing"], True
+
     async def _write_json_file(_artifact_id, path, data):
         state["written"].append((path, data))
         if path == bc.IMAGE_MANIFEST_PATH:
@@ -486,6 +500,7 @@ def importer(tmp_path, monkeypatch):
     monkeypatch.setattr(broker, "_require_role", _require_role)
     monkeypatch.setattr(broker, "_read_json_file", _read_json_file)
     monkeypatch.setattr(broker, "_list_files_safe", _list_files_safe)
+    monkeypatch.setattr(broker, "_list_files_all", _list_files_all)
     monkeypatch.setattr(broker, "_write_json_file", _write_json_file)
     monkeypatch.setattr(broker, "_ensure_staged", _ensure_staged)
     monkeypatch.setattr(broker, "_commit_tolerating_pending_uploads", _commit)
