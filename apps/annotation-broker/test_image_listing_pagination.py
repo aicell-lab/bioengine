@@ -221,6 +221,73 @@ async def test_the_list_is_complete_ABOVE_the_servers_MAXIMUM_PAGE(monkeypatch):
     assert offsets == [0, SERVER_MAX_PAGE, n], offsets
 
 
+async def test_the_list_is_complete_across_MANY_MORE_PAGES_than_the_stall_bound(
+    monkeypatch,
+):
+    """The case a review had to find by hand, and the shape of test the rest of
+    this file was missing.
+
+    The paging loop tolerates up to ``_NO_PROGRESS_PAGES`` consecutive pages
+    that add nothing new, because a filtered overlap is ordinary and an ignored
+    ``offset`` is not. Every test above goes through at most two non-empty
+    pages, so a counter that climbed on EVERY page -- which is what a duplicated
+    merge loop made it do -- stayed under the bound and nothing noticed. Above
+    the bound the read came back short again and called itself incomplete,
+    which after this change makes every mint, import and finish into a dataset
+    that size refuse permanently.
+
+    The page is forced down to 1000 so the case is 20 pages rather than a
+    dataset of 80000 fixtures: the quantity that matters is the number of
+    non-empty PAGES, not the number of entries.
+    """
+    n = 20_000
+    monkeypatch.setattr(bk, "_LIST_PAGE", SERVER_DEFAULT_PAGE)
+    b = _broker(monkeypatch, rows=_rows(n))
+
+    entries, complete = await b._list_files_all(ARTIFACT, "images")
+
+    assert len(entries) == n, f"{len(entries)} of {n} entries"
+    assert (
+        complete is True
+    ), "a server that paged correctly for 20 pages must not be called incomplete"
+    pages = [c for c in b._tam.calls if c["dir_path"] == "images"]
+    assert len(pages) == n // SERVER_DEFAULT_PAGE + 1, len(pages)
+
+
+async def test_a_SERVER_THAT_IGNORES_OFFSET_is_still_called_INCOMPLETE(monkeypatch):
+    """The control for the test above. The stall bound exists to catch a server
+    that never advances, and a fix that simply stopped counting would satisfy
+    the previous test while removing the only protection against an unreadable
+    directory."""
+
+    class _StuckAm(_PagingAm):
+        async def list_files(self, _a, dir_path=None, stage=True, limit=None, offset=0):
+            self.calls.append({"dir_path": dir_path, "limit": limit, "offset": offset})
+            if dir_path != "images":
+                return []
+            size = (
+                SERVER_DEFAULT_PAGE
+                if limit is None
+                else min(int(limit), SERVER_MAX_PAGE)
+            )
+            return self.rows[:size]  # offset IGNORED: always the first page
+
+    # The page is forced below the row count so that "one page" and "all the
+    # rows" are different numbers: with the default ask of 10000 against 5000
+    # rows, a stuck server and a working one both return 5000 and the length
+    # assertion below would prove nothing.
+    monkeypatch.setattr(bk, "_LIST_PAGE", SERVER_DEFAULT_PAGE)
+    b = _broker(monkeypatch, rows=_rows(5000))
+    monkeypatch.setattr(b, "_am", _StuckAm(_rows(5000)))
+
+    entries, complete = await b._list_files_all(ARTIFACT, "images")
+
+    assert complete is False, "an offset that is ignored cannot be read past"
+    assert (
+        len(entries) == SERVER_DEFAULT_PAGE
+    ), f"{len(entries)} entries: the loop must stop, not accumulate"
+
+
 async def test_the_read_costs_TWO_list_files_calls_and_the_CACHE_costs_NONE(
     monkeypatch,
 ):

@@ -437,16 +437,21 @@ class AnnotationBroker:
             # nothing, then declare the read incomplete. That is a bound rather
             # than a proof, and it is deliberately generous; the alternative
             # designs are recorded on the row.
-            names = [
-                entry.get("name") if isinstance(entry, dict) else str(entry)
-                for entry in batch
-            ]
-            before = len(seen)
-            for entry in batch:
-                name = entry.get("name") if isinstance(entry, dict) else str(entry)
-                if isinstance(name, str) and name not in seen:
-                    seen.add(name)
-                    out.append(entry)
+            #
+            # `before` is taken ABOVE, before the page is merged, and there is
+            # exactly ONE merge loop. There used to be a second copy of both
+            # here: the page was added, `before` was then taken from the
+            # already-grown set, and the second loop added nothing -- so
+            # `len(seen) == before` was true for EVERY non-empty page and
+            # `stalled` climbed on all of them. A correctly paging server was
+            # therefore declared INCOMPLETE after _NO_PROGRESS_PAGES pages.
+            # Measured by a review, through the shipped method against a double
+            # that serves every page in full: at a 1000-entry page, 7000
+            # entries came back complete and 8000 came back as 8000 entries
+            # with complete=False; at 10000, the cliff was at 80000. Harmless
+            # before the image reads depended on the flag, and not harmless
+            # after: every mint, import and finish into a dataset that size
+            # refused permanently and the pruning sync always skipped.
             if len(seen) == before:
                 stalled += 1
                 if stalled >= _NO_PROGRESS_PAGES:
