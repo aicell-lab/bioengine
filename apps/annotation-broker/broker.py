@@ -1351,10 +1351,21 @@ class AnnotationBroker:
             await _rm_dir(folder)
 
         await self._ensure_staged(artifact_id, _do)
-        meta["labels"] = [
-            l for l in meta.get("labels", []) or [] if l.get("name") != name
-        ]
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+
+        # Read-modify-write through update_metadata: `meta` was read before the awaits
+        # above, and those awaits DELETE the label's files. Writing the stale record
+        # here is the same half-commit as import_ngff_image had -- the compare-and-set
+        # would refuse it once anything else had written, leaving the label in the
+        # record while its folder is already gone, which is worse than either outcome
+        # alone. On a record that predates the revision stamp it instead erased the
+        # concurrent change outright. Re-reading and re-applying drops the label from
+        # whatever is current.
+        def _drop_the_label(record: Dict[str, Any]) -> None:
+            record["labels"] = [
+                l for l in record.get("labels", []) or [] if l.get("name") != name
+            ]
+
+        meta = core.update_metadata(artifact_id, _drop_the_label, root=STATE_ROOT)
         # Persist the deletion into the committed version as well: staged
         # removals alone leave the last committed snapshot holding the label
         # files. Reuses the ACL mirror cycle (commit + re-stage, tolerant of
@@ -2270,10 +2281,20 @@ class AnnotationBroker:
             self._image_manifest_cache.pop(artifact_id, None)
 
         if credential:
-            credentials = dict(meta.get("ngff_credentials") or {})
-            credentials[untokened] = credential
-            meta["ngff_credentials"] = credentials
-            core.write_metadata(meta, root=STATE_ROOT)
+            # Read-modify-write through update_metadata, because THIS is the widest window
+            # in the broker: `meta` was read at the top of this method, and everything
+            # between there and here awaits network work -- staging, the upload, and the
+            # commit. Writing `meta` whole would now be refused by the revision check (good:
+            # it is a stale copy), but refused AFTER the image has already been imported,
+            # which strands a successful import behind a failed credential write and asks
+            # the caller to repeat the upload. Re-reading and re-applying lands the
+            # credential on top of whatever else changed meanwhile.
+            def _store_credential(record: Dict[str, Any]) -> None:
+                credentials = dict(record.get("ngff_credentials") or {})
+                credentials[untokened] = credential
+                record["ngff_credentials"] = credentials
+
+            core.update_metadata(artifact_id, _store_credential, root=STATE_ROOT)
 
         return {"stem": stem, **entry}
 
@@ -3215,8 +3236,16 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         description = description if isinstance(description, str) else ""
-        core.add_label(meta, name, description)  # raises ValueError on a bad name
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+
+        # Read-modify-write through update_metadata, so a concurrent writer (the annotate
+        # page's index call caches image dimensions on the same record) cannot discard this label
+        # and this call cannot discard its dimensions. The returned record is the STORED one, so a
+        # caller is never handed a record describing a write that did not land.
+        def _add_the_label(record):
+            core.add_label(record, name, description)  # raises ValueError on a bad name
+            return record
+
+        meta = core.update_metadata(artifact_id, _add_the_label, root=STATE_ROOT)
 
         async def _put_label_metadata():
             await self._write_json_file(
@@ -3301,8 +3330,19 @@ class AnnotationBroker:
                     dims_cache[stem] = dims
                     cache_grew = True
             if cache_grew:
-                meta["image_dims"] = dims_cache
-                core.write_metadata(meta, root=STATE_ROOT)
+                # This is a READ path that opportunistically caches image dimensions, and it
+                # is the writer measured racing `create_label`. Merge into the stored record rather
+                # than replacing it wholesale: `meta` was read before the dimension fetches above,
+                # so writing it back would discard anything another call stored meanwhile — a label
+                # being the case users hit. MERGE, not replace, because a concurrent writer may
+                # also have added dimensions we should keep.
+                def _merge_dims(record):
+                    merged = dict(record.get("image_dims") or {})
+                    merged.update(dims_cache)
+                    record["image_dims"] = merged
+                    return record
+
+                meta = core.update_metadata(artifact_id, _merge_dims, root=STATE_ROOT)
         for img in images:
             entry = manifest[img["stem"]]
             dims = (
