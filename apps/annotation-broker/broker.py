@@ -1989,8 +1989,35 @@ class AnnotationBroker:
             # Past the TTL cache deliberately: "is this stem taken?" is
             # exactly the question a cached answer gets wrong, and the cost of
             # getting it wrong is overwriting an image somebody else uploaded.
-            entries = core.parse_image_manifest(
-                await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
+            #
+            # The manifest ALONE is not the dataset's image list, and reading
+            # only it was a real defect rather than a hypothetical one. The
+            # list is the manifest reconciled against the `images/` listing,
+            # which is exactly why this route can leave the entry to that
+            # reconciliation -- and therefore exactly why its own earlier
+            # uploads are NOT in the manifest it would have read. Two ways that
+            # bit:
+            #
+            #   * `images/scan01.png` present but not yet in the manifest read
+            #     as free, so the mint handed out a URL for that same path and
+            #     the upload replaced the image, orphaning its annotations;
+            #   * `scan01.tif` present and `scan01.png` uploaded collapsed into
+            #     ONE stem entry, so depending on the extensions either the new
+            #     image never appeared or it silently replaced the one the
+            #     annotations were drawn on.
+            #
+            # Reconciling here asks the same question the readers ask, so the
+            # answer cannot disagree with them.
+            doc = await self._read_json_file(
+                artifact_id, core.IMAGE_MANIFEST_PATH, None
+            )
+            listing = await self._list_files_safe(artifact_id, "images")
+            # prune=False: this is a read, and pruning is for the writer that
+            # owns the manifest. A stem whose file has gone is still "taken"
+            # for the purposes of not clobbering it here.
+            entries, _changed = core.merge_image_manifest(
+                core.parse_image_manifest(doc),
+                core.image_names_from_listing(listing),
             )
             existing = entries.get(stem)
             if isinstance(existing, dict):
@@ -2038,6 +2065,14 @@ class AnnotationBroker:
                 f"sending the body with no Content-Type header."
             )
         await self._commit_tolerating_pending_uploads(artifact_id)
+        # Drop the cached image list. Every other route that adds or removes an
+        # image refreshes it; without this the next `get_dataset_index` can be
+        # served a list computed up to `MANIFEST_CACHE_TTL_S` ago and leave out
+        # the image that was just uploaded -- so the caller is told the upload
+        # succeeded and then cannot see it. Popped rather than rewritten
+        # because this route does not build `entries`: the reconciliation does,
+        # and the next read will do it with the new file present.
+        self._image_manifest_cache.pop(artifact_id, None)
         return {"already": False, "stem": stem, "path": path, "committed": True}
 
     @bioengine.method(context=True)
