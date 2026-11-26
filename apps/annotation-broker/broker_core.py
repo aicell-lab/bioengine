@@ -384,7 +384,7 @@ def image_names_from_listing(
     directories, and never the manifest itself.
 
     *withheld_paths* holds artifact paths (``images/<name>``) belonging to
-    uploads that are still in flight -- see :func:`open_upload_paths`. A PUT
+    uploads not yet completed -- see :func:`withheld_upload_paths`. A PUT
     object becomes an image through THIS function, so an upload that was never
     finished would otherwise be a dataset image with no check ever applied to
     it. Keyed by full path rather than by name because that is what a marker
@@ -1698,24 +1698,34 @@ def abandoned_upload_removals(
     return out
 
 
-def open_upload_paths(markers: Any, *, now: float) -> frozenset:
-    """Object paths with an OPEN marker: minted, not yet finished, not expired.
+def withheld_upload_paths(markers: Any) -> frozenset:
+    """Object paths that must NOT be treated as dataset images yet.
 
-    These are uploads IN FLIGHT. The dataset's image list is built by unioning
-    the stored manifest with a listing of ``images/``, so an object that has
-    merely been PUT appears as an image whether or not the finishing call was
-    ever made -- which is how a caller that simply never finishes gets past the
-    size ceiling entirely. Withholding these paths from the listing side is what
-    makes the finish a gate rather than a formality.
+    Every marker that parses withholds its path -- **open or expired**. The
+    dataset's image list is built by unioning the stored manifest with a listing
+    of ``images/``, so an object that has merely been PUT appears as an image
+    whether or not the finishing call was ever made; withholding is what makes
+    the finish a gate rather than a formality.
 
-    Only OPEN markers withhold anything. An expired one does not: by then the
-    upload is abandoned and :func:`abandoned_upload_removals` deletes the object
-    outright, so withholding it as well would hide a file that is about to go.
-    An unparseable one does not either: it names no path to withhold.
+    **Expiry does not stop the withholding, and an earlier version of this was
+    wrong about that.** It withheld only unexpired markers, reasoning that an
+    expired one's object is about to be deleted by the sweep. A review measured
+    the gap: the sweep ran only at the END of a successful mint, which a mint of
+    the same name never reaches because the no-overwrite check answers
+    ``already`` first -- so on a dataset where nobody uploads anything else, the
+    object stayed an image indefinitely and the next commit from any route would
+    publish it. The gap was not bounded by anything.
 
-    A successful finish removes its marker BEFORE committing, so a completed
-    image is never withheld -- that ordering is what makes this safe, and it is
-    why the removal cannot be moved after the commit.
+    What makes withholding-until-swept consistent is that the sweep now runs at
+    the START of a mint, before the no-overwrite check reads the listing. An
+    abandoned object is therefore deleted before that check can answer
+    ``already`` about it, so "the image list hides a file" and "a re-mint says
+    it already exists" can no longer both be true for the same path.
+
+    An unparseable marker withholds nothing: it names no path. A successful
+    finish removes EVERY marker for its path before committing, so a completed
+    image is never withheld -- that is what makes this safe, and it is why the
+    finish must fail closed if any of those removals fails.
     """
     out = set()
     for item in markers or []:
@@ -1723,10 +1733,38 @@ def open_upload_paths(markers: Any, *, now: float) -> frozenset:
             continue
         _marker_path, doc = item
         parsed = parse_upload_marker(doc)
-        if parsed is None or upload_marker_is_expired(parsed, now=now):
+        if parsed is None:
             continue
         out.add(parsed["path"])
     return frozenset(out)
+
+
+def markers_for_path(markers: Any, *, path: str) -> List[str]:
+    """Marker paths recorded for the object at *path*, however many there are.
+
+    There can be more than one, which is the whole reason this exists. A review
+    measured two ordinary routes to it: a client whose first mint answer was
+    lost asks again and gets a second marker, and two browser tabs uploading the
+    same filename do the same. A finish that consumed only ITS OWN marker left
+    the other one open -- so the completed image was withheld immediately and
+    then deleted by the sweep, which is data loss reached through housekeeping.
+
+    An unparseable document is not returned: it names no path, so nothing can
+    say it belongs to this one.
+    """
+    out: List[str] = []
+    for item in markers or []:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        marker_path, doc = item
+        if not isinstance(marker_path, str) or not marker_path:
+            continue
+        parsed = parse_upload_marker(doc)
+        if parsed is None:
+            continue
+        if parsed["path"] == path:
+            out.append(marker_path)
+    return out
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

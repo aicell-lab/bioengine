@@ -370,7 +370,7 @@ class AnnotationBroker:
         # The stored manifest is NOT filtered: a successful finish removes its
         # marker before committing, so a completed image is never withheld, and
         # filtering a stored entry could hide an image that is genuinely there.
-        withheld = await self._open_upload_paths(artifact_id)
+        withheld = await self._withheld_upload_paths(artifact_id)
         entries, _ = core.merge_image_manifest(
             core.parse_image_manifest(doc),
             core.image_names_from_listing(listing, withheld),
@@ -2015,6 +2015,30 @@ class AnnotationBroker:
         marker_path = core.upload_marker_path(mint_id)
         if marker_path is None:
             return False
+        return await self._remove_marker_file(artifact_id, marker_path)
+
+    async def _remove_marker_file(self, artifact_id: str, marker_path: str) -> bool:
+        """Remove ONE marker file by its path. True if it is gone.
+
+        Never raises: every caller decides for itself what a failure means, and
+        they differ. The housekeeping sweep logs and carries on, because an
+        unswept marker costs disk and the authorisation check treats an expired
+        marker as no marker anyway. The finishing call refuses to commit,
+        because a marker left behind there has the sweep delete a published
+        image. A helper that raised would force one of those two to be wrong.
+
+        The parameter is `marker_path`, not `path`, deliberately: `path` in this
+        module means the IMAGE path, and the two removals must not be confusable
+        -- by a reader or by a textual mutation aimed at one of them.
+        """
+        if not isinstance(marker_path, str) or not marker_path.startswith(
+            f"{core.UPLOAD_MARKER_DIR}/"
+        ):
+            # Refuses rather than removing: this is the one place that deletes a
+            # path it was handed rather than one it built from a validated mint
+            # id, so it checks that the path is inside the marker directory.
+            logger.warning(f"refusing to remove a non-marker path: {marker_path!r}")
+            return False
         try:
             await self._am.remove_file(artifact_id=artifact_id, file_path=marker_path)
             return True
@@ -2058,28 +2082,33 @@ class AnnotationBroker:
             pairs.append((marker_path, doc))
         return pairs
 
-    async def _open_upload_paths(self, artifact_id: str) -> frozenset:
-        """Object paths belonging to uploads that are minted but not finished.
+    async def _withheld_upload_paths(self, artifact_id: str) -> frozenset:
+        """Object paths that must not be treated as dataset images yet.
 
-        Withheld from the image list, because an object that has merely been PUT
-        would otherwise be a dataset image with no size check ever applied: the
-        caller that never finishes is not refused by the finishing check.
+        Every marker that parses withholds its path, expired or not. An object
+        that has merely been PUT would otherwise be a dataset image with no size
+        check ever applied: the caller that never finishes is not refused by the
+        finishing check, because it never makes that call.
+
+        Expiry used to lift the withholding, on the reasoning that the sweep was
+        about to delete the object anyway. A review measured the gap that left --
+        the sweep was only reachable by minting a DIFFERENT name -- so the
+        withholding now lasts until the object is actually gone, and the sweep
+        runs at the start of every mint to make sure that happens.
 
         **Fails OPEN, and that is a choice with a reason.** If the markers
         cannot be listed or read, this returns an empty set and nothing is
         withheld. The alternative, withholding everything on an error, would
         make an unreadable ``.uploads/`` present the dataset as having no images
         at all -- a total outage of the image list, triggered by housekeeping
-        state, on every read path including the annotate page's first call. The
-        exposure this leaves is bounded and covered twice over: the object is
-        deleted outright once its marker expires, and the finishing call still
-        refuses the oversized file. So the failure mode here is "an abandoned
-        upload is listed for up to the TTL", not "the ceiling is unenforced".
+        state, on every read path including the annotate page's first call. What
+        the fail-open leaves is "an abandoned upload is listed until the next
+        mint sweeps it", not "the ceiling is unenforced".
         """
         pairs = await self._marker_pairs(artifact_id)
         if not pairs:
             return frozenset()
-        return core.open_upload_paths(pairs, now=time.time())
+        return core.withheld_upload_paths(pairs)
 
     async def _sweep_expired_markers(self, artifact_id: str) -> int:
         """Housekeeping: drop expired markers AND the objects they vouch for.
@@ -2230,6 +2259,24 @@ class AnnotationBroker:
             #
             # Reconciling here asks the same question the readers ask, so the
             # answer cannot disagree with them.
+            # THE SWEEP RUNS FIRST, before the listing is read. It used to run
+            # at the END of a successful mint, and a review measured what that
+            # cost: the only way to trigger it was to mint a DIFFERENT name,
+            # because minting the same name returns `already: True` from the
+            # check below and never reaches the sweep. So "mint, PUT oversized,
+            # never finish, wait for expiry" left the object as an image on any
+            # dataset where nobody uploaded anything else.
+            #
+            # Running it here closes that and removes a disagreement at the same
+            # time: an abandoned object is deleted BEFORE the no-overwrite check
+            # reads the listing, so the check cannot answer `already` about a
+            # file that is on its way out, and withholding an expired marker's
+            # path until it is swept can no longer contradict that answer.
+            #
+            # Still best-effort inside: a sweep failure is logged, not raised,
+            # so housekeeping cannot refuse a perfectly good upload.
+            await self._sweep_expired_markers(artifact_id)
+
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
@@ -2293,10 +2340,8 @@ class AnnotationBroker:
                 )
 
             await self._ensure_staged(artifact_id, _mint)
-            # Housekeeping, after the client's answer is already secured: a
-            # sweep failure must not cost a good mint. Awaited rather than
-            # fired off, so nothing outlives the request.
-            await self._sweep_expired_markers(artifact_id)
+            # No sweep here any more: it runs at the START of this call, above,
+            # where it is reached whatever the no-overwrite check answers.
             return {
                 "already": False,
                 "stem": stem,
@@ -2418,11 +2463,47 @@ class AnnotationBroker:
                 f"done=False and PUT again, sending the body with no "
                 f"Content-Type header."
             )
-        # The marker is consumed BEFORE the commit, so the commit publishes the
-        # image without it. Removing it afterwards would leave the removal
-        # staged and waiting on somebody else's commit, which is how `.uploads/`
-        # would end up in a published dataset.
-        await self._remove_upload_marker(artifact_id, mint_id)
+        # EVERY marker for this path is consumed, not just this request's, and
+        # the consumption FAILS CLOSED. Both halves were measured as defects.
+        #
+        # More than one marker for one path is ordinary, not exotic: a client
+        # whose first mint answer was lost on the wire asks again and is given a
+        # second marker, and two browser tabs uploading the same filename do the
+        # same. Consuming only `mint_id` left the other marker open -- so the
+        # image this call had just verified and committed was withheld from the
+        # listing immediately, and then DELETED by the expiry sweep, which is
+        # data loss arriving through housekeeping.
+        #
+        # And a removal that fails must stop the commit. It used to be
+        # best-effort: `_remove_upload_marker` never raises, so the commit went
+        # ahead and the leftover marker had the sweep delete the committed image
+        # later. Hypha carries out a staged removal of a committed file on the
+        # next commit, so that loss becomes permanent. Refusing here leaves the
+        # object staged and still withheld, which the next mint's sweep clears
+        # and the client can retry -- the cost of the safe direction is an
+        # error on an upload that was otherwise fine, and that is the right way
+        # round.
+        #
+        # Consumed BEFORE the commit, so the commit publishes the image without
+        # them. Removing them afterwards would leave the removals staged and
+        # waiting on somebody else's commit, which is how `.uploads/` would end
+        # up in a published dataset.
+        leftover = core.markers_for_path(
+            await self._marker_pairs(artifact_id), path=path
+        )
+        unremoved = []
+        for marker_path in leftover:
+            if not await self._remove_marker_file(artifact_id, marker_path):
+                unremoved.append(marker_path)
+        if unremoved:
+            raise RuntimeError(
+                f"'{name}' was uploaded and checked, but the record of the "
+                f"upload could not be cleared ({len(unremoved)} of "
+                f"{len(leftover)} marker file(s)), so it was NOT published. "
+                "Publishing with that record still in place would have let "
+                "housekeeping delete the image later. Nothing was committed; "
+                "retry with done=false and PUT again."
+            )
         await self._commit_tolerating_pending_uploads(artifact_id)
         # Drop the cached image list. Every other route that adds or removes an
         # image refreshes it; without this the next `get_dataset_index` can be
