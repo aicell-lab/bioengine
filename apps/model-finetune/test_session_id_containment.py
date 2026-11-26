@@ -216,96 +216,148 @@ def test_every_path_helper_inherits_the_guard(root, helper):
         fn("../escaped")
 
 
-def _sessions_root_callers(module_file: str) -> set:
-    """Every function that CALLS `sessions_root`, read from the syntax tree.
+MODULE_SCOPE = "<module or class body>"
 
-    AST rather than text, and that is a repair rather than a style choice: the
-    line-matching version counted a DOCSTRING that mentions `sessions_root()`
-    in prose as a call site, so it reported four where three existed and would
-    have misfired on any new docstring that named the function. A scan matches
-    the shape you wrote, not the thing you meant.
+
+def _sessions_root_calls(module_file: str) -> dict:
+    """How many times each scope CALLS `sessions_root`, from the syntax tree.
+
+    Three properties, and round 4 of the review established that my first
+    version had only the first:
+
+    1. AST rather than text, which is a repair: the line-matching version
+       counted a DOCSTRING mentioning `sessions_root()` in prose as a call
+       site, so it reported four where three existed and would have misfired
+       on any new docstring naming the function.
+
+    2. A COUNT PER SCOPE, not a set of names. A set cannot see a SECOND call
+       inside an already-allowed function -- a `leak = sessions_root() / ctx`
+       added inside `list_sessions` was MISSED by the set and caught by main's
+       exact line count. Multiplicity is part of the claim.
+
+    3. Calls OUTSIDE any function get a scope of their own, so a module-level
+       or class-body `root = sessions_root() / x` is visible. The set version
+       missed both -- and main's own control used exactly the module-level
+       shape, which my rewrite moved inside a function, so the control stopped
+       testing the case it existed for.
     """
     import ast
     import pathlib
 
     tree = ast.parse(pathlib.Path(module_file).read_text())
-    callers = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for inner in ast.walk(node):
+    counts: dict = {}
+
+    def walk(node, scope):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # A nested function is attributed to ITSELF, not to its
+                # parent: a closure that reaches the root is its own caller.
+                walk(child, child.name)
+                continue
             if (
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "sessions_root"
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "sessions_root"
             ):
-                callers.add(node.name)
-    return callers
+                counts[scope] = counts.get(scope, 0) + 1
+            walk(child, scope)
+
+    walk(tree, MODULE_SCOPE)
+    return counts
 
 
-#: The ONLY functions allowed to reach the sessions root directly. Named rather
-#: than counted: a count says "three" and tolerates any three, while a set says
-#: WHICH three and reddens when a fourth appears or one moves.
-SESSIONS_ROOT_CALLERS = {
+#: WHICH scopes may reach the sessions root, and HOW MANY TIMES each. Named and
+#: counted rather than either alone: a set of names tolerates a second,
+#: unvalidated call inside an allowed function, and a bare total tolerates any
+#: three calls anywhere.
+SESSIONS_ROOT_CALLS = {
     # builds every session path, and validates the id before it does
-    "session_dir",
-    # iterates the root to list what is there, and validates nothing because
-    # it validates nothing it hands out -- see its own skipped-name handling
-    "list_sessions",
+    "session_dir": 1,
+    # iterates the root to list what is there
+    "list_sessions": 1,
     # probes that the root accepts a WRITE. It has to read the root to write
     # in it, and it deliberately does not build a session path: a health check
     # that created a session directory would be a side effect on every probe.
-    "assert_sessions_root_writable",
+    "assert_sessions_root_writable": 1,
 }
 
 
 def test_no_path_helper_bypasses_the_chokepoint():
     """A structural guard. If a new helper builds on `sessions_root()` directly
     it will not be validated, and that is invisible in a behavioural test."""
-    callers = _sessions_root_callers(training.__file__)
-    assert callers == SESSIONS_ROOT_CALLERS, (
-        f"the set of functions calling sessions_root() changed: "
-        f"unexpected {sorted(callers - SESSIONS_ROOT_CALLERS)}, "
-        f"missing {sorted(SESSIONS_ROOT_CALLERS - callers)}. A new caller may "
-        "be building a session path without going through session_dir. If it "
-        "is legitimate, add it to SESSIONS_ROOT_CALLERS deliberately, with a "
-        "line saying why it may reach the root."
+    calls = _sessions_root_calls(training.__file__)
+    assert calls == SESSIONS_ROOT_CALLS, (
+        f"the calls to sessions_root() changed: found {calls}, expected "
+        f"{SESSIONS_ROOT_CALLS}. A new caller may be building a session path "
+        f"without going through session_dir, or an allowed function may have "
+        f"gained a SECOND, unvalidated use. A call attributed to "
+        f"'{MODULE_SCOPE}' is at module or class scope and belongs in neither. "
+        "If it is legitimate, change SESSIONS_ROOT_CALLS deliberately, with a "
+        "line saying why that scope may reach the root."
     )
 
 
-def test_that_chokepoint_guard_CAN_fail(tmp_path, monkeypatch):
-    """The control for the structural test above, which reads a file and so can
-    silently measure the wrong thing. Point it at a module that really does
-    have an unlisted caller and it must complain."""
-    import pathlib
+_ALLOWED_MODULE = (
+    "def sessions_root():\n    pass\n"
+    "def session_dir(sid):\n    root = sessions_root()\n"
+    "def list_sessions(ctx):\n    root = sessions_root()\n"
+    "def assert_sessions_root_writable():\n    root = sessions_root()\n"
+)
 
-    fake = tmp_path / "fake_training.py"
-    fake.write_text(
-        "def sessions_root():\n    pass\n"
-        "def session_dir(sid):\n    root = sessions_root()\n"
-        "def list_sessions(ctx):\n    root = sessions_root()\n"
-        "def assert_sessions_root_writable():\n    root = sessions_root()\n"
-        "def sneaky(sid):\n    return sessions_root() / sid\n"
-    )
+
+def _point_guard_at(tmp_path, monkeypatch, name, extra=""):
+    """Write a fake module with exactly the allowed callers, plus *extra*."""
+    fake = tmp_path / name
+    fake.write_text(_ALLOWED_MODULE + extra)
     monkeypatch.setattr(training, "__file__", str(fake))
+    return fake
+
+
+@pytest.mark.parametrize(
+    "label, extra",
+    [
+        # main's own control used exactly this shape, at MODULE level. My first
+        # AST rewrite moved it inside a function, so the control stopped
+        # testing the case it existed for. It is back where it belongs.
+        ("a module-level call", 'sneaky = sessions_root() / "x"\n'),
+        # Neither module nor function scope, and also missed by the set.
+        ("a class-body call", "class C:\n    ROOT = sessions_root()\n"),
+        # THE one a set of names cannot see: a SECOND, unvalidated use in an
+        # already-allowed function. main's exact line count caught it.
+        (
+            "a second call in a permitted function",
+            "def list_sessions_extra(ctx):\n    return sessions_root() / ctx\n",
+        ),
+        # An unlisted function, which every version of the guard caught.
+        (
+            "an unlisted function",
+            "def sneaky(sid):\n    return sessions_root() / sid\n",
+        ),
+        # A closure is attributed to itself, so it reads as an unlisted scope
+        # rather than as a second use of its parent.
+        (
+            "a closure inside a permitted function",
+            "def session_dir_helper():\n"
+            "    def inner():\n        return sessions_root()\n"
+            "    return inner\n",
+        ),
+    ],
+)
+def test_that_chokepoint_guard_CAN_fail(tmp_path, monkeypatch, label, extra):
+    """The controls for the structural test above, which reads a file and so
+    can silently measure the wrong thing. Each shape must make it complain,
+    and three of these were MISSED by the set-of-names version I briefly
+    replaced main's line count with."""
+    _point_guard_at(tmp_path, monkeypatch, "fake_training.py", extra)
     with pytest.raises(AssertionError):
         test_no_path_helper_bypasses_the_chokepoint()
 
 
 def test_the_guard_PASSES_on_exactly_the_allowed_set(tmp_path, monkeypatch):
-    """The other half of the control, and the one the old version lacked: a
+    """The other half of the control, and the one main's version lacked: a
     module with exactly the allowed callers must PASS. Without it, a guard that
-    refused everything would satisfy the test above and look like coverage."""
-    import pathlib
-
-    fake = tmp_path / "ok_training.py"
-    fake.write_text(
-        "def sessions_root():\n    pass\n"
-        "def session_dir(sid):\n    root = sessions_root()\n"
-        "def list_sessions(ctx):\n    root = sessions_root()\n"
-        "def assert_sessions_root_writable():\n    root = sessions_root()\n"
-    )
-    monkeypatch.setattr(training, "__file__", str(fake))
+    refused everything would satisfy every test above and look like coverage."""
+    _point_guard_at(tmp_path, monkeypatch, "ok_training.py")
     test_no_path_helper_bypasses_the_chokepoint()
 
 
