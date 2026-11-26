@@ -3239,14 +3239,22 @@ class EntryApp:
             # no more authoritative than the first pass's were.
             #
             # PER ID, and an ABSENT record is "still missing" rather than a read
-            # failure. A review measured the difference: one record that stays
-            # missing 404s on its fetch, and a single `gather` then raised and
-            # discarded EVERY digest in the batch -- including those of records
-            # the repair had just landed correctly. With 2 transient and 1
-            # permanent failure the report read `repaired: []` and condemned all
-            # three, when the truth was two repaired and one unresolved. That is
-            # the same misreport this whole row exists to remove, so it cannot be
+            # failure. A review measured the difference: a single `gather` over
+            # every condemned id raised on the first failure and discarded
+            # EVERY digest in the batch -- including those of records the repair
+            # had just landed correctly. With 2 transient and 1 permanent
+            # failure the report read `repaired: []` and condemned all three,
+            # when the truth was two repaired and one unresolved. That is the
+            # same misreport this whole row exists to remove, so it cannot be
             # allowed to live in the repair's own reporting.
+            #
+            # WHICH IDS ARE ABSENT IS DECIDED BY THE LISTING BELOW, not by a
+            # 404 on the fetch. An earlier version of this comment said a
+            # missing record "404s on its fetch", which stopped being how this
+            # works: a record the listing contains and the fetch then fails on
+            # -- 404 included, since it can only mean the record went away
+            # mid-pass -- is an absence of KNOWLEDGE and goes to
+            # `reread_errors`, not to `mismatched`.
             #
             # `repair_error` is reserved for exactly three things, and the code
             # sets it for exactly those: a failed stage, a failed commit, and a
@@ -3275,18 +3283,42 @@ class EntryApp:
             # The listing answers the same way everywhere.
             reread_errors: Dict[str, str] = {}
             if repair_error is None:
-                relisting, relisting_complete = await self._list_run_record_files(
-                    am, store
-                )
-                if not relisting_complete:
-                    # The same refusal the first read-back makes, for the same
-                    # reason: a listing that cannot be proven whole cannot say
-                    # which records are absent, and guessing would blame them.
-                    repair_error = (
+                # WRAPPED, because this function REPORTS rather than raises.
+                # The per-id gather uses `return_exceptions=True`, so before
+                # this re-listing existed no read failure in the repair could
+                # propagate. Adding an unwrapped await put the caller back to
+                # receiving a traceback and NO report -- the one outcome this
+                # whole operation exists to prevent, and a direct contradiction
+                # of the rule stated further down ("Reported as False rather
+                # than raised: the caller needs a verdict").
+                relist_unusable = None
+                relisting, relisting_complete = [], False
+                try:
+                    relisting, relisting_complete = await self._list_run_record_files(
+                        am, store
+                    )
+                except Exception as exc:
+                    relist_unusable = (
+                        "the repair's re-read listing could not be read: %s: %s"
+                        % (type(exc).__name__, str(exc)[:200])
+                    )
+                if relist_unusable is None and not relisting_complete:
+                    relist_unusable = (
                         "the repair's re-read listing could not be proven "
                         "complete, so which records are absent cannot be said"
                     )
+                if relist_unusable is not None:
+                    # A listing that cannot be proven whole cannot say which
+                    # records are absent, and GUESSING WOULD BLAME THEM -- so
+                    # not one of the condemned ids is reported as mismatched
+                    # here. Every one is unestablished, which is the true
+                    # statement: the repair may well have landed them, and an
+                    # earlier version of this code said exactly that in a
+                    # comment and then blamed them anyway.
+                    repair_error = relist_unusable
                     plan["repair_error"] = repair_error
+                    for sid in bad:
+                        reread_errors[sid] = relist_unusable
                 else:
                     present = {f[: -len(".json")] for f in relisting}
                     missing = [sid for sid in bad if sid not in present]
