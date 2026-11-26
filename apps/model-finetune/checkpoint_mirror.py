@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping as _ABCMapping
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -127,6 +128,65 @@ def parse_digest(value: Any) -> Tuple[str, str]:
     return alg, hexd
 
 
+def parse_expectation(value: Any) -> Dict[str, str]:
+    """``{algorithm: hex}`` for what a member is expected to hash to, or raise.
+
+    A member carries TWO claims, and they are different claims:
+
+    * upstream's **xxh128** is PROVENANCE -- these bytes are the ones upstream
+      serves. It is the only digest upstream authors, and it can be checked while
+      upstream is unreachable because it is a literal in micro-sam's source.
+    * a **sha256** of our own is INTEGRITY -- the mirror has not changed since we
+      put it there. It cannot speak to provenance: any corruption that arrived
+      before we hashed it would be sealed in.
+
+    Accepts either form, so a caller with one digest is not forced to invent the
+    other:
+
+    * ``"xxh128:<hex>"`` -- a single algorithm, the registry's own literal;
+    * ``{"xxh128": "<hex>", "sha256": "<hex>"}`` -- both, each value bare hex or
+      prefixed. A :class:`Mapping`, not specifically a ``dict``, because a record
+      that arrives over hypha RPC is a ``dotdict`` and ``isinstance(x, dict)`` is
+      False for it -- a check that would silently take the string branch.
+
+    Fail-closed throughout, including on an EMPTY mapping: no recorded digest is
+    not a weaker check, it is no check, and it must not be able to read as one.
+    """
+    if isinstance(value, str):
+        alg, hexd = parse_digest(value)
+        return {alg: hexd}
+    if isinstance(value, _ABCMapping):
+        if not value:
+            raise MirrorError(
+                "a member must record at least one digest; an empty expectation "
+                "would verify nothing and report success"
+            )
+        out: Dict[str, str] = {}
+        for alg, raw in value.items():
+            if not isinstance(alg, str) or alg not in _SUPPORTED_ALGS:
+                raise MirrorError(
+                    f"unsupported digest algorithm {alg!r}; expected one of "
+                    f"{_SUPPORTED_ALGS}"
+                )
+            if not isinstance(raw, str):
+                raise MirrorError(
+                    f"{alg} digest must be a string, got {type(raw).__name__}"
+                )
+            text = raw.strip()
+            got_alg, hexd = parse_digest(text if ":" in text else f"{alg}:{text}")
+            if got_alg != alg:
+                raise MirrorError(
+                    f"digest recorded under {alg!r} is labelled {got_alg!r}; "
+                    "refusing rather than trusting one of the two"
+                )
+            out[alg] = hexd
+        return out
+    raise MirrorError(
+        f"expectation must be '<alg>:<hex>' or a mapping of algorithm to hex, "
+        f"got {type(value).__name__}"
+    )
+
+
 def digest_file(path: Any, alg: str, *, chunk: int = 1 << 20) -> str:
     """The hex digest of a file under *alg*, read in chunks.
 
@@ -166,18 +226,53 @@ def digest_file(path: Any, alg: str, *, chunk: int = 1 << 20) -> str:
 
 
 def member_is_intact(path: Any, digest: Any) -> bool:
-    """Whether the file at *path* matches *digest*. Absent reads as False.
+    """Whether the file at *path* matches what is recorded for it.
 
-    A missing file and a corrupt one both answer False because the caller's
+    *digest* is anything :func:`parse_expectation` accepts: one algorithm, or
+    both. **Every recorded algorithm that can be computed here must match** --
+    a wrong xxh128 is not excused by a right sha256, because the two answer
+    different questions and only one of them is about provenance.
+
+    A missing file and a corrupt one both answer False, because the caller's
     action is identical -- place it again -- but they are NOT collapsed in the
     report: :func:`seed_plan` distinguishes them, so "the mirror is wrong" never
     looks like "the cache is cold".
+
+    **The fallback, and its limit.** If `xxhash` is not installed the xxh128
+    cannot be computed. When a sha256 is also recorded, that one is verified and
+    the answer stands on it -- the mirror is still known to be unchanged, and
+    this is the fallback the ruling asks for. When xxh128 is the ONLY recorded
+    digest, this RAISES rather than answering: there is nothing left to check,
+    and True would be a verification that never ran. Returning False instead
+    would be no better in the other direction -- it would read as corruption and
+    send a caller re-downloading good bytes from an origin that is down.
     """
-    alg, expected = parse_digest(digest)
+    expected = parse_expectation(digest)
     p = Path(path)
     if not p.is_file():
         return False
-    return digest_file(p, alg) == expected
+    checked = 0
+    for alg, want in sorted(expected.items()):
+        try:
+            got = digest_file(p, alg)
+        except MirrorError:
+            # Only an uncomputable algorithm lands here (no `xxhash`). Whether
+            # that is survivable depends on what ELSE was recorded, which is
+            # decided after the loop -- never inside it, where one missing
+            # hasher would short-circuit a check that could still be made.
+            continue
+        checked += 1
+        if got != want:
+            return False
+    if checked == 0:
+        raise MirrorError(
+            f"none of the recorded digests ({', '.join(sorted(expected))}) could "
+            f"be computed here, so {p.name} was NOT verified. Refusing rather "
+            "than reporting a result: install `xxhash`, or record a sha256 "
+            "alongside the registry's xxh128 so there is something to fall back "
+            "to."
+        )
+    return True
 
 
 def seed_plan(
@@ -188,7 +283,10 @@ def seed_plan(
 ) -> Dict[str, List[str]]:
     """What to do for each wanted member, as four disjoint lists.
 
-    *wanted* maps registry key -> digest. *available* is what the mirror holds;
+    *wanted* maps registry key -> expectation, where an expectation is anything
+    :func:`parse_expectation` takes: the registry's ``"xxh128:<hex>"`` literal, or
+    ``{"xxh128": ..., "sha256": ...}`` to carry provenance and integrity together.
+    *available* is what the mirror holds;
     ``None`` means "assume everything is available", which is what a caller that
     has not listed the mirror yet should say.
 
@@ -219,7 +317,7 @@ def seed_plan(
     }
     target = models_dir(cache_root)
     for key, digest in wanted.items():
-        parse_digest(digest)  # fail closed before any filesystem work
+        parse_expectation(digest)  # fail closed before any filesystem work
         path = target / key
         present = path.is_file()
         intact = member_is_intact(path, digest) if present else False

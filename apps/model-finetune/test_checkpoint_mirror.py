@@ -108,16 +108,16 @@ def test_a_registry_digest_parses_into_algorithm_and_hex():
     "bad",
     [
         "",
-        "deadbeef",                      # no algorithm
-        "xxh128:",                       # no hex
-        "xxh128:" + "a" * 31,            # one short
-        "xxh128:" + "a" * 33,            # one long
-        "sha256:" + "a" * 32,            # xxh128 length under sha256's name
-        "md5:" + "a" * 32,               # unsupported algorithm
-        "XXH128:" + "a" * 32,            # wrong case
-        "xxh128:" + "A" * 32,            # uppercase hex
-        "xxh128:zzzz" + "a" * 28,        # not hex
-        " xxh128:" + "a" * 32 + " x",    # trailing junk
+        "deadbeef",  # no algorithm
+        "xxh128:",  # no hex
+        "xxh128:" + "a" * 31,  # one short
+        "xxh128:" + "a" * 33,  # one long
+        "sha256:" + "a" * 32,  # xxh128 length under sha256's name
+        "md5:" + "a" * 32,  # unsupported algorithm
+        "XXH128:" + "a" * 32,  # wrong case
+        "xxh128:" + "A" * 32,  # uppercase hex
+        "xxh128:zzzz" + "a" * 28,  # not hex
+        " xxh128:" + "a" * 32 + " x",  # trailing junk
         None,
         1234,
     ],
@@ -157,17 +157,95 @@ def test_BOTH_algorithms_work_so_provenance_and_integrity_can_be_recorded(tmp_pa
 
 
 @pytest.mark.skipif(HAVE_XXHASH, reason="xxhash present, so the refusal cannot occur")
-def test_WITHOUT_xxhash_an_xxh128_digest_REFUSES_rather_than_falling_back(tmp_path):
+def test_WITHOUT_xxhash_an_xxh128_ALONE_REFUSES_rather_than_falling_back(tmp_path):
     """THE INVERSE CASE, and it is only testable where xxhash is missing.
 
     Upstream publishes no sha256, so hashing with something else would turn a
-    provenance check into a self-consistency check. The module raises instead.
-    A silent fallback is the one substitution that must not happen, and this is
-    the environment that can prove it does not.
+    provenance check into a self-consistency check. With xxh128 as the ONLY
+    recorded digest there is nothing left to check, and the module raises
+    instead of answering. A silent fallback is the one substitution that must
+    not happen, and this is the environment that can prove it does not.
+
+    Note what is NOT asserted: False. False would read as corruption and send a
+    caller re-fetching good bytes from the origin that is down.
     """
     _write(tmp_path, GENERALIST, b"bytes" * 10)
-    with pytest.raises(cm.MirrorError, match="xxhash is not installed"):
+    with pytest.raises(cm.MirrorError, match="NOT verified"):
         cm.member_is_intact(cm.models_dir(tmp_path) / GENERALIST, "xxh128:" + "a" * 32)
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="the fallback only engages when xxh128 cannot be computed"
+)
+def test_WITHOUT_xxhash_a_RECORDED_SHA256_IS_THE_FALLBACK_and_it_decides(tmp_path):
+    """The ruling's fallback: when the xxh128 cannot be computed but a sha256 of
+    our own was recorded, that one is verified and the answer stands on it.
+
+    Both directions, because a fallback that only ever said True would satisfy
+    the first assertion and verify nothing.
+    """
+    data = b"weights" * 512
+    _write(tmp_path, GENERALIST, data)
+    p = cm.models_dir(tmp_path) / GENERALIST
+    good_sha = _d(data, "sha256").split(":", 1)[1]
+
+    assert cm.member_is_intact(p, {"xxh128": "a" * 32, "sha256": good_sha})
+    assert not cm.member_is_intact(p, {"xxh128": "a" * 32, "sha256": "b" * 64})
+
+
+@pytest.mark.skipif(
+    not HAVE_XXHASH, reason="a wrong xxh128 can only be detected where it is computable"
+)
+def test_a_WRONG_PROVENANCE_hash_is_NOT_EXCUSED_by_a_right_integrity_hash(tmp_path):
+    """The two digests answer different questions, so both must hold.
+
+    A right sha256 says "unchanged since we hashed it". It says nothing about
+    whether the bytes are upstream's, which is the claim a wrong xxh128 refutes.
+    Accepting the file because one of the two matched would publish a mirror of
+    bytes upstream never served.
+    """
+    data = b"weights" * 512
+    _write(tmp_path, GENERALIST, data)
+    p = cm.models_dir(tmp_path) / GENERALIST
+    good_sha = _d(data, "sha256").split(":", 1)[1]
+
+    assert not cm.member_is_intact(p, {"xxh128": "a" * 32, "sha256": good_sha})
+    # ... and the control: with the real xxh128 it passes, so the refusal above
+    # is the hash and not the two-digest form itself.
+    assert cm.member_is_intact(
+        p, {"xxh128": _d(data, "xxh128").split(":", 1)[1], "sha256": good_sha}
+    )
+
+
+def test_an_EMPTY_expectation_REFUSES_rather_than_verifying_nothing(tmp_path):
+    """No recorded digest is not a weaker check, it is no check. An empty
+    mapping must not be able to read as "everything matched"."""
+    _write(tmp_path, GENERALIST, b"x" * 10)
+    with pytest.raises(cm.MirrorError, match="at least one digest"):
+        cm.member_is_intact(cm.models_dir(tmp_path) / GENERALIST, {})
+
+
+def test_a_digest_LABELLED_as_another_algorithm_REFUSES(tmp_path):
+    """`{"sha256": "xxh128:..."}` is a record that disagrees with itself. Picking
+    either reading would be a guess about which half is the typo."""
+    with pytest.raises(cm.MirrorError, match="labelled"):
+        cm.parse_expectation({"sha256": "xxh128:" + "a" * 32})
+
+
+def test_an_expectation_accepts_BARE_HEX_as_well_as_a_prefixed_digest():
+    """Both forms, because the registry hands over `xxh128:<hex>` while a record
+    keyed by algorithm naturally holds the hex alone."""
+    assert cm.parse_expectation({"sha256": "a" * 64}) == {"sha256": "a" * 64}
+    assert cm.parse_expectation({"sha256": "sha256:" + "a" * 64}) == {
+        "sha256": "a" * 64
+    }
+    assert cm.parse_expectation("sha256:" + "a" * 64) == {"sha256": "a" * 64}
+
+
+def test_an_expectation_that_is_NEITHER_a_string_nor_a_mapping_REFUSES():
+    for bad in (None, 42, ["sha256:" + "a" * 64], b"sha256:" + b"a" * 64):
+        with pytest.raises(cm.MirrorError):
+            cm.parse_expectation(bad)
 
 
 # ── the plan: four disjoint buckets ─────────────────────────────────────────
@@ -230,9 +308,7 @@ def test_the_FOUR_BUCKETS_ARE_DISJOINT_and_cover_everything_asked_for(tmp_path):
         "m_absent": _d(b"z" * 8),
         "m_missing_upstream": _d(b"q" * 8),
     }
-    plan = cm.seed_plan(
-        tmp_path, wanted, available=["m_ok", "m_bad", "m_absent"]
-    )
+    plan = cm.seed_plan(tmp_path, wanted, available=["m_ok", "m_bad", "m_absent"])
     buckets = [set(v) for v in plan.values()]
     union = set().union(*buckets)
     assert union == set(wanted), (plan, sorted(wanted))
