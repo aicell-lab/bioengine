@@ -248,7 +248,8 @@ def app(
             convention internally.
 
             The amount the app RESERVES on a node is larger than this: the
-            deployment's own ProxyDeployment adds a fixed
+            application's ProxyDeployment -- one per application, not one per
+            deployment -- adds a fixed
             ``proxy_memory_in_gb`` (default 0.5 GiB = 512 MiB) on top, and
             scheduling is checked against the total. So ``memory_mb=4096``
             needs 4608 MiB free, and asking for exactly a node's advertised
