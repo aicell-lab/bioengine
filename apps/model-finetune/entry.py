@@ -2411,6 +2411,127 @@ class EntryApp:
         return training.get_status(session_id)
 
     @bioengine.method(context=True)
+    async def migrate_run_records(
+        self,
+        apply: bool = Field(
+            False,
+            description=(
+                "Write the records. Omitted or false performs a DRY RUN that "
+                "writes nothing and returns the plan."
+            ),
+        ),
+        confirm: str = Field(
+            "",
+            description=(
+                "Must equal the number of records the dry run planned. Proves "
+                "the caller read the plan rather than passing apply=true."
+            ),
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Backfill this worker's on-disk runs into the shared record. ADMIN ONLY.
+
+        DRY RUN BY DEFAULT. `apply` is the only thing that writes, and it
+        refuses unless `confirm` matches the count the dry run reported, so a
+        caller cannot write without having read the plan.
+
+        THE STORE IS ENUMERATED BY THE FILESYSTEM, never by a listing. The
+        per-caller listing returns what the CALLER may see -- measured at 269
+        of 291 on the production store, because a run belonging to somebody
+        else, or to an anonymous identity that no longer exists, is invisible
+        to it by design. A backfill driven by it would silently skip exactly
+        the runs most in need of being preserved, and `before == after` would
+        still pass because both sides would be counting the same subset.
+
+        EQUALITY IS BY ID SET AND CONTENT HASH, not by count. Two sets of the
+        same size are not the same set, and a record that lands with the wrong
+        content is not a record that landed.
+
+        Nothing on disk is written, moved or deleted. The migration only adds
+        documents to the runs artifact.
+        """
+        import hashlib
+        import json as _json
+
+        import training
+
+        if not training.caller_is_workspace_admin(context):
+            raise training.NotTheOwner(
+                "migrating the run history is an administrator action: it reads "
+                "every run on this worker, including runs that belong to other "
+                "callers, and writes them into the shared record"
+            )
+
+        store = training.record_store_id()
+        if not store:
+            # Sharing is OFF for this replica, so it cannot tell which
+            # deployment's history it would be writing into. Refusing is the
+            # only safe answer: a fallback bucket shared by every such replica
+            # is precisely the thing `record_store_id` exists to prevent.
+            raise RuntimeError(
+                "this replica cannot tell which deployment it belongs to, so it "
+                "must not write into any deployment's run history"
+            )
+
+        names, skipped = training.run_names_on_disk()
+        planned, unreadable = [], []
+        for name in names:
+            try:
+                status = training.get_status(name, include_private=True)
+                record = training.run_record(name, status)
+                path = training.run_record_path(name, store)
+            except Exception as exc:
+                unreadable.append({"id": name, "error": "%s: %s" % (type(exc).__name__, exc)})
+                continue
+            body = _json.dumps(record).encode("utf-8")
+            planned.append(
+                {
+                    "id": name,
+                    "path": path,
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "owner": (record.get("status") or {}).get("owner"),
+                }
+            )
+
+        plan = {
+            "store": store,
+            "on_disk": len(names),
+            "skipped_names": skipped,
+            "unreadable": unreadable,
+            "planned": len(planned),
+            "ids": sorted(p["id"] for p in planned),
+            "hashes": {p["id"]: p["sha256"] for p in planned},
+            "applied": 0,
+            "dry_run": not apply,
+        }
+
+        if not apply:
+            return plan
+
+        if confirm != str(len(planned)):
+            raise ValueError(
+                f"confirm must be {len(planned)!r} — the number of records this "
+                f"run plans to write — and it was {confirm!r}. Run without "
+                f"apply first and read the plan."
+            )
+        if unreadable:
+            raise RuntimeError(
+                f"{len(unreadable)} run(s) could not be read, so a complete "
+                f"backfill cannot be claimed; refusing rather than writing a "
+                f"partial history"
+            )
+
+        written, failed = [], []
+        for item in planned:
+            ok = await self._persist_run_record(item["id"], log_failure=True)
+            (written if ok else failed).append(item["id"])
+        plan["applied"] = len(written)
+        plan["failed"] = failed
+        # BEFORE == AFTER as SETS, checked here rather than left to the caller.
+        plan["complete"] = not failed and set(written) == set(plan["ids"])
+        return plan
+
+    @bioengine.method(context=True)
     async def list_training_sessions(self, context=None) -> Dict[str, Any]:
         """The fine-tuning runs YOU may see, keyed by session_id.
 
