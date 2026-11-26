@@ -75,6 +75,26 @@ SERVER_URL = "https://hypha.aicell.io"
 # as UNHEALTHY by this check rather than timing the check itself out. Matches
 # annotation-broker's `_HEALTH_CALL_TIMEOUT_S`, which guards the same shape.
 _HEALTH_CALL_TIMEOUT_S = 15.0
+
+# How long `get_training_capabilities` waits for a backend's store verdict, and
+# how long it then stops asking a backend that did not answer.
+#
+# BOTH NUMBERS EXIST BECAUSE THIS METHOD IS POLLED BY THE ANNOTATE PAGE, and a
+# review measured what the first version cost: with VRAM declared, both backends
+# enabled and one runtime whose `ping` hangs, the call took 10.01 s and returned
+# no verdict anyway. Two faults, fixed separately. The views are now gathered
+# concurrently, so the worst case is ONE timeout rather than one per backend;
+# and the timeout is 2 s, matching the readiness probe, because `ping` reports a
+# cached verdict and does no I/O, so a runtime that is up answers in
+# milliseconds and 5 s only lengthened the wait for one that is not.
+#
+# The negative window is the other half. A cluster with fewer GPUs than enabled
+# backends leaves a backend UPSCALING indefinitely -- that is the permanent
+# state this method's own docstring describes, not a blip -- so retrying it on
+# every poll would pay the timeout forever. 30 s is short enough that a runtime
+# coming up is reflected within one or two polls.
+_STORE_VIEW_PING_TIMEOUT_S = 2.0
+_STORE_VIEW_UNREACHABLE_FOR_S = 30.0
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal[
@@ -551,6 +571,13 @@ class EntryApp:
         # to max_replicas=1 (see the deployment decorator) — every aggregate lands in this
         # process. Raising max_replicas voids it and needs a pool-side lease instead.
         self._pool_locks: Dict[str, asyncio.Lock] = {}
+        # When each backend's `ping` last failed to answer, so the POLLED
+        # capabilities method stops asking a runtime that is not there. An
+        # under-GPU'd cluster leaves a backend UPSCALING permanently, and that
+        # is not a transient: without this, every poll pays the full timeout
+        # forever. Per-instance rather than class-level, so two replicas cannot
+        # share one another's negative verdict.
+        self._store_view_unreachable_at: Dict[str, float] = {}
 
         # session_id -> the JSON this instance last pushed to the shared run
         # record. Only used to skip an unchanged write; it is NOT a claim about
@@ -824,6 +851,123 @@ class EntryApp:
                 "GPU runtime is not available yet — inference, embedding, ONNX "
                 "export, and training are unavailable until it starts."
             ) from e
+
+    async def _runtime_store(self, model_type: Optional[str] = None) -> Dict[str, Any]:
+        """The store verdict of the RUNTIME that would serve *model_type*.
+
+        Asked of the runtime rather than computed here, and that distinction is
+        the whole point: a runtime replica has its own HOME, so the entry's own
+        store says nothing about the one training writes. #0931 measured a
+        replica writing the share while another in the same image could not
+        write anything, because the redirect pointing HOME at the share had not
+        run in that process.
+
+        An unreachable runtime yields `{}` rather than a verdict: "I could not
+        ask" must not read as "the store is fine", and it must not read as
+        "the store is broken" either -- the caller distinguishes them.
+        """
+        try:
+            # Inside the try, deliberately: `_runtime_for` itself raises when a
+            # backend is not deployed, and a half-constructed instance has no
+            # runtime handle at all. Neither is a store verdict, and neither
+            # may turn this diagnostic into the thing that breaks the call.
+            runtime = self._runtime_for(model_type)
+            return await asyncio.wait_for(runtime.store_status(), timeout=30.0)
+        except Exception as exc:
+            logger.warning(
+                f"could not read the runtime's store status: "
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            return {}
+
+    def _store_view_failures(self) -> Dict[str, float]:
+        """When each backend's store `ping` last failed, created on first use.
+
+        Reached through an accessor rather than read off the attribute directly
+        because this is a CACHE, "no failures recorded yet" is the right answer
+        for an instance that has no history, and several call sites build this
+        class without running `__init__`. Crashing one of them with an
+        AttributeError would turn a missing optimisation into a broken status
+        method -- which it did, once, before this accessor existed.
+        """
+        failures = getattr(self, "_store_view_unreachable_at", None)
+        if failures is None:
+            failures = {}
+            self._store_view_unreachable_at = failures
+        return failures
+
+    async def _backend_store_view(self, backend: str) -> Dict[str, Any]:
+        """A backend's store verdict for the STATUS surface, from the cache.
+
+        Read through `ping`, which reports the runtime's cached verdict and
+        never probes -- so this cannot write a file and cannot hang on a wedged
+        mount, which matters because `get_training_capabilities` is what the
+        annotate page polls. `store_status` would be the fresher answer and is
+        deliberately NOT used here for that reason; the refusal path uses it,
+        where one probe per training request is affordable.
+
+        `{}` means "could not ask", which is a third answer and is reported as
+        `writable: None` rather than collapsed into either verdict.
+
+        BOUNDED, AND IT STOPS ASKING A BACKEND THAT IS NOT THERE. See
+        `_STORE_VIEW_PING_TIMEOUT_S` for the measurement that forced both: the
+        caller is polled, and a backend left UPSCALING by an under-GPU'd cluster
+        never answers, so an unconditional ping per poll is an unbounded cost
+        for an answer that will not arrive. A backend that failed is skipped for
+        `_STORE_VIEW_UNREACHABLE_FOR_S` and reports the same `{}` it would have
+        reported after waiting -- the ANSWER is unchanged, only the waiting is.
+        """
+        failures = self._store_view_failures()
+        last_failed = failures.get(backend)
+        if (
+            last_failed is not None
+            and (time.time() - last_failed) < _STORE_VIEW_UNREACHABLE_FOR_S
+        ):
+            return {}
+        probe = "cpsam" if backend == "cellpose" else None
+        try:
+            runtime = self._runtime_for(probe)
+            out = await asyncio.wait_for(
+                runtime.ping(), timeout=_STORE_VIEW_PING_TIMEOUT_S
+            )
+        except Exception as exc:
+            failures[backend] = time.time()
+            logger.warning(
+                f"could not read the {backend} runtime's store verdict: "
+                f"{type(exc).__name__}: {str(exc)[:120]}. Not asking it again "
+                f"for {_STORE_VIEW_UNREACHABLE_FOR_S:.0f}s."
+            )
+            return {}
+        # Cleared on success, so a runtime that comes back is asked again
+        # without waiting out the window.
+        failures.pop(backend, None)
+        store = (out or {}).get("store")
+        return store if isinstance(store, dict) else {}
+
+    async def _require_runtime_store_writable(
+        self, model_type: Optional[str] = None
+    ) -> None:
+        """Refuse a training request up front if the runtime cannot write.
+
+        Before this, such a run was ACCEPTED, queued, handed to the runtime,
+        and died at the runtime's first status write -- leaving the user a Ray
+        traceback as the reason and the run FAILED. Refusing at the door costs
+        one cached probe and says which store and why.
+
+        An unreadable verdict does NOT refuse: `_check_runtime_available` has
+        already established that the runtime answers, so a missing verdict here
+        is this check's own failure, and taking the app's training offline
+        because a status call timed out would be a worse trade than letting the
+        run proceed and fail at its write, which is the behaviour today.
+        """
+        report = await self._runtime_store(model_type)
+        if report.get("writable") is False:
+            raise RuntimeError(
+                "Training is unavailable on this worker: "
+                + str(report.get("detail") or "the runtime cannot write its run store")
+                + " No run was started. This is a worker-side fault rather "
+                "than a problem with the request."
+            )
 
     async def _runtime_gpu_memory(
         self, model_type: Optional[str] = None
@@ -2040,21 +2184,45 @@ class EntryApp:
         ``UPSCALING``, which never times out."""
         import training
 
-        microsam = (
-            await self._gpu_view("microsam")
-            if "microsam" in self._enabled_backends
-            else {}
+        # THE RUN STORE, per backend. A runtime replica has its own HOME, so a
+        # backend can have a perfectly good GPU and still be unable to write a
+        # single run record -- which is what happened in production while this
+        # method answered `trainable: True, reason: "fits"`. A review called
+        # that the status half of this row's clause 1, and it was right: the
+        # refusal at `start_training` tells a user who has already committed to
+        # a run, while the page reads THIS.
+        #
+        # EVERY VIEW IS GATHERED CONCURRENTLY, and the first version of this
+        # awaited them one after another. A review measured what that cost: with
+        # VRAM declared, both backends enabled and one runtime whose `ping`
+        # hangs, the call took 10.01 s and still returned no store verdict. The
+        # declared path exists precisely to answer CPU-side without waking a
+        # GPU, and serialising four awaits turned the page's poll into the sum
+        # of every timeout. Concurrently the worst case is the LONGEST one, not
+        # the sum -- and with VRAM declared the GPU views cost nothing at all,
+        # so what is left is a single bounded store probe.
+        enabled = [b for b in ("microsam", "cellpose") if b in self._enabled_backends]
+
+        async def _nothing() -> Dict[str, Any]:
+            return {}
+
+        gpu_order = ("microsam", "cellpose")
+        views = await asyncio.gather(
+            *(
+                self._gpu_view(b) if b in self._enabled_backends else _nothing()
+                for b in gpu_order
+            ),
+            *(self._backend_store_view(b) for b in enabled),
         )
-        cellpose = (
-            await self._gpu_view("cellpose")
-            if "cellpose" in self._enabled_backends
-            else {}
-        )
+        microsam, cellpose = views[0], views[1]
+        stores = dict(zip(enabled, views[len(gpu_order) :]))
+
         models = []
         for m in ModelType.__args__:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
             enabled = backend in self._enabled_backends
             gpu = cellpose if backend == "cellpose" else microsam
+            store = stores.get(backend) or {}
             required = training.min_training_vram_mb(m)
             rec = {
                 "model_type": m,
@@ -2080,6 +2248,15 @@ class EntryApp:
                     False,
                     "no GPU detected on the runtime",
                 )
+            elif store.get("writable") is False:
+                # Before the VRAM comparison on purpose: a replica that cannot
+                # write its run store cannot train whatever its GPU has, and
+                # reporting the VRAM reason would send the user to buy a bigger
+                # card for a read-only filesystem.
+                rec["trainable"] = False
+                rec["reason"] = str(
+                    store.get("detail") or "the runtime cannot write its run store"
+                )
             elif gpu["total_mb"] < required:
                 rec["trainable"] = False
                 rec["reason"] = f"needs ~{required} MB, GPU has {gpu['total_mb']} MB"
@@ -2100,6 +2277,18 @@ class EntryApp:
                 ),
             },
             "models": models,
+            # The per-backend store verdict as DATA, not only folded into a
+            # model's reason string: an operator wants to see which backend
+            # cannot write, and a UI should not have to parse prose for it.
+            # `writable: None` means the runtime could not be asked.
+            "stores": {
+                b: (
+                    stores.get(b) or {"writable": None, "detail": "not reported"}
+                    if b in self._enabled_backends
+                    else {"enabled": False}
+                )
+                for b in ("microsam", "cellpose")
+            },
             "parameters": self._training_parameter_schema(),
             # Why a backend reads 'runtime unavailable' when nothing is broken: on
             # a cluster with fewer GPUs than enabled backends the runtime never
@@ -2355,6 +2544,12 @@ class EntryApp:
             )
 
         await self._check_runtime_available(model_type)
+        # REFUSED AT THE DOOR if the runtime that would serve this cannot write
+        # its run store. Before this, the request was accepted, queued, handed
+        # to the runtime and died at the runtime's first status write -- the
+        # user's reason was a Ray traceback. The verdict is the runtime's own
+        # and is cached there, so this costs no write per request.
+        await self._require_runtime_store_writable(model_type)
 
         # REFUSE A BASE CHECKPOINT THIS SITE CANNOT PRODUCE, before the GPU
         # slot. Same reasoning as the fixed-tile check above: without this the

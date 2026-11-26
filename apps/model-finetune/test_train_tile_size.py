@@ -203,6 +203,14 @@ class _CapturingReplica:
     async def _check_runtime_available(self, model_type=None) -> None:
         return None
 
+    async def _require_runtime_store_writable(self, model_type=None) -> None:
+        # The stub carries this because the real `start_training` now asks
+        # whether the runtime can write its run store before accepting a run.
+        # Added here rather than made optional in the app: a call guarded by
+        # `getattr` would stop checking the day somebody renames it, and the
+        # stub's job is to model the app rather than to be forgiving.
+        return None
+
     async def _runtime_gpu_memory(self, model_type=None) -> dict:
         return {"available": False}
 

@@ -131,10 +131,30 @@ class CellposeRuntime:
                 "cpsam GPU work (_gpu_lock)": self._gpu_lock.locked,
             }
         )
+        # This replica's own store verdict -- see `_probe_store`. A cellpose
+        # runtime is a separate process from the micro-sam one and from the
+        # entry, each with its own HOME, so each must answer for itself.
+        self._store_ok: Optional[bool] = None
+        self._store_detail: str = "not probed yet"
+        self._store_checked_at: float = 0.0
 
     @bioengine.async_init
     async def _start_busy_log(self) -> None:
         self._busy.start()
+        # The store verdict is established ONCE here, so the first caller gets
+        # an answer rather than "not probed yet". It shares this hook because
+        # an app may declare only one `@bioengine.async_init` -- adding a
+        # second raises ReservedMethodNameError at import, which is how I found
+        # out.
+        #
+        # Deliberately NOT fatal. A replica that cannot write the run store can
+        # still serve inference, and failing init would take the GPU runtime
+        # down for a fault only training cares about -- the restart loop this
+        # design exists to avoid, reached from the other side.
+        try:
+            await self._probe_store()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"the startup store probe itself failed: {exc}")
 
     @bioengine.smoke_test
     async def _import_runtime_stack(self) -> None:
@@ -192,6 +212,73 @@ class CellposeRuntime:
                 "runtime_env_setup-*.log on the node."
             )
 
+    #: How long a store verdict is reused before `store_status` re-probes. The
+    #: probe writes a file, so this is not free; the fault it detects is a
+    #: property of the process and effectively static, so a minute is ample.
+    # Class-level defaults, so `ping` cannot raise AttributeError on an
+    # instance whose __init__ did not run -- which is how the suite exercises
+    # `ping` alone, and it is also what any future constructor refactor would
+    # produce. Immutable values only; every write assigns to the INSTANCE.
+    _store_ok: Optional[bool] = None
+    _store_detail: str = "not probed yet"
+    _store_checked_at: float = 0.0
+
+    STORE_PROBE_TTL_S = 60.0
+
+    async def _probe_store(self) -> Dict[str, Any]:
+        """Establish whether this replica can write its run store.
+
+        Runs the write probe off the event loop: it touches a filesystem that
+        may be a network mount, and a hung mount must not block this replica's
+        other callers.
+
+        NO `@bioengine.health_check` CALLS THIS, and that is the design rather
+        than an omission. A failing Serve health check RESTARTS the replica, so
+        reporting an unwritable store through the health check would crash-loop
+        the GPU runtimes under a cluster-side fault the app cannot repair --
+        which is exactly the condition that produced this row, and it lasted
+        hours. Any "fail after N attempts" threshold is a bet on how long such
+        a fault lasts; a probe that never fails the check cannot be tuned
+        wrong. The fault is surfaced instead through `ping`/`store_status` and
+        refused at the door by the entry, which is what an operator and a user
+        need. The cost, stated: Serve's own health view stays green.
+        """
+        import training
+
+        try:
+            root = await asyncio.to_thread(training.assert_sessions_root_writable)
+            self._store_ok = True
+            self._store_detail = f"the run store at {root} accepts writes"
+        except Exception as exc:
+            self._store_ok = False
+            self._store_detail = str(exc)
+        self._store_checked_at = time.time()
+        return self._store_report()
+
+    def _store_report(self) -> Dict[str, Any]:
+        return {
+            "writable": self._store_ok,
+            "detail": self._store_detail,
+            "checked_at": self._store_checked_at,
+            "age_s": (
+                None
+                if not self._store_checked_at
+                else round(time.time() - self._store_checked_at, 1)
+            ),
+        }
+
+    async def store_status(self, max_age_s: Optional[float] = None) -> Dict[str, Any]:
+        """This replica's store verdict, re-probed if the cached one is stale.
+
+        Composition endpoint, like `ping` and `gpu_memory_info` -- not a Hypha
+        method, so a caller cannot reach it directly and cannot ask this
+        replica to write on demand.
+        """
+        ttl = self.STORE_PROBE_TTL_S if max_age_s is None else max_age_s
+        if self._store_ok is None or (time.time() - self._store_checked_at) > ttl:
+            return await self._probe_store()
+        return self._store_report()
+
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check (mirrors RuntimeApp)."""
         return {
@@ -199,6 +286,10 @@ class CellposeRuntime:
             "loaded_checkpoint": self._loaded_key,
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
+            # The CACHED store verdict, never a fresh probe: the entry calls
+            # this inside a 2 s readiness timeout and a replica wedged on a
+            # hung mount must not make that hang.
+            "store": self._store_report(),
         }
 
     async def soup_memory_budget(self) -> Dict[str, Any]:
@@ -995,6 +1086,22 @@ class CellposeRuntime:
         resident inference model first so the subprocess owns the GPU; the
         subprocess (``train_worker_cellpose.py``) writes COMPLETED/FAILED."""
         import training
+
+        # THE REPLICA THAT WILL WRITE, asked here. The entry refuses up front
+        # using a verdict from whichever replica its handle routed to, which
+        # need not be this one if a backend ever has more than one replica --
+        # a review named that, and my own design note had admitted the window
+        # between a cached verdict and the write. This closes it: the check
+        # runs in the process that is about to write, BEFORE the GPU lock, so
+        # a refused run neither holds the GPU nor dies mid-epoch. One probe per
+        # training run is nothing next to training.
+        report = await self.store_status(max_age_s=0)
+        if report.get("writable") is False:
+            raise RuntimeError(
+                "This GPU runtime cannot write the training-run store, so the "
+                "run was not started: "
+                + str(report.get("detail") or "the store refuses writes")
+            )
 
         async with self._gpu_lock:
             await asyncio.to_thread(self._release_model)
