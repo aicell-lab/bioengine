@@ -1319,6 +1319,108 @@ def looks_like_tiff(header: bytes) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Direct upload of one local image
+#
+# A browser without the File System Access API cannot mount a folder, and the
+# mounted folder is what registers the data-provider service every other
+# upload route goes through. Such a browser therefore had no way to put a
+# local image into a dataset at all. These rules exist so an image that
+# arrives by presigned PUT is indistinguishable, afterwards, from one that
+# arrived through a mount: the object lands at ``images/<stem><ext>``, and the
+# manifest entry is then produced by the ordinary listing reconciliation
+# rather than written by the upload path.
+#
+# The extension list is the one the frontend already applies when it reads a
+# mounted folder. It is restated HERE, server-side, deliberately: a presigned
+# PUT is handed to the client, so a rule that lives only in the client is a
+# suggestion. Before this there was no server-side format rule, because no
+# server-side upload route existed to need one.
+LOCAL_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+# Same ceiling as a materialisation: both end up as one object in the same
+# bucket, read by the same viewer, and there is no reason for two numbers.
+MAX_LOCAL_IMAGE_BYTES = MAX_MATERIALISE_BYTES
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
+
+
+def split_local_image_filename(filename: Any) -> tuple:
+    """``(stem, ext)`` for an uploadable local image, or raise.
+
+    The extension is lowercased so ``Scan.TIF`` and ``scan.tif`` land on one
+    rule, but the STEM keeps its case: it is the manifest key and the name
+    the user sees, and silently changing it would make the uploaded image a
+    different image from the one they picked.
+    """
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("An image filename is required.")
+    # Reject a path rather than taking its basename. A caller that sent
+    # "a/b.png" has a different idea of where this goes than the broker does,
+    # and quietly flattening it would store the image somewhere they do not
+    # expect under a stem they did not choose.
+    if "/" in filename or "\\" in filename:
+        raise ValueError(
+            f"'{filename}' is a path, not a filename; send only the final "
+            f"component."
+        )
+    dot = filename.rfind(".")
+    if dot <= 0:
+        raise ValueError(
+            f"'{filename}' has no extension; one of "
+            f"{', '.join(LOCAL_IMAGE_EXTS)} is required."
+        )
+    stem, ext = filename[:dot], filename[dot:].lower()
+    if ext not in LOCAL_IMAGE_EXTS:
+        raise ValueError(
+            f"'{ext}' is not a supported image format. Supported: "
+            f"{', '.join(LOCAL_IMAGE_EXTS)}."
+        )
+    if not is_valid_image_stem(stem):
+        raise ValueError(
+            f"'{stem}' is not a usable image name. Use letters, digits, "
+            f"dot, dash or underscore only."
+        )
+    return stem, ext
+
+
+def looks_like_png(header: bytes) -> bool:
+    """True if *header* starts like a PNG file."""
+    return isinstance(header, (bytes, bytearray)) and bytes(header).startswith(
+        PNG_SIGNATURE
+    )
+
+
+def looks_like_jpeg(header: bytes) -> bool:
+    """True if *header* starts like a JPEG file."""
+    return isinstance(header, (bytes, bytearray)) and bytes(header).startswith(
+        JPEG_SIGNATURE
+    )
+
+
+def header_matches_ext(ext: str, header: bytes) -> bool:
+    """True if *header*'s signature agrees with the declared *ext*.
+
+    Checked because a presigned PUT reports success from S3, not from this
+    app: "the client says it uploaded a PNG" is not evidence that a PNG is
+    there. An error page or a truncated body stored under a .png name would
+    otherwise be recorded as a readable image.
+
+    An unknown extension is False rather than True. Reaching here with one
+    means ``split_local_image_filename`` has been bypassed, and the safe
+    reading of a rule that did not run is that it did not pass.
+    """
+    ext = (ext or "").lower()
+    if ext == ".png":
+        return looks_like_png(header)
+    if ext in (".jpg", ".jpeg"):
+        return looks_like_jpeg(header)
+    if ext in (".tif", ".tiff"):
+        return looks_like_tiff(header)
+    return False
+
+
 def embedding_path(stem: str, model_type: str) -> str:
     return f"embeddings/{stem}_{model_type}.npz"
 
@@ -1710,6 +1812,110 @@ def artifact_id_to_filename(artifact_id: str) -> str:
 def filename_to_artifact_id(filename: str) -> str:
     stem = filename[:-5] if filename.endswith(".json") else filename
     return stem.replace("__", "/")
+
+
+# ---------------------------------------------------------------------------
+# The public gallery
+# ---------------------------------------------------------------------------
+
+# What an anonymous visitor is told about a public dataset.
+#
+# An ALLOW-LIST, not a strip-list. Broker metadata holds the owner as
+# ``{"id", "email"}``, and the artifact manifests carry ``created_by`` with an
+# address in it, so a listing built by removing known-sensitive fields has to
+# be right about every field that exists now and every field added later. This
+# only has to be right about what a gallery card needs.
+PUBLIC_DATASET_FIELDS = (
+    "artifact_id",
+    "name",
+    "description",
+    "image_count",
+)
+
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+
+
+def iter_public_metadata(root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Every dataset whose BROKER flag says public, in a stable order.
+
+    Reads the broker's own metadata rather than the artifacts, for two
+    reasons. The flag lives here and nowhere else -- ``set_public`` writes it
+    here -- so this is the same source ``resolve_role`` consults when it
+    decides whether an anonymous caller may read a dataset at all. A gallery
+    built on any other source could advertise a dataset the read path then
+    refuses, or hide one it would serve.
+
+    A file that cannot be parsed is skipped rather than fatal: one bad record
+    must not empty the gallery.
+    """
+    out: List[Dict[str, Any]] = []
+    for path in sorted(datasets_dir(root).glob("*.json")):
+        try:
+            meta = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(meta, dict) or not meta.get("public"):
+            continue
+        if not meta.get("artifact_id"):
+            continue
+        out.append(meta)
+    return out
+
+
+# THE GALLERY CARD NAMES NO OWNER, and that is a decision rather than an
+# omission.
+#
+# An earlier version published the owner's id -- `github|…` -- on the grounds
+# that it is not an email address and that broker metadata holds nothing else.
+# Both halves were true and the conclusion was still wrong. The requirement for
+# this method is "no emails AND no user ids", and the id is a stable account
+# identifier for a named individual: the one measured on the live gallery was
+# the same id that holds the collection's `"*"` grant. Publishing it on a page
+# anyone can read is a smaller version of the exposure this gallery exists to
+# replace.
+#
+# What was never priced was the third option. A display name does not exist to
+# offer instead -- measured on the live artifact, `manifest.owner` is `{id,
+# email}` and `created_by` is the id, with nothing name-like anywhere -- so the
+# choice was only ever "an account id" or "no owner", and no owner is the one
+# that meets the requirement. The card loses a line; nobody loses an identifier.
+#
+# There is deliberately no `owner_display` helper left to call. A function that
+# returned `None` would be a slot for somebody to fill back in later with
+# whatever identifier is to hand, which is exactly how this field arrived.
+
+
+def public_dataset_entry(
+    metadata: Dict[str, Any],
+    *,
+    name: Optional[str],
+    description: Optional[str],
+    image_count: Optional[int],
+) -> Dict[str, Any]:
+    """Project one public dataset down to its gallery card.
+
+    **No owner field** -- see the block comment above for why the card names
+    nobody. ``metadata`` is still the argument because it carries the
+    ``artifact_id``; nothing identifying is read out of it.
+
+    Every value is still scrubbed for email addresses on the way out, and that
+    is not redundant now the owner is gone: ``name`` and ``description`` are
+    free text an owner typed and either could contain an address.
+    """
+    entry = {
+        "artifact_id": metadata.get("artifact_id"),
+        "name": _scrub_emails(name),
+        "description": _scrub_emails(description),
+        "image_count": image_count,
+    }
+    return {k: entry.get(k) for k in PUBLIC_DATASET_FIELDS}
+
+
+def _scrub_emails(value: Any) -> Any:
+    """Replace any email address in *value* with a placeholder."""
+    if not isinstance(value, str):
+        return value
+    return _EMAIL_RE.sub("[email removed]", value)
 
 
 def metadata_path(artifact_id: str, root: Optional[Path] = None) -> Path:

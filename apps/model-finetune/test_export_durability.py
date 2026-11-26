@@ -45,6 +45,21 @@ import training
 # tests readable while using ids the app accepts.
 S_CANCELLED = "2026-11-25-120005-00000005"
 
+# An export handle is now bound to the identity that created it: both
+# `get_export_status` and `push_export` refuse a caller who is neither the
+# creator nor a `bioimage-io` administrator, and an export with no recorded
+# creator is admin-only. These durability tests plant records directly, so they
+# plant no creator either -- which makes every call here an ownerless case.
+# They pass an administrator rather than silently relying on no check existing,
+# and the refusal itself is covered in test_export_bound_to_creator.py.
+ADMIN = {
+    "user": {
+        "id": "github|777000",
+        "is_anonymous": False,
+        "scope": {"workspaces": {"bioimage-io": "a"}},
+    }
+}
+
 
 @pytest.fixture(autouse=True)
 def _sandbox_home(monkeypatch, tmp_path):
@@ -96,7 +111,9 @@ async def test_get_export_status_answers_after_the_replica_is_gone() -> None:
     class _FreshReplica:
         pass
 
-    got = await _method_of("get_export_status", _FreshReplica())("e-ready")
+    got = await _method_of("get_export_status", _FreshReplica())(
+        "e-ready", context=ADMIN
+    )
 
     assert got["status"] == "READY"
     assert got["download_url"] == "https://example.invalid/pkg.zip"
@@ -114,7 +131,9 @@ async def test_an_unknown_export_id_still_raises_keyerror() -> None:
         pass
 
     with pytest.raises(KeyError):
-        await _method_of("get_export_status", _FreshReplica())("e-never-existed")
+        await _method_of("get_export_status", _FreshReplica())(
+            "e-never-existed", context=ADMIN
+        )
 
 
 @pytest.mark.asyncio
@@ -144,7 +163,7 @@ async def test_push_export_recovers_the_package_dir_after_a_restart(tmp_path) ->
             return _Resp()
 
     out = await _method_of("push_export", _FreshReplica())(
-        "e-push", {"weights.pt": "https://example.invalid/put"}
+        "e-push", {"weights.pt": "https://example.invalid/put"}, context=ADMIN
     )
 
     assert out == {"pushed": ["weights.pt"], "n_files": 1}
@@ -172,7 +191,9 @@ async def test_the_private_package_dir_is_not_leaked_to_the_caller() -> None:
     class _FreshReplica:
         pass
 
-    out = await _method_of("get_export_status", _FreshReplica())("e-private")
+    out = await _method_of("get_export_status", _FreshReplica())(
+        "e-private", context=ADMIN
+    )
 
     # Positive control: we are looking at the real record, so absence below means
     # filtered rather than not-found.

