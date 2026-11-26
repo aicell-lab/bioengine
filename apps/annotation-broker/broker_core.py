@@ -19,6 +19,8 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -2563,21 +2565,140 @@ def read_metadata(
     return json.loads(p.read_text())
 
 
+def metadata_tmp_path(artifact_id: str, root: Optional[Path] = None) -> Path:
+    """A staging path that is UNIQUE to this writer.
+
+    ``os.replace`` is atomic, so one writer can never be seen half-written. That guarantee is
+    void if two writers stage through the SAME scratch file, which a path derived only from the
+    artifact id does: both open it, both write into it, and the replace can then publish a
+    document assembled from two writers' bytes. A torn record takes the whole dataset out,
+    which is strictly worse than losing one field.
+    """
+    p = metadata_path(artifact_id, root)
+    return p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+
+
+def metadata_lock_path(artifact_id: str, root: Optional[Path] = None) -> Path:
+    """The lock guarding one dataset's record. Separate from the record itself so that taking
+    the lock never creates or truncates the document."""
+    p = metadata_path(artifact_id, root)
+    return p.with_name(f"{p.name}.lock")
+
+
 def write_metadata(
     metadata: Dict[str, Any], root: Optional[Path] = None
 ) -> Dict[str, Any]:
-    """Atomically write *metadata* (write to a ``.tmp`` file, then
-    ``os.replace``) — same pattern as ``training.write_status`` in the
-    micro-sam app. Stamps ``updated_at`` and returns the written dict."""
+    """Atomically write *metadata* (stage to a unique temp file, then ``os.replace``). Stamps
+    ``updated_at`` and returns the written dict.
+
+    ⚠ ATOMIC IS NOT THE SAME AS SAFE. This publishes one whole document indivisibly; it does
+    NOT protect a read-modify-write. A caller that reads the record, changes a field and calls
+    this has a window in which another writer can land a different change, which this call then
+    erases — and the caller is handed back the record it *believed* it wrote, so nothing reports
+    the loss. For any change to an existing record use `mutate_metadata`, which closes that
+    window. This stays public for the create path, where there is nothing yet to lose.
+    """
     artifact_id = metadata["artifact_id"]
     metadata = dict(metadata)
     metadata["updated_at"] = now_iso()
     p = metadata_path(artifact_id, root)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(metadata, indent=2))
-    os.replace(tmp, p)
+    tmp = metadata_tmp_path(artifact_id, root)
+    try:
+        tmp.write_text(json.dumps(metadata, indent=2))
+        os.replace(tmp, p)
+    except BaseException:
+        # Never leave a scratch file behind: the staging names are unique, so an abandoned one
+        # is never reused and would accumulate silently.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return metadata
+
+
+@contextlib.contextmanager
+def locked_metadata(artifact_id: str, root: Optional[Path] = None):
+    """Hold one dataset's record for a read-modify-write, writing it back on clean exit.
+
+        with core.locked_metadata(artifact_id) as meta:
+            meta["public"] = True
+        # written, and no other writer could land in between
+
+    The same guarantee as `mutate_metadata` in the shape most call sites want, so converting one
+    is two lines: wrap the existing mutation, drop the `write_metadata` call. The record yielded
+    is the one stored NOW, re-read inside the lock — not whatever the caller read earlier for a
+    permission check.
+
+    On an exception nothing is written. Use `.written` on the yielded object? No — deliberately
+    not: the stored record after the block is `read_metadata(artifact_id)`, and offering a second
+    source of truth invites reading the stale one. Callers needing the written record should use
+    `mutate_metadata`, which returns it.
+    """
+    lock = metadata_lock_path(artifact_id, root)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            current = read_metadata(artifact_id, root)
+            if current is None:
+                raise FileNotFoundError(f"no dataset record for {artifact_id!r}")
+            yield current
+            write_metadata(current, root=root)
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def mutate_metadata(
+    artifact_id: str,
+    mutate: Any,
+    root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read, change and write one dataset record with no lost-update window.
+
+    ``mutate`` is called with the record as stored *now* and must return the record to write
+    (mutating in place and returning it is fine). The read, the change and the write all happen
+    while this process holds an exclusive lock on that dataset, so two concurrent changes are
+    serialised instead of overwriting each other: the second one sees the first one's result.
+
+    Returns the record that was ACTUALLY WRITTEN. That is the point of the return value — the
+    defect this replaces returned the caller's in-memory copy, which is a description of a write
+    that may never have landed.
+
+    If ``mutate`` raises, nothing is written and the exception reaches the caller: a change
+    either persists or raises, never neither.
+
+    Raises ``FileNotFoundError`` when the dataset does not exist. It deliberately does not
+    create one: an empty record has no owner and no ACL, so inventing it would publish a
+    dataset nobody can administer.
+
+    SCOPE OF THE GUARANTEE, stated so it is not over-read: ``fcntl.flock`` is advisory and
+    per-host. It serialises writers on one machine — which is what the broker is, a single Ray
+    replica per deployment writing to its own state root — and it would NOT serialise two
+    replicas on different hosts sharing a filesystem. If the broker is ever scaled to several
+    replicas over shared state, this needs revisiting; a comparison-and-retry on
+    ``updated_at`` is the portable version.
+    """
+    lock = metadata_lock_path(artifact_id, root)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    # Opened separately from the document, so acquiring the lock cannot disturb it.
+    with open(lock, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            current = read_metadata(artifact_id, root)
+            if current is None:
+                raise FileNotFoundError(f"no dataset record for {artifact_id!r}")
+            updated = mutate(current)
+            if updated is None:
+                # A mutate function that forgets to return would otherwise write `null` and
+                # destroy the record. Treat it as the programming error it is.
+                raise ValueError(
+                    "mutate() returned None; it must return the record to write"
+                )
+            return write_metadata(updated, root=root)
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def delete_metadata(artifact_id: str, root: Optional[Path] = None) -> bool:

@@ -2270,10 +2270,14 @@ class AnnotationBroker:
             self._image_manifest_cache.pop(artifact_id, None)
 
         if credential:
-            credentials = dict(meta.get("ngff_credentials") or {})
-            credentials[untokened] = credential
-            meta["ngff_credentials"] = credentials
-            core.write_metadata(meta, root=STATE_ROOT)
+            # Under the lock and re-read: the staging, upload and commit above take time, and
+            # the record read at the top of this call is stale by now. Writing it back here
+            # erased anything that landed during the import -- a label created meanwhile, or
+            # another image's dimensions.
+            with core.locked_metadata(artifact_id, root=STATE_ROOT) as fresh:
+                credentials = dict(fresh.get("ngff_credentials") or {})
+                credentials[untokened] = credential
+                fresh["ngff_credentials"] = credentials
 
         return {"stem": stem, **entry}
 
@@ -3213,10 +3217,21 @@ class AnnotationBroker:
         future per-label info). The artifact manifest is NOT touched, and no
         empty placeholder files are written."""
         artifact_id = self._canonical_id(artifact_id)
-        meta, _caller, _role = self._require_role(context, artifact_id, "manager")
+        # The role check reads the record; the mutation below re-reads it under the lock. Both
+        # are needed: the check decides whether the caller may write at all, and the re-read is
+        # what stops this write erasing a change that landed in between (an upload recording
+        # image dimensions is the one that bit, since it is the step right before this one).
+        self._require_role(context, artifact_id, "manager")
         description = description if isinstance(description, str) else ""
-        core.add_label(meta, name, description)  # raises ValueError on a bad name
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+
+        def _add(meta):
+            core.add_label(meta, name, description)  # raises ValueError on a bad name
+            return meta
+
+        # Returns what was ACTUALLY stored, and raises rather than reporting a write that did
+        # not land. Previously this wrote a record read before the check and returned its own
+        # in-memory copy, so a lost update was indistinguishable from success.
+        meta = core.mutate_metadata(artifact_id, _add, root=STATE_ROOT)
 
         async def _put_label_metadata():
             await self._write_json_file(
@@ -3301,8 +3316,17 @@ class AnnotationBroker:
                     dims_cache[stem] = dims
                     cache_grew = True
             if cache_grew:
-                meta["image_dims"] = dims_cache
-                core.write_metadata(meta, root=STATE_ROOT)
+                # Re-read under the lock and UNION, rather than writing back the whole record
+                # read before the (possibly slow) ranged header fetches above. Two things made
+                # the old line lose writes: it published a record that predated anything landing
+                # during those fetches, and `image_dims` is a cache, so replacing it wholesale
+                # also discarded dimensions another caller had just measured. A union is the
+                # right merge for a cache -- entries are per-stem and never conflict.
+                with core.locked_metadata(artifact_id, root=STATE_ROOT) as fresh:
+                    fresh["image_dims"] = {
+                        **(fresh.get("image_dims") or {}),
+                        **dims_cache,
+                    }
         for img in images:
             entry = manifest[img["stem"]]
             dims = (

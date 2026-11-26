@@ -894,13 +894,20 @@ class TestImportKeepsTheCredentialOutOfTheArtifact:
         assert "secret-123" not in blob
         assert out["source"]["store_root"] == self.UNTOKENED
 
+    # These two read the STORED record rather than the fixture's in-memory `_state["meta"]`.
+    # The import now records the credential under the dataset lock, re-reading the record inside
+    # it, so that a long import cannot erase a change that landed while it ran. That re-read is
+    # the whole point, and it means the write no longer lands in the dict the fixture happens to
+    # hold — asserting on that dict would be asserting on the fake, not on the behaviour.
     async def test_the_token_lands_in_broker_metadata(self, tokened):
         await tokened.import_ngff_image("ws/ds", self.TOKENED, stem="s", context=None)
-        creds = tokened._state["meta"]["ngff_credentials"]
-        assert creds == {self.UNTOKENED: "secret-123"}
+        stored = bc.read_metadata("ws/ds", root=bk.STATE_ROOT) or {}
+        assert stored.get("ngff_credentials") == {self.UNTOKENED: "secret-123"}
 
     async def test_an_untokened_source_records_no_credential(self, importer):
         await importer.import_ngff_image("ws/ds", ROOT, stem="s", context=None)
+        stored = bc.read_metadata("ws/ds", root=bk.STATE_ROOT) or {}
+        assert "ngff_credentials" not in stored
         assert "ngff_credentials" not in importer._state["meta"]
 
 
