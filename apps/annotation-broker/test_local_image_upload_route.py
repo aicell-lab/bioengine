@@ -60,8 +60,14 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
             "images": state["manifest"],
         }
 
-    async def _list_files_safe(_a, _dir):
-        return state["listing"]
+    async def _list_files_safe(_a, _dir, stage=True):
+        # `listing` is the STAGED view: what is there after this request's PUT.
+        # The committed view is empty, because every test using this fixture
+        # models a FRESH upload -- an object staged and not yet published. A
+        # fixture that returned the same entries for both would make the route
+        # read its own in-flight upload as somebody's existing image, which is
+        # the distinction the route now depends on.
+        return state["listing"] if stage else []
 
     class _Am:
         async def put_file(self, _a, file_path=None):

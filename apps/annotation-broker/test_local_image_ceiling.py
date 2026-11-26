@@ -94,10 +94,18 @@ def test_an_UNREADABLE_size_is_refused_and_says_which_case_it_is():
 
 
 class _Store:
-    """A tiny object store: PUT records bytes, the listing reports lengths."""
+    """A tiny object store: PUT records bytes, the listing reports lengths.
+
+    STAGED and COMMITTED are separate, because the route now asks a different
+    question of each: the staged view includes what this request just PUT, and
+    only the committed view can say whether a name was ALREADY an image. A
+    double that collapsed the two could not have caught the regression this
+    models.
+    """
 
     def __init__(self):
-        self.objects: dict = {}
+        self.objects: dict = {}  # staged
+        self.published: dict = {}  # committed
         self.removed: list = []
         self.committed = 0
 
@@ -108,15 +116,22 @@ class _Store:
     async def remove_file(self, artifact_id=None, file_path=None):
         self.removed.append(file_path)
         self.objects.pop(file_path, None)
+        self.published.pop(file_path, None)
 
     # -- what a client does with the minted URL ------------------------
     def put(self, url: str, body: bytes):
         self.objects[url.split("://", 1)[1].split("/", 1)[1]] = body
 
     # -- what the broker reads back ------------------------------------
-    def listing(self, dir_path: str):
+    def publish(self, path: str, body: bytes):
+        """Pre-existing committed object, as a mounted-folder upload leaves."""
+        self.published[path] = body
+        self.objects[path] = body
+
+    def listing(self, dir_path: str, stage: bool = True):
+        source = {**self.published, **self.objects} if stage else self.published
         out = []
-        for path, body in sorted(self.objects.items()):
+        for path, body in sorted(source.items()):
             head, _, nm = path.rpartition("/")
             if head != dir_path:
                 continue
@@ -138,8 +153,8 @@ def _store_broker(monkeypatch, store, *, ceiling):
     async def _read_json_file(_a, _path, _default=None):
         return {"manifest_version": core.IMAGE_MANIFEST_VERSION, "images": {}}
 
-    async def _list_files_safe(_a, dir_path):
-        return store.listing(dir_path)
+    async def _list_files_safe(_a, dir_path, stage=True):
+        return store.listing(dir_path, stage=stage)
 
     async def _ensure_staged(_a, fn):
         return await fn()
@@ -364,3 +379,81 @@ async def test_the_MINTING_call_still_advertises_the_same_number(monkeypatch):
     b = _broker(monkeypatch, manifest={}, listing=[])
     out = await b.upload_local_image(ARTIFACT, "scan01.png")
     assert out["max_bytes"] == CEILING
+
+
+# ── an EXISTING image is never touched ──────────────────────────────────────
+#
+# The regression the discard introduced, found in review round 2. An image
+# already in a dataset can be over THIS route's ceiling, because the
+# mounted-folder path has no cap and the ceiling binds this route only. The
+# discard removed whatever sat at `images/<name>` whenever the size check
+# refused, so one finishing call for an existing image's filename deleted that
+# image and orphaned its annotations. Before the discard, that call was a
+# harmless commit.
+
+
+@pytest.mark.asyncio
+async def test_finishing_for_an_EXISTING_IMAGE_destroys_nothing(monkeypatch):
+    """The reviewer's own probe, as a test."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    store.publish("images/big.png", _png(100))  # committed, over this ceiling
+
+    # The mint refuses the name, as it always did.
+    mint = await b.upload_local_image(ARTIFACT, "big.png")
+    assert mint["already"] is True, mint
+
+    # A client that ignores that and finishes anyway must change NOTHING.
+    with pytest.raises(ValueError) as exc:
+        await b.upload_local_image(ARTIFACT, "big.png", done=True)
+    assert "already an image" in str(exc.value), str(exc.value)
+    assert "NOTHING was changed" in str(exc.value)
+
+    assert store.removed == [], f"an existing image was deleted: {store.removed}"
+    assert store.committed == 0
+    manifest = await b._image_manifest(ARTIFACT)
+    assert (
+        "big" in manifest
+    ), f"the existing image is gone from the manifest: {manifest}"
+
+
+@pytest.mark.asyncio
+async def test_an_existing_image_WITH_NO_REPORTED_SIZE_is_also_safe(monkeypatch):
+    """The unreadable-size branch had the same shape, and would have deleted
+    an existing image whose listing entry carried no size."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    store.publish("images/odd.png", _png(32))
+
+    # strip the size from what the store reports, as a store that does not
+    # report sizes would
+    real_listing = store.listing
+
+    def no_sizes(dir_path, stage=True):
+        return [
+            {k: v for k, v in e.items() if k != "size"}
+            for e in real_listing(dir_path, stage=stage)
+        ]
+
+    monkeypatch.setattr(store, "listing", no_sizes)
+
+    with pytest.raises(ValueError) as exc:
+        await b.upload_local_image(ARTIFACT, "odd.png", done=True)
+    assert "already an image" in str(exc.value), str(exc.value)
+    assert store.removed == [], store.removed
+
+
+@pytest.mark.asyncio
+async def test_a_GENUINE_upload_still_discards_on_refusal(monkeypatch):
+    """The control for the guard above: a name that is NOT already committed
+    still gets the round-1 behaviour, so the guard did not simply disable the
+    discard."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    mint = await b.upload_local_image(ARTIFACT, "fresh.png")
+    store.put(mint["put_url"], _png(65))
+
+    with pytest.raises(ValueError) as exc:
+        await b.upload_local_image(ARTIFACT, "fresh.png", done=True)
+    assert "65" in str(exc.value), str(exc.value)
+    assert store.removed == ["images/fresh.png"], store.removed

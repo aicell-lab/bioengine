@@ -249,11 +249,19 @@ class AnnotationBroker:
         return await core.ensure_staged(call, restage)
 
     async def _list_files_safe(
-        self, artifact_id: str, dir_path: str
+        self, artifact_id: str, dir_path: str, stage: bool = True
     ) -> List[Dict[str, Any]]:
+        """Entries under *dir_path*, staged view by default.
+
+        `stage=False` asks what is COMMITTED, which answers a different
+        question: the staged view includes an object this request has just
+        PUT, so it cannot distinguish "the caller uploaded this" from "this was
+        already somebody's image". One caller needs that distinction and must
+        not get it wrong -- see the finishing half of `upload_local_image`.
+        """
         try:
             files = await self._am.list_files(
-                artifact_id, dir_path=dir_path, stage=True
+                artifact_id, dir_path=dir_path, stage=stage
             )
             return files or []
         except Exception as exc:
@@ -2083,6 +2091,32 @@ class AnnotationBroker:
         # Checked BEFORE the signature, deliberately: the signature check
         # fetches the first bytes of the object, and there is no reason to
         # reach into something already known to be over the limit.
+        # AN EXISTING IMAGE IS NEVER TOUCHED, and this guard is the reason the
+        # discard below is safe. A review measured the hole it closes: the
+        # discard removed whatever sat at `images/<name>` whenever the size
+        # check refused, and an image ALREADY in the dataset can be over this
+        # route's ceiling, because the mounted-folder path has no cap and
+        # MAX_LOCAL_IMAGE_BYTES binds this route only. So one finishing call
+        # for an existing image's filename -- a client that ignores
+        # `already: True` and finishes anyway, a stray retry, or exactly the
+        # client bug this ceiling exists for -- deleted that image from the
+        # stage, and the next commit from any route published the removal and
+        # orphaned its annotations. Before the discard existed the same call
+        # was a harmless commit.
+        #
+        # The COMMITTED listing is the one that answers this. The staged view
+        # includes the object this request just PUT, so it cannot tell "the
+        # caller uploaded this" from "this was already an image".
+        committed = await self._list_files_safe(artifact_id, "images", stage=False)
+        if any(isinstance(e, dict) and e.get("name") == name for e in committed):
+            raise ValueError(
+                f"'{name}' is already an image in this dataset, so this upload "
+                "was not accepted and NOTHING was changed. A name that is "
+                "already taken is reported by the call that mints the upload "
+                "URL, which answers 'already': true and hands out no URL. "
+                "Upload under a different name."
+            )
+
         listing = await self._list_files_safe(artifact_id, "images")
         refusal = core.oversized_image_refusal(
             name,
