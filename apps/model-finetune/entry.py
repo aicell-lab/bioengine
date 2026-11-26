@@ -1597,12 +1597,21 @@ class EntryApp:
         status: Optional[Dict[str, Any]] = None,
         *,
         log_failure: bool = False,
+        record: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Share one run's record. True if it landed.
 
         Returns rather than raises, because every caller is doing something
         else that must not fail with it: a finished run, or a poll that will
         come round again.
+
+        `record` SUPPLIES THE DOCUMENT INSTEAD OF BUILDING ONE, and exists so a
+        caller can hash the exact bytes that will be written. Rebuilding the
+        record here would re-read the run, and a document built twice is not
+        necessarily the same document twice: a run that moved on, or merely an
+        `elapsed_s` derived from the clock, makes the second build differ from
+        the first. A caller that hashed the first and then wrote the second
+        would be attesting to bytes that never existed.
 
         A commit can legitimately lose a race -- two instances can hold
         `stage=True` on one artifact, and the first commit clears the single
@@ -1622,7 +1631,8 @@ class EntryApp:
             return False
         for attempt in (1, 2):
             try:
-                record = training.run_record(session_id, status)
+                if record is None:
+                    record = training.run_record(session_id, status)
                 path = training.run_record_path(session_id, store)
                 am = await self._runs_artifact_manager()
                 await am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True)
@@ -2445,7 +2455,19 @@ class EntryApp:
 
         EQUALITY IS BY ID SET AND CONTENT HASH, not by count. Two sets of the
         same size are not the same set, and a record that lands with the wrong
-        content is not a record that landed.
+        content is not a record that landed. Both halves are enforced against
+        the ARTIFACT after the write, not against this replica's own account of
+        what it did: the records are listed and downloaded again, and `complete`
+        requires every one of them to hash to what the plan said it would.
+
+        Each record is built ONCE, in the plan, and that same document is what
+        gets written -- so the hash in the plan is a hash of the bytes that were
+        actually uploaded.
+
+        A run that starts between the dry run and the apply changes the count,
+        and the apply then REFUSES because `confirm` no longer matches. That is
+        the safe direction: it costs a second dry run and cannot write a plan
+        the caller has not seen.
 
         Nothing on disk is written, moved or deleted. The migration only adds
         documents to the runs artifact.
@@ -2477,8 +2499,25 @@ class EntryApp:
         planned, unreadable = [], []
         for name in names:
             try:
-                status = training.get_status(name, include_private=True)
-                record = training.run_record(name, status)
+                # THE RECORD IS BUILT EXACTLY AS THE WRITER BUILDS IT, and it is
+                # kept so the write below uses this very document. An earlier
+                # version hashed `run_record(name, get_status(...))` -- the
+                # SHAPED status, which adds session_id, checkpoint_available,
+                # config and a clock-derived elapsed_s, and has the stale sweep
+                # applied -- while the write produced the RAW document. The two
+                # disagreed on every run, and on a run that had gone stale they
+                # disagreed on the status itself, so the plan attested to bytes
+                # nobody ever wrote.
+                # STRICT, and this is the one place that must be. The ordinary
+                # reader answers `{}` for a status document that will not
+                # parse, which is right for a listing -- one damaged run must
+                # not take out the poll around it. Here it would copy a corrupt
+                # run into the permanent record as an EMPTY one, replacing that
+                # run's history with nothing and reporting success, and the
+                # `unreadable` refusal below would never fire because nothing
+                # ever raised.
+                document = training.read_status_strict(name)
+                record = training.run_record(name, document)
                 path = training.run_record_path(name, store)
             except Exception as exc:
                 unreadable.append({"id": name, "error": "%s: %s" % (type(exc).__name__, exc)})
@@ -2488,6 +2527,7 @@ class EntryApp:
                 {
                     "id": name,
                     "path": path,
+                    "record": record,
                     "sha256": hashlib.sha256(body).hexdigest(),
                     "owner": (record.get("status") or {}).get("owner"),
                 }
@@ -2523,12 +2563,68 @@ class EntryApp:
 
         written, failed = [], []
         for item in planned:
-            ok = await self._persist_run_record(item["id"], log_failure=True)
+            # The PLANNED record, not a freshly built one: the hash in the plan
+            # is of these bytes, so writing anything else would make the plan a
+            # statement about a document that was never uploaded.
+            ok = await self._persist_run_record(
+                item["id"], record=item["record"], log_failure=True
+            )
             (written if ok else failed).append(item["id"])
         plan["applied"] = len(written)
         plan["failed"] = failed
-        # BEFORE == AFTER as SETS, checked here rather than left to the caller.
-        plan["complete"] = not failed and set(written) == set(plan["ids"])
+
+        # THE ARTIFACT IS READ BACK. `written` only means "our commit returned"
+        # -- it is this replica's account of its own actions, and a backfill
+        # that grades itself on that has not checked anything. What the clause
+        # asks is whether the ARTIFACT holds the records, so the artifact is
+        # asked, and the bytes it serves are hashed and compared to the plan.
+        verified, verify_error = {}, None
+        try:
+            am = await self._runs_artifact_manager()
+            listing = await am.list_files(
+                artifact_id=training.RUNS_ARTIFACT_ID,
+                dir_path=training.run_record_dir(store),
+            )
+            for e in listing or []:
+                if not isinstance(e, dict) or e.get("type") == "directory":
+                    continue
+                fname = e.get("name")
+                if not (isinstance(fname, str) and fname.endswith(".json")):
+                    continue
+                sid = fname[: -len(".json")]
+                if sid not in plan["hashes"]:
+                    # Another deployment's or an older run's record. Not part of
+                    # this plan, so not evidence either way about it.
+                    continue
+                url = await am.get_file(
+                    artifact_id=training.RUNS_ARTIFACT_ID,
+                    file_path=f"{training.run_record_dir(store)}/{fname}",
+                )
+                resp = await self._http.get(url)
+                resp.raise_for_status()
+                verified[sid] = hashlib.sha256(
+                    resp.text.encode("utf-8")
+                ).hexdigest()
+        except Exception as exc:
+            verify_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+
+        plan["verified"] = len(verified)
+        plan["verify_error"] = verify_error
+        plan["mismatched"] = sorted(
+            sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
+        )
+        # COMPLETE IS THE CONJUNCTION, and every term is load-bearing: nothing
+        # failed to write, the id set that landed is the id set that was
+        # planned, the read-back itself succeeded, and every record the artifact
+        # serves hashes to what the plan said it would. Dropping the last term
+        # is what let a record land with the wrong content and still be called
+        # complete.
+        plan["complete"] = (
+            not failed
+            and set(written) == set(plan["ids"])
+            and verify_error is None
+            and not plan["mismatched"]
+        )
         return plan
 
     @bioengine.method(context=True)

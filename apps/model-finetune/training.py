@@ -480,6 +480,41 @@ def read_status(session_id: str) -> Dict[str, Any]:
         return {}
 
 
+def read_status_strict(session_id: str) -> Dict[str, Any]:
+    """The status document, RAISING if it cannot be read.
+
+    :func:`read_status` answers ``{}`` for a status document that is missing or
+    will not parse, which is right for a listing or a poll: one damaged run
+    must not take out the operation around it, and the next write repairs it.
+
+    It is WRONG for anything that copies a run somewhere permanent. There,
+    ``{}`` is indistinguishable from "this run genuinely has no status", so a
+    corrupt document would be faithfully preserved as an EMPTY record -- the
+    run's history replaced by nothing, with no error anywhere. A backfill has
+    one chance to read each run, so it asks the question that can fail.
+
+    Raises ``OSError`` if the document is absent and ``ValueError`` if it will
+    not parse.
+    """
+    p = _status_path(session_id)
+    if not p.exists():
+        raise OSError(f"no status document for {validate_session_id(session_id)}")
+    text = p.read_text()
+    try:
+        document = json.loads(text)
+    except Exception as exc:
+        raise ValueError(
+            f"the status document for {validate_session_id(session_id)} is not "
+            f"readable JSON ({type(exc).__name__}); {len(text)} byte(s) on disk"
+        ) from exc
+    if not isinstance(document, dict):
+        raise ValueError(
+            f"the status document for {validate_session_id(session_id)} is a "
+            f"{type(document).__name__}, not an object"
+        )
+    return document
+
+
 # The mutex a writer holds while merging a record.
 #
 # ⚠ NOT flock, and not fcntl.lockf -- and the reason is portability across
