@@ -709,6 +709,59 @@ class EntryApp:
                 "export, and training are unavailable until it starts."
             ) from e
 
+    async def _runtime_store(self, model_type: Optional[str] = None) -> Dict[str, Any]:
+        """The store verdict of the RUNTIME that would serve *model_type*.
+
+        Asked of the runtime rather than computed here, and that distinction is
+        the whole point: a runtime replica has its own HOME, so the entry's own
+        store says nothing about the one training writes. #0931 measured a
+        replica writing the share while another in the same image could not
+        write anything, because the redirect pointing HOME at the share had not
+        run in that process.
+
+        An unreachable runtime yields `{}` rather than a verdict: "I could not
+        ask" must not read as "the store is fine", and it must not read as
+        "the store is broken" either -- the caller distinguishes them.
+        """
+        try:
+            # Inside the try, deliberately: `_runtime_for` itself raises when a
+            # backend is not deployed, and a half-constructed instance has no
+            # runtime handle at all. Neither is a store verdict, and neither
+            # may turn this diagnostic into the thing that breaks the call.
+            runtime = self._runtime_for(model_type)
+            return await asyncio.wait_for(runtime.store_status(), timeout=30.0)
+        except Exception as exc:
+            logger.warning(
+                f"could not read the runtime's store status: "
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            return {}
+
+    async def _require_runtime_store_writable(
+        self, model_type: Optional[str] = None
+    ) -> None:
+        """Refuse a training request up front if the runtime cannot write.
+
+        Before this, such a run was ACCEPTED, queued, handed to the runtime,
+        and died at the runtime's first status write -- leaving the user a Ray
+        traceback as the reason and the run FAILED. Refusing at the door costs
+        one cached probe and says which store and why.
+
+        An unreadable verdict does NOT refuse: `_check_runtime_available` has
+        already established that the runtime answers, so a missing verdict here
+        is this check's own failure, and taking the app's training offline
+        because a status call timed out would be a worse trade than letting the
+        run proceed and fail at its write, which is the behaviour today.
+        """
+        report = await self._runtime_store(model_type)
+        if report.get("writable") is False:
+            raise RuntimeError(
+                "Training is unavailable on this worker: "
+                + str(report.get("detail") or "the runtime cannot write its run store")
+                + " No run was started. This is a worker-side fault rather "
+                "than a problem with the request."
+            )
+
     async def _runtime_gpu_memory(
         self, model_type: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -1756,6 +1809,12 @@ class EntryApp:
             )
 
         await self._check_runtime_available(model_type)
+        # REFUSED AT THE DOOR if the runtime that would serve this cannot write
+        # its run store. Before this, the request was accepted, queued, handed
+        # to the runtime and died at the runtime's first status write -- the
+        # user's reason was a Ray traceback. The verdict is the runtime's own
+        # and is cached there, so this costs no write per request.
+        await self._require_runtime_store_writable(model_type)
 
         gpu = await self._runtime_gpu_memory(model_type)
         required = training.min_training_vram_mb(model_type)

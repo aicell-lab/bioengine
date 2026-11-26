@@ -120,10 +120,37 @@ class RuntimeApp:
         self._busy = busy.BusyLog(
             {"micro-sam GPU work (_gpu_lock)": self._gpu_lock.locked}
         )
+        # Whether THIS replica's run store accepts a write, and when that was
+        # last established. A runtime replica has its own HOME and therefore
+        # its own store: #0931 measured one replica writing the share while
+        # another, in the same pod image, could not write anything, because
+        # the redirect that points HOME at the share had not run. So this is a
+        # fact about the process, not about the cluster, and it cannot be
+        # answered by asking the entry.
+        #
+        # None means "not established yet" and is reported as such rather than
+        # as either answer.
+        self._store_ok: Optional[bool] = None
+        self._store_detail: str = "not probed yet"
+        self._store_checked_at: float = 0.0
 
     @bioengine.async_init
     async def _start_busy_log(self) -> None:
         self._busy.start()
+        # The store verdict is established ONCE here, so the first caller gets
+        # an answer rather than "not probed yet". It shares this hook because
+        # an app may declare only one `@bioengine.async_init` -- adding a
+        # second raises ReservedMethodNameError at import, which is how I found
+        # out.
+        #
+        # Deliberately NOT fatal. A replica that cannot write the run store can
+        # still serve inference, and failing init would take the GPU runtime
+        # down for a fault only training cares about -- the restart loop this
+        # design exists to avoid, reached from the other side.
+        try:
+            await self._probe_store()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"the startup store probe itself failed: {exc}")
 
     @bioengine.smoke_test
     async def _import_runtime_stack(self) -> None:
@@ -181,6 +208,73 @@ class RuntimeApp:
                 "runtime_env_setup-*.log on the node."
             )
 
+    #: How long a store verdict is reused before `store_status` re-probes. The
+    #: probe writes a file, so this is not free; the fault it detects is a
+    #: property of the process and effectively static, so a minute is ample.
+    # Class-level defaults, so `ping` cannot raise AttributeError on an
+    # instance whose __init__ did not run -- which is how the suite exercises
+    # `ping` alone, and it is also what any future constructor refactor would
+    # produce. Immutable values only; every write assigns to the INSTANCE.
+    _store_ok: Optional[bool] = None
+    _store_detail: str = "not probed yet"
+    _store_checked_at: float = 0.0
+
+    STORE_PROBE_TTL_S = 60.0
+
+    async def _probe_store(self) -> Dict[str, Any]:
+        """Establish whether this replica can write its run store.
+
+        Runs the write probe off the event loop: it touches a filesystem that
+        may be a network mount, and a hung mount must not block this replica's
+        other callers.
+
+        NO `@bioengine.health_check` CALLS THIS, and that is the design rather
+        than an omission. A failing Serve health check RESTARTS the replica, so
+        reporting an unwritable store through the health check would crash-loop
+        the GPU runtimes under a cluster-side fault the app cannot repair --
+        which is exactly the condition that produced this row, and it lasted
+        hours. Any "fail after N attempts" threshold is a bet on how long such
+        a fault lasts; a probe that never fails the check cannot be tuned
+        wrong. The fault is surfaced instead through `ping`/`store_status` and
+        refused at the door by the entry, which is what an operator and a user
+        need. The cost, stated: Serve's own health view stays green.
+        """
+        import training
+
+        try:
+            root = await asyncio.to_thread(training.assert_sessions_root_writable)
+            self._store_ok = True
+            self._store_detail = f"the run store at {root} accepts writes"
+        except Exception as exc:
+            self._store_ok = False
+            self._store_detail = str(exc)
+        self._store_checked_at = time.time()
+        return self._store_report()
+
+    def _store_report(self) -> Dict[str, Any]:
+        return {
+            "writable": self._store_ok,
+            "detail": self._store_detail,
+            "checked_at": self._store_checked_at,
+            "age_s": (
+                None
+                if not self._store_checked_at
+                else round(time.time() - self._store_checked_at, 1)
+            ),
+        }
+
+    async def store_status(self, max_age_s: Optional[float] = None) -> Dict[str, Any]:
+        """This replica's store verdict, re-probed if the cached one is stale.
+
+        Composition endpoint, like `ping` and `gpu_memory_info` -- not a Hypha
+        method, so a caller cannot reach it directly and cannot ask this
+        replica to write on demand.
+        """
+        ttl = self.STORE_PROBE_TTL_S if max_age_s is None else max_age_s
+        if self._store_ok is None or (time.time() - self._store_checked_at) > ttl:
+            return await self._probe_store()
+        return self._store_report()
+
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check — not a Hypha method,
         but reachable via the composition handle. Unlocked so it answers during
@@ -191,6 +285,11 @@ class RuntimeApp:
             "loaded_model_type": self._loaded_model_type,
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
+            # The CACHED store verdict. `ping` never probes: the entry calls it
+            # inside a 2 s readiness timeout, and a replica wedged on a hung
+            # mount must not make that readiness check hang -- which is the
+            # failure the timeout exists for in the first place.
+            "store": self._store_report(),
         }
 
     async def gpu_memory_info(self) -> Dict[str, Any]:
