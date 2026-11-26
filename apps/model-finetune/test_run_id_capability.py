@@ -555,30 +555,46 @@ def test_the_README_TABLE_ROW_itself_names_the_weights():
 #: that reads the code's legs and requires the documentation to name each one
 #: cannot: narrowing the prose fails because a leg's phrase goes missing, and
 #: narrowing the code fails because the leg set no longer matches.
-#: A leg whose wording differs per documented site, so its requirement lives in
-#: each statement's own `phrases` rather than here. A SENTINEL rather than an
-#: empty tuple, because an empty tuple is indistinguishable from "nobody filled
-#: this in" and the test below has to tell the two apart.
-PER_SITE = "PER_SITE"
-
+#: FOR EVERY LEG, THE PHRASE EACH DOCUMENTED STATEMENT MUST CARRY BECAUSE OF IT.
+#:
+#: Nested per statement, and there is NO escape hatch — which is the fourth
+#: shape this table has taken and the first one that cannot be satisfied by
+#: filling in nothing. The history is worth keeping, because each version
+#: claimed an enforcement it did not have:
+#:
+#:   1. phrases required of the whole README  -> a whole-file grep; narrowing
+#:      two of the three statements left it green.
+#:   2. phrases per statement, legs checked by INTERSECTION -> a leg added
+#:      under a new name was filtered out before the comparison, while the
+#:      failure message said "a leg was added".
+#:   3. phrases per leg with a `PER_SITE` sentinel for the admin leg, whose
+#:      wording differs -> the VALUES were never read, and once they were, the
+#:      sentinel became the hole: a review added a leg to the code, marked it
+#:      PER_SITE, changed no documentation, and all 29 tests passed.
+#:
+#: So: every leg names, for every statement, the text that statement must
+#: contain. Adding a leg to the code forces three entries here, and filling
+#: them with text the README does not contain fails the statement check. There
+#: is nothing to write that enforces nothing.
 RESUME_ADMISSION_LEGS = {
     # the run's owner AND the dataset's owners/managers, in one helper
-    "_owner_or_comanager": ("owns or manages the dataset",),
-    # `rw`/admin on `bioimage-io` in the table and the prose, "an administrator"
-    # in the authoritative paragraph
-    "caller_is_workspace_admin": PER_SITE,
+    "_owner_or_comanager": {
+        "the capability table row": ("the run's owner", "owns or manages the dataset"),
+        "the prose beside the table": ("owns or manages the dataset",),
+        "the authoritative paragraph": ("its owner", "owns or manages the dataset"),
+    },
+    # worded `rw`/admin on `bioimage-io` in the table and the prose, and "an
+    # administrator" in the authoritative paragraph. That difference is why the
+    # table is nested rather than per-leg -- it is NOT a reason to exempt a leg.
+    "caller_is_workspace_admin": {
+        "the capability table row": ("`rw`/admin on `bioimage-io`",),
+        "the prose beside the table": ("`rw`/admin on `bioimage-io`",),
+        "the authoritative paragraph": ("an administrator",),
+    },
 }
 
 #: Names `caller_may_resume_run` calls that are NOT admission legs. Everything
 #: else it calls must be a known leg, so a leg added under ANY new name fails.
-#:
-#: An INTERSECTION was what the first version of this used, and a review showed
-#: it made the claim above false: widening the function to call
-#: `caller_may_see_run` passed, because the intersection filtered the new name
-#: out before the comparison. The test's own failure message said "a leg was
-#: added" while being structurally unable to notice one. An ignore-list is the
-#: only form that is honest here -- an unknown name is an unknown ADMISSION
-#: until somebody says otherwise.
 RESUME_NON_ADMISSION_CALLS = frozenset(
     {
         "read_status",  # how it FINDS the run, not who may use it
@@ -586,49 +602,13 @@ RESUME_NON_ADMISSION_CALLS = frozenset(
     }
 )
 
-#: THE DOCUMENTED STATEMENTS OF THE RULE, each with its own locator and its own
-#: required phrases, scoped to ITS OWN LINE.
-#:
-#: A review narrowed two of these three and nothing reddened, because the test
-#: searched the WHOLE README for each phrase and the table row always supplied
-#: it. A whole-file grep says a phrase exists SOMEWHERE; it says nothing about
-#: whether the sentence under test still contains it -- which is exactly the
-#: failure mode this row was filed about, reproduced one level up.
-#:
-#: The admin leg is worded differently per site (`rw`/admin on `bioimage-io` in
-#: the table and the prose, "an administrator" in the authoritative paragraph),
-#: so the phrases are per-statement rather than per-leg.
-#:
-#: THE RESIDUAL, STATED RATHER THAN GUARDED. A FOURTH statement of the rule
-#: written later is not detected: this pins the three locators it knows. I tried
-#: a heuristic -- every README line mentioning resuming alongside a permission
-#: word must be one of the three -- and it is the wrong instrument: it fired on
-#: four legitimate mentions (the export table row's `resume_checkpoint_file`,
-#: the ownerless-run paragraph, the export-handle paragraph) and would need a
-#: growing exclusion list, which is the shape that rots. A new statement of this
-#: rule has to be added here by whoever writes it, and this comment is the
-#: notice that it does.
-RESUME_DOC_STATEMENTS = {
-    "the capability table row": {
-        "locator": "| `start_training(resume_session_id=…)` |",
-        "phrases": (
-            "the run's owner",
-            "owns or manages the dataset",
-            "`rw`/admin on `bioimage-io`",
-        ),
-    },
-    "the prose beside the table": {
-        "locator": "**Resuming is deliberately wider**",
-        "phrases": ("owns or manages the dataset",),
-    },
-    "the authoritative paragraph": {
-        "locator": "**Resuming sits between the two**",
-        "phrases": (
-            "owns or manages the dataset",
-            "its owner",
-            "an administrator",
-        ),
-    },
+#: Where each statement of the rule lives. The locator must match exactly ONE
+#: README line, so a statement that moves or is duplicated fails rather than
+#: being read loosely.
+RESUME_DOC_LOCATORS = {
+    "the capability table row": "| `start_training(resume_session_id=…)` |",
+    "the prose beside the table": "**Resuming is deliberately wider**",
+    "the authoritative paragraph": "**Resuming sits between the two**",
 }
 
 
@@ -666,57 +646,6 @@ def _statement(locator: str) -> str:
     return hits[0]
 
 
-def test_EVERY_LEG_PHRASE_IS_ACTUALLY_REQUIRED_OF_EVERY_STATEMENT():
-    """THE VALUES OF `RESUME_ADMISSION_LEGS` ARE LOAD-BEARING, and until a review
-    found otherwise they were dead data.
-
-    Only the KEYS were read. Changing `_owner_or_comanager`'s phrase to
-    `"zzz no such phrase"` left all 27 tests green, and so did adding a leg to
-    the code AND to this dict without touching the README — while the comment
-    above the dict claimed it held "the thing every documented statement of the
-    rule must say because of it" and the leg test's failure message claimed the
-    dict and the documentation were pinned "together". Both claims were false.
-
-    That is this row's own defect — text asserting an enforcement that does not
-    exist — reproduced inside the fix for it, which is why it is worth a test
-    rather than a correction to the comment.
-
-    A leg either names phrases every statement must carry, or declares itself
-    `PER_SITE` because its wording differs and its requirement lives in each
-    statement's own `phrases`.
-    """
-    for leg, required in RESUME_ADMISSION_LEGS.items():
-        if required == PER_SITE:
-            continue
-        assert required, (
-            f"{leg} names no phrases and is not marked PER_SITE, so nothing "
-            "about it is enforced"
-        )
-        for phrase in required:
-            missing = [
-                which
-                for which, spec in RESUME_DOC_STATEMENTS.items()
-                if phrase not in spec["phrases"]
-            ]
-            assert not missing, (
-                f"{leg} requires {phrase!r}, but these documented statements do "
-                f"not list it among their phrases: {missing}. Add it there, or "
-                "mark the leg PER_SITE and say in each statement what it needs."
-            )
-
-
-def test_EVERY_PER_SITE_LEG_IS_NAMED_BY_EVERY_STATEMENT():
-    """`PER_SITE` must not become a way to enforce nothing. A leg marked
-    PER_SITE is one whose wording differs between sites, so every statement
-    still has to name SOMETHING for it: the assertion is that no statement's
-    phrase list is empty, which is the only thing checkable without hard-coding
-    each site's wording twice."""
-    per_site = [leg for leg, v in RESUME_ADMISSION_LEGS.items() if v == PER_SITE]
-    assert per_site, "no leg is PER_SITE; this test is vacuous and should go"
-    for which, spec in RESUME_DOC_STATEMENTS.items():
-        assert spec["phrases"], f"{which} requires no phrases at all"
-
-
 def test_THE_CODES_RESUME_LEGS_ARE_THE_ONES_THIS_TEST_KNOWS():
     """The half that catches a NARROWED or WIDENED code.
 
@@ -738,19 +667,44 @@ def test_THE_CODES_RESUME_LEGS_ARE_THE_ONES_THIS_TEST_KNOWS():
     )
 
 
-@pytest.mark.parametrize("which", sorted(RESUME_DOC_STATEMENTS))
+@pytest.mark.parametrize("which", sorted(RESUME_DOC_LOCATORS))
 def test_EVERY_DOCUMENTED_STATEMENT_OF_THE_RESUME_RULE_IS_WIDE(which):
-    """The half that catches a NARROWED document, once per statement.
+    """The half that catches a NARROWED DOCUMENT, once per statement.
 
-    Parametrised rather than looped so a failure names WHICH of the three
-    places went narrow. A review narrowed the authoritative paragraph and the
-    prose and the previous version of this stayed green, because it grepped the
-    whole file and the table row supplied the phrase.
+    Parametrised so a failure names WHICH of the three places went narrow. A
+    review narrowed the authoritative paragraph and the prose while an earlier
+    version grepped the whole file, and the table row kept supplying the phrase.
     """
-    spec = RESUME_DOC_STATEMENTS[which]
-    line = _statement(spec["locator"])
-    missing = [phrase for phrase in spec["phrases"] if phrase not in line]
+    line = _statement(RESUME_DOC_LOCATORS[which])
+    missing = [
+        phrase
+        for per_statement in RESUME_ADMISSION_LEGS.values()
+        for phrase in per_statement[which]
+        if phrase not in line
+    ]
     assert not missing, f"{which} does not name: {missing}\nline: {line}"
+
+
+def test_EVERY_LEG_NAMES_A_PHRASE_FOR_EVERY_STATEMENT():
+    """THE HATCH IS GONE, and this is the test that keeps it gone.
+
+    Version 3 of the table let a leg declare itself `PER_SITE` and name no
+    phrases, which a review showed was exactly "a way to enforce nothing": it
+    added a leg to the code, marked it PER_SITE, changed no documentation, and
+    everything passed. Every leg must now name at least one non-empty phrase
+    for every statement, so there is no value that satisfies the table without
+    also constraining the README.
+    """
+    for leg, per_statement in RESUME_ADMISSION_LEGS.items():
+        assert set(per_statement) == set(RESUME_DOC_LOCATORS), (
+            f"{leg} names {sorted(per_statement)}; the statements are "
+            f"{sorted(RESUME_DOC_LOCATORS)}"
+        )
+        for which, phrases in per_statement.items():
+            assert phrases and all(p.strip() for p in phrases), (
+                f"{leg} names no usable phrase for {which!r}, so nothing about "
+                "it is enforced there"
+            )
 
 
 def test_NO_COMMENT_IN_THIS_FILE_CONTRADICTS_A_SET_DEFINED_BELOW_IT():
