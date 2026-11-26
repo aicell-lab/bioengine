@@ -136,5 +136,7 @@ def test_the_scan_actually_reads_files() -> None:
     would pass. Assert the file set is real and holds the two modules the
     original defect lived in."""
     names = {p.name for p in _python_files()}
-    assert len(names) > 20, f"only {len(names)} python file(s) scanned — the glob is wrong"
+    assert (
+        len(names) > 20
+    ), f"only {len(names)} python file(s) scanned — the glob is wrong"
     assert {"test_preflight.py", "export_worker_cellpose.py"} <= names
